@@ -61,7 +61,7 @@ _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
 _USER_SHEET_COLS = ["ID", "Password", "Reason", "Source", "Status"]
 _NARRATIVES_WORKSHEET_TITLE = "Narratives"
-_NARRATIVES_SHEET_COLS = ["ID", "Date", "Category", "Title", "Content", "Tickers"]
+_NARRATIVES_SHEET_COLS = ["ID", "Date", "Category", "Title", "Content", "Winners", "Emerging"]
 _PORTFOLIOS_WORKSHEET_TITLE = "Portfolios"
 _PORTFOLIOS_SHEET_COLS = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
@@ -108,7 +108,7 @@ def open_narratives_worksheet():
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
                 sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET_TITLE, rows=3000, cols=6)
+                ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET_TITLE, rows=3000, cols=7)
                 ensure_narratives_header_row(ws)
                 return ws, None
             except Exception as exc2:
@@ -151,11 +151,11 @@ def ensure_portfolios_header_row(ws):
 def ensure_narratives_header_row(ws):
     vals = ws.get_all_values()
     if not vals or not any(str(c).strip() for c in vals[0]):
-        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
+        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:G1", value_input_option="USER_ENTERED")
         return
-    hdr = [str(h).strip() for h in vals[0][:6]]
+    hdr = [str(h).strip() for h in vals[0][:7]]
     if hdr != _NARRATIVES_SHEET_COLS:
-        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
+        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:G1", value_input_option="USER_ENTERED")
 
 
 def _looks_kst_timestamp(s: str) -> bool:
@@ -164,17 +164,36 @@ def _looks_kst_timestamp(s: str) -> bool:
 
 
 def _normalize_narrative_sheet_row(row: list) -> list:
-    """레거시 4열(Date..Content) 또는 6열(ID..Tickers) 행을 6열로 맞춘다."""
+    """레거시 4~6열 행을 7열 [ID..Emerging] 로 맞춘다."""
     row = list(row or [])
-    if len(row) >= 6:
-        return (row[:6] + [""] * 6)[:6]
+    if len(row) >= 7:
+        return (row[:7] + [""] * 7)[:7]
+    # 레거시 6열: ID, Date, Category, Title, Content, Tickers(단일)
+    if len(row) == 6:
+        s0 = str(row[0] or "").strip()
+        if s0 and not _looks_kst_timestamp(s0):
+            return [
+                str(row[0]).strip(),
+                str(row[1]).strip(),
+                str(row[2]).strip(),
+                str(row[3]).strip(),
+                str(row[4]).strip(),
+                str(row[5]).strip(),
+                "",
+            ]
     s0 = str(row[0]).strip() if row else ""
     if len(row) >= 4 and _looks_kst_timestamp(s0):
         c = str(row[3]).strip() if len(row) > 3 else ""
         if c.startswith("{") or c.startswith("["):
-            ex = str(row[4]).strip() if len(row) > 4 else ""
-            return ["", row[0], row[1], row[2], row[3], ex]
-    return (row + [""] * 6)[:6]
+            if len(row) == 5:
+                return ["", row[0], row[1], row[2], row[3], str(row[4]).strip(), ""]
+            wleg = str(row[4]).strip() if len(row) > 4 else ""
+            eleg = str(row[5]).strip() if len(row) > 5 else ""
+            ex6 = str(row[6]).strip() if len(row) > 6 else ""
+            if ex6:
+                return ["", row[0], row[1], row[2], row[3], wleg, eleg or ex6]
+            return ["", row[0], row[1], row[2], row[3], wleg, eleg]
+    return (row + [""] * 7)[:7]
 
 
 def _narrative_now_kst_string(dt_utc=None) -> str:
@@ -205,8 +224,55 @@ def _narrative_sheet_title_for_record(rec: dict) -> str:
     return base if base and base != "N/A" else "시장 내러티브 스냅샷"
 
 
+def winners_tickers_from_theme_analysis(analysis):
+    """themes[].winners 텍스트에서 티커만 추출 (strip·대문자·검증은 filter_scanner_ticker_list)."""
+    if not isinstance(analysis, dict):
+        return []
+    themes = analysis.get("themes", [])
+    if not isinstance(themes, list):
+        themes = analysis.get("Themes", []) if isinstance(analysis.get("Themes"), list) else []
+    if not isinstance(themes, list):
+        themes = []
+    out = []
+    seen = set()
+    for theme in themes:
+        theme = theme if isinstance(theme, dict) else {}
+        for ticker in parse_tickers_from_text(theme.get("winners", "") or ""):
+            t = str(ticker).strip().upper()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+    return filter_scanner_ticker_list(out)
+
+
+def emerging_tickers_from_theme_analysis(analysis):
+    """themes[].expanding_to[].expected_tickers 에서 티커만 추출."""
+    if not isinstance(analysis, dict):
+        return []
+    themes = analysis.get("themes", [])
+    if not isinstance(themes, list):
+        themes = analysis.get("Themes", []) if isinstance(analysis.get("Themes"), list) else []
+    if not isinstance(themes, list):
+        themes = []
+    out = []
+    seen = set()
+    for theme in themes:
+        theme = theme if isinstance(theme, dict) else {}
+        expanding_to_data = theme.get("expanding_to", [])
+        if not isinstance(expanding_to_data, list):
+            continue
+        for flow in expanding_to_data:
+            flow = flow if isinstance(flow, dict) else {}
+            for ticker in parse_tickers_from_text(flow.get("expected_tickers", "") or ""):
+                t = str(ticker).strip().upper()
+                if t and t not in seen:
+                    seen.add(t)
+                    out.append(t)
+    return filter_scanner_ticker_list(out)
+
+
 def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
-    """내부 레코드 dict → Narratives 시트 한 행 [ID, Date, Category, Title, Content, Tickers]."""
+    """내부 레코드 dict → Narratives 시트 한 행 [ID, Date, Category, Title, Content, Winners, Emerging]."""
     rec_out = {k: v for k, v in rec.items() if not str(k).startswith("_sheet")}
     analysis = rec_out.get("analysis") if isinstance(rec_out.get("analysis"), dict) else {}
     dt_utc = _narrative_parse_saved_at_utc(rec_out.get("saved_at"))
@@ -218,24 +284,35 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
     if len(title) > 500:
         title = title[:497] + "..."
     content = json.dumps(rec_out, ensure_ascii=False)
-    tk_csv = ""
+    w_list: list = []
+    e_list: list = []
     try:
-        tk_csv = ",".join(universe_tickers_from_theme_analysis(analysis))
+        w_list = winners_tickers_from_theme_analysis(analysis)
+        e_list = emerging_tickers_from_theme_analysis(analysis)
     except Exception:
-        tk_csv = ""
-    if (not tk_csv.strip()) and str(analysis.get("source") or "") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+        pass
+    if (not w_list and not e_list) and str(analysis.get("source") or "") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
         pre = analysis.get("precomputed_universe")
         if isinstance(pre, list):
             try:
-                tk_csv = ",".join(filter_scanner_ticker_list([str(x).strip().upper() for x in pre if str(x).strip()]))
+                w_list = filter_scanner_ticker_list([str(x).strip().upper() for x in pre if str(x).strip()])
             except Exception:
-                tk_csv = ""
-    return [str(owner_id).strip(), date_kst, category, title, content, tk_csv]
+                w_list = []
+    w_csv = ",".join(w_list)
+    e_csv = ",".join(e_list)
+    return [str(owner_id).strip(), date_kst, category, title, content, w_csv, e_csv]
 
 
 def _sheet_row_to_narrative_record(row: list) -> dict | None:
     """시트 데이터 행 → 내부 레코드 dict."""
-    rid, date_kst, category, title, content, tickers_csv = _normalize_narrative_sheet_row(row)
+    cells = _normalize_narrative_sheet_row(row)
+    rid = cells[0]
+    date_kst = cells[1]
+    category = cells[2]
+    title = cells[3]
+    content = cells[4]
+    winners_csv = str(cells[5]).strip() if len(cells) > 5 else ""
+    emerging_csv = str(cells[6]).strip() if len(cells) > 6 else ""
     content = str(content or "").strip()
     if not content:
         return None
@@ -253,7 +330,8 @@ def _sheet_row_to_narrative_record(row: list) -> dict | None:
                 envelope["saved_at"] = iso_guess
         envelope = dict(envelope)
         envelope["_sheet_user_id"] = str(rid).strip()
-        envelope["_sheet_tickers_csv"] = str(tickers_csv or "").strip()
+        envelope["_sheet_winners_csv"] = winners_csv
+        envelope["_sheet_emerging_csv"] = emerging_csv
         return envelope
     return None
 
@@ -277,13 +355,13 @@ def _invalidate_narratives_sheet_cache():
 
 
 def append_narrative_row_to_sheet(row_values: list) -> tuple[bool, str]:
-    """Narratives 시트에 한 행 append. row_values = [ID, Date, Category, Title, Content, Tickers]."""
+    """Narratives 시트에 한 행 append. row_values = [ID, Date, Category, Title, Content, Winners, Emerging]."""
     ws, err = open_narratives_worksheet()
     if err:
         return False, err
     try:
         ensure_narratives_header_row(ws)
-        ws.append_row(list(row_values)[:6], value_input_option="USER_ENTERED")
+        ws.append_row(list(row_values)[:7], value_input_option="USER_ENTERED")
         _invalidate_narratives_sheet_cache()
         return True, ""
     except Exception as exc:
@@ -297,7 +375,7 @@ def fetch_narrative_records_from_sheet() -> tuple[list, str | None]:
         return [], err
     if not vals or len(vals) < 2:
         return [], None
-    hdr = [str(h).strip() for h in vals[0][:6]]
+    hdr = [str(h).strip() for h in vals[0][:7]]
     if hdr != _NARRATIVES_SHEET_COLS:
         try:
             ws2, err2 = open_narratives_worksheet()
@@ -352,7 +430,7 @@ def save_narrative_history_records_merge_user(owner_id: str, records: list) -> t
             if isinstance(rec, dict) and isinstance(rec.get("analysis"), dict):
                 rows.append(_narrative_record_to_sheet_row(rec, owner_id))
         ws.clear()
-        ws.update(rows, range_name=f"A1:F{len(rows)}", value_input_option="USER_ENTERED")
+        ws.update(rows, range_name=f"A1:G{len(rows)}", value_input_option="USER_ENTERED")
         _invalidate_narratives_sheet_cache()
         return True, ""
     except Exception as exc:
@@ -2500,6 +2578,16 @@ def filter_scanner_ticker_list(tickers):
     return out
 
 
+def _parse_narrative_tickers_csv(csv: str) -> list:
+    """쉼표/줄바꿈 구분 문자열 → strip·대문자·검증된 티커 리스트."""
+    parts = []
+    for piece in str(csv or "").replace("\n", ",").split(","):
+        t = str(piece).strip().upper()
+        if t:
+            parts.append(t)
+    return filter_scanner_ticker_list(parts)
+
+
 def parse_tickers_from_text(text):
     raw_text = str(text or "").upper()
     found = re.findall(r"\b[A-Z][A-Z0-9\.\-]{0,9}\b", raw_text)
@@ -2834,72 +2922,102 @@ def render_narrative_factcheck_table(df: pd.DataFrame, kind: str = "weekly") -> 
 
 
 def universe_tickers_from_theme_analysis(analysis):
-    """일반 내러티브 analysis dict의 themes에서 티커만 추출 (precomputed_universe는 사용하지 않음)."""
-    if not isinstance(analysis, dict):
-        return []
-    themes = analysis.get("themes", [])
-    if not isinstance(themes, list):
-        themes = analysis.get("Themes", []) if isinstance(analysis.get("Themes"), list) else []
-    if not isinstance(themes, list):
-        themes = []
-    target_universe = []
+    """themes 기준 Winners + Emerging 합집합(순서: Winners 먼저, 중복 제거)."""
+    w = winners_tickers_from_theme_analysis(analysis)
+    e = emerging_tickers_from_theme_analysis(analysis)
+    out = []
     seen = set()
-    for theme in themes:
-        theme = theme if isinstance(theme, dict) else {}
-        winners = theme.get("winners", "")
-        for ticker in parse_tickers_from_text(winners):
-            if ticker not in seen:
-                seen.add(ticker)
-                target_universe.append(ticker)
-        expanding_to_data = theme.get("expanding_to", [])
-        if isinstance(expanding_to_data, list):
-            for flow in expanding_to_data:
-                flow = flow if isinstance(flow, dict) else {}
-                expected_tickers = flow.get("expected_tickers", "")
-                for ticker in parse_tickers_from_text(expected_tickers):
-                    if ticker not in seen:
-                        seen.add(ticker)
-                        target_universe.append(ticker)
-    return filter_scanner_ticker_list(target_universe)
+    for t in w + e:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _non_weekly_narratives_latest_first(records):
+    """주간 전용 레코드 제외 후 saved_at 기준 최신이 앞."""
+    pool = []
+    for r in records or []:
+        if not isinstance(r, dict):
+            continue
+        a = r.get("analysis") if isinstance(r.get("analysis"), dict) else {}
+        if a.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+            continue
+        pool.append(r)
+    return sorted(
+        pool,
+        key=lambda r: _narrative_parse_saved_at_utc(r.get("saved_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def get_latest_narrative_sheet_winners_tickers_only():
+    """현재 유저의 최신 일반 내러티브에서 시트 `Winners` 열(또는 JSON themes의 winners)만."""
+    records = load_narrative_history_records()
+    if not records:
+        return [], {}
+    for rec in _non_weekly_narratives_latest_first(records):
+        analysis = rec.get("analysis", {}) if isinstance(rec, dict) else {}
+        if not isinstance(analysis, dict):
+            continue
+        wc = str(rec.get("_sheet_winners_csv") or "").strip()
+        if wc:
+            parsed = _parse_narrative_tickers_csv(wc)
+            if parsed:
+                return parsed, analysis
+        wj = winners_tickers_from_theme_analysis(analysis)
+        if wj:
+            return wj, analysis
+    return [], {}
+
+
+def get_latest_narrative_sheet_emerging_tickers_only():
+    """현재 유저의 최신 일반 내러티브에서 시트 `Emerging` 열(또는 JSON expanding_to)만."""
+    records = load_narrative_history_records()
+    if not records:
+        return [], {}
+    for rec in _non_weekly_narratives_latest_first(records):
+        analysis = rec.get("analysis", {}) if isinstance(rec, dict) else {}
+        if not isinstance(analysis, dict):
+            continue
+        ec = str(rec.get("_sheet_emerging_csv") or "").strip()
+        if ec:
+            parsed = _parse_narrative_tickers_csv(ec)
+            if parsed:
+                return parsed, analysis
+        ej = emerging_tickers_from_theme_analysis(analysis)
+        if ej:
+            return ej, analysis
+    return [], {}
 
 
 def get_latest_narrative_target_universe():
     """
-    가장 최근 저장된 *일반* 내러티브(주간 트렌드 전용 레코드 제외)에서 유니버스를 구성한다.
-    Google 시트 `Tickers` 열이 있으면 우선 사용하고, 없으면 themes(Winners/Expanding) JSON에서 추출한다.
+    가장 최근 일반 내러티브에서 시트 `Winners`·`Emerging` 합집합을 우선 사용하고,
+    없으면 JSON themes에서 Winners+Expanding 전체를 사용한다.
     """
     records = load_narrative_history_records()
     if not records:
         return [], {}
 
-    sorted_recs = sorted(
-        records,
-        key=lambda r: _narrative_parse_saved_at_utc(r.get("saved_at")) or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
-    for rec in sorted_recs:
+    for rec in _non_weekly_narratives_latest_first(records):
         analysis = rec.get("analysis", {}) if isinstance(rec, dict) else {}
         if not isinstance(analysis, dict):
             continue
-        if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
-            continue
-        csv = str(rec.get("_sheet_tickers_csv") or "").strip()
-        if csv:
-            try:
-                parsed = filter_scanner_ticker_list([t.strip().upper() for t in csv.split(",") if str(t).strip()])
-            except Exception:
-                parsed = []
+        wc = str(rec.get("_sheet_winners_csv") or "").strip()
+        ec = str(rec.get("_sheet_emerging_csv") or "").strip()
+        merged = ",".join(x for x in [wc, ec] if x)
+        if merged:
+            parsed = _parse_narrative_tickers_csv(merged)
             if parsed:
                 return parsed, analysis
         u = universe_tickers_from_theme_analysis(analysis)
         if u:
             return u, analysis
 
-    for rec in sorted_recs:
+    for rec in _non_weekly_narratives_latest_first(records):
         analysis = rec.get("analysis", {}) if isinstance(rec, dict) else {}
         if not isinstance(analysis, dict):
-            continue
-        if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
             continue
         return universe_tickers_from_theme_analysis(analysis), analysis
 
@@ -2927,12 +3045,12 @@ def get_latest_weekly_trend_scan_universe_and_analysis():
         if analysis.get("source") != _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
             continue
 
-        csv = str(rec.get("_sheet_tickers_csv") or "").strip()
-        if csv:
-            try:
-                parsed = filter_scanner_ticker_list([t.strip().upper() for t in csv.split(",") if str(t).strip()])
-            except Exception:
-                parsed = []
+        wc = str(rec.get("_sheet_winners_csv") or "").strip()
+        ec = str(rec.get("_sheet_emerging_csv") or "").strip()
+        leg = str(rec.get("_sheet_tickers_csv") or "").strip()
+        merged_csv = ",".join(x for x in [wc, ec, leg] if x)
+        if merged_csv:
+            parsed = _parse_narrative_tickers_csv(merged_csv)
             if parsed:
                 return parsed, analysis
 
@@ -5150,7 +5268,8 @@ if st.session_state.get("logged_in"):
                 )
             elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
                 st.caption(
-                    "`Quant_DB` / `Narratives`에서 **가장 최근 일반 내러티브**(주간 트렌드 전용 저장분 제외)의 Themes·winners·expected_tickers로 유니버스를 구성합니다."
+                    "「Current Leaders 스캔」은 `Narratives` 시트 **Winners** 열(또는 JSON의 winners)만 사용합니다. "
+                    "「Emerging Opportunities 스캔」은 **Emerging** 열만 사용합니다."
                 )
             else:
                 st.caption(
@@ -5158,9 +5277,7 @@ if st.session_state.get("logged_in"):
                     f"「{_MAIN_NAV_OPTIONS[1]}」 메뉴에서 「📊 주간 트렌드 추출」 실행 시 `Narratives` 시트에 자동 저장됩니다."
                 )
     
-            run_scanner = st.button(
-                "🚀 Current Leaders 스캔 실행", key="run_ai_opportunity_scanner", use_container_width=True
-            )
+            run_scanner = st.button("Current Leaders 스캔", key="run_ai_opportunity_scanner", use_container_width=True, type="primary")
     
             if run_scanner:
                 target_universe = []
@@ -5177,13 +5294,11 @@ if st.session_state.get("logged_in"):
                     if not target_universe:
                         st.warning("섹터를 하나 이상 선택하거나, 티커를 입력한 뒤 다시 실행해주세요.")
                 elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
-                    target_universe, latest_analysis = get_latest_narrative_target_universe()
-                    src_note = "최신 내러티브"
-                    scanner_mode_saved = "내러티브 기반 스캔"
+                    target_universe, latest_analysis = get_latest_narrative_sheet_winners_tickers_only()
+                    src_note = "최신 내러티브 · Winners"
+                    scanner_mode_saved = "내러티브 Winners 스캔"
                     if not target_universe:
-                        st.warning(
-                            f"일반 내러티브 기록에서 유니버스를 만들 수 없습니다. 「{_MAIN_NAV_OPTIONS[1]}」에서 분석을 저장한 뒤 다시 시도하세요."
-                        )
+                        st.info("분석된 티커가 없습니다.")
                 else:
                     target_universe, latest_analysis = get_latest_weekly_trend_scan_universe_and_analysis()
                     src_note = "주간 메가 트렌드"
@@ -5245,12 +5360,14 @@ if st.session_state.get("logged_in"):
                     key="opportunity_scanner_manual_tickers_em",
                 )
             elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
-                st.caption("Current Leaders와 동일한 **최신 일반 내러티브** 소스로 유니버스를 구성합니다.")
+                st.caption(
+                    "「Emerging Opportunities 스캔」은 `Narratives` 시트 **Emerging** 열(또는 JSON expanding_to)만 사용합니다."
+                )
             else:
                 st.caption("Current Leaders와 동일한 **주간 메가 트렌드** 소스로 유니버스를 구성합니다.")
     
             run_emerge = st.button(
-                "🚀 Emerging Opportunities 스캔 실행",
+                "Emerging Opportunities 스캔",
                 key="run_emerging_opportunity_scanner",
                 use_container_width=True,
             )
@@ -5270,13 +5387,11 @@ if st.session_state.get("logged_in"):
                     if not target_u_em:
                         st.warning("섹터를 하나 이상 선택하거나, 티커를 입력한 뒤 다시 실행해주세요.")
                 elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
-                    target_u_em, latest_a_em = get_latest_narrative_target_universe()
-                    src_note_em = "최신 내러티브"
-                    scanner_mode_saved_em = "내러티브 기반 스캔"
+                    target_u_em, latest_a_em = get_latest_narrative_sheet_emerging_tickers_only()
+                    src_note_em = "최신 내러티브 · Emerging"
+                    scanner_mode_saved_em = "내러티브 Emerging 스캔"
                     if not target_u_em:
-                        st.warning(
-                            f"일반 내러티브 기록에서 유니버스를 만들 수 없습니다. 「{_MAIN_NAV_OPTIONS[1]}」에서 분석을 저장한 뒤 다시 시도하세요."
-                        )
+                        st.info("분석된 티커가 없습니다.")
                 else:
                     target_u_em, latest_a_em = get_latest_weekly_trend_scan_universe_and_analysis()
                     src_note_em = "주간 메가 트렌드"
