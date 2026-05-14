@@ -5,6 +5,7 @@ fredapi
 google-auth
 google-genai
 gspread
+matplotlib
 numpy
 pandas
 pytz
