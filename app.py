@@ -25,10 +25,6 @@ import pytz
 import requests
 import streamlit as st
 import yfinance as yf
-
-yf_session = requests.Session()
-yf_session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-
 import gspread
 from google.oauth2.service_account import Credentials
 from fredapi import Fred
@@ -615,8 +611,8 @@ def macro_traffic_light(bad_total):
 
 def fetch_yield_spread_latest():
     try:
-        tnx = yf.Ticker("^TNX", session=yf_session).history(period="10d", auto_adjust=False)
-        irx = yf.Ticker("^IRX", session=yf_session).history(period="10d", auto_adjust=False)
+        tnx = yf.Ticker("^TNX").history(period="10d", auto_adjust=False)
+        irx = yf.Ticker("^IRX").history(period="10d", auto_adjust=False)
         t10 = get_latest_close_from_history(tnx)
         t3m = get_latest_close_from_history(irx)
         if pd.isna(t10) or pd.isna(t3m):
@@ -645,7 +641,7 @@ def evaluate_vix_status(vix_value):
 
 def fetch_vix_latest_and_history():
     try:
-        hist = yf.Ticker("^VIX", session=yf_session).history(period="1y", auto_adjust=False)
+        hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
         cur = get_latest_close_from_history(hist)
         return cur, hist, None
     except Exception as exc:
@@ -666,7 +662,7 @@ def evaluate_wti_status(wti):
 
 def fetch_wti_latest():
     try:
-        o = yf.Ticker("CL=F", session=yf_session).history(period="14d", auto_adjust=False)
+        o = yf.Ticker("CL=F").history(period="14d", auto_adjust=False)
         return get_latest_close_from_history(o)
     except Exception:
         return np.nan
@@ -743,7 +739,7 @@ def evaluate_cpi_yoy():
 
 def fetch_dxy_latest_and_mean_deviation():
     try:
-        dxy_hist = yf.Ticker("DX-Y.NYB", session=yf_session).history(period="400d", auto_adjust=False)
+        dxy_hist = yf.Ticker("DX-Y.NYB").history(period="400d", auto_adjust=False)
         cur = get_latest_close_from_history(dxy_hist)
         if dxy_hist is None or "Close" not in dxy_hist.columns:
             return np.nan, np.nan, MACRO_STATUS_NA
@@ -1010,7 +1006,6 @@ def build_etf_universe_returns_table(pool_tickers):
             group_by="column",
             progress=False,
             threads=True,
-            session=yf_session,
         )
     except Exception:
         raw = pd.DataFrame()
@@ -1075,7 +1070,6 @@ def cached_sector_etf_closes(tickers_tuple: tuple[str, ...]):
             auto_adjust=False,
             group_by="column",
             progress=False,
-            session=yf_session,
         )
     except Exception:
         raw = pd.DataFrame()
@@ -1123,7 +1117,7 @@ def cached_etf_universe_momentum_rankings(universe_tickers_tuple: tuple[str, ...
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_yfinance_quote_type(ticker_upper: str):
     try:
-        info = yf.Ticker(str(ticker_upper).strip().upper(), session=yf_session).info or {}
+        info = yf.Ticker(str(ticker_upper).strip().upper()).info or {}
         return str(info.get("quoteType") or "").strip()
     except Exception:
         return ""
@@ -1132,7 +1126,7 @@ def cached_yfinance_quote_type(ticker_upper: str):
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_timing_price_history(ticker_upper: str):
     try:
-        return yf.Ticker(str(ticker_upper).strip().upper(), session=yf_session).history(
+        return yf.Ticker(str(ticker_upper).strip().upper()).history(
             period="1y", auto_adjust=False
         )
     except Exception:
@@ -1170,7 +1164,7 @@ def cached_build_etf_holdings_performance_pairs(holding_pairs):
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_etf_holdings_universe_str(etf_ticker: str):
     t_clean = str(etf_ticker or "").strip().upper()
-    return build_etf_holdings_universe(yf.Ticker(t_clean, session=yf_session))
+    return build_etf_holdings_universe(yf.Ticker(t_clean))
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -1187,7 +1181,6 @@ def cached_portfolio_yf_close_1y(tuple_tickers: tuple[str, ...]):
             group_by="column",
             progress=False,
             threads=True,
-            session=yf_session,
         )
     except Exception:
         raw = pd.DataFrame()
@@ -1214,7 +1207,7 @@ def tab_sync_refresh(clear_callbacks, rerun_after=True):
 
 def evaluate_kpis(ticker_symbol):
     try:
-        ticker = yf.Ticker(ticker_symbol, session=yf_session)
+        ticker = yf.Ticker(ticker_symbol)
         info = ticker.info if ticker.info else {}
         cashflow = ticker.cashflow
         history = ticker.history(period="1y", auto_adjust=False)
@@ -1322,13 +1315,13 @@ def evaluate_kpis(ticker_symbol):
 
 def detect_quote_type(ticker_symbol):
     try:
-        ticker = yf.Ticker(ticker_symbol, session=yf_session)
+        ticker = yf.Ticker(ticker_symbol)
         info = ticker.info if ticker.info else {}
         quote_type = str(info.get("quoteType") or "").upper()
         return quote_type, ticker, info
     except Exception:
         _notify_yfinance_fetch_failed()
-        return "", yf.Ticker(ticker_symbol, session=yf_session), {}
+        return "", yf.Ticker(ticker_symbol), {}
 
 
 def get_etf_top_holdings(ticker_obj):
@@ -1407,7 +1400,6 @@ def build_etf_holdings_performance(holdings_df):
             group_by="column",
             progress=False,
             threads=True,
-            session=yf_session,
         )
     except Exception:
         raw = pd.DataFrame()
@@ -2029,7 +2021,6 @@ def fetch_latest_prices_for_tickers(tickers):
             group_by="column",
             progress=False,
             threads=True,
-            session=yf_session,
         )
         close_df = get_close_prices_from_download(raw)
         if close_df.empty:
@@ -2270,7 +2261,6 @@ def _factcheck_download_closes(tickers, period: str = "60d") -> pd.DataFrame:
             group_by="column",
             progress=False,
             threads=True,
-            session=yf_session,
         )
     except Exception:
         _notify_yfinance_fetch_failed()
@@ -3141,9 +3131,8 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
                 group_by="column",
                 progress=False,
                 threads=True,
-                session=yf_session,
             )
-            spy_hist = yf.Ticker("SPY", session=yf_session).history(period="6mo", auto_adjust=False)
+            spy_hist = yf.Ticker("SPY").history(period="6mo", auto_adjust=False)
         except Exception:
             _notify_yfinance_fetch_failed()
             raw = pd.DataFrame()
@@ -3184,7 +3173,7 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
 
         info = {}
         try:
-            info = yf.Ticker(ticker, session=yf_session).info or {}
+            info = yf.Ticker(ticker).info or {}
         except Exception:
             _notify_yfinance_fetch_failed()
             info = {}
@@ -3301,7 +3290,6 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
                 group_by="column",
                 progress=False,
                 threads=True,
-                session=yf_session,
             )
         except Exception:
             _notify_yfinance_fetch_failed()
@@ -3394,7 +3382,7 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
 
         info = {}
         try:
-            info = yf.Ticker(ticker, session=yf_session).info or {}
+            info = yf.Ticker(ticker).info or {}
         except Exception:
             _notify_yfinance_fetch_failed()
             info = {}
