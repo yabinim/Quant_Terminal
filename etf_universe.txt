@@ -1,0 +1,28 @@
+# Hidden Alpha Radar — 티커는 쉼표·공백·줄바꿈으로 구분. # 주석 줄은 무시됩니다.
+# 매크로·브로드 인덱스
+SPY, QQQ, DIA, IWM, VTI, VOO, IVV, SCHX, SPLG, ITOT, RSP, IJR, VXF, MGK
+# 섹터 SPDR
+XLK, XLV, XLF, XLE, XLY, XLI, XLC, XLU, XLRE, XLB
+# 테크·반도체·디지털
+VGT, SOXX, SMH, XSD, SOXQ, DRAM
+# 우라늄·인프라·로봇·AI 테마
+URA, URNM, NLR, BOTZ, ROBO, PAVE, IFRA, UFO
+# 사이버·클라우드
+CIBR, HACK, WCLD, CLOU, SKYY
+# 신흥국·아시아·유럽·라틴
+INDA, SMIN, EIDO, EPOL, TUR, EZA, VNM, FM, EWZ, EWJ, EWY, EWT, EWH, EWA, EWC
+EWG, EWU, EWL, EWP, EWN, EWD
+# 원자재·금속·에너지
+COPX, CPER, XME, PICK, REMX, SILJ, GDX, GDXJ, GLD, IAU, SLV, USO, UNG, DBC
+# 배터리·클린
+LIT, ICLN, TAN, FAN, QCLN
+# 암호화폐·금융
+BITO, IBIT, KRE, KBWB, KBE
+# 농업·식량
+MOO, DBA, WEAT, CORN
+# ARK·바이오·에너지 지수
+ARKK, ARKG, ARKW, ARKF, ARKQ, XBI, XOP, OIH, AMLP
+# 게임·테마
+MJ, MSOS, ESPO, HERO, BETZ, EMQQ, CHIQ, KWEB, MCHI, ASHR, FXI
+# 방산·부동산·소비·채권·달러
+ITA, XAR, PPA, XRT, XHB, ITB, VNQ, SCHH, AGG, TLT, HYG, LQD, SHY, IEF, UUP

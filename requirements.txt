@@ -1,0 +1,13 @@
+# app.py — Streamlit Community Cloud 및 로컬 실행용 (표준 라이브러리 제외)
+altair
+feedparser
+fredapi
+google-auth
+google-genai
+gspread
+numpy
+pandas
+pytz
+requests
+streamlit
+yfinance

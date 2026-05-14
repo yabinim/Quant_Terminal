@@ -1,0 +1,29 @@
+# --- Streamlit secrets (절대 커밋 금지) ---
+.streamlit/secrets.toml
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+
+# --- 환경 변수 / 자격 증명 ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- 로그/캐시 ---
+*.log
+.cache/
