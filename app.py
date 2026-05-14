@@ -58,6 +58,8 @@ def _notify_yfinance_fetch_failed() -> None:
 _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
 _USER_SHEET_COLS = ["ID", "Password", "Reason", "Source", "Status"]
+_NARRATIVES_WORKSHEET_TITLE = "Narratives"
+_NARRATIVES_SHEET_COLS = ["Date", "Category", "Title", "Content"]
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 
 
@@ -86,6 +88,168 @@ def open_users_worksheet():
         return ws, None
     except Exception as exc:
         return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_USERS_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
+
+
+def open_narratives_worksheet():
+    """Quant_DB 스프레드시트의 Narratives 탭. (worksheet | None, err_msg | None)"""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_NARRATIVES_WORKSHEET_TITLE)
+        return ws, None
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
+            try:
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET_TITLE, rows=3000, cols=4)
+                ensure_narratives_header_row(ws)
+                return ws, None
+            except Exception as exc2:
+                return None, f"`{_NARRATIVES_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
+        return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_NARRATIVES_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
+
+
+def ensure_narratives_header_row(ws):
+    vals = ws.get_all_values()
+    if not vals or not any(str(c).strip() for c in vals[0]):
+        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:D1", value_input_option="USER_ENTERED")
+        return
+    hdr = [str(h).strip() for h in vals[0][:4]]
+    if hdr != _NARRATIVES_SHEET_COLS:
+        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:D1", value_input_option="USER_ENTERED")
+
+
+def _narrative_now_kst_string(dt_utc=None) -> str:
+    """UTC 시각을 KST 문자열 YYYY-MM-DD HH:MM:SS 로."""
+    u = dt_utc or datetime.now(timezone.utc)
+    if u.tzinfo is None:
+        u = u.replace(tzinfo=timezone.utc)
+    return u.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _narrative_kst_date_string_to_utc_iso(date_kst_str: str) -> str | None:
+    """시트 Date 열(KST) → UTC ISO 문자열."""
+    if not date_kst_str or not str(date_kst_str).strip():
+        return None
+    try:
+        naive = datetime.strptime(str(date_kst_str).strip(), "%Y-%m-%d %H:%M:%S")
+        loc = _KST_TZ.localize(naive)
+        return loc.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _narrative_sheet_title_for_record(rec: dict) -> str:
+    analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+    base = _narrative_core_theme_display(analysis, max_chars=100)
+    if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+        return "주간 트렌드(7일) 브리핑"
+    return base if base and base != "N/A" else "시장 내러티브 스냅샷"
+
+
+def _narrative_record_to_sheet_row(rec: dict) -> list:
+    """내부 레코드 dict → Narratives 시트 한 행 [Date, Category, Title, Content]."""
+    analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+    dt_utc = _narrative_parse_saved_at_utc(rec.get("saved_at"))
+    if dt_utc is None:
+        dt_utc = datetime.now(timezone.utc)
+    date_kst = _narrative_now_kst_string(dt_utc)
+    category = str(analysis.get("source") or "market_narrative").strip() or "market_narrative"
+    title = _narrative_sheet_title_for_record(rec)
+    if len(title) > 500:
+        title = title[:497] + "..."
+    content = json.dumps(rec, ensure_ascii=False)
+    return [date_kst, category, title, content]
+
+
+def _sheet_row_to_narrative_record(row: list) -> dict | None:
+    """시트 데이터 행 → 내부 레코드 dict."""
+    row = (row or []) + [""] * 4
+    date_kst, category, title, content = row[0], row[1], row[2], row[3]
+    content = str(content or "").strip()
+    if not content:
+        return None
+    try:
+        envelope = json.loads(content)
+    except Exception:
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    if isinstance(envelope.get("analysis"), dict):
+        if not envelope.get("saved_at") and date_kst:
+            iso_guess = _narrative_kst_date_string_to_utc_iso(date_kst)
+            if iso_guess:
+                envelope = dict(envelope)
+                envelope["saved_at"] = iso_guess
+        return envelope
+    return None
+
+
+def append_narrative_row_to_sheet(row_values: list) -> tuple[bool, str]:
+    """Narratives 시트에 한 행 append. row_values = [Date, Category, Title, Content]."""
+    ws, err = open_narratives_worksheet()
+    if err:
+        return False, err
+    try:
+        ensure_narratives_header_row(ws)
+        ws.append_row(list(row_values)[:4], value_input_option="USER_ENTERED")
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def fetch_narrative_records_from_sheet() -> tuple[list, str | None]:
+    """Narratives 시트 전체를 읽어 내부 레코드 리스트(시간순 오래된 것 먼저)로 반환."""
+    ws, err = open_narratives_worksheet()
+    if err:
+        return [], err
+    try:
+        vals = ws.get_all_values()
+    except Exception as exc:
+        return [], str(exc)
+    if not vals or len(vals) < 2:
+        return [], None
+    hdr = [str(h).strip() for h in vals[0][:4]]
+    if hdr != _NARRATIVES_SHEET_COLS:
+        ensure_narratives_header_row(ws)
+        vals = ws.get_all_values()
+        if not vals or len(vals) < 2:
+            return [], None
+    records = []
+    for r in vals[1:]:
+        rec = _sheet_row_to_narrative_record(r)
+        if rec and isinstance(rec.get("analysis"), dict):
+            if not str(rec.get("session_label") or "").strip():
+                dtu = _narrative_parse_saved_at_utc(rec.get("saved_at"))
+                rec = dict(rec)
+                rec["session_label"] = narrative_session_label_at_utc(dtu) if dtu else ""
+            records.append(rec)
+    records.sort(
+        key=lambda r: _narrative_parse_saved_at_utc(r.get("saved_at")) or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    return records, None
+
+
+def save_narrative_history_records(records):
+    """레코드 전체를 Narratives 시트에 덮어쓰기(헤더 유지). prune 후 동기화용."""
+    ws, err = open_narratives_worksheet()
+    if err:
+        return
+    try:
+        ensure_narratives_header_row(ws)
+        rows = [_NARRATIVES_SHEET_COLS]
+        for rec in records or []:
+            if isinstance(rec, dict) and isinstance(rec.get("analysis"), dict):
+                rows.append(_narrative_record_to_sheet_row(rec))
+        ws.clear()
+        if rows:
+            rng = f"A1:D{len(rows)}"
+            ws.update(rows, range_name=rng, value_input_option="USER_ENTERED")
+    except Exception:
+        pass
 
 
 def ensure_users_header_row(ws):
@@ -309,9 +473,9 @@ _APP_DIR = Path(__file__).resolve().parent
 _ETF_UNIVERSE_FILE = _APP_DIR / "etf_universe.txt"
 _WATCHLIST_FILE = _APP_DIR / "watchlist.json"
 _PORTFOLIO_FILE = _APP_DIR / "portfolio.csv"
-_NARRATIVE_HISTORY_FILE = _APP_DIR / "narrative_history.json"
 _SAN_ANTONIO_TZ = pytz.timezone("America/Chicago")
 _MARKET_ET_TZ = pytz.timezone("America/New_York")
+_KST_TZ = pytz.timezone("Asia/Seoul")
 _NARRATIVE_HISTORY_MAX_RECORDS = 40
 _NARRATIVE_HISTORY_RETENTION_DAYS = 14
 _DATA_CACHE_TTL = 3600
@@ -1839,34 +2003,16 @@ def prune_narrative_history_records(records):
 
 
 def load_narrative_history_records():
-    """Load persisted narrative snapshots (chronological, oldest first). 로드 시 정리·마이그레이션 반영."""
-    if not _NARRATIVE_HISTORY_FILE.exists():
+    """Narratives 시트에서 스냅샷 로드(시간순 오래된 것 먼저). prune 후 시트와 동기화."""
+    st.session_state.pop("_narratives_last_sheet_error", None)
+    base, err = fetch_narrative_records_from_sheet()
+    if err:
+        st.session_state["_narratives_last_sheet_error"] = err
         return []
-    try:
-        with open(_NARRATIVE_HISTORY_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception:
-        return []
-    if isinstance(raw, list):
-        base = [x for x in raw if isinstance(x, dict) and isinstance(x.get("analysis"), dict)]
-    elif isinstance(raw, dict):
-        records = raw.get("records") or raw.get("items") or []
-        base = [x for x in records if isinstance(x, dict) and isinstance(x.get("analysis"), dict)] if isinstance(records, list) else []
-    else:
-        base = []
     pruned = prune_narrative_history_records(base)
     if pruned != base:
         save_narrative_history_records(pruned)
     return pruned
-
-
-def save_narrative_history_records(records):
-    payload = {"version": 2, "records": records}
-    try:
-        with open(_NARRATIVE_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
 
 
 def append_narrative_history_record(analysis_dict, language: str):
@@ -1874,22 +2020,28 @@ def append_narrative_history_record(analysis_dict, language: str):
         return
     now_utc = datetime.now(timezone.utc)
     session_label = narrative_session_label_at_utc(now_utc)
-    records = load_narrative_history_records()
-    records.append(
-        {
-            "saved_at": now_utc.isoformat(),
-            "session_label": session_label,
-            "language": str(language or "ko"),
-            "analysis": analysis_dict,
-        }
-    )
-    records = prune_narrative_history_records(records)
-    save_narrative_history_records(records)
+    record = {
+        "saved_at": now_utc.isoformat(),
+        "session_label": session_label,
+        "language": str(language or "ko"),
+        "analysis": analysis_dict,
+    }
+    category = str(analysis_dict.get("source") or "market_narrative").strip() or "market_narrative"
+    title = _narrative_sheet_title_for_record(record)
+    date_kst = _narrative_now_kst_string(now_utc)
+    content = json.dumps(record, ensure_ascii=False)
+    ok, err = append_narrative_row_to_sheet([date_kst, category, title, content])
+    if not ok:
+        st.error(f"Google 시트 `Quant_DB` / `Narratives` 저장에 실패했습니다: {err}")
+        return
+    st.session_state.pop("_narratives_cached_records", None)
+    st.session_state.pop("_narratives_cache_time", None)
+    load_narrative_history_records()
 
 
 def append_weekly_trend_narrative_record(briefing_markdown: str, language: str, week_recs: list):
     """
-    1.5 주간 트렌드 Gemini 결과를 narrative_history에 남겨 1.6 스캐너가 동일 파일에서 조회할 수 있게 한다.
+    1.5 주간 트렌드 Gemini 결과를 `Quant_DB` / `Narratives` 시트에 남겨 1.6 스캐너가 동일 기록에서 조회할 수 있게 한다.
     유니버스 = 최근 7일 스냅샷 테마 티커 합집합 + 브리핑 본문에서 파싱한 티커.
     """
     md = str(briefing_markdown or "").strip()
@@ -1920,17 +2072,23 @@ def append_weekly_trend_narrative_record(briefing_markdown: str, language: str, 
         "weekly_briefing_markdown": md,
         "precomputed_universe": filter_scanner_ticker_list(ordered),
     }
-    records = load_narrative_history_records()
-    records.append(
-        {
-            "saved_at": now_utc.isoformat(),
-            "session_label": "📊 주간 트렌드 (최근 7일 교집합)",
-            "language": str(language or "ko"),
-            "analysis": analysis_dict,
-        }
-    )
-    records = prune_narrative_history_records(records)
-    save_narrative_history_records(records)
+    record = {
+        "saved_at": now_utc.isoformat(),
+        "session_label": "📊 주간 트렌드 (최근 7일 교집합)",
+        "language": str(language or "ko"),
+        "analysis": analysis_dict,
+    }
+    category = _NARRATIVE_RECORD_SOURCE_WEEKLY_7D
+    title = _narrative_sheet_title_for_record(record)
+    date_kst = _narrative_now_kst_string(now_utc)
+    content = json.dumps(record, ensure_ascii=False)
+    ok, err = append_narrative_row_to_sheet([date_kst, category, title, content])
+    if not ok:
+        st.error(f"Google 시트 `Quant_DB` / `Narratives` 저장에 실패했습니다: {err}")
+        return
+    st.session_state.pop("_narratives_cached_records", None)
+    st.session_state.pop("_narratives_cache_time", None)
+    load_narrative_history_records()
 
 
 def clear_narrative_history_file_and_session():
@@ -1939,6 +2097,8 @@ def clear_narrative_history_file_and_session():
     st.session_state["narrative_history_disk_records"] = []
     st.session_state["market_narrative_data"] = {}
     st.session_state["current_view"] = {}
+    for k in ("_narratives_cached_records", "_narratives_cache_time", "_narratives_force_sheet_refresh", "_narrative_past_show_n"):
+        st.session_state.pop(k, None)
     if "_narrative_persist_loaded_v2" in st.session_state:
         del st.session_state["_narrative_persist_loaded_v2"]
 
@@ -1985,26 +2145,47 @@ def render_narrative_history_compact(analysis: dict):
 
 
 def hydrate_narrative_from_disk_once():
-    if st.session_state.get("_narrative_persist_loaded_v2"):
-        return
-    records = load_narrative_history_records()
+    """Quant_DB / Narratives 시트에서 기록을 세션으로 불러옵니다. 짧은 간격으로 API를 재호출하지 않도록 캐시합니다."""
+    import time as _time
+
+    now_ts = _time.time()
+    cache_ttl = 45.0
+    last_ts = float(st.session_state.get("_narratives_cache_time") or 0)
+    force = st.session_state.pop("_narratives_force_sheet_refresh", None)
+    if (
+        not force
+        and st.session_state.get("_narratives_cached_records") is not None
+        and (now_ts - last_ts) < cache_ttl
+    ):
+        records = list(st.session_state["_narratives_cached_records"])
+    else:
+        records = load_narrative_history_records()
+        err = st.session_state.pop("_narratives_last_sheet_error", None)
+        if err:
+            st.error(f"내러티브 기록을 Google 시트(`Quant_DB` / `Narratives`)에서 불러오지 못했습니다: {err}")
+            records = []
+        st.session_state["_narratives_cached_records"] = list(records)
+        st.session_state["_narratives_cache_time"] = now_ts
+
     st.session_state["narrative_history_disk_records"] = records
-    st.session_state["narrative_history"] = [r["analysis"] for r in records]
-    cv = st.session_state.get("current_view")
-    last_non_weekly = None
-    for r in reversed(records):
-        if not isinstance(r, dict):
-            continue
-        a = r.get("analysis") if isinstance(r.get("analysis"), dict) else {}
-        if a.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
-            continue
-        last_non_weekly = r
-        break
-    pick = last_non_weekly or (records[-1] if records else None)
-    if (not isinstance(cv, dict) or not cv) and pick:
-        st.session_state["current_view"] = pick.get("analysis", {})
-        st.session_state["current_view_language"] = pick.get("language", "ko")
-    st.session_state["_narrative_persist_loaded_v2"] = True
+    st.session_state["narrative_history"] = [r["analysis"] for r in records if isinstance(r.get("analysis"), dict)]
+
+    if not st.session_state.get("_narrative_persist_loaded_v2"):
+        cv = st.session_state.get("current_view")
+        last_non_weekly = None
+        for r in reversed(records):
+            if not isinstance(r, dict):
+                continue
+            a = r.get("analysis") if isinstance(r.get("analysis"), dict) else {}
+            if a.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+                continue
+            last_non_weekly = r
+            break
+        pick = last_non_weekly or (records[-1] if records else None)
+        if (not isinstance(cv, dict) or not cv) and pick:
+            st.session_state["current_view"] = pick.get("analysis", {})
+            st.session_state["current_view_language"] = pick.get("language", "ko")
+        st.session_state["_narrative_persist_loaded_v2"] = True
 
 
 def fetch_latest_prices_for_tickers(tickers):
@@ -2484,7 +2665,7 @@ def get_latest_narrative_target_universe():
 
 def get_latest_weekly_trend_scan_universe_and_analysis():
     """
-    narrative_history.json에서 가장 최근 `weekly_trend_7d` 레코드를 찾아 유니버스·분석 dict를 반환.
+    `Quant_DB` / `Narratives` 시트에서 가장 최근 `weekly_trend_7d` 레코드를 찾아 유니버스·분석 dict를 반환.
     (레거시: source 없이 weekly_briefing_markdown만 있는 경우도 마크다운에서 티커 추출 시도)
     """
     records = load_narrative_history_records()
@@ -3868,7 +4049,7 @@ def translate_narrative_json(json_data, target_language):
 
 
 def _compact_narrative_record_for_timeseries(rec):
-    """narrative_history.json 한 건을 시계열 LLM 입력용으로 축약."""
+    """`Narratives` 시트에서 읽은 한 건을 시계열 LLM 입력용으로 축약."""
     if not isinstance(rec, dict):
         return None
     a = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
@@ -4302,12 +4483,13 @@ if st.session_state.get("logged_in"):
         nrow_1, nrow_2 = st.columns([1, 3])
         with nrow_1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_narrative", use_container_width=True):
+                st.session_state["_narratives_force_sheet_refresh"] = True
                 tab_sync_refresh(
                     [cached_fetch_global_market_news_pack.clear],
                     rerun_after=True,
                 )
         with nrow_2:
-            st.caption("동기화 시 RSS·뉴스 캐시를 비웁니다. 이후 [AI 내러티브 엔진 가동]에서 최신 뉴스를 불러옵니다.")
+            st.caption("동기화 시 RSS·뉴스 캐시를 비우고, `Narratives` 시트 기록도 다시 불러옵니다.")
     
         header_col_1, header_col_2 = st.columns([3, 1])
         with header_col_1:
@@ -4349,7 +4531,7 @@ if st.session_state.get("logged_in"):
                             st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
                             status.update(label="✅ 분석 완료! (성공)", state="complete", expanded=False)
                             st.success(
-                                f"분석 결과를 저장했으며 `narrative_history.json`에 누적했습니다. "
+                                "분석 결과를 Google 스프레드시트 `Quant_DB`의 **`Narratives`** 탭에 한 행 추가했습니다. "
                                 f"(수집 {raw_news_count}건 / LLM 투입 Top {len(top_news)})"
                             )
                         else:
@@ -4467,7 +4649,7 @@ if st.session_state.get("logged_in"):
     
         st.markdown("### 🕒 시계열 분석 엔진")
         st.caption(
-            "`narrative_history.json`의 `saved_at`(UTC)을 기준으로 구간을 나눈 뒤 Gemini로 브리핑합니다. "
+            "`Quant_DB` → `Narratives` 시트에 저장된 `saved_at`(UTC)을 기준으로 구간을 나눈 뒤 Gemini로 브리핑합니다. "
             "**오늘**은 미국 동부(ET) 달력 기준입니다."
         )
         ts_b1, ts_b2, ts_b3 = st.columns(3)
@@ -4486,7 +4668,7 @@ if st.session_state.get("logged_in"):
                     out.append(c)
             return out
     
-        disk_for_ts = load_narrative_history_records()
+        disk_for_ts = list(st.session_state.get("narrative_history_disk_records") or [])
         anchor_utc = datetime.now(timezone.utc)
     
         if btn_daily:
@@ -4540,7 +4722,7 @@ if st.session_state.get("logged_in"):
                             r["analysis"] for r in st.session_state["narrative_history_disk_records"]
                         ]
                         st.info(
-                            f"주간 트렌드 결과를 `narrative_history.json`에 저장했습니다. "
+                            f"주간 트렌드 결과를 Google 시트 **`Narratives`**에 저장했습니다. "
                             f"「{_MAIN_NAV_OPTIONS[3]}」의 「주간 메가 트렌드」 소스에서 사용할 수 있습니다."
                         )
     
@@ -4585,14 +4767,14 @@ if st.session_state.get("logged_in"):
                 st.subheader("📊 내러티브 팩트 체크 (실제 수익률)")
                 render_narrative_factcheck_table(fc_df, kind=fc_kind)
     
-        st.markdown("### 📚 과거 분석 기록 (저장 파일 기준)")
+        st.markdown("### 📚 과거 분석 기록 (`Quant_DB` / `Narratives`)")
         st.caption(
-            f"최대 **{_NARRATIVE_HISTORY_MAX_RECORDS}**건 · 최근 **{_NARRATIVE_HISTORY_RETENTION_DAYS}**일 이내만 유지합니다 "
-            "(하루 4회 루틴에 맞춘 세션 라벨이 자동 저장됩니다)."
+            f"Google 시트에서 최신순으로 불러옵니다. 기본 **10**건만 펼치며, "
+            f"최대 **{_NARRATIVE_HISTORY_MAX_RECORDS}**건 · 최근 **{_NARRATIVE_HISTORY_RETENTION_DAYS}**일 이내만 유지합니다."
         )
         disk_recs = st.session_state.get("narrative_history_disk_records") or []
         if not disk_recs:
-            st.caption("`narrative_history.json`에 아직 저장된 스냅샷이 없습니다.")
+            st.caption("`Narratives` 시트에 아직 저장된 스냅샷이 없습니다.")
         else:
             sorted_disk = sorted(
                 disk_recs,
@@ -4600,7 +4782,20 @@ if st.session_state.get("logged_in"):
                 or datetime.min.replace(tzinfo=timezone.utc),
                 reverse=True,
             )
-            for rec in sorted_disk:
+            n_default = min(10, len(sorted_disk))
+            n_show = int(st.session_state.get("_narrative_past_show_n", n_default))
+            n_show = min(max(n_show, 1), len(sorted_disk))
+            st.session_state["_narrative_past_show_n"] = n_show
+            b_more, b_reset = st.columns(2)
+            with b_more:
+                if st.button("과거 기록 더 보기 (+10)", key="narrative_past_more_btn", disabled=n_show >= len(sorted_disk)):
+                    st.session_state["_narrative_past_show_n"] = min(n_show + 10, len(sorted_disk))
+            with b_reset:
+                cap10 = min(10, len(sorted_disk))
+                if st.button("최근 10건으로", key="narrative_past_reset_btn", disabled=n_show <= cap10):
+                    st.session_state["_narrative_past_show_n"] = cap10
+            st.caption(f"표시 중: **{n_show}** / {len(sorted_disk)}건 (최신순)")
+            for rec in sorted_disk[:n_show]:
                 exp_title = narrative_history_expander_title(rec)
                 with st.expander(exp_title, expanded=False):
                     ts_raw = rec.get("saved_at", "") or ""
@@ -4699,12 +4894,12 @@ if st.session_state.get("logged_in"):
                 )
             elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
                 st.caption(
-                    "`narrative_history.json`에서 **가장 최근 일반 내러티브**(주간 트렌드 전용 저장분 제외)의 Themes·winners·expected_tickers로 유니버스를 구성합니다."
+                    "`Quant_DB` / `Narratives`에서 **가장 최근 일반 내러티브**(주간 트렌드 전용 저장분 제외)의 Themes·winners·expected_tickers로 유니버스를 구성합니다."
                 )
             else:
                 st.caption(
-                    "`narrative_history.json`에서 **가장 최근 주간 트렌드(최근 7일)** 저장분의 티커 풀·브리핑을 사용합니다. "
-                    f"「{_MAIN_NAV_OPTIONS[1]}」 메뉴에서 「📊 주간 트렌드 추출」 실행 시 파일에 자동 저장됩니다."
+                    "`Quant_DB` / `Narratives`에서 **가장 최근 주간 트렌드(최근 7일)** 저장분의 티커 풀·브리핑을 사용합니다. "
+                    f"「{_MAIN_NAV_OPTIONS[1]}」 메뉴에서 「📊 주간 트렌드 추출」 실행 시 `Narratives` 시트에 자동 저장됩니다."
                 )
     
             run_scanner = st.button(
