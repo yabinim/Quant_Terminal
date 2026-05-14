@@ -42,6 +42,8 @@ if "login_feedback" not in st.session_state:
     st.session_state["login_feedback"] = ""
 if "login_user_id" not in st.session_state:
     st.session_state["login_user_id"] = ""
+if "user_id" not in st.session_state:
+    st.session_state["user_id"] = ""
 
 if "_yf_cloud_limit_warn_shown" not in st.session_state:
     st.session_state["_yf_cloud_limit_warn_shown"] = False
@@ -59,7 +61,9 @@ _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
 _USER_SHEET_COLS = ["ID", "Password", "Reason", "Source", "Status"]
 _NARRATIVES_WORKSHEET_TITLE = "Narratives"
-_NARRATIVES_SHEET_COLS = ["Date", "Category", "Title", "Content"]
+_NARRATIVES_SHEET_COLS = ["ID", "Date", "Category", "Title", "Content", "Tickers"]
+_PORTFOLIOS_WORKSHEET_TITLE = "Portfolios"
+_PORTFOLIOS_SHEET_COLS = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 
 
@@ -104,7 +108,7 @@ def open_narratives_worksheet():
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
                 sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET_TITLE, rows=3000, cols=4)
+                ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET_TITLE, rows=3000, cols=6)
                 ensure_narratives_header_row(ws)
                 return ws, None
             except Exception as exc2:
@@ -112,14 +116,65 @@ def open_narratives_worksheet():
         return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_NARRATIVES_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
 
 
+def open_portfolios_worksheet():
+    """Quant_DB 스프레드시트의 Portfolios 탭. (worksheet | None, err_msg | None)"""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_PORTFOLIOS_WORKSHEET_TITLE)
+        return ws, None
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
+            try:
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                ws = sh.add_worksheet(title=_PORTFOLIOS_WORKSHEET_TITLE, rows=3000, cols=5)
+                ensure_portfolios_header_row(ws)
+                return ws, None
+            except Exception as exc2:
+                return None, f"`{_PORTFOLIOS_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
+        return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_PORTFOLIOS_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
+
+
+def ensure_portfolios_header_row(ws):
+    vals = ws.get_all_values()
+    if not vals or not any(str(c).strip() for c in vals[0]):
+        ws.update([_PORTFOLIOS_SHEET_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
+        return
+    hdr = [str(h).strip() for h in vals[0][:5]]
+    if hdr != _PORTFOLIOS_SHEET_COLS:
+        ws.update([_PORTFOLIOS_SHEET_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
+
+
 def ensure_narratives_header_row(ws):
     vals = ws.get_all_values()
     if not vals or not any(str(c).strip() for c in vals[0]):
-        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:D1", value_input_option="USER_ENTERED")
+        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
         return
-    hdr = [str(h).strip() for h in vals[0][:4]]
+    hdr = [str(h).strip() for h in vals[0][:6]]
     if hdr != _NARRATIVES_SHEET_COLS:
-        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:D1", value_input_option="USER_ENTERED")
+        ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
+
+
+def _looks_kst_timestamp(s: str) -> bool:
+    s = str(s or "").strip()
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:", s))
+
+
+def _normalize_narrative_sheet_row(row: list) -> list:
+    """레거시 4열(Date..Content) 또는 6열(ID..Tickers) 행을 6열로 맞춘다."""
+    row = list(row or [])
+    if len(row) >= 6:
+        return (row[:6] + [""] * 6)[:6]
+    s0 = str(row[0]).strip() if row else ""
+    if len(row) >= 4 and _looks_kst_timestamp(s0):
+        c = str(row[3]).strip() if len(row) > 3 else ""
+        if c.startswith("{") or c.startswith("["):
+            ex = str(row[4]).strip() if len(row) > 4 else ""
+            return ["", row[0], row[1], row[2], row[3], ex]
+    return (row + [""] * 6)[:6]
 
 
 def _narrative_now_kst_string(dt_utc=None) -> str:
@@ -150,25 +205,37 @@ def _narrative_sheet_title_for_record(rec: dict) -> str:
     return base if base and base != "N/A" else "시장 내러티브 스냅샷"
 
 
-def _narrative_record_to_sheet_row(rec: dict) -> list:
-    """내부 레코드 dict → Narratives 시트 한 행 [Date, Category, Title, Content]."""
-    analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
-    dt_utc = _narrative_parse_saved_at_utc(rec.get("saved_at"))
+def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
+    """내부 레코드 dict → Narratives 시트 한 행 [ID, Date, Category, Title, Content, Tickers]."""
+    rec_out = {k: v for k, v in rec.items() if not str(k).startswith("_sheet")}
+    analysis = rec_out.get("analysis") if isinstance(rec_out.get("analysis"), dict) else {}
+    dt_utc = _narrative_parse_saved_at_utc(rec_out.get("saved_at"))
     if dt_utc is None:
         dt_utc = datetime.now(timezone.utc)
     date_kst = _narrative_now_kst_string(dt_utc)
     category = str(analysis.get("source") or "market_narrative").strip() or "market_narrative"
-    title = _narrative_sheet_title_for_record(rec)
+    title = _narrative_sheet_title_for_record(rec_out)
     if len(title) > 500:
         title = title[:497] + "..."
-    content = json.dumps(rec, ensure_ascii=False)
-    return [date_kst, category, title, content]
+    content = json.dumps(rec_out, ensure_ascii=False)
+    tk_csv = ""
+    try:
+        tk_csv = ",".join(universe_tickers_from_theme_analysis(analysis))
+    except Exception:
+        tk_csv = ""
+    if (not tk_csv.strip()) and str(analysis.get("source") or "") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+        pre = analysis.get("precomputed_universe")
+        if isinstance(pre, list):
+            try:
+                tk_csv = ",".join(filter_scanner_ticker_list([str(x).strip().upper() for x in pre if str(x).strip()]))
+            except Exception:
+                tk_csv = ""
+    return [str(owner_id).strip(), date_kst, category, title, content, tk_csv]
 
 
 def _sheet_row_to_narrative_record(row: list) -> dict | None:
     """시트 데이터 행 → 내부 레코드 dict."""
-    row = (row or []) + [""] * 4
-    date_kst, category, title, content = row[0], row[1], row[2], row[3]
+    rid, date_kst, category, title, content, tickers_csv = _normalize_narrative_sheet_row(row)
     content = str(content or "").strip()
     if not content:
         return None
@@ -184,18 +251,40 @@ def _sheet_row_to_narrative_record(row: list) -> dict | None:
             if iso_guess:
                 envelope = dict(envelope)
                 envelope["saved_at"] = iso_guess
+        envelope = dict(envelope)
+        envelope["_sheet_user_id"] = str(rid).strip()
+        envelope["_sheet_tickers_csv"] = str(tickers_csv or "").strip()
         return envelope
     return None
 
 
+@st.cache_data(ttl=60)
+def _narratives_sheet_all_values_cached():
+    try:
+        ws, err = open_narratives_worksheet()
+        if err or ws is None:
+            return None, err
+        return (ws.get_all_values(), None)
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _invalidate_narratives_sheet_cache():
+    try:
+        _narratives_sheet_all_values_cached.clear()
+    except Exception:
+        pass
+
+
 def append_narrative_row_to_sheet(row_values: list) -> tuple[bool, str]:
-    """Narratives 시트에 한 행 append. row_values = [Date, Category, Title, Content]."""
+    """Narratives 시트에 한 행 append. row_values = [ID, Date, Category, Title, Content, Tickers]."""
     ws, err = open_narratives_worksheet()
     if err:
         return False, err
     try:
         ensure_narratives_header_row(ws)
-        ws.append_row(list(row_values)[:4], value_input_option="USER_ENTERED")
+        ws.append_row(list(row_values)[:6], value_input_option="USER_ENTERED")
+        _invalidate_narratives_sheet_cache()
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -203,21 +292,24 @@ def append_narrative_row_to_sheet(row_values: list) -> tuple[bool, str]:
 
 def fetch_narrative_records_from_sheet() -> tuple[list, str | None]:
     """Narratives 시트 전체를 읽어 내부 레코드 리스트(시간순 오래된 것 먼저)로 반환."""
-    ws, err = open_narratives_worksheet()
+    vals, err = _narratives_sheet_all_values_cached()
     if err:
         return [], err
-    try:
-        vals = ws.get_all_values()
-    except Exception as exc:
-        return [], str(exc)
     if not vals or len(vals) < 2:
         return [], None
-    hdr = [str(h).strip() for h in vals[0][:4]]
+    hdr = [str(h).strip() for h in vals[0][:6]]
     if hdr != _NARRATIVES_SHEET_COLS:
-        ensure_narratives_header_row(ws)
-        vals = ws.get_all_values()
-        if not vals or len(vals) < 2:
-            return [], None
+        try:
+            ws2, err2 = open_narratives_worksheet()
+            if err2:
+                return [], err2
+            ensure_narratives_header_row(ws2)
+            _invalidate_narratives_sheet_cache()
+            vals, err = _narratives_sheet_all_values_cached()
+        except Exception as exc:
+            return [], str(exc)
+        if err or not vals or len(vals) < 2:
+            return [], err
     records = []
     for r in vals[1:]:
         rec = _sheet_row_to_narrative_record(r)
@@ -233,23 +325,51 @@ def fetch_narrative_records_from_sheet() -> tuple[list, str | None]:
     return records, None
 
 
-def save_narrative_history_records(records):
-    """레코드 전체를 Narratives 시트에 덮어쓰기(헤더 유지). prune 후 동기화용."""
+def save_narrative_history_records_merge_user(owner_id: str, records: list) -> tuple[bool, str]:
+    """현재 사용자(owner_id) 행만 교체하고 나머지 사용자 행은 유지한다."""
+    owner_id = str(owner_id or "").strip()
+    if not owner_id:
+        return False, "user_id 가 비어 있습니다."
     ws, err = open_narratives_worksheet()
     if err:
-        return
+        return False, err
     try:
+        _invalidate_narratives_sheet_cache()
         ensure_narratives_header_row(ws)
-        rows = [_NARRATIVES_SHEET_COLS]
+        vals = ws.get_all_values() or []
+        header = _NARRATIVES_SHEET_COLS
+        body = []
+        oid_u = owner_id.upper()
+        for r in vals[1:]:
+            cells = _normalize_narrative_sheet_row(r)
+            rid = str(cells[0]).strip().upper()
+            if rid == oid_u:
+                continue
+            body.append(cells)
+        rows = [header]
+        rows.extend(body)
         for rec in records or []:
             if isinstance(rec, dict) and isinstance(rec.get("analysis"), dict):
-                rows.append(_narrative_record_to_sheet_row(rec))
+                rows.append(_narrative_record_to_sheet_row(rec, owner_id))
         ws.clear()
-        if rows:
-            rng = f"A1:D{len(rows)}"
-            ws.update(rows, range_name=rng, value_input_option="USER_ENTERED")
-    except Exception:
-        pass
+        ws.update(rows, range_name=f"A1:F{len(rows)}", value_input_option="USER_ENTERED")
+        _invalidate_narratives_sheet_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def save_narrative_history_records(records):
+    """현재 세션 user_id 기준으로 Narratives 시트를 머지 저장(prune 후 동기화용)."""
+    uid = str(st.session_state.get("user_id") or "").strip()
+    if not uid:
+        return
+    ok, err = save_narrative_history_records_merge_user(uid, records or [])
+    if not ok and err:
+        try:
+            st.error(f"내러티브 시트 동기화 실패: {err}")
+        except Exception:
+            pass
 
 
 def ensure_users_header_row(ws):
@@ -324,6 +444,7 @@ def try_sheet_login():
     """로그인 탭 버튼 on_click: 시트 검증 또는 admin_pw 백도어."""
     st.session_state["login_feedback"] = ""
     st.session_state["login_error"] = False
+    st.session_state["user_id"] = ""
     uid = str(st.session_state.get("login_id_input", "") or "").strip()
     pw = str(st.session_state.get("login_pw_input", "") or "").strip()
     if not uid or not pw:
@@ -338,6 +459,7 @@ def try_sheet_login():
         st.session_state["logged_in"] = True
         st.session_state["user_role"] = "admin"
         st.session_state["login_user_id"] = uid
+        st.session_state["user_id"] = uid
         st.session_state["login_error"] = False
         st.session_state["login_feedback"] = ""
         return
@@ -372,7 +494,9 @@ def try_sheet_login():
         if str(row.get("Password", "")) == pw:
             st.session_state["logged_in"] = True
             st.session_state["user_role"] = "guest"
-            st.session_state["login_user_id"] = str(row.get("ID", "")).strip()
+            lid = str(row.get("ID", "")).strip()
+            st.session_state["login_user_id"] = lid
+            st.session_state["user_id"] = lid
             st.session_state["login_error"] = False
             st.session_state["login_feedback"] = ""
         else:
@@ -1603,65 +1727,159 @@ def one_month_total_return_pct(close_series):
     return (float(clean.iloc[-1]) / float(clean.iloc[0]) - 1.0) * 100.0
 
 
+@st.cache_data(ttl=60)
+def _portfolio_sheet_all_values_cached():
+    try:
+        ws, err = open_portfolios_worksheet()
+        if err or ws is None:
+            return None, err
+        return (ws.get_all_values(), None)
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _invalidate_portfolio_sheet_cache():
+    try:
+        _portfolio_sheet_all_values_cached.clear()
+    except Exception:
+        pass
+
+
+def delete_portfolio_sheet_row(user_id: str, ticker: str) -> tuple[bool, str]:
+    """Portfolios 시트에서 ID·Ticker가 일치하는 행을 삭제한다."""
+    uid = str(user_id or "").strip()
+    tku = str(ticker or "").strip().upper()
+    if not uid or not tku:
+        return False, "ID 또는 티커가 비어 있습니다."
+    ws, err = open_portfolios_worksheet()
+    if err:
+        return False, err
+    try:
+        _invalidate_portfolio_sheet_cache()
+        vals = ws.get_all_values() or []
+        for i, r in enumerate(vals[1:], start=2):
+            r = (r or []) + [""] * 5
+            if str(r[0]).strip().upper() == uid.upper() and str(r[1]).strip().upper() == tku:
+                ws.delete_rows(i)
+                _invalidate_portfolio_sheet_cache()
+                return True, ""
+        return False, "시트에서 해당 행을 찾을 수 없습니다."
+    except Exception as exc:
+        return False, str(exc)
+
+
+def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[bool, str]:
+    """해당 user_id 행만 시트에서 교체하고 다른 사용자 행은 유지한다."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False, "user_id 가 비어 있습니다."
+    ws, err = open_portfolios_worksheet()
+    if err:
+        return False, err
+    try:
+        _invalidate_portfolio_sheet_cache()
+        ensure_portfolios_header_row(ws)
+        vals = ws.get_all_values() or []
+        header = _PORTFOLIOS_SHEET_COLS
+        others = []
+        uid_u = uid.upper()
+        for r in vals[1:]:
+            r = (r or []) + [""] * 5
+            if str(r[0]).strip().upper() == uid_u:
+                continue
+            others.append([str(r[0]), str(r[1]), r[2], r[3], str(r[4]) if len(r) > 4 else ""])
+        rows = [header] + others
+        now_s = _narrative_now_kst_string()
+        for _, row in df.iterrows():
+            tk = str(row.get("Ticker", "")).strip().upper()
+            if not tk:
+                continue
+            pp = pd.to_numeric(row.get("Purchase_Price"), errors="coerce")
+            qq = pd.to_numeric(row.get("Quantity"), errors="coerce")
+            if pd.isna(pp) or pd.isna(qq):
+                continue
+            rows.append([uid, tk, float(pp), float(qq), now_s])
+        ws.clear()
+        ws.update(rows, range_name=f"A1:E{len(rows)}", value_input_option="USER_ENTERED")
+        _invalidate_portfolio_sheet_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def load_portfolio():
     base_columns = ["Account", "Ticker", "Purchase_Price", "Quantity"]
-    if not _PORTFOLIO_FILE.exists():
-        empty_df = pd.DataFrame(columns=base_columns)
+    uid = str(st.session_state.get("user_id") or "").strip()
+    if not uid:
+        return pd.DataFrame(columns=base_columns)
+    st.session_state.pop("_portfolio_last_sheet_error", None)
+    vals, err = _portfolio_sheet_all_values_cached()
+    if err:
+        st.session_state["_portfolio_last_sheet_error"] = err
+        return pd.DataFrame(columns=base_columns)
+    if not vals or len(vals) < 2:
+        return pd.DataFrame(columns=base_columns)
+    hdr = [str(h).strip() for h in vals[0][:5]]
+    if hdr != _PORTFOLIOS_SHEET_COLS:
         try:
-            empty_df.to_csv(_PORTFOLIO_FILE, index=False, encoding="utf-8-sig")
+            ws2, err2 = open_portfolios_worksheet()
+            if not err2 and ws2:
+                ensure_portfolios_header_row(ws2)
+                _invalidate_portfolio_sheet_cache()
+                vals, err = _portfolio_sheet_all_values_cached()
         except Exception:
             pass
-        return empty_df
-
-    try:
-        df = pd.read_csv(_PORTFOLIO_FILE, encoding="utf-8-sig")
-    except Exception:
-        df = pd.DataFrame(columns=base_columns)
-
-    # Backward compatibility for old schema names.
-    if "Purchase Price" in df.columns and "Purchase_Price" not in df.columns:
-        df["Purchase_Price"] = df["Purchase Price"]
-    if "purchase_price" in df.columns and "Purchase_Price" not in df.columns:
-        df["Purchase_Price"] = df["purchase_price"]
-    if "account" in df.columns and "Account" not in df.columns:
-        df["Account"] = df["account"]
-    if "ticker" in df.columns and "Ticker" not in df.columns:
-        df["Ticker"] = df["ticker"]
-    if "quantity" in df.columns and "Quantity" not in df.columns:
-        df["Quantity"] = df["quantity"]
-
-    for col in base_columns:
-        if col not in df.columns:
-            df[col] = np.nan
-    df = df[base_columns].copy()
-    df["Account"] = df["Account"].fillna("Default Account").astype(str).str.strip()
-    df.loc[df["Account"] == "", "Account"] = "Default Account"
-    df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
-    df["Purchase_Price"] = pd.to_numeric(df["Purchase_Price"], errors="coerce")
-    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+        if err or not vals or len(vals) < 2:
+            return pd.DataFrame(columns=base_columns)
+    rows = []
+    uid_u = uid.upper()
+    for r in vals[1:]:
+        r = (r or []) + [""] * 5
+        if str(r[0]).strip().upper() != uid_u:
+            continue
+        tk = str(r[1]).strip().upper()
+        if not tk:
+            continue
+        rows.append(
+            {
+                "Account": uid,
+                "Ticker": tk,
+                "Purchase_Price": pd.to_numeric(r[2], errors="coerce"),
+                "Quantity": pd.to_numeric(r[3], errors="coerce"),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=base_columns)
     df["Quantity"] = df["Quantity"].fillna(1.0)
-    df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN") & df["Account"].ne("NAN")]
-    df = df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
-    save_portfolio(df)
-    return df
+    df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN")]
+    df = df.drop_duplicates(subset=["Ticker"], keep="last").reset_index(drop=True)
+    return df[base_columns].copy()
 
 
 def save_portfolio(df):
+    uid = str(st.session_state.get("user_id") or "").strip()
+    if not uid:
+        return
     base_columns = ["Account", "Ticker", "Purchase_Price", "Quantity"]
     safe_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=base_columns)
     for col in base_columns:
         if col not in safe_df.columns:
             safe_df[col] = np.nan
     safe_df = safe_df[base_columns].copy()
-    safe_df["Account"] = safe_df["Account"].fillna("Default Account").astype(str).str.strip()
-    safe_df.loc[safe_df["Account"] == "", "Account"] = "Default Account"
+    safe_df["Account"] = uid
     safe_df["Ticker"] = safe_df["Ticker"].astype(str).str.strip().str.upper()
     safe_df["Purchase_Price"] = pd.to_numeric(safe_df["Purchase_Price"], errors="coerce")
     safe_df["Quantity"] = pd.to_numeric(safe_df["Quantity"], errors="coerce")
     safe_df["Quantity"] = safe_df["Quantity"].fillna(1.0)
-    safe_df = safe_df[safe_df["Ticker"].ne("") & safe_df["Ticker"].ne("NAN") & safe_df["Account"].ne("NAN")]
-    safe_df = safe_df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
-    safe_df.to_csv(_PORTFOLIO_FILE, index=False, encoding="utf-8-sig")
+    safe_df = safe_df[safe_df["Ticker"].ne("") & safe_df["Ticker"].ne("NAN")]
+    safe_df = safe_df.drop_duplicates(subset=["Ticker"], keep="last").reset_index(drop=True)
+    ok, msg = replace_user_portfolio_sheet_rows(uid, safe_df)
+    if not ok:
+        try:
+            st.error(f"Portfolios 시트 저장 실패: {msg}")
+        except Exception:
+            pass
 
 
 def _validate_positive_portfolio_number(label_kr, value):
@@ -2003,20 +2221,40 @@ def prune_narrative_history_records(records):
 
 
 def load_narrative_history_records():
-    """Narratives 시트에서 스냅샷 로드(시간순 오래된 것 먼저). prune 후 시트와 동기화."""
+    """Narratives 시트에서 현재 user_id 행만 로드. prune 후 해당 사용자 구간만 시트와 동기화."""
     st.session_state.pop("_narratives_last_sheet_error", None)
     base, err = fetch_narrative_records_from_sheet()
     if err:
         st.session_state["_narratives_last_sheet_error"] = err
         return []
-    pruned = prune_narrative_history_records(base)
-    if pruned != base:
-        save_narrative_history_records(pruned)
+    uid = str(st.session_state.get("user_id") or "").strip()
+    uid_u = uid.upper()
+    mine = []
+    for rec in base:
+        if not isinstance(rec, dict):
+            continue
+        rid = str(rec.get("_sheet_user_id") or "").strip().upper()
+        if uid_u and rid == uid_u:
+            mine.append(rec)
+    if not uid_u:
+        return []
+    pruned = prune_narrative_history_records(mine)
+    if pruned != mine:
+        ok, merr = save_narrative_history_records_merge_user(uid, pruned)
+        if not ok and merr:
+            try:
+                st.warning(merr)
+            except Exception:
+                pass
     return pruned
 
 
 def append_narrative_history_record(analysis_dict, language: str):
     if not isinstance(analysis_dict, dict) or not analysis_dict:
+        return
+    uid = str(st.session_state.get("user_id") or "").strip()
+    if not uid:
+        st.error("로그인 user_id 가 없습니다. 다시 로그인해 주세요.")
         return
     now_utc = datetime.now(timezone.utc)
     session_label = narrative_session_label_at_utc(now_utc)
@@ -2026,11 +2264,7 @@ def append_narrative_history_record(analysis_dict, language: str):
         "language": str(language or "ko"),
         "analysis": analysis_dict,
     }
-    category = str(analysis_dict.get("source") or "market_narrative").strip() or "market_narrative"
-    title = _narrative_sheet_title_for_record(record)
-    date_kst = _narrative_now_kst_string(now_utc)
-    content = json.dumps(record, ensure_ascii=False)
-    ok, err = append_narrative_row_to_sheet([date_kst, category, title, content])
+    ok, err = append_narrative_row_to_sheet(_narrative_record_to_sheet_row(record, uid))
     if not ok:
         st.error(f"Google 시트 `Quant_DB` / `Narratives` 저장에 실패했습니다: {err}")
         return
@@ -2078,11 +2312,11 @@ def append_weekly_trend_narrative_record(briefing_markdown: str, language: str, 
         "language": str(language or "ko"),
         "analysis": analysis_dict,
     }
-    category = _NARRATIVE_RECORD_SOURCE_WEEKLY_7D
-    title = _narrative_sheet_title_for_record(record)
-    date_kst = _narrative_now_kst_string(now_utc)
-    content = json.dumps(record, ensure_ascii=False)
-    ok, err = append_narrative_row_to_sheet([date_kst, category, title, content])
+    uid = str(st.session_state.get("user_id") or "").strip()
+    if not uid:
+        st.error("로그인 user_id 가 없습니다. 다시 로그인해 주세요.")
+        return
+    ok, err = append_narrative_row_to_sheet(_narrative_record_to_sheet_row(record, uid))
     if not ok:
         st.error(f"Google 시트 `Quant_DB` / `Narratives` 저장에 실패했습니다: {err}")
         return
@@ -2631,7 +2865,8 @@ def universe_tickers_from_theme_analysis(analysis):
 
 def get_latest_narrative_target_universe():
     """
-    가장 최근 저장된 *일반* 내러티브(주간 트렌드 전용 레코드 제외)에서 테마 기반 유니버스를 구성한다.
+    가장 최근 저장된 *일반* 내러티브(주간 트렌드 전용 레코드 제외)에서 유니버스를 구성한다.
+    Google 시트 `Tickers` 열이 있으면 우선 사용하고, 없으면 themes(Winners/Expanding) JSON에서 추출한다.
     """
     records = load_narrative_history_records()
     if not records:
@@ -2648,6 +2883,14 @@ def get_latest_narrative_target_universe():
             continue
         if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
             continue
+        csv = str(rec.get("_sheet_tickers_csv") or "").strip()
+        if csv:
+            try:
+                parsed = filter_scanner_ticker_list([t.strip().upper() for t in csv.split(",") if str(t).strip()])
+            except Exception:
+                parsed = []
+            if parsed:
+                return parsed, analysis
         u = universe_tickers_from_theme_analysis(analysis)
         if u:
             return u, analysis
@@ -2683,6 +2926,15 @@ def get_latest_weekly_trend_scan_universe_and_analysis():
             continue
         if analysis.get("source") != _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
             continue
+
+        csv = str(rec.get("_sheet_tickers_csv") or "").strip()
+        if csv:
+            try:
+                parsed = filter_scanner_ticker_list([t.strip().upper() for t in csv.split(",") if str(t).strip()])
+            except Exception:
+                parsed = []
+            if parsed:
+                return parsed, analysis
 
         ordered = []
         seen = set()
@@ -4384,6 +4636,7 @@ if st.session_state.get("logged_in"):
         st.session_state["login_error"] = False
         st.session_state["login_feedback"] = ""
         st.session_state["login_user_id"] = ""
+        st.session_state["user_id"] = ""
         st.rerun()
     
     quote_type, selected_ticker_obj, selected_ticker_info = detect_quote_type(selected_ticker)
@@ -4485,7 +4738,10 @@ if st.session_state.get("logged_in"):
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_narrative", use_container_width=True):
                 st.session_state["_narratives_force_sheet_refresh"] = True
                 tab_sync_refresh(
-                    [cached_fetch_global_market_news_pack.clear],
+                    [
+                        cached_fetch_global_market_news_pack.clear,
+                        _narratives_sheet_all_values_cached.clear,
+                    ],
                     rerun_after=True,
                 )
         with nrow_2:
@@ -5533,6 +5789,7 @@ if st.session_state.get("logged_in"):
                         cached_portfolio_yf_close_1y.clear,
                         cached_etf_universe_rankings_full.clear,
                         cached_yfinance_quote_type.clear,
+                        _portfolio_sheet_all_values_cached.clear,
                     ],
                     rerun_after=True,
                 )
@@ -5542,9 +5799,14 @@ if st.session_state.get("logged_in"):
             )
     
         st.subheader(_MAIN_NAV_OPTIONS[5])
-        st.caption("다중 계좌 기반 포트폴리오 관리 + 듀얼 모멘텀 매도 레이더 + 심층 손익 분석")
-    
+        st.caption(
+            "Google 시트 `Quant_DB` / **Portfolios**에 로그인 ID별로 종목이 저장됩니다. "
+            "다중 계좌 UI는 유지되나 시트에는 사용자당 티커당 한 행(ID + Ticker)으로 동기화됩니다."
+        )
+
         portfolio_df = load_portfolio()
+        if st.session_state.get("_portfolio_last_sheet_error"):
+            st.warning(f"Portfolios 시트: {st.session_state['_portfolio_last_sheet_error']}")
     
         st.markdown("### 계좌 필터")
         account_list = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist()) if not portfolio_df.empty else []
@@ -5559,38 +5821,13 @@ if st.session_state.get("logged_in"):
         if selected_accounts:
             filtered_portfolio_df = filtered_portfolio_df[filtered_portfolio_df["Account"].isin(selected_accounts)].copy()
     
-        st.markdown("### 기존 계좌 이름 변경")
-        rename_col1, rename_col2, rename_col3 = st.columns([1.4, 1.4, 1.0])
-        with rename_col1:
-            rename_account_options = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist()) if not portfolio_df.empty else []
-            rename_from_account = st.selectbox(
-                "기존 계좌 선택",
-                options=rename_account_options if rename_account_options else ["(등록된 계좌 없음)"],
-                index=0,
-                key="portfolio_rename_from_account",
-            )
-        with rename_col2:
-            rename_to_account = st.text_input(
-                "새 계좌 이름 입력",
-                value="",
-                placeholder="예: Fidelity Roth IRA",
-                key="portfolio_rename_to_account",
-            ).strip()
-        with rename_col3:
-            st.write("")
-            st.write("")
-            if st.button("이름 변경 적용", use_container_width=True):
-                if portfolio_df.empty or rename_from_account == "(등록된 계좌 없음)":
-                    st.info("변경할 계좌가 없습니다.")
-                elif not rename_to_account:
-                    st.warning("새 계좌 이름을 입력해주세요.")
-                else:
-                    updated_df = portfolio_df.copy()
-                    updated_df.loc[updated_df["Account"] == rename_from_account, "Account"] = rename_to_account
-                    save_portfolio(updated_df)
-                    st.success(f"{rename_from_account} 계좌명을 {rename_to_account}(으)로 변경했습니다.")
-                    st.rerun()
-    
+        st.markdown("### 저장 방식 안내")
+        st.caption(
+            "종목·평단가·수량은 **Portfolios** 탭에 `[ID, Ticker, AvgPrice, Quantity, Date_Added]` 로 저장됩니다. "
+            "아래 **계좌** 필드는 화면 필터용이며, 시트의 ID 열은 항상 현재 로그인 `user_id` 와 같습니다. "
+            "계좌명 변경은 시트 스키마에 없어 지원하지 않습니다."
+        )
+
         st.markdown("### 포트폴리오 관리")
     
         with st.expander("종목 추가", expanded=True):
@@ -5637,13 +5874,9 @@ if st.session_state.get("logged_in"):
                 )
                 submitted_add = st.form_submit_button("포트폴리오에 추가", use_container_width=True, type="primary")
                 if submitted_add:
-                    account_name = (
-                        (custom_account_input or "").strip()
-                        if selected_account_option == "직접 입력"
-                        else selected_account_option
-                    )
-                    if not account_name:
-                        st.warning("계좌명을 선택하거나 직접 입력해주세요.")
+                    puid = str(st.session_state.get("user_id") or "").strip()
+                    if not puid:
+                        st.error("로그인 user_id 가 없습니다. 다시 로그인해 주세요.")
                     elif not new_ticker:
                         st.warning("티커를 입력해주세요.")
                     else:
@@ -5655,7 +5888,7 @@ if st.session_state.get("logged_in"):
                             st.error(err_q)
                         else:
                             updated_df = portfolio_df.copy()
-                            mask = (updated_df["Account"] == account_name) & (updated_df["Ticker"] == new_ticker)
+                            mask = updated_df["Ticker"] == new_ticker
                             if mask.any():
                                 idx = updated_df.index[mask][0]
                                 old_qty = float(updated_df.loc[idx, "Quantity"])
@@ -5671,9 +5904,10 @@ if st.session_state.get("logged_in"):
                                     new_avg = ((old_price * old_qty) + (price_v * qty_v)) / new_qty_total
                                     updated_df.loc[idx, "Quantity"] = new_qty_total
                                     updated_df.loc[idx, "Purchase_Price"] = new_avg
+                                    updated_df.loc[idx, "Account"] = puid
                                     save_portfolio(updated_df)
                                     st.success(
-                                        f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
+                                        f"{new_ticker}: 추가 매수를 반영했습니다. "
                                         f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
                                     )
                                     st.rerun()
@@ -5684,7 +5918,7 @@ if st.session_state.get("logged_in"):
                                         pd.DataFrame(
                                             [
                                                 {
-                                                    "Account": account_name,
+                                                    "Account": puid,
                                                     "Ticker": new_ticker,
                                                     "Purchase_Price": price_v,
                                                     "Quantity": qty_v,
@@ -5695,7 +5929,7 @@ if st.session_state.get("logged_in"):
                                     ignore_index=True,
                                 )
                                 save_portfolio(updated_df)
-                                st.success(f"{account_name} 계좌에 {new_ticker} 종목을 새로 추가했습니다.")
+                                st.success(f"{new_ticker} 종목을 포트폴리오에 추가했습니다.")
                                 st.rerun()
     
         with st.expander("데이터 수정하기", expanded=False):
@@ -5805,14 +6039,12 @@ if st.session_state.get("logged_in"):
                 elif delete_target == "(등록된 티커 없음)":
                     st.info("삭제할 종목이 없습니다.")
                 else:
-                    updated_df = portfolio_df[
-                        ~(
-                            (portfolio_df["Account"] == delete_account)
-                            & (portfolio_df["Ticker"] == delete_target)
-                        )
-                    ].copy()
-                    save_portfolio(updated_df)
-                    st.success(f"{delete_account} 계좌에서 {delete_target} 종목을 삭제했습니다.")
+                    uid_del = str(st.session_state.get("user_id") or "").strip()
+                    ok_del, derr = delete_portfolio_sheet_row(uid_del, delete_target)
+                    if not ok_del:
+                        st.error(derr)
+                    else:
+                        st.success(f"{delete_target} 종목을 삭제했습니다.")
                     st.rerun()
     
         st.divider()
