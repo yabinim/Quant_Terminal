@@ -63,7 +63,8 @@ _USER_SHEET_COLS = ["ID", "Password", "Reason", "Source", "Status"]
 _NARRATIVES_WORKSHEET_TITLE = "Narratives"
 _NARRATIVES_SHEET_COLS = ["ID", "Date", "Category", "Title", "Content", "Winners", "Emerging"]
 _PORTFOLIOS_WORKSHEET_TITLE = "Portfolios"
-_PORTFOLIOS_SHEET_COLS = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
+_PORTFOLIOS_SHEET_COLS = ["ID", "Account", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
+_PORTFOLIOS_LEGACY_HEADER = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 
 
@@ -130,7 +131,7 @@ def open_portfolios_worksheet():
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
                 sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_PORTFOLIOS_WORKSHEET_TITLE, rows=3000, cols=5)
+                ws = sh.add_worksheet(title=_PORTFOLIOS_WORKSHEET_TITLE, rows=3000, cols=6)
                 ensure_portfolios_header_row(ws)
                 return ws, None
             except Exception as exc2:
@@ -141,11 +142,53 @@ def open_portfolios_worksheet():
 def ensure_portfolios_header_row(ws):
     vals = ws.get_all_values()
     if not vals or not any(str(c).strip() for c in vals[0]):
-        ws.update([_PORTFOLIOS_SHEET_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
+        ws.update([_PORTFOLIOS_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
         return
-    hdr = [str(h).strip() for h in vals[0][:5]]
-    if hdr != _PORTFOLIOS_SHEET_COLS:
-        ws.update([_PORTFOLIOS_SHEET_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
+    if _portfolio_sheet_header_kind(vals[0]) != "new":
+        ws.update([_PORTFOLIOS_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
+
+
+def _portfolio_sheet_header_kind(header_row: list) -> str:
+    """'new' (ID+Account+…) | 'legacy' (Account 열 없음) | 'unknown'."""
+    h = [str(x).strip() for x in (header_row or [])[:6]]
+    if len(h) >= 6 and h[:6] == _PORTFOLIOS_SHEET_COLS:
+        return "new"
+    h5 = [str(x).strip() for x in (header_row or [])[:5]]
+    if h5 == _PORTFOLIOS_LEGACY_HEADER:
+        return "legacy"
+    return "unknown"
+
+
+def _portfolio_row_to_new_six_cells(header_kind: str, row: list) -> list | None:
+    """데이터 행을 항상 [ID, Account, Ticker, AvgPrice, Quantity, Date_Added] 6칸으로 맞춘다."""
+    row = list(row or [])
+    effective = header_kind
+    if header_kind == "new" and len(row) <= 5:
+        t_candidate = str(row[1]).strip().upper() if len(row) > 1 else ""
+        if len(row) >= 5 and is_valid_scanner_ticker(t_candidate):
+            effective = "legacy"
+    if effective == "legacy":
+        row = row + [""] * 6
+        rid = str(row[0]).strip()
+        tk = str(row[1]).strip().upper()
+        if not rid or not tk:
+            return None
+        return [
+            rid,
+            "Default",
+            tk,
+            row[2],
+            row[3],
+            str(row[4]).strip() if len(row) > 4 and str(row[4]).strip() else _narrative_now_kst_string(),
+        ]
+    row = row + [""] * 6
+    rid = str(row[0]).strip()
+    acct = str(row[1]).strip()
+    tk = str(row[2]).strip().upper()
+    if not rid or not acct or not tk:
+        return None
+    dt = str(row[5]).strip() if len(row) > 5 and str(row[5]).strip() else _narrative_now_kst_string()
+    return [rid, acct, tk, row[3], row[4], dt]
 
 
 def ensure_narratives_header_row(ws):
@@ -1823,24 +1866,65 @@ def _invalidate_portfolio_sheet_cache():
         pass
 
 
-def delete_portfolio_sheet_row(user_id: str, ticker: str) -> tuple[bool, str]:
-    """Portfolios 시트에서 ID·Ticker가 일치하는 행을 삭제한다."""
+def distinct_portfolio_accounts_for_user_id(user_id: str) -> list[str]:
+    """시트에서 해당 ID의 고유 Account 이름 목록(정렬)."""
     uid = str(user_id or "").strip()
+    if not uid:
+        return []
+    vals, err = _portfolio_sheet_all_values_cached()
+    if err or not vals or len(vals) < 2:
+        return []
+    hk = _portfolio_sheet_header_kind(vals[0])
+    if hk == "unknown":
+        hk = "new"
+    uid_u = uid.upper()
+    seen = set()
+    out = []
+    for r in vals[1:]:
+        cells = _portfolio_row_to_new_six_cells(hk, r)
+        if not cells:
+            continue
+        if str(cells[0]).strip().upper() != uid_u:
+            continue
+        a = str(cells[1]).strip()
+        if not a:
+            continue
+        ak = a.lower()
+        if ak not in seen:
+            seen.add(ak)
+            out.append(a)
+    return sorted(out, key=lambda s: s.lower())
+
+
+def delete_portfolio_sheet_row(user_id: str, account: str, ticker: str) -> tuple[bool, str]:
+    """Portfolios 시트에서 ID·Account·Ticker가 모두 일치하는 행을 삭제한다."""
+    uid = str(user_id or "").strip()
+    acct = str(account or "").strip()
     tku = str(ticker or "").strip().upper()
-    if not uid or not tku:
-        return False, "ID 또는 티커가 비어 있습니다."
+    if not uid or not acct or not tku:
+        return False, "ID, 계좌명, 티커를 모두 확인해 주세요."
     ws, err = open_portfolios_worksheet()
     if err:
         return False, err
     try:
         _invalidate_portfolio_sheet_cache()
         vals = ws.get_all_values() or []
+        hk = _portfolio_sheet_header_kind(vals[0])
+        if hk == "unknown":
+            hk = "new"
         for i, r in enumerate(vals[1:], start=2):
-            r = (r or []) + [""] * 5
-            if str(r[0]).strip().upper() == uid.upper() and str(r[1]).strip().upper() == tku:
-                ws.delete_rows(i)
-                _invalidate_portfolio_sheet_cache()
-                return True, ""
+            cells = _portfolio_row_to_new_six_cells(hk, r)
+            if not cells:
+                continue
+            if str(cells[0]).strip().upper() != uid.upper():
+                continue
+            if str(cells[1]).strip().lower() != acct.lower():
+                continue
+            if str(cells[2]).strip().upper() != tku:
+                continue
+            ws.delete_rows(i)
+            _invalidate_portfolio_sheet_cache()
+            return True, ""
         return False, "시트에서 해당 행을 찾을 수 없습니다."
     except Exception as exc:
         return False, str(exc)
@@ -1861,24 +1945,30 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
         header = _PORTFOLIOS_SHEET_COLS
         others = []
         uid_u = uid.upper()
+        hk = _portfolio_sheet_header_kind(vals[0])
+        if hk == "unknown":
+            hk = "new"
         for r in vals[1:]:
-            r = (r or []) + [""] * 5
-            if str(r[0]).strip().upper() == uid_u:
+            cells = _portfolio_row_to_new_six_cells(hk, r)
+            if not cells:
                 continue
-            others.append([str(r[0]), str(r[1]), r[2], r[3], str(r[4]) if len(r) > 4 else ""])
+            if str(cells[0]).strip().upper() == uid_u:
+                continue
+            others.append(cells)
         rows = [header] + others
         now_s = _narrative_now_kst_string()
         for _, row in df.iterrows():
+            acct = str(row.get("Account", "") or "").strip()
             tk = str(row.get("Ticker", "")).strip().upper()
-            if not tk:
+            if not acct or not tk:
                 continue
             pp = pd.to_numeric(row.get("Purchase_Price"), errors="coerce")
             qq = pd.to_numeric(row.get("Quantity"), errors="coerce")
             if pd.isna(pp) or pd.isna(qq):
                 continue
-            rows.append([uid, tk, float(pp), float(qq), now_s])
+            rows.append([uid, acct, tk, float(pp), float(qq), now_s])
         ws.clear()
-        ws.update(rows, range_name=f"A1:E{len(rows)}", value_input_option="USER_ENTERED")
+        ws.update(rows, range_name=f"A1:F{len(rows)}", value_input_option="USER_ENTERED")
         _invalidate_portfolio_sheet_cache()
         return True, ""
     except Exception as exc:
@@ -1897,8 +1987,8 @@ def load_portfolio():
         return pd.DataFrame(columns=base_columns)
     if not vals or len(vals) < 2:
         return pd.DataFrame(columns=base_columns)
-    hdr = [str(h).strip() for h in vals[0][:5]]
-    if hdr != _PORTFOLIOS_SHEET_COLS:
+    hk0 = _portfolio_sheet_header_kind(vals[0])
+    if hk0 not in ("new", "legacy"):
         try:
             ws2, err2 = open_portfolios_worksheet()
             if not err2 and ws2:
@@ -1909,29 +1999,31 @@ def load_portfolio():
             pass
         if err or not vals or len(vals) < 2:
             return pd.DataFrame(columns=base_columns)
+    hk = _portfolio_sheet_header_kind(vals[0])
+    if hk == "unknown":
+        hk = "new"
     rows = []
     uid_u = uid.upper()
     for r in vals[1:]:
-        r = (r or []) + [""] * 5
-        if str(r[0]).strip().upper() != uid_u:
+        cells = _portfolio_row_to_new_six_cells(hk, r)
+        if not cells:
             continue
-        tk = str(r[1]).strip().upper()
-        if not tk:
+        if str(cells[0]).strip().upper() != uid_u:
             continue
         rows.append(
             {
-                "Account": uid,
-                "Ticker": tk,
-                "Purchase_Price": pd.to_numeric(r[2], errors="coerce"),
-                "Quantity": pd.to_numeric(r[3], errors="coerce"),
+                "Account": str(cells[1]).strip(),
+                "Ticker": str(cells[2]).strip().upper(),
+                "Purchase_Price": pd.to_numeric(cells[3], errors="coerce"),
+                "Quantity": pd.to_numeric(cells[4], errors="coerce"),
             }
         )
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=base_columns)
     df["Quantity"] = df["Quantity"].fillna(1.0)
-    df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN")]
-    df = df.drop_duplicates(subset=["Ticker"], keep="last").reset_index(drop=True)
+    df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN") & df["Account"].astype(str).str.strip().ne("")]
+    df = df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
     return df[base_columns].copy()
 
 
@@ -1945,13 +2037,19 @@ def save_portfolio(df):
         if col not in safe_df.columns:
             safe_df[col] = np.nan
     safe_df = safe_df[base_columns].copy()
-    safe_df["Account"] = uid
+    safe_df["Account"] = safe_df["Account"].astype(str).str.strip()
     safe_df["Ticker"] = safe_df["Ticker"].astype(str).str.strip().str.upper()
     safe_df["Purchase_Price"] = pd.to_numeric(safe_df["Purchase_Price"], errors="coerce")
     safe_df["Quantity"] = pd.to_numeric(safe_df["Quantity"], errors="coerce")
     safe_df["Quantity"] = safe_df["Quantity"].fillna(1.0)
+    if safe_df["Account"].eq("").any():
+        try:
+            st.error("계좌명(Account)이 비어 있는 행이 있습니다. 계좌명을 입력한 뒤 다시 저장해 주세요.")
+        except Exception:
+            pass
+        return
     safe_df = safe_df[safe_df["Ticker"].ne("") & safe_df["Ticker"].ne("NAN")]
-    safe_df = safe_df.drop_duplicates(subset=["Ticker"], keep="last").reset_index(drop=True)
+    safe_df = safe_df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
     ok, msg = replace_user_portfolio_sheet_rows(uid, safe_df)
     if not ok:
         try:
@@ -5915,41 +6013,53 @@ if st.session_state.get("logged_in"):
     
         st.subheader(_MAIN_NAV_OPTIONS[5])
         st.caption(
-            "Google 시트 `Quant_DB` / **Portfolios**에 로그인 ID별로 종목이 저장됩니다. "
-            "다중 계좌 UI는 유지되나 시트에는 사용자당 티커당 한 행(ID + Ticker)으로 동기화됩니다."
+            "Google 시트 `Quant_DB` / **Portfolios** 한 줄은 "
+            "`[ID, Account, Ticker, AvgPrice, Quantity, Date_Added]` 입니다. "
+            "**ID** 열에는 항상 현재 로그인 `user_id` 만 기록하고, 증권사·계좌 구분 이름은 **Account** 열에만 저장합니다."
         )
 
         portfolio_df = load_portfolio()
+        puid = str(st.session_state.get("user_id") or "").strip()
         if st.session_state.get("_portfolio_last_sheet_error"):
             st.warning(f"Portfolios 시트: {st.session_state['_portfolio_last_sheet_error']}")
-    
-        st.markdown("### 계좌 필터")
+
+        st.markdown("### 보유 계좌별 요약")
+        st.caption(f"시트에서 **ID = `{puid or '—'}`** 인 행만 표시합니다. (Account는 사용자가 지정한 계좌명입니다.)")
+        if portfolio_df.empty:
+            st.info("등록된 포트폴리오가 없습니다. 하단에서 종목을 추가해 주세요.")
+        else:
+            for acct in sorted(portfolio_df["Account"].astype(str).unique(), key=lambda x: str(x).lower()):
+                sub = portfolio_df[portfolio_df["Account"] == acct].sort_values("Ticker")
+                with st.expander(f"**{acct}** · {len(sub)}종목", expanded=len(sub) <= 8):
+                    st.dataframe(
+                        sub[["Ticker", "Purchase_Price", "Quantity"]].rename(
+                            columns={"Purchase_Price": "평단가(AvgPrice)", "Quantity": "수량"}
+                        ),
+                        width="stretch",
+                        hide_index=True,
+                    )
+
+        st.markdown("### 계좌 필터 (매도 레이더)")
         account_list = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist()) if not portfolio_df.empty else []
         selected_accounts = st.multiselect(
             "조회할 계좌를 선택하세요",
             options=account_list,
             default=account_list,
-            help="선택한 계좌만 메인 테이블과 차트에 표시됩니다.",
+            help="선택한 계좌만 아래 매도 레이더·차트에 반영됩니다.",
         )
-    
+
         filtered_portfolio_df = portfolio_df.copy()
         if selected_accounts:
             filtered_portfolio_df = filtered_portfolio_df[filtered_portfolio_df["Account"].isin(selected_accounts)].copy()
-    
-        st.markdown("### 저장 방식 안내")
-        st.caption(
-            "종목·평단가·수량은 **Portfolios** 탭에 `[ID, Ticker, AvgPrice, Quantity, Date_Added]` 로 저장됩니다. "
-            "아래 **계좌** 필드는 화면 필터용이며, 시트의 ID 열은 항상 현재 로그인 `user_id` 와 같습니다. "
-            "계좌명 변경은 시트 스키마에 없어 지원하지 않습니다."
-        )
+
+        sheet_accounts = distinct_portfolio_accounts_for_user_id(puid) if puid else []
 
         st.markdown("### 포트폴리오 관리")
-    
+
         with st.expander("종목 추가", expanded=True):
-            # 계좌 선택만 폼 밖: 직접 입력 전환·종속 UI가 즉시 반영되도록 (폼은 입력 중 리런 방지)
-            add_account_options = ["직접 입력"] + account_list
+            add_account_options = ["직접 입력"] + sheet_accounts
             selected_account_option = st.selectbox(
-                "계좌명 선택",
+                "계좌명 (시트 Account 열)",
                 options=add_account_options,
                 index=0,
                 key="portfolio_add_account_selector",
@@ -5959,7 +6069,7 @@ if st.session_state.get("logged_in"):
                     custom_account_input = st.text_input(
                         "계좌명 직접 입력",
                         value="",
-                        placeholder="예: Fidelity Roth IRA",
+                        placeholder="예: robinhood, Fidelity Roth",
                         key="form_portfolio_add_custom_account",
                     )
                 else:
@@ -5989,64 +6099,70 @@ if st.session_state.get("logged_in"):
                 )
                 submitted_add = st.form_submit_button("포트폴리오에 추가", use_container_width=True, type="primary")
                 if submitted_add:
-                    puid = str(st.session_state.get("user_id") or "").strip()
                     if not puid:
                         st.error("로그인 user_id 가 없습니다. 다시 로그인해 주세요.")
-                    elif not new_ticker:
-                        st.warning("티커를 입력해주세요.")
                     else:
-                        ok_p, price_v, err_p = _validate_positive_portfolio_number("매수가", new_purchase_price)
-                        ok_q, qty_v, err_q = _validate_positive_portfolio_number("수량", new_quantity)
-                        if not ok_p:
-                            st.error(err_p)
-                        elif not ok_q:
-                            st.error(err_q)
+                        account_name = (
+                            (custom_account_input or "").strip()
+                            if selected_account_option == "직접 입력"
+                            else str(selected_account_option or "").strip()
+                        )
+                        if not account_name:
+                            st.warning("계좌명을 선택하거나 직접 입력해주세요.")
+                        elif not new_ticker:
+                            st.warning("티커를 입력해주세요.")
                         else:
-                            updated_df = portfolio_df.copy()
-                            mask = updated_df["Ticker"] == new_ticker
-                            if mask.any():
-                                idx = updated_df.index[mask][0]
-                                old_qty = float(updated_df.loc[idx, "Quantity"])
-                                old_price = float(updated_df.loc[idx, "Purchase_Price"])
-                                ok_old_q, _, err_old_q = _validate_positive_portfolio_number("기존 수량", old_qty)
-                                ok_old_p, _, err_old_p = _validate_positive_portfolio_number("기존 평단가", old_price)
-                                if not ok_old_q:
-                                    st.error(f"저장된 데이터 오류: {err_old_q} [데이터 수정하기]에서 바로잡아 주세요.")
-                                elif not ok_old_p:
-                                    st.error(f"저장된 데이터 오류: {err_old_p} [데이터 수정하기]에서 바로잡아 주세요.")
-                                else:
-                                    new_qty_total = old_qty + qty_v
-                                    new_avg = ((old_price * old_qty) + (price_v * qty_v)) / new_qty_total
-                                    updated_df.loc[idx, "Quantity"] = new_qty_total
-                                    updated_df.loc[idx, "Purchase_Price"] = new_avg
-                                    updated_df.loc[idx, "Account"] = puid
-                                    save_portfolio(updated_df)
-                                    st.success(
-                                        f"{new_ticker}: 추가 매수를 반영했습니다. "
-                                        f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
-                                    )
-                                    st.rerun()
+                            ok_p, price_v, err_p = _validate_positive_portfolio_number("매수가", new_purchase_price)
+                            ok_q, qty_v, err_q = _validate_positive_portfolio_number("수량", new_quantity)
+                            if not ok_p:
+                                st.error(err_p)
+                            elif not ok_q:
+                                st.error(err_q)
                             else:
-                                updated_df = pd.concat(
-                                    [
-                                        updated_df,
-                                        pd.DataFrame(
-                                            [
-                                                {
-                                                    "Account": puid,
-                                                    "Ticker": new_ticker,
-                                                    "Purchase_Price": price_v,
-                                                    "Quantity": qty_v,
-                                                }
-                                            ]
-                                        ),
-                                    ],
-                                    ignore_index=True,
-                                )
-                                save_portfolio(updated_df)
-                                st.success(f"{new_ticker} 종목을 포트폴리오에 추가했습니다.")
-                                st.rerun()
-    
+                                updated_df = portfolio_df.copy()
+                                mask = (updated_df["Account"] == account_name) & (updated_df["Ticker"] == new_ticker)
+                                if mask.any():
+                                    idx = updated_df.index[mask][0]
+                                    old_qty = float(updated_df.loc[idx, "Quantity"])
+                                    old_price = float(updated_df.loc[idx, "Purchase_Price"])
+                                    ok_old_q, _, err_old_q = _validate_positive_portfolio_number("기존 수량", old_qty)
+                                    ok_old_p, _, err_old_p = _validate_positive_portfolio_number("기존 평단가", old_price)
+                                    if not ok_old_q:
+                                        st.error(f"저장된 데이터 오류: {err_old_q} [데이터 수정하기]에서 바로잡아 주세요.")
+                                    elif not ok_old_p:
+                                        st.error(f"저장된 데이터 오류: {err_old_p} [데이터 수정하기]에서 바로잡아 주세요.")
+                                    else:
+                                        new_qty_total = old_qty + qty_v
+                                        new_avg = ((old_price * old_qty) + (price_v * qty_v)) / new_qty_total
+                                        updated_df.loc[idx, "Quantity"] = new_qty_total
+                                        updated_df.loc[idx, "Purchase_Price"] = new_avg
+                                        save_portfolio(updated_df)
+                                        st.success(
+                                            f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
+                                            f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
+                                        )
+                                        st.rerun()
+                                else:
+                                    updated_df = pd.concat(
+                                        [
+                                            updated_df,
+                                            pd.DataFrame(
+                                                [
+                                                    {
+                                                        "Account": account_name,
+                                                        "Ticker": new_ticker,
+                                                        "Purchase_Price": price_v,
+                                                        "Quantity": qty_v,
+                                                    }
+                                                ]
+                                            ),
+                                        ],
+                                        ignore_index=True,
+                                    )
+                                    save_portfolio(updated_df)
+                                    st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다. (시트 ID={puid})")
+                                    st.rerun()
+
         with st.expander("데이터 수정하기", expanded=False):
             if portfolio_df.empty:
                 st.info("수정할 포트폴리오 데이터가 없습니다.")
@@ -6123,7 +6239,7 @@ if st.session_state.get("logged_in"):
                                             f"{edit_account} / {edit_ticker} 수량·평단가를 수정해 저장했습니다."
                                         )
                                         st.rerun()
-    
+
         st.markdown("### 포트폴리오 종목 삭제")
         delete_col1, delete_col2, delete_col3 = st.columns([1.4, 1.4, 1.0])
         with delete_col1:
@@ -6155,11 +6271,11 @@ if st.session_state.get("logged_in"):
                     st.info("삭제할 종목이 없습니다.")
                 else:
                     uid_del = str(st.session_state.get("user_id") or "").strip()
-                    ok_del, derr = delete_portfolio_sheet_row(uid_del, delete_target)
+                    ok_del, derr = delete_portfolio_sheet_row(uid_del, delete_account, delete_target)
                     if not ok_del:
                         st.error(derr)
                     else:
-                        st.success(f"{delete_target} 종목을 삭제했습니다.")
+                        st.success(f"{delete_account} / {delete_target} 종목을 삭제했습니다.")
                     st.rerun()
     
         st.divider()
