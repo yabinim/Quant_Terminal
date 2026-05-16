@@ -6466,10 +6466,13 @@ if st.session_state.get("logged_in"):
                                 corr_matrix = ret_df.corr()
 
                                 # Altair heatmap 렌더링
+                                corr_reset = corr_matrix.reset_index()
+                                corr_reset.columns.name = None
+                                index_col = corr_reset.columns[0]
                                 corr_long = (
-                                    corr_matrix.reset_index()
-                                    .melt(id_vars="index", var_name="종목2", value_name="상관계수")
-                                    .rename(columns={"index": "종목1"})
+                                    corr_reset
+                                    .melt(id_vars=index_col, var_name="종목2", value_name="상관계수")
+                                    .rename(columns={index_col: "종목1"})
                                 )
                                 corr_long["상관계수_표시"] = corr_long["상관계수"].map(
                                     lambda x: f"{x:.2f}" if pd.notna(x) else "N/A"
