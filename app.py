@@ -1324,6 +1324,102 @@ def fetch_dxy_latest_and_mean_deviation():
         return np.nan, np.nan, MACRO_STATUS_NA
 
 
+def fetch_fear_greed_index() -> tuple[float, str, str]:
+    """CNN Fear & Greed Index API. (score, rating, status)"""
+    try:
+        url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=8)
+        if resp.status_code != 200:
+            return np.nan, "N/A", MACRO_STATUS_NA
+        data = resp.json()
+        score = float(data.get("fear_and_greed", {}).get("score", np.nan))
+        rating = str(data.get("fear_and_greed", {}).get("rating", "N/A"))
+        if score >= 75:
+            status = MACRO_STATUS_FAIL   # 극단적 탐욕 → 과매수
+        elif score >= 55:
+            status = MACRO_STATUS_WARN   # 탐욕
+        elif score <= 25:
+            status = MACRO_STATUS_PASS   # 극단적 공포 → 매수 기회
+        else:
+            status = MACRO_STATUS_PASS
+        return score, rating, status
+    except Exception:
+        return np.nan, "N/A", MACRO_STATUS_NA
+
+
+def fetch_fed_funds_rate() -> tuple[float, str]:
+    """FRED FEDFUNDS 시리즈에서 현재 기준금리 반환. (rate, note)"""
+    try:
+        series = fred.get_series("FEDFUNDS")
+        if series is None or series.empty:
+            return np.nan, "FRED 데이터 없음"
+        rate = float(pd.to_numeric(series, errors="coerce").dropna().iloc[-1])
+        if rate >= 5.0:
+            note = "고금리 레짐. 성장주 밸류에이션 압박 지속."
+        elif rate >= 3.0:
+            note = "중립 이상 금리. 연준 기조 모니터링 필요."
+        else:
+            note = "완화적 금리 환경. 유동성 우호적."
+        return rate, note
+    except Exception:
+        return np.nan, _FRED_TRANSIENT_ERROR_NOTE
+
+
+def fetch_macro_history_series() -> dict:
+    """CPI·실업률·DXY·Fed Rate 1~2년 히스토리 시리즈 반환."""
+    out = {}
+    try:
+        cpi_s = fred.get_series("CPIAUCSL")
+        if cpi_s is not None and not cpi_s.empty:
+            cpi_df = pd.DataFrame({"CPI": pd.to_numeric(cpi_s, errors="coerce")}).dropna()
+            cpi_df["CPI YoY(%)"] = cpi_df["CPI"].pct_change(12) * 100
+            out["cpi"] = cpi_df["CPI YoY(%)"].dropna().tail(24)
+    except Exception:
+        pass
+    try:
+        un_s = fred.get_series("UNRATE")
+        if un_s is not None and not un_s.empty:
+            out["unrate"] = pd.to_numeric(un_s, errors="coerce").dropna().tail(24)
+    except Exception:
+        pass
+    try:
+        fed_s = fred.get_series("FEDFUNDS")
+        if fed_s is not None and not fed_s.empty:
+            out["fedfunds"] = pd.to_numeric(fed_s, errors="coerce").dropna().tail(24)
+    except Exception:
+        pass
+    try:
+        dxy_hist = yf.Ticker("DX-Y.NYB").history(period="2y", auto_adjust=False)
+        if dxy_hist is not None and not dxy_hist.empty and "Close" in dxy_hist.columns:
+            out["dxy"] = pd.to_numeric(dxy_hist["Close"], errors="coerce").dropna()
+    except Exception:
+        pass
+    return out
+
+
+def compute_macro_score(rows: list) -> tuple[float, str, str]:
+    """
+    6대 지표 + Fear&Greed + Fed Rate를 종합해 0~100 Macro Score 계산.
+    반환: (score, grade, description)
+    pass=100, warning=50, fail=0, na=50(중립)으로 환산 후 평균.
+    """
+    score_map = {MACRO_STATUS_PASS: 100, MACRO_STATUS_WARN: 40, MACRO_STATUS_FAIL: 0, MACRO_STATUS_NA: 50}
+    scores = [score_map.get(r["_status"], 50) for r in rows]
+    if not scores:
+        return 50.0, "N/A", "데이터 없음"
+    avg = float(np.mean(scores))
+    if avg >= 75:
+        grade, desc = "🟢 BULLISH", "매크로 환경 우호적. 적극적 포지션 가능."
+    elif avg >= 50:
+        grade, desc = "🟡 NEUTRAL", "혼재된 신호. 선별적 접근 권장."
+    elif avg >= 25:
+        grade, desc = "🟠 CAUTIOUS", "위험 신호 누적. 비중 축소 고려."
+    else:
+        grade, desc = "🔴 BEARISH", "전방위 경고. 현금 비중 확대 권장."
+    return avg, grade, desc
+
+
 def analyze_us_macro_dashboard():
     spread_val, spread_st, spread_note = fetch_yield_spread_latest()
 
@@ -1426,8 +1522,40 @@ def analyze_us_macro_dashboard():
         }
     )
 
+    # Fear & Greed Index
+    fg_score, fg_rating, fg_status = fetch_fear_greed_index()
+    rows.append({
+        "지표": "Fear & Greed Index (CNN)",
+        "현재값": f"{fg_score:.0f} / 100 ({fg_rating})" if pd.notna(fg_score) else "N/A",
+        "판정": macro_status_label(fg_status),
+        "판독 요약": (
+            "극단적 탐욕 구간. 과매수 경고, 조정 가능성 높음." if fg_score >= 75
+            else "탐욕 구간. 추격 매수 주의." if fg_score >= 55
+            else "극단적 공포 구간. 역발상 매수 기회일 수 있습니다." if fg_score <= 25
+            else "중립~공포 구간. 시장 심리 정상화 중."
+        ) if pd.notna(fg_score) else "데이터 수신 실패.",
+        "_status": fg_status,
+    })
+
+    # Fed Funds Rate
+    fed_rate, fed_note = fetch_fed_funds_rate()
+    fed_status = (
+        MACRO_STATUS_FAIL if pd.notna(fed_rate) and fed_rate >= 5.0
+        else MACRO_STATUS_WARN if pd.notna(fed_rate) and fed_rate >= 3.0
+        else MACRO_STATUS_PASS if pd.notna(fed_rate)
+        else MACRO_STATUS_NA
+    )
+    rows.append({
+        "지표": "연준 기준금리 (Fed Funds Rate)",
+        "현재값": f"{fed_rate:.2f}%" if pd.notna(fed_rate) else "N/A",
+        "판정": macro_status_label(fed_status),
+        "판독 요약": fed_note,
+        "_status": fed_status,
+    })
+
     bad_total = sum(1 for r in rows if macro_status_bad_count(r["_status"]))
     na_total = sum(1 for r in rows if r["_status"] == MACRO_STATUS_NA)
+    macro_score, macro_grade, macro_desc = compute_macro_score(rows)
 
     return {
         "rows": rows,
@@ -1436,6 +1564,12 @@ def analyze_us_macro_dashboard():
         "spread_val": spread_val,
         "vix_val": vix_val,
         "na_total": na_total,
+        "macro_score": macro_score,
+        "macro_grade": macro_grade,
+        "macro_desc": macro_desc,
+        "fg_score": fg_score,
+        "fg_rating": fg_rating,
+        "fed_rate": fed_rate,
     }
 
 
@@ -5346,79 +5480,142 @@ if st.session_state.get("logged_in"):
         with sync_m2:
             st.caption("불러온 지표는 세션 동안 캐시됩니다. 동기화 시 캐시를 비우고 최신 데이터를 다시 가져옵니다.")
     
-        st.subheader(f"{_MAIN_NAV_OPTIONS[0]} · 미국 6대 지표 대시보드")
-        st.caption("yfinance + FRED API fredapi(UNRATE·CPI) 기준. 판단은 참고용 휴리스틱입니다.")
-    
+        st.subheader(f"{_MAIN_NAV_OPTIONS[0]} · 미국 거시경제 대시보드")
+        st.caption("yfinance + FRED API + CNN Fear & Greed 기준. 판단은 참고용 휴리스틱입니다.")
+
         try:
-            with st.spinner("6대 매크로 지표를 불러오는 중..."):
+            with st.spinner("매크로 지표를 불러오는 중..."):
                 macro_pack = cached_analyze_us_macro_dashboard()
 
             if macro_pack.get("na_total", 0) >= 4:
                 _notify_yfinance_fetch_failed()
 
-            macro_traffic_light(macro_pack["bad_total"])
-    
+            # ── 1. Macro Score 게이지 ──────────────────────────────────────
+            macro_score = macro_pack.get("macro_score", 50.0)
+            macro_grade = macro_pack.get("macro_grade", "N/A")
+            macro_desc = macro_pack.get("macro_desc", "")
+            fg_score = macro_pack.get("fg_score", np.nan)
+            fg_rating = macro_pack.get("fg_rating", "N/A")
+            fed_rate = macro_pack.get("fed_rate", np.nan)
+
+            st.markdown("### 🎯 종합 Macro Score")
+            score_col1, score_col2, score_col3, score_col4 = st.columns(4)
+            with score_col1:
+                st.metric("Macro Score", f"{macro_score:.0f} / 100", delta=macro_grade)
+            with score_col2:
+                fg_str = f"{fg_score:.0f} ({fg_rating})" if pd.notna(fg_score) else "N/A"
+                st.metric("Fear & Greed", fg_str)
+            with score_col3:
+                st.metric("Fed Funds Rate", f"{fed_rate:.2f}%" if pd.notna(fed_rate) else "N/A")
+            with score_col4:
+                bad_n = macro_pack["bad_total"]
+                total_n = len(macro_pack["rows"])
+                st.metric("경고 지표", f"{bad_n} / {total_n}")
+
+            # Macro Score 프로그레스 바
+            score_pct = int(macro_score)
+            bar_color = "#16a34a" if macro_score >= 75 else "#f59e0b" if macro_score >= 50 else "#f97316" if macro_score >= 25 else "#dc2626"
             st.markdown(
-                f"**종합 신호등 요약**: Warning 또는 Fail 상태인 지표 개수는 **{macro_pack['bad_total']} / 6** 입니다. "
-                f"데이터를 가져오지 못한 지표는 **{macro_pack.get('na_total', 0)}**건입니다 (신호등 집계에는 포함하지 않음)."
+                f"""
+                <div style="background:#1e293b;border-radius:8px;padding:4px;margin:4px 0 8px 0;">
+                  <div style="background:{bar_color};width:{score_pct}%;height:18px;border-radius:6px;
+                              display:flex;align-items:center;justify-content:center;
+                              color:white;font-size:12px;font-weight:700;">
+                    {macro_grade}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-    
+            st.caption(macro_desc)
+            macro_traffic_light(macro_pack["bad_total"])
+
             st.divider()
-    
-            vix_hist = macro_pack.get("vix_hist")
-            st.markdown("#### VIX (1년 추세)")
-            if vix_hist is None or vix_hist.empty or "Close" not in vix_hist.columns:
-                st.warning("VIX 1년 차트 데이터를 불러오지 못했습니다.")
-            else:
-                vix_chart = pd.DataFrame({"VIX Close": pd.to_numeric(vix_hist["Close"], errors="coerce")}).dropna(
-                    how="all"
-                )
-                st.line_chart(vix_chart, use_container_width=True)
-            st.caption(
-                "💡 [VIX 판독법] 하루의 등락보다 '바닥권에서 고개를 들며 20을 돌파하는지' 추세가 중요합니다. "
-                "평온한 장세에서는 주 1~2회, 시장이 출렁일 때는 매일 전고점 돌파 여부를 모니터링하세요. "
-                "(6개월~1년 차트로 과거 평균 대비 현재 위치를 파악하세요.)"
+
+            # ── 2. 지표별 히스토리 차트 ───────────────────────────────────
+            st.markdown("### 📈 주요 지표 트렌드 (2년 히스토리)")
+            with st.spinner("히스토리 데이터 로딩 중..."):
+                hist_data = fetch_macro_history_series()
+
+            chart_tab1, chart_tab2, chart_tab3, chart_tab4, chart_tab5 = st.tabs(
+                ["VIX", "CPI YoY", "실업률", "Fed Rate", "DXY"]
             )
-    
+            with chart_tab1:
+                vix_hist = macro_pack.get("vix_hist")
+                if vix_hist is not None and not vix_hist.empty and "Close" in vix_hist.columns:
+                    vix_chart = pd.DataFrame({"VIX": pd.to_numeric(vix_hist["Close"], errors="coerce")}).dropna()
+                    st.line_chart(vix_chart, use_container_width=True)
+                    st.caption("💡 20 돌파 여부가 핵심. 바닥에서 고개를 들면 조정 신호.")
+                else:
+                    st.warning("VIX 데이터를 불러오지 못했습니다.")
+
+            with chart_tab2:
+                if "cpi" in hist_data and not hist_data["cpi"].empty:
+                    cpi_df = pd.DataFrame({"CPI YoY(%)": hist_data["cpi"]})
+                    st.line_chart(cpi_df, use_container_width=True)
+                    st.caption("💡 연준 목표 2%. 3% 이상이면 고금리 유지 압력.")
+                else:
+                    st.warning("CPI 데이터를 불러오지 못했습니다.")
+
+            with chart_tab3:
+                if "unrate" in hist_data and not hist_data["unrate"].empty:
+                    un_df = pd.DataFrame({"실업률(%)": hist_data["unrate"]})
+                    st.line_chart(un_df, use_container_width=True)
+                    st.caption("💡 우상향 전환 시 샴의 법칙 근접. 소비 둔화 선행 지표.")
+                else:
+                    st.warning("실업률 데이터를 불러오지 못했습니다.")
+
+            with chart_tab4:
+                if "fedfunds" in hist_data and not hist_data["fedfunds"].empty:
+                    fed_df = pd.DataFrame({"Fed Rate(%)": hist_data["fedfunds"]})
+                    st.line_chart(fed_df, use_container_width=True)
+                    st.caption("💡 금리 인하 사이클 시작 여부가 성장주 밸류에이션의 핵심 트리거.")
+                else:
+                    st.warning("Fed Rate 데이터를 불러오지 못했습니다.")
+
+            with chart_tab5:
+                if "dxy" in hist_data and not hist_data["dxy"].empty:
+                    dxy_df = pd.DataFrame({"DXY": hist_data["dxy"]})
+                    st.line_chart(dxy_df, use_container_width=True)
+                    st.caption("💡 달러 강세 시 다국적 빅테크 해외 실적 환차손 우려.")
+                else:
+                    st.warning("DXY 데이터를 불러오지 못했습니다.")
+
             st.divider()
-    
+
+            # ── 3. 전체 지표 카드 ─────────────────────────────────────────
             highlights = macro_pack["rows"]
-            macro_df = pd.DataFrame(highlights)
-            show_df = macro_df.drop(columns=["_status"], errors="ignore")
-    
-            st.markdown("###### 6대 지표 종합 카드 · 판독 결과")
-            for row_idx in range(2):
-                card_cols = st.columns(3)
-                for col_idx in range(3):
-                    ix = row_idx * 3 + col_idx
+            st.markdown("### 🗂️ 전체 지표 판독 카드")
+            for row_idx in range(0, len(highlights), 4):
+                card_cols = st.columns(4)
+                for col_idx in range(4):
+                    ix = row_idx + col_idx
                     if ix >= len(highlights):
-                        continue
+                        break
                     row = highlights[ix]
                     with card_cols[col_idx]:
-                        st.metric(label="판정", value=row["판정"])
-                        st.caption(row["지표"])
-                        st.write(f"**현재값:** {row['현재값']}")
+                        st.metric(label=row["지표"], value=row["판정"])
+                        st.caption(row["현재값"])
                         st.info(row["판독 요약"])
-    
-            st.markdown("###### 원본 표 (복사용)")
-            st.dataframe(show_df, use_container_width=True, hide_index=True, height=min(520, 140 + len(show_df) * 36))
-    
-            with st.expander("📖 6대 거시경제 지표 해석 가이드", expanded=False):
-                st.markdown(
-                    """
-    | 지표 | 의미 (무엇을 나타내는가?) | 주식 시장 영향 |
-    |---|---|---|
-    | 장단기 금리차 | 시장이 예상하는 경기 침체의 유효성 | 마이너스(-)일 때 침체 예고, 정상화될 때 폭락 가능성 |
-    | Sentiment (VIX) | 투자자들의 광기와 공포의 수준 | 80 이상 과매수 시 하락 주의, 20 이하 공포 시 매수 기회 |
-    | WTI 유가 | 인플레이션 압력과 기업 생산 비용 | 급등 시 기술주(대장주) 밸류에이션에 타격 |
-    | 실업률 (샴의 법칙) | 소비 체력과 경기 침체 진입 여부 | 법칙 발동 시 실물 경제 위기 시작 |
-    | CPI (물가) | 연방준비제도(Fed)의 금리 결정 방향 | 예상 상회 시 고금리 유지 (성장주에 악재) |
-    | 달러 지수 (DXY) | 글로벌 자산 중 달러의 위상 | 달러 강세 시 다국적 빅테크 해외 실적 악화 |
-    
-    *본 앱의 Pass/Warning/Fail은 위 표를 완전 반영하지 않으며, 간단한 임계치 휴리스틱을 사용합니다.*
-    """
-                )
-    
+
+            show_df = pd.DataFrame(highlights).drop(columns=["_status"], errors="ignore")
+            with st.expander("📋 원본 표 (복사용)", expanded=False):
+                st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+            with st.expander("📖 거시경제 지표 해석 가이드", expanded=False):
+                st.markdown("""
+| 지표 | 의미 | 주식 시장 영향 |
+|---|---|---|
+| 장단기 금리차 | 경기 침체 예고 신호 | 역전 시 침체 우려, 정상화 시 폭락 가능 |
+| VIX | 투자자 공포·탐욕 수준 | 20 이하 안정, 35 이상 극단적 공포 |
+| WTI 유가 | 인플레이션·비용 압력 | 급등 시 성장주 밸류에이션 타격 |
+| 실업률 (샴) | 소비 체력·침체 진입 | 샴 발동 시 실물 위기 시작 |
+| CPI YoY | 연준 금리 결정 방향 | 3% 이상 시 고금리 유지 (성장주 악재) |
+| DXY | 글로벌 달러 위상 | 강세 시 다국적 기업 해외 실적 악화 |
+| Fear & Greed | 시장 심리 종합 | 75+ 극단적 탐욕(매도 고려), 25- 극단적 공포(매수 고려) |
+| Fed Funds Rate | 현재 기준금리 | 5% 이상 고금리 레짐, 인하 시 성장주 재평가 |
+""")
+
         except Exception as e:
             st.error("거시경제 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
