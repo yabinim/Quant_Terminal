@@ -67,6 +67,8 @@ _PORTFOLIOS_SHEET_COLS = ["ID", "Account", "Ticker", "AvgPrice", "Quantity", "Da
 _PORTFOLIOS_LEGACY_HEADER = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 _THESIS_WORKSHEET_TITLE = "Thesis"
+_WATCHLIST_SHEET_TITLE = "Watchlist"
+_WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added"]
 _THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
 
@@ -839,6 +841,7 @@ _MAIN_NAV_OPTIONS = (
     "🎯 [AI] 내러티브 적중률 트래커",
     "💡 [AI] Idea-to-Portfolio 추적",
     "📋 [AI] 주간 포트폴리오 요약",
+    "🔔 Buy Watchlist & Alert",
 )
 
 # 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
@@ -2397,6 +2400,126 @@ def build_portfolio_sell_radar_df(portfolio_df):
         )
 
     return pd.DataFrame(rows)
+
+
+def open_watchlist_worksheet():
+    """Quant_DB 스프레드시트의 Watchlist 탭."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_WATCHLIST_SHEET_TITLE)
+        return ws, None
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
+            try:
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                ws = sh.add_worksheet(title=_WATCHLIST_SHEET_TITLE, rows=1000, cols=8)
+                ws.update([_WATCHLIST_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+                return ws, None
+            except Exception as exc2:
+                return None, f"`{_WATCHLIST_SHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
+        return None, f"Watchlist 워크시트를 열 수 없습니다: {exc}"
+
+
+def load_watchlist_sheet(user_id: str) -> list[dict]:
+    """Watchlist 시트에서 현재 user_id 기록 로드."""
+    ws, err = open_watchlist_worksheet()
+    if err or ws is None:
+        return []
+    try:
+        vals = ws.get_all_values()
+        if not vals or len(vals) < 2:
+            return []
+        uid_u = str(user_id).strip().upper()
+        items = []
+        for r in vals[1:]:
+            r = (r + [""] * 8)[:8]
+            if str(r[0]).strip().upper() != uid_u:
+                continue
+            items.append({
+                "ticker": str(r[1]).strip().upper(),
+                "memo": str(r[2]).strip(),
+                "alert_price": pd.to_numeric(r[3], errors="coerce") if r[3] else np.nan,
+                "alert_rsi": pd.to_numeric(r[4], errors="coerce") if r[4] else np.nan,
+                "alert_ma200": str(r[5]).strip().lower() == "true",
+                "saved_price": pd.to_numeric(r[6], errors="coerce") if r[6] else np.nan,
+                "date_added": str(r[7]).strip(),
+            })
+        return items
+    except Exception:
+        return []
+
+
+def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
+    """현재 user_id의 Watchlist 전체를 시트에 덮어쓰기."""
+    ws, err = open_watchlist_worksheet()
+    if err or ws is None:
+        return False, err or "워크시트 열기 실패"
+    try:
+        vals = ws.get_all_values() or []
+        uid_u = str(user_id).strip().upper()
+        # 다른 유저 행 보존
+        other_rows = [
+            r for r in vals[1:]
+            if str((r + [""])[0]).strip().upper() != uid_u
+        ]
+        new_rows = []
+        for item in items:
+            ticker = str(item.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            alert_price = item.get("alert_price", "")
+            alert_price_str = str(round(float(alert_price), 4)) if pd.notna(alert_price) and alert_price != "" else ""
+            alert_rsi = item.get("alert_rsi", "")
+            alert_rsi_str = str(round(float(alert_rsi), 1)) if pd.notna(alert_rsi) and alert_rsi != "" else ""
+            alert_ma200_str = "true" if item.get("alert_ma200") else "false"
+            saved_price = item.get("saved_price", "")
+            saved_price_str = str(round(float(saved_price), 4)) if pd.notna(saved_price) and saved_price != "" else ""
+            new_rows.append([
+                str(user_id).strip(),
+                ticker,
+                str(item.get("memo", "")).strip(),
+                alert_price_str,
+                alert_rsi_str,
+                alert_ma200_str,
+                saved_price_str,
+                str(item.get("date_added", _narrative_now_kst_string())).strip(),
+            ])
+        all_rows = [_WATCHLIST_SHEET_COLS] + other_rows + new_rows
+        ws.clear()
+        ws.update(all_rows, range_name=f"A1:H{len(all_rows)}", value_input_option="USER_ENTERED")
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def check_watchlist_alerts(items: list[dict], price_map: dict, rsi_map: dict, ma200_map: dict) -> list[dict]:
+    """Watchlist 각 종목의 Alert 조건 체크. 발동된 Alert만 반환."""
+    triggered = []
+    for item in items:
+        tk = str(item.get("ticker", "")).strip().upper()
+        current_price = pd.to_numeric(price_map.get(tk), errors="coerce")
+        current_rsi = pd.to_numeric(rsi_map.get(tk), errors="coerce")
+        ma200 = pd.to_numeric(ma200_map.get(tk), errors="coerce")
+        alert_price = pd.to_numeric(item.get("alert_price"), errors="coerce")
+        alert_rsi = pd.to_numeric(item.get("alert_rsi"), errors="coerce")
+        alert_ma200 = bool(item.get("alert_ma200"))
+
+        alerts = []
+        if pd.notna(alert_price) and pd.notna(current_price) and current_price <= alert_price:
+            alerts.append(f"💰 목표가 도달: 현재 ${current_price:.2f} ≤ 설정 ${alert_price:.2f}")
+        if pd.notna(alert_rsi) and pd.notna(current_rsi) and current_rsi <= alert_rsi:
+            alerts.append(f"📉 RSI 과매도: 현재 RSI {current_rsi:.1f} ≤ 설정 {alert_rsi:.1f}")
+        if alert_ma200 and pd.notna(current_price) and pd.notna(ma200):
+            gap_pct = (current_price / ma200 - 1.0) * 100
+            if abs(gap_pct) <= 3.0:
+                alerts.append(f"📊 200일선 근접: 현재가 ${current_price:.2f} / 200일선 ${ma200:.2f} (괴리 {gap_pct:+.1f}%)")
+        if alerts:
+            triggered.append({"ticker": tk, "alerts": alerts, "current_price": current_price})
+    return triggered
 
 
 def load_watchlist():
@@ -5063,7 +5186,38 @@ if st.session_state.get("logged_in"):
     )
     
     render_global_market_watch_header()
-    
+
+    # ── Watchlist Alert 자동 체크 (매 세션 1회) ───────────────────────────
+    _uid_alert = str(st.session_state.get("user_id") or "").strip()
+    if _uid_alert and not st.session_state.get("_watchlist_alert_checked"):
+        st.session_state["_watchlist_alert_checked"] = True
+        try:
+            _wl_items = load_watchlist_sheet(_uid_alert)
+            if _wl_items:
+                _wl_tickers = [i["ticker"] for i in _wl_items]
+                _price_map = fetch_latest_prices_for_tickers(_wl_tickers)
+                _rsi_map, _ma200_map = {}, {}
+                for _tk in _wl_tickers:
+                    try:
+                        _hist = yf.Ticker(_tk).history(period="1y", auto_adjust=False)
+                        _close = pd.to_numeric(_hist["Close"], errors="coerce").dropna() if not _hist.empty else pd.Series(dtype=float)
+                        _rsi_map[_tk] = float(calculate_rsi(_close).dropna().iloc[-1]) if not calculate_rsi(_close).dropna().empty else np.nan
+                        _ma200_map[_tk] = float(_close.rolling(200, min_periods=200).mean().iloc[-1]) if len(_close) >= 200 else np.nan
+                    except Exception:
+                        _rsi_map[_tk] = np.nan
+                        _ma200_map[_tk] = np.nan
+                _triggered = check_watchlist_alerts(_wl_items, _price_map, _rsi_map, _ma200_map)
+                if _triggered:
+                    st.session_state["_watchlist_triggered_alerts"] = _triggered
+        except Exception:
+            pass
+
+    # Alert 발동 시 상단에 배너 표시
+    _triggered_alerts = st.session_state.get("_watchlist_triggered_alerts", [])
+    if _triggered_alerts:
+        with st.container():
+            st.warning(f"🔔 **Watchlist Alert** — {len(_triggered_alerts)}개 종목에서 매수 조건이 발동됐어요! `🔔 Buy Watchlist & Alert` 메뉴에서 확인하세요.")
+
     _nav_key = "main_sidebar_nav"
     _nav_opts = list(_MAIN_NAV_OPTIONS)
     if st.session_state.get("user_role") == "admin":
@@ -7629,6 +7783,189 @@ if st.session_state.get("logged_in"):
             st.success("✅ 이번 주 AI 포트폴리오 리포트")
             st.markdown(latest_summary)
             st.caption("이 리포트는 `Narratives` 시트에 자동 저장되었습니다. 투자 권유가 아닙니다.")
+
+    elif main_nav == _MAIN_NAV_OPTIONS[9]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 🔔 Buy Watchlist & Alert
+        # 관심 종목 등록 + 매수 조건(목표가/RSI/200일선) 자동 체크
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader("🔔 Buy Watchlist & Alert")
+        st.caption(
+            "관심 종목을 등록하고 **매수 조건**을 설정하세요. "
+            "앱 접속 시 조건이 자동으로 체크되며, 발동 시 상단에 알림이 표시됩니다."
+        )
+
+        uid_wl = str(st.session_state.get("user_id") or "").strip()
+
+        # ── Alert 발동 현황 ────────────────────────────────────────────────
+        triggered = st.session_state.get("_watchlist_triggered_alerts", [])
+        if triggered:
+            st.error(f"🔔 현재 **{len(triggered)}개 종목**에서 매수 조건이 발동됐어요!")
+            for t in triggered:
+                with st.expander(f"⚡ {t['ticker']} — 현재가 ${t['current_price']:.2f}" if pd.notna(t.get('current_price')) else f"⚡ {t['ticker']}", expanded=True):
+                    for a in t["alerts"]:
+                        st.markdown(f"- {a}")
+            st.divider()
+
+        # ── Watchlist 로드 ─────────────────────────────────────────────────
+        wl_items = load_watchlist_sheet(uid_wl)
+
+        # ── 종목 추가 폼 ───────────────────────────────────────────────────
+        with st.expander("➕ 관심 종목 추가", expanded=not wl_items):
+            with st.form("watchlist_add_form", clear_on_submit=True):
+                wl_col1, wl_col2 = st.columns([1, 2])
+                with wl_col1:
+                    wl_ticker = st.text_input(
+                        "티커",
+                        placeholder="예: NVDA",
+                        key="wl_form_ticker",
+                    ).strip().upper()
+                with wl_col2:
+                    wl_memo = st.text_input(
+                        "메모 (매수 근거)",
+                        placeholder="예: AI Capex 수혜, 어닝 모멘텀",
+                        key="wl_form_memo",
+                    )
+                st.markdown("**Alert 조건 설정** (하나 이상 설정하세요)")
+                al_col1, al_col2, al_col3 = st.columns(3)
+                with al_col1:
+                    wl_alert_price = st.number_input(
+                        "💰 목표 매수가 ($) 이하",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.5,
+                        format="%.2f",
+                        key="wl_form_alert_price",
+                        help="현재가가 이 가격 이하로 내려오면 알림",
+                    )
+                with al_col2:
+                    wl_alert_rsi = st.number_input(
+                        "📉 RSI(14) 이하",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=0.0,
+                        step=1.0,
+                        format="%.0f",
+                        key="wl_form_alert_rsi",
+                        help="RSI가 이 값 이하로 내려오면 알림 (예: 30 = 과매도)",
+                    )
+                with al_col3:
+                    wl_alert_ma200 = st.checkbox(
+                        "📊 200일선 ±3% 근접 시",
+                        key="wl_form_alert_ma200",
+                        help="현재가가 200일 이동평균선의 ±3% 이내에 들어오면 알림",
+                    )
+                submitted_wl = st.form_submit_button("Watchlist에 추가", type="primary", use_container_width=True)
+
+            if submitted_wl:
+                if not wl_ticker:
+                    st.warning("티커를 입력해주세요.")
+                else:
+                    price_now = fetch_latest_prices_for_tickers([wl_ticker])
+                    new_wl_item = {
+                        "ticker": wl_ticker,
+                        "memo": wl_memo.strip(),
+                        "alert_price": float(wl_alert_price) if wl_alert_price > 0 else np.nan,
+                        "alert_rsi": float(wl_alert_rsi) if wl_alert_rsi > 0 else np.nan,
+                        "alert_ma200": wl_alert_ma200,
+                        "saved_price": price_now.get(wl_ticker, np.nan),
+                        "date_added": _narrative_now_kst_string(),
+                    }
+                    wl_items = [i for i in wl_items if i["ticker"] != wl_ticker]
+                    wl_items.append(new_wl_item)
+                    ok_wl, err_wl = save_watchlist_sheet(uid_wl, wl_items)
+                    if ok_wl:
+                        st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!")
+                        st.session_state["_watchlist_alert_checked"] = False
+                        st.rerun()
+                    else:
+                        st.error(f"저장 실패: {err_wl}")
+
+        st.divider()
+
+        # ── Watchlist 현황 ─────────────────────────────────────────────────
+        if not wl_items:
+            st.info("등록된 관심 종목이 없어요. 위에서 종목을 추가해주세요.")
+        else:
+            st.markdown(f"### 📋 관심 종목 현황 ({len(wl_items)}개)")
+            wl_tickers = [i["ticker"] for i in wl_items]
+
+            with st.spinner("실시간 가격 및 지표 계산 중..."):
+                price_map_wl = fetch_latest_prices_for_tickers(wl_tickers)
+                rsi_map_wl, ma200_map_wl = {}, {}
+                for tk in wl_tickers:
+                    try:
+                        hist = yf.Ticker(tk).history(period="1y", auto_adjust=False)
+                        close = pd.to_numeric(hist["Close"], errors="coerce").dropna() if not hist.empty else pd.Series(dtype=float)
+                        rsi_series = calculate_rsi(close).dropna()
+                        rsi_map_wl[tk] = float(rsi_series.iloc[-1]) if not rsi_series.empty else np.nan
+                        ma200_map_wl[tk] = float(close.rolling(200, min_periods=200).mean().iloc[-1]) if len(close) >= 200 else np.nan
+                    except Exception:
+                        rsi_map_wl[tk] = np.nan
+                        ma200_map_wl[tk] = np.nan
+
+            for idx, item in enumerate(wl_items):
+                tk = item["ticker"]
+                current_price = pd.to_numeric(price_map_wl.get(tk), errors="coerce")
+                saved_price = pd.to_numeric(item.get("saved_price"), errors="coerce")
+                rsi_val = pd.to_numeric(rsi_map_wl.get(tk), errors="coerce")
+                ma200_val = pd.to_numeric(ma200_map_wl.get(tk), errors="coerce")
+                pnl = (float(current_price) / float(saved_price) - 1.0) * 100.0 if pd.notna(current_price) and pd.notna(saved_price) and saved_price > 0 else np.nan
+
+                # Alert 조건 체크
+                item_alerts = check_watchlist_alerts([item], price_map_wl, rsi_map_wl, ma200_map_wl)
+                alert_badge = "⚡ Alert 발동!" if item_alerts else ""
+
+                with st.expander(
+                    f"**{tk}** {alert_badge} | "
+                    f"현재가 {'${:.2f}'.format(float(current_price)) if pd.notna(current_price) else 'N/A'} | "
+                    f"RSI {'{:.1f}'.format(float(rsi_val)) if pd.notna(rsi_val) else 'N/A'} | "
+                    f"등록 시 대비 {'{:+.1f}%'.format(pnl) if pd.notna(pnl) else 'N/A'}",
+                    expanded=bool(item_alerts),
+                ):
+                    info_col, alert_col = st.columns([3, 2])
+                    with info_col:
+                        st.markdown(f"**메모:** {item.get('memo', '') or '없음'}")
+                        st.markdown(f"**등록일:** {item.get('date_added', 'N/A')}")
+                        st.markdown(f"**200일선:** {'${:.2f}'.format(float(ma200_val)) if pd.notna(ma200_val) else 'N/A'}")
+
+                    with alert_col:
+                        st.markdown("**설정된 Alert 조건:**")
+                        ap = pd.to_numeric(item.get("alert_price"), errors="coerce")
+                        ar = pd.to_numeric(item.get("alert_rsi"), errors="coerce")
+                        am = item.get("alert_ma200", False)
+                        if pd.notna(ap):
+                            st.caption(f"💰 목표가: ${ap:.2f} 이하")
+                        if pd.notna(ar):
+                            st.caption(f"📉 RSI: {ar:.0f} 이하")
+                        if am:
+                            st.caption("📊 200일선 ±3% 근접")
+                        if not pd.notna(ap) and not pd.notna(ar) and not am:
+                            st.caption("조건 없음 (메모만)")
+
+                    if item_alerts:
+                        for a in item_alerts[0]["alerts"]:
+                            st.success(a)
+
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        if st.button(f"📌 {tk} 분석하기", key=f"wl_pick_{idx}", use_container_width=True):
+                            st.session_state["selected_ticker"] = tk
+                            st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[4]
+                            st.rerun()
+                    with btn_col2:
+                        if st.button(f"🗑️ 삭제", key=f"wl_del_{idx}", use_container_width=True):
+                            updated_wl = [x for j, x in enumerate(wl_items) if j != idx]
+                            save_watchlist_sheet(uid_wl, updated_wl)
+                            st.session_state["_watchlist_alert_checked"] = False
+                            st.rerun()
+
+            # Alert 재체크 버튼
+            st.divider()
+            if st.button("🔄 Alert 조건 다시 체크", key="wl_recheck_btn", use_container_width=True):
+                st.session_state["_watchlist_alert_checked"] = False
+                st.session_state.pop("_watchlist_triggered_alerts", None)
+                st.rerun()
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
