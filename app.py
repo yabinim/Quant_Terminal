@@ -6541,6 +6541,23 @@ if st.session_state.get("logged_in"):
                                 dl_period = "3mo" if horizon_td <= 21 else "6mo"
                                 closes = _factcheck_download_closes(unique_tickers, period=dl_period)
 
+                            # ── 디버그 정보 (문제 진단용) ──────────────────────
+                            with st.expander("🔧 디버그 정보 (문제 진단용)", expanded=True):
+                                st.write(f"**closes.empty:** `{closes.empty}`")
+                                st.write(f"**closes shape:** `{closes.shape}`")
+                                st.write(f"**closes columns 앞 10개:** `{list(closes.columns[:10]) if not closes.empty else '없음'}`")
+                                st.write(f"**closes index tz:** `{closes.index.tz if not closes.empty else 'N/A'}`")
+                                st.write(f"**closes index 샘플:** `{list(closes.index[:3]) if not closes.empty else '없음'}`")
+                                sample_tk = unique_tickers[0] if unique_tickers else "없음"
+                                st.write(f"**첫번째 티커 in columns:** `{sample_tk in closes.columns if not closes.empty else False}`")
+                                if not closes.empty and sample_tk in closes.columns:
+                                    ss = closes[sample_tk].dropna()
+                                    st.write(f"**series 길이:** `{len(ss)}`")
+                                if rows_to_evaluate:
+                                    r0 = rows_to_evaluate[0]
+                                    st.write(f"**첫번째 saved_at_utc:** `{r0['saved_at_utc']}`")
+                                    st.write(f"**첫번째 ticker:** `{r0['ticker']}`")
+
                             # ── 수익률 계산 ────────────────────────────────────
                             result_rows = []
                             for row in rows_to_evaluate:
