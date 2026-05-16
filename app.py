@@ -6816,7 +6816,9 @@ if st.session_state.get("logged_in"):
 
                                     # Rolling 차트 (Altair line chart)
                                     chart_data.index = pd.to_datetime(chart_data.index)
-                                    chart_data = chart_data.reset_index().rename(columns={"index": "날짜"})
+                                    chart_data = chart_data.reset_index()
+                                    date_col = chart_data.columns[0]
+                                    chart_data = chart_data.rename(columns={date_col: "날짜"})
                                     chart_long = chart_data.melt(
                                         id_vars="날짜", var_name="종류", value_name="누적수익률(100=시작)"
                                     )
