@@ -6703,7 +6703,161 @@ if st.session_state.get("logged_in"):
                                     st.success("✅ 고상관 종목 쌍 없음 — 포트폴리오가 적절히 분산되어 있어요.")
                 except Exception as e:
                     st.warning(f"Correlation Matrix 계산 중 오류가 발생했습니다: {e}")
-    
+
+                # ── Personal Benchmark 비교 ────────────────────────────────
+                st.divider()
+                st.markdown("### 📈 Personal Benchmark 비교")
+                st.caption(
+                    "보유 종목의 **현재 비중(자산 비중)** 기준으로 가중 수익률을 계산해 "
+                    "SPY · QQQ와 동일 시작점(100)으로 비교합니다."
+                )
+
+                bench_period = st.radio(
+                    "비교 기간",
+                    options=["1개월", "3개월", "6개월", "1년"],
+                    index=1,
+                    horizontal=True,
+                    key="benchmark_period_radio",
+                )
+                period_td_map = {"1개월": 21, "3개월": 63, "6개월": 126, "1년": 252}
+                bench_lookback = period_td_map[bench_period]
+
+                try:
+                    # 포트폴리오 종목 + SPY + QQQ 한 번에 다운로드
+                    bench_tickers_raw = sell_radar_df["티커"].dropna().astype(str).unique().tolist()
+                    bench_tickers_raw = [t for t in bench_tickers_raw if t]
+                    if not bench_tickers_raw:
+                        st.info("Benchmark 비교를 위한 포트폴리오 종목이 없습니다.")
+                    else:
+                        all_bench_tickers = tuple(sorted(set(bench_tickers_raw + ["SPY", "QQQ"])))
+                        bench_close_df = cached_portfolio_yf_close_1y(all_bench_tickers)
+
+                        if bench_close_df is None or bench_close_df.empty:
+                            st.warning("Benchmark 비교 데이터를 불러오지 못했습니다.")
+                        else:
+                            # 최근 bench_lookback 거래일만 슬라이싱
+                            bench_close_df = bench_close_df.dropna(how="all")
+                            if len(bench_close_df) > bench_lookback:
+                                bench_close_df = bench_close_df.iloc[-bench_lookback:]
+
+                            # 자산 비중 계산 (sell_radar_df의 자산 비중 컬럼 활용)
+                            weight_series = pd.to_numeric(
+                                sell_radar_df.set_index("티커")["자산 비중(%)"], errors="coerce"
+                            ).dropna()
+                            weight_series = weight_series[weight_series > 0]
+                            total_w = weight_series.sum()
+                            if total_w > 0:
+                                weight_series = weight_series / total_w  # 합계 1로 정규화
+
+                            # 포트폴리오 가중 일별 수익률 계산
+                            valid_bench_tickers = [
+                                t for t in weight_series.index
+                                if t in bench_close_df.columns
+                            ]
+                            if not valid_bench_tickers:
+                                st.warning("비중 데이터가 있는 종목의 가격 데이터를 불러오지 못했습니다.")
+                            else:
+                                price_df = bench_close_df[valid_bench_tickers].copy()
+                                price_df = price_df.ffill().dropna(how="all")
+                                ret_df = price_df.pct_change().fillna(0)
+
+                                # 각 종목 비중으로 weighted return 계산
+                                weights = weight_series.reindex(valid_bench_tickers).fillna(0)
+                                weights = weights / weights.sum()
+                                portfolio_daily_ret = (ret_df * weights.values).sum(axis=1)
+
+                                # 100 기준 누적 수익률 (normalized)
+                                portfolio_cum = (1 + portfolio_daily_ret).cumprod() * 100
+
+                                # SPY, QQQ normalized
+                                chart_data = pd.DataFrame({"내 포트폴리오": portfolio_cum})
+                                for bm in ["SPY", "QQQ"]:
+                                    if bm in bench_close_df.columns:
+                                        bm_series = pd.to_numeric(
+                                            bench_close_df[bm], errors="coerce"
+                                        ).ffill().dropna()
+                                        if len(bm_series) > bench_lookback:
+                                            bm_series = bm_series.iloc[-bench_lookback:]
+                                        bm_ret = bm_series.pct_change().fillna(0)
+                                        bm_cum = (1 + bm_ret).cumprod() * 100
+                                        bm_cum.index = portfolio_cum.index[:len(bm_cum)]
+                                        chart_data[bm] = bm_cum
+
+                                chart_data = chart_data.dropna(how="all")
+
+                                if chart_data.empty:
+                                    st.warning("차트를 그릴 데이터가 부족합니다.")
+                                else:
+                                    # 최종 수익률 요약
+                                    final_vals = chart_data.iloc[-1]
+                                    mc1, mc2, mc3 = st.columns(3)
+                                    port_ret_final = float(final_vals.get("내 포트폴리오", 100)) - 100
+                                    spy_ret_final = float(final_vals.get("SPY", 100)) - 100
+                                    qqq_ret_final = float(final_vals.get("QQQ", 100)) - 100
+                                    with mc1:
+                                        st.metric(
+                                            f"내 포트폴리오 ({bench_period})",
+                                            f"{port_ret_final:+.2f}%",
+                                        )
+                                    with mc2:
+                                        alpha_spy = port_ret_final - spy_ret_final
+                                        st.metric(
+                                            f"SPY vs 포트폴리오 Alpha",
+                                            f"{spy_ret_final:+.2f}%",
+                                            delta=f"Alpha {alpha_spy:+.2f}%p",
+                                        )
+                                    with mc3:
+                                        alpha_qqq = port_ret_final - qqq_ret_final
+                                        st.metric(
+                                            f"QQQ vs 포트폴리오 Alpha",
+                                            f"{qqq_ret_final:+.2f}%",
+                                            delta=f"Alpha {alpha_qqq:+.2f}%p",
+                                        )
+
+                                    # Rolling 차트 (Altair line chart)
+                                    chart_data.index = pd.to_datetime(chart_data.index)
+                                    chart_data = chart_data.reset_index().rename(columns={"index": "날짜"})
+                                    chart_long = chart_data.melt(
+                                        id_vars="날짜", var_name="종류", value_name="누적수익률(100=시작)"
+                                    )
+                                    color_scale = alt.Scale(
+                                        domain=["내 포트폴리오", "SPY", "QQQ"],
+                                        range=["#3b82f6", "#f59e0b", "#10b981"],
+                                    )
+                                    line_chart = (
+                                        alt.Chart(chart_long)
+                                        .mark_line(strokeWidth=2)
+                                        .encode(
+                                            x=alt.X("날짜:T", title="날짜"),
+                                            y=alt.Y(
+                                                "누적수익률(100=시작):Q",
+                                                title="누적 수익률 (시작=100)",
+                                                scale=alt.Scale(zero=False),
+                                            ),
+                                            color=alt.Color("종류:N", scale=color_scale, title=""),
+                                            tooltip=[
+                                                alt.Tooltip("날짜:T", format="%Y-%m-%d"),
+                                                alt.Tooltip("종류:N"),
+                                                alt.Tooltip("누적수익률(100=시작):Q", format=".2f"),
+                                            ],
+                                        )
+                                        .properties(height=320)
+                                        .interactive()
+                                    )
+                                    rule = (
+                                        alt.Chart(pd.DataFrame({"y": [100]}))
+                                        .mark_rule(color="gray", strokeDash=[4, 4], strokeWidth=1)
+                                        .encode(y="y:Q")
+                                    )
+                                    st.altair_chart(line_chart + rule, use_container_width=True)
+                                    st.caption(
+                                        "🔵 내 포트폴리오 · 🟡 SPY · 🟢 QQQ | "
+                                        "시작점 100 기준 normalized. 포트폴리오는 현재 자산 비중으로 계산되며, "
+                                        "실제 매수 시점과 다를 수 있습니다."
+                                    )
+                except Exception as e:
+                    st.warning(f"Benchmark 비교 차트 계산 중 오류가 발생했습니다: {e}")
+
     elif main_nav == _MAIN_NAV_OPTIONS[6]:
         # ─────────────────────────────────────────────────────────────────────
         # 🎯 AI 내러티브 적중률 트래커
