@@ -1575,24 +1575,40 @@ def analyze_us_macro_dashboard():
         }
     )
 
-    # Fear & Greed Index — 이미 가져온 vix_hist 재사용
-    _vix_series_fg = pd.Series(dtype=float)
+    # Market Sentiment Score — VIX 데이터 직접 인라인 계산 (별도 API 호출 없음)
+    fg_score = np.nan
+    fg_rating = "N/A"
+    fg_status = MACRO_STATUS_NA
     try:
         if vix_hist is not None and not vix_hist.empty and "Close" in vix_hist.columns:
-            _vix_series_fg = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
+            _vix_s = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
+            if len(_vix_s) >= 20 and pd.notna(vix_val):
+                # VIX 백분위 역산 → 낮을수록 탐욕
+                _vix_pct = float((_vix_s < float(vix_val)).sum() / len(_vix_s) * 100)
+                fg_score = float(np.clip(100.0 - _vix_pct, 0, 100))
+                if fg_score >= 75:
+                    fg_rating, fg_status = "Extreme Greed", MACRO_STATUS_FAIL
+                elif fg_score >= 55:
+                    fg_rating, fg_status = "Greed", MACRO_STATUS_WARN
+                elif fg_score >= 45:
+                    fg_rating, fg_status = "Neutral", MACRO_STATUS_PASS
+                elif fg_score >= 25:
+                    fg_rating, fg_status = "Fear", MACRO_STATUS_PASS
+                else:
+                    fg_rating, fg_status = "Extreme Fear", MACRO_STATUS_PASS
     except Exception:
         pass
-    fg_score, fg_rating, fg_status = fetch_fear_greed_index(vix_series=_vix_series_fg)
     rows.append({
-        "지표": "Fear & Greed Index (CNN)",
+        "지표": "Market Sentiment (VIX 기반)",
         "현재값": f"{fg_score:.0f} / 100 ({fg_rating})" if pd.notna(fg_score) else "N/A",
         "판정": macro_status_label(fg_status),
         "판독 요약": (
-            "극단적 탐욕 구간. 과매수 경고, 조정 가능성 높음." if fg_score >= 75
-            else "탐욕 구간. 추격 매수 주의." if fg_score >= 55
-            else "극단적 공포 구간. 역발상 매수 기회일 수 있습니다." if fg_score <= 25
-            else "중립~공포 구간. 시장 심리 정상화 중."
-        ) if pd.notna(fg_score) else "데이터 수신 실패.",
+            "극단적 탐욕 구간. 과매수 경고, 조정 가능성 높음." if pd.notna(fg_score) and fg_score >= 75
+            else "탐욕 구간. 추격 매수 주의." if pd.notna(fg_score) and fg_score >= 55
+            else "극단적 공포 구간. 역발상 매수 기회일 수 있습니다." if pd.notna(fg_score) and fg_score <= 25
+            else "중립~공포 구간. 시장 심리 정상화 중." if pd.notna(fg_score)
+            else "VIX 데이터 부족."
+        ),
         "_status": fg_status,
     })
 
