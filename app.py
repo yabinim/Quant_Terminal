@@ -687,6 +687,7 @@ _MAIN_NAV_OPTIONS = (
     "🚀 [2단계] AI 종목 스캐너",
     "🔬 [3단계] 개별 종목 정밀 검사",
     "🛡️ [4단계] 포트폴리오 매도 레이더",
+    "🎯 [AI] 내러티브 적중률 트래커",
 )
 
 # 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
@@ -6402,6 +6403,347 @@ if st.session_state.get("logged_in"):
                 )
                 st.dataframe(styled_sell_radar, use_container_width=True, hide_index=True)
     
+    elif main_nav == _MAIN_NAV_OPTIONS[6]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 🎯 AI 내러티브 적중률 트래커
+        # Narratives 시트에 저장된 Winners/Emerging 티커의 실제 수익률을 역산해
+        # AI의 예측 품질을 정량적으로 평가합니다.
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader("🎯 AI 내러티브 적중률 트래커")
+        st.caption(
+            "`Narratives` 시트의 **Winners / Emerging** 티커를 기준으로, "
+            "내러티브 생성 시점 이후 **실제 주가 수익률**을 역산해 AI의 예측 품질을 정량 평가합니다. "
+            "적중 기준: 내러티브 생성 후 해당 기간 내 **+5% 이상** 상승."
+        )
+
+        uid_tracker = str(st.session_state.get("user_id") or "").strip()
+
+        # ── 설정 컨트롤 ────────────────────────────────────────────────────
+        ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
+        with ctrl_col1:
+            lookback_days = st.selectbox(
+                "분석 기간 (최근 N일 내러티브)",
+                options=[7, 14, 30, 60, 90],
+                index=1,
+                key="tracker_lookback_days",
+                help="몇 일 이내에 생성된 내러티브를 평가 대상으로 할지 설정합니다.",
+            )
+        with ctrl_col2:
+            eval_horizon = st.selectbox(
+                "수익률 측정 기간",
+                options=["1주(5거래일)", "2주(10거래일)", "1개월(21거래일)"],
+                index=0,
+                key="tracker_eval_horizon",
+                help="내러티브 생성 시점 이후 몇 거래일 후 수익률을 측정할지 설정합니다.",
+            )
+        with ctrl_col3:
+            hit_threshold = st.number_input(
+                "적중 기준 (%)",
+                min_value=1.0,
+                max_value=20.0,
+                value=5.0,
+                step=0.5,
+                format="%.1f",
+                key="tracker_hit_threshold",
+                help="이 수익률(%) 이상이면 '적중'으로 판정합니다.",
+            )
+
+        horizon_map = {
+            "1주(5거래일)": 5,
+            "2주(10거래일)": 10,
+            "1개월(21거래일)": 21,
+        }
+        horizon_td = horizon_map[eval_horizon]
+
+        run_tracker = st.button(
+            "📊 적중률 분석 실행",
+            key="run_accuracy_tracker_btn",
+            type="primary",
+            use_container_width=True,
+        )
+
+        if run_tracker:
+            with st.spinner("Narratives 시트에서 기록을 불러오는 중..."):
+                all_records, sheet_err = fetch_narrative_records_from_sheet()
+
+            if sheet_err:
+                st.error(f"시트 로드 실패: {sheet_err}")
+            elif not all_records:
+                st.info("분석 가능한 내러티브 기록이 없습니다. 먼저 내러티브를 생성하고 저장해주세요.")
+            else:
+                # user_id 필터링
+                user_records = [
+                    r for r in all_records
+                    if str(r.get("_sheet_user_id") or "").strip().upper() == uid_tracker.upper()
+                ]
+
+                if not user_records:
+                    st.info(f"현재 계정(`{uid_tracker}`)으로 저장된 내러티브가 없습니다.")
+                else:
+                    # lookback 필터링
+                    now_utc = datetime.now(timezone.utc)
+                    cutoff_utc = now_utc - timedelta(days=lookback_days)
+                    filtered_records = [
+                        r for r in user_records
+                        if (_narrative_parse_saved_at_utc(r.get("saved_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff_utc
+                    ]
+
+                    if not filtered_records:
+                        st.warning(f"최근 {lookback_days}일 이내 저장된 내러티브가 없습니다. 분석 기간을 늘려보세요.")
+                    else:
+                        # ── 티커 수집 ──────────────────────────────────────────
+                        rows_to_evaluate = []
+                        for rec in filtered_records:
+                            saved_at_utc = _narrative_parse_saved_at_utc(rec.get("saved_at"))
+                            if saved_at_utc is None:
+                                continue
+                            saved_at_kst = saved_at_utc.astimezone(_KST_TZ)
+                            date_label = saved_at_kst.strftime("%m/%d %H:%M")
+                            session_label = rec.get("session_label") or ""
+
+                            # Winners
+                            winners_csv = str(rec.get("_sheet_winners_csv") or "").strip()
+                            for tk in filter_scanner_ticker_list(
+                                [t.strip().upper() for t in winners_csv.split(",") if t.strip()]
+                            ):
+                                rows_to_evaluate.append({
+                                    "saved_at_utc": saved_at_utc,
+                                    "date_label": date_label,
+                                    "session": session_label,
+                                    "type": "Winners",
+                                    "ticker": tk,
+                                })
+
+                            # Emerging
+                            emerging_csv = str(rec.get("_sheet_emerging_csv") or "").strip()
+                            for tk in filter_scanner_ticker_list(
+                                [t.strip().upper() for t in emerging_csv.split(",") if t.strip()]
+                            ):
+                                rows_to_evaluate.append({
+                                    "saved_at_utc": saved_at_utc,
+                                    "date_label": date_label,
+                                    "session": session_label,
+                                    "type": "Emerging",
+                                    "ticker": tk,
+                                })
+
+                        if not rows_to_evaluate:
+                            st.warning("해당 기간 내러티브에 Winners/Emerging 티커가 기록되어 있지 않습니다.")
+                        else:
+                            unique_tickers = list(dict.fromkeys(r["ticker"] for r in rows_to_evaluate))
+                            st.info(
+                                f"**{len(filtered_records)}**개 내러티브 · **{len(unique_tickers)}**개 고유 티커 분석 중... "
+                                f"(측정 기간: {eval_horizon})"
+                            )
+
+                            # ── 가격 데이터 다운로드 ───────────────────────────
+                            with st.spinner(f"yfinance에서 {len(unique_tickers)}개 티커 가격 데이터를 받는 중..."):
+                                dl_period = "3mo" if horizon_td <= 21 else "6mo"
+                                closes = _factcheck_download_closes(unique_tickers, period=dl_period)
+
+                            # ── 수익률 계산 ────────────────────────────────────
+                            result_rows = []
+                            for row in rows_to_evaluate:
+                                tk = row["ticker"]
+                                saved_at_utc = row["saved_at_utc"]
+
+                                if closes.empty or tk not in closes.columns:
+                                    ret = np.nan
+                                else:
+                                    series = closes[tk].dropna()
+                                    # 내러티브 생성 날짜 이후 데이터만 슬라이싱
+                                    try:
+                                        series_after = series[series.index >= pd.Timestamp(saved_at_utc).tz_localize(None)]
+                                    except Exception:
+                                        try:
+                                            series_after = series[series.index >= pd.Timestamp(saved_at_utc.replace(tzinfo=None))]
+                                        except Exception:
+                                            series_after = series
+
+                                    if len(series_after) >= horizon_td:
+                                        base = float(series_after.iloc[0])
+                                        end_ = float(series_after.iloc[min(horizon_td - 1, len(series_after) - 1)])
+                                        ret = (end_ / base - 1.0) * 100.0 if base != 0 else np.nan
+                                    elif len(series_after) >= 2:
+                                        # 데이터가 horizon보다 짧으면 현재까지 수익률로 표시
+                                        base = float(series_after.iloc[0])
+                                        end_ = float(series_after.iloc[-1])
+                                        ret = (end_ / base - 1.0) * 100.0 if base != 0 else np.nan
+                                    else:
+                                        ret = np.nan
+
+                                hit = (pd.notna(ret) and ret >= hit_threshold)
+                                result_rows.append({
+                                    "날짜": row["date_label"],
+                                    "세션": row["session"],
+                                    "타입": row["type"],
+                                    "티커": tk,
+                                    f"수익률(%, {eval_horizon})": ret,
+                                    "적중 여부": "✅ 적중" if hit else ("N/A" if pd.isna(ret) else "❌ 미적중"),
+                                })
+
+                            result_df = pd.DataFrame(result_rows)
+
+                            # ── 요약 지표 ──────────────────────────────────────
+                            st.divider()
+                            st.markdown("### 📈 종합 적중률 요약")
+
+                            valid_df = result_df[result_df["적중 여부"] != "N/A"].copy()
+                            total_valid = len(valid_df)
+                            hit_count = (valid_df["적중 여부"] == "✅ 적중").sum()
+                            hit_rate = (hit_count / total_valid * 100) if total_valid > 0 else 0.0
+
+                            winners_df = valid_df[valid_df["타입"] == "Winners"]
+                            emerging_df = valid_df[valid_df["타입"] == "Emerging"]
+                            w_hit = (winners_df["적중 여부"] == "✅ 적중").sum()
+                            e_hit = (emerging_df["적중 여부"] == "✅ 적중").sum()
+                            w_rate = (w_hit / len(winners_df) * 100) if len(winners_df) > 0 else 0.0
+                            e_rate = (e_hit / len(emerging_df) * 100) if len(emerging_df) > 0 else 0.0
+
+                            avg_ret_winners = pd.to_numeric(
+                                winners_df[f"수익률(%, {eval_horizon})"], errors="coerce"
+                            ).mean()
+                            avg_ret_emerging = pd.to_numeric(
+                                emerging_df[f"수익률(%, {eval_horizon})"], errors="coerce"
+                            ).mean()
+
+                            m1, m2, m3, m4 = st.columns(4)
+                            with m1:
+                                st.metric(
+                                    "전체 적중률",
+                                    f"{hit_rate:.1f}%",
+                                    delta=f"{hit_count}/{total_valid}건",
+                                )
+                            with m2:
+                                st.metric(
+                                    "Winners 적중률",
+                                    f"{w_rate:.1f}%",
+                                    delta=f"평균 {avg_ret_winners:+.1f}%" if pd.notna(avg_ret_winners) else "N/A",
+                                )
+                            with m3:
+                                st.metric(
+                                    "Emerging 적중률",
+                                    f"{e_rate:.1f}%",
+                                    delta=f"평균 {avg_ret_emerging:+.1f}%" if pd.notna(avg_ret_emerging) else "N/A",
+                                )
+                            with m4:
+                                na_count = (result_df["적중 여부"] == "N/A").sum()
+                                st.metric(
+                                    "데이터 없음",
+                                    f"{na_count}건",
+                                    delta="yfinance 미수신 티커",
+                                )
+
+                            # 적중률 수준별 평가 메시지
+                            if total_valid > 0:
+                                if hit_rate >= 60:
+                                    st.success(
+                                        f"🏆 AI 예측 품질 우수: 적중률 **{hit_rate:.1f}%** — "
+                                        f"내러티브 신호를 적극 활용할 수 있는 수준입니다."
+                                    )
+                                elif hit_rate >= 40:
+                                    st.warning(
+                                        f"🟡 AI 예측 품질 보통: 적중률 **{hit_rate:.1f}%** — "
+                                        f"내러티브를 참고 지표로만 활용하고, 다른 기준과 병행하세요."
+                                    )
+                                else:
+                                    st.error(
+                                        f"🔴 AI 예측 품질 저조: 적중률 **{hit_rate:.1f}%** — "
+                                        f"현재 시장 환경이 내러티브 패턴과 맞지 않을 수 있습니다."
+                                    )
+
+                            # ── 티커별 베스트/워스트 ──────────────────────────
+                            st.divider()
+                            st.markdown("### 🏅 티커별 수익률 순위")
+
+                            ticker_summary = (
+                                result_df.groupby("티커")
+                                .agg(
+                                    타입=("타입", "first"),
+                                    평균수익률=(f"수익률(%, {eval_horizon})", lambda x: pd.to_numeric(x, errors="coerce").mean()),
+                                    등장횟수=("티커", "count"),
+                                )
+                                .reset_index()
+                                .sort_values("평균수익률", ascending=False, na_position="last")
+                            )
+
+                            best5 = ticker_summary.head(5)
+                            worst5 = ticker_summary.tail(5).sort_values("평균수익률", ascending=True)
+
+                            rank_col1, rank_col2 = st.columns(2)
+                            with rank_col1:
+                                st.markdown("#### 🟢 Best 5 티커")
+                                for _, r in best5.iterrows():
+                                    val = r["평균수익률"]
+                                    val_str = f"{val:+.2f}%" if pd.notna(val) else "N/A"
+                                    st.markdown(
+                                        f"**{r['티커']}** `{r['타입']}` — {val_str} "
+                                        f"_(등장 {int(r['등장횟수'])}회)_"
+                                    )
+
+                            with rank_col2:
+                                st.markdown("#### 🔴 Worst 5 티커")
+                                for _, r in worst5.iterrows():
+                                    val = r["평균수익률"]
+                                    val_str = f"{val:+.2f}%" if pd.notna(val) else "N/A"
+                                    st.markdown(
+                                        f"**{r['티커']}** `{r['타입']}` — {val_str} "
+                                        f"_(등장 {int(r['등장횟수'])}회)_"
+                                    )
+
+                            # ── 상세 결과 테이블 ──────────────────────────────
+                            st.divider()
+                            st.markdown("### 📋 상세 결과 테이블")
+                            ret_col = f"수익률(%, {eval_horizon})"
+
+                            def _style_hit(val):
+                                if "적중" in str(val):
+                                    return "color: #16a34a; font-weight: 700;"
+                                if "미적중" in str(val):
+                                    return "color: #dc2626; font-weight: 600;"
+                                return "color: #9ca3af;"
+
+                            def _style_return(val):
+                                v = pd.to_numeric(val, errors="coerce")
+                                if pd.isna(v):
+                                    return "color: #9ca3af;"
+                                if v >= hit_threshold:
+                                    return "color: #16a34a; font-weight: 600;"
+                                if v < 0:
+                                    return "color: #dc2626;"
+                                return ""
+
+                            styled_result = (
+                                result_df.style
+                                .format(
+                                    {ret_col: lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A"},
+                                    na_rep="N/A",
+                                )
+                                .map(_style_hit, subset=["적중 여부"])
+                                .map(_style_return, subset=[ret_col])
+                                .background_gradient(
+                                    cmap="RdYlGn",
+                                    subset=[ret_col],
+                                    axis=0,
+                                )
+                            )
+                            st.dataframe(styled_result, use_container_width=True, hide_index=True)
+
+                            st.caption(
+                                f"⚠️ 적중 기준: 내러티브 생성 시점 이후 {eval_horizon} 기준 **+{hit_threshold:.1f}%** 이상 상승. "
+                                "데이터가 horizon보다 짧은 경우 현재까지 수익률로 대체합니다. 투자 권유가 아닙니다."
+                            )
+
+        else:
+            # 버튼 미클릭 상태 안내
+            st.info(
+                "설정을 완료한 후 **📊 적중률 분석 실행** 버튼을 클릭하면 분석이 시작됩니다.\n\n"
+                "**분석 방식:**\n"
+                "- `Narratives` 시트에서 현재 계정의 내러티브 기록을 불러옵니다.\n"
+                "- 각 내러티브의 **Winners**와 **Emerging** 티커에 대해 생성 시점 이후 수익률을 계산합니다.\n"
+                "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
+            )
+
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
         st.caption(
