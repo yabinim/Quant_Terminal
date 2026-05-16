@@ -1325,24 +1325,62 @@ def fetch_dxy_latest_and_mean_deviation():
 
 
 def fetch_fear_greed_index() -> tuple[float, str, str]:
-    """CNN Fear & Greed Index API. (score, rating, status)"""
+    """
+    VIX 기반 자체 Fear & Greed Score 계산 (0~100).
+    VIX 1년 히스토리에서 현재 VIX의 백분위(percentile)를 역산:
+      - VIX 백분위 높을수록 공포 → 점수 낮음
+      - VIX 백분위 낮을수록 탐욕 → 점수 높음
+    추가로 SPY 단기 모멘텀(21일 수익률)을 보조 팩터로 합산.
+    """
     try:
-        url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=8)
-        if resp.status_code != 200:
+        # VIX 1년 히스토리
+        vix_hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
+        if vix_hist is None or vix_hist.empty or "Close" not in vix_hist.columns:
             return np.nan, "N/A", MACRO_STATUS_NA
-        data = resp.json()
-        score = float(data.get("fear_and_greed", {}).get("score", np.nan))
-        rating = str(data.get("fear_and_greed", {}).get("rating", "N/A"))
-        if score >= 75:
-            status = MACRO_STATUS_FAIL   # 극단적 탐욕 → 과매수
-        elif score >= 55:
-            status = MACRO_STATUS_WARN   # 탐욕
-        elif score <= 25:
-            status = MACRO_STATUS_PASS   # 극단적 공포 → 매수 기회
+        vix_series = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
+        if len(vix_series) < 20:
+            return np.nan, "N/A", MACRO_STATUS_NA
+        current_vix = float(vix_series.iloc[-1])
+
+        # VIX 백분위 (높을수록 공포)
+        vix_pct = float((vix_series < current_vix).sum() / len(vix_series) * 100)
+        # 공포 점수 = 100 - VIX백분위 (VIX 낮을수록 탐욕 = 점수 높음)
+        vix_score = 100.0 - vix_pct
+
+        # SPY 21일 모멘텀 보조 팩터
+        spy_hist = yf.Ticker("SPY").history(period="3mo", auto_adjust=False)
+        spy_mom = np.nan
+        if spy_hist is not None and not spy_hist.empty and "Close" in spy_hist.columns:
+            spy_close = pd.to_numeric(spy_hist["Close"], errors="coerce").dropna()
+            if len(spy_close) >= 22:
+                spy_mom = float((spy_close.iloc[-1] / spy_close.iloc[-22] - 1.0) * 100)
+
+        # 최종 점수: VIX 70% + SPY 모멘텀 30%
+        if pd.notna(spy_mom):
+            # SPY 모멘텀을 0~100으로 변환 (-10%~+10% 범위 기준)
+            spy_score = float(np.clip((spy_mom + 10) / 20 * 100, 0, 100))
+            score = vix_score * 0.7 + spy_score * 0.3
         else:
+            score = vix_score
+
+        score = float(np.clip(score, 0, 100))
+
+        if score >= 75:
+            rating = "Extreme Greed"
+            status = MACRO_STATUS_FAIL
+        elif score >= 55:
+            rating = "Greed"
+            status = MACRO_STATUS_WARN
+        elif score >= 45:
+            rating = "Neutral"
             status = MACRO_STATUS_PASS
+        elif score >= 25:
+            rating = "Fear"
+            status = MACRO_STATUS_PASS
+        else:
+            rating = "Extreme Fear"
+            status = MACRO_STATUS_PASS
+
         return score, rating, status
     except Exception:
         return np.nan, "N/A", MACRO_STATUS_NA
