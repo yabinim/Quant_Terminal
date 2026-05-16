@@ -838,6 +838,7 @@ _MAIN_NAV_OPTIONS = (
     "🛡️ [4단계] 포트폴리오 매도 레이더",
     "🎯 [AI] 내러티브 적중률 트래커",
     "💡 [AI] Idea-to-Portfolio 추적",
+    "📋 [AI] 주간 포트폴리오 요약",
 )
 
 # 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
@@ -4783,6 +4784,158 @@ def _narrative_timeseries_briefing_model():
     )
 
 
+def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context: list, macro_context: dict) -> str:
+    """
+    포트폴리오 현황 + 최근 내러티브 + Macro 지표를 묶어 Gemini로 주간 요약 리포트 생성.
+    반환: 마크다운 문자열
+    """
+    portfolio_json = json.dumps(portfolio_context, ensure_ascii=False)
+    narrative_json = json.dumps(narrative_context[:10], ensure_ascii=False)
+    macro_json = json.dumps(macro_context, ensure_ascii=False)
+
+    prompt = f"""
+당신은 개인 투자자의 전담 퀀트 애널리스트입니다.
+아래 세 가지 데이터를 종합해 **주간 포트폴리오 리뷰 리포트**를 한국어 마크다운으로 작성하세요.
+
+[1] 포트폴리오 현황
+{portfolio_json}
+
+[2] 최근 AI 내러티브 요약 (최신 10개)
+{narrative_json}
+
+[3] 거시경제 지표 현황
+{macro_json}
+
+---
+작성 규칙:
+1) 데이터에 없는 내용은 추측하지 마세요.
+2) 반드시 아래 섹션 구조를 지켜 마크다운으로 작성하세요.
+3) 각 섹션은 간결하고 실전적으로, 투자 판단에 바로 쓸 수 있는 내용으로.
+
+## 📊 이번 주 포트폴리오 요약
+- 전체 수익률, 최고/최저 종목, 주목할 변화 한 줄씩
+
+## 🌐 거시경제 환경 점검
+- 현재 Macro 지표가 포트폴리오에 미치는 영향 (긍정/부정 요인)
+
+## 🧠 AI 내러티브와 포트폴리오 연결
+- 이번 주 AI가 강조한 테마와 내 포트폴리오 종목의 연관성
+- 내러티브 상 수혜가 예상되는 보유 종목 vs 위험 종목
+
+## ⚠️ 리스크 점검
+- 고상관 종목 쌍, 섹터 편중, Drawdown 주의 종목
+
+## 🎯 다음 주 액션 플랜
+- 모니터링 우선순위 3가지 (매수/매도/관망 판단 기준 포함)
+"""
+
+    try:
+        summary_model = _GenAIModel(
+            "gemini-2.5-flash",
+            generation_config={
+                "temperature": 0.3,
+                "top_p": 1,
+                "top_k": 1,
+                "max_output_tokens": 4096,
+            },
+        )
+        response = summary_model.generate_content(prompt)
+        raw = _gemini_response_text_utf8_safe(response)
+        return raw if raw else ""
+    except Exception as exc:
+        return f"Weekly Summary 생성 실패: {exc}"
+
+
+def _build_portfolio_context_for_summary(sell_radar_df: pd.DataFrame) -> dict:
+    """sell_radar_df에서 Gemini 입력용 포트폴리오 context 생성."""
+    if sell_radar_df is None or sell_radar_df.empty:
+        return {}
+    rows = []
+    for _, r in sell_radar_df.iterrows():
+        ret = pd.to_numeric(r.get("수익률(%)"), errors="coerce")
+        alpha = pd.to_numeric(r.get("SPY Alpha(%)"), errors="coerce")
+        dd = pd.to_numeric(r.get("Drawdown(%)"), errors="coerce")
+        rows.append({
+            "ticker": str(r.get("티커", "")),
+            "account": str(r.get("계좌", "")),
+            "return_pct": round(float(ret), 2) if pd.notna(ret) else None,
+            "spy_alpha_pct": round(float(alpha), 2) if pd.notna(alpha) else None,
+            "drawdown_pct": round(float(dd), 2) if pd.notna(dd) else None,
+            "status": str(r.get("상태(Status)", "")),
+        })
+    total_gl = pd.to_numeric(sell_radar_df["투자 손익($)"], errors="coerce").sum()
+    return {
+        "total_gain_loss_usd": round(float(total_gl), 2) if pd.notna(total_gl) else None,
+        "positions": rows,
+    }
+
+
+def _build_narrative_context_for_summary(user_id: str) -> list:
+    """최근 내러티브에서 Gemini 입력용 context 생성 (최신 10개)."""
+    records, _ = fetch_narrative_records_from_sheet()
+    if not records:
+        return []
+    uid_u = str(user_id).strip().upper()
+    user_recs = [
+        r for r in reversed(records)
+        if str(r.get("_sheet_user_id", "")).strip().upper() == uid_u
+    ][:10]
+    out = []
+    for rec in user_recs:
+        analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+        saved_at = rec.get("saved_at", "")
+        themes = analysis.get("themes", [])
+        theme_titles = [str(t.get("title", "")) for t in themes if isinstance(t, dict)]
+        out.append({
+            "saved_at": saved_at,
+            "session": rec.get("session_label", ""),
+            "regime": analysis.get("regime", {}),
+            "themes": theme_titles[:5],
+            "rotation": str(analysis.get("rotation", ""))[:300],
+            "winners_csv": str(rec.get("_sheet_winners_csv", ""))[:200],
+        })
+    return out
+
+
+def _build_macro_context_for_summary() -> dict:
+    """cached_analyze_us_macro_dashboard에서 Gemini 입력용 macro context 생성."""
+    try:
+        macro_rows = cached_analyze_us_macro_dashboard()
+        if not macro_rows:
+            return {}
+        out = {}
+        for row in macro_rows:
+            label = str(row.get("지표", ""))
+            val = str(row.get("현재값", ""))
+            status = str(row.get("_status", ""))
+            note = str(row.get("판독 요약", ""))[:100]
+            out[label] = {"value": val, "status": status, "note": note}
+        return out
+    except Exception:
+        return {}
+
+
+def _save_weekly_summary_to_narratives(user_id: str, summary_text: str) -> tuple[bool, str]:
+    """주간 요약을 Narratives 시트에 저장."""
+    if not summary_text or not user_id:
+        return False, "내용 또는 user_id가 없습니다."
+    rec = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "language": "ko",
+        "session_label": "📋 Weekly Portfolio Summary",
+        "analysis": {
+            "source": "weekly_portfolio_summary",
+            "summary": summary_text,
+            "themes": [],
+            "regime": {},
+            "rotation": "",
+        },
+    }
+    row = _narrative_record_to_sheet_row(rec, user_id)
+    ok, err = append_narrative_row_to_sheet(row)
+    return ok, err
+
+
 def run_narrative_timeseries_gemini(kind, records_payload, target_language):
     """
     kind: 'daily' | 'weekly' | 'wow'
@@ -7346,6 +7499,136 @@ if st.session_state.get("logged_in"):
                 .rename(columns={"Thesis_Title": "연결된 Thesis"})
             )
             st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
+
+    elif main_nav == _MAIN_NAV_OPTIONS[8]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 📋 주간 포트폴리오 AI 요약
+        # 포트폴리오 현황 + 최근 내러티브 + Macro를 묶어 Gemini로 주간 리포트 생성
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader("📋 주간 포트폴리오 AI 요약")
+        st.caption(
+            "현재 포트폴리오 상태 · 최근 AI 내러티브 · 거시경제 지표를 종합해 "
+            "Gemini가 **주간 투자 리뷰 리포트**를 자동 생성합니다. "
+            "생성된 리포트는 `Narratives` 시트에 자동 저장돼요."
+        )
+
+        uid_weekly = str(st.session_state.get("user_id") or "").strip()
+
+        # ── 이전 저장된 요약 불러오기 ──────────────────────────────────────
+        with st.expander("📚 이전 주간 요약 기록 보기", expanded=False):
+            prev_records, _ = fetch_narrative_records_from_sheet()
+            prev_summaries = [
+                r for r in (prev_records or [])
+                if str(r.get("_sheet_user_id", "")).strip().upper() == uid_weekly.upper()
+                and isinstance(r.get("analysis"), dict)
+                and r["analysis"].get("source") == "weekly_portfolio_summary"
+            ]
+            if not prev_summaries:
+                st.caption("저장된 주간 요약이 없습니다.")
+            else:
+                prev_summaries_sorted = sorted(
+                    prev_summaries,
+                    key=lambda r: _narrative_parse_saved_at_utc(r.get("saved_at"))
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    reverse=True,
+                )
+                for prev in prev_summaries_sorted[:5]:
+                    dt = _narrative_parse_saved_at_utc(prev.get("saved_at"))
+                    dt_str = dt.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M") if dt else "날짜 불명"
+                    summary_text = prev["analysis"].get("summary", "")
+                    with st.expander(f"📋 {dt_str} (KST)", expanded=False):
+                        st.markdown(summary_text)
+
+        st.divider()
+
+        # ── 데이터 미리보기 ────────────────────────────────────────────────
+        with st.expander("📊 분석에 사용될 데이터 미리보기", expanded=False):
+            col_p, col_m = st.columns(2)
+            with col_p:
+                st.markdown("**포트폴리오 종목**")
+                preview_portfolio = load_portfolio()
+                if preview_portfolio.empty:
+                    st.caption("포트폴리오가 없습니다.")
+                else:
+                    st.dataframe(
+                        preview_portfolio[["Account", "Ticker"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            with col_m:
+                st.markdown("**거시경제 지표**")
+                macro_preview = _build_macro_context_for_summary()
+                if not macro_preview:
+                    st.caption("Macro 데이터 없음")
+                else:
+                    for k, v in list(macro_preview.items())[:5]:
+                        status_icon = "✅" if v["status"] == "pass" else ("🟡" if v["status"] == "warning" else "🔴")
+                        st.caption(f"{status_icon} {k}: {v['value']}")
+
+            st.markdown("**최근 내러티브 테마**")
+            narr_preview = _build_narrative_context_for_summary(uid_weekly)
+            if not narr_preview:
+                st.caption("내러티브 기록 없음")
+            else:
+                for n in narr_preview[:3]:
+                    themes_str = " · ".join(n.get("themes", [])[:3])
+                    st.caption(f"- {n.get('session', '')} | {themes_str}")
+
+        st.divider()
+
+        # ── 생성 버튼 ──────────────────────────────────────────────────────
+        st.info(
+            "💡 리포트 생성 전 **[4단계] 포트폴리오 매도 레이더**를 한 번 열어두면 "
+            "포트폴리오 수익률 데이터가 더 정확하게 반영됩니다."
+        )
+
+        if st.button(
+            "🤖 주간 AI 리포트 생성",
+            key="generate_weekly_summary_btn",
+            type="primary",
+            use_container_width=True,
+        ):
+            with st.status("주간 리포트를 생성하는 중...", expanded=True) as weekly_status:
+                st.write("📊 포트폴리오 데이터 수집 중...")
+                portfolio_df_weekly = load_portfolio()
+                if portfolio_df_weekly.empty:
+                    weekly_status.update(label="❌ 포트폴리오 데이터 없음", state="error")
+                    st.error("포트폴리오에 종목을 먼저 추가해주세요.")
+                else:
+                    # sell_radar_df 계산
+                    sell_radar_weekly = build_portfolio_sell_radar_df(portfolio_df_weekly)
+                    portfolio_ctx = _build_portfolio_context_for_summary(sell_radar_weekly)
+
+                    st.write("🧠 내러티브 데이터 수집 중...")
+                    narrative_ctx = _build_narrative_context_for_summary(uid_weekly)
+
+                    st.write("🌐 거시경제 지표 수집 중...")
+                    macro_ctx = _build_macro_context_for_summary()
+
+                    st.write("✨ Gemini가 리포트를 작성하는 중... (약 20~30초 소요)")
+                    summary_md = generate_weekly_portfolio_summary(
+                        portfolio_ctx, narrative_ctx, macro_ctx
+                    )
+
+                    if not summary_md or summary_md.startswith("Weekly Summary 생성 실패"):
+                        weekly_status.update(label="❌ 리포트 생성 실패", state="error")
+                        st.error(summary_md or "알 수 없는 오류가 발생했습니다.")
+                    else:
+                        st.write("💾 Narratives 시트에 저장 중...")
+                        ok_save, err_save = _save_weekly_summary_to_narratives(uid_weekly, summary_md)
+                        if not ok_save:
+                            st.warning(f"시트 저장 실패 (리포트는 아래에서 확인 가능): {err_save}")
+                        weekly_status.update(label="✅ 주간 리포트 생성 완료!", state="complete", expanded=False)
+                        st.session_state["_weekly_summary_latest"] = summary_md
+                        st.rerun()
+
+        # ── 생성된 리포트 표시 ─────────────────────────────────────────────
+        latest_summary = st.session_state.get("_weekly_summary_latest", "")
+        if latest_summary:
+            st.divider()
+            st.success("✅ 이번 주 AI 포트폴리오 리포트")
+            st.markdown(latest_summary)
+            st.caption("이 리포트는 `Narratives` 시트에 자동 저장되었습니다. 투자 권유가 아닙니다.")
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
