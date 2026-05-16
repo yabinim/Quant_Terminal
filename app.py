@@ -2081,6 +2081,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
         "현재가",
         "투자 손익($)",
         "수익률(%)",
+        "SPY Alpha(%)",
         "Drawdown(%)",
         "200일선",
         "1개월 수익률",
@@ -2105,9 +2106,21 @@ def build_portfolio_sell_radar_df(portfolio_df):
         return pd.DataFrame(columns=_sell_radar_cols)
 
     tickers_sorted_tuple = tuple(sorted(dict.fromkeys(clean_tickers)))
-    close_df = cached_portfolio_yf_close_1y(tickers_sorted_tuple)
-    if close_df is None or close_df.empty:
+    # SPY 포함해서 한 번에 다운로드 (Alpha 계산용)
+    tickers_with_spy = tuple(sorted(dict.fromkeys(list(clean_tickers) + ["SPY"])))
+    close_df_full = cached_portfolio_yf_close_1y(tickers_with_spy)
+    if close_df_full is None or close_df_full.empty:
         return pd.DataFrame(columns=_sell_radar_cols)
+    close_df = close_df_full
+
+    # SPY 1개월 수익률 (Alpha 기준선)
+    spy_1m_return = np.nan
+    try:
+        if "SPY" in close_df_full.columns:
+            spy_series = pd.to_numeric(close_df_full["SPY"], errors="coerce").dropna()
+            spy_1m_return = calculate_period_return(spy_series, 21)
+    except Exception:
+        spy_1m_return = np.nan
 
     universe_list = read_etf_universe_file_tickers()
     universe_set = set(str(x).strip().upper() for x in universe_list if str(x).strip())
@@ -2208,6 +2221,11 @@ def build_portfolio_sell_radar_df(portfolio_df):
                     if int(rk) > 5:
                         universe_rank_cell = f"🔴 {universe_rank_cell}"
 
+        # SPY Alpha = 종목 1개월 수익률 - SPY 1개월 수익률
+        spy_alpha = np.nan
+        if pd.notna(one_month_return) and pd.notna(spy_1m_return):
+            spy_alpha = float(one_month_return) - float(spy_1m_return)
+
         rows.append(
             {
                 "계좌": account,
@@ -2217,6 +2235,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
                 "현재가": current_price,
                 "투자 손익($)": gain_loss,
                 "수익률(%)": return_pct,
+                "SPY Alpha(%)": spy_alpha,
                 "Drawdown(%)": drawdown_pct,
                 "200일선": ma200,
                 "1개월 수익률": one_month_return,
@@ -6380,6 +6399,16 @@ if st.session_state.get("logged_in"):
                         return "color: #dc2626; font-weight: 700;"
                     return ""
     
+                def style_spy_alpha(val):
+                    v = pd.to_numeric(val, errors="coerce")
+                    if pd.isna(v):
+                        return "color: #9ca3af;"
+                    if v > 0:
+                        return "color: #16a34a; font-weight: 600;"
+                    if v < 0:
+                        return "color: #dc2626; font-weight: 600;"
+                    return ""
+
                 styled_sell_radar = (
                     sell_radar_df.style.format(
                         {
@@ -6388,6 +6417,7 @@ if st.session_state.get("logged_in"):
                             "현재가": "{:,.2f}",
                             "투자 손익($)": "${:,.2f}",
                             "수익률(%)": "{:.2f}%",
+                            "SPY Alpha(%)": "{:+.2f}%",
                             "Drawdown(%)": "{:.2f}%",
                             "200일선": "{:,.2f}",
                             "1개월 수익률": "{:.2f}%",
@@ -6399,9 +6429,104 @@ if st.session_state.get("logged_in"):
                     .background_gradient(cmap="RdYlGn", subset=["투자 손익($)"], axis=0)
                     .map(highlight_deep_drawdown, subset=["Drawdown(%)"])
                     .map(style_status, subset=["상태(Status)"])
+                    .map(style_spy_alpha, subset=["SPY Alpha(%)"])
                     .map(style_universe_rank_cell, subset=["유니버스 랭킹(Universe Rank)"])
                 )
                 st.dataframe(styled_sell_radar, use_container_width=True, hide_index=True)
+
+                # ── Correlation Matrix ─────────────────────────────────────
+                st.divider()
+                st.markdown("### 🔗 보유 종목 Correlation Matrix")
+                st.caption(
+                    "최근 1년 일별 수익률 기준 종목 간 상관계수(-1 ~ +1). "
+                    "**1.0(진한 초록)** 완전 동행 · **0(노랑)** 무관 · **-1.0(진한 빨강)** 완전 역행. "
+                    "상관계수가 높은 종목끼리는 실질적으로 분산 효과가 없어요."
+                )
+                try:
+                    corr_tickers = sell_radar_df["티커"].dropna().astype(str).unique().tolist()
+                    corr_tickers = [t for t in corr_tickers if t and t != "SPY"]
+                    if len(corr_tickers) < 2:
+                        st.info("Correlation Matrix는 보유 종목이 2개 이상일 때 표시됩니다.")
+                    else:
+                        # close_df_full은 build_portfolio_sell_radar_df 내부에서만 쓰이므로
+                        # 여기선 cached_portfolio_yf_close_1y 재사용
+                        corr_tuple = tuple(sorted(dict.fromkeys(corr_tickers)))
+                        corr_close = cached_portfolio_yf_close_1y(corr_tuple)
+                        if corr_close is None or corr_close.empty:
+                            st.warning("Correlation Matrix 데이터를 불러오지 못했습니다.")
+                        else:
+                            # 유효한 ticker만 추출
+                            valid_cols = [t for t in corr_tickers if t in corr_close.columns]
+                            if len(valid_cols) < 2:
+                                st.warning("유효한 가격 데이터가 있는 종목이 2개 미만입니다.")
+                            else:
+                                price_df = corr_close[valid_cols].copy()
+                                # 일별 수익률로 변환 후 상관계수 계산
+                                ret_df = price_df.pct_change().dropna(how="all")
+                                corr_matrix = ret_df.corr()
+
+                                # Altair heatmap 렌더링
+                                corr_long = (
+                                    corr_matrix.reset_index()
+                                    .melt(id_vars="index", var_name="종목2", value_name="상관계수")
+                                    .rename(columns={"index": "종목1"})
+                                )
+                                corr_long["상관계수_표시"] = corr_long["상관계수"].map(
+                                    lambda x: f"{x:.2f}" if pd.notna(x) else "N/A"
+                                )
+                                n_tickers = len(valid_cols)
+                                cell_size = max(40, min(70, 500 // n_tickers))
+                                heatmap = (
+                                    alt.Chart(corr_long)
+                                    .mark_rect()
+                                    .encode(
+                                        x=alt.X("종목1:N", sort=valid_cols, title=None),
+                                        y=alt.Y("종목2:N", sort=valid_cols, title=None),
+                                        color=alt.Color(
+                                            "상관계수:Q",
+                                            scale=alt.Scale(scheme="redyellowgreen", domain=[-1, 1]),
+                                            title="상관계수",
+                                        ),
+                                        tooltip=["종목1:N", "종목2:N", "상관계수_표시:N"],
+                                    )
+                                    .properties(width=cell_size * n_tickers, height=cell_size * n_tickers)
+                                )
+                                text_layer = (
+                                    alt.Chart(corr_long)
+                                    .mark_text(fontSize=11, fontWeight="bold")
+                                    .encode(
+                                        x=alt.X("종목1:N", sort=valid_cols),
+                                        y=alt.Y("종목2:N", sort=valid_cols),
+                                        text="상관계수_표시:N",
+                                        color=alt.condition(
+                                            "datum.상관계수 > 0.5 || datum.상관계수 < -0.5",
+                                            alt.value("white"),
+                                            alt.value("black"),
+                                        ),
+                                    )
+                                )
+                                st.altair_chart(heatmap + text_layer, use_container_width=True)
+
+                                # 고상관 경고 (0.85 이상)
+                                high_corr_pairs = []
+                                for i, t1 in enumerate(valid_cols):
+                                    for t2 in valid_cols[i+1:]:
+                                        val = corr_matrix.loc[t1, t2]
+                                        if pd.notna(val) and abs(val) >= 0.85:
+                                            high_corr_pairs.append((t1, t2, val))
+                                if high_corr_pairs:
+                                    pair_lines = "\n".join(
+                                        f"- **{t1}** & **{t2}**: {v:.2f}"
+                                        for t1, t2, v in high_corr_pairs
+                                    )
+                                    st.warning(
+                                        "⚠️ **고상관 종목 쌍 감지** (상관계수 ≥ 0.85) — "
+                                        "실질적인 분산 효과가 낮을 수 있어요:\n" + pair_lines
+                                    )
+                                else:
+                                    st.success("✅ 고상관 종목 쌍 없음 — 포트폴리오가 적절히 분산되어 있어요.")
+                except Exception as e:
+                    st.warning(f"Correlation Matrix 계산 중 오류가 발생했습니다: {e}")
     
     elif main_nav == _MAIN_NAV_OPTIONS[6]:
         # ─────────────────────────────────────────────────────────────────────
