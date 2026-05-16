@@ -1324,73 +1324,83 @@ def fetch_dxy_latest_and_mean_deviation():
         return np.nan, np.nan, MACRO_STATUS_NA
 
 
-def fetch_fear_greed_index() -> tuple[float, str, str]:
+def fetch_fear_greed_index(vix_series: pd.Series = None) -> tuple[float, str, str]:
     """
-    VIX + SPY momentum 기반 Fear & Greed 근사 (0~100).
-    이미 캐시된 데이터를 최대한 재사용해서 추가 API 호출 최소화.
+    Market Sentiment Score (0~100) — CNN Fear & Greed 근사.
+    vix_series: 이미 가져온 VIX 1년 종가 시리즈 (있으면 재사용, 없으면 새로 fetch).
+    팩터별 독립 try-except로 하나가 실패해도 나머지로 계산.
     """
+    scores = {}
+
+    # ── 팩터 1: VIX 백분위 (50%) ─────────────────────────────────────────
     try:
-        scores = {}
-
-        # ── VIX 1년 히스토리 (핵심 팩터) ─────────────────────────────────
-        vix_hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
-        if vix_hist is not None and not vix_hist.empty and "Close" in vix_hist.columns:
+        if vix_series is None or vix_series.empty:
+            vix_hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
             vix_series = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
-            if len(vix_series) >= 20:
-                current_vix = float(vix_series.iloc[-1])
-                vix_pct = float((vix_series < current_vix).sum() / len(vix_series) * 100)
-                scores["volatility"] = (100.0 - vix_pct, 0.50)
+        if len(vix_series) >= 20:
+            cur_vix = float(vix_series.iloc[-1])
+            vix_pct = float((vix_series < cur_vix).sum() / len(vix_series) * 100)
+            scores["vix"] = (100.0 - vix_pct, 0.50)
+    except Exception:
+        pass
 
-        # ── SPY momentum (보조 팩터) ──────────────────────────────────────
-        spy_hist = yf.Ticker("SPY").history(period="6mo", auto_adjust=False)
-        if spy_hist is not None and not spy_hist.empty and "Close" in spy_hist.columns:
-            spy_close = pd.to_numeric(spy_hist["Close"], errors="coerce").dropna()
-            if len(spy_close) >= 125:
-                ma125 = float(spy_close.rolling(125).mean().iloc[-1])
-                current_spy = float(spy_close.iloc[-1])
-                dev = (current_spy / ma125 - 1.0) * 100
-                mom_score = float(np.clip((dev + 15) / 30 * 100, 0, 100))
-                scores["momentum"] = (mom_score, 0.30)
-            elif len(spy_close) >= 21:
-                ret_21d = float((spy_close.iloc[-1] / spy_close.iloc[-22] - 1.0) * 100)
-                mom_score = float(np.clip((ret_21d + 10) / 20 * 100, 0, 100))
-                scores["momentum"] = (mom_score, 0.30)
+    # ── 팩터 2: SPY vs MA125 모멘텀 (30%) ────────────────────────────────
+    try:
+        spy_hist = yf.Ticker("SPY").history(period="1y", auto_adjust=False)
+        spy_c = pd.to_numeric(spy_hist["Close"], errors="coerce").dropna()
+        if len(spy_c) >= 21:
+            if len(spy_c) >= 126:
+                ma125 = float(spy_c.rolling(125, min_periods=63).mean().iloc[-1])
+                dev = (float(spy_c.iloc[-1]) / ma125 - 1.0) * 100 if ma125 > 0 else 0
+            else:
+                dev = float((spy_c.iloc[-1] / spy_c.iloc[-22] - 1.0) * 100)
+            mom_score = float(np.clip((dev + 15) / 30 * 100, 0, 100))
+            scores["momentum"] = (mom_score, 0.30)
+    except Exception:
+        pass
 
-        # ── HYG vs LQD (Junk Bond 팩터) ──────────────────────────────────
+    # ── 팩터 3: HYG vs LQD Junk Bond (20%) ──────────────────────────────
+    try:
+        hyg_c = pd.to_numeric(yf.Ticker("HYG").history(period="2mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        lqd_c = pd.to_numeric(yf.Ticker("LQD").history(period="2mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        if len(hyg_c) >= 21 and len(lqd_c) >= 21:
+            hyg_ret = float(hyg_c.iloc[-1] / hyg_c.iloc[-22] - 1.0) * 100
+            lqd_ret = float(lqd_c.iloc[-1] / lqd_c.iloc[-22] - 1.0) * 100
+            junk_score = float(np.clip((hyg_ret - lqd_ret + 5) / 10 * 100, 0, 100))
+            scores["junk"] = (junk_score, 0.20)
+    except Exception:
+        pass
+
+    # ── VIX 단독이라도 있으면 fallback 계산 ──────────────────────────────
+    if not scores:
+        # 모든 fetch 실패 시 VIX 절대값으로 마지막 시도
         try:
-            hyg = yf.Ticker("HYG").history(period="2mo", auto_adjust=False)
-            lqd = yf.Ticker("LQD").history(period="2mo", auto_adjust=False)
-            hyg_c = pd.to_numeric(hyg["Close"], errors="coerce").dropna()
-            lqd_c = pd.to_numeric(lqd["Close"], errors="coerce").dropna()
-            if len(hyg_c) >= 21 and len(lqd_c) >= 21:
-                hyg_ret = float(hyg_c.iloc[-1] / hyg_c.iloc[-22] - 1.0) * 100
-                lqd_ret = float(lqd_c.iloc[-1] / lqd_c.iloc[-22] - 1.0) * 100
-                junk_score = float(np.clip((hyg_ret - lqd_ret + 5) / 10 * 100, 0, 100))
-                scores["junk_bond"] = (junk_score, 0.20)
+            vix_val = float(vix_series.iloc[-1]) if (vix_series is not None and not vix_series.empty) else np.nan
+            if pd.notna(vix_val):
+                # VIX 절대값 기준: 10=100점, 20=75점, 30=40점, 40+=0점
+                raw = float(np.clip((40 - vix_val) / 30 * 100, 0, 100))
+                scores["vix_abs"] = (raw, 1.0)
         except Exception:
             pass
 
-        if not scores:
-            return np.nan, "N/A", MACRO_STATUS_NA
-
-        total_weight = sum(w for _, w in scores.values())
-        weighted_sum = sum(s * w for s, w in scores.values())
-        score = float(np.clip(weighted_sum / total_weight, 0, 100)) if total_weight > 0 else 50.0
-
-        if score >= 75:
-            rating, status = "Extreme Greed", MACRO_STATUS_FAIL
-        elif score >= 55:
-            rating, status = "Greed", MACRO_STATUS_WARN
-        elif score >= 45:
-            rating, status = "Neutral", MACRO_STATUS_PASS
-        elif score >= 25:
-            rating, status = "Fear", MACRO_STATUS_PASS
-        else:
-            rating, status = "Extreme Fear", MACRO_STATUS_PASS
-
-        return score, rating, status
-    except Exception:
+    if not scores:
         return np.nan, "N/A", MACRO_STATUS_NA
+
+    total_w = sum(w for _, w in scores.values())
+    score = float(np.clip(sum(s * w for s, w in scores.values()) / total_w, 0, 100)) if total_w > 0 else 50.0
+
+    if score >= 75:
+        rating, status = "Extreme Greed", MACRO_STATUS_FAIL
+    elif score >= 55:
+        rating, status = "Greed", MACRO_STATUS_WARN
+    elif score >= 45:
+        rating, status = "Neutral", MACRO_STATUS_PASS
+    elif score >= 25:
+        rating, status = "Fear", MACRO_STATUS_PASS
+    else:
+        rating, status = "Extreme Fear", MACRO_STATUS_PASS
+
+    return score, rating, status
 def fetch_fed_funds_rate() -> tuple[float, str]:
     """FRED FEDFUNDS 시리즈에서 현재 기준금리 반환. (rate, note)"""
     try:
@@ -1565,8 +1575,14 @@ def analyze_us_macro_dashboard():
         }
     )
 
-    # Fear & Greed Index
-    fg_score, fg_rating, fg_status = fetch_fear_greed_index()
+    # Fear & Greed Index — 이미 가져온 vix_hist 재사용
+    _vix_series_fg = pd.Series(dtype=float)
+    try:
+        if vix_hist is not None and not vix_hist.empty and "Close" in vix_hist.columns:
+            _vix_series_fg = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
+    except Exception:
+        pass
+    fg_score, fg_rating, fg_status = fetch_fear_greed_index(vix_series=_vix_series_fg)
     rows.append({
         "지표": "Fear & Greed Index (CNN)",
         "현재값": f"{fg_score:.0f} / 100 ({fg_rating})" if pd.notna(fg_score) else "N/A",
