@@ -1381,18 +1381,26 @@ def fetch_fear_greed_index() -> tuple[float, str, str]:
         except Exception:
             pass
 
-        # ── 4. Put/Call Ratio (역산: 낮을수록 탐욕) ──────────────────────
+        # ── 4. Put/Call Ratio 근사 (SQQQ vs QQQ 거래량 비율로 대체) ─────
+        # ^PCALL은 yfinance에서 불안정 → SQQQ(인버스) 거래량 급증 = 공포로 근사
         try:
-            pcall_hist = yf.Ticker("^PCALL").history(period="1mo", auto_adjust=False)
-            pcall_series = pd.to_numeric(pcall_hist["Close"], errors="coerce").dropna()
-            if len(pcall_series) >= 5:
-                current_pc = float(pcall_series.iloc[-1])
-                pc_1y = yf.Ticker("^PCALL").history(period="1y", auto_adjust=False)
-                pc_1y_series = pd.to_numeric(pc_1y["Close"], errors="coerce").dropna()
-                if len(pc_1y_series) >= 20:
-                    pc_pct = float((pc_1y_series < current_pc).sum() / len(pc_1y_series) * 100)
-                    # Put/Call 높을수록 공포 → 역산
-                    scores["put_call"] = (100.0 - pc_pct, 0.20)
+            qqq_hist2 = yf.Ticker("QQQ").history(period="2mo", auto_adjust=False)
+            sqqq_hist2 = yf.Ticker("SQQQ").history(period="2mo", auto_adjust=False)
+            qqq_vol2 = pd.to_numeric(qqq_hist2["Volume"], errors="coerce").dropna()
+            sqqq_vol2 = pd.to_numeric(sqqq_hist2["Volume"], errors="coerce").dropna()
+            if len(qqq_vol2) >= 21 and len(sqqq_vol2) >= 21:
+                # 최근 5일 vs 이전 21일 평균 SQQQ 비율 변화
+                sqqq_recent = float(sqqq_vol2.tail(5).mean())
+                sqqq_baseline = float(sqqq_vol2.tail(21).mean())
+                qqq_recent = float(qqq_vol2.tail(5).mean())
+                qqq_baseline = float(qqq_vol2.tail(21).mean())
+                sqqq_surge = sqqq_recent / sqqq_baseline if sqqq_baseline > 0 else 1.0
+                qqq_surge = qqq_recent / qqq_baseline if qqq_baseline > 0 else 1.0
+                # SQQQ 급증 / QQQ 급증 비율 → 공포 지수
+                fear_ratio = sqqq_surge / qqq_surge if qqq_surge > 0 else 1.0
+                # fear_ratio > 1 → 공포 (점수 낮음), < 1 → 탐욕 (점수 높음)
+                pc_score = float(np.clip((2.0 - fear_ratio) / 2.0 * 100, 0, 100))
+                scores["put_call"] = (pc_score, 0.20)
         except Exception:
             pass
 
@@ -2909,7 +2917,9 @@ def narrative_history_expander_title(rec):
 
 
 def prune_narrative_history_records(records):
-    """최근 14일 이내 + 최대 40건(시간순 보존 후 최신만 유지)."""
+    """최근 14일 이내 + 최대 40건(시간순 보존 후 최신만 유지).
+    weekly_portfolio_summary는 별도 탭에서 관리하므로 prune 대상에서 제외.
+    """
     if not records:
         return []
     now_utc = datetime.now(timezone.utc)
@@ -2917,6 +2927,9 @@ def prune_narrative_history_records(records):
     migrated = []
     for rec in records:
         if not isinstance(rec, dict) or not isinstance(rec.get("analysis"), dict):
+            continue
+        # weekly_portfolio_summary는 prune/sync 대상 제외 (Weekly Summary 탭에서 별도 관리)
+        if rec.get("analysis", {}).get("source") == "weekly_portfolio_summary":
             continue
         dt_utc = _narrative_parse_saved_at_utc(rec.get("saved_at"))
         if dt_utc is None:
