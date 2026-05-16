@@ -66,6 +66,8 @@ _PORTFOLIOS_WORKSHEET_TITLE = "Portfolios"
 _PORTFOLIOS_SHEET_COLS = ["ID", "Account", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
 _PORTFOLIOS_LEGACY_HEADER = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
+_THESIS_WORKSHEET_TITLE = "Thesis"
+_THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
 
 def get_gspread_client():
@@ -137,6 +139,153 @@ def open_portfolios_worksheet():
             except Exception as exc2:
                 return None, f"`{_PORTFOLIOS_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
         return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_PORTFOLIOS_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
+
+
+def open_thesis_worksheet():
+    """Quant_DB 스프레드시트의 Thesis 탭. (worksheet | None, err_msg | None)"""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_THESIS_WORKSHEET_TITLE)
+        return ws, None
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
+            try:
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                ws = sh.add_worksheet(title=_THESIS_WORKSHEET_TITLE, rows=3000, cols=7)
+                ws.update([_THESIS_SHEET_COLS], range_name="A1:G1", value_input_option="USER_ENTERED")
+                return ws, None
+            except Exception as exc2:
+                return None, f"`{_THESIS_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
+        return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_THESIS_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
+
+
+def save_thesis_row(user_id: str, ticker: str, account: str, thesis_title: str, narrative_category: str, narrative_date: str) -> tuple[bool, str]:
+    """Thesis 시트에 한 행 저장."""
+    ws, err = open_thesis_worksheet()
+    if err:
+        return False, err
+    try:
+        date_added = _narrative_now_kst_string()
+        row = [
+            str(user_id).strip(),
+            str(ticker).strip().upper(),
+            str(account).strip(),
+            str(thesis_title).strip(),
+            str(narrative_category).strip(),
+            str(narrative_date).strip(),
+            date_added,
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def load_thesis_records(user_id: str) -> pd.DataFrame:
+    """현재 user_id의 Thesis 기록 전체를 DataFrame으로 반환."""
+    empty_df = pd.DataFrame(columns=_THESIS_SHEET_COLS)
+    ws, err = open_thesis_worksheet()
+    if err:
+        return empty_df
+    try:
+        vals = ws.get_all_values()
+        if not vals or len(vals) < 2:
+            return empty_df
+        rows = []
+        uid_u = str(user_id).strip().upper()
+        for r in vals[1:]:
+            r_padded = (r + [""] * 7)[:7]
+            if str(r_padded[0]).strip().upper() != uid_u:
+                continue
+            rows.append({
+                "ID": r_padded[0],
+                "Ticker": r_padded[1],
+                "Account": r_padded[2],
+                "Thesis_Title": r_padded[3],
+                "Narrative_Category": r_padded[4],
+                "Narrative_Date": r_padded[5],
+                "Date_Added": r_padded[6],
+            })
+        if not rows:
+            return empty_df
+        return pd.DataFrame(rows)
+    except Exception:
+        return empty_df
+
+
+def delete_thesis_row(user_id: str, ticker: str, thesis_title: str) -> tuple[bool, str]:
+    """Thesis 시트에서 특정 행 삭제."""
+    ws, err = open_thesis_worksheet()
+    if err:
+        return False, err
+    try:
+        vals = ws.get_all_values()
+        uid_u = str(user_id).strip().upper()
+        tk_u = str(ticker).strip().upper()
+        th_u = str(thesis_title).strip()
+        rows_to_delete = []
+        for i, r in enumerate(vals[1:], start=2):
+            r_padded = (r + [""] * 7)[:7]
+            if (str(r_padded[0]).strip().upper() == uid_u
+                    and str(r_padded[1]).strip().upper() == tk_u
+                    and str(r_padded[3]).strip() == th_u):
+                rows_to_delete.append(i)
+        for row_idx in reversed(rows_to_delete):
+            ws.delete_rows(row_idx)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def get_thesis_options_from_narratives(user_id: str) -> list[dict]:
+    """최근 내러티브에서 Thesis 선택 옵션 생성 (최신 10개 테마)."""
+    records, _ = fetch_narrative_records_from_sheet()
+    if not records:
+        return []
+    uid_u = str(user_id).strip().upper()
+    options = []
+    seen = set()
+    for rec in reversed(records):
+        if str(rec.get("_sheet_user_id", "")).strip().upper() != uid_u:
+            continue
+        analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+        saved_at = rec.get("saved_at", "")
+        date_str = ""
+        try:
+            dt = _narrative_parse_saved_at_utc(saved_at)
+            if dt:
+                date_str = dt.astimezone(_KST_TZ).strftime("%m/%d")
+        except Exception:
+            pass
+        category = str(analysis.get("source") or "market_narrative").strip()
+        themes = analysis.get("themes", [])
+        if not isinstance(themes, list):
+            themes = []
+        for theme in themes[:5]:
+            if not isinstance(theme, dict):
+                continue
+            title = str(theme.get("title", "") or "").strip()
+            if not title:
+                continue
+            key = f"{title}_{date_str}"
+            if key in seen:
+                continue
+            seen.add(key)
+            options.append({
+                "label": f"[{date_str}] {title}",
+                "thesis_title": title,
+                "narrative_category": category,
+                "narrative_date": date_str,
+            })
+            if len(options) >= 15:
+                break
+        if len(options) >= 15:
+            break
+    return options
 
 
 def ensure_portfolios_header_row(ws):
@@ -688,6 +837,7 @@ _MAIN_NAV_OPTIONS = (
     "🔬 [3단계] 개별 종목 정밀 검사",
     "🛡️ [4단계] 포트폴리오 매도 레이더",
     "🎯 [AI] 내러티브 적중률 트래커",
+    "💡 [AI] Idea-to-Portfolio 추적",
 )
 
 # 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
@@ -6084,6 +6234,10 @@ if st.session_state.get("logged_in"):
                 index=0,
                 key="portfolio_add_account_selector",
             )
+            # Thesis 옵션 (폼 바깥에서 미리 로드)
+            thesis_options = get_thesis_options_from_narratives(puid)
+            thesis_labels = ["(Thesis 없음 - 일반 매수)"] + [o["label"] for o in thesis_options]
+
             with st.form("portfolio_add_form", clear_on_submit=False):
                 if selected_account_option == "직접 입력":
                     custom_account_input = st.text_input(
@@ -6116,6 +6270,13 @@ if st.session_state.get("logged_in"):
                     step=1.0,
                     format="%.4f",
                     key="form_portfolio_add_quantity",
+                )
+                selected_thesis_label = st.selectbox(
+                    "📌 투자 Thesis (어떤 내러티브 테마에서 매수했나요?)",
+                    options=thesis_labels,
+                    index=0,
+                    key="form_portfolio_add_thesis",
+                    help="최근 내러티브에서 추출한 테마 목록입니다. 선택하면 Thesis 탭에서 추적할 수 있어요.",
                 )
                 submitted_add = st.form_submit_button("포트폴리오에 추가", use_container_width=True, type="primary")
                 if submitted_add:
@@ -6180,6 +6341,18 @@ if st.session_state.get("logged_in"):
                                         ignore_index=True,
                                     )
                                     save_portfolio(updated_df)
+                                    # Thesis 선택 시 Thesis 시트에도 저장
+                                    if selected_thesis_label != "(Thesis 없음 - 일반 매수)":
+                                        matched = next((o for o in thesis_options if o["label"] == selected_thesis_label), None)
+                                        if matched:
+                                            save_thesis_row(
+                                                puid,
+                                                new_ticker,
+                                                account_name,
+                                                matched["thesis_title"],
+                                                matched["narrative_category"],
+                                                matched["narrative_date"],
+                                            )
                                     st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다. (시트 ID={puid})")
                                     st.rerun()
 
@@ -6880,6 +7053,143 @@ if st.session_state.get("logged_in"):
                 "- 각 내러티브의 **Winners**와 **Emerging** 티커에 대해 생성 시점 이후 수익률을 계산합니다.\n"
                 "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
             )
+
+    elif main_nav == _MAIN_NAV_OPTIONS[7]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 💡 Idea-to-Portfolio 추적
+        # 내러티브 테마 → 종목 발굴 → 포트폴리오 편입 흐름을 Thesis ID로 연결
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader("💡 Idea-to-Portfolio 추적")
+        st.caption(
+            "AI 내러티브 테마(Thesis)에서 시작해 포트폴리오에 편입한 종목들을 추적합니다. "
+            "**[4단계] 포트폴리오 매도 레이더**에서 종목 추가 시 Thesis를 선택하면 여기에 자동으로 기록돼요."
+        )
+
+        uid_thesis = str(st.session_state.get("user_id") or "").strip()
+
+        with st.spinner("Thesis 기록 불러오는 중..."):
+            thesis_df = load_thesis_records(uid_thesis)
+
+        if thesis_df.empty:
+            st.info(
+                "아직 Thesis 기록이 없어요. "
+                "[4단계] 포트폴리오 매도 레이더 → 종목 추가 시 "
+                "📌 투자 Thesis 드롭다운에서 내러티브 테마를 선택하면 여기에 자동으로 기록됩니다."
+            )
+        else:
+            # ── 요약 지표 ──────────────────────────────────────────────────
+            total_positions = len(thesis_df)
+            unique_thesis = thesis_df["Thesis_Title"].nunique()
+            unique_tickers = thesis_df["Ticker"].nunique()
+
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("총 Thesis 연결 포지션", f"{total_positions}건")
+            with m2:
+                st.metric("고유 Thesis 수", f"{unique_thesis}개")
+            with m3:
+                st.metric("추적 중인 티커", f"{unique_tickers}개")
+
+            st.divider()
+
+            # ── Thesis별 그룹 뷰 ───────────────────────────────────────────
+            st.markdown("### 📋 Thesis별 포지션 현황")
+            thesis_groups = thesis_df.groupby("Thesis_Title")
+
+            for thesis_title, group in thesis_groups:
+                tickers_in_thesis = group["Ticker"].tolist()
+                narrative_date = group["Narrative_Date"].iloc[0]
+                narrative_cat = group["Narrative_Category"].iloc[0]
+
+                # 현재가 및 수익률 계산
+                ticker_tuple = tuple(sorted(set(tickers_in_thesis)))
+                try:
+                    close_df_thesis = cached_portfolio_yf_close_1y(ticker_tuple)
+                except Exception:
+                    close_df_thesis = pd.DataFrame()
+
+                perf_rows = []
+                for _, row in group.iterrows():
+                    tk = str(row["Ticker"]).strip().upper()
+                    acct = str(row["Account"]).strip()
+                    date_added = str(row["Date_Added"]).strip()
+
+                    # 포트폴리오에서 매수가/수량 조회
+                    portfolio_df_cur = load_portfolio()
+                    port_row = portfolio_df_cur[
+                        (portfolio_df_cur["Ticker"] == tk) &
+                        (portfolio_df_cur["Account"] == acct)
+                    ] if not portfolio_df_cur.empty else pd.DataFrame()
+
+                    purchase_price = np.nan
+                    current_price = np.nan
+                    ret_pct = np.nan
+                    if not port_row.empty:
+                        purchase_price = pd.to_numeric(port_row.iloc[0].get("Purchase_Price"), errors="coerce")
+                    if not close_df_thesis.empty and tk in close_df_thesis.columns:
+                        series = pd.to_numeric(close_df_thesis[tk], errors="coerce").dropna()
+                        current_price = float(series.iloc[-1]) if not series.empty else np.nan
+                    if pd.notna(purchase_price) and pd.notna(current_price) and purchase_price > 0:
+                        ret_pct = (current_price / purchase_price - 1.0) * 100.0
+
+                    perf_rows.append({
+                        "계좌": acct,
+                        "티커": tk,
+                        "매수가": purchase_price,
+                        "현재가": current_price,
+                        "수익률(%)": ret_pct,
+                        "Thesis 편입일": date_added,
+                    })
+
+                perf_df = pd.DataFrame(perf_rows)
+                avg_ret = pd.to_numeric(perf_df["수익률(%)"], errors="coerce").mean()
+                avg_ret_str = f"{avg_ret:+.2f}%" if pd.notna(avg_ret) else "N/A"
+
+                with st.expander(
+                    f"**{thesis_title}** [{narrative_date}] — {len(tickers_in_thesis)}개 종목 · 평균 수익률 {avg_ret_str}",
+                    expanded=True,
+                ):
+                    st.caption(f"카테고리: `{narrative_cat}` · 내러티브 날짜: `{narrative_date}`")
+
+                    def _style_ret(val):
+                        v = pd.to_numeric(val, errors="coerce")
+                        if pd.isna(v): return "color: #9ca3af;"
+                        if v > 0: return "color: #16a34a; font-weight: 600;"
+                        if v < 0: return "color: #dc2626; font-weight: 600;"
+                        return ""
+
+                    styled_perf = (
+                        perf_df.style
+                        .format({
+                            "매수가": lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A",
+                            "현재가": lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A",
+                            "수익률(%)": lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A",
+                        }, na_rep="N/A")
+                        .map(_style_ret, subset=["수익률(%)"])
+                    )
+                    st.dataframe(styled_perf, use_container_width=True, hide_index=True)
+
+                    # Thesis 삭제 버튼
+                    if st.button(
+                        f"🗑️ '{thesis_title}' Thesis 기록 삭제",
+                        key=f"del_thesis_{thesis_title[:20]}",
+                        help="Thesis 연결 기록만 삭제합니다. 포트폴리오 종목은 삭제되지 않아요.",
+                    ):
+                        for tk in tickers_in_thesis:
+                            delete_thesis_row(uid_thesis, tk, thesis_title)
+                        st.success(f"'{thesis_title}' Thesis 기록을 삭제했습니다.")
+                        st.rerun()
+
+            st.divider()
+            st.markdown("### 📊 티커별 Thesis 연결 현황")
+            st.caption("한 종목이 여러 Thesis에 연결되어 있을 수 있어요.")
+            ticker_thesis_summary = (
+                thesis_df.groupby("Ticker")["Thesis_Title"]
+                .apply(lambda x: " / ".join(x.unique()))
+                .reset_index()
+                .rename(columns={"Thesis_Title": "연결된 Thesis"})
+            )
+            st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
