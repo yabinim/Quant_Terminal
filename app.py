@@ -1326,123 +1326,50 @@ def fetch_dxy_latest_and_mean_deviation():
 
 def fetch_fear_greed_index() -> tuple[float, str, str]:
     """
-    CNN Fear & Greed 7개 팩터 근사 계산 (yfinance 기반, 0~100).
-
-    팩터 구성:
-      1. Market Volatility  : VIX 1년 백분위 역산          (가중 20%)
-      2. Stock Momentum     : SPY vs MA125                  (가중 20%)
-      3. Stock Breadth      : 상승/하락 거래량 비율         (가중 15%)
-      4. Put/Call Ratio     : ^PCALL 역산                   (가중 20%)
-      5. Junk Bond Demand   : HYG vs LQD 스프레드 역산      (가중 15%)
-      6. Safe Haven Demand  : SPY vs TLT 상대 수익률        (가중 10%)
-      7. 52W Strength       : SPY 52주 고점 대비 현재 위치  (가중 없음 → 보조)
+    VIX + SPY momentum 기반 Fear & Greed 근사 (0~100).
+    이미 캐시된 데이터를 최대한 재사용해서 추가 API 호출 최소화.
     """
     try:
         scores = {}
 
-        # ── 1. Market Volatility (VIX 백분위 역산) ───────────────────────
-        try:
-            vix_hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
+        # ── VIX 1년 히스토리 (핵심 팩터) ─────────────────────────────────
+        vix_hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
+        if vix_hist is not None and not vix_hist.empty and "Close" in vix_hist.columns:
             vix_series = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
             if len(vix_series) >= 20:
                 current_vix = float(vix_series.iloc[-1])
                 vix_pct = float((vix_series < current_vix).sum() / len(vix_series) * 100)
-                scores["volatility"] = (100.0 - vix_pct, 0.20)
-        except Exception:
-            pass
+                scores["volatility"] = (100.0 - vix_pct, 0.50)
 
-        # ── 2. Stock Price Momentum (SPY vs MA125) ────────────────────────
-        try:
-            spy_hist = yf.Ticker("SPY").history(period="1y", auto_adjust=False)
+        # ── SPY momentum (보조 팩터) ──────────────────────────────────────
+        spy_hist = yf.Ticker("SPY").history(period="6mo", auto_adjust=False)
+        if spy_hist is not None and not spy_hist.empty and "Close" in spy_hist.columns:
             spy_close = pd.to_numeric(spy_hist["Close"], errors="coerce").dropna()
             if len(spy_close) >= 125:
                 ma125 = float(spy_close.rolling(125).mean().iloc[-1])
                 current_spy = float(spy_close.iloc[-1])
-                # MA125 대비 편차를 -15%~+15% 범위로 0~100 변환
                 dev = (current_spy / ma125 - 1.0) * 100
                 mom_score = float(np.clip((dev + 15) / 30 * 100, 0, 100))
-                scores["momentum"] = (mom_score, 0.20)
+                scores["momentum"] = (mom_score, 0.30)
+            elif len(spy_close) >= 21:
+                ret_21d = float((spy_close.iloc[-1] / spy_close.iloc[-22] - 1.0) * 100)
+                mom_score = float(np.clip((ret_21d + 10) / 20 * 100, 0, 100))
+                scores["momentum"] = (mom_score, 0.30)
+
+        # ── HYG vs LQD (Junk Bond 팩터) ──────────────────────────────────
+        try:
+            hyg = yf.Ticker("HYG").history(period="2mo", auto_adjust=False)
+            lqd = yf.Ticker("LQD").history(period="2mo", auto_adjust=False)
+            hyg_c = pd.to_numeric(hyg["Close"], errors="coerce").dropna()
+            lqd_c = pd.to_numeric(lqd["Close"], errors="coerce").dropna()
+            if len(hyg_c) >= 21 and len(lqd_c) >= 21:
+                hyg_ret = float(hyg_c.iloc[-1] / hyg_c.iloc[-22] - 1.0) * 100
+                lqd_ret = float(lqd_c.iloc[-1] / lqd_c.iloc[-22] - 1.0) * 100
+                junk_score = float(np.clip((hyg_ret - lqd_ret + 5) / 10 * 100, 0, 100))
+                scores["junk_bond"] = (junk_score, 0.20)
         except Exception:
             pass
 
-        # ── 3. Stock Price Breadth (상승/하락 거래량 비율) ────────────────
-        try:
-            # QQQ (상승 대표) vs SQQQ (하락 대표) 거래량 비율로 근사
-            qqq_hist = yf.Ticker("QQQ").history(period="1mo", auto_adjust=False)
-            sqqq_hist = yf.Ticker("SQQQ").history(period="1mo", auto_adjust=False)
-            qqq_vol = pd.to_numeric(qqq_hist["Volume"], errors="coerce").dropna()
-            sqqq_vol = pd.to_numeric(sqqq_hist["Volume"], errors="coerce").dropna()
-            if len(qqq_vol) >= 5 and len(sqqq_vol) >= 5:
-                qqq_avg = float(qqq_vol.tail(5).mean())
-                sqqq_avg = float(sqqq_vol.tail(5).mean())
-                ratio = qqq_avg / (qqq_avg + sqqq_avg) if (qqq_avg + sqqq_avg) > 0 else 0.5
-                breadth_score = float(np.clip(ratio * 100, 0, 100))
-                scores["breadth"] = (breadth_score, 0.15)
-        except Exception:
-            pass
-
-        # ── 4. Put/Call Ratio 근사 (SQQQ vs QQQ 거래량 비율로 대체) ─────
-        # ^PCALL은 yfinance에서 불안정 → SQQQ(인버스) 거래량 급증 = 공포로 근사
-        try:
-            qqq_hist2 = yf.Ticker("QQQ").history(period="2mo", auto_adjust=False)
-            sqqq_hist2 = yf.Ticker("SQQQ").history(period="2mo", auto_adjust=False)
-            qqq_vol2 = pd.to_numeric(qqq_hist2["Volume"], errors="coerce").dropna()
-            sqqq_vol2 = pd.to_numeric(sqqq_hist2["Volume"], errors="coerce").dropna()
-            if len(qqq_vol2) >= 21 and len(sqqq_vol2) >= 21:
-                # 최근 5일 vs 이전 21일 평균 SQQQ 비율 변화
-                sqqq_recent = float(sqqq_vol2.tail(5).mean())
-                sqqq_baseline = float(sqqq_vol2.tail(21).mean())
-                qqq_recent = float(qqq_vol2.tail(5).mean())
-                qqq_baseline = float(qqq_vol2.tail(21).mean())
-                sqqq_surge = sqqq_recent / sqqq_baseline if sqqq_baseline > 0 else 1.0
-                qqq_surge = qqq_recent / qqq_baseline if qqq_baseline > 0 else 1.0
-                # SQQQ 급증 / QQQ 급증 비율 → 공포 지수
-                fear_ratio = sqqq_surge / qqq_surge if qqq_surge > 0 else 1.0
-                # fear_ratio > 1 → 공포 (점수 낮음), < 1 → 탐욕 (점수 높음)
-                pc_score = float(np.clip((2.0 - fear_ratio) / 2.0 * 100, 0, 100))
-                scores["put_call"] = (pc_score, 0.20)
-        except Exception:
-            pass
-
-        # ── 5. Junk Bond Demand (HYG vs LQD 스프레드 역산) ───────────────
-        try:
-            hyg_hist = yf.Ticker("HYG").history(period="3mo", auto_adjust=False)
-            lqd_hist = yf.Ticker("LQD").history(period="3mo", auto_adjust=False)
-            hyg_close = pd.to_numeric(hyg_hist["Close"], errors="coerce").dropna()
-            lqd_close = pd.to_numeric(lqd_hist["Close"], errors="coerce").dropna()
-            if len(hyg_close) >= 21 and len(lqd_close) >= 21:
-                hyg_ret = float(hyg_close.iloc[-1] / hyg_close.iloc[-22] - 1.0) * 100
-                lqd_ret = float(lqd_close.iloc[-1] / lqd_close.iloc[-22] - 1.0) * 100
-                spread_ret = hyg_ret - lqd_ret  # 양수 = HYG 강세 = Greed
-                junk_score = float(np.clip((spread_ret + 5) / 10 * 100, 0, 100))
-                scores["junk_bond"] = (junk_score, 0.15)
-        except Exception:
-            pass
-
-        # ── 6. Safe Haven Demand (SPY vs TLT 상대 수익률) ────────────────
-        try:
-            tlt_hist = yf.Ticker("TLT").history(period="3mo", auto_adjust=False)
-            tlt_close = pd.to_numeric(tlt_hist["Close"], errors="coerce").dropna()
-            spy_close_3m = pd.to_numeric(
-                yf.Ticker("SPY").history(period="3mo", auto_adjust=False)["Close"],
-                errors="coerce"
-            ).dropna()
-            if len(tlt_close) >= 21 and len(spy_close_3m) >= 21:
-                spy_ret_3m = float(spy_close_3m.iloc[-1] / spy_close_3m.iloc[-22] - 1.0) * 100
-                tlt_ret_3m = float(tlt_close.iloc[-1] / tlt_close.iloc[-22] - 1.0) * 100
-                safe_diff = spy_ret_3m - tlt_ret_3m  # 양수 = 주식 강세 = Greed
-                safe_score = float(np.clip((safe_diff + 15) / 30 * 100, 0, 100))
-                scores["safe_haven"] = (safe_score, 0.10)
-        except Exception:
-            pass
-
-        # ── 최종 가중 평균 계산 ───────────────────────────────────────────
-        # 디버그: 어떤 팩터가 성공했는지 확인
-        try:
-            import streamlit as _st
-            _st.caption(f"🔧 F&G 팩터 성공: {list(scores.keys())} / 전체점수: { {k: round(v[0],1) for k,v in scores.items()} }")
-        except Exception:
-            pass
         if not scores:
             return np.nan, "N/A", MACRO_STATUS_NA
 
@@ -1451,26 +1378,19 @@ def fetch_fear_greed_index() -> tuple[float, str, str]:
         score = float(np.clip(weighted_sum / total_weight, 0, 100)) if total_weight > 0 else 50.0
 
         if score >= 75:
-            rating = "Extreme Greed"
-            status = MACRO_STATUS_FAIL
+            rating, status = "Extreme Greed", MACRO_STATUS_FAIL
         elif score >= 55:
-            rating = "Greed"
-            status = MACRO_STATUS_WARN
+            rating, status = "Greed", MACRO_STATUS_WARN
         elif score >= 45:
-            rating = "Neutral"
-            status = MACRO_STATUS_PASS
+            rating, status = "Neutral", MACRO_STATUS_PASS
         elif score >= 25:
-            rating = "Fear"
-            status = MACRO_STATUS_PASS
+            rating, status = "Fear", MACRO_STATUS_PASS
         else:
-            rating = "Extreme Fear"
-            status = MACRO_STATUS_PASS
+            rating, status = "Extreme Fear", MACRO_STATUS_PASS
 
         return score, rating, status
     except Exception:
         return np.nan, "N/A", MACRO_STATUS_NA
-
-
 def fetch_fed_funds_rate() -> tuple[float, str]:
     """FRED FEDFUNDS 시리즈에서 현재 기준금리 반환. (rate, note)"""
     try:
