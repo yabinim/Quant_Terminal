@@ -1437,6 +1437,12 @@ def fetch_fear_greed_index() -> tuple[float, str, str]:
             pass
 
         # ── 최종 가중 평균 계산 ───────────────────────────────────────────
+        # 디버그: 어떤 팩터가 성공했는지 확인
+        try:
+            import streamlit as _st
+            _st.caption(f"🔧 F&G 팩터 성공: {list(scores.keys())} / 전체점수: { {k: round(v[0],1) for k,v in scores.items()} }")
+        except Exception:
+            pass
         if not scores:
             return np.nan, "N/A", MACRO_STATUS_NA
 
