@@ -6552,17 +6552,18 @@ if st.session_state.get("logged_in"):
                                 else:
                                     series = closes[tk].dropna()
                                     # 내러티브 생성 날짜 이후 데이터만 슬라이싱
-                                    # timezone을 완전히 제거해서 naive timestamp로 비교
+                                    # yfinance auto_adjust=True 시 index에 tz(America/New_York)가 붙으므로
+                                    # tz_convert(None)로 naive로 변환 후 비교
                                     try:
                                         naive_cutoff = pd.Timestamp(saved_at_utc.replace(tzinfo=None))
                                         idx = series.index
-                                        # index에 timezone 있으면 제거 후 비교
                                         if hasattr(idx, 'tz') and idx.tz is not None:
-                                            idx_naive = idx.tz_localize(None)
+                                            idx_naive = idx.tz_convert(None)  # tz aware → naive
                                         else:
-                                            idx_naive = idx
-                                        series_after = series[idx_naive >= naive_cutoff]
-                                        # 슬라이싱 결과가 비어있으면 전체 series 사용 (내러티브가 오래된 경우)
+                                            idx_naive = idx  # 이미 naive
+                                        mask = idx_naive >= naive_cutoff
+                                        series_after = series.iloc[mask.values]
+                                        # 슬라이싱 결과가 비어있으면 전체 series 사용
                                         if series_after.empty:
                                             series_after = series
                                     except Exception:
