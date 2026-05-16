@@ -6541,6 +6541,23 @@ if st.session_state.get("logged_in"):
                                 dl_period = "3mo" if horizon_td <= 21 else "6mo"
                                 closes = _factcheck_download_closes(unique_tickers, period=dl_period)
 
+                            # ── 디버그 정보 (문제 진단용) ──────────────────────
+                            with st.expander("🔧 디버그 정보 (문제 진단용)", expanded=True):
+                                st.write(f"**closes.empty:** `{closes.empty}`")
+                                st.write(f"**closes shape:** `{closes.shape}`")
+                                st.write(f"**closes columns 앞 10개:** `{list(closes.columns[:10]) if not closes.empty else '없음'}`")
+                                st.write(f"**closes index tz:** `{closes.index.tz if not closes.empty else 'N/A'}`")
+                                st.write(f"**closes index 샘플:** `{list(closes.index[:3]) if not closes.empty else '없음'}`")
+                                sample_tk = unique_tickers[0] if unique_tickers else "없음"
+                                st.write(f"**첫번째 티커 in columns:** `{sample_tk in closes.columns if not closes.empty else False}`")
+                                if not closes.empty and sample_tk in closes.columns:
+                                    ss = closes[sample_tk].dropna()
+                                    st.write(f"**series 길이:** `{len(ss)}`")
+                                if rows_to_evaluate:
+                                    r0 = rows_to_evaluate[0]
+                                    st.write(f"**첫번째 saved_at_utc:** `{r0['saved_at_utc']}`")
+                                    st.write(f"**첫번째 ticker:** `{r0['ticker']}`")
+
                             # ── 수익률 계산 ────────────────────────────────────
                             result_rows = []
                             for row in rows_to_evaluate:
@@ -6552,13 +6569,22 @@ if st.session_state.get("logged_in"):
                                 else:
                                     series = closes[tk].dropna()
                                     # 내러티브 생성 날짜 이후 데이터만 슬라이싱
+                                    # yfinance auto_adjust=True 시 index에 tz(America/New_York)가 붙으므로
+                                    # tz_convert(None)로 naive로 변환 후 비교
                                     try:
-                                        series_after = series[series.index >= pd.Timestamp(saved_at_utc).tz_localize(None)]
-                                    except Exception:
-                                        try:
-                                            series_after = series[series.index >= pd.Timestamp(saved_at_utc.replace(tzinfo=None))]
-                                        except Exception:
+                                        naive_cutoff = pd.Timestamp(saved_at_utc.replace(tzinfo=None))
+                                        idx = series.index
+                                        if hasattr(idx, 'tz') and idx.tz is not None:
+                                            idx_naive = idx.tz_convert(None)  # tz aware → naive
+                                        else:
+                                            idx_naive = idx  # 이미 naive
+                                        mask = idx_naive >= naive_cutoff
+                                        series_after = series.iloc[mask.values]
+                                        # 슬라이싱 결과가 비어있으면 전체 series 사용
+                                        if series_after.empty:
                                             series_after = series
+                                    except Exception:
+                                        series_after = series
 
                                     if len(series_after) >= horizon_td:
                                         base = float(series_after.iloc[0])
