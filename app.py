@@ -5940,6 +5940,162 @@ if st.session_state.get("logged_in"):
     is_etf_mode = quote_type == "ETF"
     
     if main_nav == _MAIN_NAV_OPTIONS[0]:
+        st.title("📖 Quant Terminal 사용 가이드")
+        st.markdown("처음 오셨나요? **실제 매수 결정부터 매도까지** 앱의 모든 탭을 어떤 순서로, 어떻게 활용하는지 단계별로 설명합니다.")
+        st.info("💡 **핵심 원칙:** 이 앱은 단 하나의 신호로 매수 결정을 내리지 않습니다. Macro → Sector → Stock 3개 레이어가 모두 같은 방향을 가리킬 때만 높은 확신으로 진입할 수 있습니다.")
+
+        st.divider()
+        st.markdown("## 🗺️ 전체 투자 흐름")
+        flow_cols = st.columns(5)
+        flow_data = [
+            ("🌐", "Step 1", "거시 환경 확인"),
+            ("📰", "Step 2", "테마 발굴"),
+            ("🔬", "Step 3", "종목 검증"),
+            ("💼", "Step 4", "매수 & 관리"),
+            ("🛡️", "Step 5", "매도 타이밍"),
+        ]
+        for col, (emoji, title, sub) in zip(flow_cols, flow_data):
+            with col:
+                st.markdown(
+                    "<div style='text-align:center;padding:12px;background:#1e293b;border-radius:8px;'>"
+                    f"<div style='font-size:28px'>{emoji}</div>"
+                    f"<div style='font-weight:700;margin:4px 0;font-size:12px'>{title}</div>"
+                    f"<div style='color:#94a3b8;font-size:11px'>{sub}</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        # Step 1
+        with st.expander("🌐 Step 1 — 거시경제 환경 확인 (탭: 거시경제 지표)", expanded=True):
+            g1c1, g1c2 = st.columns(2)
+            with g1c1:
+                st.success(
+                    "✅ 진입 가능 신호\n\n"
+                    "- Macro Score 60점 이상\n"
+                    "- VIX 20 이하\n"
+                    "- Fear & Greed 25~74\n"
+                    "- 장단기 금리차 플러스(+)"
+                )
+            with g1c2:
+                st.error(
+                    "❌ 주의/대기 신호\n\n"
+                    "- Macro Score 50점 미만\n"
+                    "- VIX 30 이상\n"
+                    "- Fear & Greed 10 이하\n"
+                    "- 경고 지표 5개 이상"
+                )
+            st.markdown("**💡 팁:** VIX 히스토리에서 추세를 보세요. 숫자 하나보다 방향이 중요해요. Fear & Greed 25 이하는 역발상 매수 기회일 수 있어요.")
+            st.markdown("**📌 예시:** Macro Score 74 / NEUTRAL, VIX 17.3 → 선별적 진입 가능")
+
+        # Step 2
+        with st.expander("📰 Step 2 — AI 내러티브로 테마 발굴 (탭: 시장 내러티브)", expanded=False):
+            g2c1, g2c2, g2c3 = st.columns(3)
+            with g2c1:
+                st.info("🏆 Top Quant Picks\n\n정량 모멘텀 + 뉴스 테마 동시 확인. 가장 신뢰도 높음.")
+            with g2c2:
+                st.success("🎯 Winners\n\n테마별 주요 수혜주. 가격 + 내러티브 모두 확인.")
+            with g2c3:
+                st.warning("🌱 Emerging\n\n뉴스는 있지만 가격 미확인. Watchlist에 등록 후 대기.")
+            st.markdown("**💡 팁:** Emerging 종목을 놓치지 마세요. 초기 발굴해서 Watchlist에 등록하면 타이밍을 잡을 수 있어요.")
+            st.markdown("**📌 예시:** Theme: AI 인프라 Capex / Winners: NVDA, SMH / Emerging: VST, CEG → NVDA는 스캐너 검증, VST는 Watchlist 등록")
+
+        # Step 3
+        with st.expander("🎯 Step 3 — 섹터 흐름 검증 (탭: 섹터 & 자금 흐름)", expanded=False):
+            st.markdown("Hidden Alpha Radar에서 내러티브 테마 ETF가 RS Score 상위에 있는지 확인하세요.")
+            st.markdown("- **RS Score 상위 + 거래량 급증** = 기관 자금 유입 신호\n- 내러티브와 섹터 RS가 일치할 때 진입 확신이 높아집니다.")
+            st.markdown("**📌 예시:** SOXX RS +18.3%p 거래량 1.9x → 반도체 섹터 강세. 내러티브와 완전 일치.")
+
+        # Step 4
+        with st.expander("🚀 Step 4 — AI 스캐너로 최종 종목 선별 (탭: AI 종목 스캐너)", expanded=False):
+            g4c1, g4c2, g4c3 = st.columns(3)
+            with g4c1:
+                st.success("80점 이상\n\n강력 매수 후보.")
+            with g4c2:
+                st.warning("60~79점\n\n조건부 매수. 타이밍 추가 확인.")
+            with g4c3:
+                st.error("60점 미만\n\n관망. 다음 기회 탐색.")
+            st.markdown("**💡 팁:** TOP3에 🔔 Watchlist 추가 버튼으로 바로 등록하세요. Narrative Score 높아도 Momentum Score 낮으면 시장이 아직 안 따라오는 신호예요.")
+
+        # Step 5
+        with st.expander("🔬 Step 5 — 개별 종목 진입 타이밍 (탭: 개별 종목 정밀 검사)", expanded=False):
+            g5c1, g5c2 = st.columns(2)
+            with g5c1:
+                st.success(
+                    "✅ 진입 조건\n\n"
+                    "- 현재가 200일선 위\n"
+                    "- RSI 40~65 사이\n"
+                    "- 최근 고점 대비 5~15% 조정\n"
+                    "- 실적 발표 2주 이상 남음"
+                )
+            with g5c2:
+                st.warning(
+                    "⚠️ 주의 신호\n\n"
+                    "- RSI 75 이상 (과매수)\n"
+                    "- 52주 신고가 바로 위\n"
+                    "- 실적 발표 1주 이내\n"
+                    "- 200일선 아래"
+                )
+            st.markdown("**📌 예시:** NVDA 현재가 $875 / 200일선 $812 ✅ / RSI 58 ✅ / 최근 고점 -8% ✅ → 진입 타이밍 양호")
+
+        # Step 6
+        with st.expander("🔔 Step 6 — Watchlist Alert 설정 (탭: Buy Watchlist & Alert)", expanded=False):
+            g6c1, g6c2, g6c3 = st.columns(3)
+            with g6c1:
+                st.info("💰 목표 매수가\n\n원하는 가격 이하 도달 시 알림.")
+            with g6c2:
+                st.info("📉 RSI 과매도\n\nRSI 30 이하 설정 권장.")
+            with g6c3:
+                st.info("📊 200일선 근접\n\n장기 지지선 테스트 시 알림.")
+            st.markdown("**💡 팁:** Alert 발동 시 바로 매수하지 말고 [3단계] 개별 종목 검사를 다시 확인하세요.")
+
+        # Step 7
+        with st.expander("💼 Step 7 — 포트폴리오 등록 & Thesis 기록 (탭: 포트폴리오 매도 레이더)", expanded=False):
+            st.markdown("매수 후 등록 시 **📌 투자 Thesis를 반드시 선택**하세요. 나중에 어떤 테마로 샀는지 추적할 수 있어요.")
+            st.markdown("- **Correlation Matrix:** 기존 보유 종목과 0.85 이상이면 분산 효과 없음\n- **Personal Benchmark:** 내 포트폴리오가 SPY를 이기고 있는지 확인\n- **Earnings Calendar:** 보유 종목 실적 발표일 확인")
+
+        # Step 8
+        with st.expander("🛡️ Step 8 — 매도 타이밍 잡기 (탭: 포트폴리오 매도 레이더)", expanded=False):
+            g8c1, g8c2 = st.columns(2)
+            with g8c1:
+                st.error(
+                    "🔴 즉시 매도 검토\n\n"
+                    "- 상태: SELL 표시\n"
+                    "- Drawdown -30% 이상\n"
+                    "- 200일선 아래\n"
+                    "- SPY Alpha -20%p 이하\n"
+                    "- Macro Score 45점 미만 급락"
+                )
+            with g8c2:
+                st.warning(
+                    "🟡 부분 매도 / 관망\n\n"
+                    "- SPY Alpha 0%p 이하\n"
+                    "- VIX 30 이상 급등\n"
+                    "- 내러티브 테마 약화\n"
+                    "- 실적 발표 1주 전\n"
+                    "- Correlation 종목 동시 하락"
+                )
+            st.markdown("**📌 주간 루틴:** 월요일 거시 확인 → 화요일 내러티브 실행 → 목요일 포트폴리오 점검 → 금요일 주간 AI 리포트")
+            st.markdown("**📌 매도 예시:** Macro Score 급락 + VIX 급등 + 주간 리포트 축소 권장 + Drawdown 18% → 4가지 동시 발생 시 보유 물량 50% 이상 매도")
+
+        st.divider()
+        st.markdown("## ✅ 매수 전 최종 체크리스트 (5개 이상 충족 시 진입)")
+        checklist = [
+            ("🌐", "Macro Score 60점 이상", "거시 환경 우호적"),
+            ("📰", "AI 내러티브 Winners 또는 Top Quant Picks 포함", "테마 확인"),
+            ("🎯", "Hidden Alpha Radar 상위 20% 이내", "섹터 강세"),
+            ("🚀", "AI 스캐너 Final Score 70점 이상", "종목 경쟁력"),
+            ("🔬", "RSI 40~70 사이", "과매수/과매도 아님"),
+            ("📊", "현재가 200일선 위", "장기 우상향 추세"),
+            ("📅", "실적 발표 2주 이상 남음", "이벤트 리스크 없음"),
+        ]
+        for emoji, item, desc in checklist:
+            st.markdown(f"{emoji} **{item}** — _{desc}_")
+
+        st.divider()
+        st.warning("⚠️ 면책 조항: 이 앱은 투자 참고 도구이며 투자 권유가 아닙니다. 모든 투자 결정과 결과는 투자자 본인의 책임입니다.")
+
+    elif main_nav == _MAIN_NAV_OPTIONS[1]:
         sync_m1, sync_m2 = st.columns([1, 3])
         with sync_m1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_macro", use_container_width=True):
