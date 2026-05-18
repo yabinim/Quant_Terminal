@@ -835,6 +835,8 @@ if "narrative_timeseries_briefing" not in st.session_state:
 
 # 사이드바 메인 내비게이션 (탑다운: 단일 radio, 옵션 문자열로 분기)
 _MAIN_NAV_OPTIONS = (
+    # ── 시작하기 ───────────────────────────────────────────────────────────
+    "📖 사용 가이드 (처음이라면 여기부터)",
     # ── 분석 도구 ──────────────────────────────────────────────────────────
     "🌐 [1단계] 거시경제 지표",
     "📰 [1단계] 시장 내러티브",
@@ -6088,7 +6090,7 @@ if st.session_state.get("logged_in"):
             st.error("거시경제 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
     
-    elif main_nav == _MAIN_NAV_OPTIONS[1]:
+    elif main_nav == _MAIN_NAV_OPTIONS[2]:
         hydrate_narrative_from_disk_once()
     
         nrow_1, nrow_2 = st.columns([1, 3])
@@ -6502,7 +6504,7 @@ if st.session_state.get("logged_in"):
                                 st.markdown(f"**{ui_text['sentiment']}**\n\n{deep_result.get('market_sentiment', 'N/A')}")
                                 st.markdown(f"**{ui_text['outlook']}**\n\n{deep_result.get('forward_outlook', 'N/A')}")
     
-    elif main_nav == _MAIN_NAV_OPTIONS[3]:
+    elif main_nav == _MAIN_NAV_OPTIONS[4]:
         st.subheader(f"{_MAIN_NAV_OPTIONS[3]} · 듀얼 엔진")
         st.caption(
             "**Current Leaders**는 기존 6대 팩터로 대장·테마 정렬을, **Emerging**은 2차 수혜·초기 모멘텀·거래량 가속·과열 회피 관점으로 같은 유니버스를 재스코어링합니다."
@@ -6702,7 +6704,7 @@ if st.session_state.get("logged_in"):
             elif not run_emerge:
                 st.caption("Emerging 엔진 스캔을 실행하면 RSI·거래량 가속 지표와 함께 결과가 세션에 유지됩니다.")
     
-    elif main_nav == _MAIN_NAV_OPTIONS[2]:
+    elif main_nav == _MAIN_NAV_OPTIONS[3]:
         syn_s1, syn_s2 = st.columns([1, 3])
         with syn_s1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_sector", use_container_width=True):
@@ -6992,7 +6994,7 @@ if st.session_state.get("logged_in"):
             "💡 이 레이더에 잡힌 생소한 티커를 왼쪽 사이드바에 입력하여 해당 테마를 이끄는 개별 주도주를 찾아보세요."
         )
     
-    elif main_nav == _MAIN_NAV_OPTIONS[4]:
+    elif main_nav == _MAIN_NAV_OPTIONS[5]:
         st.subheader(_MAIN_NAV_OPTIONS[4])
         st.caption(
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
@@ -7230,7 +7232,7 @@ if st.session_state.get("logged_in"):
             st.error("매수 타점 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
     
-    elif main_nav == _MAIN_NAV_OPTIONS[5]:
+    elif main_nav == _MAIN_NAV_OPTIONS[6]:
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_portfolio", use_container_width=True):
@@ -7976,7 +7978,7 @@ if st.session_state.get("logged_in"):
                 except Exception as _earn_e:
                     st.warning(f"실적 캘린더 로드 중 오류: {_earn_e}")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[7]:
+    elif main_nav == _MAIN_NAV_OPTIONS[8]:
         # ─────────────────────────────────────────────────────────────────────
         # 🎯 AI 내러티브 적중률 트래커
         # Narratives 시트에 저장된 Winners/Emerging 티커의 실제 수익률을 역산해
@@ -8371,7 +8373,7 @@ if st.session_state.get("logged_in"):
                 "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
             )
 
-    elif main_nav == _MAIN_NAV_OPTIONS[8]:
+    elif main_nav == _MAIN_NAV_OPTIONS[9]:
         # ─────────────────────────────────────────────────────────────────────
         # 💡 Idea-to-Portfolio 추적
         # 내러티브 테마 → 종목 발굴 → 포트폴리오 편입 흐름을 Thesis ID로 연결
@@ -8508,7 +8510,7 @@ if st.session_state.get("logged_in"):
             )
             st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
 
-    elif main_nav == _MAIN_NAV_OPTIONS[9]:
+    elif main_nav == _MAIN_NAV_OPTIONS[10]:
         # ─────────────────────────────────────────────────────────────────────
         # 📋 주간 포트폴리오 AI 요약
         # 포트폴리오 현황 + 최근 내러티브 + Macro를 묶어 Gemini로 주간 리포트 생성
@@ -8638,7 +8640,7 @@ if st.session_state.get("logged_in"):
             st.markdown(latest_summary)
             st.caption("이 리포트는 `Narratives` 시트에 자동 저장되었습니다. 투자 권유가 아닙니다.")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[6]:
+    elif main_nav == _MAIN_NAV_OPTIONS[7]:
         # ─────────────────────────────────────────────────────────────────────
         # 🔔 Buy Watchlist & Alert
         # 관심 종목 등록 + 매수 조건(목표가/RSI/200일선) 자동 체크
