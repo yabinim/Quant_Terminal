@@ -68,6 +68,9 @@ _PORTFOLIOS_LEGACY_HEADER = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 _THESIS_WORKSHEET_TITLE = "Thesis"
 _WATCHLIST_SHEET_TITLE = "Watchlist"
+_ETF_UNIVERSE_SHEET_TITLE = "ETF_Universe"
+_ETF_UNIVERSE_SHEET_COLS = ["Ticker", "Name", "Category", "AUM_M", "Added_Date", "Source"]
+_ETF_AUTO_UPDATE_INTERVAL_DAYS = 7  # 자동 업데이트 주기
 _WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added"]
 _THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
@@ -1029,10 +1032,10 @@ def load_etf_universe_tickers():
 
 def read_etf_universe_file_tickers():
     """
-    `etf_universe.txt`에서 ETF 티커 목록을 읽는다 (줄바꿈·쉼표·공백 구분, # 주석 지원).
-    내부적으로 `load_etf_universe_tickers()`와 동일한 파서를 사용한다.
+    etf_universe.txt + Google Sheets ETF_Universe 합산 티커 목록 반환.
+    Sheets에 신규 ETF가 자동 추가되면 여기에도 자동 반영된다.
     """
-    return load_etf_universe_tickers()
+    return load_etf_universe_tickers_merged()
 
 
 def to_float(value):
@@ -2609,6 +2612,201 @@ def build_portfolio_sell_radar_df(portfolio_df):
         )
 
     return pd.DataFrame(rows)
+
+
+def open_etf_universe_worksheet():
+    """Quant_DB 스프레드시트의 ETF_Universe 탭."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_ETF_UNIVERSE_SHEET_TITLE)
+        return ws, None
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
+            try:
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                ws = sh.add_worksheet(title=_ETF_UNIVERSE_SHEET_TITLE, rows=3000, cols=6)
+                ws.update([_ETF_UNIVERSE_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
+                return ws, None
+            except Exception as exc2:
+                return None, f"ETF_Universe 워크시트 생성 실패: {exc2}"
+        return None, f"ETF_Universe 워크시트 열기 실패: {exc}"
+
+
+def load_etf_universe_from_sheet() -> list[str]:
+    """Google Sheets ETF_Universe 탭에서 ticker 목록 로드."""
+    ws, err = open_etf_universe_worksheet()
+    if err or ws is None:
+        return []
+    try:
+        vals = ws.get_all_values()
+        if not vals or len(vals) < 2:
+            return []
+        tickers = []
+        seen = set()
+        for r in vals[1:]:
+            tk = str((r + [""])[0]).strip().upper()
+            if tk and tk not in seen:
+                seen.add(tk)
+                tickers.append(tk)
+        return tickers
+    except Exception:
+        return []
+
+
+def save_new_etfs_to_sheet(new_etfs: list[dict]) -> tuple[int, str]:
+    """신규 ETF를 ETF_Universe 시트에 추가. 반환: (추가된 수, 에러메시지)"""
+    if not new_etfs:
+        return 0, ""
+    ws, err = open_etf_universe_worksheet()
+    if err or ws is None:
+        return 0, err or "워크시트 열기 실패"
+    try:
+        existing_vals = ws.get_all_values()
+        existing_tickers = set(
+            str(r[0]).strip().upper()
+            for r in existing_vals[1:]
+            if r and r[0].strip()
+        )
+        rows_to_add = []
+        added_date = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+        for etf in new_etfs:
+            tk = str(etf.get("ticker", "")).strip().upper()
+            if not tk or tk in existing_tickers:
+                continue
+            rows_to_add.append([
+                tk,
+                str(etf.get("name", ""))[:80],
+                str(etf.get("category", ""))[:50],
+                str(etf.get("aum_m", "")),
+                added_date,
+                "FMP_AUTO",
+            ])
+            existing_tickers.add(tk)
+        if rows_to_add:
+            ws.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+        return len(rows_to_add), ""
+    except Exception as exc:
+        return 0, str(exc)
+
+
+def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) -> list[dict]:
+    """
+    FMP API로 최근 상장된 ETF를 스캔.
+    - days_lookback: 최근 N일 이내 상장된 ETF
+    - min_aum_m: 최소 AUM (백만달러)
+    """
+    try:
+        fmp_key = st.secrets.get("FMP_API_KEY", "")
+        if not fmp_key:
+            return []
+
+        # FMP ETF 전체 목록
+        url = f"https://financialmodelingprep.com/stable/etf-list?apikey={fmp_key}"
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            return []
+        all_etfs = resp.json()
+        if not isinstance(all_etfs, list):
+            return []
+
+        cutoff_date = datetime.now(_KST_TZ) - timedelta(days=days_lookback)
+        new_etfs = []
+
+        for etf in all_etfs:
+            if not isinstance(etf, dict):
+                continue
+            ticker = str(etf.get("symbol", "") or "").strip().upper()
+            if not ticker:
+                continue
+            # 미국 ETF만 필터링
+            exchange = str(etf.get("exchange", "") or "").upper()
+            if exchange not in ("NYSE ARCA", "NASDAQ", "BATS", "NYSEARCA", "NYSEArca"):
+                continue
+            # 상장일 체크
+            ipo_date_str = str(etf.get("ipoDate", "") or "")
+            if ipo_date_str:
+                try:
+                    ipo_dt = datetime.strptime(ipo_date_str[:10], "%Y-%m-%d").replace(tzinfo=_KST_TZ)
+                    if ipo_dt < cutoff_date:
+                        continue
+                except Exception:
+                    continue
+            else:
+                continue
+            new_etfs.append({
+                "ticker": ticker,
+                "name": str(etf.get("name", "") or "")[:80],
+                "category": str(etf.get("assetClass", "") or "")[:50],
+                "aum_m": "",
+                "ipo_date": ipo_date_str[:10],
+            })
+
+        # AUM 필터링 (yfinance로 빠르게 체크)
+        filtered = []
+        for etf in new_etfs[:50]:  # 최대 50개만 체크 (rate limit 방지)
+            try:
+                info = yf.Ticker(etf["ticker"]).info
+                aum = float(info.get("totalAssets", 0) or 0) / 1_000_000
+                if aum >= min_aum_m:
+                    etf["aum_m"] = f"{aum:.0f}"
+                    filtered.append(etf)
+            except Exception:
+                # AUM 확인 실패해도 포함 (보수적으로)
+                filtered.append(etf)
+
+        return filtered
+
+    except Exception:
+        return []
+
+
+def should_run_etf_auto_update() -> bool:
+    """마지막 ETF 자동 업데이트로부터 7일이 지났는지 확인."""
+    last_update = st.session_state.get("_etf_auto_update_last_run")
+    if last_update is None:
+        return True
+    elapsed = (datetime.now(timezone.utc) - last_update).total_seconds()
+    return elapsed > (_ETF_AUTO_UPDATE_INTERVAL_DAYS * 86400)
+
+
+def run_etf_auto_update_if_needed(silent: bool = True) -> tuple[int, str]:
+    """
+    필요 시 ETF 자동 업데이트 실행.
+    silent=True: 백그라운드 실행 (UI 메시지 없음)
+    반환: (새로 추가된 ETF 수, 에러 메시지)
+    """
+    if not should_run_etf_auto_update():
+        return 0, ""
+    st.session_state["_etf_auto_update_last_run"] = datetime.now(timezone.utc)
+    try:
+        new_etfs = fetch_new_etfs_from_fmp(days_lookback=90, min_aum_m=50.0)
+        if not new_etfs:
+            return 0, ""
+        added, err = save_new_etfs_to_sheet(new_etfs)
+        return added, err
+    except Exception as exc:
+        return 0, str(exc)
+
+
+def load_etf_universe_tickers_merged() -> list[str]:
+    """
+    etf_universe.txt + Google Sheets ETF_Universe 합산 ticker 목록.
+    중복 제거 후 반환.
+    """
+    file_tickers = load_etf_universe_tickers()
+    sheet_tickers = load_etf_universe_from_sheet()
+    seen = set()
+    merged = []
+    for tk in file_tickers + sheet_tickers:
+        tk = str(tk).strip().upper()
+        if tk and tk not in seen:
+            seen.add(tk)
+            merged.append(tk)
+    return merged
 
 
 def open_watchlist_worksheet():
@@ -5401,6 +5599,17 @@ if st.session_state.get("logged_in"):
     
     render_global_market_watch_header()
 
+    # ── ETF Universe 자동 업데이트 (주 1회) ─────────────────────────────────
+    if str(st.session_state.get("user_id") or "").strip():
+        if not st.session_state.get("_etf_auto_update_done_this_session"):
+            st.session_state["_etf_auto_update_done_this_session"] = True
+            try:
+                _added_cnt, _add_err = run_etf_auto_update_if_needed(silent=True)
+                if _added_cnt > 0:
+                    st.session_state["_etf_new_added_count"] = _added_cnt
+            except Exception:
+                pass
+
     # ── Watchlist Alert 자동 체크 (매 세션 1회) ───────────────────────────
     _uid_alert = str(st.session_state.get("user_id") or "").strip()
     if _uid_alert and not st.session_state.get("_watchlist_alert_checked"):
@@ -5431,6 +5640,11 @@ if st.session_state.get("logged_in"):
     if _triggered_alerts:
         with st.container():
             st.warning(f"🔔 **Watchlist Alert** — {len(_triggered_alerts)}개 종목에서 매수 조건이 발동됐어요! `🔔 Buy Watchlist & Alert` 메뉴에서 확인하세요.")
+
+    # 신규 ETF 자동 발견 알림
+    _etf_new_cnt = st.session_state.pop("_etf_new_added_count", 0)
+    if _etf_new_cnt > 0:
+        st.success(f"🆕 **ETF Universe 자동 업데이트** — 최근 90일 내 신규 상장 ETF **{_etf_new_cnt}개**가 자동으로 추가됐어요! `[2단계] 섹터 & 자금 흐름`에서 확인하세요.")
 
     _nav_key = "main_sidebar_nav"
     _nav_opts = list(_MAIN_NAV_OPTIONS)
@@ -6295,6 +6509,52 @@ if st.session_state.get("logged_in"):
         with syn_s2:
             st.caption("섹터 ETF·세부 종목 풀 데이터 캐시를 비우고 해당 화면을 다시 열 때 최신 데이터를 사용합니다.")
     
+        # ── ETF Universe 관리 expander ────────────────────────────────────
+        with st.expander("🆕 ETF Universe 관리 (자동 업데이트)", expanded=False):
+            st.caption(
+                "FMP API로 최근 90일 내 신규 상장 ETF를 자동 스캔해 Google Sheets `ETF_Universe` 탭에 추가합니다. "
+                f"업데이트 주기: **{_ETF_AUTO_UPDATE_INTERVAL_DAYS}일마다 자동 실행**. 수동으로도 실행할 수 있어요."
+            )
+
+            eu_col1, eu_col2 = st.columns(2)
+            with eu_col1:
+                current_merged = load_etf_universe_tickers_merged()
+                file_only = load_etf_universe_tickers()
+                sheet_only = load_etf_universe_from_sheet()
+                st.metric("전체 ETF Universe", f"{len(current_merged)}개")
+                st.caption(f"📄 etf_universe.txt: {len(file_only)}개 | ☁️ Sheets 자동추가: {len(sheet_only)}개")
+
+            with eu_col2:
+                last_run = st.session_state.get("_etf_auto_update_last_run")
+                last_run_str = last_run.astimezone(_KST_TZ).strftime("%m/%d %H:%M") if last_run else "이번 세션 미실행"
+                st.metric("마지막 자동 업데이트", last_run_str)
+
+            manual_col1, manual_col2 = st.columns(2)
+            with manual_col1:
+                if st.button("🔍 신규 ETF 지금 스캔", key="etf_manual_scan_btn", use_container_width=True, type="primary"):
+                    with st.spinner("FMP API로 신규 ETF 스캔 중... (약 30초 소요)"):
+                        st.session_state["_etf_auto_update_last_run"] = None  # 강제 재실행
+                        _m_added, _m_err = run_etf_auto_update_if_needed(silent=False)
+                    if _m_err:
+                        st.error(f"스캔 오류: {_m_err}")
+                    elif _m_added > 0:
+                        st.success(f"✅ 신규 ETF {_m_added}개가 추가됐어요!")
+                        cached_etf_universe_rankings_full.clear()
+                        st.rerun()
+                    else:
+                        st.info("최근 90일 내 신규 상장된 ETF(AUM $50M 이상)가 없거나 이미 모두 등록되어 있어요.")
+
+            with manual_col2:
+                if st.button("📋 Sheets 추가 목록 보기", key="etf_sheet_list_btn", use_container_width=True):
+                    if sheet_only:
+                        st.dataframe(
+                            pd.DataFrame({"자동추가 ETF": sheet_only}),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.info("Sheets에 자동 추가된 ETF가 없어요.")
+
         st.subheader(f"{_MAIN_NAV_OPTIONS[2]} · 섹터 ETF 상대 강도")
         st.caption("주요 섹터/테마 ETF 상대 강도 점검 (2년 데이터 기반)")
         st.markdown(f"기준 티커: `{selected_ticker}`")
