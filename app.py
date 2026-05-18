@@ -5175,25 +5175,169 @@ Hard rules:
         return {}
 
 
-def generate_market_narrative(news_text, target_language):
+def compute_quantitative_sector_leaders(top_n: int = 30) -> dict:
+    """
+    ETF Universe에서 정량 지표로 유망 섹터/종목을 선별.
+    반환: {
+        "leaders": [{"ticker", "rs_score", "mom_1m", "mom_3m", "vol_surge", "above_ma200"}],
+        "top_sectors": [섹터 ETF 티커],
+        "summary_text": "Gemini 입력용 요약 텍스트"
+    }
+    """
+    try:
+        universe = read_etf_universe_file_tickers()
+        if not universe:
+            return {"leaders": [], "top_sectors": [], "summary_text": ""}
+
+        # 핵심 섹터 ETF (RS 계산용)
+        sector_etfs = ["XLK", "XLV", "XLF", "XLE", "XLY", "XLI", "XLC", "XLU", "XLRE", "XLB"]
+        spy_ticker = "SPY"
+
+        # 전체 유니버스 + SPY 가격 다운로드
+        all_tickers = list(dict.fromkeys(universe + [spy_ticker] + sector_etfs))
+        all_tuple = tuple(sorted(set(all_tickers)))
+
+        try:
+            raw = yf.download(
+                list(all_tuple), period="1y", interval="1d",
+                auto_adjust=True, progress=False, threads=True
+            )
+            if isinstance(raw.columns, pd.MultiIndex):
+                closes = raw["Close"] if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
+                volumes = raw["Volume"] if "Volume" in raw.columns.get_level_values(0) else pd.DataFrame()
+            else:
+                closes = raw
+                volumes = pd.DataFrame()
+        except Exception:
+            return {"leaders": [], "top_sectors": [], "summary_text": ""}
+
+        if closes.empty:
+            return {"leaders": [], "top_sectors": [], "summary_text": ""}
+
+        # SPY 기준 RS 계산
+        spy_series = pd.to_numeric(closes.get(spy_ticker, pd.Series(dtype=float)), errors="coerce").dropna()
+
+        leaders = []
+        for tk in universe:
+            if tk not in closes.columns:
+                continue
+            try:
+                price = pd.to_numeric(closes[tk], errors="coerce").dropna()
+                if len(price) < 63:
+                    continue
+
+                # 1개월·3개월 수익률
+                mom_1m = float((price.iloc[-1] / price.iloc[-22] - 1.0) * 100) if len(price) >= 22 else np.nan
+                mom_3m = float((price.iloc[-1] / price.iloc[-63] - 1.0) * 100) if len(price) >= 63 else np.nan
+
+                # RS Score (SPY 대비 3개월 수익률)
+                if len(spy_series) >= 63:
+                    spy_3m = float((spy_series.iloc[-1] / spy_series.iloc[-63] - 1.0) * 100)
+                    rs_score = float(mom_3m - spy_3m) if pd.notna(mom_3m) else np.nan
+                else:
+                    rs_score = np.nan
+
+                # 200일선 위/아래
+                ma200 = float(price.rolling(200, min_periods=150).mean().iloc[-1]) if len(price) >= 150 else np.nan
+                above_ma200 = bool(price.iloc[-1] > ma200) if pd.notna(ma200) else None
+
+                # 거래량 급증 (최근 5일 vs 21일 평균)
+                vol_surge = np.nan
+                if not volumes.empty and tk in volumes.columns:
+                    vol = pd.to_numeric(volumes[tk], errors="coerce").dropna()
+                    if len(vol) >= 21:
+                        recent_vol = float(vol.tail(5).mean())
+                        baseline_vol = float(vol.tail(21).mean())
+                        vol_surge = float(recent_vol / baseline_vol) if baseline_vol > 0 else np.nan
+
+                leaders.append({
+                    "ticker": tk,
+                    "rs_score": round(rs_score, 2) if pd.notna(rs_score) else None,
+                    "mom_1m": round(mom_1m, 2) if pd.notna(mom_1m) else None,
+                    "mom_3m": round(mom_3m, 2) if pd.notna(mom_3m) else None,
+                    "vol_surge": round(vol_surge, 2) if pd.notna(vol_surge) else None,
+                    "above_ma200": above_ma200,
+                })
+            except Exception:
+                continue
+
+        # RS Score 기준 정렬 → Top N
+        leaders_sorted = sorted(
+            [l for l in leaders if l["rs_score"] is not None],
+            key=lambda x: x["rs_score"],
+            reverse=True
+        )[:top_n]
+
+        # 섹터 ETF RS 랭킹
+        sector_rs = []
+        for se in sector_etfs:
+            found = next((l for l in leaders if l["ticker"] == se), None)
+            if found and found["rs_score"] is not None:
+                sector_rs.append((se, found["rs_score"]))
+        sector_rs.sort(key=lambda x: x[1], reverse=True)
+        top_sectors = [s[0] for s in sector_rs[:5]]
+
+        # Gemini 입력용 요약 텍스트 생성
+        lines = ["[정량 스크리닝 결과 — Gemini 참고용]"]
+        lines.append(f"SPY 대비 RS 상위 {len(leaders_sorted)}개 ETF/종목:")
+        for l in leaders_sorted[:15]:
+            ma_str = "✅200일선 위" if l["above_ma200"] else "❌200일선 아래" if l["above_ma200"] is False else ""
+            vol_str = f"거래량 급증 {l['vol_surge']:.1f}x" if l["vol_surge"] and l["vol_surge"] >= 1.3 else ""
+            lines.append(
+                f"  {l['ticker']}: RS={l['rs_score']:+.1f}%p | 1M={l['mom_1m']:+.1f}% | 3M={l['mom_3m']:+.1f}% {ma_str} {vol_str}"
+            )
+        if top_sectors:
+            lines.append(f"강세 섹터 ETF 상위 5: {', '.join(top_sectors)}")
+
+        return {
+            "leaders": leaders_sorted,
+            "top_sectors": top_sectors,
+            "summary_text": "\n".join(lines),
+        }
+
+    except Exception:
+        return {"leaders": [], "top_sectors": [], "summary_text": ""}
+
+
+def generate_market_narrative(news_text, target_language, quant_data: dict = None):
     if not news_text:
         return {}
 
     st.session_state["last_gemini_raw_text"] = ""
     language_label = "한국어" if target_language == "ko" else "English"
+
+    # 정량 데이터 섹션 구성
+    quant_section = ""
+    if quant_data and quant_data.get("summary_text"):
+        quant_section = f"""
+[정량 스크리닝 데이터 — 실제 가격/거래량 기반]
+{quant_data['summary_text']}
+
+중요: winners 선정 시 위 정량 데이터에서 RS Score가 양수(+)이고 200일선 위에 있는 종목을 우선적으로 포함하세요.
+뉴스 테마와 정량 모멘텀이 일치하는 종목이 가장 신뢰도 높은 Winners입니다.
+"""
+
     prompt = f"""
-당신은 월가 수석 전략가입니다.
-아래 뉴스 묶음을 분석하여 지정된 JSON 스키마 그대로만 응답하세요.
+당신은 월가 수석 퀀트 전략가입니다.
+아래 뉴스와 정량 스크리닝 데이터를 종합 분석하여 지정된 JSON 스키마 그대로만 응답하세요.
+
+핵심 원칙:
+- 뉴스(정성) + 가격 모멘텀(정량)이 동시에 확인된 종목만 Winners로 선정
+- 정량 데이터에서 RS Score 양수 + 200일선 위 종목을 우선 포함
+- 뉴스만 좋고 가격이 안 받쳐주는 종목은 emerging으로만 분류
+- 각 theme의 winners는 반드시 3~6개 티커
+
 중요 규칙:
 1) 반드시 순수 JSON 텍스트만 출력 (```json 같은 마크다운 금지)
 2) 모든 키를 빠짐없이 포함
-3) themes는 최소 2개 이상 생성
-4) winners는 티커를 쉼표로 구분한 문자열
-5) 각 theme의 expanding_to는 반드시 객체 배열(list)이어야 함 (문자열 금지)
+3) themes는 최소 3개 이상 생성
+4) winners/emerging은 티커를 쉼표로 구분한 문자열
+5) 각 theme의 expanding_to는 반드시 객체 배열(list)이어야 함
 6) expanding_to의 각 객체는 반드시 "stage"와 "expected_tickers" 키를 포함
 7) expected_tickers는 각 stage마다 반드시 2~4개 티커를 쉼표 구분 문자열로 작성
-8) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
-
+8) momentum_note: 이 테마의 가격 모멘텀 강도 한 줄 평가 (강함/보통/약함 + 이유)
+9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
+{quant_section}
 [뉴스 데이터]
 {news_text}
 
@@ -5208,7 +5352,9 @@ def generate_market_narrative(news_text, target_language):
     {{
       "title": "테마명 (예: AI Capex Expansion)",
       "driver": "무엇이 이 테마를 촉발했는가?",
-      "winners": "수혜주 티커들 (예: NVDA, MSFT)",
+      "winners": "정량+정성 모두 확인된 수혜주 (예: NVDA, MSFT, SOXX)",
+      "emerging": "뉴스 모멘텀은 있으나 가격 확인 필요 종목 (예: ARM, MRVL)",
+      "momentum_note": "이 테마의 가격 모멘텀 강도 평가 (예: 강함 - RS +15%p, 거래량 1.8x 급증)",
       "expanding_to": [
         {{"stage": "기업용 AI 솔루션", "expected_tickers": "CRM, NOW, WDAY"}},
         {{"stage": "AI 기반 사이버 보안", "expected_tickers": "CRWD, PANW, FTNT"}}
@@ -5217,7 +5363,8 @@ def generate_market_narrative(news_text, target_language):
     }}
   ],
   "rotation": "과열 섹터 -> 수혜 섹터 플로우 요약 (예: Tech -> Industrials)",
-  "summary": "월가 리포트 스타일의 전체 시장 핵심 요약 (기관과 개인의 뷰 차이 포함)"
+  "top_quant_picks": "정량 스크리닝 상위 종목 중 내러티브와 일치하는 최우선 종목 3~5개 (쉼표 구분)",
+  "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약 (뉴스+모멘텀 종합, 기관 vs 개인 뷰 차이 포함)"
 }}
 You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings.
 """
@@ -6029,9 +6176,16 @@ if st.session_state.get("logged_in"):
                         st.write(f"✔️ 중복 제거/랭킹 완료: Top {len(top_news)}개 핵심 뉴스 선별")
                         st.session_state["latest_top_news"] = top_news
     
-                        st.write("🧠 3단계: 추출된 핵심 뉴스를 Gemini 2.5 Flash 엔진으로 전송하여 내러티브 분석 중...")
-                        narrative_data = generate_market_narrative(news_text, selected_language)
-                        st.write("🔍 4단계: AI 응답 수신 완료. JSON 데이터 파싱 및 필터링 중...")
+                        st.write("📊 3단계: ETF Universe 정량 스크리닝 (RS·모멘텀·거래량 분석) 중...")
+                        quant_result = compute_quantitative_sector_leaders(top_n=30)
+                        if quant_result.get("leaders"):
+                            st.write(f"✔️ 정량 스크리닝 완료: RS 상위 {len(quant_result['leaders'])}개 종목 선별 | 강세 섹터: {', '.join(quant_result.get('top_sectors', []))}")
+                        else:
+                            st.write("⚠️ 정량 스크리닝 데이터 없음 — 뉴스 분석만으로 진행")
+
+                        st.write("🧠 4단계: 뉴스 + 정량 데이터를 Gemini 2.5 Flash 엔진으로 전송하여 내러티브 분석 중...")
+                        narrative_data = generate_market_narrative(news_text, selected_language, quant_data=quant_result)
+                        st.write("🔍 5단계: AI 응답 수신 완료. JSON 데이터 파싱 및 필터링 중...")
     
                         if narrative_data:
                             st.session_state["narrative_history"].append(narrative_data)
@@ -6088,6 +6242,7 @@ if st.session_state.get("logged_in"):
         themes_data = narrative_data.get("themes", []) if isinstance(narrative_data, dict) else []
         rotation_data = narrative_data.get("rotation", "") if isinstance(narrative_data, dict) else ""
         summary_data = narrative_data.get("summary", "") if isinstance(narrative_data, dict) else ""
+        top_quant_picks = narrative_data.get("top_quant_picks", "") if isinstance(narrative_data, dict) else ""
     
         if not narrative_data:
             st.warning("아직 AI 분석 결과가 없습니다. 상단 버튼을 눌러 실시간 내러티브를 생성하세요.")
@@ -6115,6 +6270,15 @@ if st.session_state.get("logged_in"):
                 regime_data.get("liquidity", "N/A"),
             )
     
+        # ── Top Quant Picks 배너 ─────────────────────────────────────────
+        if top_quant_picks:
+            st.divider()
+            st.markdown("### 🏆 Top Quant Picks (정량+정성 동시 확인)")
+            st.success(
+                f"**정량 모멘텀 + 뉴스 내러티브가 동시에 확인된 최우선 종목:** `{top_quant_picks}`  "
+                "RS Score 양수 + 200일선 위 + 내러티브 테마 일치 종목입니다."
+            )
+
         st.divider()
         st.markdown("### 🔥 Current Market Themes & 📊 Narrative Breakdown")
         if isinstance(themes_data, list) and themes_data:
@@ -6136,15 +6300,32 @@ if st.session_state.get("logged_in"):
                     fallback_text = str(expanding_to_data or "N/A").strip()
                     expanding_to_display = f"- ➔ **Legacy Flow**: `{fallback_text}`"
     
-                with st.expander(f"Theme {idx}: {title}", expanded=(idx == 1)):
+                momentum_note = str(theme.get("momentum_note", "") or "").strip()
+                emerging_tickers = str(theme.get("emerging", "") or "").strip()
+                winners_str = str(theme.get("winners", "") or "N/A").strip()
+
+                # 모멘텀 강도 이모지
+                if "강함" in momentum_note or "strong" in momentum_note.lower():
+                    mom_emoji = "🔥"
+                elif "약함" in momentum_note or "weak" in momentum_note.lower():
+                    mom_emoji = "❄️"
+                else:
+                    mom_emoji = "📊"
+
+                with st.expander(f"Theme {idx}: {title} {mom_emoji}", expanded=(idx == 1)):
+                    # Winners + 모멘텀 점수 강조
+                    st.markdown(f"**🎯 Winners (정량+정성 확인):** `{winners_str}`")
+                    if emerging_tickers:
+                        st.markdown(f"**🌱 Emerging (추적 필요):** `{emerging_tickers}`")
+                    if momentum_note:
+                        st.caption(f"📈 모멘텀: {momentum_note}")
                     st.markdown(
                         f"""
-    - **Driver (원인):** {theme.get("driver", "N/A")}
-    - **Winners (수혜주):** {theme.get("winners", "N/A")}
-    - **Expanding to (확장 흐름):**
-    {expanding_to_display}
-    - **Risk (위험 요인):** {theme.get("risk", "N/A")}
-    """
+- **Driver (원인):** {theme.get("driver", "N/A")}
+- **Expanding to (확장 흐름):**
+{expanding_to_display}
+- **Risk (위험 요인):** {theme.get("risk", "N/A")}
+"""
                     )
         else:
             st.info("AI가 추출한 테마 데이터가 아직 없습니다.")
