@@ -5912,20 +5912,32 @@ if st.session_state.get("logged_in"):
         _wl_cur = load_watchlist_sheet(_uid_memo)
         _wl_cur = [x for x in _wl_cur if x["ticker"] != selected_ticker]
         _wl_cur.append(_new_wl_item)
-        save_watchlist_sheet(_uid_memo, _wl_cur)
-        st.sidebar.success(f"{selected_ticker} Watchlist에 저장했습니다.")
-        st.session_state["_watchlist_alert_checked"] = False
+        _ok_wl_save, _err_wl_save = save_watchlist_sheet(_uid_memo, _wl_cur)
+        if _ok_wl_save:
+            st.sidebar.success(f"{selected_ticker} Watchlist에 저장했습니다.")
+            st.session_state["_watchlist_alert_checked"] = False
+            st.session_state.pop("_sidebar_wl_count", None)  # 카운트 캐시 초기화
+            st.rerun()
+        else:
+            st.sidebar.error(f"저장 실패: {_err_wl_save}")
 
     if st.sidebar.button("🔔 Watchlist 전체 보기", key="sidebar_wl_goto", use_container_width=True):
-        st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[6]
+        st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[7]
         st.rerun()
 
+    # Watchlist 종목 수 표시 (매 렌더링마다 API 호출 방지 - session_state 캐시 활용)
     _uid_sidebar = str(st.session_state.get("user_id") or "").strip()
-    _sidebar_wl = load_watchlist_sheet(_uid_sidebar)
-    if _sidebar_wl:
-        st.sidebar.caption(f"📋 Watchlist: {len(_sidebar_wl)}개 종목")
+    if "_sidebar_wl_count" not in st.session_state:
+        try:
+            _temp_wl = load_watchlist_sheet(_uid_sidebar)
+            st.session_state["_sidebar_wl_count"] = len(_temp_wl)
+        except Exception:
+            st.session_state["_sidebar_wl_count"] = 0
+    _wl_count = st.session_state.get("_sidebar_wl_count", 0)
+    if _wl_count > 0:
+        st.sidebar.caption(f"📋 Watchlist: {_wl_count}개 종목 저장됨")
     else:
-        st.sidebar.caption("저장된 메모가 없습니다.")
+        st.sidebar.caption("저장된 Watchlist 메모가 없습니다.")
     
     if st.sidebar.button("로그아웃", key="sidebar_logout_btn", use_container_width=True):
         st.session_state["logged_in"] = False
@@ -8963,7 +8975,7 @@ if st.session_state.get("logged_in"):
                     with btn_col1:
                         if st.button(f"📌 {tk} 분석하기", key=f"wl_pick_{idx}", use_container_width=True):
                             st.session_state["selected_ticker"] = tk
-                            st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[4]
+                            st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
                             st.rerun()
                     with btn_col2:
                         if st.button(f"🗑️ 삭제", key=f"wl_del_{idx}", use_container_width=True):
