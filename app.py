@@ -5908,9 +5908,15 @@ if st.session_state.get("logged_in"):
         else:
             st.sidebar.error(f"저장 실패: {_err_wl_save}")
 
-    if st.sidebar.button("🔔 Watchlist 전체 보기", key="sidebar_wl_goto", use_container_width=True):
+    def _goto_watchlist():
         st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[7]
-        st.rerun()
+
+    st.sidebar.button(
+        "🔔 Watchlist 전체 보기",
+        key="sidebar_wl_goto",
+        use_container_width=True,
+        on_click=_goto_watchlist,
+    )
 
     # Watchlist 종목 수 표시 (매 렌더링마다 API 호출 방지 - session_state 캐시 활용)
     _uid_sidebar = str(st.session_state.get("user_id") or "").strip()
