@@ -8966,15 +8966,21 @@ if st.session_state.get("logged_in"):
 
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
-                        if st.button(f"📌 {tk} 분석하기", key=f"wl_pick_{idx}", use_container_width=True):
-                            st.session_state["selected_ticker"] = tk
+                        def _goto_analysis(ticker=tk):
+                            st.session_state["selected_ticker"] = ticker
                             st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
-                            st.rerun()
+                        st.button(
+                            f"📌 {tk} 분석하기",
+                            key=f"wl_pick_{idx}",
+                            use_container_width=True,
+                            on_click=_goto_analysis,
+                        )
                     with btn_col2:
                         if st.button(f"🗑️ 삭제", key=f"wl_del_{idx}", use_container_width=True):
                             updated_wl = [x for j, x in enumerate(wl_items) if j != idx]
                             save_watchlist_sheet(uid_wl, updated_wl)
                             st.session_state["_watchlist_alert_checked"] = False
+                            st.session_state.pop("_sidebar_wl_count", None)
                             st.rerun()
 
             # Alert 재체크 버튼
