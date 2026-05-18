@@ -835,16 +835,19 @@ if "narrative_timeseries_briefing" not in st.session_state:
 
 # 사이드바 메인 내비게이션 (탑다운: 단일 radio, 옵션 문자열로 분기)
 _MAIN_NAV_OPTIONS = (
+    # ── 분석 도구 ──────────────────────────────────────────────────────────
     "🌐 [1단계] 거시경제 지표",
     "📰 [1단계] 시장 내러티브",
     "🎯 [2단계] 섹터 & 자금 흐름",
     "🚀 [2단계] AI 종목 스캐너",
     "🔬 [3단계] 개별 종목 정밀 검사",
+    # ── 포트폴리오 관리 ────────────────────────────────────────────────────
     "🛡️ [4단계] 포트폴리오 매도 레이더",
-    "🎯 [AI] 내러티브 적중률 트래커",
+    "🔔 Buy Watchlist & Alert",
+    # ── AI 인사이트 ────────────────────────────────────────────────────────
+    "📊 [AI] 내러티브 적중률 트래커",
     "💡 [AI] Idea-to-Portfolio 추적",
     "📋 [AI] 주간 포트폴리오 요약",
-    "🔔 Buy Watchlist & Alert",
 )
 
 # 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
@@ -1327,83 +1330,46 @@ def fetch_dxy_latest_and_mean_deviation():
         return np.nan, np.nan, MACRO_STATUS_NA
 
 
-def fetch_fear_greed_index(vix_series: pd.Series = None) -> tuple[float, str, str]:
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
     """
-    Market Sentiment Score (0~100) — CNN Fear & Greed 근사.
-    vix_series: 이미 가져온 VIX 1년 종가 시리즈 (있으면 재사용, 없으면 새로 fetch).
-    팩터별 독립 try-except로 하나가 실패해도 나머지로 계산.
+    보유 종목의 다음 실적 발표일을 yfinance로 조회.
+    반환: [{"ticker", "earnings_date", "days_until", "eps_estimate"}]
     """
-    scores = {}
-
-    # ── 팩터 1: VIX 백분위 (50%) ─────────────────────────────────────────
-    try:
-        if vix_series is None or vix_series.empty:
-            vix_hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
-            vix_series = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
-        if len(vix_series) >= 20:
-            cur_vix = float(vix_series.iloc[-1])
-            vix_pct = float((vix_series < cur_vix).sum() / len(vix_series) * 100)
-            scores["vix"] = (100.0 - vix_pct, 0.50)
-    except Exception:
-        pass
-
-    # ── 팩터 2: SPY vs MA125 모멘텀 (30%) ────────────────────────────────
-    try:
-        spy_hist = yf.Ticker("SPY").history(period="1y", auto_adjust=False)
-        spy_c = pd.to_numeric(spy_hist["Close"], errors="coerce").dropna()
-        if len(spy_c) >= 21:
-            if len(spy_c) >= 126:
-                ma125 = float(spy_c.rolling(125, min_periods=63).mean().iloc[-1])
-                dev = (float(spy_c.iloc[-1]) / ma125 - 1.0) * 100 if ma125 > 0 else 0
-            else:
-                dev = float((spy_c.iloc[-1] / spy_c.iloc[-22] - 1.0) * 100)
-            mom_score = float(np.clip((dev + 15) / 30 * 100, 0, 100))
-            scores["momentum"] = (mom_score, 0.30)
-    except Exception:
-        pass
-
-    # ── 팩터 3: HYG vs LQD Junk Bond (20%) ──────────────────────────────
-    try:
-        hyg_c = pd.to_numeric(yf.Ticker("HYG").history(period="2mo", auto_adjust=False)["Close"], errors="coerce").dropna()
-        lqd_c = pd.to_numeric(yf.Ticker("LQD").history(period="2mo", auto_adjust=False)["Close"], errors="coerce").dropna()
-        if len(hyg_c) >= 21 and len(lqd_c) >= 21:
-            hyg_ret = float(hyg_c.iloc[-1] / hyg_c.iloc[-22] - 1.0) * 100
-            lqd_ret = float(lqd_c.iloc[-1] / lqd_c.iloc[-22] - 1.0) * 100
-            junk_score = float(np.clip((hyg_ret - lqd_ret + 5) / 10 * 100, 0, 100))
-            scores["junk"] = (junk_score, 0.20)
-    except Exception:
-        pass
-
-    # ── VIX 단독이라도 있으면 fallback 계산 ──────────────────────────────
-    if not scores:
-        # 모든 fetch 실패 시 VIX 절대값으로 마지막 시도
+    results = []
+    for tk in tickers:
         try:
-            vix_val = float(vix_series.iloc[-1]) if (vix_series is not None and not vix_series.empty) else np.nan
-            if pd.notna(vix_val):
-                # VIX 절대값 기준: 10=100점, 20=75점, 30=40점, 40+=0점
-                raw = float(np.clip((40 - vix_val) / 30 * 100, 0, 100))
-                scores["vix_abs"] = (raw, 1.0)
+            info = yf.Ticker(tk).info
+            # yfinance earnings date
+            earnings_ts = info.get("earningsTimestamp") or info.get("earningsDate")
+            eps_fwd = info.get("forwardEps")
+
+            earnings_dt = None
+            if earnings_ts:
+                try:
+                    if isinstance(earnings_ts, (int, float)):
+                        earnings_dt = datetime.fromtimestamp(earnings_ts, tz=timezone.utc)
+                    elif isinstance(earnings_ts, list) and earnings_ts:
+                        earnings_dt = datetime.fromtimestamp(earnings_ts[0], tz=timezone.utc)
+                except Exception:
+                    pass
+
+            if earnings_dt:
+                now_utc = datetime.now(timezone.utc)
+                days_until = (earnings_dt.date() - now_utc.date()).days
+                results.append({
+                    "ticker": tk,
+                    "earnings_date": earnings_dt.strftime("%Y-%m-%d"),
+                    "days_until": days_until,
+                    "eps_estimate": round(float(eps_fwd), 2) if eps_fwd else None,
+                })
         except Exception:
-            pass
+            continue
 
-    if not scores:
-        return np.nan, "N/A", MACRO_STATUS_NA
+    results.sort(key=lambda x: x["days_until"])
+    return results
 
-    total_w = sum(w for _, w in scores.values())
-    score = float(np.clip(sum(s * w for s, w in scores.values()) / total_w, 0, 100)) if total_w > 0 else 50.0
 
-    if score >= 75:
-        rating, status = "Extreme Greed", MACRO_STATUS_FAIL
-    elif score >= 55:
-        rating, status = "Greed", MACRO_STATUS_WARN
-    elif score >= 45:
-        rating, status = "Neutral", MACRO_STATUS_PASS
-    elif score >= 25:
-        rating, status = "Fear", MACRO_STATUS_PASS
-    else:
-        rating, status = "Extreme Fear", MACRO_STATUS_PASS
-
-    return score, rating, status
 def fetch_fed_funds_rate() -> tuple[float, str]:
     """FRED FEDFUNDS 시리즈에서 현재 기준금리 반환. (rate, note)"""
     try:
@@ -4044,8 +4010,9 @@ def render_opportunity_scanner_snapshot(snap):
     top3 = score_df.head(3).copy()
     for rank_idx, row in top3.iterrows():
         rank = rank_idx + 1
+        tk_scan = str(row["Ticker"]).strip().upper()
         st.error(
-            f"🏆 TOP {rank} | {row['Ticker']} ({row['Name']}) | "
+            f"🏆 TOP {rank} | {tk_scan} ({row['Name']}) | "
             f"Final {_scanner_ui_fmt_2f(row['Final Score'])} / 100"
         )
         fac_cols = st.columns(6)
@@ -4054,6 +4021,30 @@ def render_opportunity_scanner_snapshot(snap):
                 st.metric(label, _scanner_ui_fmt_2f(row[key]))
         st.markdown(f"**Narrative Why:** {row['Narrative Why']}")
         st.markdown(f"**Risk:** {row['Risk']}")
+        # Watchlist 추가 버튼
+        btn_col1, btn_col2 = st.columns([1, 3])
+        with btn_col1:
+            if st.button(f"🔔 {tk_scan} Watchlist 추가", key=f"scanner_wl_add_{rank_idx}_{tk_scan}", use_container_width=True):
+                _uid_scan = str(st.session_state.get("user_id") or "").strip()
+                _cur_price_scan = fetch_latest_prices_for_tickers([tk_scan]).get(tk_scan, np.nan)
+                _scan_wl_item = {
+                    "ticker": tk_scan,
+                    "memo": f"AI 스캐너 TOP{rank} - Final Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
+                    "alert_price": np.nan,
+                    "alert_rsi": np.nan,
+                    "alert_ma200": False,
+                    "saved_price": float(_cur_price_scan) if pd.notna(_cur_price_scan) else np.nan,
+                    "date_added": _narrative_now_kst_string(),
+                }
+                _scan_wl_cur = load_watchlist_sheet(_uid_scan)
+                _scan_wl_cur = [x for x in _scan_wl_cur if x["ticker"] != tk_scan]
+                _scan_wl_cur.append(_scan_wl_item)
+                _ok_scan, _err_scan = save_watchlist_sheet(_uid_scan, _scan_wl_cur)
+                if _ok_scan:
+                    st.success(f"✅ {tk_scan}을 Watchlist에 추가했어요!")
+                    st.session_state["_watchlist_alert_checked"] = False
+                else:
+                    st.error(f"저장 실패: {_err_scan}")
         st.divider()
 
     remain_df = score_df.iloc[3:].copy()
@@ -5175,6 +5166,7 @@ Hard rules:
         return {}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def compute_quantitative_sector_leaders(top_n: int = 30) -> dict:
     """
     ETF Universe에서 정량 지표로 유망 섹터/종목을 선별.
@@ -5901,70 +5893,35 @@ if st.session_state.get("logged_in"):
     
     st.session_state["selected_ticker"] = selected_ticker
     
-    watchlist_items = load_watchlist()
-    
+    # 사이드바 투자 메모 (간단 버전) - 전체 기능은 🔔 Buy Watchlist & Alert 탭에서
     watch_note = st.sidebar.text_area("투자 메모", key="watch_note_input", placeholder="매수 근거, 리스크, 체크포인트를 기록하세요.")
     if st.sidebar.button("현재 티커 저장", use_container_width=True):
-        current_price_map = fetch_latest_prices_for_tickers([selected_ticker])
-        current_price = current_price_map.get(selected_ticker, np.nan)
-        new_item = {
+        _uid_memo = str(st.session_state.get("user_id") or "").strip()
+        _cur_price = fetch_latest_prices_for_tickers([selected_ticker]).get(selected_ticker, np.nan)
+        _new_wl_item = {
             "ticker": selected_ticker,
             "memo": watch_note.strip(),
-            "saved_price": None if pd.isna(current_price) else float(current_price),
+            "alert_price": np.nan,
+            "alert_rsi": np.nan,
+            "alert_ma200": False,
+            "saved_price": float(_cur_price) if pd.notna(_cur_price) else np.nan,
+            "date_added": _narrative_now_kst_string(),
         }
-        watchlist_items = [i for i in watchlist_items if str(i.get("ticker", "")).upper() != selected_ticker]
-        watchlist_items.append(new_item)
-        save_watchlist(watchlist_items)
-        st.sidebar.success(f"{selected_ticker} 메모를 저장했습니다.")
-    
-    watchlist_items = load_watchlist()
-    if watchlist_items:
-        tickers = [str(item.get("ticker", "")).strip().upper() for item in watchlist_items]
-        latest_price_map = fetch_latest_prices_for_tickers(tickers)
-    
-        rows = []
-        for item in watchlist_items:
-            ticker = str(item.get("ticker", "")).strip().upper()
-            memo = str(item.get("memo", "") or "")
-            saved_price = pd.to_numeric(item.get("saved_price"), errors="coerce")
-            current_price = pd.to_numeric(latest_price_map.get(ticker), errors="coerce")
-            pnl_pct = np.nan
-            if pd.notna(saved_price) and saved_price > 0 and pd.notna(current_price):
-                pnl_pct = (float(current_price) / float(saved_price) - 1.0) * 100.0
-            rows.append(
-                {
-                    "Ticker": ticker,
-                    "메모 내용": memo,
-                    "저장 시점 가격": saved_price,
-                    "현재가": current_price,
-                    "수익률(%)": pnl_pct,
-                }
-            )
-    
-        watch_df = pd.DataFrame(rows)
-        st.sidebar.dataframe(
-            watch_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "저장 시점 가격": st.column_config.NumberColumn(format="%.2f"),
-                "현재가": st.column_config.NumberColumn(format="%.2f"),
-                "수익률(%)": st.column_config.NumberColumn(format="%.2f"),
-            },
-        )
-    
-        for idx, item in enumerate(watchlist_items):
-            ticker = str(item.get("ticker", "")).strip().upper()
-            action_cols = st.sidebar.columns([2, 1])
-            with action_cols[0]:
-                if st.button(f"📌 {ticker} 분석", key=f"watch_pick_{idx}", use_container_width=True):
-                    st.session_state["selected_ticker"] = ticker
-                    st.rerun()
-            with action_cols[1]:
-                if st.button("삭제", key=f"watch_del_{idx}", use_container_width=True):
-                    updated = [x for j, x in enumerate(watchlist_items) if j != idx]
-                    save_watchlist(updated)
-                    st.rerun()
+        _wl_cur = load_watchlist_sheet(_uid_memo)
+        _wl_cur = [x for x in _wl_cur if x["ticker"] != selected_ticker]
+        _wl_cur.append(_new_wl_item)
+        save_watchlist_sheet(_uid_memo, _wl_cur)
+        st.sidebar.success(f"{selected_ticker} Watchlist에 저장했습니다.")
+        st.session_state["_watchlist_alert_checked"] = False
+
+    if st.sidebar.button("🔔 Watchlist 전체 보기", key="sidebar_wl_goto", use_container_width=True):
+        st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[6]
+        st.rerun()
+
+    _uid_sidebar = str(st.session_state.get("user_id") or "").strip()
+    _sidebar_wl = load_watchlist_sheet(_uid_sidebar)
+    if _sidebar_wl:
+        st.sidebar.caption(f"📋 Watchlist: {len(_sidebar_wl)}개 종목")
     else:
         st.sidebar.caption("저장된 메모가 없습니다.")
     
@@ -7970,7 +7927,56 @@ if st.session_state.get("logged_in"):
                 except Exception as e:
                     st.warning(f"Benchmark 비교 차트 계산 중 오류가 발생했습니다: {e}")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[6]:
+                # ── Earnings Calendar ──────────────────────────────────────
+                st.divider()
+                st.markdown("### 📅 보유 종목 실적 발표 캘린더")
+                st.caption("보유 종목의 다음 실적 발표일을 자동으로 조회합니다.")
+                try:
+                    earn_tickers = tuple(sorted(set(
+                        sell_radar_df["티커"].dropna().astype(str).unique().tolist()
+                    )))
+                    if earn_tickers:
+                        with st.spinner("실적 발표일 조회 중..."):
+                            earn_data = fetch_earnings_calendar(earn_tickers)
+
+                        if not earn_data:
+                            st.info("실적 발표일 데이터를 가져오지 못했습니다.")
+                        else:
+                            # 30일 이내 발표 예정 강조
+                            upcoming = [e for e in earn_data if 0 <= e["days_until"] <= 30]
+                            future = [e for e in earn_data if e["days_until"] > 30]
+                            past = [e for e in earn_data if e["days_until"] < 0]
+
+                            if upcoming:
+                                st.warning(f"⚠️ **30일 이내 실적 발표 예정: {len(upcoming)}개 종목**")
+                                for e in upcoming:
+                                    eps_str = f"EPS 예상: ${e['eps_estimate']}" if e['eps_estimate'] else ""
+                                    st.markdown(
+                                        f"🔴 **{e['ticker']}** — {e['earnings_date']} "
+                                        f"(**D-{e['days_until']}일**) {eps_str}"
+                                    )
+
+                            earn_rows = []
+                            for e in earn_data:
+                                if e["days_until"] >= 0:
+                                    label = f"D-{e['days_until']}일"
+                                    status = "🔴 30일 이내" if e["days_until"] <= 30 else "🟡 예정"
+                                else:
+                                    label = f"{abs(e['days_until'])}일 전"
+                                    status = "✅ 완료"
+                                earn_rows.append({
+                                    "티커": e["ticker"],
+                                    "실적 발표일": e["earnings_date"],
+                                    "D-Day": label,
+                                    "상태": status,
+                                    "EPS 예상": f"${e['eps_estimate']}" if e["eps_estimate"] else "N/A",
+                                })
+                            earn_df = pd.DataFrame(earn_rows)
+                            st.dataframe(earn_df, use_container_width=True, hide_index=True)
+                except Exception as _earn_e:
+                    st.warning(f"실적 캘린더 로드 중 오류: {_earn_e}")
+
+    elif main_nav == _MAIN_NAV_OPTIONS[7]:
         # ─────────────────────────────────────────────────────────────────────
         # 🎯 AI 내러티브 적중률 트래커
         # Narratives 시트에 저장된 Winners/Emerging 티커의 실제 수익률을 역산해
@@ -8310,6 +8316,51 @@ if st.session_state.get("logged_in"):
                                 "데이터가 horizon보다 짧은 경우 현재까지 수익률로 대체합니다. 투자 권유가 아닙니다."
                             )
 
+                            # ── 월별 적중률 트렌드 차트 ──────────────────
+                            st.divider()
+                            st.markdown("### 📅 월별 적중률 트렌드")
+                            try:
+                                result_df["날짜_dt"] = pd.to_datetime(
+                                    result_df["날짜"].apply(
+                                        lambda x: f"2026/{x}" if "/" in str(x) else str(x)
+                                    ), errors="coerce"
+                                )
+                                valid_monthly = result_df[result_df["적중 여부"] != "N/A"].copy()
+                                valid_monthly["월"] = valid_monthly["날짜_dt"].dt.to_period("M").astype(str)
+                                monthly_stats = (
+                                    valid_monthly.groupby("월")
+                                    .apply(lambda g: round((g["적중 여부"] == "✅ 적중").sum() / len(g) * 100, 1))
+                                    .reset_index()
+                                    .rename(columns={0: "적중률(%)"})
+                                )
+                                if len(monthly_stats) >= 2:
+                                    monthly_chart = (
+                                        alt.Chart(monthly_stats)
+                                        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+                                        .encode(
+                                            x=alt.X("월:N", title="월"),
+                                            y=alt.Y("적중률(%):Q", scale=alt.Scale(domain=[0, 100]), title="적중률(%)"),
+                                            color=alt.condition(
+                                                "datum['적중률(%)'] >= 50",
+                                                alt.value("#16a34a"),
+                                                alt.value("#dc2626"),
+                                            ),
+                                            tooltip=["월:N", "적중률(%):Q"],
+                                        )
+                                        .properties(height=200)
+                                    )
+                                    rule_50 = (
+                                        alt.Chart(pd.DataFrame({"y": [50]}))
+                                        .mark_rule(color="gray", strokeDash=[4, 4])
+                                        .encode(y="y:Q")
+                                    )
+                                    st.altair_chart(monthly_chart + rule_50, use_container_width=True)
+                                    st.caption("초록 = 50% 이상 적중 · 빨강 = 50% 미만 | 점선 = 50% 기준선")
+                                else:
+                                    st.info("월별 트렌드를 표시하려면 2개월 이상의 내러티브 기록이 필요해요.")
+                            except Exception as _me:
+                                st.warning(f"월별 트렌드 차트 오류: {_me}")
+
         else:
             # 버튼 미클릭 상태 안내
             st.info(
@@ -8320,7 +8371,7 @@ if st.session_state.get("logged_in"):
                 "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
             )
 
-    elif main_nav == _MAIN_NAV_OPTIONS[7]:
+    elif main_nav == _MAIN_NAV_OPTIONS[8]:
         # ─────────────────────────────────────────────────────────────────────
         # 💡 Idea-to-Portfolio 추적
         # 내러티브 테마 → 종목 발굴 → 포트폴리오 편입 흐름을 Thesis ID로 연결
@@ -8457,7 +8508,7 @@ if st.session_state.get("logged_in"):
             )
             st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
 
-    elif main_nav == _MAIN_NAV_OPTIONS[8]:
+    elif main_nav == _MAIN_NAV_OPTIONS[9]:
         # ─────────────────────────────────────────────────────────────────────
         # 📋 주간 포트폴리오 AI 요약
         # 포트폴리오 현황 + 최근 내러티브 + Macro를 묶어 Gemini로 주간 리포트 생성
@@ -8587,7 +8638,7 @@ if st.session_state.get("logged_in"):
             st.markdown(latest_summary)
             st.caption("이 리포트는 `Narratives` 시트에 자동 저장되었습니다. 투자 권유가 아닙니다.")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[9]:
+    elif main_nav == _MAIN_NAV_OPTIONS[6]:
         # ─────────────────────────────────────────────────────────────────────
         # 🔔 Buy Watchlist & Alert
         # 관심 종목 등록 + 매수 조건(목표가/RSI/200일선) 자동 체크
