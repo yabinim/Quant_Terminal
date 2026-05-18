@@ -5335,7 +5335,7 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
 5) 각 theme의 expanding_to는 반드시 객체 배열(list)이어야 함
 6) expanding_to의 각 객체는 반드시 "stage"와 "expected_tickers" 키를 포함
 7) expected_tickers는 각 stage마다 반드시 2~4개 티커를 쉼표 구분 문자열로 작성
-8) momentum_note: 이 테마의 가격 모멘텀 강도 한 줄 평가 (강함/보통/약함 + 이유)
+8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력 (설명 금지, 큰따옴표 사용 금지)
 9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
 {quant_section}
 [뉴스 데이터]
@@ -5354,7 +5354,7 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
       "driver": "무엇이 이 테마를 촉발했는가?",
       "winners": "정량+정성 모두 확인된 수혜주 (예: NVDA, MSFT, SOXX)",
       "emerging": "뉴스 모멘텀은 있으나 가격 확인 필요 종목 (예: ARM, MRVL)",
-      "momentum_note": "이 테마의 가격 모멘텀 강도 평가 (예: 강함 - RS +15%p, 거래량 1.8x 급증)",
+      "momentum_note": "강함/보통/약함 중 하나만 선택 (예: 강함)",
       "expanding_to": [
         {{"stage": "기업용 AI 솔루션", "expected_tickers": "CRM, NOW, WDAY"}},
         {{"stage": "AI 기반 사이버 보안", "expected_tickers": "CRWD, PANW, FTNT"}}
@@ -5375,41 +5375,41 @@ You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings.
         if not raw_text:
             return {}
 
-        try:
-            result_data = json.loads(raw_text)
-        except Exception as e:
-            import traceback
+        # JSON 자동 복구: 3단계 파싱 시도
+        def _try_parse_json(text):
+            try:
+                return json.loads(text)
+            except Exception:
+                pass
+            try:
+                c = re.sub(r"^```json", "", text.strip(), flags=re.IGNORECASE)
+                c = re.sub(r"^```", "", c.strip())
+                c = re.sub(r"```$", "", c.strip())
+                return json.loads(c.strip())
+            except Exception:
+                pass
+            return None
 
-            err_text = str(e) or ""
-            err_lower = err_text.lower()
-            if any(token in err_lower for token in ["429", "resourceexhausted", "quota"]):
-                st.warning(
-                    "⚠️ API 요청 한도를 초과했습니다. 약 1분 정도 기다리신 후 다시 시도해주세요. "
-                    "(무료 API는 분당 호출 횟수 제한이 있습니다)"
-                )
-                result_data = {}
-            elif any(token in err_lower for token in ["safety", "blocked"]):
-                st.warning(
-                    "⚠️ 뉴스 내용 중 민감한 키워드가 포함되어 AI 안전 필터에 의해 분석이 차단되었습니다."
-                )
-                result_data = {}
+        result_data = _try_parse_json(raw_text)
+        if result_data is None:
+            err_lower = ""
+            try:
+                json.loads(raw_text)
+            except Exception as _pe:
+                err_lower = str(_pe).lower()
+            if any(t in err_lower for t in ["429", "resourceexhausted", "quota"]):
+                st.warning("⚠️ API 요청 한도를 초과했습니다. 약 1분 후 다시 시도해주세요.")
+            elif any(t in err_lower for t in ["safety", "blocked"]):
+                st.warning("⚠️ AI 안전 필터에 의해 분석이 차단되었습니다.")
             else:
                 st.error("❌ Gemini 응답 파싱에 실패했습니다.")
-                st.code(traceback.format_exc(), language="bash")
                 st.error(f"🤖 Gemini 실제 답변 원문:\n\n{raw_text}")
-                st.error(f"에러 메시지: {e}")
-                result_data = {}
-
+            result_data = {}
         return result_data
     except Exception as e:
-        import traceback
-
         st.error("❌ JSON 파싱 에러가 발생했습니다.")
-        st.code(traceback.format_exc(), language="bash")
-        st.error(f"🤖 Gemini 실제 답변 원문:\n\n{st.session_state.get('last_gemini_raw_text', '')}")
         st.error(f"에러 메시지: {e}")
         return {}
-
 
 def translate_narrative_json(json_data, target_language):
     if not isinstance(json_data, dict) or not json_data:
