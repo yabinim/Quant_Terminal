@@ -2764,6 +2764,66 @@ def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) ->
         return []
 
 
+def cleanup_low_quality_etfs_from_sheet(min_avg_volume_m: float = 1.0, min_aum_m: float = 100.0) -> tuple[int, str]:
+    """
+    Google Sheets ETF_Universe에서 유동성/AUM 미달 ETF 자동 제거.
+    - 30일 평균 거래대금 < $1M
+    - AUM < $100M (상장 6개월 이상된 ETF만)
+    보호 목록: etf_universe.txt에 있는 티커는 절대 삭제하지 않음.
+    """
+    ws, err = open_etf_universe_worksheet()
+    if err or ws is None:
+        return 0, err or "워크시트 열기 실패"
+    try:
+        vals = ws.get_all_values()
+        if not vals or len(vals) < 2:
+            return 0, ""
+
+        # etf_universe.txt 티커는 보호 (삭제 대상에서 제외)
+        protected = set(load_etf_universe_tickers())
+        cutoff_date = datetime.now(_KST_TZ) - timedelta(days=180)
+
+        rows_to_delete = []
+        for i, r in enumerate(vals[1:], start=2):
+            r = (r + [""] * 6)[:6]
+            ticker = str(r[0]).strip().upper()
+            source = str(r[5]).strip()
+            added_date_str = str(r[4]).strip()
+
+            # txt 보호 목록은 스킵
+            if ticker in protected or source != "FMP_AUTO":
+                continue
+
+            # 상장 6개월 미만이면 스킵 (아직 AUM 성장 중)
+            try:
+                added_dt = datetime.strptime(added_date_str[:10], "%Y-%m-%d").replace(tzinfo=_KST_TZ)
+                if added_dt > cutoff_date:
+                    continue
+            except Exception:
+                continue
+
+            # yfinance로 AUM + 거래량 체크
+            try:
+                info = yf.Ticker(ticker).info
+                aum = float(info.get("totalAssets", 0) or 0) / 1_000_000
+                avg_vol = float(info.get("averageVolume", 0) or 0)
+                price = float(info.get("regularMarketPrice", 0) or info.get("previousClose", 0) or 0)
+                avg_vol_m = avg_vol * price / 1_000_000
+
+                if aum < min_aum_m or avg_vol_m < min_avg_volume_m:
+                    rows_to_delete.append(i)
+            except Exception:
+                continue
+
+        # 역순으로 삭제 (인덱스 밀림 방지)
+        for row_idx in reversed(rows_to_delete):
+            ws.delete_rows(row_idx)
+
+        return len(rows_to_delete), ""
+    except Exception as exc:
+        return 0, str(exc)
+
+
 def should_run_etf_auto_update() -> bool:
     """마지막 ETF 자동 업데이트로부터 7일이 지났는지 확인."""
     last_update = st.session_state.get("_etf_auto_update_last_run")
@@ -2776,17 +2836,27 @@ def should_run_etf_auto_update() -> bool:
 def run_etf_auto_update_if_needed(silent: bool = True) -> tuple[int, str]:
     """
     필요 시 ETF 자동 업데이트 실행.
-    silent=True: 백그라운드 실행 (UI 메시지 없음)
+    1) FMP로 신규 ETF 추가
+    2) 유동성 낮은 ETF 자동 정리 (상장 6개월+ & AUM<$100M & 거래대금<$1M)
+    silent=True: 백그라운드 실행
     반환: (새로 추가된 ETF 수, 에러 메시지)
     """
     if not should_run_etf_auto_update():
         return 0, ""
     st.session_state["_etf_auto_update_last_run"] = datetime.now(timezone.utc)
     try:
+        # 1. 신규 ETF 추가
         new_etfs = fetch_new_etfs_from_fmp(days_lookback=90, min_aum_m=50.0)
-        if not new_etfs:
-            return 0, ""
-        added, err = save_new_etfs_to_sheet(new_etfs)
+        added = 0
+        err = ""
+        if new_etfs:
+            added, err = save_new_etfs_to_sheet(new_etfs)
+        # 2. 저품질 ETF 자동 정리 (silent 모드에서만 - 백그라운드)
+        if silent:
+            try:
+                cleanup_low_quality_etfs_from_sheet(min_avg_volume_m=1.0, min_aum_m=100.0)
+            except Exception:
+                pass
         return added, err
     except Exception as exc:
         return 0, str(exc)
@@ -6554,6 +6624,21 @@ if st.session_state.get("logged_in"):
                         )
                     else:
                         st.info("Sheets에 자동 추가된 ETF가 없어요.")
+
+            st.caption("🧹 저품질 ETF 자동 정리 조건: 상장 6개월 이상 & AUM $100M 미만 & 30일 평균 거래대금 $1M 미만")
+            if st.button("🧹 저품질 ETF 정리 실행", key="etf_cleanup_btn", use_container_width=True):
+                with st.spinner("유동성/AUM 기준으로 저품질 ETF 정리 중..."):
+                    removed_n, clean_err = cleanup_low_quality_etfs_from_sheet(
+                        min_avg_volume_m=1.0, min_aum_m=100.0
+                    )
+                if clean_err:
+                    st.error(f"정리 오류: {clean_err}")
+                elif removed_n > 0:
+                    st.success(f"✅ 저품질 ETF {removed_n}개를 정리했어요!")
+                    cached_etf_universe_rankings_full.clear()
+                    st.rerun()
+                else:
+                    st.info("정리 대상 ETF가 없어요. 리스트 품질이 좋은 상태예요.")
 
         st.subheader(f"{_MAIN_NAV_OPTIONS[2]} · 섹터 ETF 상대 강도")
         st.caption("주요 섹터/테마 ETF 상대 강도 점검 (2년 데이터 기반)")
