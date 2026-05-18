@@ -147,25 +147,20 @@ def open_portfolios_worksheet():
 
 
 def open_thesis_worksheet():
-    """Quant_DB 스프레드시트의 Thesis 탭. (worksheet | None, err_msg | None)"""
+    """Quant_DB 스프레드시트의 Thesis 탭. 없으면 자동 생성."""
     gc = get_gspread_client()
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
         sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_THESIS_WORKSHEET_TITLE)
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if _THESIS_WORKSHEET_TITLE in existing_titles:
+            return sh.worksheet(_THESIS_WORKSHEET_TITLE), None
+        ws = sh.add_worksheet(title=_THESIS_WORKSHEET_TITLE, rows=3000, cols=7)
+        ws.update([_THESIS_SHEET_COLS], range_name="A1:G1", value_input_option="USER_ENTERED")
         return ws, None
     except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
-            try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_THESIS_WORKSHEET_TITLE, rows=3000, cols=7)
-                ws.update([_THESIS_SHEET_COLS], range_name="A1:G1", value_input_option="USER_ENTERED")
-                return ws, None
-            except Exception as exc2:
-                return None, f"`{_THESIS_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
-        return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_THESIS_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
+        return None, f"Thesis 워크시트 열기/생성 실패: {exc}"
 
 
 def save_thesis_row(user_id: str, ticker: str, account: str, thesis_title: str, narrative_category: str, narrative_date: str) -> tuple[bool, str]:
@@ -2583,25 +2578,20 @@ def build_portfolio_sell_radar_df(portfolio_df):
 
 
 def open_etf_universe_worksheet():
-    """Quant_DB 스프레드시트의 ETF_Universe 탭."""
+    """Quant_DB 스프레드시트의 ETF_Universe 탭. 없으면 자동 생성."""
     gc = get_gspread_client()
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
         sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_ETF_UNIVERSE_SHEET_TITLE)
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if _ETF_UNIVERSE_SHEET_TITLE in existing_titles:
+            return sh.worksheet(_ETF_UNIVERSE_SHEET_TITLE), None
+        ws = sh.add_worksheet(title=_ETF_UNIVERSE_SHEET_TITLE, rows=3000, cols=6)
+        ws.update([_ETF_UNIVERSE_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
         return ws, None
     except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
-            try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_ETF_UNIVERSE_SHEET_TITLE, rows=3000, cols=6)
-                ws.update([_ETF_UNIVERSE_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
-                return ws, None
-            except Exception as exc2:
-                return None, f"ETF_Universe 워크시트 생성 실패: {exc2}"
-        return None, f"ETF_Universe 워크시트 열기 실패: {exc}"
+        return None, f"ETF_Universe 워크시트 열기/생성 실패: {exc}"
 
 
 def load_etf_universe_from_sheet() -> list[str]:
@@ -2848,25 +2838,22 @@ def load_etf_universe_tickers_merged() -> list[str]:
 
 
 def open_watchlist_worksheet():
-    """Quant_DB 스프레드시트의 Watchlist 탭."""
+    """Quant_DB 스프레드시트의 Watchlist 탭. 없으면 자동 생성."""
     gc = get_gspread_client()
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
         sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_WATCHLIST_SHEET_TITLE)
+        # 먼저 기존 탭 목록에서 찾기
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if _WATCHLIST_SHEET_TITLE in existing_titles:
+            return sh.worksheet(_WATCHLIST_SHEET_TITLE), None
+        # 없으면 새로 생성
+        ws = sh.add_worksheet(title=_WATCHLIST_SHEET_TITLE, rows=1000, cols=8)
+        ws.update([_WATCHLIST_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
         return ws, None
     except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
-            try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_WATCHLIST_SHEET_TITLE, rows=1000, cols=8)
-                ws.update([_WATCHLIST_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
-                return ws, None
-            except Exception as exc2:
-                return None, f"`{_WATCHLIST_SHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
-        return None, f"Watchlist 워크시트를 열 수 없습니다: {exc}"
+        return None, f"Watchlist 워크시트를 열거나 생성할 수 없습니다: {exc}"
 
 
 def load_watchlist_sheet(user_id: str) -> list[dict]:
