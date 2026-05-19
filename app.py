@@ -10061,6 +10061,58 @@ if st.session_state.get("logged_in"):
                 st.session_state.pop("_watchlist_triggered_alerts", None)
                 st.rerun()
 
+            st.divider()
+            st.markdown("### 🗑️ Watchlist 전체 초기화")
+            st.caption("등록된 모든 종목을 삭제합니다. Alert 조건은 🔔 Buy Watchlist & Alert 탭에서 새로 추가하세요.")
+            if st.button("🗑️ Watchlist 전체 삭제", key="wl_clear_all_btn", use_container_width=True):
+                st.session_state["_wl_clear_confirm"] = True
+
+            if st.session_state.get("_wl_clear_confirm"):
+                st.error("⚠️ 정말 모두 삭제할까요? 이 작업은 되돌릴 수 없어요.")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("✅ 네, 전부 삭제", key="wl_clear_yes", use_container_width=True, type="primary"):
+                        ok_clear, err_clear = save_watchlist_sheet(uid_wl, [])
+                        if ok_clear:
+                            st.session_state.pop("_wl_clear_confirm", None)
+                            st.session_state.pop("_sidebar_wl_count", None)
+                            st.session_state["_watchlist_alert_checked"] = False
+                            st.success("✅ Watchlist를 모두 삭제했어요!")
+                            st.rerun()
+                        else:
+                            st.error(f"삭제 실패: {err_clear}")
+                with c2:
+                    if st.button("❌ 취소", key="wl_clear_no", use_container_width=True):
+                        st.session_state.pop("_wl_clear_confirm", None)
+                        st.rerun()
+
+            # ── saved_price 일괄 복구 ──────────────────────────────────────
+            missing_price = [i for i in wl_items if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce"))]
+            if missing_price:
+                st.warning(f"⚠️ **{len(missing_price)}개 종목**의 등록 시 가격이 없어서 수익률이 0%로 표시돼요.")
+                if st.button("💰 현재가로 등록 가격 일괄 복구", key="wl_fix_price_btn", type="primary", use_container_width=True):
+                    with st.spinner("현재가 조회 중..."):
+                        fix_tickers = tuple(i["ticker"] for i in missing_price)
+                        fix_price_map = fetch_latest_prices_for_tickers(fix_tickers)
+                    fixed_count = 0
+                    updated_items = []
+                    for item in wl_items:
+                        tk = item["ticker"]
+                        if pd.isna(pd.to_numeric(item.get("saved_price"), errors="coerce")):
+                            new_price = fix_price_map.get(tk, np.nan)
+                            if pd.notna(new_price):
+                                item = dict(item)
+                                item["saved_price"] = float(new_price)
+                                fixed_count += 1
+                        updated_items.append(item)
+                    ok_fix, err_fix = save_watchlist_sheet(uid_wl, updated_items)
+                    if ok_fix:
+                        st.success(f"✅ {fixed_count}개 종목의 등록 가격을 현재가로 복구했어요!")
+                        st.session_state.pop("_sidebar_wl_count", None)
+                        st.rerun()
+                    else:
+                        st.error(f"저장 실패: {err_fix}")
+
     elif main_nav == _MAIN_NAV_OPTIONS[11]:
         # ─────────────────────────────────────────────────────────────────────
         # 📡 Emerging 종목 추적기
