@@ -1877,6 +1877,53 @@ def cached_evaluate_kpis_snapshot(ticker_upper: str):
     return evaluate_kpis(str(ticker_upper).strip().upper())
 
 
+@st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
+def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
+    """최근 분기별 EPS 예상 vs 실제 (Earnings Surprise)."""
+    try:
+        tk = yf.Ticker(str(ticker_upper).strip().upper())
+        # quarterly earnings
+        qe = tk.quarterly_earnings
+        if qe is not None and not qe.empty:
+            qe = qe.reset_index()
+            return qe
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
+def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
+    """기관 보유 비중 상위 목록."""
+    try:
+        tk = yf.Ticker(str(ticker_upper).strip().upper())
+        ih = tk.institutional_holders
+        if ih is not None and not ih.empty:
+            return ih.head(10)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def calculate_macd(close_series: pd.Series, fast=12, slow=26, signal=9):
+    """MACD 라인, 시그널 라인, 히스토그램 반환."""
+    ema_fast = close_series.ewm(span=fast, adjust=False).mean()
+    ema_slow = close_series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def calculate_bollinger_bands(close_series: pd.Series, window=20, num_std=2):
+    """볼린저 밴드 상단/중단/하단 반환."""
+    ma = close_series.rolling(window=window, min_periods=window).mean()
+    std = close_series.rolling(window=window, min_periods=window).std()
+    upper = ma + num_std * std
+    lower = ma - num_std * std
+    return upper, ma, lower
+
+
 def _etf_holdings_perf_cache_key(holdings_df):
     pairs = []
     if holdings_df is None or holdings_df.empty:
@@ -7317,8 +7364,8 @@ if st.session_state.get("logged_in"):
             st.exception(e)
     
         st.divider()
-        st.markdown("### 매수 타점 (Timing)")
-        st.caption("RSI(14)와 장기 이동평균으로 진입 구간 점검")
+        st.markdown("### 📊 기술적 분석 (Technical Analysis)")
+        st.caption("RSI · MACD · 볼린저밴드 · 거래량으로 진입 구간 점검")
         syn_t1, syn_t2 = st.columns([1, 3])
         with syn_t1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_timing", use_container_width=True):
@@ -7328,70 +7375,282 @@ if st.session_state.get("logged_in"):
                 )
         with syn_t2:
             st.caption("가격 이력 캐시를 비워 다음 로드부터 최근 1년 OHLC를 다시 받습니다.")
-    
+
         try:
             with st.spinner(f"{selected_ticker} 타이밍 데이터를 불러오는 중..."):
                 timing_history = cached_timing_price_history(str(selected_ticker).strip())
-    
+
             if timing_history is None or timing_history.empty or "Close" not in timing_history.columns:
                 st.warning("가격 데이터를 불러오지 못했습니다. 티커를 확인해주세요.")
             else:
                 close = pd.to_numeric(timing_history["Close"], errors="coerce")
+                volume = pd.to_numeric(timing_history.get("Volume", pd.Series(dtype=float)), errors="coerce")
                 current_price = float(close.dropna().iloc[-1]) if not close.dropna().empty else np.nan
+                high_52w = float(close.dropna().max())
+                low_52w = float(close.dropna().min())
+
                 ma20 = close.rolling(window=20, min_periods=20).mean()
                 ma50 = close.rolling(window=50, min_periods=50).mean()
                 ma200 = close.rolling(window=200, min_periods=200).mean()
                 rsi_series = calculate_rsi(close, window=14)
-                current_rsi = rsi_series.dropna().iloc[-1] if not rsi_series.dropna().empty else np.nan
-                current_ma20 = ma20.dropna().iloc[-1] if not ma20.dropna().empty else np.nan
-                current_ma50 = ma50.dropna().iloc[-1] if not ma50.dropna().empty else np.nan
-                current_ma200 = ma200.dropna().iloc[-1] if not ma200.dropna().empty else np.nan
-    
+                current_rsi = float(rsi_series.dropna().iloc[-1]) if not rsi_series.dropna().empty else np.nan
+                current_ma20 = float(ma20.dropna().iloc[-1]) if not ma20.dropna().empty else np.nan
+                current_ma50 = float(ma50.dropna().iloc[-1]) if not ma50.dropna().empty else np.nan
+                current_ma200 = float(ma200.dropna().iloc[-1]) if not ma200.dropna().empty else np.nan
+
+                # MACD
+                macd_line, signal_line, histogram = calculate_macd(close.dropna())
+                current_macd = float(macd_line.iloc[-1]) if not macd_line.empty else np.nan
+                current_signal = float(signal_line.iloc[-1]) if not signal_line.empty else np.nan
+                current_hist = float(histogram.iloc[-1]) if not histogram.empty else np.nan
+                macd_bullish = pd.notna(current_hist) and current_hist > 0
+
+                # 볼린저밴드
+                bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(close)
+                current_bb_upper = float(bb_upper.dropna().iloc[-1]) if not bb_upper.dropna().empty else np.nan
+                current_bb_lower = float(bb_lower.dropna().iloc[-1]) if not bb_lower.dropna().empty else np.nan
+
+                # 52주 위치
+                pct_from_high = ((current_price / high_52w) - 1) * 100 if pd.notna(current_price) and high_52w > 0 else np.nan
+                pct_from_low = ((current_price / low_52w) - 1) * 100 if pd.notna(current_price) and low_52w > 0 else np.nan
+
+                # 거래량 급증
+                vol_surge = np.nan
+                if not volume.dropna().empty and len(volume.dropna()) >= 21:
+                    recent_vol = float(volume.dropna().tail(5).mean())
+                    baseline_vol = float(volume.dropna().tail(21).mean())
+                    vol_surge = recent_vol / baseline_vol if baseline_vol > 0 else np.nan
+
+                # 눌림목 포착
                 is_buy_on_dip = (
-                    pd.notna(current_price)
-                    and pd.notna(current_ma200)
+                    pd.notna(current_price) and pd.notna(current_ma200)
                     and current_price > current_ma200
-                    and pd.notna(current_rsi)
-                    and current_rsi < 50
+                    and pd.notna(current_rsi) and current_rsi < 50
                     and (
                         (pd.notna(current_ma20) and current_price <= current_ma20 * 1.02)
                         or (pd.notna(current_ma50) and current_price <= current_ma50 * 1.02)
                     )
                 )
-    
-                rsi_col, info_col = st.columns([1, 2])
-                with rsi_col:
-                    st.metric("현재 RSI (14)", num_str(current_rsi))
-    
-                with info_col:
-                    if pd.isna(current_rsi):
-                        st.warning("RSI 계산에 필요한 데이터가 부족합니다.")
-                    elif current_rsi >= 70:
-                        st.error("🚨 과매수 구간 (추격 매수 금지 - 인내심을 가지세요)")
-                    elif current_rsi >= 50:
-                        st.warning("🟡 중립 구간 (관망)")
-                    else:
-                        st.success("✅ 조정 구간 (분할 매수 고려)")
-    
+
+                # ── 지표 요약 메트릭 ──────────────────────────────────────
+                m1, m2, m3, m4, m5 = st.columns(5)
+                with m1:
+                    rsi_delta = "과매수🚨" if pd.notna(current_rsi) and current_rsi >= 70 else ("조정구간✅" if pd.notna(current_rsi) and current_rsi < 50 else "중립🟡")
+                    st.metric("RSI (14)", f"{current_rsi:.1f}" if pd.notna(current_rsi) else "N/A", delta=rsi_delta)
+                with m2:
+                    macd_delta = "상승전환🟢" if macd_bullish else "하락전환🔴"
+                    st.metric("MACD 히스토그램", f"{current_hist:+.3f}" if pd.notna(current_hist) else "N/A", delta=macd_delta)
+                with m3:
+                    ma200_delta = "200일선 위✅" if pd.notna(current_price) and pd.notna(current_ma200) and current_price > current_ma200 else "200일선 아래❌"
+                    st.metric("200일선", f"${current_ma200:.2f}" if pd.notna(current_ma200) else "N/A", delta=ma200_delta)
+                with m4:
+                    st.metric("52주 고점 대비", f"{pct_from_high:+.1f}%" if pd.notna(pct_from_high) else "N/A",
+                              delta="신고가 근접🔥" if pd.notna(pct_from_high) and pct_from_high >= -5 else "조정구간" if pd.notna(pct_from_high) and pct_from_high <= -20 else "")
+                with m5:
+                    vol_str = f"{vol_surge:.1f}x" if pd.notna(vol_surge) else "N/A"
+                    vol_delta = "거래량 급증🔥" if pd.notna(vol_surge) and vol_surge >= 1.5 else ("평균 이하" if pd.notna(vol_surge) and vol_surge < 0.8 else "")
+                    st.metric("거래량 (5일/21일)", vol_str, delta=vol_delta)
+
+                # RSI 종합 판정
+                if pd.isna(current_rsi):
+                    st.warning("RSI 계산에 필요한 데이터가 부족합니다.")
+                elif current_rsi >= 70:
+                    st.error("🚨 과매수 구간 — 추격 매수 금지. 인내심을 가지세요.")
+                elif current_rsi >= 50:
+                    st.warning("🟡 중립 구간 — 관망. 조정을 기다리세요.")
+                else:
+                    st.success("✅ 조정 구간 — 분할 매수 고려.")
+
                 if is_buy_on_dip:
                     st.warning("🎯 [눌림목 포착] 장기 우상향 중인 종목의 단기 조정 구간입니다. 매수를 검토하세요!")
-    
-                chart_df = pd.DataFrame(
-                    {
+
+                # 볼린저밴드 위치 알림
+                if pd.notna(current_price) and pd.notna(current_bb_lower) and pd.notna(current_bb_upper):
+                    if current_price <= current_bb_lower:
+                        st.success(f"📊 볼린저밴드 하단 터치 (${current_bb_lower:.2f}) — 단기 반등 가능성.")
+                    elif current_price >= current_bb_upper:
+                        st.error(f"📊 볼린저밴드 상단 터치 (${current_bb_upper:.2f}) — 단기 과열 주의.")
+
+                # ── 차트 탭 ───────────────────────────────────────────────
+                chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📈 가격 + 이평선 + 볼린저밴드", "📊 MACD", "📦 거래량"])
+
+                with chart_tab1:
+                    chart_df = pd.DataFrame({
                         "Close": close,
                         "MA20": ma20,
                         "MA50": ma50,
                         "MA200": ma200,
-                    }
-                ).dropna(how="all")
-                if chart_df.empty:
-                    st.warning("차트를 표시할 데이터가 부족합니다.")
-                else:
-                    st.line_chart(chart_df, use_container_width=True)
-    
+                        "BB_Upper": bb_upper,
+                        "BB_Lower": bb_lower,
+                    }).dropna(how="all")
+                    if not chart_df.empty:
+                        st.line_chart(chart_df[["Close", "MA20", "MA50", "MA200", "BB_Upper", "BB_Lower"]], use_container_width=True)
+                        st.caption("파란선=Close, MA20/50/200, BB_Upper/Lower (볼린저밴드)")
+                    else:
+                        st.warning("차트 데이터 부족")
+
+                with chart_tab2:
+                    macd_df = pd.DataFrame({
+                        "MACD": macd_line,
+                        "Signal": signal_line,
+                        "Histogram": histogram,
+                    }).dropna(how="all")
+                    if not macd_df.empty:
+                        st.line_chart(macd_df[["MACD", "Signal"]], use_container_width=True)
+                        st.bar_chart(macd_df[["Histogram"]], use_container_width=True)
+                        st.caption("MACD가 Signal 위로 올라오면 상승 전환 신호. Histogram이 양수(+)면 상승 모멘텀.")
+                    else:
+                        st.warning("MACD 데이터 부족")
+
+                with chart_tab3:
+                    if not volume.dropna().empty:
+                        vol_df = pd.DataFrame({"Volume": volume}).dropna()
+                        st.bar_chart(vol_df, use_container_width=True)
+                        st.caption("거래량 급증 + 가격 상승 = 강한 신호. 거래량 감소 + 가격 상승 = 약한 신호.")
+                    else:
+                        st.warning("거래량 데이터 없음")
+
         except Exception as e:
             st.error("매수 타점 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
+
+        # ── Earnings Surprise 히스토리 ────────────────────────────────────
+        if not is_etf_mode:
+            st.divider()
+            st.markdown("### 📅 Earnings Surprise 히스토리")
+            st.caption("최근 분기별 EPS 예상 vs 실제. 어닝 서프라이즈가 꾸준히 양수면 실적 퀄리티가 높은 종목입니다.")
+            try:
+                with st.spinner("어닝 데이터 불러오는 중..."):
+                    earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
+
+                if earn_df.empty:
+                    st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
+                else:
+                    # 컬럼 정규화
+                    earn_df.columns = [str(c).strip() for c in earn_df.columns]
+                    # Estimate, Actual, Surprise 컬럼 찾기
+                    est_col = next((c for c in earn_df.columns if "estimate" in c.lower()), None)
+                    act_col = next((c for c in earn_df.columns if "actual" in c.lower() or "reported" in c.lower()), None)
+
+                    if est_col and act_col:
+                        earn_df[est_col] = pd.to_numeric(earn_df[est_col], errors="coerce")
+                        earn_df[act_col] = pd.to_numeric(earn_df[act_col], errors="coerce")
+                        earn_df["Surprise(%)"] = ((earn_df[act_col] - earn_df[est_col]) / earn_df[est_col].abs() * 100).round(1)
+                        earn_df["판정"] = earn_df["Surprise(%)"].apply(
+                            lambda x: "✅ Beat" if pd.notna(x) and x > 0 else ("❌ Miss" if pd.notna(x) and x < 0 else "N/A")
+                        )
+
+                        beat_count = (earn_df["판정"] == "✅ Beat").sum()
+                        total_count = len(earn_df[earn_df["판정"] != "N/A"])
+                        if total_count > 0:
+                            beat_rate = beat_count / total_count * 100
+                            if beat_rate >= 75:
+                                st.success(f"🏆 어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}) — 실적 퀄리티 우수")
+                            elif beat_rate >= 50:
+                                st.warning(f"🟡 어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}) — 보통")
+                            else:
+                                st.error(f"🔴 어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}) — 실적 부진")
+
+                    def _style_surprise(val):
+                        v = pd.to_numeric(str(val).replace("%",""), errors="coerce")
+                        if pd.isna(v): return ""
+                        return "color:#16a34a;font-weight:600" if v > 0 else "color:#dc2626;font-weight:600"
+
+                    display_cols = [c for c in earn_df.columns if c not in ["판정"]]
+                    if "Surprise(%)" in earn_df.columns:
+                        styled_earn = earn_df.style.map(_style_surprise, subset=["Surprise(%)"])
+                        st.dataframe(styled_earn, use_container_width=True, hide_index=True)
+                    else:
+                        st.dataframe(earn_df, use_container_width=True, hide_index=True)
+            except Exception as _ee:
+                st.warning(f"어닝 히스토리 로드 오류: {_ee}")
+
+            # ── 기관 보유 비중 ────────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🏦 기관 투자자 보유 현황")
+            st.caption("상위 기관의 보유 비중. 기관 보유 비중이 높고 증가 추세이면 스마트머니 유입 신호입니다.")
+            try:
+                with st.spinner("기관 보유 데이터 불러오는 중..."):
+                    inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
+
+                if inst_df.empty:
+                    st.info("기관 보유 데이터를 가져오지 못했습니다.")
+                else:
+                    inst_df.columns = [str(c).strip() for c in inst_df.columns]
+                    # % Held 컬럼 포맷
+                    pct_col = next((c for c in inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
+                    if pct_col:
+                        inst_df[pct_col] = pd.to_numeric(inst_df[pct_col], errors="coerce")
+                        total_inst = inst_df[pct_col].sum() * 100 if inst_df[pct_col].max() <= 1 else inst_df[pct_col].sum()
+                        st.metric("상위 10개 기관 합산 보유 비중", f"{total_inst:.1f}%")
+                    st.dataframe(inst_df, use_container_width=True, hide_index=True)
+            except Exception as _ie:
+                st.warning(f"기관 보유 데이터 로드 오류: {_ie}")
+
+        # ── AI 종합 진단 ─────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 🤖 AI 종합 진단")
+        st.caption("펀더멘털 + 기술적 지표를 Gemini AI가 종합 분석해서 투자 판단을 제공합니다.")
+
+        if st.button("🤖 AI 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
+            try:
+                # 진단에 사용할 데이터 수집
+                _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
+                _diag_close = pd.to_numeric(_diag_timing["Close"], errors="coerce").dropna() if not _diag_timing.empty else pd.Series(dtype=float)
+                _diag_rsi = float(calculate_rsi(_diag_close).dropna().iloc[-1]) if len(_diag_close) > 14 else np.nan
+                _diag_ma200 = float(_diag_close.rolling(200, min_periods=150).mean().iloc[-1]) if len(_diag_close) >= 150 else np.nan
+                _diag_price = float(_diag_close.iloc[-1]) if not _diag_close.empty else np.nan
+                _diag_macd, _diag_sig, _diag_hist = calculate_macd(_diag_close)
+                _diag_hist_val = float(_diag_hist.iloc[-1]) if not _diag_hist.empty else np.nan
+
+                _kpi_summary = ""
+                try:
+                    _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
+                    _kpi_summary = f"KPI Pass/Fail: {_pass_n}개 통과 / {_fail_n}개 실패. 안전마진: {_margin.get('margin_of_safety', 'N/A')}%"
+                except Exception:
+                    _kpi_summary = "KPI 데이터 없음"
+
+                _diag_prompt = f"""
+당신은 월가 수석 퀀트 애널리스트입니다.
+아래 데이터를 바탕으로 **{selected_ticker}** 종목에 대한 투자 판단을 한국어로 간결하게 작성하세요.
+
+[기술적 지표]
+- 현재가: ${_diag_price:.2f}
+- RSI(14): {_diag_rsi:.1f}
+- MACD 히스토그램: {_diag_hist_val:+.3f} ({'상승모멘텀' if _diag_hist_val and _diag_hist_val > 0 else '하락모멘텀'})
+- 200일선: ${_diag_ma200:.2f} ({'현재가 위 ✅' if _diag_price and _diag_ma200 and _diag_price > _diag_ma200 else '현재가 아래 ❌'})
+
+[펀더멘털]
+{_kpi_summary}
+
+[출력 형식 - 반드시 아래 구조로만 답하세요]
+## 종합 판단: [매수 고려 / 관망 / 매도 고려] 중 하나
+
+**근거 (3줄 이내):**
+- 기술적 측면:
+- 펀더멘털 측면:
+- 리스크:
+
+**투자 전략 제안 (1줄):**
+
+*본 분석은 참고용이며 투자 권유가 아닙니다.*
+"""
+                with st.spinner("Gemini AI가 종합 진단 중... (약 10초 소요)"):
+                    _diag_model = _GenAIModel("gemini-2.5-flash", generation_config={"temperature": 0.2, "max_output_tokens": 800})
+                    _diag_response = _diag_model.generate_content(_diag_prompt)
+                    _diag_text = _gemini_response_text_utf8_safe(_diag_response)
+
+                if _diag_text:
+                    if "매수 고려" in _diag_text:
+                        st.success(_diag_text)
+                    elif "매도 고려" in _diag_text:
+                        st.error(_diag_text)
+                    else:
+                        st.warning(_diag_text)
+                else:
+                    st.warning("AI 진단 결과를 받지 못했습니다.")
+            except Exception as _ae:
+                st.error(f"AI 진단 오류: {_ae}")
     
     elif main_nav == _MAIN_NAV_OPTIONS[6]:
         syn_p1, syn_p2 = st.columns([1, 3])
