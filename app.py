@@ -2765,8 +2765,9 @@ def open_etf_universe_worksheet():
         return None, f"ETF_Universe 워크시트 열기/생성 실패: {exc}"
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_etf_universe_from_sheet() -> list[str]:
-    """Google Sheets ETF_Universe 탭에서 ticker 목록 로드."""
+    """Google Sheets ETF_Universe 탭에서 ticker 목록 로드. 1시간 캐시."""
     ws, err = open_etf_universe_worksheet()
     if err or ws is None:
         return []
@@ -3027,8 +3028,9 @@ def open_watchlist_worksheet():
         return None, f"Watchlist 워크시트를 열거나 생성할 수 없습니다: {exc}"
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_watchlist_sheet(user_id: str) -> list[dict]:
-    """Watchlist 시트에서 현재 user_id 기록 로드."""
+    """Watchlist 시트에서 현재 user_id 기록 로드. 60초 캐시."""
     ws, err = open_watchlist_worksheet()
     if err or ws is None:
         return []
@@ -7816,7 +7818,7 @@ if st.session_state.get("logged_in"):
                 with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
                     _diag_model = _GenAIModel(
                         "gemini-2.5-flash",
-                        generation_config={"temperature": 0.2, "max_output_tokens": 2048}
+                        generation_config={"temperature": 0.2, "max_output_tokens": 4096}
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
                     _diag_text = _gemini_response_text_utf8_safe(_diag_response)
@@ -9035,11 +9037,11 @@ if st.session_state.get("logged_in"):
                     date_added = str(row["Date_Added"]).strip()
 
                     # 포트폴리오에서 매수가/수량 조회
-                    portfolio_df_cur = load_portfolio()
-                    port_row = portfolio_df_cur[
-                        (portfolio_df_cur["Ticker"] == tk) &
-                        (portfolio_df_cur["Account"] == acct)
-                    ] if not portfolio_df_cur.empty else pd.DataFrame()
+                    # portfolio_df_cur 는 루프 밖에서 이미 로드됨
+                    port_row = portfolio_df_thesis[
+                        (portfolio_df_thesis["Ticker"] == tk) &
+                        (portfolio_df_thesis["Account"] == acct)
+                    ] if not portfolio_df_thesis.empty else pd.DataFrame()
 
                     purchase_price = np.nan
                     current_price = np.nan
