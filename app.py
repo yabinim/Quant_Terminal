@@ -3874,7 +3874,9 @@ def hydrate_narrative_from_disk_once():
         st.session_state["_narrative_persist_loaded_v2"] = True
 
 
-def fetch_latest_prices_for_tickers(tickers):
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
+    """현재가 조회. tickers는 반드시 tuple로 전달해야 캐싱 가능."""
     clean_tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
     clean_tickers = list(dict.fromkeys(clean_tickers))
     if not clean_tickers:
@@ -4560,7 +4562,7 @@ def render_opportunity_scanner_snapshot(snap):
         with btn_col1:
             if st.button(f"🔔 {tk_scan} Watchlist 추가", key=f"scanner_wl_add_{rank_idx}_{tk_scan}", use_container_width=True):
                 _uid_scan = str(st.session_state.get("user_id") or "").strip()
-                _cur_price_scan = fetch_latest_prices_for_tickers([tk_scan]).get(tk_scan, np.nan)
+                _cur_price_scan = fetch_latest_prices_for_tickers((tk_scan,)).get(tk_scan, np.nan)
                 _scan_wl_item = {
                     "ticker": tk_scan,
                     "memo": f"AI 스캐너 TOP{rank} - Final Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
@@ -6361,7 +6363,7 @@ if st.session_state.get("logged_in"):
             _wl_items = load_watchlist_sheet(_uid_alert)
             if _wl_items:
                 _wl_tickers = [i["ticker"] for i in _wl_items]
-                _price_map = fetch_latest_prices_for_tickers(_wl_tickers)
+                _price_map = fetch_latest_prices_for_tickers(tuple(_wl_tickers))
                 _rsi_map, _ma200_map = {}, {}
                 for _tk in _wl_tickers:
                     try:
@@ -6431,7 +6433,7 @@ if st.session_state.get("logged_in"):
     watch_note = st.sidebar.text_area("투자 메모", key="watch_note_input", placeholder="매수 근거, 리스크, 체크포인트를 기록하세요.")
     if st.sidebar.button("현재 티커 저장", use_container_width=True):
         _uid_memo = str(st.session_state.get("user_id") or "").strip()
-        _cur_price = fetch_latest_prices_for_tickers([selected_ticker]).get(selected_ticker, np.nan)
+        _cur_price = fetch_latest_prices_for_tickers((selected_ticker,)).get(selected_ticker, np.nan)
         _new_wl_item = {
             "ticker": selected_ticker,
             "memo": watch_note.strip(),
@@ -9947,7 +9949,7 @@ if st.session_state.get("logged_in"):
                 if not wl_ticker:
                     st.warning("티커를 입력해주세요.")
                 else:
-                    price_now = fetch_latest_prices_for_tickers([wl_ticker])
+                    price_now = fetch_latest_prices_for_tickers((wl_ticker,))
                     new_wl_item = {
                         "ticker": wl_ticker,
                         "memo": wl_memo.strip(),
@@ -9977,7 +9979,7 @@ if st.session_state.get("logged_in"):
             wl_tickers = [i["ticker"] for i in wl_items]
 
             with st.spinner("실시간 가격 및 지표 계산 중..."):
-                price_map_wl = fetch_latest_prices_for_tickers(wl_tickers)
+                price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
                 rsi_map_wl, ma200_map_wl = {}, {}
                 for tk in wl_tickers:
                     try:
