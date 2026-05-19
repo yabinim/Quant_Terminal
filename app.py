@@ -921,12 +921,33 @@ class _GenAIModel:
         cfg = dict(generation_config or {})
         self._config = genai_types.GenerateContentConfig(**cfg) if cfg else None
 
-    def generate_content(self, prompt):
-        return _ensure_genai_client().models.generate_content(
-            model=self._model_id,
-            contents=prompt,
-            config=self._config,
-        )
+    def generate_content(self, prompt, max_retries: int = 3):
+        """
+        Gemini API 호출. 503/429 등 일시적 오류 시 최대 max_retries회 자동 재시도.
+        재시도 간격: 1초 → 3초 → 7초 (지수 백오프)
+        """
+        import time as _time
+        delays = [1, 3, 7]
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                return _ensure_genai_client().models.generate_content(
+                    model=self._model_id,
+                    contents=prompt,
+                    config=self._config,
+                )
+            except Exception as exc:
+                last_exc = exc
+                err_str = str(exc).lower()
+                # 재시도 가능한 오류: 503(과부하), 429(rate limit), 500(서버오류)
+                retryable = any(code in err_str for code in ["503", "500", "unavailable", "internal"])
+                if retryable and attempt < max_retries - 1:
+                    wait = delays[attempt]
+                    _time.sleep(wait)
+                    continue
+                # 재시도 불가 오류 또는 마지막 시도 실패 → 즉시 raise
+                raise
+        raise last_exc
 
 
 model = _GenAIModel(
