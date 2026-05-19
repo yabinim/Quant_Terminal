@@ -1804,6 +1804,258 @@ def build_etf_universe_returns_table(pool_tickers):
     return result_df
 
 
+def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series = None) -> pd.DataFrame:
+    """
+    1주 전 RS Score 대비 현재 RS Score 변화율 계산.
+    - RS Score = 종목 3개월 수익률 - SPY 3개월 수익률
+    - RS 변화 = (현재 RS) - (1주 전 RS) → 양수면 최근 1주간 시장 대비 강해짐
+    반환: DataFrame [Ticker, RS_Now, RS_1W_Ago, RS_Change, RS_Signal]
+    """
+    if not pool_tickers:
+        return pd.DataFrame()
+    try:
+        unique = list(dict.fromkeys(str(t).strip().upper() for t in pool_tickers if str(t).strip()))
+        all_tickers = list(dict.fromkeys(unique + ["SPY"]))
+        raw = yf.download(
+            tickers=all_tickers, period="6mo", interval="1d",
+            auto_adjust=False, group_by="column", progress=False, threads=True
+        )
+        close_df = get_close_prices_from_download(raw)
+        if close_df.empty:
+            return pd.DataFrame()
+
+        spy = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
+        if len(spy) < 70:
+            return pd.DataFrame()
+
+        rows = []
+        for tk in unique:
+            if tk not in close_df.columns:
+                continue
+            s = pd.to_numeric(close_df[tk], errors="coerce").dropna()
+            if len(s) < 70:
+                continue
+            # 현재 RS (3개월 = 63거래일)
+            rs_now = float((s.iloc[-1]/s.iloc[-64] - 1)*100 - (spy.iloc[-1]/spy.iloc[-64] - 1)*100) if len(s) >= 64 and len(spy) >= 64 else np.nan
+            # 1주 전(5거래일 전) RS
+            rs_1w = float((s.iloc[-6]/s.iloc[-69] - 1)*100 - (spy.iloc[-6]/spy.iloc[-69] - 1)*100) if len(s) >= 69 and len(spy) >= 69 else np.nan
+            rs_change = float(rs_now - rs_1w) if pd.notna(rs_now) and pd.notna(rs_1w) else np.nan
+
+            # 신호 분류
+            if pd.notna(rs_change):
+                if rs_now > 0 and rs_change > 2:
+                    signal = "🚀 급부상"       # 강하면서 더 강해짐
+                elif rs_now < 0 and rs_change > 2:
+                    signal = "🌱 Early Signal"  # 약했는데 강해지기 시작 ← 핵심!
+                elif rs_now > 0 and rs_change < -2:
+                    signal = "⚠️ 모멘텀 약화"   # 강했는데 약해지기 시작 ← 매도 주의
+                elif rs_change < -3:
+                    signal = "🔴 급하락"
+                else:
+                    signal = "➡️ 유지"
+            else:
+                signal = "N/A"
+
+            rows.append({
+                "Ticker": tk,
+                "RS_Now": round(rs_now, 2) if pd.notna(rs_now) else np.nan,
+                "RS_1W_Ago": round(rs_1w, 2) if pd.notna(rs_1w) else np.nan,
+                "RS_Change": round(rs_change, 2) if pd.notna(rs_change) else np.nan,
+                "RS_Signal": signal,
+            })
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values("RS_Change", ascending=False, na_position="last")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "") -> list[dict]:
+    """
+    내러티브 Emerging 종목을 정량 데이터로 교차 검증.
+    "아직 안 오른 2차 수혜주"를 자동으로 분류.
+    반환: [{"ticker", "rs_score", "mom_1m", "above_ma200", "vol_surge", "verdict", "verdict_emoji"}]
+    """
+    if not emerging_tickers:
+        return []
+    try:
+        unique = list(dict.fromkeys(str(t).strip().upper() for t in emerging_tickers if str(t).strip()))
+        all_tickers = list(dict.fromkeys(unique + ["SPY"]))
+        raw = yf.download(
+            tickers=all_tickers, period="6mo", interval="1d",
+            auto_adjust=False, group_by="column", progress=False, threads=True
+        )
+        close_df = get_close_prices_from_download(raw)
+        if close_df.empty:
+            return []
+
+        spy = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
+        spy_3m = float((spy.iloc[-1]/spy.iloc[-64] - 1)*100) if len(spy) >= 64 else 0.0
+
+        results = []
+        for tk in unique:
+            if tk not in close_df.columns:
+                continue
+            s = pd.to_numeric(close_df[tk], errors="coerce").dropna()
+            if len(s) < 22:
+                continue
+            mom_1m = float((s.iloc[-1]/s.iloc[-22] - 1)*100) if len(s) >= 22 else np.nan
+            mom_3m = float((s.iloc[-1]/s.iloc[-64] - 1)*100) if len(s) >= 64 else np.nan
+            rs_score = float(mom_3m - spy_3m) if pd.notna(mom_3m) else np.nan
+            ma200 = float(s.rolling(200, min_periods=150).mean().iloc[-1]) if len(s) >= 150 else np.nan
+            above_ma200 = bool(s.iloc[-1] > ma200) if pd.notna(ma200) else None
+
+            # 거래량 급증
+            try:
+                raw_vol = yf.download(tk, period="2mo", interval="1d", auto_adjust=False, progress=False)
+                vol = pd.to_numeric(raw_vol.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
+                vol_surge = float(vol.tail(5).mean() / vol.tail(21).mean()) if len(vol) >= 21 else np.nan
+            except Exception:
+                vol_surge = np.nan
+
+            # ── 핵심 판정 ─────────────────────────────────────────────────
+            # 🎯 최적 매수 타이밍: RS 음수(아직 안 올랐음) + 거래량 급증(돈 들어오기 시작)
+            # 🌱 얼리버드: RS 낮음 + 200일선 위 + 최근 모멘텀 상승
+            # ✅ 이미 강세: RS 양수 + 모멘텀 확인 (늦지 않음)
+            # ⏳ 대기: 아직 신호 없음
+            # ❌ 하락 추세: RS 음수 + 200일선 아래
+
+            if pd.notna(rs_score) and rs_score < 0 and pd.notna(vol_surge) and vol_surge >= 1.5:
+                verdict = "🎯 최적 매수 타이밍"
+                detail = f"RS {rs_score:+.1f}%p (아직 저평가) + 거래량 {vol_surge:.1f}x 급증"
+            elif pd.notna(rs_score) and rs_score < 3 and above_ma200 and pd.notna(mom_1m) and mom_1m > 2:
+                verdict = "🌱 얼리버드 기회"
+                detail = f"RS {rs_score:+.1f}%p + 200일선 위 + 1개월 {mom_1m:+.1f}%"
+            elif pd.notna(rs_score) and rs_score > 5 and above_ma200:
+                verdict = "✅ 이미 강세 (진입 시 고점 주의)"
+                detail = f"RS {rs_score:+.1f}%p + 200일선 위"
+            elif above_ma200 is False:
+                verdict = "❌ 하락 추세 (대기)"
+                detail = "200일선 아래 — 아직 때가 아님"
+            else:
+                verdict = "⏳ 신호 대기"
+                detail = f"RS {rs_score:+.1f}%p" if pd.notna(rs_score) else "데이터 부족"
+
+            results.append({
+                "ticker": tk,
+                "rs_score": round(rs_score, 2) if pd.notna(rs_score) else None,
+                "mom_1m": round(mom_1m, 2) if pd.notna(mom_1m) else None,
+                "above_ma200": above_ma200,
+                "vol_surge": round(vol_surge, 2) if pd.notna(vol_surge) else None,
+                "verdict": verdict,
+                "detail": detail,
+            })
+
+        results.sort(key=lambda x: (
+            0 if "최적" in x["verdict"] else
+            1 if "얼리" in x["verdict"] else
+            2 if "이미" in x["verdict"] else
+            3 if "대기" in x["verdict"] else 4
+        ))
+        return results
+    except Exception:
+        return []
+
+
+def detect_sector_momentum_reversal(universe_tickers: list) -> list[dict]:
+    """
+    섹터 꺾임 감지: 연속 2주 RS 하락 + 거래량 감소 + 가격 유지 패턴.
+    반환: [{"ticker", "signal", "rs_now", "rs_1w", "rs_change", "vol_change", "description"}]
+    """
+    if not universe_tickers:
+        return []
+    try:
+        all_tickers = list(dict.fromkeys([t.strip().upper() for t in universe_tickers if t.strip()] + ["SPY"]))
+        raw = yf.download(
+            tickers=all_tickers, period="6mo", interval="1d",
+            auto_adjust=False, group_by="column", progress=False, threads=True
+        )
+        close_df = get_close_prices_from_download(raw)
+        vol_raw = pd.DataFrame()
+        try:
+            if isinstance(raw.columns, pd.MultiIndex) and "Volume" in raw.columns.get_level_values(0):
+                vol_raw = raw["Volume"]
+        except Exception:
+            pass
+        if close_df.empty:
+            return []
+
+        spy = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
+        if len(spy) < 75:
+            return []
+
+        def calc_rs(s, spy, offset_start=0, offset_end=0):
+            try:
+                s_start = offset_start + 63
+                s_end = offset_start
+                spy_start = offset_start + 63
+                spy_end = offset_start
+                s_ret = float((s.iloc[-(1+s_end)] / s.iloc[-(1+s_start)] - 1) * 100)
+                spy_ret = float((spy.iloc[-(1+spy_end)] / spy.iloc[-(1+spy_start)] - 1) * 100)
+                return s_ret - spy_ret
+            except Exception:
+                return np.nan
+
+        alerts = []
+        for tk in all_tickers:
+            if tk == "SPY" or tk not in close_df.columns:
+                continue
+            s = pd.to_numeric(close_df[tk], errors="coerce").dropna()
+            if len(s) < 75:
+                continue
+
+            rs_now = calc_rs(s, spy, 0)        # 현재 RS
+            rs_1w = calc_rs(s, spy, 5)         # 1주 전 RS
+            rs_2w = calc_rs(s, spy, 10)        # 2주 전 RS
+
+            if not (pd.notna(rs_now) and pd.notna(rs_1w) and pd.notna(rs_2w)):
+                continue
+
+            rs_change_1w = rs_now - rs_1w
+            rs_change_2w = rs_1w - rs_2w
+            consecutive_drop = rs_change_1w < -1.5 and rs_change_2w < -1.5
+
+            # 거래량 변화
+            vol_change = np.nan
+            if not vol_raw.empty and tk in vol_raw.columns:
+                vol = pd.to_numeric(vol_raw[tk], errors="coerce").dropna()
+                if len(vol) >= 21:
+                    recent_avg = float(vol.tail(5).mean())
+                    baseline_avg = float(vol.tail(21).mean())
+                    vol_change = (recent_avg / baseline_avg - 1) * 100 if baseline_avg > 0 else np.nan
+
+            vol_declining = pd.notna(vol_change) and vol_change < -20
+
+            # 신호 결정
+            if consecutive_drop and rs_now > 0:
+                signal = "⚠️ 매도 주의"
+                desc = f"2주 연속 RS 하락 (현재 {rs_now:+.1f}%p → {rs_change_1w:+.1f}%p/주)"
+                if vol_declining:
+                    signal = "🔴 분산 매도 감지"
+                    desc += f" + 거래량 {vol_change:+.0f}% 감소 (기관 매도 가능성)"
+            elif rs_change_1w < -3 and rs_now < 0:
+                signal = "🔴 급격한 약세 전환"
+                desc = f"RS {rs_now:+.1f}%p + 주간 변화 {rs_change_1w:+.1f}%p"
+            else:
+                continue  # 정상 → 생략
+
+            alerts.append({
+                "ticker": tk,
+                "signal": signal,
+                "rs_now": round(rs_now, 2),
+                "rs_1w": round(rs_1w, 2),
+                "rs_change": round(rs_change_1w, 2),
+                "vol_change": round(vol_change, 1) if pd.notna(vol_change) else None,
+                "description": desc,
+            })
+
+        alerts.sort(key=lambda x: x["rs_change"])
+        return alerts
+    except Exception:
+        return []
+
+
 def build_pool_monthly_returns_table(pool_tickers):
     """Download pool prices once and calculate 1-month returns per ticker (공통 빌더 사용)."""
     df = build_etf_universe_returns_table(pool_tickers)
@@ -6630,6 +6882,81 @@ if st.session_state.get("logged_in"):
         st.divider()
         st.markdown("### 🧠 Smart AI Summary")
         st.info(summary_data if summary_data else "N/A")
+
+        # ── 기능 2: Emerging 종목 정량 교차 검증 ─────────────────────────
+        if themes_data and isinstance(themes_data, list):
+            all_emerging = []
+            for theme in themes_data:
+                if not isinstance(theme, dict):
+                    continue
+                em_str = str(theme.get("emerging", "") or "").strip()
+                if em_str:
+                    tks = [t.strip().upper() for t in em_str.replace(",", " ").split() if t.strip()]
+                    all_emerging.extend(tks)
+            all_emerging = list(dict.fromkeys(all_emerging))
+
+            if all_emerging:
+                st.divider()
+                st.markdown("### 🔬 Emerging 종목 정량 교차 검증")
+                st.caption(
+                    f"AI가 제시한 **Emerging 종목 {len(all_emerging)}개**를 실제 가격/거래량 데이터로 검증합니다. "
+                    "'아직 안 오른 2차 수혜주'를 자동으로 분류해요."
+                )
+                if st.button("🔍 Emerging 종목 검증 실행", key="emerging_verify_btn", type="primary", use_container_width=True):
+                    with st.spinner(f"Emerging {len(all_emerging)}개 종목 정량 검증 중..."):
+                        verified = verify_emerging_with_quant(all_emerging)
+
+                    if not verified:
+                        st.warning("Emerging 종목 검증 데이터를 가져오지 못했습니다.")
+                    else:
+                        # 최적 매수 타이밍 종목 강조
+                        best = [v for v in verified if "최적" in v["verdict"]]
+                        early = [v for v in verified if "얼리" in v["verdict"]]
+
+                        if best:
+                            st.success(f"🎯 **최적 매수 타이밍 {len(best)}개** — 아직 저평가 + 거래량 급증!")
+                            for v in best:
+                                vol_str = f"거래량 {v['vol_surge']:.1f}x" if v["vol_surge"] else ""
+                                st.markdown(
+                                    f"**{v['ticker']}** — RS {v['rs_score']:+.1f}%p / "
+                                    f"1개월 {v['mom_1m']:+.1f}% / {vol_str} | _{v['detail']}_"
+                                )
+                                if st.button(f"🔔 {v['ticker']} Watchlist 추가", key=f"em_wl_{v['ticker']}", use_container_width=False):
+                                    _uid_em = str(st.session_state.get("user_id") or "").strip()
+                                    _em_item = {
+                                        "ticker": v["ticker"],
+                                        "memo": f"Emerging 검증 - {v['verdict']}",
+                                        "alert_price": np.nan,
+                                        "alert_rsi": 30.0,
+                                        "alert_ma200": True,
+                                        "saved_price": np.nan,
+                                        "date_added": _narrative_now_kst_string(),
+                                    }
+                                    _em_wl = load_watchlist_sheet(_uid_em)
+                                    _em_wl = [x for x in _em_wl if x["ticker"] != v["ticker"]]
+                                    _em_wl.append(_em_item)
+                                    save_watchlist_sheet(_uid_em, _em_wl)
+                                    st.success(f"✅ {v['ticker']} Watchlist 추가!")
+                                    st.session_state.pop("_sidebar_wl_count", None)
+
+                        if early:
+                            st.info(f"🌱 **얼리버드 기회 {len(early)}개** — 아직 초기, 200일선 위")
+                            for v in early:
+                                st.markdown(f"**{v['ticker']}** — {v['detail']}")
+
+                        # 전체 결과 테이블
+                        with st.expander("📋 전체 Emerging 검증 결과", expanded=False):
+                            em_rows = []
+                            for v in verified:
+                                em_rows.append({
+                                    "티커": v["ticker"],
+                                    "판정": v["verdict"],
+                                    "RS Score": f"{v['rs_score']:+.1f}%p" if v["rs_score"] is not None else "N/A",
+                                    "1개월 수익률": f"{v['mom_1m']:+.1f}%" if v["mom_1m"] is not None else "N/A",
+                                    "200일선": "위 ✅" if v["above_ma200"] else ("아래 ❌" if v["above_ma200"] is False else "N/A"),
+                                    "거래량 배율": f"{v['vol_surge']:.1f}x" if v["vol_surge"] else "N/A",
+                                })
+                            st.dataframe(pd.DataFrame(em_rows), use_container_width=True, hide_index=True)
     
         st.markdown("### 🕒 시계열 분석 엔진")
         st.caption(
@@ -7327,6 +7654,91 @@ if st.session_state.get("logged_in"):
         st.info(
             "💡 이 레이더에 잡힌 생소한 티커를 왼쪽 사이드바에 입력하여 해당 테마를 이끄는 개별 주도주를 찾아보세요."
         )
+
+        # ── 기능 1: RS Score 주간 변화율 (Early Signal) ───────────────────
+        st.divider()
+        st.subheader("🌱 Early Signal Radar — 지금 막 강해지기 시작한 섹터")
+        st.caption(
+            "1주 전 RS Score 대비 현재 RS Score 변화율을 계산합니다. "
+            "**아직 RS가 낮지만 변화가 급격히 플러스**인 종목이 Early Entry 기회예요."
+        )
+
+        if st.button("🔍 Early Signal 스캔", key="early_signal_btn", type="primary", use_container_width=True):
+            with st.spinner("RS Score 주간 변화율 계산 중... (약 30초 소요)"):
+                rs_change_df = compute_rs_score_weekly_change(etf_radar_universe)
+
+            if rs_change_df.empty:
+                st.warning("RS 변화율 데이터를 가져오지 못했습니다.")
+            else:
+                # 신호별 분류
+                early_df = rs_change_df[rs_change_df["RS_Signal"] == "🌱 Early Signal"]
+                surge_df = rs_change_df[rs_change_df["RS_Signal"] == "🚀 급부상"]
+                weak_df = rs_change_df[rs_change_df["RS_Signal"] == "⚠️ 모멘텀 약화"]
+
+                if not early_df.empty:
+                    st.success(f"🌱 **Early Signal {len(early_df)}개** — 아직 안 올랐지만 강해지기 시작한 섹터!")
+                    for _, row in early_df.iterrows():
+                        st.markdown(
+                            f"**{row['Ticker']}** — RS {row['RS_Now']:+.1f}%p "
+                            f"(1주 변화: {row['RS_Change']:+.1f}%p) "
+                            f"→ Watchlist 등록 고려"
+                        )
+
+                es_col1, es_col2 = st.columns(2)
+                with es_col1:
+                    if not surge_df.empty:
+                        st.info(f"🚀 **급부상 {len(surge_df)}개** — 강하면서 더 강해지는 중")
+                        for _, row in surge_df.iterrows():
+                            st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 +{row['RS_Change']:.1f}%p")
+                with es_col2:
+                    if not weak_df.empty:
+                        st.warning(f"⚠️ **모멘텀 약화 {len(weak_df)}개** — 주의 필요")
+                        for _, row in weak_df.iterrows():
+                            st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 {row['RS_Change']:.1f}%p")
+
+                with st.expander("📋 전체 RS 변화율 테이블", expanded=False):
+                    def _style_rs_change(val):
+                        v = pd.to_numeric(val, errors="coerce")
+                        if pd.isna(v): return ""
+                        return "color:#16a34a;font-weight:600" if v > 2 else "color:#dc2626;font-weight:600" if v < -2 else ""
+                    styled_rs = rs_change_df.style.map(_style_rs_change, subset=["RS_Change"])
+                    st.dataframe(styled_rs, use_container_width=True, hide_index=True)
+
+        # ── 기능 3: 섹터 꺾임 감지 ───────────────────────────────────────
+        st.divider()
+        st.subheader("🛡️ 섹터 꺾임 감지 — 매도 타이밍 선제 포착")
+        st.caption(
+            "2주 연속 RS Score 하락 + 거래량 감소 패턴을 자동으로 감지합니다. "
+            "보유 종목의 섹터 ETF가 여기 뜨면 **선제적 매도를 고려**하세요."
+        )
+
+        if st.button("🔍 섹터 꺾임 스캔", key="sector_reversal_btn", use_container_width=True):
+            with st.spinner("섹터 모멘텀 반전 신호 분석 중..."):
+                reversal_alerts = detect_sector_momentum_reversal(etf_radar_universe)
+
+            if not reversal_alerts:
+                st.success("✅ 현재 감지된 꺾임 신호 없음 — 전반적으로 모멘텀 유지 중입니다.")
+            else:
+                st.warning(f"⚠️ **{len(reversal_alerts)}개 섹터에서 꺾임 신호 감지!**")
+                for alert in reversal_alerts:
+                    is_critical = "분산 매도" in alert["signal"] or "급격" in alert["signal"]
+                    with st.expander(
+                        f"{alert['signal']} **{alert['ticker']}** — RS {alert['rs_now']:+.1f}%p / 주간 변화 {alert['rs_change']:+.1f}%p",
+                        expanded=is_critical,
+                    ):
+                        st.markdown(f"**신호:** {alert['description']}")
+                        detail_col1, detail_col2 = st.columns(2)
+                        with detail_col1:
+                            st.metric("현재 RS", f"{alert['rs_now']:+.1f}%p")
+                            st.metric("1주 전 RS", f"{alert['rs_1w']:+.1f}%p")
+                        with detail_col2:
+                            st.metric("주간 RS 변화", f"{alert['rs_change']:+.1f}%p")
+                            if alert["vol_change"] is not None:
+                                st.metric("거래량 변화", f"{alert['vol_change']:+.0f}%")
+                        if "분산 매도" in alert["signal"]:
+                            st.error("🔴 기관 분산 매도 패턴 — 포트폴리오에 이 ETF 관련 종목이 있다면 즉시 점검하세요!")
+                        else:
+                            st.warning("⚠️ 모멘텀 약화 초기 신호 — 매도 준비 또는 손절 라인 설정 권장")
     
     elif main_nav == _MAIN_NAV_OPTIONS[5]:
         st.subheader(_MAIN_NAV_OPTIONS[4])
