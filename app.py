@@ -7166,7 +7166,7 @@ if st.session_state.get("logged_in"):
                                 st.markdown(f"**{ui_text['outlook']}**\n\n{deep_result.get('forward_outlook', 'N/A')}")
     
     elif main_nav == _MAIN_NAV_OPTIONS[4]:
-        st.subheader(f"{_MAIN_NAV_OPTIONS[3]} · 듀얼 엔진")
+        st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 듀얼 엔진")
         st.caption(
             "**Current Leaders**는 기존 6대 팩터로 대장·테마 정렬을, **Emerging**은 2차 수혜·초기 모멘텀·거래량 가속·과열 회피 관점으로 같은 유니버스를 재스코어링합니다."
         )
@@ -7441,7 +7441,7 @@ if st.session_state.get("logged_in"):
                 else:
                     st.info("정리 대상 ETF가 없어요. 리스트 품질이 좋은 상태예요.")
 
-        st.subheader(f"{_MAIN_NAV_OPTIONS[2]} · 섹터 ETF 상대 강도")
+        st.subheader(f"{_MAIN_NAV_OPTIONS[3]} · 섹터 ETF 상대 강도")
         st.caption("주요 섹터/테마 ETF 상대 강도 점검 (2년 데이터 기반)")
         st.markdown(f"기준 티커: `{selected_ticker}`")
     
@@ -7663,9 +7663,82 @@ if st.session_state.get("logged_in"):
             "**아직 RS가 낮지만 변화가 급격히 플러스**인 종목이 Early Entry 기회예요."
         )
 
+        # ── 필터 설정 ──────────────────────────────────────────────────
+        _uid_filter = str(st.session_state.get("user_id") or "").strip()
+        filter_col1, filter_col2 = st.columns([2, 3])
+        with filter_col1:
+            scan_universe_choice = st.selectbox(
+                "📋 스캔 대상 선택",
+                options=[
+                    "전체 ETF Universe",
+                    "포트폴리오 보유 종목만",
+                    "Watchlist 종목만",
+                    "포트폴리오 + Watchlist",
+                    "주요 섹터 ETF만 (SPDR XL*)",
+                    "테크·반도체만",
+                    "직접 입력",
+                ],
+                key="early_signal_universe_choice",
+            )
+        with filter_col2:
+            if scan_universe_choice == "직접 입력":
+                custom_tickers_input = st.text_input(
+                    "티커 직접 입력 (쉼표 구분)",
+                    placeholder="NVDA, SMH, SOXX, XLK",
+                    key="early_signal_custom_tickers",
+                )
+            else:
+                custom_tickers_input = ""
+
+        # 스캔 대상 결정
+        def _resolve_scan_universe(choice, uid, custom_input, full_universe):
+            if choice == "포트폴리오 보유 종목만":
+                try:
+                    pf = load_portfolio()
+                    return list(pf["Ticker"].dropna().astype(str).str.upper().unique()) if not pf.empty else []
+                except Exception:
+                    return []
+            elif choice == "Watchlist 종목만":
+                try:
+                    wl = load_watchlist_sheet(uid)
+                    return [i["ticker"] for i in wl] if wl else []
+                except Exception:
+                    return []
+            elif choice == "포트폴리오 + Watchlist":
+                tickers = []
+                try:
+                    pf = load_portfolio()
+                    if not pf.empty:
+                        tickers += list(pf["Ticker"].dropna().astype(str).str.upper().unique())
+                except Exception:
+                    pass
+                try:
+                    wl = load_watchlist_sheet(uid)
+                    tickers += [i["ticker"] for i in wl] if wl else []
+                except Exception:
+                    pass
+                return list(dict.fromkeys(tickers))
+            elif choice == "주요 섹터 ETF만 (SPDR XL*)":
+                return [t for t in full_universe if t.startswith("XL")]
+            elif choice == "테크·반도체만":
+                tech = {"VGT","SOXX","SMH","XSD","SOXQ","DRAM","XLK","FTEC","CHAT","AIQ","IGPT"}
+                return [t for t in full_universe if t in tech]
+            elif choice == "직접 입력":
+                return [t.strip().upper() for t in custom_input.replace(",", " ").split() if t.strip()]
+            else:
+                return full_universe  # 전체
+
+        scan_target = _resolve_scan_universe(
+            scan_universe_choice, _uid_filter, custom_tickers_input, etf_radar_universe
+        )
+        st.caption(f"스캔 대상: **{len(scan_target)}개** 티커")
+
         if st.button("🔍 Early Signal 스캔", key="early_signal_btn", type="primary", use_container_width=True):
-            with st.spinner("RS Score 주간 변화율 계산 중... (약 30초 소요)"):
-                rs_change_df = compute_rs_score_weekly_change(etf_radar_universe)
+            if not scan_target:
+                st.warning("스캔 대상 티커가 없어요. 필터를 변경하거나 포트폴리오/Watchlist에 종목을 추가해주세요.")
+            else:
+                with st.spinner(f"RS Score 주간 변화율 계산 중... ({len(scan_target)}개 티커)"):
+                    rs_change_df = compute_rs_score_weekly_change(scan_target)
 
             if rs_change_df.empty:
                 st.warning("RS 변화율 데이터를 가져오지 못했습니다.")
@@ -7713,8 +7786,11 @@ if st.session_state.get("logged_in"):
         )
 
         if st.button("🔍 섹터 꺾임 스캔", key="sector_reversal_btn", use_container_width=True):
-            with st.spinner("섹터 모멘텀 반전 신호 분석 중..."):
-                reversal_alerts = detect_sector_momentum_reversal(etf_radar_universe)
+            if not scan_target:
+                st.warning("스캔 대상 티커가 없어요. 위 Early Signal 필터를 먼저 설정하세요.")
+            else:
+                with st.spinner(f"섹터 모멘텀 반전 신호 분석 중... ({len(scan_target)}개)"):
+                    reversal_alerts = detect_sector_momentum_reversal(scan_target)
 
             if not reversal_alerts:
                 st.success("✅ 현재 감지된 꺾임 신호 없음 — 전반적으로 모멘텀 유지 중입니다.")
@@ -7741,7 +7817,7 @@ if st.session_state.get("logged_in"):
                             st.warning("⚠️ 모멘텀 약화 초기 신호 — 매도 준비 또는 손절 라인 설정 권장")
     
     elif main_nav == _MAIN_NAV_OPTIONS[5]:
-        st.subheader(_MAIN_NAV_OPTIONS[4])
+        st.subheader(_MAIN_NAV_OPTIONS[5])
         st.caption(
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
         )
@@ -8265,7 +8341,7 @@ if st.session_state.get("logged_in"):
                 "시세·ETF 유니버스 모멘텀 랭킹(1시간 TTL)·종목 유형(quoteType) 캐시를 비우고 레이더를 다시 계산합니다."
             )
     
-        st.subheader(_MAIN_NAV_OPTIONS[5])
+        st.subheader(_MAIN_NAV_OPTIONS[6])
         st.caption(
             "Google 시트 `Quant_DB` / **Portfolios** 한 줄은 "
             "`[ID, Account, Ticker, AvgPrice, Quantity, Date_Added]` 입니다. "
