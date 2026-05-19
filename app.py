@@ -7594,49 +7594,106 @@ if st.session_state.get("logged_in"):
 
         if st.button("🤖 AI 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
             try:
-                # 진단에 사용할 데이터 수집
+                # 이미 위에서 계산된 값들을 최대한 재사용
                 _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
                 _diag_close = pd.to_numeric(_diag_timing["Close"], errors="coerce").dropna() if not _diag_timing.empty else pd.Series(dtype=float)
                 _diag_rsi = float(calculate_rsi(_diag_close).dropna().iloc[-1]) if len(_diag_close) > 14 else np.nan
                 _diag_ma200 = float(_diag_close.rolling(200, min_periods=150).mean().iloc[-1]) if len(_diag_close) >= 150 else np.nan
+                _diag_ma50 = float(_diag_close.rolling(50, min_periods=50).mean().iloc[-1]) if len(_diag_close) >= 50 else np.nan
                 _diag_price = float(_diag_close.iloc[-1]) if not _diag_close.empty else np.nan
-                _diag_macd, _diag_sig, _diag_hist = calculate_macd(_diag_close)
-                _diag_hist_val = float(_diag_hist.iloc[-1]) if not _diag_hist.empty else np.nan
+                _diag_52w_high = float(_diag_close.max()) if not _diag_close.empty else np.nan
+                _diag_pct_from_high = ((_diag_price / _diag_52w_high) - 1) * 100 if pd.notna(_diag_price) and pd.notna(_diag_52w_high) and _diag_52w_high > 0 else np.nan
 
+                # MACD - 명시적으로 양수/음수 체크
+                _diag_macd_line, _diag_sig_line, _diag_hist_series = calculate_macd(_diag_close)
+                _diag_hist_val = float(_diag_hist_series.iloc[-1]) if not _diag_hist_series.empty else np.nan
+                _macd_direction = "상승모멘텀 (양수)" if (pd.notna(_diag_hist_val) and _diag_hist_val > 0) else "하락모멘텀 (음수)" if (pd.notna(_diag_hist_val) and _diag_hist_val < 0) else "중립"
+
+                # 볼린저밴드
+                _bb_upper, _bb_mid, _bb_lower = calculate_bollinger_bands(_diag_close)
+                _bb_upper_val = float(_bb_upper.dropna().iloc[-1]) if not _bb_upper.dropna().empty else np.nan
+                _bb_lower_val = float(_bb_lower.dropna().iloc[-1]) if not _bb_lower.dropna().empty else np.nan
+                _bb_position = "하단 터치 (반등 가능)" if pd.notna(_diag_price) and pd.notna(_bb_lower_val) and _diag_price <= _bb_lower_val * 1.01 else \
+                               "상단 터치 (과열)" if pd.notna(_diag_price) and pd.notna(_bb_upper_val) and _diag_price >= _bb_upper_val * 0.99 else "밴드 내부"
+
+                # KPI 요약
                 _kpi_summary = ""
+                _kpi_details = ""
                 try:
                     _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
-                    _kpi_summary = f"KPI Pass/Fail: {_pass_n}개 통과 / {_fail_n}개 실패. 안전마진: {_margin.get('margin_of_safety', 'N/A')}%"
+                    _kpi_summary = f"KPI: {_pass_n}개 통과 / {_fail_n}개 실패"
+                    _safety = _margin.get('margin_of_safety')
+                    _intrinsic = _margin.get('intrinsic_value')
+                    _kpi_details = (
+                        f"안전마진: {_safety:.1f}% / 적정주가: ${_intrinsic:.2f}"
+                        if pd.notna(_safety) and pd.notna(_intrinsic) else "밸류에이션 데이터 없음"
+                    )
+                    # 실패한 KPI 목록
+                    _fail_items = _kpi_df[_kpi_df["Pass"].str.contains("Fail", na=False)]["KPI"].tolist() if not _kpi_df.empty else []
+                    if _fail_items:
+                        _kpi_details += f" / 실패 항목: {', '.join(_fail_items[:3])}"
                 except Exception:
                     _kpi_summary = "KPI 데이터 없음"
+                    _kpi_details = ""
 
-                _diag_prompt = f"""
-당신은 월가 수석 퀀트 애널리스트입니다.
-아래 데이터를 바탕으로 **{selected_ticker}** 종목에 대한 투자 판단을 한국어로 간결하게 작성하세요.
+                # 기관 보유
+                _inst_pct = "데이터 없음"
+                try:
+                    _inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
+                    if not _inst_df.empty:
+                        _pct_col = next((c for c in _inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
+                        if _pct_col:
+                            _total = _inst_df[_pct_col].sum()
+                            _total_pct = _total * 100 if _total <= 1 else _total
+                            _inst_pct = f"{_total_pct:.1f}%"
+                except Exception:
+                    pass
 
-[기술적 지표]
-- 현재가: ${_diag_price:.2f}
-- RSI(14): {_diag_rsi:.1f}
-- MACD 히스토그램: {_diag_hist_val:+.3f} ({'상승모멘텀' if _diag_hist_val and _diag_hist_val > 0 else '하락모멘텀'})
-- 200일선: ${_diag_ma200:.2f} ({'현재가 위 ✅' if _diag_price and _diag_ma200 and _diag_price > _diag_ma200 else '현재가 아래 ❌'})
+                _diag_prompt = f"""당신은 월가 수석 퀀트 애널리스트입니다.
+아래 실제 데이터를 바탕으로 **{selected_ticker}** 종목에 대한 투자 진단을 한국어로 작성하세요.
+데이터에 없는 내용은 추측하지 마세요.
+
+[기술적 지표 — 실제 계산값]
+- 현재가: ${f'{_diag_price:.2f}' if pd.notna(_diag_price) else 'N/A'}
+- RSI(14): {f'{_diag_rsi:.1f}' if pd.notna(_diag_rsi) else 'N/A'} ({'과매수' if pd.notna(_diag_rsi) and _diag_rsi >= 70 else '조정구간' if pd.notna(_diag_rsi) and _diag_rsi < 50 else '중립'})
+- MACD 히스토그램: {f'{_diag_hist_val:+.4f}' if pd.notna(_diag_hist_val) else 'N/A'} → {_macd_direction}
+- 200일선: ${f'{_diag_ma200:.2f}' if pd.notna(_diag_ma200) else 'N/A'} → 현재가 {'위 (장기 우상향)' if pd.notna(_diag_price) and pd.notna(_diag_ma200) and _diag_price > _diag_ma200 else '아래 (장기 하락추세)'}
+- 50일선: ${f'{_diag_ma50:.2f}' if pd.notna(_diag_ma50) else 'N/A'} → 현재가 {'위' if pd.notna(_diag_price) and pd.notna(_diag_ma50) and _diag_price > _diag_ma50 else '아래'}
+- 52주 고점 대비: {f'{_diag_pct_from_high:+.1f}%' if pd.notna(_diag_pct_from_high) else 'N/A'}
+- 볼린저밴드: {_bb_position}
 
 [펀더멘털]
-{_kpi_summary}
+- {_kpi_summary}
+- {_kpi_details}
+- 기관 보유 비중 (상위 10개): {_inst_pct}
 
-[출력 형식 - 반드시 아래 구조로만 답하세요]
-## 종합 판단: [매수 고려 / 관망 / 매도 고려] 중 하나
+[출력 규칙]
+1. 반드시 아래 형식 그대로 작성 (마크다운 사용)
+2. 각 항목을 구체적 수치와 함께 설명 (데이터 기반)
+3. "관망" 판단 시에도 구체적인 매수 진입 조건을 명시
+4. 전체 200~300자 이상 작성
 
-**근거 (3줄 이내):**
-- 기술적 측면:
-- 펀더멘털 측면:
-- 리스크:
+## 종합 판단: [매수 고려 / 관망 / 매도 고려]
 
-**투자 전략 제안 (1줄):**
+**📊 기술적 분석:**
+(RSI, MACD, 이동평균, 볼린저밴드 각각 언급)
 
-*본 분석은 참고용이며 투자 권유가 아닙니다.*
-"""
-                with st.spinner("Gemini AI가 종합 진단 중... (약 10초 소요)"):
-                    _diag_model = _GenAIModel("gemini-2.5-flash", generation_config={"temperature": 0.2, "max_output_tokens": 800})
+**💼 펀더멘털 분석:**
+(KPI 통과/실패, 안전마진, 기관 보유 언급)
+
+**⚠️ 주요 리스크:**
+(구체적으로 2가지)
+
+**🎯 액션 플랜:**
+(관망이면 구체적 진입 조건 명시. 예: RSI XX 이하 또는 MACD 양전환 시)
+
+*본 분석은 참고용이며 투자 권유가 아닙니다.*"""
+
+                with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
+                    _diag_model = _GenAIModel(
+                        "gemini-2.5-flash",
+                        generation_config={"temperature": 0.2, "max_output_tokens": 2048}
+                    )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
                     _diag_text = _gemini_response_text_utf8_safe(_diag_response)
 
