@@ -7059,6 +7059,173 @@ if st.session_state.get("logged_in"):
     is_etf_mode = quote_type == "ETF"
     
     if main_nav == _MAIN_NAV_OPTIONS[0]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 🚨 Daily Risk Gauge
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader("🚨 Daily Risk Gauge")
+        st.caption("매일 접속 시 시장 하락 선행 신호 5가지를 자동 스캔합니다. 전날 미리 경고를 포착하는 게 목표예요.")
+
+        drg_col1, drg_col2 = st.columns([2, 3])
+        with drg_col1:
+            sector_choice = st.selectbox(
+                "📊 분석 섹터",
+                options=["전체", "테크·반도체", "에너지", "금융", "헬스케어", "산업재"],
+                key="drg_sector_choice",
+            )
+        with drg_col2:
+            st.caption(f"선택 섹터: **{sector_choice}** | 30분 캐시")
+
+        if st.button("🔄 지금 스캔", key="drg_refresh_btn", use_container_width=True):
+            compute_daily_risk_gauge.clear()
+
+        with st.spinner("선행 지표 5가지 분석 중..."):
+            drg = compute_daily_risk_gauge(sector_filter=sector_choice)
+
+        risk_score = drg["risk_score"]
+        st.markdown(
+            f"<div style='background:{drg['risk_color']}22;border:2px solid {drg['risk_color']};"
+            f"border-radius:12px;padding:20px;margin:12px 0;text-align:center;'>"
+            f"<div style='font-size:32px;font-weight:900;color:{drg['risk_color']}'>{drg['risk_level']}</div>"
+            f"<div style='font-size:16px;margin-top:6px;'>{drg['risk_msg']}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+        bar_width = int(risk_score / 10 * 100)
+        st.markdown(
+            f"<div style='background:#1e293b;border-radius:8px;padding:4px;margin:4px 0 8px 0;'>"
+            f"<div style='background:{drg['risk_color']};width:{bar_width}%;height:20px;border-radius:6px;"
+            f"display:flex;align-items:center;justify-content:center;color:white;font-size:12px;font-weight:700;'>"
+            f"Risk {risk_score}/10"
+            f"</div></div>",
+            unsafe_allow_html=True
+        )
+
+        st.markdown("### 📡 선행 신호 5가지")
+        sig = drg["signals"]
+        s_col1, s_col2, s_col3, s_col4, s_col5 = st.columns(5)
+        signal_defs = [
+            ("vix",     "VIX 방향",     "🌡️"),
+            ("credit",  "신용 스프레드", "💳"),
+            ("leaders", "대장주 모멘텀", "🏆"),
+            ("volume",  "거래량 패턴",   "📦"),
+            ("vix_vxn", "VIX/VXN",      "⚡"),
+        ]
+        for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5], signal_defs):
+            with col:
+                s = sig.get(key, {})
+                ok = s.get("ok", True)
+                val = s.get("value", "N/A")
+                status = "✅ 정상" if ok else "⚠️ 경고"
+                color = "#16a34a" if ok else "#dc2626"
+                st.markdown(
+                    f"<div style='text-align:center;padding:10px;background:#1e293b;border-radius:8px;"
+                    f"border:1px solid {color};'>"
+                    f"<div style='font-size:20px'>{emoji}</div>"
+                    f"<div style='font-size:11px;color:#94a3b8'>{label}</div>"
+                    f"<div style='font-weight:700;color:{color}'>{status}</div>"
+                    f"<div style='font-size:11px;color:#cbd5e1'>{val}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+        warnings_drg = drg.get("warnings", [])
+        if warnings_drg:
+            st.divider()
+            st.markdown("### ⚠️ 감지된 경고 신호")
+            for w in warnings_drg:
+                st.warning(w)
+        else:
+            st.success("✅ 현재 감지된 선행 경고 신호 없음 — 시장 환경 정상")
+
+        with st.expander("🔍 신호 상세 데이터", expanded=False):
+            for key, data in drg.get("details", {}).items():
+                st.markdown(f"**{key}**")
+                if isinstance(data, dict):
+                    for k2, v2 in data.items():
+                        if isinstance(v2, dict):
+                            st.markdown("  - `" + k2 + "`: " + " / ".join(f"{kk}={vv}" for kk, vv in v2.items()))
+                        else:
+                            st.markdown(f"  - {k2}: **{v2}**")
+
+        news_items = drg.get("news_items", [])
+        if news_items:
+            st.divider()
+            st.markdown("### 📰 관련 최신 뉴스")
+            for n in news_items[:8]:
+                time_str = ""
+                if n.get("time"):
+                    try:
+                        import datetime as _dt
+                        dt = _dt.datetime.fromtimestamp(n["time"], tz=_dt.timezone.utc).astimezone(_KST_TZ)
+                        time_str = dt.strftime("%m/%d %H:%M")
+                    except Exception:
+                        pass
+                link = n.get("link", "")
+                title = n.get("title", "")
+                publisher = n.get("publisher", "")
+                ticker = n.get("ticker", "")
+                if link:
+                    st.markdown(f"**{ticker}** | [{title}]({link}) — _{publisher}_ {time_str}")
+                else:
+                    st.markdown(f"**{ticker}** | {title} — _{publisher}_ {time_str}")
+
+        st.divider()
+        st.markdown("### 🤖 AI 내일 시장 예측")
+        st.caption("선행 신호 5가지 + 최신 뉴스를 종합해 Gemini AI가 내일 시장 방향을 분석합니다. 장 전/후 실행 권장.")
+
+        if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
+            news_text = "\n".join([
+                f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
+                for n in news_items[:10]
+            ]) if news_items else "최신 뉴스 없음"
+            signal_summary = "\n".join([
+                f"- {label}: {'정상' if sig.get(key, {}).get('ok', True) else '경고'} | {sig.get(key, {}).get('value', 'N/A')}"
+                for key, label, _ in signal_defs
+            ])
+            warning_text = "\n".join(warnings_drg) if warnings_drg else "없음"
+            now_kst = datetime.now(_KST_TZ)
+            market_session = "장 전" if now_kst.hour < 9 else ("장 중" if now_kst.hour < 16 else "장 후")
+            drg_prompt = (
+                "당신은 월가 수석 퀀트 전략가입니다.\n"
+                f"현재 시각: {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
+                f"분석 섹터: {sector_choice}\n\n"
+                "[선행 지표 5가지]\n" + signal_summary + "\n\n"
+                "[감지된 경고]\n" + warning_text + "\n\n"
+                "[최신 뉴스]\n" + news_text + "\n\n"
+                "반드시 아래 형식으로 한국어 작성:\n\n"
+                "## 내일 시장 방향: [상승 우세 / 중립 / 하락 우세]\n\n"
+                "**기술적 근거:** (선행 지표 기반, 수치 포함)\n\n"
+                "**뉴스 센티먼트:** (뉴스가 시장에 미칠 영향)\n\n"
+                "**주요 리스크:** (2가지)\n\n"
+                "**대응 전략:**\n"
+                "- 보유 중이라면:\n"
+                "- 매수 고려 중이라면:\n"
+                "- 현금 비중이라면:\n\n"
+                "*본 분석은 참고용이며 투자 권유가 아닙니다.*"
+            )
+            with st.spinner("Gemini AI 분석 중... (약 15초)"):
+                _drg_model = _GenAIModel(
+                    "gemini-2.5-flash",
+                    generation_config={"temperature": 0.0, "max_output_tokens": 2048}
+                )
+                _drg_response = _drg_model.generate_content(drg_prompt)
+                _drg_text = _gemini_response_text_utf8_safe(_drg_response)
+            if _drg_text:
+                st.session_state["_drg_ai_result"] = _drg_text
+                st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
+                st.rerun()
+
+        if st.session_state.get("_drg_ai_result"):
+            st.info(f"🕐 분석 시각: {st.session_state.get('_drg_ai_time', '')} KST")
+            _txt = st.session_state["_drg_ai_result"]
+            if "하락 우세" in _txt:
+                st.error(_txt)
+            elif "상승 우세" in _txt:
+                st.success(_txt)
+            else:
+                st.warning(_txt)
+
+    elif main_nav == _MAIN_NAV_OPTIONS[13]:
         st.title("📖 Quant Terminal 사용 가이드")
         st.markdown("처음 오셨나요? **실제 매수 결정부터 매도까지** 앱의 모든 탭을 어떤 순서로, 어떻게 활용하는지 단계별로 설명합니다.")
         st.info("💡 **핵심 원칙:** 이 앱은 단 하나의 신호로 매수 결정을 내리지 않습니다. Macro → Sector → Stock 3개 레이어가 모두 같은 방향을 가리킬 때만 높은 확신으로 진입할 수 있습니다.")
@@ -7214,7 +7381,7 @@ if st.session_state.get("logged_in"):
         st.divider()
         st.warning("⚠️ 면책 조항: 이 앱은 투자 참고 도구이며 투자 권유가 아닙니다. 모든 투자 결정과 결과는 투자자 본인의 책임입니다.")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[2]:
+    elif main_nav == _MAIN_NAV_OPTIONS[1]:
         sync_m1, sync_m2 = st.columns([1, 3])
         with sync_m1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_macro", use_container_width=True):
@@ -7365,7 +7532,7 @@ if st.session_state.get("logged_in"):
             st.error("거시경제 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
     
-    elif main_nav == _MAIN_NAV_OPTIONS[3]:
+    elif main_nav == _MAIN_NAV_OPTIONS[2]:
         hydrate_narrative_from_disk_once()
     
         nrow_1, nrow_2 = st.columns([1, 3])
@@ -7916,8 +8083,8 @@ if st.session_state.get("logged_in"):
                                 st.markdown(f"**{ui_text['sentiment']}**\n\n{deep_result.get('market_sentiment', 'N/A')}")
                                 st.markdown(f"**{ui_text['outlook']}**\n\n{deep_result.get('forward_outlook', 'N/A')}")
     
-    elif main_nav == _MAIN_NAV_OPTIONS[5]:
-        st.subheader(f"{_MAIN_NAV_OPTIONS[5]} · 듀얼 엔진")
+    elif main_nav == _MAIN_NAV_OPTIONS[4]:
+        st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 듀얼 엔진")
         st.caption(
             "**Current Leaders**는 기존 6대 팩터로 대장·테마 정렬을, **Emerging**은 2차 수혜·초기 모멘텀·거래량 가속·과열 회피 관점으로 같은 유니버스를 재스코어링합니다."
         )
@@ -8152,7 +8319,7 @@ if st.session_state.get("logged_in"):
             elif not run_emerge:
                 st.caption("Emerging 엔진 스캔을 실행하면 RSI·거래량 가속 지표와 함께 결과가 세션에 유지됩니다.")
     
-    elif main_nav == _MAIN_NAV_OPTIONS[4]:
+    elif main_nav == _MAIN_NAV_OPTIONS[3]:
         syn_s1, syn_s2 = st.columns([1, 3])
         with syn_s1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_sector", use_container_width=True):
@@ -8228,7 +8395,7 @@ if st.session_state.get("logged_in"):
                 else:
                     st.info("정리 대상 ETF가 없어요. 리스트 품질이 좋은 상태예요.")
 
-        st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 섹터 ETF 상대 강도")
+        st.subheader(f"{_MAIN_NAV_OPTIONS[3]} · 섹터 ETF 상대 강도")
         st.caption("주요 섹터/테마 ETF 상대 강도 점검 (2년 데이터 기반)")
         st.markdown(f"기준 티커: `{selected_ticker}`")
     
@@ -8603,8 +8770,8 @@ if st.session_state.get("logged_in"):
                         else:
                             st.warning("⚠️ 모멘텀 약화 초기 신호 — 매도 준비 또는 손절 라인 설정 권장")
     
-    elif main_nav == _MAIN_NAV_OPTIONS[6]:
-        st.subheader(_MAIN_NAV_OPTIONS[7])
+    elif main_nav == _MAIN_NAV_OPTIONS[5]:
+        st.subheader(_MAIN_NAV_OPTIONS[5])
         st.caption(
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
         )
@@ -9162,7 +9329,7 @@ if st.session_state.get("logged_in"):
             except Exception as _ae:
                 st.error(f"AI 진단 오류: {_ae}")
     
-    elif main_nav == _MAIN_NAV_OPTIONS[7]:
+    elif main_nav == _MAIN_NAV_OPTIONS[6]:
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_portfolio", use_container_width=True):
@@ -10008,7 +10175,7 @@ if st.session_state.get("logged_in"):
                 except Exception as _earn_e:
                     st.warning(f"실적 캘린더 로드 중 오류: {_earn_e}")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[9]:
+    elif main_nav == _MAIN_NAV_OPTIONS[8]:
         # ─────────────────────────────────────────────────────────────────────
         # 🎯 AI 내러티브 적중률 트래커
         # Narratives 시트에 저장된 Winners/Emerging 티커의 실제 수익률을 역산해
@@ -10403,7 +10570,7 @@ if st.session_state.get("logged_in"):
                 "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
             )
 
-    elif main_nav == _MAIN_NAV_OPTIONS[10]:
+    elif main_nav == _MAIN_NAV_OPTIONS[9]:
         # ─────────────────────────────────────────────────────────────────────
         # 💡 Idea-to-Portfolio 추적
         # 내러티브 테마 → 종목 발굴 → 포트폴리오 편입 흐름을 Thesis ID로 연결
@@ -10540,7 +10707,7 @@ if st.session_state.get("logged_in"):
             )
             st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
 
-    elif main_nav == _MAIN_NAV_OPTIONS[11]:
+    elif main_nav == _MAIN_NAV_OPTIONS[10]:
         # ─────────────────────────────────────────────────────────────────────
         # 📋 주간 포트폴리오 AI 요약
         # 포트폴리오 현황 + 최근 내러티브 + Macro를 묶어 Gemini로 주간 리포트 생성
@@ -10670,12 +10837,12 @@ if st.session_state.get("logged_in"):
             st.markdown(latest_summary)
             st.caption("이 리포트는 `Narratives` 시트에 자동 저장되었습니다. 투자 권유가 아닙니다.")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[8]:
+    elif main_nav == _MAIN_NAV_OPTIONS[7]:
         # ─────────────────────────────────────────────────────────────────────
         # 🔔 Buy Watchlist & Alert
         # 관심 종목 등록 + 매수 조건(목표가/RSI/200일선) 자동 체크
         # ─────────────────────────────────────────────────────────────────────
-        st.subheader(_MAIN_NAV_OPTIONS[8])
+        st.subheader(_MAIN_NAV_OPTIONS[7])
         st.caption(
             "관심 종목을 등록하고 **매수 조건**을 설정하세요. "
             "앱 접속 시 조건이 자동으로 체크되며, 발동 시 상단에 알림이 표시됩니다."
@@ -10911,7 +11078,7 @@ if st.session_state.get("logged_in"):
                     else:
                         st.error(f"저장 실패: {err_fix}")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[12]:
+    elif main_nav == _MAIN_NAV_OPTIONS[11]:
         # ─────────────────────────────────────────────────────────────────────
         # 📡 Emerging 종목 추적기
         # ─────────────────────────────────────────────────────────────────────
