@@ -5682,7 +5682,7 @@ def _narrative_timeseries_briefing_model():
     return _GenAIModel(
         "gemini-2.5-flash",
         generation_config={
-            "temperature": 0.2,
+            "temperature": 0.0,
             "top_p": 0.95,
             "top_k": 40,
             "max_output_tokens": 4096,
@@ -5739,7 +5739,7 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
         summary_model = _GenAIModel(
             "gemini-2.5-flash",
             generation_config={
-                "temperature": 0.3,
+                "temperature": 0.0,
                 "top_p": 1,
                 "top_k": 1,
                 "max_output_tokens": 4096,
@@ -7818,7 +7818,7 @@ if st.session_state.get("logged_in"):
                 with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
                     _diag_model = _GenAIModel(
                         "gemini-2.5-flash",
-                        generation_config={"temperature": 0.2, "max_output_tokens": 4096}
+                        generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
                     _diag_text = _gemini_response_text_utf8_safe(_diag_response)
