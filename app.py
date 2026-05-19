@@ -1994,28 +1994,131 @@ def tab_sync_refresh(clear_callbacks, rerun_after=True):
 def evaluate_kpis(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info if ticker.info else {}
-        cashflow = ticker.cashflow
-        history = ticker.history(period="1y", auto_adjust=False)
+
+        # ── info 수집 (여러 방법 시도) ──────────────────────────────────
+        info = {}
+        try:
+            raw_info = ticker.info
+            if isinstance(raw_info, dict) and len(raw_info) > 5:
+                info = raw_info
+        except Exception:
+            pass
+
+        # info가 비어있으면 fast_info로 보완
+        if not info:
+            try:
+                fi = ticker.fast_info
+                info = {
+                    "currentPrice": getattr(fi, "last_price", None),
+                    "fiftyDayAverage": getattr(fi, "fifty_day_average", None),
+                    "twoHundredDayAverage": getattr(fi, "two_hundred_day_average", None),
+                    "marketCap": getattr(fi, "market_cap", None),
+                }
+            except Exception:
+                pass
+
+        cashflow = None
+        try:
+            cashflow = ticker.cashflow
+        except Exception:
+            pass
+        if cashflow is None or cashflow.empty:
+            try:
+                cashflow = ticker.get_cashflow()
+            except Exception:
+                cashflow = None
+
+        history = pd.DataFrame()
+        try:
+            history = ticker.history(period="1y", auto_adjust=False)
+        except Exception:
+            pass
+
+        # ── 재무제표에서 직접 추출 시도 ─────────────────────────────────
+        income_stmt = None
+        try:
+            income_stmt = ticker.income_stmt
+        except Exception:
+            try:
+                income_stmt = ticker.get_income_stmt()
+            except Exception:
+                pass
+
+        balance_sheet = None
+        try:
+            balance_sheet = ticker.balance_sheet
+        except Exception:
+            try:
+                balance_sheet = ticker.get_balance_sheet()
+            except Exception:
+                pass
+
     except Exception:
         info, cashflow, history = {}, None, pd.DataFrame()
+        income_stmt, balance_sheet = None, None
 
+    # ── 지표 추출 ──────────────────────────────────────────────────────
+    # ROE
     roe = to_float(info.get("returnOnEquity"))
+    if pd.isna(roe) and income_stmt is not None and balance_sheet is not None:
+        try:
+            net_income = income_stmt.loc["Net Income"].iloc[0] if "Net Income" in income_stmt.index else np.nan
+            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
+            if pd.notna(net_income) and pd.notna(equity) and equity != 0:
+                roe = float(net_income / equity)
+        except Exception:
+            pass
+
+    # Operating Margin
     operating_margin = to_float(info.get("operatingMargins"))
+    if pd.isna(operating_margin) and income_stmt is not None:
+        try:
+            op_income = income_stmt.loc["Operating Income"].iloc[0] if "Operating Income" in income_stmt.index else np.nan
+            total_rev = income_stmt.loc["Total Revenue"].iloc[0] if "Total Revenue" in income_stmt.index else np.nan
+            if pd.notna(op_income) and pd.notna(total_rev) and total_rev != 0:
+                operating_margin = float(op_income / total_rev)
+        except Exception:
+            pass
+
+    # Debt to Equity
     debt_to_equity = to_float(info.get("debtToEquity"))
-    peg_ratio = to_float(info.get("pegRatio"))
-    trailing_eps = to_float(info.get("trailingEps"))
-    earnings_growth = to_float(info.get("earningsGrowth"))
+    if pd.isna(debt_to_equity) and balance_sheet is not None:
+        try:
+            total_debt = balance_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in balance_sheet.index else np.nan
+            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
+            if pd.notna(total_debt) and pd.notna(equity) and equity != 0:
+                debt_to_equity = float(total_debt / equity * 100)
+        except Exception:
+            pass
 
+    # PEG Ratio
+    peg_ratio = to_float(info.get("pegRatio") or info.get("trailingPegRatio"))
+
+    # EPS & Growth
+    trailing_eps = to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
+    earnings_growth = to_float(info.get("earningsGrowth") or info.get("revenueGrowth"))
+
+    # Free Cash Flow
     fcf = get_latest_series_value(cashflow, "Free Cash Flow")
+    if pd.isna(fcf) and cashflow is not None:
+        for key in ["FreeCashFlow", "Free Cash Flow", "Operating Cash Flow"]:
+            fcf = get_latest_series_value(cashflow, key)
+            if not pd.isna(fcf):
+                break
 
+    # Momentum (가격 + MA)
     current_price, ma50, ma200 = get_momentum_values(history)
+    # info에서 보완
+    if pd.isna(current_price):
+        current_price = to_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+    if pd.isna(ma50):
+        ma50 = to_float(info.get("fiftyDayAverage"))
+    if pd.isna(ma200):
+        ma200 = to_float(info.get("twoHundredDayAverage"))
+
     momentum_pass = (
-        not pd.isna(current_price)
-        and not pd.isna(ma50)
-        and not pd.isna(ma200)
-        and current_price > ma50
-        and current_price > ma200
+        not pd.isna(current_price) and not pd.isna(ma50) and not pd.isna(ma200)
+        and current_price > ma50 and current_price > ma200
     )
     growth_percent = earnings_growth * 100 if not pd.isna(earnings_growth) else np.nan
     intrinsic_value = np.nan
@@ -2033,42 +2136,42 @@ def evaluate_kpis(ticker_symbol):
             "KPI": "ROE",
             "Value": pct_str(roe),
             "Rule": "15% 이상",
-            "Pass": pass_fail_badge(roe >= 0.15, pd.isna(roe)),
+            "Pass": pass_fail_badge(not pd.isna(roe) and roe >= 0.15, pd.isna(roe)),
         },
         {
             "Category": "수익성 (Profitability)",
             "KPI": "Operating Margin",
             "Value": pct_str(operating_margin),
             "Rule": "0 이상",
-            "Pass": pass_fail_badge(operating_margin >= 0, pd.isna(operating_margin)),
+            "Pass": pass_fail_badge(not pd.isna(operating_margin) and operating_margin >= 0, pd.isna(operating_margin)),
         },
         {
             "Category": "건전성 (Financial Strength)",
             "KPI": "Debt-to-Equity",
             "Value": num_str(debt_to_equity),
             "Rule": "100 미만",
-            "Pass": pass_fail_badge(debt_to_equity < 100, pd.isna(debt_to_equity)),
+            "Pass": pass_fail_badge(not pd.isna(debt_to_equity) and debt_to_equity < 100, pd.isna(debt_to_equity)),
         },
         {
             "Category": "건전성 (Financial Strength)",
             "KPI": "Free Cash Flow (최근연도)",
             "Value": won_str(fcf),
             "Rule": "0 초과",
-            "Pass": pass_fail_badge(fcf > 0, pd.isna(fcf)),
+            "Pass": pass_fail_badge(not pd.isna(fcf) and fcf > 0, pd.isna(fcf)),
         },
         {
             "Category": "밸류에이션 (Valuation)",
             "KPI": "PEG Ratio",
             "Value": num_str(peg_ratio),
             "Rule": "1.0 미만",
-            "Pass": pass_fail_badge(peg_ratio < 1.0, pd.isna(peg_ratio)),
+            "Pass": pass_fail_badge(not pd.isna(peg_ratio) and peg_ratio < 1.0, pd.isna(peg_ratio)),
         },
         {
             "Category": "밸류에이션 (Valuation)",
             "KPI": "Margin of Safety",
             "Value": pct_points_str(margin_of_safety),
             "Rule": "20% 이상",
-            "Pass": pass_fail_badge(margin_of_safety >= 20, pd.isna(margin_of_safety)),
+            "Pass": pass_fail_badge(not pd.isna(margin_of_safety) and margin_of_safety >= 20, pd.isna(margin_of_safety)),
         },
         {
             "Category": "모멘텀 (Momentum)",
