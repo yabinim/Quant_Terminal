@@ -69,6 +69,8 @@ _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 _THESIS_WORKSHEET_TITLE = "Thesis"
 _WATCHLIST_SHEET_TITLE = "Watchlist"
 _ETF_UNIVERSE_SHEET_TITLE = "ETF_Universe"
+_EMERGING_TRACKER_SHEET_TITLE = "Emerging_Tracker"
+_EMERGING_TRACKER_COLS = ["ID", "Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]
 _ETF_UNIVERSE_SHEET_COLS = ["Ticker", "Name", "Category", "AUM_M", "Added_Date", "Source"]
 _ETF_AUTO_UPDATE_INTERVAL_DAYS = 7  # 자동 업데이트 주기
 _WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added"]
@@ -845,6 +847,7 @@ _MAIN_NAV_OPTIONS = (
     "📊 [AI] 내러티브 적중률 트래커",
     "💡 [AI] Idea-to-Portfolio 추적",
     "📋 [AI] 주간 포트폴리오 요약",
+    "📡 [AI] Emerging 종목 추적기",
 )
 
 # 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
@@ -1906,11 +1909,14 @@ def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "")
             ma200 = float(s.rolling(200, min_periods=150).mean().iloc[-1]) if len(s) >= 150 else np.nan
             above_ma200 = bool(s.iloc[-1] > ma200) if pd.notna(ma200) else None
 
-            # 거래량 급증
+            # 거래량 급증 (cached_timing_price_history 재사용)
             try:
-                raw_vol = yf.download(tk, period="2mo", interval="1d", auto_adjust=False, progress=False)
-                vol = pd.to_numeric(raw_vol.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
-                vol_surge = float(vol.tail(5).mean() / vol.tail(21).mean()) if len(vol) >= 21 else np.nan
+                _hist_vol = cached_timing_price_history(tk)
+                if not _hist_vol.empty and "Volume" in _hist_vol.columns:
+                    vol = pd.to_numeric(_hist_vol["Volume"], errors="coerce").dropna()
+                    vol_surge = float(vol.tail(5).mean() / vol.tail(21).mean()) if len(vol) >= 21 else np.nan
+                else:
+                    vol_surge = np.nan
             except Exception:
                 vol_surge = np.nan
 
@@ -3259,6 +3265,120 @@ def load_etf_universe_tickers_merged() -> list[str]:
             seen.add(tk)
             merged.append(tk)
     return merged
+
+
+def open_emerging_tracker_worksheet():
+    """Quant_DB 스프레드시트의 Emerging_Tracker 탭. 없으면 자동 생성."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [ws.title for ws in sh.worksheets()]
+        if _EMERGING_TRACKER_SHEET_TITLE in existing:
+            return sh.worksheet(_EMERGING_TRACKER_SHEET_TITLE), None
+        ws = sh.add_worksheet(title=_EMERGING_TRACKER_SHEET_TITLE, rows=2000, cols=9)
+        ws.update([_EMERGING_TRACKER_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc:
+        return None, f"Emerging_Tracker 워크시트 열기/생성 실패: {exc}"
+
+
+def load_emerging_tracker(user_id: str) -> pd.DataFrame:
+    """현재 유저의 Emerging 추적 기록 전체 로드."""
+    ws, err = open_emerging_tracker_worksheet()
+    if err or ws is None:
+        return pd.DataFrame(columns=_EMERGING_TRACKER_COLS)
+    try:
+        vals = ws.get_all_values()
+        if not vals or len(vals) < 2:
+            return pd.DataFrame(columns=_EMERGING_TRACKER_COLS)
+        uid_u = str(user_id).strip().upper()
+        rows = []
+        for r in vals[1:]:
+            r = (r + [""] * 9)[:9]
+            if str(r[0]).strip().upper() != uid_u:
+                continue
+            rows.append({
+                "ID": r[0], "Ticker": r[1], "Theme": r[2],
+                "First_Seen": r[3], "Last_Seen": r[4],
+                "Count": int(r[5]) if r[5].isdigit() else 1,
+                "Best_Verdict": r[6], "RS_Score": r[7], "Status": r[8],
+            })
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=_EMERGING_TRACKER_COLS)
+    except Exception:
+        return pd.DataFrame(columns=_EMERGING_TRACKER_COLS)
+
+
+def upsert_emerging_tracker(user_id: str, ticker: str, theme: str, verdict: str, rs_score) -> tuple[bool, str]:
+    """Emerging 종목 기록 추가/업데이트. 같은 티커면 Count++, Last_Seen 갱신."""
+    ws, err = open_emerging_tracker_worksheet()
+    if err or ws is None:
+        return False, err or "워크시트 열기 실패"
+    try:
+        vals = ws.get_all_values()
+        uid_u = str(user_id).strip().upper()
+        tk_u = str(ticker).strip().upper()
+        now_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d %H:%M")
+        rs_str = f"{float(rs_score):.2f}" if rs_score is not None and rs_score == rs_score else ""
+
+        # 기존 행 찾기
+        found_row = None
+        for i, r in enumerate(vals[1:], start=2):
+            r = (r + [""] * 9)[:9]
+            if str(r[0]).strip().upper() == uid_u and str(r[1]).strip().upper() == tk_u:
+                found_row = (i, r)
+                break
+
+        if found_row:
+            row_idx, old_r = found_row
+            old_count = int(old_r[5]) if old_r[5].isdigit() else 1
+            new_count = old_count + 1
+            # Best_Verdict: 최적 > 얼리버드 > 이미강세 > 신호대기 우선순위
+            verdict_priority = {"🎯 최적 매수 타이밍": 0, "🌱 얼리버드 기회": 1, "✅ 이미 강세 (진입 시 고점 주의)": 2}
+            old_priority = verdict_priority.get(old_r[6], 99)
+            new_priority = verdict_priority.get(verdict, 99)
+            best_verdict = verdict if new_priority < old_priority else old_r[6]
+
+            # Status 결정
+            if new_count >= 5:
+                status = "🔥 지속 등장 (강한 신호)"
+            elif new_count >= 3:
+                status = "📌 반복 등장"
+            else:
+                status = "🆕 신규"
+
+            ws.update(
+                [[uid_u, tk_u, theme, old_r[3], now_str, str(new_count), best_verdict, rs_str, status]],
+                range_name=f"A{row_idx}:I{row_idx}",
+                value_input_option="USER_ENTERED"
+            )
+        else:
+            ws.append_row(
+                [uid_u, tk_u, str(theme)[:60], now_str, now_str, "1", verdict, rs_str, "🆕 신규"],
+                value_input_option="USER_ENTERED"
+            )
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def delete_emerging_tracker_row(user_id: str, ticker: str) -> tuple[bool, str]:
+    """Emerging Tracker에서 특정 티커 삭제."""
+    ws, err = open_emerging_tracker_worksheet()
+    if err or ws is None:
+        return False, err or "워크시트 열기 실패"
+    try:
+        vals = ws.get_all_values()
+        uid_u = str(user_id).strip().upper()
+        tk_u = str(ticker).strip().upper()
+        to_del = [i for i, r in enumerate(vals[1:], start=2)
+                  if (r + [""])[0].strip().upper() == uid_u and (r + [""])[1].strip().upper() == tk_u]
+        for idx in reversed(to_del):
+            ws.delete_rows(idx)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def open_watchlist_worksheet():
@@ -6536,7 +6656,7 @@ if st.session_state.get("logged_in"):
         with sync_m2:
             st.caption("불러온 지표는 세션 동안 캐시됩니다. 동기화 시 캐시를 비우고 최신 데이터를 다시 가져옵니다.")
     
-        st.subheader(f"{_MAIN_NAV_OPTIONS[0]} · 미국 거시경제 대시보드")
+        st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 미국 거시경제 대시보드")
         st.caption("yfinance + FRED API + CNN Fear & Greed 기준. 판단은 참고용 휴리스틱입니다.")
 
         try:
@@ -6695,7 +6815,7 @@ if st.session_state.get("logged_in"):
     
         header_col_1, header_col_2 = st.columns([3, 1])
         with header_col_1:
-            st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 테마와 자본 이동 관제탑")
+            st.subheader(f"{_MAIN_NAV_OPTIONS[2]} · AI 시장 내러티브 분석")
         with header_col_2:
             language_option = st.radio(
                 "언어",
@@ -6943,6 +7063,25 @@ if st.session_state.get("logged_in"):
                             st.info(f"🌱 **얼리버드 기회 {len(early)}개** — 아직 초기, 200일선 위")
                             for v in early:
                                 st.markdown(f"**{v['ticker']}** — {v['detail']}")
+
+                        # 자동 저장
+                        _em_uid = str(st.session_state.get("user_id") or "").strip()
+                        _saved_count = 0
+                        for v in verified:
+                            _theme_str = ", ".join([
+                                str(t.get("title", "")) for t in themes_data
+                                if isinstance(t, dict) and v["ticker"] in str(t.get("emerging", ""))
+                            ])
+                            _ok, _ = upsert_emerging_tracker(
+                                _em_uid, v["ticker"],
+                                _theme_str or "내러티브",
+                                v["verdict"],
+                                v["rs_score"]
+                            )
+                            if _ok:
+                                _saved_count += 1
+                        if _saved_count > 0:
+                            st.caption(f"💾 {_saved_count}개 Emerging 종목이 추적 시트에 자동 저장됐어요.")
 
                         # 전체 결과 테이블
                         with st.expander("📋 전체 Emerging 검증 결과", expanded=False):
@@ -9919,6 +10058,115 @@ if st.session_state.get("logged_in"):
                 st.session_state["_watchlist_alert_checked"] = False
                 st.session_state.pop("_watchlist_triggered_alerts", None)
                 st.rerun()
+
+    elif main_nav == _MAIN_NAV_OPTIONS[11]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 📡 Emerging 종목 추적기
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader("📡 Emerging 종목 추적기")
+        st.caption(
+            "AI 내러티브 분석 후 Emerging 종목 검증을 실행할 때마다 자동으로 기록이 쌓입니다. "
+            "같은 종목이 반복 등장할수록 신뢰도 높은 신호예요."
+        )
+
+        uid_et = str(st.session_state.get("user_id") or "").strip()
+
+        with st.spinner("Emerging 추적 기록 불러오는 중..."):
+            et_df = load_emerging_tracker(uid_et)
+
+        if et_df.empty:
+            st.info(
+                "아직 추적 기록이 없어요. "
+                "[1단계] 시장 내러티브에서 AI 분석 후 **Emerging 종목 검증 실행** 버튼을 누르면 "
+                "자동으로 기록이 쌓입니다."
+            )
+        else:
+            # ── 요약 지표 ──────────────────────────────────────────────────
+            total = len(et_df)
+            hot = (et_df["Count"].astype(int) >= 3).sum() if "Count" in et_df.columns else 0
+            new_ones = (et_df["Status"].str.contains("신규", na=False)).sum()
+            best_ones = et_df[et_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)]
+
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("전체 추적 종목", f"{total}개")
+            with m2:
+                st.metric("🔥 반복 등장 (3회+)", f"{hot}개")
+            with m3:
+                st.metric("🆕 신규 등장", f"{new_ones}개")
+            with m4:
+                st.metric("🎯 매수 신호 종목", f"{len(best_ones)}개")
+
+            # ── 최우선 관심 종목 ───────────────────────────────────────────
+            if not best_ones.empty:
+                st.divider()
+                st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드)")
+                st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 종목들이에요.")
+                for _, row in best_ones.sort_values("Count", ascending=False).iterrows():
+                    count = int(row["Count"]) if str(row["Count"]).isdigit() else 1
+                    rs_str = f"RS {float(row['RS_Score']):.1f}%p" if row["RS_Score"] else ""
+                    st.markdown(
+                        f"**{row['Ticker']}** — {row['Best_Verdict']} | "
+                        f"등장 **{count}회** | {rs_str} | 최근: {row['Last_Seen']}"
+                    )
+                    col_a, col_b = st.columns([1, 4])
+                    with col_a:
+                        def _goto_stock(tk=row["Ticker"]):
+                            st.session_state["selected_ticker"] = tk
+                            st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                        st.button(f"🔬 {row['Ticker']} 분석", key=f"et_goto_{row['Ticker']}", on_click=_goto_stock)
+
+            # ── 반복 등장 종목 ─────────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🔥 반복 등장 종목 (관심 집중)")
+
+            hot_df = et_df[et_df["Count"].astype(int) >= 2].sort_values("Count", ascending=False)
+            if hot_df.empty:
+                st.info("아직 2회 이상 등장한 종목이 없어요. 내러티브 분석을 더 진행하면 쌓입니다.")
+            else:
+                def _style_count(val):
+                    v = int(val) if str(val).isdigit() else 0
+                    if v >= 5: return "color:#dc2626;font-weight:700"
+                    if v >= 3: return "color:#f97316;font-weight:600"
+                    return "color:#16a34a"
+
+                def _style_verdict(val):
+                    if "최적" in str(val): return "color:#16a34a;font-weight:700"
+                    if "얼리" in str(val): return "color:#0ea5e9;font-weight:600"
+                    return ""
+
+                styled_hot = (
+                    hot_df[["Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]]
+                    .style
+                    .map(_style_count, subset=["Count"])
+                    .map(_style_verdict, subset=["Best_Verdict"])
+                )
+                st.dataframe(styled_hot, use_container_width=True, hide_index=True)
+
+            # ── 전체 목록 ──────────────────────────────────────────────────
+            st.divider()
+            st.markdown("### 📋 전체 추적 목록")
+            with st.expander("전체 보기", expanded=False):
+                st.dataframe(
+                    et_df.sort_values("Count", ascending=False),
+                    use_container_width=True, hide_index=True
+                )
+
+            # ── 개별 삭제 ──────────────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🗑️ 종목 삭제")
+            del_ticker = st.selectbox(
+                "삭제할 종목 선택",
+                options=[""] + et_df["Ticker"].tolist(),
+                key="et_del_select"
+            )
+            if del_ticker and st.button("🗑️ 선택 종목 삭제", key="et_del_btn"):
+                ok_del, err_del = delete_emerging_tracker_row(uid_et, del_ticker)
+                if ok_del:
+                    st.success(f"✅ {del_ticker} 삭제 완료")
+                    st.rerun()
+                else:
+                    st.error(f"삭제 실패: {err_del}")
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
