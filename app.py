@@ -2200,12 +2200,14 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     import time as _time
 
     sector_etf_map = {
-        "전체":      {"주도주": ["SPY", "QQQ", "NVDA", "AAPL", "MSFT"], "sector_etf": "SPY"},
-        "테크·반도체": {"주도주": ["NVDA", "AMD", "SOXX", "SMH", "XLK"], "sector_etf": "XLK"},
-        "에너지":    {"주도주": ["XLE", "XOP", "CVX", "XOM", "OIH"],   "sector_etf": "XLE"},
-        "금융":      {"주도주": ["XLF", "KRE", "JPM", "GS", "BAC"],    "sector_etf": "XLF"},
-        "헬스케어":  {"주도주": ["XLV", "IBB", "UNH", "JNJ", "ABBV"],  "sector_etf": "XLV"},
-        "산업재":    {"주도주": ["XLI", "BA", "CAT", "GE", "HON"],      "sector_etf": "XLI"},
+        "전체":        {"주도주": ["SPY", "QQQ", "NVDA", "AAPL", "MSFT"], "sector_etf": "SPY"},
+        "테크·반도체": {"주도주": ["NVDA", "AMD", "SOXX", "SMH", "XLK"],  "sector_etf": "XLK"},
+        "에너지":      {"주도주": ["XLE", "XOP", "CVX", "XOM", "OIH"],    "sector_etf": "XLE"},
+        "금융":        {"주도주": ["XLF", "KRE", "JPM", "GS", "BAC"],     "sector_etf": "XLF"},
+        "헬스케어":    {"주도주": ["XLV", "IBB", "UNH", "JNJ", "ABBV"],   "sector_etf": "XLV"},
+        "산업재":      {"주도주": ["XLI", "BA", "CAT", "GE", "HON"],      "sector_etf": "XLI"},
+        "소비재":      {"주도주": ["XLY", "XLP", "AMZN", "HD", "MCD"],    "sector_etf": "XLY"},
+        "부동산":      {"주도주": ["XLRE", "VNQ", "AMT", "PLD", "EQIX"],  "sector_etf": "XLRE"},
     }
     cfg = sector_etf_map.get(sector_filter, sector_etf_map["전체"])
     leaders = cfg["주도주"]
@@ -7069,7 +7071,7 @@ if st.session_state.get("logged_in"):
         with drg_col1:
             sector_choice = st.selectbox(
                 "📊 분석 섹터",
-                options=["전체", "테크·반도체", "에너지", "금융", "헬스케어", "산업재"],
+                options=["전체", "테크·반도체", "에너지", "금융", "헬스케어", "산업재", "소비재", "부동산"],
                 key="drg_sector_choice",
             )
         with drg_col2:
@@ -7225,7 +7227,7 @@ if st.session_state.get("logged_in"):
             else:
                 st.warning(_txt)
 
-    elif main_nav == _MAIN_NAV_OPTIONS[13]:
+    elif main_nav == _MAIN_NAV_OPTIONS[12]:
         st.title("📖 Quant Terminal 사용 가이드")
         st.markdown("처음 오셨나요? **실제 매수 결정부터 매도까지** 앱의 모든 탭을 어떤 순서로, 어떻게 활용하는지 단계별로 설명합니다.")
         st.info("💡 **핵심 원칙:** 이 앱은 단 하나의 신호로 매수 결정을 내리지 않습니다. Macro → Sector → Stock 3개 레이어가 모두 같은 방향을 가리킬 때만 높은 확신으로 진입할 수 있습니다.")
