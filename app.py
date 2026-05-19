@@ -6428,18 +6428,39 @@ if st.session_state.get("logged_in"):
         st.sidebar.warning("티커가 비어 있어 기본값 TSLA를 사용합니다.")
     
     st.session_state["selected_ticker"] = selected_ticker
-    
-    # 사이드바 투자 메모 (간단 버전) - 전체 기능은 🔔 Buy Watchlist & Alert 탭에서
-    watch_note = st.sidebar.text_area("투자 메모", key="watch_note_input", placeholder="매수 근거, 리스크, 체크포인트를 기록하세요.")
-    if st.sidebar.button("현재 티커 저장", use_container_width=True):
+
+    # 사이드바 투자 메모 + Alert 조건 (Quick Save)
+    watch_note = st.sidebar.text_area(
+        "투자 메모",
+        key="watch_note_input",
+        placeholder="매수 근거, 리스크, 체크포인트를 기록하세요."
+    )
+
+    # Alert 조건 (간단 버전)
+    st.sidebar.caption("⚡ Alert 조건 (선택)")
+    _alert_rsi_val = st.sidebar.number_input(
+        "📉 RSI 이하 시 알림 (0=사용 안 함)",
+        min_value=0.0, max_value=100.0,
+        value=0.0, step=5.0, format="%.0f",
+        key="sidebar_alert_rsi",
+        help="예) 30 입력 → RSI 30 이하로 내려오면 알림"
+    )
+    _alert_ma200_val = st.sidebar.checkbox(
+        "📊 200일선 ±3% 근접 시 알림",
+        key="sidebar_alert_ma200",
+        help="현재가가 200일 이동평균 ±3% 이내 진입 시 알림"
+    )
+    st.sidebar.caption("💡 목표가 등 상세 설정은 🔔 Watchlist 탭에서")
+
+    if st.sidebar.button("현재 티커 저장", use_container_width=True, type="primary"):
         _uid_memo = str(st.session_state.get("user_id") or "").strip()
         _cur_price = fetch_latest_prices_for_tickers((selected_ticker,)).get(selected_ticker, np.nan)
         _new_wl_item = {
             "ticker": selected_ticker,
             "memo": watch_note.strip(),
             "alert_price": np.nan,
-            "alert_rsi": np.nan,
-            "alert_ma200": False,
+            "alert_rsi": float(_alert_rsi_val) if _alert_rsi_val > 0 else np.nan,
+            "alert_ma200": bool(_alert_ma200_val),
             "saved_price": float(_cur_price) if pd.notna(_cur_price) else np.nan,
             "date_added": _narrative_now_kst_string(),
         }
@@ -6448,9 +6469,15 @@ if st.session_state.get("logged_in"):
         _wl_cur.append(_new_wl_item)
         _ok_wl_save, _err_wl_save = save_watchlist_sheet(_uid_memo, _wl_cur)
         if _ok_wl_save:
-            st.sidebar.success(f"{selected_ticker} Watchlist에 저장했습니다.")
+            _alert_desc = []
+            if _alert_rsi_val > 0:
+                _alert_desc.append(f"RSI {_alert_rsi_val:.0f} 이하")
+            if _alert_ma200_val:
+                _alert_desc.append("200일선 근접")
+            _alert_str = " + ".join(_alert_desc) if _alert_desc else "Alert 없음"
+            st.sidebar.success(f"{selected_ticker} 저장 완료 ({_alert_str})")
             st.session_state["_watchlist_alert_checked"] = False
-            st.session_state.pop("_sidebar_wl_count", None)  # 카운트 캐시 초기화
+            st.session_state.pop("_sidebar_wl_count", None)
             st.rerun()
         else:
             st.sidebar.error(f"저장 실패: {_err_wl_save}")
