@@ -8989,26 +8989,38 @@ if st.session_state.get("logged_in"):
             # 회사 소개: 영문 원문을 Gemini로 번역
             summary_en = co.get("summary_en", "")
             if summary_en:
-                with st.expander("📋 회사 소개 (한글)", expanded=False):
-                    _sum_key = f"_co_summary_kr_{selected_ticker}"
+                _sum_key = f"_co_summary_kr_{selected_ticker}"
+                with st.expander("📋 회사 소개", expanded=False):
                     if st.session_state.get(_sum_key):
+                        # 한글 번역본 표시
                         st.markdown(st.session_state[_sum_key])
+                        if st.button("🔄 다시 번역", key=f"retranslate_{selected_ticker}", use_container_width=False):
+                            del st.session_state[_sum_key]
+                            st.rerun()
                     else:
-                        if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}"):
-                            with st.spinner("번역 중..."):
+                        # 영문 원문 전체 표시
+                        st.markdown(summary_en)
+                        if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
+                            with st.spinner("한글로 번역 중..."):
                                 try:
-                                    _tr_model = _GenAIModel("gemini-2.5-flash", generation_config={"temperature": 0.0, "max_output_tokens": 1024})
-                                    _tr_prompt = "아래 영문 회사 소개를 자연스러운 한국어로 번역하세요. 번역문만 출력하세요.\n\n" + summary_en
+                                    _tr_model = _GenAIModel(
+                                        "gemini-2.5-flash",
+                                        generation_config={"temperature": 0.0, "max_output_tokens": 2048}
+                                    )
+                                    _tr_prompt = (
+                                        "아래 영문 회사 소개를 자연스럽고 완전한 한국어로 번역하세요. "
+                                        "내용을 생략하지 말고 전체를 번역하세요. 번역문만 출력하세요.\n\n"
+                                        + summary_en
+                                    )
                                     _tr_resp = _tr_model.generate_content(_tr_prompt)
                                     _tr_text = _gemini_response_text_utf8_safe(_tr_resp)
                                     if _tr_text:
                                         st.session_state[_sum_key] = _tr_text
                                         st.rerun()
+                                    else:
+                                        st.warning("번역 결과를 받지 못했어요. 다시 시도해주세요.")
                                 except Exception as _te:
                                     st.warning(f"번역 오류: {_te}")
-                        # 영문 원문 표시 (짤림 없이 전체)
-                        st.markdown("**영문 원문:**")
-                        st.markdown(summary_en)
 
         st.divider()
 
