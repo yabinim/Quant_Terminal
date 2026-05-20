@@ -960,7 +960,7 @@ class _GenAIModel:
 
 
 model = _GenAIModel(
-    "gemini-2.5-flash",  # 1.5가 아닌 가장 최근에 입력했던 2.5로 통일!
+    "gemini-3.0-flash",  # 1.5가 아닌 가장 최근에 입력했던 2.5로 통일!
     generation_config={
         "temperature": 0.0,  # AI의 상상력을 0으로 통제 (일관성 극대화)
         "top_p": 1,
@@ -971,7 +971,7 @@ model = _GenAIModel(
 )
 
 # 1.6 스캐너 내러티브 전용: 티커 청크별 Gemini 호출 · JSON MIME + max_output_tokens(8192) + 세탁 후 파싱
-_SCANNER_NARRATIVE_BATCH_MODEL_ID = "gemini-2.5-flash"
+_SCANNER_NARRATIVE_BATCH_MODEL_ID = "gemini-3.0-flash"
 # 티커를 한 번에 너무 많이 넘기면 응답이 잘려 JSONDecodeError(Unterminated string)가 날 수 있어 상한을 둔다.
 _SCANNER_NARRATIVE_TICKER_CHUNK_SIZE = 20
 
@@ -2439,7 +2439,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
     """
     개별 주식이 어떤 ETF의 보유 종목에 포함되어 있는지 찾기.
-    상위 20개 주요 ETF만 체크 (5~10초 목표).
+    상위 20개 주요 ETF를 체크. VOO/SPY 같은 대형 ETF는 많은 종목 보유.
     반환: [{"etf": "SMH", "weight": 8.5, "rank": 2}]
     """
     if not stock_ticker:
@@ -2448,77 +2448,90 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
     target = str(stock_ticker).strip().upper()
     results = []
 
-    # 가장 많이 쓰이는 핵심 ETF 20개만 체크
     check_list = [
         "QQQ", "SPY", "VOO", "VGT", "XLK",
-        "SOXX", "SMH", "XSD", "SOXQ", "DRAM",
-        "ARKK", "ARKW", "ARKQ", "IWM", "MGK",
-        "XLF", "XLV", "XLE", "XLY", "XLI",
+        "SOXX", "SMH", "XSD", "ARKK", "ARKW",
+        "IWM", "MGK", "RSP", "XLF", "XLV",
+        "XLE", "XLY", "XLI", "CIBR", "BOTZ",
     ]
 
     for etf_tk in check_list:
         try:
             tk = yf.Ticker(str(etf_tk).strip().upper())
-            # funds_data.top_holdings (최신 yfinance)
-            holdings = None
+            holdings_df = None
+
+            # 방법 1: funds_data.top_holdings
             try:
                 fd = tk.funds_data
                 if fd is not None:
-                    holdings = fd.top_holdings
+                    h = fd.top_holdings
+                    if h is not None and not h.empty:
+                        holdings_df = h.copy()
             except Exception:
                 pass
 
-            # 대안: get_holdings
-            if holdings is None or (hasattr(holdings, "empty") and holdings.empty):
+            # 방법 2: get_holdings()
+            if holdings_df is None or holdings_df.empty:
                 try:
-                    holdings = tk.get_holdings()
+                    h2 = tk.get_holdings()
+                    if h2 is not None and not h2.empty:
+                        holdings_df = h2.copy()
                 except Exception:
                     pass
 
-            if holdings is None or (hasattr(holdings, "empty") and holdings.empty):
+            if holdings_df is None or holdings_df.empty:
                 continue
 
-            # index 또는 컬럼에서 ticker 찾기
-            holdings_idx = list(holdings.index.astype(str).str.upper()) if hasattr(holdings, "index") else []
-            holdings_reset = holdings.reset_index() if hasattr(holdings, "reset_index") else holdings
-
-            sym_col = next(
-                (c for c in holdings_reset.columns if c.lower() in ("symbol", "ticker", "holding", "index")),
-                None
-            )
-
+            # target 검색 — index 또는 컬럼에서
             found = False
-            idx_in = -1
+            rank = -1
             weight = np.nan
 
-            if target in holdings_idx:
-                idx_in = holdings_idx.index(target)
+            # Case A: index에 ticker가 있는 경우 (가장 흔한 패턴)
+            idx_list = [str(i).strip().upper() for i in holdings_df.index]
+            if target in idx_list:
                 found = True
-                weight_col = next((c for c in holdings.columns if "weight" in c.lower() or "%" in c.lower()), None)
-                if weight_col:
-                    weight = float(holdings.iloc[idx_in][weight_col])
-            elif sym_col:
-                tickers_col = holdings_reset[sym_col].astype(str).str.upper().tolist()
-                if target in tickers_col:
-                    idx_in = tickers_col.index(target)
-                    found = True
-                    weight_col = next((c for c in holdings_reset.columns if "weight" in c.lower() or "%" in c.lower()), None)
-                    if weight_col:
-                        weight = float(holdings_reset.iloc[idx_in][weight_col])
+                rank = idx_list.index(target) + 1
+                # weight 컬럼 찾기 (다양한 컬럼명 대응)
+                for w_col in ["% Assets", "Weight", "weight", "Holding %", "pctHolding", "value"]:
+                    if w_col in holdings_df.columns:
+                        raw_w = holdings_df.iloc[rank-1][w_col]
+                        w_val = pd.to_numeric(raw_w, errors="coerce")
+                        if pd.notna(w_val):
+                            # 0~1 범위면 100 곱하기
+                            weight = float(w_val * 100) if w_val <= 1 else float(w_val)
+                        break
+
+            # Case B: 컬럼에 symbol 있는 경우
+            if not found:
+                sym_col = next(
+                    (c for c in holdings_df.columns
+                     if c.lower() in ("symbol", "ticker", "holding", "name")),
+                    None
+                )
+                if sym_col:
+                    col_list = holdings_df[sym_col].astype(str).str.upper().tolist()
+                    if target in col_list:
+                        found = True
+                        rank = col_list.index(target) + 1
+                        for w_col in ["% Assets", "Weight", "weight", "Holding %", "pctHolding"]:
+                            if w_col in holdings_df.columns:
+                                raw_w = holdings_df.iloc[rank-1][w_col]
+                                w_val = pd.to_numeric(raw_w, errors="coerce")
+                                if pd.notna(w_val):
+                                    weight = float(w_val * 100) if w_val <= 1 else float(w_val)
+                                break
 
             if found:
-                # weight 정규화 (0~1 → 0~100%)
-                if pd.notna(weight) and 0 < weight <= 1:
-                    weight = weight * 100
                 results.append({
                     "etf": etf_tk,
-                    "weight": round(float(weight) if pd.notna(weight) else 0.0, 2),
-                    "rank": idx_in + 1,
+                    "weight": round(weight, 2) if pd.notna(weight) else None,
+                    "rank": rank,
                 })
         except Exception:
             continue
 
-    results.sort(key=lambda x: x.get("weight", 0), reverse=True)
+    results.sort(key=lambda x: (x.get("weight") or 0), reverse=True)
     return results
 
 
@@ -6439,7 +6452,7 @@ def analyze_deep_dive(query, news_data, language):
     news_text = "\n\n".join(chunks).strip()
 
     deep_dive_model = _GenAIModel(
-        "gemini-2.5-flash",
+        "gemini-3.0-flash",
         generation_config={
             "temperature": 0.0,
             "top_p": 1,
@@ -6833,7 +6846,7 @@ def _split_narrative_records_wow(records, anchor_utc=None):
 
 def _narrative_timeseries_briefing_model():
     return _GenAIModel(
-        "gemini-2.5-flash",
+        "gemini-3.0-flash",
         generation_config={
             "temperature": 0.0,
             "top_p": 0.95,
@@ -6890,7 +6903,7 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
 
     try:
         summary_model = _GenAIModel(
-            "gemini-2.5-flash",
+            "gemini-3.0-flash",
             generation_config={
                 "temperature": 0.0,
                 "top_p": 1,
@@ -7446,7 +7459,7 @@ if st.session_state.get("logged_in"):
             )
             with st.spinner("Gemini AI 분석 중... (약 15초)"):
                 _drg_model = _GenAIModel(
-                    "gemini-2.5-flash",
+                    "gemini-3.0-flash",
                     generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                 )
                 _drg_response = _drg_model.generate_content(drg_prompt)
@@ -9108,7 +9121,7 @@ if st.session_state.get("logged_in"):
                                         for i in range(0, len(_words), _chunk_size)
                                     ]
                                     _tr_model = _GenAIModel(
-                                        "gemini-2.5-flash",
+                                        "gemini-3.0-flash",
                                         generation_config={"temperature": 0.0, "max_output_tokens": 2048}
                                     )
                                     _tr_parts = []
@@ -9741,7 +9754,7 @@ if st.session_state.get("logged_in"):
 
                 with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
                     _diag_model = _GenAIModel(
-                        "gemini-2.5-flash",
+                        "gemini-3.0-flash",
                         generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
