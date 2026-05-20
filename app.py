@@ -2763,6 +2763,16 @@ def cached_portfolio_yf_close_1y(tuple_tickers: tuple[str, ...]):
     return close_df
 
 
+def render_sync_button(key: str, clear_funcs: list, caption: str = "캐시를 비우고 최신 데이터를 다시 가져옵니다."):
+    """모든 탭 상단에 공통으로 사용하는 데이터 동기화 버튼."""
+    _sc1, _sc2 = st.columns([1, 3])
+    with _sc1:
+        if st.button("🔄 현재 페이지 데이터 동기화", key=key, use_container_width=True):
+            tab_sync_refresh(clear_funcs, rerun_after=True)
+    with _sc2:
+        st.caption(caption)
+
+
 def tab_sync_refresh(clear_callbacks, rerun_after=True):
     """Invalidate tab-specific caches, toast notice, optionally rerun."""
     st.toast("데이터를 동기화 중입니다...", icon="🔄", duration="short")
@@ -7526,16 +7536,7 @@ if st.session_state.get("logged_in"):
         st.warning("⚠️ 면책 조항: 이 앱은 투자 참고 도구이며 투자 권유가 아닙니다. 모든 투자 결정과 결과는 투자자 본인의 책임입니다.")
 
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
-        sync_m1, sync_m2 = st.columns([1, 3])
-        with sync_m1:
-            if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_macro", use_container_width=True):
-                tab_sync_refresh(
-                    [cached_analyze_us_macro_dashboard.clear],
-                    rerun_after=True,
-                )
-        with sync_m2:
-            st.caption("불러온 지표는 세션 동안 캐시됩니다. 동기화 시 캐시를 비우고 최신 데이터를 다시 가져옵니다.")
-    
+        render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
         st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 미국 거시경제 대시보드")
         st.caption("yfinance + FRED API + CNN Fear & Greed 기준. 판단은 참고용 휴리스틱입니다.")
 
@@ -8252,6 +8253,7 @@ if st.session_state.get("logged_in"):
                                 st.markdown(f"**{ui_text['outlook']}**\n\n{deep_result.get('forward_outlook', 'N/A')}")
     
     elif main_nav == _MAIN_NAV_OPTIONS[4]:
+        render_sync_button("sync_tab_scanner", [], "스캐너 결과 캐시를 초기화합니다.")
         st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 듀얼 엔진")
         st.caption(
             "**Current Leaders**는 기존 6대 팩터로 대장·테마 정렬을, **Emerging**은 2차 수혜·초기 모멘텀·거래량 가속·과열 회피 관점으로 같은 유니버스를 재스코어링합니다."
@@ -9003,22 +9005,35 @@ if st.session_state.get("logged_in"):
                         if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
                             with st.spinner("한글로 번역 중..."):
                                 try:
-                                    # 영문 길이 기반 토큰 계산 (영문 1단어 ≈ 1.5 한글 토큰)
-                                    _en_words = len(summary_en.split())
-                                    _needed_tokens = max(1024, min(4096, int(_en_words * 2.5)))
+                                    # 문장 단위로 분할해서 번역 (청크당 300단어)
+                                    import textwrap as _tw
+                                    _words = summary_en.split()
+                                    _chunk_size = 300
+                                    _chunks = [
+                                        " ".join(_words[i:i+_chunk_size])
+                                        for i in range(0, len(_words), _chunk_size)
+                                    ]
                                     _tr_model = _GenAIModel(
                                         "gemini-2.5-flash",
-                                        generation_config={"temperature": 0.0, "max_output_tokens": _needed_tokens}
+                                        generation_config={"temperature": 0.0, "max_output_tokens": 2048}
                                     )
-                                    _tr_prompt = (
-                                        "아래 영문 회사 소개를 한국어로 번역하세요.\n"
-                                        "절대 요약하거나 생략하지 마세요. 원문의 모든 문장을 빠짐없이 번역하세요.\n"
-                                        "번역문만 출력하고 설명이나 추가 코멘트는 쓰지 마세요.\n\n"
-                                        + summary_en
-                                    )
-                                    _tr_resp = _tr_model.generate_content(_tr_prompt)
-                                    _tr_text = _gemini_response_text_utf8_safe(_tr_resp)
-                                    if _tr_text:
+                                    _tr_parts = []
+                                    _tr_ok = True
+                                    for _chunk in _chunks:
+                                        _tr_prompt = (
+                                            "아래 영문을 한국어로 번역하세요. "
+                                            "요약하거나 생략하지 말고 모든 문장을 번역하세요. "
+                                            "번역문만 출력하세요.\n\n" + _chunk
+                                        )
+                                        _tr_resp = _tr_model.generate_content(_tr_prompt)
+                                        _part = _gemini_response_text_utf8_safe(_tr_resp)
+                                        if _part:
+                                            _tr_parts.append(_part.strip())
+                                        else:
+                                            _tr_ok = False
+                                            break
+                                    if _tr_ok and _tr_parts:
+                                        _tr_text = " ".join(_tr_parts)
                                         st.session_state[_sum_key] = _tr_text
                                         st.rerun()
                                     else:
@@ -9065,19 +9080,11 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.caption("yfinance 기반 KPI 점검 (Pass/Fail)")
-        syn_f1, syn_f2 = st.columns([1, 3])
-        with syn_f1:
-            if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_fund", use_container_width=True):
-                tab_sync_refresh(
-                    [
-                        cached_evaluate_kpis_snapshot.clear,
-                        cached_etf_holdings_universe_str.clear,
-                        cached_build_etf_holdings_performance_pairs.clear,
-                    ],
-                    rerun_after=True,
-                )
-        with syn_f2:
-            st.caption("종목별 재무·ETF 보유 데이터 캐시를 비워 최신 재조회 결과를 받습니다.")
+        render_sync_button(
+            "sync_tab_fund",
+            [cached_evaluate_kpis_snapshot.clear, cached_etf_holdings_universe_str.clear, cached_build_etf_holdings_performance_pairs.clear],
+            "종목별 재무·ETF 보유 데이터 캐시를 비워 최신 데이터를 받습니다.",
+        )
     
         try:
             if is_etf_mode:
@@ -9244,15 +9251,7 @@ if st.session_state.get("logged_in"):
         st.divider()
         st.markdown("### 📊 기술적 분석 (Technical Analysis)")
         st.caption("RSI · MACD · 볼린저밴드 · 거래량으로 진입 구간 점검")
-        syn_t1, syn_t2 = st.columns([1, 3])
-        with syn_t1:
-            if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_timing", use_container_width=True):
-                tab_sync_refresh(
-                    [cached_timing_price_history.clear],
-                    rerun_after=True,
-                )
-        with syn_t2:
-            st.caption("가격 이력 캐시를 비워 다음 로드부터 최근 1년 OHLC를 다시 받습니다.")
+        # 기술적 분석 sync는 탭 상단 버튼과 통합됨
 
         try:
             with st.spinner(f"{selected_ticker} 타이밍 데이터를 불러오는 중..."):
@@ -10881,6 +10880,7 @@ if st.session_state.get("logged_in"):
             )
 
     elif main_nav == _MAIN_NAV_OPTIONS[9]:
+        render_sync_button("sync_tab_idea", [], "Idea-to-Portfolio 데이터를 다시 불러옵니다.")
         # ─────────────────────────────────────────────────────────────────────
         # 💡 Idea-to-Portfolio 추적
         # 내러티브 테마 → 종목 발굴 → 포트폴리오 편입 흐름을 Thesis ID로 연결
@@ -11018,6 +11018,7 @@ if st.session_state.get("logged_in"):
             st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
 
     elif main_nav == _MAIN_NAV_OPTIONS[10]:
+        render_sync_button("sync_tab_weekly", [], "주간 요약 데이터를 다시 불러옵니다.")
         # ─────────────────────────────────────────────────────────────────────
         # 📋 주간 포트폴리오 AI 요약
         # 포트폴리오 현황 + 최근 내러티브 + Macro를 묶어 Gemini로 주간 리포트 생성
@@ -11350,8 +11351,10 @@ if st.session_state.get("logged_in"):
                             new_wl = [updated_item if j == idx else x for j, x in enumerate(wl_items)]
                             ok_edit, err_edit = save_watchlist_sheet(uid_wl, new_wl)
                             if ok_edit:
-                                st.success(f"✅ {tk} Alert 조건 저장 완료!")
+                                # 캐시 즉시 초기화 → 화면 즉시 반영
+                                load_watchlist_sheet.clear()
                                 st.session_state["_watchlist_alert_checked"] = False
+                                st.session_state.pop("_sidebar_wl_count", None)
                                 st.rerun()
                             else:
                                 st.error(f"저장 실패: {err_edit}")
@@ -11436,6 +11439,7 @@ if st.session_state.get("logged_in"):
                         st.error(f"저장 실패: {err_fix}")
 
     elif main_nav == _MAIN_NAV_OPTIONS[11]:
+        render_sync_button("sync_tab_emerging", [], "Emerging 추적 데이터를 다시 불러옵니다.")
         # ─────────────────────────────────────────────────────────────────────
         # 📡 Emerging 종목 추적기
         # ─────────────────────────────────────────────────────────────────────
