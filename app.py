@@ -72,7 +72,7 @@ _ETF_UNIVERSE_SHEET_TITLE = "ETF_Universe"
 _EMERGING_TRACKER_SHEET_TITLE = "Emerging_Tracker"
 _PORTFOLIO_HISTORY_SHEET_TITLE = "Portfolio_History"
 _SCANNER_HISTORY_SHEET_TITLE = "Scanner_History"
-_SCANNER_HISTORY_COLS = ["ID", "Date", "Ticker", "Score", "Rank", "Verdict", "RS_Score", "Mom_1M"]
+_SCANNER_HISTORY_COLS = ["ID", "Date", "Engine", "Ticker", "Score", "Rank", "Verdict", "RS_Score", "Mom_1M"]
 _PORTFOLIO_HISTORY_COLS = ["ID", "Date", "Total_Value", "Total_Cost", "Return_Pct", "SPY_Pct", "Alpha_Pct", "Positions"]
 _EMERGING_TRACKER_COLS = ["ID", "Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]
 _ETF_UNIVERSE_SHEET_COLS = ["Ticker", "Name", "Category", "AUM_M", "Added_Date", "Source"]
@@ -3876,8 +3876,8 @@ def load_etf_universe_tickers_merged() -> list[str]:
     return merged
 
 
-def save_scanner_result_history(user_id: str, score_df: pd.DataFrame) -> tuple[bool, str]:
-    """AI 스캐너 TOP 결과를 Sheets에 저장."""
+def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: str = "leaders") -> tuple[bool, str]:
+    """AI 스캐너 TOP 결과를 Sheets에 저장. engine: 'leaders' | 'emerging'"""
     gc = get_gspread_client()
     if gc is None:
         return False, "Google 서비스 계정이 설정되지 않았습니다."
@@ -3885,20 +3885,35 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame) -> tuple[b
         sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
         existing = [ws.title for ws in sh.worksheets()]
         if _SCANNER_HISTORY_SHEET_TITLE not in existing:
-            ws = sh.add_worksheet(title=_SCANNER_HISTORY_SHEET_TITLE, rows=5000, cols=8)
-            ws.update([_SCANNER_HISTORY_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+            ws = sh.add_worksheet(title=_SCANNER_HISTORY_SHEET_TITLE, rows=5000, cols=9)
+            ws.update([_SCANNER_HISTORY_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
         else:
             ws = sh.worksheet(_SCANNER_HISTORY_SHEET_TITLE)
+            # ── 헤더 마이그레이션: Engine 컬럼 없으면 자동 추가 ──────────
+            cur_header = ws.row_values(1)
+            if "Engine" not in cur_header:
+                # 기존 데이터 전체 읽기
+                all_vals = ws.get_all_values()
+                # 시트 초기화 후 새 헤더로 재작성
+                ws.clear()
+                ws.update([_SCANNER_HISTORY_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
+                # 기존 데이터를 새 포맷으로 변환 (Engine="Leaders" 삽입)
+                if len(all_vals) > 1:
+                    migrated = []
+                    for old_row in all_vals[1:]:
+                        old_row = (old_row + [""] * 8)[:8]
+                        # ID, Date, [Engine삽입], Ticker, Score, Rank, Verdict, RS_Score, Mom_1M
+                        migrated.append([old_row[0], old_row[1], "Leaders"] + old_row[2:])
+                    ws.append_rows(migrated, value_input_option="USER_ENTERED")
 
         today_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
         uid_u = str(user_id).strip().upper()
+        engine_label = "Emerging" if engine == "emerging" else "Leaders"
         rows = []
         for rank_idx, (_, row) in enumerate(score_df.head(10).iterrows(), start=1):
-            # 컬럼명 유연하게 처리 (Current Leaders / Emerging 둘 다 지원)
             _ticker = str(row.get("Ticker", ""))
             _score = str(round(float(row.get("Final Score", 0) or 0), 2))
             _verdict = str(row.get("Narrative Why", row.get("Verdict", "")))[:50]
-            # RS Score: Current Leaders는 "RS Score", Emerging은 "Early RS Score"
             _rs = ""
             for _rs_col in ["RS Score", "Early RS Score", "RS"]:
                 if _rs_col in row and pd.notna(row[_rs_col]):
@@ -3907,7 +3922,6 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame) -> tuple[b
                     except Exception:
                         pass
                     break
-            # 1M Return: Current Leaders는 "Momentum Score", Emerging은 "Vol Accel Score"
             _mom = ""
             for _mom_col in ["1M Return", "Momentum Score", "Vol Accel Score"]:
                 if _mom_col in row and pd.notna(row[_mom_col]):
@@ -3916,7 +3930,7 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame) -> tuple[b
                     except Exception:
                         pass
                     break
-            rows.append([uid_u, today_str, _ticker, _score, str(rank_idx), _verdict, _rs, _mom])
+            rows.append([uid_u, today_str, engine_label, _ticker, _score, str(rank_idx), _verdict, _rs, _mom])
         if rows:
             ws.append_rows(rows, value_input_option="USER_ENTERED")
         return True, ""
@@ -3925,8 +3939,8 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame) -> tuple[b
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_scanner_history(user_id: str) -> pd.DataFrame:
-    """스캐너 히스토리 로드."""
+def load_scanner_history(user_id: str, engine: str = "all") -> pd.DataFrame:
+    """스캐너 히스토리 로드. engine: 'all' | 'leaders' | 'emerging'"""
     gc = get_gspread_client()
     if gc is None:
         return pd.DataFrame()
@@ -3940,16 +3954,34 @@ def load_scanner_history(user_id: str) -> pd.DataFrame:
         if not vals or len(vals) < 2:
             return pd.DataFrame()
         uid_u = str(user_id).strip().upper()
+        # 헤더로 컬럼 인덱스 파악 (Engine 컬럼 있을 수도 없을 수도)
+        header = [str(h).strip() for h in vals[0]]
+        has_engine = "Engine" in header
         rows = []
         for r in vals[1:]:
-            r = (r + [""] * 8)[:8]
+            r = (r + [""] * 9)[:9]
             if str(r[0]).strip().upper() != uid_u:
                 continue
+            if has_engine:
+                row_engine = str(r[2]).strip()
+                date_v, eng_v, tk_v, sc_v, rk_v, vd_v, rs_v, mom_v = r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]
+            else:
+                # 구버전 (Engine 컬럼 없음) → Leaders로 간주
+                row_engine = "Leaders"
+                date_v, eng_v, tk_v, sc_v, rk_v, vd_v, rs_v, mom_v = r[1], "Leaders", r[2], r[3], r[4], r[5], r[6], r[7]
+            # 엔진 필터
+            if engine != "all":
+                if engine == "leaders" and row_engine.lower() != "leaders":
+                    continue
+                if engine == "emerging" and row_engine.lower() != "emerging":
+                    continue
             rows.append({
-                "Date": r[1], "Ticker": r[2], "Score": pd.to_numeric(r[3], errors="coerce"),
-                "Rank": pd.to_numeric(r[4], errors="coerce"),
-                "Verdict": r[5], "RS_Score": pd.to_numeric(r[6], errors="coerce"),
-                "Mom_1M": pd.to_numeric(r[7], errors="coerce"),
+                "Date": date_v, "Engine": eng_v, "Ticker": tk_v,
+                "Score": pd.to_numeric(sc_v, errors="coerce"),
+                "Rank": pd.to_numeric(rk_v, errors="coerce"),
+                "Verdict": vd_v,
+                "RS_Score": pd.to_numeric(rs_v, errors="coerce"),
+                "Mom_1M": pd.to_numeric(mom_v, errors="coerce"),
             })
         return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
@@ -8491,7 +8523,7 @@ if st.session_state.get("logged_in"):
                 _sc_last = st.session_state.get("_scanner_saved_date")
                 _sc_today = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
                 if _sc_last != _sc_today:
-                    _ok_sc, _ = save_scanner_result_history(_sc_uid, snap["score_df"])
+                    _ok_sc, _ = save_scanner_result_history(_sc_uid, snap["score_df"], engine="leaders")
                     if _ok_sc:
                         st.session_state["_scanner_saved_date"] = _sc_today
                         load_scanner_history.clear()
@@ -8502,8 +8534,8 @@ if st.session_state.get("logged_in"):
 
             # ── 스캐너 히스토리 ────────────────────────────────────────────
             _sc_uid2 = str(st.session_state.get("user_id") or "").strip()
-            with st.expander("📚 스캐너 히스토리 (과거 TOP 결과 추적)", expanded=False):
-                sc_hist = load_scanner_history(_sc_uid2)
+            with st.expander("📚 Current Leaders 히스토리 (과거 TOP 결과 추적)", expanded=False):
+                sc_hist = load_scanner_history(_sc_uid2, engine="leaders")
                 if sc_hist.empty:
                     st.info("아직 히스토리가 없어요. 스캔 실행 시 자동 저장됩니다.")
                 else:
@@ -8609,7 +8641,7 @@ if st.session_state.get("logged_in"):
                         }
                         # Emerging 히스토리 저장
                         _em_uid_sc = str(st.session_state.get("user_id") or "").strip()
-                        _ok_em_hist, _ = save_scanner_result_history(_em_uid_sc, em_df)
+                        _ok_em_hist, _ = save_scanner_result_history(_em_uid_sc, em_df, engine="emerging")
                         if _ok_em_hist:
                             load_scanner_history.clear()
                         st.success("Emerging Opportunities 스캔 완료 — 결과가 세션 및 히스토리에 저장되었습니다.")
@@ -8617,8 +8649,43 @@ if st.session_state.get("logged_in"):
             snap_em = st.session_state.get("scanner_results_emerging")
             if isinstance(snap_em, dict) and isinstance(snap_em.get("score_df"), pd.DataFrame) and not snap_em["score_df"].empty:
                 render_opportunity_emerging_snapshot(snap_em)
+
+                # Emerging 자동 저장 (스캔 직후 session에 있을 때)
+                _em_sc_uid = str(st.session_state.get("user_id") or "").strip()
+                _em_sc_last = st.session_state.get("_em_scanner_saved_date")
+                _em_sc_today = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+                if _em_sc_last != _em_sc_today:
+                    _ok_em_sc, _ = save_scanner_result_history(_em_sc_uid, snap_em["score_df"], engine="emerging")
+                    if _ok_em_sc:
+                        st.session_state["_em_scanner_saved_date"] = _em_sc_today
+                        load_scanner_history.clear()
+
             elif not run_emerge:
                 st.caption("Emerging 엔진 스캔을 실행하면 RSI·거래량 가속 지표와 함께 결과가 세션에 유지됩니다.")
+
+            # ── Emerging 히스토리 ──────────────────────────────────────────
+            _em_uid3 = str(st.session_state.get("user_id") or "").strip()
+            with st.expander("📚 Emerging 히스토리 (과거 TOP 결과 추적)", expanded=False):
+                em_sc_hist = load_scanner_history(_em_uid3, engine="emerging")
+                if em_sc_hist.empty:
+                    st.info("아직 히스토리가 없어요. Emerging 스캔 실행 시 자동 저장됩니다.")
+                else:
+                    # 종목별 등장 빈도
+                    em_freq = em_sc_hist.groupby("Ticker").agg(
+                        등장횟수=("Ticker", "count"),
+                        평균점수=("Score", "mean"),
+                        최근날짜=("Date", "max"),
+                        최고순위=("Rank", "min"),
+                    ).reset_index().sort_values("등장횟수", ascending=False)
+                    em_freq["평균점수"] = em_freq["평균점수"].round(1)
+
+                    st.markdown("**🌱 자주 등장한 Emerging 종목 (신뢰도 높은 신호)**")
+                    st.dataframe(em_freq.head(15), use_container_width=True, hide_index=True)
+
+                    # 최근 스캔 기록
+                    st.markdown("**📅 최근 Emerging 스캔 기록**")
+                    recent_em = em_sc_hist.sort_values("Date", ascending=False).head(20)
+                    st.dataframe(recent_em, use_container_width=True, hide_index=True)
     
     elif main_nav == _MAIN_NAV_OPTIONS[3]:
         syn_s1, syn_s2 = st.columns([1, 3])
