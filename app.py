@@ -2435,6 +2435,93 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     }
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
+    """
+    개별 주식이 어떤 ETF의 보유 종목에 포함되어 있는지 찾기.
+    상위 20개 주요 ETF만 체크 (5~10초 목표).
+    반환: [{"etf": "SMH", "weight": 8.5, "rank": 2}]
+    """
+    if not stock_ticker:
+        return []
+
+    target = str(stock_ticker).strip().upper()
+    results = []
+
+    # 가장 많이 쓰이는 핵심 ETF 20개만 체크
+    check_list = [
+        "QQQ", "SPY", "VOO", "VGT", "XLK",
+        "SOXX", "SMH", "XSD", "SOXQ", "DRAM",
+        "ARKK", "ARKW", "ARKQ", "IWM", "MGK",
+        "XLF", "XLV", "XLE", "XLY", "XLI",
+    ]
+
+    for etf_tk in check_list:
+        try:
+            tk = yf.Ticker(str(etf_tk).strip().upper())
+            # funds_data.top_holdings (최신 yfinance)
+            holdings = None
+            try:
+                fd = tk.funds_data
+                if fd is not None:
+                    holdings = fd.top_holdings
+            except Exception:
+                pass
+
+            # 대안: get_holdings
+            if holdings is None or (hasattr(holdings, "empty") and holdings.empty):
+                try:
+                    holdings = tk.get_holdings()
+                except Exception:
+                    pass
+
+            if holdings is None or (hasattr(holdings, "empty") and holdings.empty):
+                continue
+
+            # index 또는 컬럼에서 ticker 찾기
+            holdings_idx = list(holdings.index.astype(str).str.upper()) if hasattr(holdings, "index") else []
+            holdings_reset = holdings.reset_index() if hasattr(holdings, "reset_index") else holdings
+
+            sym_col = next(
+                (c for c in holdings_reset.columns if c.lower() in ("symbol", "ticker", "holding", "index")),
+                None
+            )
+
+            found = False
+            idx_in = -1
+            weight = np.nan
+
+            if target in holdings_idx:
+                idx_in = holdings_idx.index(target)
+                found = True
+                weight_col = next((c for c in holdings.columns if "weight" in c.lower() or "%" in c.lower()), None)
+                if weight_col:
+                    weight = float(holdings.iloc[idx_in][weight_col])
+            elif sym_col:
+                tickers_col = holdings_reset[sym_col].astype(str).str.upper().tolist()
+                if target in tickers_col:
+                    idx_in = tickers_col.index(target)
+                    found = True
+                    weight_col = next((c for c in holdings_reset.columns if "weight" in c.lower() or "%" in c.lower()), None)
+                    if weight_col:
+                        weight = float(holdings_reset.iloc[idx_in][weight_col])
+
+            if found:
+                # weight 정규화 (0~1 → 0~100%)
+                if pd.notna(weight) and 0 < weight <= 1:
+                    weight = weight * 100
+                results.append({
+                    "etf": etf_tk,
+                    "weight": round(float(weight) if pd.notna(weight) else 0.0, 2),
+                    "rank": idx_in + 1,
+                })
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: x.get("weight", 0), reverse=True)
+    return results
+
+
 def fetch_short_interest(ticker_upper: str) -> dict:
     """공매도 비율 + 숏 스퀴즈 가능성 계산."""
     try:
@@ -8977,14 +9064,7 @@ if st.session_state.get("logged_in"):
             with info_c2:
                 industry_display = co.get("industry", "N/A")
                 industry_en = co.get("industry_en", "")
-                # ETF 소속 여부 확인
-                _universe = load_etf_universe_tickers_merged()
-                _tk_upper = str(selected_ticker).strip().upper()
-                if _tk_upper in [t.upper() for t in _universe]:
-                    st.metric("산업", industry_display[:14] if industry_display else "N/A")
-                    st.caption(f"📊 ETF Universe 포함")
-                else:
-                    st.metric("산업", industry_display[:18] if industry_display else "N/A")
+                st.metric("산업", industry_display[:18] if industry_display else "N/A")
                 if industry_en and industry_en != industry_display:
                     st.caption(industry_en[:25])
             with info_c3:
@@ -9054,6 +9134,37 @@ if st.session_state.get("logged_in"):
                                         st.warning("번역 결과를 받지 못했어요. 다시 시도해주세요.")
                                 except Exception as _te:
                                     st.warning(f"번역 오류: {_te}")
+
+        # ── 이 종목을 보유한 ETF 목록 (자동 조회) ────────────────────────
+        if not is_etf_mode:
+            with st.expander("📊 이 종목을 보유한 ETF 목록", expanded=True):
+                st.caption("주요 ETF 20개 중 이 종목을 보유 중인 ETF를 자동으로 찾습니다.")
+                _etf_list_key = f"_etf_holding_{selected_ticker}"
+                if st.session_state.get(_etf_list_key) is None:
+                    with st.spinner(f"{selected_ticker} 보유 ETF 검색 중... (약 10초)"):
+                        _etf_list = find_etfs_holding_stock(selected_ticker)
+                    st.session_state[_etf_list_key] = _etf_list
+                _etf_result = st.session_state.get(_etf_list_key, [])
+                if _etf_result:
+                    st.success(f"**{selected_ticker}** 를 보유한 ETF **{len(_etf_result)}개** 발견!")
+                    _etf_rows = []
+                    for e in _etf_result:
+                        _etf_rows.append({
+                            "ETF": e["etf"],
+                            "보유 비중": f"{e['weight']:.2f}%" if e.get("weight") else "N/A",
+                            "보유 순위": f"Top {e['rank']}" if e.get("rank") else "N/A",
+                        })
+                    st.dataframe(
+                        pd.DataFrame(_etf_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info(f"조회한 주요 ETF 20개 중 {selected_ticker}를 보유한 ETF를 찾지 못했습니다.")
+                if st.button("🔄 다시 조회", key=f"re_find_etf_{selected_ticker}"):
+                    st.session_state.pop(_etf_list_key, None)
+                    find_etfs_holding_stock.clear()
+                    st.rerun()
 
         st.divider()
 
