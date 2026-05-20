@@ -7194,12 +7194,14 @@ if st.session_state.get("logged_in"):
                 "[선행 지표 5가지]\n" + signal_summary + "\n\n"
                 "[감지된 경고]\n" + warning_text + "\n\n"
                 "[최신 뉴스]\n" + news_text + "\n\n"
+                "중요: 각 항목은 반드시 3문장 이내로 간결하게 작성. 불필요한 서론/수식어 금지.\n\n"
                 "반드시 아래 형식으로 한국어 작성:\n\n"
                 "## 내일 시장 방향: [상승 우세 / 중립 / 하락 우세]\n\n"
-                "**기술적 근거:** (선행 지표 기반, 수치 포함)\n\n"
-                "**뉴스 센티먼트:** (뉴스가 시장에 미칠 영향)\n\n"
-                "**주요 리스크:** (2가지)\n\n"
-                "**대응 전략:**\n"
+                "**기술적 근거:** (선행 지표 수치 기반, 3문장 이내)\n\n"
+                "**뉴스 센티먼트:** (뉴스 영향, 2문장 이내)\n\n"
+                "**주요 리스크:** (번호 목록, 각 1문장)\n"
+                "1. \n2. \n\n"
+                "**대응 전략:** (각 1~2문장)\n"
                 "- 보유 중이라면:\n"
                 "- 매수 고려 중이라면:\n"
                 "- 현금 비중이라면:\n\n"
@@ -7208,7 +7210,7 @@ if st.session_state.get("logged_in"):
             with st.spinner("Gemini AI 분석 중... (약 15초)"):
                 _drg_model = _GenAIModel(
                     "gemini-2.5-flash",
-                    generation_config={"temperature": 0.0, "max_output_tokens": 2048}
+                    generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                 )
                 _drg_response = _drg_model.generate_content(drg_prompt)
                 _drg_text = _gemini_response_text_utf8_safe(_drg_response)
