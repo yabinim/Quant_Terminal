@@ -2164,17 +2164,61 @@ def cached_evaluate_kpis_snapshot(ticker_upper: str):
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
-    """최근 분기별 EPS 예상 vs 실제 (Earnings Surprise)."""
+    """분기별 EPS 히스토리 — income_stmt 기반으로 직접 계산."""
+    tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
+
+    # 방법 1: get_earnings_history (신버전 API)
     try:
-        tk = yf.Ticker(str(ticker_upper).strip().upper())
-        # quarterly earnings
-        qe = tk.quarterly_earnings
-        if qe is not None and not qe.empty:
-            qe = qe.reset_index()
-            return qe
-        return pd.DataFrame()
+        eh = tk_obj.get_earnings_history()
+        if eh is not None and not eh.empty:
+            return eh.reset_index()
     except Exception:
-        return pd.DataFrame()
+        pass
+
+    # 방법 2: quarterly_income_stmt에서 EPS 직접 계산
+    try:
+        q_income = tk_obj.quarterly_income_stmt
+        if q_income is not None and not q_income.empty:
+            net_row = next(
+                (q_income.loc[i] for i in q_income.index if "net income" in str(i).lower()),
+                None
+            )
+            if net_row is not None:
+                info = tk_obj.info or {}
+                shares = to_float(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding"))
+                rows = []
+                for col in q_income.columns[:8]:
+                    ni = to_float(net_row.get(col))
+                    if pd.isna(ni):
+                        continue
+                    eps = float(ni / shares) if shares and shares > 0 else np.nan
+                    rows.append({
+                        "분기": str(col)[:10],
+                        "Net Income": f"${ni/1e9:.2f}B" if abs(ni) >= 1e9 else f"${ni/1e6:.0f}M",
+                        "EPS": f"${eps:.3f}" if pd.notna(eps) else "N/A",
+                    })
+                if rows:
+                    return pd.DataFrame(rows)
+    except Exception:
+        pass
+
+    # 방법 3: info EPS 요약
+    try:
+        info = tk_obj.info or {}
+        rows = []
+        eps_t = to_float(info.get("trailingEps"))
+        eps_f = to_float(info.get("forwardEps"))
+        if pd.notna(eps_t):
+            rows.append({"구분": "Trailing EPS (TTM)", "EPS": f"${eps_t:.3f}", "비고": "최근 12개월 실제"})
+        if pd.notna(eps_f):
+            rows.append({"구분": "Forward EPS", "EPS": f"${eps_f:.3f}", "비고": "향후 12개월 예상"})
+        if rows:
+            return pd.DataFrame(rows)
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -2546,41 +2590,81 @@ def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14)
         return {}
 
 
+
+_SECTOR_KR = {
+    "Technology": "기술", "Financial Services": "금융 서비스",
+    "Healthcare": "헬스케어", "Consumer Cyclical": "경기소비재",
+    "Consumer Defensive": "필수소비재", "Industrials": "산업재",
+    "Basic Materials": "소재", "Energy": "에너지",
+    "Real Estate": "부동산", "Utilities": "유틸리티",
+    "Communication Services": "통신 서비스",
+    "ETF": "ETF", "Mutual Fund": "펀드",
+}
+
+_INDUSTRY_KR = {
+    "Semiconductors": "반도체", "Software—Application": "소프트웨어(응용)",
+    "Software—Infrastructure": "소프트웨어(인프라)", "Consumer Electronics": "소비자 전자",
+    "Internet Retail": "인터넷 소매", "Internet Content & Information": "인터넷 콘텐츠",
+    "Auto Manufacturers": "자동차 제조", "Drug Manufacturers—General": "제약(대형)",
+    "Biotechnology": "바이오테크", "Banks—Diversified": "은행(다각화)",
+    "Oil & Gas E&P": "석유·가스 탐사", "Oil & Gas Integrated": "석유·가스 통합",
+    "Aerospace & Defense": "항공우주·방산", "Capital Markets": "자본시장",
+    "Asset Management": "자산운용", "Insurance—Diversified": "보험",
+    "Specialty Retail": "전문 소매", "Restaurants": "외식업",
+    "REITs": "리츠(부동산)", "Utilities—Regulated Electric": "전력(규제)",
+    "Telecom Services": "통신 서비스",
+}
+
+
+def translate_ko(text: str, mapping: dict) -> str:
+    """영문 섹터/산업명을 한글로 변환. 없으면 원문 반환."""
+    return mapping.get(str(text).strip(), str(text).strip())
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_company_overview(ticker_upper: str) -> dict:
-    """회사 기본 정보 조회."""
+    """회사 기본 정보 조회 (섹터/산업 한글 포함)."""
     try:
-        info = yf.Ticker(str(ticker_upper).strip().upper()).info or {}
+        tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
+        info = tk_obj.info or {}
         name = str(info.get("longName") or info.get("shortName") or ticker_upper)
-        sector = str(info.get("sector") or "N/A")
-        industry = str(info.get("industry") or "N/A")
+        sector_en = str(info.get("sector") or "")
+        industry_en = str(info.get("industry") or "")
+        quote_type = str(info.get("quoteType") or "").upper()
+        is_etf = quote_type in ("ETF", "MUTUALFUND") or "etf" in sector_en.lower()
         country = str(info.get("country") or "N/A")
-        summary = str(info.get("longBusinessSummary") or "")[:400]
+        summary_en = str(info.get("longBusinessSummary") or "")
         employees = info.get("fullTimeEmployees")
         market_cap = to_float(info.get("marketCap"))
         website = str(info.get("website") or "")
+
+        # 섹터/산업 한글 변환
+        sector_kr = translate_ko(sector_en, _SECTOR_KR) if sector_en else "N/A"
+        industry_kr = translate_ko(industry_en, _INDUSTRY_KR) if industry_en else "N/A"
+
         # 다음 실적 발표일
         next_earnings = None
         try:
-            cal = yf.Ticker(str(ticker_upper).strip().upper()).calendar
-            if cal is not None and not cal.empty:
-                if "Earnings Date" in cal.index:
-                    ed = cal.loc["Earnings Date"]
-                    if hasattr(ed, '__iter__'):
-                        next_earnings = str(list(ed)[0])[:10] if len(list(ed)) > 0 else None
-                    else:
-                        next_earnings = str(ed)[:10]
+            ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
+            if ts and int(ts) > 0:
+                next_earnings = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
         except Exception:
-            # info에서 대안
-            ts = info.get("earningsTimestamp")
-            if ts:
-                try:
-                    next_earnings = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
-                except Exception:
-                    pass
+            pass
+        if not next_earnings:
+            try:
+                ed_list = info.get("earningsDate") or []
+                if ed_list and isinstance(ed_list, list):
+                    next_earnings = str(ed_list[0])[:10]
+            except Exception:
+                pass
+
         return {
-            "name": name, "sector": sector, "industry": industry,
-            "country": country, "summary": summary,
+            "name": name,
+            "sector": sector_kr, "sector_en": sector_en,
+            "industry": industry_kr, "industry_en": industry_en,
+            "is_etf": is_etf,
+            "country": country,
+            "summary_en": summary_en,
             "employees": employees, "market_cap": market_cap,
             "website": website, "next_earnings": next_earnings,
         }
@@ -8866,15 +8950,27 @@ if st.session_state.get("logged_in"):
             co = fetch_company_overview(str(selected_ticker).strip().upper())
 
         if co:
+            name_str = co.get("name", selected_ticker)
+            website = co.get("website", "")
+            is_etf_co = co.get("is_etf", False)
+            etf_badge = " 🏷️ ETF" if is_etf_co else ""
             st.markdown(
-                f"## {co.get('name', selected_ticker)}"
-                + (f" — [{co.get('website','').replace('https://','').replace('http://','')[:30]}]({co.get('website','')})" if co.get('website') else "")
+                f"## {name_str}{etf_badge}"
+                + (f"  [{website.replace('https://','').replace('http://','')[:35]}]({website})" if website else "")
             )
             info_c1, info_c2, info_c3, info_c4 = st.columns(4)
             with info_c1:
-                st.metric("섹터", co.get("sector", "N/A"))
+                sector_display = co.get("sector", "N/A")
+                sector_en = co.get("sector_en", "")
+                st.metric("섹터", sector_display)
+                if sector_en and sector_en != sector_display:
+                    st.caption(sector_en)
             with info_c2:
-                st.metric("산업", co.get("industry", "N/A")[:20] if co.get("industry") else "N/A")
+                industry_display = co.get("industry", "N/A")
+                industry_en = co.get("industry_en", "")
+                st.metric("산업", industry_display[:18] if industry_display else "N/A")
+                if industry_en and industry_en != industry_display:
+                    st.caption(industry_en[:25])
             with info_c3:
                 mc = co.get("market_cap")
                 st.metric("시가총액", usd_short_str(mc) if mc else "N/A")
@@ -8890,9 +8986,29 @@ if st.session_state.get("logged_in"):
                 else:
                     st.metric("다음 실적 발표", "N/A")
 
-            if co.get("summary"):
-                with st.expander("📋 회사 소개", expanded=False):
-                    st.markdown(co["summary"] + ("..." if len(co.get("summary","")) >= 400 else ""))
+            # 회사 소개: 영문 원문을 Gemini로 번역
+            summary_en = co.get("summary_en", "")
+            if summary_en:
+                with st.expander("📋 회사 소개 (한글)", expanded=False):
+                    _sum_key = f"_co_summary_kr_{selected_ticker}"
+                    if st.session_state.get(_sum_key):
+                        st.markdown(st.session_state[_sum_key])
+                    else:
+                        if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}"):
+                            with st.spinner("번역 중..."):
+                                try:
+                                    _tr_model = _GenAIModel("gemini-2.5-flash", generation_config={"temperature": 0.0, "max_output_tokens": 1024})
+                                    _tr_prompt = "아래 영문 회사 소개를 자연스러운 한국어로 번역하세요. 번역문만 출력하세요.\n\n" + summary_en
+                                    _tr_resp = _tr_model.generate_content(_tr_prompt)
+                                    _tr_text = _gemini_response_text_utf8_safe(_tr_resp)
+                                    if _tr_text:
+                                        st.session_state[_sum_key] = _tr_text
+                                        st.rerun()
+                                except Exception as _te:
+                                    st.warning(f"번역 오류: {_te}")
+                        # 영문 원문 표시 (짤림 없이 전체)
+                        st.markdown("**영문 원문:**")
+                        st.markdown(summary_en)
 
         st.divider()
 
