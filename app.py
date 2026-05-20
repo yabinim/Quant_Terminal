@@ -9003,9 +9003,12 @@ if st.session_state.get("logged_in"):
                         if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
                             with st.spinner("한글로 번역 중..."):
                                 try:
+                                    # 영문 길이 기반 토큰 계산 (영문 1단어 ≈ 1.5 한글 토큰)
+                                    _en_words = len(summary_en.split())
+                                    _needed_tokens = max(1024, min(4096, int(_en_words * 2.5)))
                                     _tr_model = _GenAIModel(
                                         "gemini-2.5-flash",
-                                        generation_config={"temperature": 0.0, "max_output_tokens": 2048}
+                                        generation_config={"temperature": 0.0, "max_output_tokens": _needed_tokens}
                                     )
                                     _tr_prompt = (
                                         "아래 영문 회사 소개를 한국어로 번역하세요.\n"
@@ -11307,6 +11310,52 @@ if st.session_state.get("logged_in"):
                         for a in item_alerts[0]["alerts"]:
                             st.success(a)
 
+                    # Alert 조건 편집
+                    with st.expander("✏️ Alert 조건 편집", expanded=False):
+                        _edit_key = f"_wl_edit_{idx}_{tk}"
+                        _ap_cur = float(ap) if pd.notna(ap) else 0.0
+                        _ar_cur = float(ar) if pd.notna(ar) else 0.0
+                        _am_cur = bool(am)
+
+                        edit_c1, edit_c2 = st.columns(2)
+                        with edit_c1:
+                            new_ap = st.number_input(
+                                "💰 목표 매수가 (0=사용 안 함)",
+                                min_value=0.0, value=_ap_cur, step=1.0, format="%.2f",
+                                key=f"edit_ap_{idx}_{tk}",
+                            )
+                            new_ar = st.number_input(
+                                "📉 RSI 이하 시 알림 (0=사용 안 함)",
+                                min_value=0.0, max_value=100.0, value=_ar_cur, step=5.0, format="%.0f",
+                                key=f"edit_ar_{idx}_{tk}",
+                            )
+                        with edit_c2:
+                            new_am = st.checkbox(
+                                "📊 200일선 ±3% 근접 시 알림",
+                                value=_am_cur,
+                                key=f"edit_am_{idx}_{tk}",
+                            )
+                            new_memo = st.text_input(
+                                "📝 메모 수정",
+                                value=str(item.get("memo", "") or ""),
+                                key=f"edit_memo_{idx}_{tk}",
+                            )
+
+                        if st.button("💾 저장", key=f"wl_edit_save_{idx}_{tk}", type="primary", use_container_width=True):
+                            updated_item = dict(item)
+                            updated_item["alert_price"] = float(new_ap) if new_ap > 0 else np.nan
+                            updated_item["alert_rsi"] = float(new_ar) if new_ar > 0 else np.nan
+                            updated_item["alert_ma200"] = bool(new_am)
+                            updated_item["memo"] = new_memo.strip()
+                            new_wl = [updated_item if j == idx else x for j, x in enumerate(wl_items)]
+                            ok_edit, err_edit = save_watchlist_sheet(uid_wl, new_wl)
+                            if ok_edit:
+                                st.success(f"✅ {tk} Alert 조건 저장 완료!")
+                                st.session_state["_watchlist_alert_checked"] = False
+                                st.rerun()
+                            else:
+                                st.error(f"저장 실패: {err_edit}")
+
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
                         def _goto_analysis(ticker=tk):
@@ -11325,6 +11374,7 @@ if st.session_state.get("logged_in"):
                             st.session_state["_watchlist_alert_checked"] = False
                             st.session_state.pop("_sidebar_wl_count", None)
                             st.rerun()
+
 
             # Alert 재체크 버튼
             st.divider()
