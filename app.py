@@ -837,7 +837,7 @@ if "narrative_timeseries_briefing" not in st.session_state:
 # 사이드바 메인 내비게이션 (탑다운: 단일 radio, 옵션 문자열로 분기)
 _MAIN_NAV_OPTIONS = (
     # ── 시작하기 ───────────────────────────────────────────────────────────
-    "📖 사용 가이드 (처음이라면 여기부터)",
+    "🚨 Daily Risk Gauge",
     # ── 분석 도구 ──────────────────────────────────────────────────────────
     "🌐 [1단계] 거시경제 지표",
     "📰 [1단계] 시장 내러티브",
@@ -852,6 +852,8 @@ _MAIN_NAV_OPTIONS = (
     "💡 [AI] Idea-to-Portfolio 추적",
     "📋 [AI] 주간 포트폴리오 요약",
     "📡 [AI] Emerging 종목 추적기",
+    # ── 도움말 ─────────────────────────────────────────────────────────────
+    "📖 사용 가이드",
 )
 
 # 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
@@ -2189,6 +2191,206 @@ def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
+def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
+    """
+    Daily Risk Gauge — 하락장 선행 신호 5가지 종합 점수.
+    sector_filter: "전체" | "테크·반도체" | "에너지" | "금융" | "헬스케어" | "산업재"
+    """
+    import time as _time
+
+    sector_etf_map = {
+        "전체":        {"주도주": ["SPY", "QQQ", "NVDA", "AAPL", "MSFT"], "sector_etf": "SPY"},
+        "테크·반도체": {"주도주": ["NVDA", "AMD", "SOXX", "SMH", "XLK"],  "sector_etf": "XLK"},
+        "에너지":      {"주도주": ["XLE", "XOP", "CVX", "XOM", "OIH"],    "sector_etf": "XLE"},
+        "금융":        {"주도주": ["XLF", "KRE", "JPM", "GS", "BAC"],     "sector_etf": "XLF"},
+        "헬스케어":    {"주도주": ["XLV", "IBB", "UNH", "JNJ", "ABBV"],   "sector_etf": "XLV"},
+        "산업재":      {"주도주": ["XLI", "BA", "CAT", "GE", "HON"],      "sector_etf": "XLI"},
+        "소비재":      {"주도주": ["XLY", "XLP", "AMZN", "HD", "MCD"],    "sector_etf": "XLY"},
+        "부동산":      {"주도주": ["XLRE", "VNQ", "AMT", "PLD", "EQIX"],  "sector_etf": "XLRE"},
+    }
+    cfg = sector_etf_map.get(sector_filter, sector_etf_map["전체"])
+    leaders = cfg["주도주"]
+    sector_etf = cfg["sector_etf"]
+
+    signals = {}
+    warnings = []
+    details = {}
+
+    # ── 신호 1: VIX 방향 전환 ───────────────────────────────────────────
+    try:
+        vix_hist = yf.Ticker("^VIX").history(period="1mo", auto_adjust=False)
+        vix_close = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
+        if len(vix_close) >= 10:
+            vix_now = float(vix_close.iloc[-1])
+            vix_5d_avg = float(vix_close.tail(5).mean())
+            vix_20d_avg = float(vix_close.tail(20).mean())
+            vix_trend = vix_now - float(vix_close.iloc[-6]) if len(vix_close) >= 6 else 0
+            vix_alert = vix_trend > 2 or vix_now > vix_20d_avg * 1.15
+            signals["vix"] = {"ok": not vix_alert, "value": f"{vix_now:.1f}", "trend": f"{vix_trend:+.1f}/5일"}
+            details["VIX"] = {"현재값": f"{vix_now:.1f}", "5일 변화": f"{vix_trend:+.1f}", "20일 평균": f"{vix_20d_avg:.1f}"}
+            if vix_alert:
+                warnings.append(f"⚠️ VIX 상승 전환 감지 ({vix_now:.1f}, +{vix_trend:.1f}/5일)")
+    except Exception:
+        signals["vix"] = {"ok": True, "value": "N/A", "trend": "N/A"}
+
+    # ── 신호 2: Put/Call Ratio (HYG/LQD 스프레드로 근사) ─────────────────
+    try:
+        hyg = pd.to_numeric(yf.Ticker("HYG").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        lqd = pd.to_numeric(yf.Ticker("LQD").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        if len(hyg) >= 10 and len(lqd) >= 10:
+            spread_now = float(hyg.iloc[-1] / lqd.iloc[-1])
+            spread_5d = float(hyg.iloc[-6] / lqd.iloc[-6]) if len(hyg) >= 6 else spread_now
+            spread_chg = (spread_now / spread_5d - 1) * 100
+            spread_alert = spread_chg < -0.5
+            signals["credit"] = {"ok": not spread_alert, "value": f"{spread_chg:+.2f}%/5일", "trend": ""}
+            details["HYG/LQD 스프레드"] = {"5일 변화": f"{spread_chg:+.2f}%", "판정": "⚠️ 축소(위험)" if spread_alert else "✅ 정상"}
+            if spread_alert:
+                warnings.append(f"⚠️ 신용 스프레드 축소 ({spread_chg:+.2f}%/5일) — 리스크오프 신호")
+    except Exception:
+        signals["credit"] = {"ok": True, "value": "N/A", "trend": ""}
+
+    # ── 신호 3: 대장주 모멘텀 약화 ─────────────────────────────────────
+    try:
+        leader_alerts = []
+        leader_details = {}
+        tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
+        raw = yf.download(tickers_dl, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        close_df = get_close_prices_from_download(raw)
+
+        spy_s = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
+        spy_5d = float((spy_s.iloc[-1]/spy_s.iloc[-6] - 1)*100) if len(spy_s) >= 6 else 0
+
+        for ldr in leaders[:4]:
+            if ldr == "SPY" or ldr not in close_df.columns:
+                continue
+            s = pd.to_numeric(close_df[ldr], errors="coerce").dropna()
+            if len(s) < 10:
+                continue
+            ret_5d = float((s.iloc[-1]/s.iloc[-6] - 1)*100) if len(s) >= 6 else 0
+            ma20 = float(s.rolling(20, min_periods=10).mean().iloc[-1])
+            below_ma20 = float(s.iloc[-1]) < ma20
+            rel_strength = ret_5d - spy_5d
+            is_weak = below_ma20 or rel_strength < -3
+            leader_alerts.append(is_weak)
+            leader_details[ldr] = {
+                "5일 수익률": f"{ret_5d:+.1f}%",
+                "SPY 대비": f"{rel_strength:+.1f}%p",
+                "MA20": "아래 ⚠️" if below_ma20 else "위 ✅",
+            }
+
+        weak_count = sum(leader_alerts)
+        leader_alert = weak_count >= 2
+        signals["leaders"] = {"ok": not leader_alert, "value": f"{weak_count}/{len(leader_alerts)}개 약세", "trend": ""}
+        details["대장주 모멘텀"] = leader_details
+        if leader_alert:
+            warnings.append(f"⚠️ 대장주 {weak_count}개 동시 약세 — 섹터 전반 하락 가능성")
+    except Exception:
+        signals["leaders"] = {"ok": True, "value": "N/A", "trend": ""}
+
+    # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
+    try:
+        etf_s = pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if 'close_df' in dir() else pd.Series(dtype=float)
+        if close_df is not None and sector_etf in close_df.columns and not etf_s.empty:
+            raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
+            if len(etf_s) >= 10 and len(vol) >= 10:
+                price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
+                vol_5d = float(vol.tail(5).mean())
+                vol_20d = float(vol.tail(20).mean())
+                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
+                dist_selling = price_5d > 0 and vol_ratio < 0.8
+                vol_alert = dist_selling or vol_ratio < 0.7
+                signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
+                details["거래량"] = {"5일 평균 비율": f"{vol_ratio:.2f}x", "가격 5일": f"{price_5d:+.1f}%", "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상")}
+                if vol_alert:
+                    warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
+            else:
+                signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+        else:
+            signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+    except Exception:
+        signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+
+    # ── 신호 5: VIX 선물 구조 (VIX > VXN 비율) ────────────────────────────
+    try:
+        vxn = pd.to_numeric(yf.Ticker("^VXN").history(period="5d", auto_adjust=False)["Close"], errors="coerce").dropna()
+        if not vxn.empty and "vix" in signals and signals["vix"]["value"] != "N/A":
+            vix_now2 = float(vix_close.iloc[-1])
+            vxn_now = float(vxn.iloc[-1])
+            ratio = vix_now2 / vxn_now if vxn_now > 0 else 1
+            fear_spike = ratio > 0.95
+            signals["vix_vxn"] = {"ok": not fear_spike, "value": f"VIX/VXN {ratio:.3f}", "trend": ""}
+            details["VIX/VXN 비율"] = {"현재": f"{ratio:.3f}", "판정": "⚠️ 공포 급등" if fear_spike else "✅ 정상"}
+            if fear_spike:
+                warnings.append(f"⚠️ VIX/VXN 비율 {ratio:.3f} — 공포 급등 신호")
+        else:
+            signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
+    except Exception:
+        signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
+
+    # ── 뉴스 수집 ─────────────────────────────────────────────────────────
+    news_items = []
+    try:
+        risk_tickers = ["SPY", sector_etf] + leaders[:2]
+        for tk in risk_tickers[:3]:
+            try:
+                tk_news = yf.Ticker(tk).news
+                if tk_news:
+                    for n in tk_news[:3]:
+                        title = str(n.get("title", "") or n.get("headline", "") or "")
+                        publisher = str(n.get("publisher", "") or n.get("source", "") or "")
+                        link = str(n.get("link", "") or n.get("url", "") or "")
+                        pub_time = n.get("providerPublishTime") or n.get("pubDate")
+                        if title:
+                            news_items.append({
+                                "ticker": tk,
+                                "title": title,
+                                "publisher": publisher,
+                                "link": link,
+                                "time": pub_time,
+                            })
+                _time.sleep(0.3)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # ── 종합 점수 계산 ─────────────────────────────────────────────────────
+    ok_count = sum(1 for v in signals.values() if v["ok"])
+    total = len(signals)
+    risk_score = int((1 - ok_count / total) * 10) if total > 0 else 0
+
+    if risk_score >= 7:
+        risk_level = "🔴 HIGH RISK"
+        risk_color = "#dc2626"
+        risk_msg = "복수의 선행 지표에서 경고 신호. 신규 매수 자제, 포지션 축소 권장."
+    elif risk_score >= 4:
+        risk_level = "🟡 CAUTION"
+        risk_color = "#f59e0b"
+        risk_msg = "일부 경고 신호 감지. 종목 선별 신중히, 손절 라인 점검 권장."
+    elif risk_score >= 2:
+        risk_level = "🟢 MODERATE"
+        risk_color = "#16a34a"
+        risk_msg = "소수 경고 신호. 대체로 안전하나 모니터링 유지."
+    else:
+        risk_level = "🟢 LOW RISK"
+        risk_color = "#16a34a"
+        risk_msg = "선행 지표 이상 없음. 정상적인 투자 환경."
+
+    return {
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "risk_color": risk_color,
+        "risk_msg": risk_msg,
+        "signals": signals,
+        "warnings": warnings,
+        "details": details,
+        "news_items": news_items,
+        "sector_filter": sector_filter,
+    }
+
+
 def fetch_short_interest(ticker_upper: str) -> dict:
     """공매도 비율 + 숏 스퀴즈 가능성 계산."""
     try:
@@ -6859,6 +7061,173 @@ if st.session_state.get("logged_in"):
     is_etf_mode = quote_type == "ETF"
     
     if main_nav == _MAIN_NAV_OPTIONS[0]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 🚨 Daily Risk Gauge
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader("🚨 Daily Risk Gauge")
+        st.caption("매일 접속 시 시장 하락 선행 신호 5가지를 자동 스캔합니다. 전날 미리 경고를 포착하는 게 목표예요.")
+
+        drg_col1, drg_col2 = st.columns([2, 3])
+        with drg_col1:
+            sector_choice = st.selectbox(
+                "📊 분석 섹터",
+                options=["전체", "테크·반도체", "에너지", "금융", "헬스케어", "산업재", "소비재", "부동산"],
+                key="drg_sector_choice",
+            )
+        with drg_col2:
+            st.caption(f"선택 섹터: **{sector_choice}** | 30분 캐시")
+
+        if st.button("🔄 지금 스캔", key="drg_refresh_btn", use_container_width=True):
+            compute_daily_risk_gauge.clear()
+
+        with st.spinner("선행 지표 5가지 분석 중..."):
+            drg = compute_daily_risk_gauge(sector_filter=sector_choice)
+
+        risk_score = drg["risk_score"]
+        st.markdown(
+            f"<div style='background:{drg['risk_color']}22;border:2px solid {drg['risk_color']};"
+            f"border-radius:12px;padding:20px;margin:12px 0;text-align:center;'>"
+            f"<div style='font-size:32px;font-weight:900;color:{drg['risk_color']}'>{drg['risk_level']}</div>"
+            f"<div style='font-size:16px;margin-top:6px;'>{drg['risk_msg']}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+        bar_width = int(risk_score / 10 * 100)
+        st.markdown(
+            f"<div style='background:#1e293b;border-radius:8px;padding:4px;margin:4px 0 8px 0;'>"
+            f"<div style='background:{drg['risk_color']};width:{bar_width}%;height:20px;border-radius:6px;"
+            f"display:flex;align-items:center;justify-content:center;color:white;font-size:12px;font-weight:700;'>"
+            f"Risk {risk_score}/10"
+            f"</div></div>",
+            unsafe_allow_html=True
+        )
+
+        st.markdown("### 📡 선행 신호 5가지")
+        sig = drg["signals"]
+        s_col1, s_col2, s_col3, s_col4, s_col5 = st.columns(5)
+        signal_defs = [
+            ("vix",     "VIX 방향",     "🌡️"),
+            ("credit",  "신용 스프레드", "💳"),
+            ("leaders", "대장주 모멘텀", "🏆"),
+            ("volume",  "거래량 패턴",   "📦"),
+            ("vix_vxn", "VIX/VXN",      "⚡"),
+        ]
+        for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5], signal_defs):
+            with col:
+                s = sig.get(key, {})
+                ok = s.get("ok", True)
+                val = s.get("value", "N/A")
+                status = "✅ 정상" if ok else "⚠️ 경고"
+                color = "#16a34a" if ok else "#dc2626"
+                st.markdown(
+                    f"<div style='text-align:center;padding:10px;background:#1e293b;border-radius:8px;"
+                    f"border:1px solid {color};'>"
+                    f"<div style='font-size:20px'>{emoji}</div>"
+                    f"<div style='font-size:11px;color:#94a3b8'>{label}</div>"
+                    f"<div style='font-weight:700;color:{color}'>{status}</div>"
+                    f"<div style='font-size:11px;color:#cbd5e1'>{val}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+        warnings_drg = drg.get("warnings", [])
+        if warnings_drg:
+            st.divider()
+            st.markdown("### ⚠️ 감지된 경고 신호")
+            for w in warnings_drg:
+                st.warning(w)
+        else:
+            st.success("✅ 현재 감지된 선행 경고 신호 없음 — 시장 환경 정상")
+
+        with st.expander("🔍 신호 상세 데이터", expanded=False):
+            for key, data in drg.get("details", {}).items():
+                st.markdown(f"**{key}**")
+                if isinstance(data, dict):
+                    for k2, v2 in data.items():
+                        if isinstance(v2, dict):
+                            st.markdown("  - `" + k2 + "`: " + " / ".join(f"{kk}={vv}" for kk, vv in v2.items()))
+                        else:
+                            st.markdown(f"  - {k2}: **{v2}**")
+
+        news_items = drg.get("news_items", [])
+        if news_items:
+            st.divider()
+            st.markdown("### 📰 관련 최신 뉴스")
+            for n in news_items[:8]:
+                time_str = ""
+                if n.get("time"):
+                    try:
+                        import datetime as _dt
+                        dt = _dt.datetime.fromtimestamp(n["time"], tz=_dt.timezone.utc).astimezone(_KST_TZ)
+                        time_str = dt.strftime("%m/%d %H:%M")
+                    except Exception:
+                        pass
+                link = n.get("link", "")
+                title = n.get("title", "")
+                publisher = n.get("publisher", "")
+                ticker = n.get("ticker", "")
+                if link:
+                    st.markdown(f"**{ticker}** | [{title}]({link}) — _{publisher}_ {time_str}")
+                else:
+                    st.markdown(f"**{ticker}** | {title} — _{publisher}_ {time_str}")
+
+        st.divider()
+        st.markdown("### 🤖 AI 내일 시장 예측")
+        st.caption("선행 신호 5가지 + 최신 뉴스를 종합해 Gemini AI가 내일 시장 방향을 분석합니다. 장 전/후 실행 권장.")
+
+        if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
+            news_text = "\n".join([
+                f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
+                for n in news_items[:10]
+            ]) if news_items else "최신 뉴스 없음"
+            signal_summary = "\n".join([
+                f"- {label}: {'정상' if sig.get(key, {}).get('ok', True) else '경고'} | {sig.get(key, {}).get('value', 'N/A')}"
+                for key, label, _ in signal_defs
+            ])
+            warning_text = "\n".join(warnings_drg) if warnings_drg else "없음"
+            now_kst = datetime.now(_KST_TZ)
+            market_session = "장 전" if now_kst.hour < 9 else ("장 중" if now_kst.hour < 16 else "장 후")
+            drg_prompt = (
+                "당신은 월가 수석 퀀트 전략가입니다.\n"
+                f"현재 시각: {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
+                f"분석 섹터: {sector_choice}\n\n"
+                "[선행 지표 5가지]\n" + signal_summary + "\n\n"
+                "[감지된 경고]\n" + warning_text + "\n\n"
+                "[최신 뉴스]\n" + news_text + "\n\n"
+                "반드시 아래 형식으로 한국어 작성:\n\n"
+                "## 내일 시장 방향: [상승 우세 / 중립 / 하락 우세]\n\n"
+                "**기술적 근거:** (선행 지표 기반, 수치 포함)\n\n"
+                "**뉴스 센티먼트:** (뉴스가 시장에 미칠 영향)\n\n"
+                "**주요 리스크:** (2가지)\n\n"
+                "**대응 전략:**\n"
+                "- 보유 중이라면:\n"
+                "- 매수 고려 중이라면:\n"
+                "- 현금 비중이라면:\n\n"
+                "*본 분석은 참고용이며 투자 권유가 아닙니다.*"
+            )
+            with st.spinner("Gemini AI 분석 중... (약 15초)"):
+                _drg_model = _GenAIModel(
+                    "gemini-2.5-flash",
+                    generation_config={"temperature": 0.0, "max_output_tokens": 2048}
+                )
+                _drg_response = _drg_model.generate_content(drg_prompt)
+                _drg_text = _gemini_response_text_utf8_safe(_drg_response)
+            if _drg_text:
+                st.session_state["_drg_ai_result"] = _drg_text
+                st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
+                st.rerun()
+
+        if st.session_state.get("_drg_ai_result"):
+            st.info(f"🕐 분석 시각: {st.session_state.get('_drg_ai_time', '')} KST")
+            _txt = st.session_state["_drg_ai_result"]
+            if "하락 우세" in _txt:
+                st.error(_txt)
+            elif "상승 우세" in _txt:
+                st.success(_txt)
+            else:
+                st.warning(_txt)
+
+    elif main_nav == _MAIN_NAV_OPTIONS[12]:
         st.title("📖 Quant Terminal 사용 가이드")
         st.markdown("처음 오셨나요? **실제 매수 결정부터 매도까지** 앱의 모든 탭을 어떤 순서로, 어떻게 활용하는지 단계별로 설명합니다.")
         st.info("💡 **핵심 원칙:** 이 앱은 단 하나의 신호로 매수 결정을 내리지 않습니다. Macro → Sector → Stock 3개 레이어가 모두 같은 방향을 가리킬 때만 높은 확신으로 진입할 수 있습니다.")
@@ -10475,7 +10844,7 @@ if st.session_state.get("logged_in"):
         # 🔔 Buy Watchlist & Alert
         # 관심 종목 등록 + 매수 조건(목표가/RSI/200일선) 자동 체크
         # ─────────────────────────────────────────────────────────────────────
-        st.subheader("🔔 Buy Watchlist & Alert")
+        st.subheader(_MAIN_NAV_OPTIONS[7])
         st.caption(
             "관심 종목을 등록하고 **매수 조건**을 설정하세요. "
             "앱 접속 시 조건이 자동으로 체크되며, 발동 시 상단에 알림이 표시됩니다."
