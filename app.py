@@ -9133,35 +9133,36 @@ if st.session_state.get("logged_in"):
                         if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
                             with st.spinner("한글로 번역 중..."):
                                 try:
-                                    # 문장 단위로 분할해서 번역 (청크당 300단어)
-                                    import textwrap as _tw
-                                    _words = summary_en.split()
-                                    _chunk_size = 300
-                                    _chunks = [
-                                        " ".join(_words[i:i+_chunk_size])
-                                        for i in range(0, len(_words), _chunk_size)
-                                    ]
+                                    # 영문 길이 기반 토큰 계산
+                                    # 한글은 영문보다 토큰 2~3배 → 단어수 × 5 + 여유분
+                                    _word_count = len(summary_en.split())
+                                    _max_tok = min(8192, max(2048, _word_count * 6))
                                     _tr_model = _GenAIModel(
                                         "gemini-2.5-flash",
-                                        generation_config={"temperature": 0.0, "max_output_tokens": 2048}
+                                        generation_config={"temperature": 0.0, "max_output_tokens": _max_tok}
                                     )
-                                    _tr_parts = []
-                                    _tr_ok = True
-                                    for _chunk in _chunks:
-                                        _tr_prompt = (
-                                            "아래 영문을 한국어로 번역하세요. "
-                                            "요약하거나 생략하지 말고 모든 문장을 번역하세요. "
-                                            "번역문만 출력하세요.\n\n" + _chunk
-                                        )
-                                        _tr_resp = _tr_model.generate_content(_tr_prompt)
-                                        _part = _gemini_response_text_utf8_safe(_tr_resp)
-                                        if _part:
-                                            _tr_parts.append(_part.strip())
-                                        else:
-                                            _tr_ok = False
-                                            break
-                                    if _tr_ok and _tr_parts:
-                                        _tr_text = " ".join(_tr_parts)
+                                    _tr_prompt = (
+                                        "다음 영문 회사 소개를 한국어로 완전히 번역하세요.\n"
+                                        "반드시 모든 문장을 빠짐없이 번역해야 합니다. 요약하거나 생략하면 안 됩니다.\n"
+                                        "번역이 완료되면 반드시 마지막 줄에 '---END---' 를 출력하세요.\n"
+                                        "한국어 번역문과 '---END---' 외에 다른 내용은 출력하지 마세요.\n\n"
+                                        f"[원문]\n{summary_en}"
+                                    )
+                                    _tr_resp = _tr_model.generate_content(_tr_prompt)
+                                    _tr_raw = _gemini_response_text_utf8_safe(_tr_resp) or ""
+                                    # ---END--- 확인 → 번역 완료 여부 판단
+                                    if "---END---" in _tr_raw:
+                                        _tr_text = _tr_raw.split("---END---")[0].strip()
+                                    else:
+                                        # 잘렸을 경우 → 마지막 온전한 문장까지만 사용
+                                        _tr_text = _tr_raw.strip()
+                                        # 마지막 문장 부호 이후가 잘린 경우 처리
+                                        for _end_char in ["다.", "요.", "습니다.", "입니다."]:
+                                            _last = _tr_raw.rfind(_end_char)
+                                            if _last > len(_tr_raw) * 0.8:
+                                                _tr_text = _tr_raw[:_last + len(_end_char)].strip()
+                                                break
+                                    if _tr_text:
                                         st.session_state[_sum_key] = _tr_text
                                         st.rerun()
                                     else:
