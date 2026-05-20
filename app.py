@@ -8617,8 +8617,43 @@ if st.session_state.get("logged_in"):
             snap_em = st.session_state.get("scanner_results_emerging")
             if isinstance(snap_em, dict) and isinstance(snap_em.get("score_df"), pd.DataFrame) and not snap_em["score_df"].empty:
                 render_opportunity_emerging_snapshot(snap_em)
+
+                # Emerging 자동 저장 (스캔 직후 session에 있을 때)
+                _em_sc_uid = str(st.session_state.get("user_id") or "").strip()
+                _em_sc_last = st.session_state.get("_em_scanner_saved_date")
+                _em_sc_today = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+                if _em_sc_last != _em_sc_today:
+                    _ok_em_sc, _ = save_scanner_result_history(_em_sc_uid, snap_em["score_df"])
+                    if _ok_em_sc:
+                        st.session_state["_em_scanner_saved_date"] = _em_sc_today
+                        load_scanner_history.clear()
+
             elif not run_emerge:
                 st.caption("Emerging 엔진 스캔을 실행하면 RSI·거래량 가속 지표와 함께 결과가 세션에 유지됩니다.")
+
+            # ── Emerging 히스토리 ──────────────────────────────────────────
+            _em_uid3 = str(st.session_state.get("user_id") or "").strip()
+            with st.expander("📚 Emerging 스캐너 히스토리 (과거 TOP 결과 추적)", expanded=False):
+                em_sc_hist = load_scanner_history(_em_uid3)
+                if em_sc_hist.empty:
+                    st.info("아직 히스토리가 없어요. Emerging 스캔 실행 시 자동 저장됩니다.")
+                else:
+                    # 종목별 등장 빈도
+                    em_freq = em_sc_hist.groupby("Ticker").agg(
+                        등장횟수=("Ticker", "count"),
+                        평균점수=("Score", "mean"),
+                        최근날짜=("Date", "max"),
+                        최고순위=("Rank", "min"),
+                    ).reset_index().sort_values("등장횟수", ascending=False)
+                    em_freq["평균점수"] = em_freq["평균점수"].round(1)
+
+                    st.markdown("**🌱 자주 등장한 Emerging 종목 (신뢰도 높은 신호)**")
+                    st.dataframe(em_freq.head(15), use_container_width=True, hide_index=True)
+
+                    # 최근 스캔 기록
+                    st.markdown("**📅 최근 Emerging 스캔 기록**")
+                    recent_em = em_sc_hist.sort_values("Date", ascending=False).head(20)
+                    st.dataframe(recent_em, use_container_width=True, hide_index=True)
     
     elif main_nav == _MAIN_NAV_OPTIONS[3]:
         syn_s1, syn_s2 = st.columns([1, 3])
