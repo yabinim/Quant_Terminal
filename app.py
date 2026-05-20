@@ -949,7 +949,7 @@ class _GenAIModel:
                 last_exc = exc
                 err_str = str(exc).lower()
                 # 재시도 가능한 오류: 503(과부하), 429(rate limit), 500(서버오류)
-                retryable = any(code in err_str for code in ["503", "500", "unavailable", "internal"])
+                retryable = any(code in err_str for code in ["503", "500", "unavailable", "internal", "server", "overloaded", "resource"])
                 if retryable and attempt < max_retries - 1:
                     wait = delays[attempt]
                     _time.sleep(wait)
@@ -960,7 +960,7 @@ class _GenAIModel:
 
 
 model = _GenAIModel(
-    "gemini-3.0-flash",  # 1.5가 아닌 가장 최근에 입력했던 2.5로 통일!
+    "gemini-2.5-flash",  # 1.5가 아닌 가장 최근에 입력했던 2.5로 통일!
     generation_config={
         "temperature": 0.0,  # AI의 상상력을 0으로 통제 (일관성 극대화)
         "top_p": 1,
@@ -971,7 +971,7 @@ model = _GenAIModel(
 )
 
 # 1.6 스캐너 내러티브 전용: 티커 청크별 Gemini 호출 · JSON MIME + max_output_tokens(8192) + 세탁 후 파싱
-_SCANNER_NARRATIVE_BATCH_MODEL_ID = "gemini-3.0-flash"
+_SCANNER_NARRATIVE_BATCH_MODEL_ID = "gemini-2.5-flash"
 # 티커를 한 번에 너무 많이 넘기면 응답이 잘려 JSONDecodeError(Unterminated string)가 날 수 있어 상한을 둔다.
 _SCANNER_NARRATIVE_TICKER_CHUNK_SIZE = 20
 
@@ -2439,8 +2439,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
     """
     개별 주식이 어떤 ETF의 보유 종목에 포함되어 있는지 찾기.
-    상위 20개 주요 ETF를 체크. VOO/SPY 같은 대형 ETF는 많은 종목 보유.
-    반환: [{"etf": "SMH", "weight": 8.5, "rank": 2}]
+    컬럼명에 의존하지 않고 row의 숫자값을 직접 순회해서 weight 추출.
     """
     if not stock_ticker:
         return []
@@ -2454,6 +2453,20 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
         "IWM", "MGK", "RSP", "XLF", "XLV",
         "XLE", "XLY", "XLI", "CIBR", "BOTZ",
     ]
+
+    def _extract_weight_from_row(row) -> float:
+        """row에서 0~100 범위의 숫자를 weight로 추출."""
+        for val in row:
+            num = pd.to_numeric(val, errors="coerce")
+            if pd.isna(num):
+                continue
+            # 0~1 범위면 % 비중 (0.05 → 5%)
+            if 0 < num <= 1:
+                return round(float(num) * 100, 3)
+            # 0~100 범위면 이미 %
+            if 1 < num <= 100:
+                return round(float(num), 3)
+        return np.nan
 
     for etf_tk in check_list:
         try:
@@ -2470,10 +2483,10 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
             except Exception:
                 pass
 
-            # 방법 2: get_holdings()
+            # 방법 2: fund_top_holdings 속성
             if holdings_df is None or holdings_df.empty:
                 try:
-                    h2 = tk.get_holdings()
+                    h2 = tk.fund_top_holdings
                     if h2 is not None and not h2.empty:
                         holdings_df = h2.copy()
                 except Exception:
@@ -2482,50 +2495,35 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
             if holdings_df is None or holdings_df.empty:
                 continue
 
-            # target 검색 — index 또는 컬럼에서
             found = False
             rank = -1
             weight = np.nan
 
-            # Case A: index에 ticker가 있는 경우 (가장 흔한 패턴)
+            # Case A: index가 ticker (가장 흔한 패턴)
             idx_list = [str(i).strip().upper() for i in holdings_df.index]
             if target in idx_list:
                 found = True
                 rank = idx_list.index(target) + 1
-                # weight 컬럼 찾기 (다양한 컬럼명 대응)
-                for w_col in ["% Assets", "Weight", "weight", "Holding %", "pctHolding", "value"]:
-                    if w_col in holdings_df.columns:
-                        raw_w = holdings_df.iloc[rank-1][w_col]
-                        w_val = pd.to_numeric(raw_w, errors="coerce")
-                        if pd.notna(w_val):
-                            # 0~1 범위면 100 곱하기
-                            weight = float(w_val * 100) if w_val <= 1 else float(w_val)
-                        break
+                row = holdings_df.iloc[rank - 1]
+                weight = _extract_weight_from_row(row.values)
 
-            # Case B: 컬럼에 symbol 있는 경우
+            # Case B: 컬럼 중 하나가 ticker
             if not found:
-                sym_col = next(
-                    (c for c in holdings_df.columns
-                     if c.lower() in ("symbol", "ticker", "holding", "name")),
-                    None
-                )
-                if sym_col:
-                    col_list = holdings_df[sym_col].astype(str).str.upper().tolist()
-                    if target in col_list:
+                for col in holdings_df.columns:
+                    col_vals = holdings_df[col].astype(str).str.strip().str.upper().tolist()
+                    if target in col_vals:
                         found = True
-                        rank = col_list.index(target) + 1
-                        for w_col in ["% Assets", "Weight", "weight", "Holding %", "pctHolding"]:
-                            if w_col in holdings_df.columns:
-                                raw_w = holdings_df.iloc[rank-1][w_col]
-                                w_val = pd.to_numeric(raw_w, errors="coerce")
-                                if pd.notna(w_val):
-                                    weight = float(w_val * 100) if w_val <= 1 else float(w_val)
-                                break
+                        rank = col_vals.index(target) + 1
+                        row = holdings_df.iloc[rank - 1]
+                        # ticker 컬럼 제외한 나머지 값에서 weight 추출
+                        other_vals = [v for c, v in zip(holdings_df.columns, row.values) if c != col]
+                        weight = _extract_weight_from_row(other_vals)
+                        break
 
             if found:
                 results.append({
                     "etf": etf_tk,
-                    "weight": round(weight, 2) if pd.notna(weight) else None,
+                    "weight": weight if pd.notna(weight) else None,
                     "rank": rank,
                 })
         except Exception:
@@ -2533,7 +2531,6 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
 
     results.sort(key=lambda x: (x.get("weight") or 0), reverse=True)
     return results
-
 
 def fetch_short_interest(ticker_upper: str) -> dict:
     """공매도 비율 + 숏 스퀴즈 가능성 계산."""
@@ -3897,15 +3894,29 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame) -> tuple[b
         uid_u = str(user_id).strip().upper()
         rows = []
         for rank_idx, (_, row) in enumerate(score_df.head(10).iterrows(), start=1):
-            rows.append([
-                uid_u, today_str,
-                str(row.get("Ticker", "")),
-                str(round(float(row.get("Final Score", 0)), 2)),
-                str(rank_idx),
-                str(row.get("Verdict", ""))[:50] if "Verdict" in row else "",
-                str(round(float(row.get("RS Score", 0)), 2)) if "RS Score" in row else "",
-                str(round(float(row.get("1M Return", 0)), 2)) if "1M Return" in row else "",
-            ])
+            # 컬럼명 유연하게 처리 (Current Leaders / Emerging 둘 다 지원)
+            _ticker = str(row.get("Ticker", ""))
+            _score = str(round(float(row.get("Final Score", 0) or 0), 2))
+            _verdict = str(row.get("Narrative Why", row.get("Verdict", "")))[:50]
+            # RS Score: Current Leaders는 "RS Score", Emerging은 "Early RS Score"
+            _rs = ""
+            for _rs_col in ["RS Score", "Early RS Score", "RS"]:
+                if _rs_col in row and pd.notna(row[_rs_col]):
+                    try:
+                        _rs = str(round(float(row[_rs_col]), 2))
+                    except Exception:
+                        pass
+                    break
+            # 1M Return: Current Leaders는 "Momentum Score", Emerging은 "Vol Accel Score"
+            _mom = ""
+            for _mom_col in ["1M Return", "Momentum Score", "Vol Accel Score"]:
+                if _mom_col in row and pd.notna(row[_mom_col]):
+                    try:
+                        _mom = str(round(float(row[_mom_col]), 2))
+                    except Exception:
+                        pass
+                    break
+            rows.append([uid_u, today_str, _ticker, _score, str(rank_idx), _verdict, _rs, _mom])
         if rows:
             ws.append_rows(rows, value_input_option="USER_ENTERED")
         return True, ""
@@ -5349,61 +5360,76 @@ def render_opportunity_scanner_snapshot(snap):
                 st.metric(label, _scanner_ui_fmt_2f(row[key]))
         st.markdown(f"**Narrative Why:** {row['Narrative Why']}")
         st.markdown(f"**Risk:** {row['Risk']}")
-        # Watchlist 추가 버튼
+        # Watchlist 추가 버튼 (on_click 방식)
+        def _add_sc_top3_wl(tk=tk_scan, r=rank, _row=row):
+            _uid_s = str(st.session_state.get("user_id") or "").strip()
+            _p_s = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+            _item_s = {
+                "ticker": tk,
+                "memo": f"AI 스캐너 TOP{r} - Final Score: {_scanner_ui_fmt_2f(_row['Final Score'])}",
+                "alert_price": np.nan, "alert_rsi": np.nan, "alert_ma200": False,
+                "saved_price": float(_p_s) if pd.notna(_p_s) else np.nan,
+                "date_added": _narrative_now_kst_string(),
+            }
+            _wl_s = load_watchlist_sheet(_uid_s)
+            _wl_s = [x for x in _wl_s if x["ticker"] != tk]
+            _wl_s.append(_item_s)
+            _ok_s, _err_s = save_watchlist_sheet(_uid_s, _wl_s)
+            if _ok_s:
+                st.session_state[f"_sc_wl_added_{tk}"] = True
+                st.session_state["_watchlist_alert_checked"] = False
+                st.session_state.pop("_sidebar_wl_count", None)
         btn_col1, btn_col2 = st.columns([1, 3])
         with btn_col1:
-            if st.button(f"🔔 {tk_scan} Watchlist 추가", key=f"scanner_wl_add_{rank_idx}_{tk_scan}", use_container_width=True):
-                _uid_scan = str(st.session_state.get("user_id") or "").strip()
-                _cur_price_scan = fetch_latest_prices_for_tickers((tk_scan,)).get(tk_scan, np.nan)
-                _scan_wl_item = {
-                    "ticker": tk_scan,
-                    "memo": f"AI 스캐너 TOP{rank} - Final Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
-                    "alert_price": np.nan,
-                    "alert_rsi": np.nan,
-                    "alert_ma200": False,
-                    "saved_price": float(_cur_price_scan) if pd.notna(_cur_price_scan) else np.nan,
-                    "date_added": _narrative_now_kst_string(),
-                }
-                _scan_wl_cur = load_watchlist_sheet(_uid_scan)
-                _scan_wl_cur = [x for x in _scan_wl_cur if x["ticker"] != tk_scan]
-                _scan_wl_cur.append(_scan_wl_item)
-                _ok_scan, _err_scan = save_watchlist_sheet(_uid_scan, _scan_wl_cur)
-                if _ok_scan:
-                    st.success(f"✅ {tk_scan}을 Watchlist에 추가했어요!")
-                    st.session_state["_watchlist_alert_checked"] = False
-                else:
-                    st.error(f"저장 실패: {_err_scan}")
+            if st.session_state.get(f"_sc_wl_added_{tk_scan}"):
+                st.success(f"✅ {tk_scan} 추가됨!")
+            else:
+                st.button(f"🔔 {tk_scan} Watchlist 추가",
+                    key=f"scanner_wl_add_{rank_idx}_{tk_scan}",
+                    on_click=_add_sc_top3_wl,
+                    use_container_width=True)
         st.divider()
 
     remain_df = score_df.iloc[3:].copy()
     if not remain_df.empty:
         st.markdown("### 4위 이하 종목")
         show_cols = [
-            "Ticker",
-            "Name",
-            "Final Score",
-            "Narrative Score",
-            "Momentum Score",
-            "RS Score",
-            "Fundamentals Score",
-            "Institutional Score",
-            "Valuation Score",
+            "Ticker", "Name", "Final Score", "Narrative Score",
+            "Momentum Score", "RS Score", "Fundamentals Score",
+            "Institutional Score", "Valuation Score",
         ]
         num_fmt = st.column_config.NumberColumn(format="%.2f")
         st.dataframe(
-            remain_df[show_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Final Score": num_fmt,
-                "Narrative Score": num_fmt,
-                "Momentum Score": num_fmt,
-                "RS Score": num_fmt,
-                "Fundamentals Score": num_fmt,
-                "Institutional Score": num_fmt,
-                "Valuation Score": num_fmt,
-            },
+            remain_df[show_cols], use_container_width=True, hide_index=True,
+            column_config={c: num_fmt for c in show_cols if c not in ("Ticker", "Name")},
         )
+        # 4위 이하 Watchlist 추가
+        st.markdown("**🔔 Watchlist에 추가하기:**")
+        _rem_cols = st.columns(min(len(remain_df), 5))
+        for _ri, (_, _rrow) in enumerate(remain_df.head(5).iterrows()):
+            _rtk = str(_rrow["Ticker"]).strip().upper()
+            with _rem_cols[_ri]:
+                def _add_rem_wl(tk=_rtk, row=_rrow):
+                    _uid_r = str(st.session_state.get("user_id") or "").strip()
+                    _p_r = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+                    _item_r = {
+                        "ticker": tk,
+                        "memo": f"AI 스캐너 - Final Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
+                        "alert_price": np.nan, "alert_rsi": np.nan, "alert_ma200": False,
+                        "saved_price": float(_p_r) if pd.notna(_p_r) else np.nan,
+                        "date_added": _narrative_now_kst_string(),
+                    }
+                    _wl_r = load_watchlist_sheet(_uid_r)
+                    _wl_r = [x for x in _wl_r if x["ticker"] != tk]
+                    _wl_r.append(_item_r)
+                    _ok_r, _ = save_watchlist_sheet(_uid_r, _wl_r)
+                    if _ok_r:
+                        st.session_state[f"_sc_wl_added_{tk}"] = True
+                        st.session_state.pop("_sidebar_wl_count", None)
+                if st.session_state.get(f"_sc_wl_added_{_rtk}"):
+                    st.success(f"✅ {_rtk}")
+                else:
+                    st.button(f"🔔 {_rtk}", key=f"rem_wl_{_ri}_{_rtk}", on_click=_add_rem_wl, use_container_width=True)
     else:
         st.caption("유니버스 종목 수가 3개 이하라 추가 표시는 없습니다.")
 
@@ -6452,7 +6478,7 @@ def analyze_deep_dive(query, news_data, language):
     news_text = "\n\n".join(chunks).strip()
 
     deep_dive_model = _GenAIModel(
-        "gemini-3.0-flash",
+        "gemini-2.5-flash",
         generation_config={
             "temperature": 0.0,
             "top_p": 1,
@@ -6846,7 +6872,7 @@ def _split_narrative_records_wow(records, anchor_utc=None):
 
 def _narrative_timeseries_briefing_model():
     return _GenAIModel(
-        "gemini-3.0-flash",
+        "gemini-2.5-flash",
         generation_config={
             "temperature": 0.0,
             "top_p": 0.95,
@@ -6903,7 +6929,7 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
 
     try:
         summary_model = _GenAIModel(
-            "gemini-3.0-flash",
+            "gemini-2.5-flash",
             generation_config={
                 "temperature": 0.0,
                 "top_p": 1,
@@ -7459,7 +7485,7 @@ if st.session_state.get("logged_in"):
             )
             with st.spinner("Gemini AI 분석 중... (약 15초)"):
                 _drg_model = _GenAIModel(
-                    "gemini-3.0-flash",
+                    "gemini-2.5-flash",
                     generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                 )
                 _drg_response = _drg_model.generate_content(drg_prompt)
@@ -8581,7 +8607,12 @@ if st.session_state.get("logged_in"):
                             "universe": list(target_u_em),
                             "completed_at": datetime.now(timezone.utc).isoformat(),
                         }
-                        st.success("Emerging Opportunities 스캔 완료 — 결과가 세션에 저장되었습니다.")
+                        # Emerging 히스토리 저장
+                        _em_uid_sc = str(st.session_state.get("user_id") or "").strip()
+                        _ok_em_hist, _ = save_scanner_result_history(_em_uid_sc, em_df)
+                        if _ok_em_hist:
+                            load_scanner_history.clear()
+                        st.success("Emerging Opportunities 스캔 완료 — 결과가 세션 및 히스토리에 저장되었습니다.")
     
             snap_em = st.session_state.get("scanner_results_emerging")
             if isinstance(snap_em, dict) and isinstance(snap_em.get("score_df"), pd.DataFrame) and not snap_em["score_df"].empty:
@@ -9055,8 +9086,12 @@ if st.session_state.get("logged_in"):
         st.markdown(f"**분석 티커:** `{selected_ticker}`")
 
         # ── 회사 기본 정보 ────────────────────────────────────────────────
-        with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
-            co = fetch_company_overview(str(selected_ticker).strip().upper())
+        try:
+            with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
+                co = fetch_company_overview(str(selected_ticker).strip().upper())
+        except Exception as _co_err:
+            co = {}
+            st.warning(f"회사 기본정보 조회 실패: {_co_err}")
 
         if co:
             name_str = co.get("name", selected_ticker)
@@ -9112,35 +9147,21 @@ if st.session_state.get("logged_in"):
                         if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
                             with st.spinner("한글로 번역 중..."):
                                 try:
-                                    # 문장 단위로 분할해서 번역 (청크당 300단어)
-                                    import textwrap as _tw
-                                    _words = summary_en.split()
-                                    _chunk_size = 300
-                                    _chunks = [
-                                        " ".join(_words[i:i+_chunk_size])
-                                        for i in range(0, len(_words), _chunk_size)
-                                    ]
+                                    # 입력 텍스트를 800단어로 제한 (출력 토큰 안정화)
+                                    _words_list = summary_en.split()
+                                    _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
                                     _tr_model = _GenAIModel(
-                                        "gemini-3.0-flash",
-                                        generation_config={"temperature": 0.0, "max_output_tokens": 2048}
+                                        "gemini-2.5-flash",
+                                        generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                                     )
-                                    _tr_parts = []
-                                    _tr_ok = True
-                                    for _chunk in _chunks:
-                                        _tr_prompt = (
-                                            "아래 영문을 한국어로 번역하세요. "
-                                            "요약하거나 생략하지 말고 모든 문장을 번역하세요. "
-                                            "번역문만 출력하세요.\n\n" + _chunk
-                                        )
-                                        _tr_resp = _tr_model.generate_content(_tr_prompt)
-                                        _part = _gemini_response_text_utf8_safe(_tr_resp)
-                                        if _part:
-                                            _tr_parts.append(_part.strip())
-                                        else:
-                                            _tr_ok = False
-                                            break
-                                    if _tr_ok and _tr_parts:
-                                        _tr_text = " ".join(_tr_parts)
+                                    _tr_prompt = (
+                                        "다음 영문 회사 소개를 한국어로 번역하세요. "
+                                        "모든 문장을 빠짐없이 번역하고, 번역문만 출력하세요.\n\n"
+                                        + _capped
+                                    )
+                                    _tr_resp = _tr_model.generate_content(_tr_prompt)
+                                    _tr_text = (_gemini_response_text_utf8_safe(_tr_resp) or "").strip()
+                                    if _tr_text:
                                         st.session_state[_sum_key] = _tr_text
                                         st.rerun()
                                     else:
@@ -9154,9 +9175,13 @@ if st.session_state.get("logged_in"):
                 st.caption("주요 ETF 20개 중 이 종목을 보유 중인 ETF를 자동으로 찾습니다.")
                 _etf_list_key = f"_etf_holding_{selected_ticker}"
                 if st.session_state.get(_etf_list_key) is None:
-                    with st.spinner(f"{selected_ticker} 보유 ETF 검색 중... (약 10초)"):
-                        _etf_list = find_etfs_holding_stock(selected_ticker)
-                    st.session_state[_etf_list_key] = _etf_list
+                    try:
+                        with st.spinner(f"{selected_ticker} 보유 ETF 검색 중... (약 10초)"):
+                            _etf_list = find_etfs_holding_stock(selected_ticker)
+                        st.session_state[_etf_list_key] = _etf_list
+                    except Exception as _etf_err:
+                        st.session_state[_etf_list_key] = []
+                        st.warning(f"ETF 보유 목록 조회 실패: {_etf_err}")
                 _etf_result = st.session_state.get(_etf_list_key, [])
                 if _etf_result:
                     st.success(f"**{selected_ticker}** 를 보유한 ETF **{len(_etf_result)}개** 발견!")
@@ -9528,8 +9553,8 @@ if st.session_state.get("logged_in"):
         # ── Earnings Surprise 히스토리 ────────────────────────────────────
         if not is_etf_mode:
             st.divider()
-            st.markdown("### 📅 Earnings Surprise 히스토리")
-            st.caption("최근 분기별 EPS 예상 vs 실제. 어닝 서프라이즈가 꾸준히 양수면 실적 퀄리티가 높은 종목입니다.")
+            st.markdown("### 📅 Earnings 히스토리")
+            st.caption("최근 분기별 실적 데이터입니다.")
             try:
                 with st.spinner("어닝 데이터 불러오는 중..."):
                     earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
@@ -9604,6 +9629,8 @@ if st.session_state.get("logged_in"):
             try:
                 with st.spinner("공매도 데이터 불러오는 중..."):
                     short_data = fetch_short_interest(str(selected_ticker).strip().upper())
+                    if short_data is None:
+                        short_data = {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
 
                 si_c1, si_c2, si_c3 = st.columns(3)
                 with si_c1:
@@ -9754,7 +9781,7 @@ if st.session_state.get("logged_in"):
 
                 with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
                     _diag_model = _GenAIModel(
-                        "gemini-3.0-flash",
+                        "gemini-2.5-flash",
                         generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
