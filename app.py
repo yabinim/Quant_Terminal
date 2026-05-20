@@ -5346,61 +5346,76 @@ def render_opportunity_scanner_snapshot(snap):
                 st.metric(label, _scanner_ui_fmt_2f(row[key]))
         st.markdown(f"**Narrative Why:** {row['Narrative Why']}")
         st.markdown(f"**Risk:** {row['Risk']}")
-        # Watchlist 추가 버튼
+        # Watchlist 추가 버튼 (on_click 방식)
+        def _add_sc_top3_wl(tk=tk_scan, r=rank, _row=row):
+            _uid_s = str(st.session_state.get("user_id") or "").strip()
+            _p_s = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+            _item_s = {
+                "ticker": tk,
+                "memo": f"AI 스캐너 TOP{r} - Final Score: {_scanner_ui_fmt_2f(_row['Final Score'])}",
+                "alert_price": np.nan, "alert_rsi": np.nan, "alert_ma200": False,
+                "saved_price": float(_p_s) if pd.notna(_p_s) else np.nan,
+                "date_added": _narrative_now_kst_string(),
+            }
+            _wl_s = load_watchlist_sheet(_uid_s)
+            _wl_s = [x for x in _wl_s if x["ticker"] != tk]
+            _wl_s.append(_item_s)
+            _ok_s, _err_s = save_watchlist_sheet(_uid_s, _wl_s)
+            if _ok_s:
+                st.session_state[f"_sc_wl_added_{tk}"] = True
+                st.session_state["_watchlist_alert_checked"] = False
+                st.session_state.pop("_sidebar_wl_count", None)
         btn_col1, btn_col2 = st.columns([1, 3])
         with btn_col1:
-            if st.button(f"🔔 {tk_scan} Watchlist 추가", key=f"scanner_wl_add_{rank_idx}_{tk_scan}", use_container_width=True):
-                _uid_scan = str(st.session_state.get("user_id") or "").strip()
-                _cur_price_scan = fetch_latest_prices_for_tickers((tk_scan,)).get(tk_scan, np.nan)
-                _scan_wl_item = {
-                    "ticker": tk_scan,
-                    "memo": f"AI 스캐너 TOP{rank} - Final Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
-                    "alert_price": np.nan,
-                    "alert_rsi": np.nan,
-                    "alert_ma200": False,
-                    "saved_price": float(_cur_price_scan) if pd.notna(_cur_price_scan) else np.nan,
-                    "date_added": _narrative_now_kst_string(),
-                }
-                _scan_wl_cur = load_watchlist_sheet(_uid_scan)
-                _scan_wl_cur = [x for x in _scan_wl_cur if x["ticker"] != tk_scan]
-                _scan_wl_cur.append(_scan_wl_item)
-                _ok_scan, _err_scan = save_watchlist_sheet(_uid_scan, _scan_wl_cur)
-                if _ok_scan:
-                    st.success(f"✅ {tk_scan}을 Watchlist에 추가했어요!")
-                    st.session_state["_watchlist_alert_checked"] = False
-                else:
-                    st.error(f"저장 실패: {_err_scan}")
+            if st.session_state.get(f"_sc_wl_added_{tk_scan}"):
+                st.success(f"✅ {tk_scan} 추가됨!")
+            else:
+                st.button(f"🔔 {tk_scan} Watchlist 추가",
+                    key=f"scanner_wl_add_{rank_idx}_{tk_scan}",
+                    on_click=_add_sc_top3_wl,
+                    use_container_width=True)
         st.divider()
 
     remain_df = score_df.iloc[3:].copy()
     if not remain_df.empty:
         st.markdown("### 4위 이하 종목")
         show_cols = [
-            "Ticker",
-            "Name",
-            "Final Score",
-            "Narrative Score",
-            "Momentum Score",
-            "RS Score",
-            "Fundamentals Score",
-            "Institutional Score",
-            "Valuation Score",
+            "Ticker", "Name", "Final Score", "Narrative Score",
+            "Momentum Score", "RS Score", "Fundamentals Score",
+            "Institutional Score", "Valuation Score",
         ]
         num_fmt = st.column_config.NumberColumn(format="%.2f")
         st.dataframe(
-            remain_df[show_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Final Score": num_fmt,
-                "Narrative Score": num_fmt,
-                "Momentum Score": num_fmt,
-                "RS Score": num_fmt,
-                "Fundamentals Score": num_fmt,
-                "Institutional Score": num_fmt,
-                "Valuation Score": num_fmt,
-            },
+            remain_df[show_cols], use_container_width=True, hide_index=True,
+            column_config={c: num_fmt for c in show_cols if c not in ("Ticker", "Name")},
         )
+        # 4위 이하 Watchlist 추가
+        st.markdown("**🔔 Watchlist에 추가하기:**")
+        _rem_cols = st.columns(min(len(remain_df), 5))
+        for _ri, (_, _rrow) in enumerate(remain_df.head(5).iterrows()):
+            _rtk = str(_rrow["Ticker"]).strip().upper()
+            with _rem_cols[_ri]:
+                def _add_rem_wl(tk=_rtk, row=_rrow):
+                    _uid_r = str(st.session_state.get("user_id") or "").strip()
+                    _p_r = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+                    _item_r = {
+                        "ticker": tk,
+                        "memo": f"AI 스캐너 - Final Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
+                        "alert_price": np.nan, "alert_rsi": np.nan, "alert_ma200": False,
+                        "saved_price": float(_p_r) if pd.notna(_p_r) else np.nan,
+                        "date_added": _narrative_now_kst_string(),
+                    }
+                    _wl_r = load_watchlist_sheet(_uid_r)
+                    _wl_r = [x for x in _wl_r if x["ticker"] != tk]
+                    _wl_r.append(_item_r)
+                    _ok_r, _ = save_watchlist_sheet(_uid_r, _wl_r)
+                    if _ok_r:
+                        st.session_state[f"_sc_wl_added_{tk}"] = True
+                        st.session_state.pop("_sidebar_wl_count", None)
+                if st.session_state.get(f"_sc_wl_added_{_rtk}"):
+                    st.success(f"✅ {_rtk}")
+                else:
+                    st.button(f"🔔 {_rtk}", key=f"rem_wl_{_ri}_{_rtk}", on_click=_add_rem_wl, use_container_width=True)
     else:
         st.caption("유니버스 종목 수가 3개 이하라 추가 표시는 없습니다.")
 
@@ -8578,7 +8593,12 @@ if st.session_state.get("logged_in"):
                             "universe": list(target_u_em),
                             "completed_at": datetime.now(timezone.utc).isoformat(),
                         }
-                        st.success("Emerging Opportunities 스캔 완료 — 결과가 세션에 저장되었습니다.")
+                        # Emerging 히스토리 저장
+                        _em_uid_sc = str(st.session_state.get("user_id") or "").strip()
+                        _ok_em_hist, _ = save_scanner_result_history(_em_uid_sc, em_df)
+                        if _ok_em_hist:
+                            load_scanner_history.clear()
+                        st.success("Emerging Opportunities 스캔 완료 — 결과가 세션 및 히스토리에 저장되었습니다.")
     
             snap_em = st.session_state.get("scanner_results_emerging")
             if isinstance(snap_em, dict) and isinstance(snap_em.get("score_df"), pd.DataFrame) and not snap_em["score_df"].empty:
