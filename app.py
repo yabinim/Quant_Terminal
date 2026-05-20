@@ -949,7 +949,7 @@ class _GenAIModel:
                 last_exc = exc
                 err_str = str(exc).lower()
                 # 재시도 가능한 오류: 503(과부하), 429(rate limit), 500(서버오류)
-                retryable = any(code in err_str for code in ["503", "500", "unavailable", "internal"])
+                retryable = any(code in err_str for code in ["503", "500", "unavailable", "internal", "server", "overloaded", "resource"])
                 if retryable and attempt < max_retries - 1:
                     wait = delays[attempt]
                     _time.sleep(wait)
@@ -3894,15 +3894,29 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame) -> tuple[b
         uid_u = str(user_id).strip().upper()
         rows = []
         for rank_idx, (_, row) in enumerate(score_df.head(10).iterrows(), start=1):
-            rows.append([
-                uid_u, today_str,
-                str(row.get("Ticker", "")),
-                str(round(float(row.get("Final Score", 0)), 2)),
-                str(rank_idx),
-                str(row.get("Verdict", ""))[:50] if "Verdict" in row else "",
-                str(round(float(row.get("RS Score", 0)), 2)) if "RS Score" in row else "",
-                str(round(float(row.get("1M Return", 0)), 2)) if "1M Return" in row else "",
-            ])
+            # 컬럼명 유연하게 처리 (Current Leaders / Emerging 둘 다 지원)
+            _ticker = str(row.get("Ticker", ""))
+            _score = str(round(float(row.get("Final Score", 0) or 0), 2))
+            _verdict = str(row.get("Narrative Why", row.get("Verdict", "")))[:50]
+            # RS Score: Current Leaders는 "RS Score", Emerging은 "Early RS Score"
+            _rs = ""
+            for _rs_col in ["RS Score", "Early RS Score", "RS"]:
+                if _rs_col in row and pd.notna(row[_rs_col]):
+                    try:
+                        _rs = str(round(float(row[_rs_col]), 2))
+                    except Exception:
+                        pass
+                    break
+            # 1M Return: Current Leaders는 "Momentum Score", Emerging은 "Vol Accel Score"
+            _mom = ""
+            for _mom_col in ["1M Return", "Momentum Score", "Vol Accel Score"]:
+                if _mom_col in row and pd.notna(row[_mom_col]):
+                    try:
+                        _mom = str(round(float(row[_mom_col]), 2))
+                    except Exception:
+                        pass
+                    break
+            rows.append([uid_u, today_str, _ticker, _score, str(rank_idx), _verdict, _rs, _mom])
         if rows:
             ws.append_rows(rows, value_input_option="USER_ENTERED")
         return True, ""
@@ -9133,35 +9147,20 @@ if st.session_state.get("logged_in"):
                         if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
                             with st.spinner("한글로 번역 중..."):
                                 try:
-                                    # 영문 길이 기반 토큰 계산
-                                    # 한글은 영문보다 토큰 2~3배 → 단어수 × 5 + 여유분
-                                    _word_count = len(summary_en.split())
-                                    _max_tok = min(8192, max(2048, _word_count * 6))
+                                    # 입력 텍스트를 800단어로 제한 (출력 토큰 안정화)
+                                    _words_list = summary_en.split()
+                                    _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
                                     _tr_model = _GenAIModel(
                                         "gemini-2.5-flash",
-                                        generation_config={"temperature": 0.0, "max_output_tokens": _max_tok}
+                                        generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                                     )
                                     _tr_prompt = (
-                                        "다음 영문 회사 소개를 한국어로 완전히 번역하세요.\n"
-                                        "반드시 모든 문장을 빠짐없이 번역해야 합니다. 요약하거나 생략하면 안 됩니다.\n"
-                                        "번역이 완료되면 반드시 마지막 줄에 '---END---' 를 출력하세요.\n"
-                                        "한국어 번역문과 '---END---' 외에 다른 내용은 출력하지 마세요.\n\n"
-                                        f"[원문]\n{summary_en}"
+                                        "다음 영문 회사 소개를 한국어로 번역하세요. "
+                                        "모든 문장을 빠짐없이 번역하고, 번역문만 출력하세요.\n\n"
+                                        + _capped
                                     )
                                     _tr_resp = _tr_model.generate_content(_tr_prompt)
-                                    _tr_raw = _gemini_response_text_utf8_safe(_tr_resp) or ""
-                                    # ---END--- 확인 → 번역 완료 여부 판단
-                                    if "---END---" in _tr_raw:
-                                        _tr_text = _tr_raw.split("---END---")[0].strip()
-                                    else:
-                                        # 잘렸을 경우 → 마지막 온전한 문장까지만 사용
-                                        _tr_text = _tr_raw.strip()
-                                        # 마지막 문장 부호 이후가 잘린 경우 처리
-                                        for _end_char in ["다.", "요.", "습니다.", "입니다."]:
-                                            _last = _tr_raw.rfind(_end_char)
-                                            if _last > len(_tr_raw) * 0.8:
-                                                _tr_text = _tr_raw[:_last + len(_end_char)].strip()
-                                                break
+                                    _tr_text = (_gemini_response_text_utf8_safe(_tr_resp) or "").strip()
                                     if _tr_text:
                                         st.session_state[_sum_key] = _tr_text
                                         st.rerun()
