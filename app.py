@@ -2546,6 +2546,65 @@ def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14)
         return {}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_company_overview(ticker_upper: str) -> dict:
+    """회사 기본 정보 조회."""
+    try:
+        info = yf.Ticker(str(ticker_upper).strip().upper()).info or {}
+        name = str(info.get("longName") or info.get("shortName") or ticker_upper)
+        sector = str(info.get("sector") or "N/A")
+        industry = str(info.get("industry") or "N/A")
+        country = str(info.get("country") or "N/A")
+        summary = str(info.get("longBusinessSummary") or "")[:400]
+        employees = info.get("fullTimeEmployees")
+        market_cap = to_float(info.get("marketCap"))
+        website = str(info.get("website") or "")
+        # 다음 실적 발표일
+        next_earnings = None
+        try:
+            cal = yf.Ticker(str(ticker_upper).strip().upper()).calendar
+            if cal is not None and not cal.empty:
+                if "Earnings Date" in cal.index:
+                    ed = cal.loc["Earnings Date"]
+                    if hasattr(ed, '__iter__'):
+                        next_earnings = str(list(ed)[0])[:10] if len(list(ed)) > 0 else None
+                    else:
+                        next_earnings = str(ed)[:10]
+        except Exception:
+            # info에서 대안
+            ts = info.get("earningsTimestamp")
+            if ts:
+                try:
+                    next_earnings = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+        return {
+            "name": name, "sector": sector, "industry": industry,
+            "country": country, "summary": summary,
+            "employees": employees, "market_cap": market_cap,
+            "website": website, "next_earnings": next_earnings,
+        }
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_price_history_by_period(ticker_upper: str, period: str) -> pd.DataFrame:
+    """기간별 주가 히스토리 조회."""
+    period_map = {
+        "1D": ("1d", "5m"), "1M": ("1mo", "1d"), "3M": ("3mo", "1d"),
+        "YTD": ("ytd", "1d"), "1Y": ("1y", "1d"), "5Y": ("5y", "1wk"), "MAX": ("max", "1mo"),
+    }
+    yf_period, interval = period_map.get(period, ("1y", "1d"))
+    try:
+        hist = yf.Ticker(str(ticker_upper).strip().upper()).history(
+            period=yf_period, interval=interval, auto_adjust=True
+        )
+        return hist if hist is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
 def calculate_macd(close_series: pd.Series, fast=12, slow=26, signal=9):
     """MACD 라인, 시그널 라인, 히스토그램 반환."""
     ema_fast = close_series.ewm(span=fast, adjust=False).mean()
@@ -2816,12 +2875,9 @@ def evaluate_kpis(ticker_symbol):
         },
         {
             "Category": "모멘텀 (Momentum)",
-            "KPI": "가격 > MA50 & MA200",
-            "Value": (
-                f"현재가 {num_str(current_price)} / MA50 {num_str(ma50)} / "
-                f"MA200 {num_str(ma200)}"
-            ),
-            "Rule": "정배열(상향)",
+            "KPI": "가격>MA50&MA200",
+            "Value": f"${num_str(current_price)} / MA50 ${num_str(ma50)} / MA200 ${num_str(ma200)}",
+            "Rule": "정배열",
             "Pass": pass_fail_badge(momentum_pass, pd.isna(current_price) or pd.isna(ma50) or pd.isna(ma200)),
         },
     ]
@@ -7194,12 +7250,14 @@ if st.session_state.get("logged_in"):
                 "[선행 지표 5가지]\n" + signal_summary + "\n\n"
                 "[감지된 경고]\n" + warning_text + "\n\n"
                 "[최신 뉴스]\n" + news_text + "\n\n"
+                "중요: 각 항목은 반드시 3문장 이내로 간결하게 작성. 불필요한 서론/수식어 금지.\n\n"
                 "반드시 아래 형식으로 한국어 작성:\n\n"
                 "## 내일 시장 방향: [상승 우세 / 중립 / 하락 우세]\n\n"
-                "**기술적 근거:** (선행 지표 기반, 수치 포함)\n\n"
-                "**뉴스 센티먼트:** (뉴스가 시장에 미칠 영향)\n\n"
-                "**주요 리스크:** (2가지)\n\n"
-                "**대응 전략:**\n"
+                "**기술적 근거:** (선행 지표 수치 기반, 3문장 이내)\n\n"
+                "**뉴스 센티먼트:** (뉴스 영향, 2문장 이내)\n\n"
+                "**주요 리스크:** (번호 목록, 각 1문장)\n"
+                "1. \n2. \n\n"
+                "**대응 전략:** (각 1~2문장)\n"
                 "- 보유 중이라면:\n"
                 "- 매수 고려 중이라면:\n"
                 "- 현금 비중이라면:\n\n"
@@ -7208,7 +7266,7 @@ if st.session_state.get("logged_in"):
             with st.spinner("Gemini AI 분석 중... (약 15초)"):
                 _drg_model = _GenAIModel(
                     "gemini-2.5-flash",
-                    generation_config={"temperature": 0.0, "max_output_tokens": 2048}
+                    generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                 )
                 _drg_response = _drg_model.generate_content(drg_prompt)
                 _drg_text = _gemini_response_text_utf8_safe(_drg_response)
@@ -7805,78 +7863,102 @@ if st.session_state.get("logged_in"):
                 )
                 if st.button("🔍 Emerging 종목 검증 실행", key="emerging_verify_btn", type="primary", use_container_width=True):
                     with st.spinner(f"Emerging {len(all_emerging)}개 종목 정량 검증 중..."):
-                        verified = verify_emerging_with_quant(all_emerging)
-
-                    if not verified:
-                        st.warning("Emerging 종목 검증 데이터를 가져오지 못했습니다.")
-                    else:
-                        # 최적 매수 타이밍 종목 강조
-                        best = [v for v in verified if "최적" in v["verdict"]]
-                        early = [v for v in verified if "얼리" in v["verdict"]]
-
-                        if best:
-                            st.success(f"🎯 **최적 매수 타이밍 {len(best)}개** — 아직 저평가 + 거래량 급증!")
-                            for v in best:
-                                vol_str = f"거래량 {v['vol_surge']:.1f}x" if v["vol_surge"] else ""
-                                st.markdown(
-                                    f"**{v['ticker']}** — RS {v['rs_score']:+.1f}%p / "
-                                    f"1개월 {v['mom_1m']:+.1f}% / {vol_str} | _{v['detail']}_"
-                                )
-                                if st.button(f"🔔 {v['ticker']} Watchlist 추가", key=f"em_wl_{v['ticker']}", use_container_width=False):
-                                    _uid_em = str(st.session_state.get("user_id") or "").strip()
-                                    _em_item = {
-                                        "ticker": v["ticker"],
-                                        "memo": f"Emerging 검증 - {v['verdict']}",
-                                        "alert_price": np.nan,
-                                        "alert_rsi": 30.0,
-                                        "alert_ma200": True,
-                                        "saved_price": np.nan,
-                                        "date_added": _narrative_now_kst_string(),
-                                    }
-                                    _em_wl = load_watchlist_sheet(_uid_em)
-                                    _em_wl = [x for x in _em_wl if x["ticker"] != v["ticker"]]
-                                    _em_wl.append(_em_item)
-                                    save_watchlist_sheet(_uid_em, _em_wl)
-                                    st.success(f"✅ {v['ticker']} Watchlist 추가!")
-                                    st.session_state.pop("_sidebar_wl_count", None)
-
-                        if early:
-                            st.info(f"🌱 **얼리버드 기회 {len(early)}개** — 아직 초기, 200일선 위")
-                            for v in early:
-                                st.markdown(f"**{v['ticker']}** — {v['detail']}")
-
+                        _v_result = verify_emerging_with_quant(all_emerging)
+                    if _v_result:
+                        st.session_state["_emerging_verified"] = _v_result
+                        st.session_state["_emerging_themes_data"] = themes_data
                         # 자동 저장
-                        _em_uid = str(st.session_state.get("user_id") or "").strip()
-                        _saved_count = 0
-                        for v in verified:
-                            _theme_str = ", ".join([
-                                str(t.get("title", "")) for t in themes_data
-                                if isinstance(t, dict) and v["ticker"] in str(t.get("emerging", ""))
-                            ])
-                            _ok, _ = upsert_emerging_tracker(
-                                _em_uid, v["ticker"],
-                                _theme_str or "내러티브",
-                                v["verdict"],
-                                v["rs_score"]
-                            )
-                            if _ok:
-                                _saved_count += 1
-                        if _saved_count > 0:
-                            st.caption(f"💾 {_saved_count}개 Emerging 종목이 추적 시트에 자동 저장됐어요.")
+                        _em_uid2 = str(st.session_state.get("user_id") or "").strip()
+                        for _v in _v_result:
+                            _tstr = ", ".join([str(t.get("title","")) for t in themes_data if isinstance(t,dict) and _v["ticker"] in str(t.get("emerging",""))])
+                            upsert_emerging_tracker(_em_uid2, _v["ticker"], _tstr or "내러티브", _v["verdict"], _v["rs_score"])
+                        st.rerun()
+                    else:
+                        st.warning("Emerging 종목 검증 데이터를 가져오지 못했습니다.")
 
-                        # 전체 결과 테이블
-                        with st.expander("📋 전체 Emerging 검증 결과", expanded=False):
-                            em_rows = []
-                            for v in verified:
-                                em_rows.append({
-                                    "티커": v["ticker"],
-                                    "판정": v["verdict"],
-                                    "RS Score": f"{v['rs_score']:+.1f}%p" if v["rs_score"] is not None else "N/A",
-                                    "1개월 수익률": f"{v['mom_1m']:+.1f}%" if v["mom_1m"] is not None else "N/A",
-                                    "200일선": "위 ✅" if v["above_ma200"] else ("아래 ❌" if v["above_ma200"] is False else "N/A"),
-                                    "거래량 배율": f"{v['vol_surge']:.1f}x" if v["vol_surge"] else "N/A",
-                                })
-                            st.dataframe(pd.DataFrame(em_rows), use_container_width=True, hide_index=True)
+                # 검증 결과 표시 (session_state에서 복원 → 버튼 클릭 후에도 유지)
+                _verified_cache = st.session_state.get("_emerging_verified", [])
+                if _verified_cache:
+                    best = [v for v in _verified_cache if "최적" in v["verdict"]]
+                    early = [v for v in _verified_cache if "얼리" in v["verdict"]]
+
+                    if best:
+                        st.success(f"🎯 **최적 매수 타이밍 {len(best)}개** — 아직 저평가 + 거래량 급증!")
+                        for v in best:
+                            vol_str = f"거래량 {v['vol_surge']:.1f}x" if v["vol_surge"] else ""
+                            st.markdown(
+                                f"**{v['ticker']}** — RS {v['rs_score']:+.1f}%p / "
+                                f"1개월 {v['mom_1m']:+.1f}% / {vol_str} | _{v['detail']}_"
+                            )
+                            def _add_to_wl_em(tk=v["ticker"], vdict=v):
+                                _uid_em = str(st.session_state.get("user_id") or "").strip()
+                                _cur_p = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+                                _em_item = {
+                                    "ticker": tk,
+                                    "memo": f"Emerging 검증 - {vdict['verdict']}",
+                                    "alert_price": np.nan,
+                                    "alert_rsi": 30.0,
+                                    "alert_ma200": True,
+                                    "saved_price": float(_cur_p) if pd.notna(_cur_p) else np.nan,
+                                    "date_added": _narrative_now_kst_string(),
+                                }
+                                _em_wl = load_watchlist_sheet(_uid_em)
+                                _em_wl = [x for x in _em_wl if x["ticker"] != tk]
+                                _em_wl.append(_em_item)
+                                _ok_em, _ = save_watchlist_sheet(_uid_em, _em_wl)
+                                if _ok_em:
+                                    st.session_state[f"_em_wl_added_{tk}"] = True
+                                    st.session_state.pop("_sidebar_wl_count", None)
+                            tk_key = v["ticker"]
+                            if st.session_state.get(f"_em_wl_added_{tk_key}"):
+                                st.success(f"✅ {tk_key} Watchlist 추가됨!")
+                            else:
+                                st.button(
+                                    f"🔔 {tk_key} Watchlist 추가",
+                                    key=f"em_wl_{tk_key}",
+                                    on_click=_add_to_wl_em,
+                                    use_container_width=False,
+                                )
+
+                    if early:
+                        st.info(f"🌱 **얼리버드 기회 {len(early)}개** — 아직 초기, 200일선 위")
+                        for v in early:
+                            st.markdown(f"**{v['ticker']}** — {v['detail']}")
+                            def _add_early_wl(tk=v["ticker"], vd=v):
+                                _uid_el = str(st.session_state.get("user_id") or "").strip()
+                                _cur_p2 = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+                                _el_item = {
+                                    "ticker": tk, "memo": f"Emerging 얼리버드 - {vd['detail']}",
+                                    "alert_price": np.nan, "alert_rsi": 35.0, "alert_ma200": True,
+                                    "saved_price": float(_cur_p2) if pd.notna(_cur_p2) else np.nan,
+                                    "date_added": _narrative_now_kst_string(),
+                                }
+                                _el_wl = load_watchlist_sheet(_uid_el)
+                                _el_wl = [x for x in _el_wl if x["ticker"] != tk]
+                                _el_wl.append(_el_item)
+                                _ok_el, _ = save_watchlist_sheet(_uid_el, _el_wl)
+                                if _ok_el:
+                                    st.session_state[f"_em_wl_added_{tk}"] = True
+                                    st.session_state.pop("_sidebar_wl_count", None)
+                            tk_e = v["ticker"]
+                            if st.session_state.get(f"_em_wl_added_{tk_e}"):
+                                st.success(f"✅ {tk_e} Watchlist 추가됨!")
+                            else:
+                                st.button(f"🔔 {tk_e} Watchlist 추가", key=f"em_wl_e_{tk_e}", on_click=_add_early_wl)
+
+                    with st.expander("📋 전체 Emerging 검증 결과", expanded=False):
+                        em_rows = []
+                        for v in _verified_cache:
+                            em_rows.append({
+                                "티커": v["ticker"], "판정": v["verdict"],
+                                "RS Score": f"{v['rs_score']:+.1f}%p" if v["rs_score"] is not None else "N/A",
+                                "1개월 수익률": f"{v['mom_1m']:+.1f}%" if v["mom_1m"] is not None else "N/A",
+                                "200일선": "위 ✅" if v["above_ma200"] else ("아래 ❌" if v["above_ma200"] is False else "N/A"),
+                                "거래량 배율": f"{v['vol_surge']:.1f}x" if v["vol_surge"] else "N/A",
+                            })
+                        st.dataframe(pd.DataFrame(em_rows), use_container_width=True, hide_index=True)
+                    
+                    st.caption(f"💾 {len(_verified_cache)}개 Emerging 종목 추적 시트에 자동 저장됨.")
     
         st.markdown("### 🕒 시계열 분석 엔진")
         st.caption(
@@ -8778,8 +8860,78 @@ if st.session_state.get("logged_in"):
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
         )
         st.markdown(f"**분석 티커:** `{selected_ticker}`")
-    
-        st.markdown("### 체력 검사 (Fundamentals)")
+
+        # ── 회사 기본 정보 ────────────────────────────────────────────────
+        with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
+            co = fetch_company_overview(str(selected_ticker).strip().upper())
+
+        if co:
+            st.markdown(
+                f"## {co.get('name', selected_ticker)}"
+                + (f" — [{co.get('website','').replace('https://','').replace('http://','')[:30]}]({co.get('website','')})" if co.get('website') else "")
+            )
+            info_c1, info_c2, info_c3, info_c4 = st.columns(4)
+            with info_c1:
+                st.metric("섹터", co.get("sector", "N/A"))
+            with info_c2:
+                st.metric("산업", co.get("industry", "N/A")[:20] if co.get("industry") else "N/A")
+            with info_c3:
+                mc = co.get("market_cap")
+                st.metric("시가총액", usd_short_str(mc) if mc else "N/A")
+            with info_c4:
+                ne = co.get("next_earnings")
+                if ne:
+                    try:
+                        days_to_earn = (datetime.strptime(ne[:10], "%Y-%m-%d") - datetime.now()).days
+                        earn_label = f"D-{days_to_earn}일" if days_to_earn >= 0 else f"{abs(days_to_earn)}일 전"
+                        st.metric("다음 실적 발표", ne[:10], delta=earn_label)
+                    except Exception:
+                        st.metric("다음 실적 발표", ne[:10])
+                else:
+                    st.metric("다음 실적 발표", "N/A")
+
+            if co.get("summary"):
+                with st.expander("📋 회사 소개", expanded=False):
+                    st.markdown(co["summary"] + ("..." if len(co.get("summary","")) >= 400 else ""))
+
+        st.divider()
+
+        # ── 기간별 주가 차트 ──────────────────────────────────────────────
+        st.markdown("### 📈 주가 차트")
+        period_options = ["1D", "1M", "3M", "YTD", "1Y", "5Y", "MAX"]
+        selected_period = st.radio(
+            "기간 선택",
+            period_options,
+            index=4,  # 기본값 1Y
+            horizontal=True,
+            key="stock_chart_period",
+            label_visibility="collapsed",
+        )
+        with st.spinner(f"{selected_ticker} {selected_period} 차트 로딩 중..."):
+            period_hist = fetch_price_history_by_period(str(selected_ticker).strip().upper(), selected_period)
+
+        if period_hist is not None and not period_hist.empty and "Close" in period_hist.columns:
+            close_p = pd.to_numeric(period_hist["Close"], errors="coerce").dropna()
+            if not close_p.empty:
+                first_p = float(close_p.iloc[0])
+                last_p = float(close_p.iloc[-1])
+                change_pct = (last_p / first_p - 1) * 100 if first_p > 0 else 0
+                chg_col1, chg_col2, chg_col3 = st.columns(3)
+                with chg_col1:
+                    st.metric("현재가", f"${last_p:.2f}")
+                with chg_col2:
+                    st.metric(f"{selected_period} 수익률", f"{change_pct:+.2f}%")
+                with chg_col3:
+                    high_p = float(close_p.max())
+                    low_p = float(close_p.min())
+                    st.metric("기간 고점/저점", f"${high_p:.2f} / ${low_p:.2f}")
+
+                chart_pdf = pd.DataFrame({"Close": close_p})
+                st.line_chart(chart_pdf, use_container_width=True, height=260)
+        else:
+            st.warning("차트 데이터를 가져오지 못했습니다.")
+
+        st.divider()
         st.caption("yfinance 기반 KPI 점검 (Pass/Fail)")
         syn_f1, syn_f2 = st.columns([1, 3])
         with syn_f1:
