@@ -9008,8 +9008,9 @@ if st.session_state.get("logged_in"):
                                         generation_config={"temperature": 0.0, "max_output_tokens": 2048}
                                     )
                                     _tr_prompt = (
-                                        "아래 영문 회사 소개를 자연스럽고 완전한 한국어로 번역하세요. "
-                                        "내용을 생략하지 말고 전체를 번역하세요. 번역문만 출력하세요.\n\n"
+                                        "아래 영문 회사 소개를 한국어로 번역하세요.\n"
+                                        "절대 요약하거나 생략하지 마세요. 원문의 모든 문장을 빠짐없이 번역하세요.\n"
+                                        "번역문만 출력하고 설명이나 추가 코멘트는 쓰지 마세요.\n\n"
                                         + summary_en
                                     )
                                     _tr_resp = _tr_model.generate_content(_tr_prompt)
@@ -9171,17 +9172,40 @@ if st.session_state.get("logged_in"):
                 for category in category_order:
                     st.markdown(f"### {category}")
                     cat_df = kpi_df[kpi_df["Category"] == category].reset_index(drop=True)
-                    for idx in range(0, len(cat_df), 2):
-                        cols = st.columns(2)
-                        for j in range(2):
-                            row_idx = idx + j
-                            if row_idx >= len(cat_df):
-                                continue
-                            row = cat_df.iloc[row_idx]
-                            with cols[j]:
-                                st.metric(label=row["KPI"], value=row["Value"], delta=row["Rule"])
-                                st.markdown(f"판정: {row['Pass']}")
-    
+
+                    if category == "모멘텀 (Momentum)":
+                        # 모멘텀은 값이 길어서 카드 형태로 별도 표시
+                        for _, row in cat_df.iterrows():
+                            _pass_str = str(row["Pass"])
+                            _is_pass = "Pass" in _pass_str and "Fail" not in _pass_str
+                            _is_fail = "Fail" in _pass_str
+                            _is_nodata = "No Data" in _pass_str
+                            _card_color = "#16a34a" if _is_pass else ("#dc2626" if _is_fail else "#94a3b8")
+                            _pass_label = "✅ Pass" if _is_pass else ("❌ Fail" if _is_fail else "⚫ 데이터 없음")
+                            _val = str(row["Value"])
+                            _parts = [p.strip() for p in _val.split("/") if p.strip()]
+                            _html = (
+                                f"<div style='background:#1e293b;border-radius:10px;padding:14px 16px;"
+                                f"border-left:4px solid {_card_color};margin:6px 0;'>"
+                                f"<div style='color:{_card_color};font-weight:700;font-size:15px;margin-bottom:8px;'>"
+                                f"{_pass_label} — {row['Rule']}</div>"
+                            )
+                            for _p in _parts:
+                                _html += f"<div style='font-size:14px;color:#e2e8f0;margin:2px 0;'>• {_p}</div>"
+                            _html += "</div>"
+                            st.markdown(_html, unsafe_allow_html=True)
+                    else:
+                        for idx in range(0, len(cat_df), 2):
+                            cols = st.columns(2)
+                            for j in range(2):
+                                row_idx = idx + j
+                                if row_idx >= len(cat_df):
+                                    continue
+                                row = cat_df.iloc[row_idx]
+                                with cols[j]:
+                                    st.metric(label=row["KPI"], value=row["Value"], delta=row["Rule"])
+                                    st.markdown(f"판정: {row['Pass']}")
+
                     if category == "밸류에이션 (Valuation)":
                         intrinsic_col, mos_col = st.columns(2)
                         with intrinsic_col:
@@ -9199,8 +9223,9 @@ if st.session_state.get("logged_in"):
                                 pct_points_str(margin_context.get("margin_of_safety")),
                                 delta=f"현재가 {num_str(margin_context.get('current_price'))}",
                             )
-    
+
                     st.divider()
+
     
                 with st.expander("원본 KPI 테이블 보기"):
                     st.dataframe(
