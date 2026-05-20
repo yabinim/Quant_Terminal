@@ -3889,6 +3889,22 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: st
             ws.update([_SCANNER_HISTORY_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
         else:
             ws = sh.worksheet(_SCANNER_HISTORY_SHEET_TITLE)
+            # ── 헤더 마이그레이션: Engine 컬럼 없으면 자동 추가 ──────────
+            cur_header = ws.row_values(1)
+            if "Engine" not in cur_header:
+                # 기존 데이터 전체 읽기
+                all_vals = ws.get_all_values()
+                # 시트 초기화 후 새 헤더로 재작성
+                ws.clear()
+                ws.update([_SCANNER_HISTORY_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
+                # 기존 데이터를 새 포맷으로 변환 (Engine="Leaders" 삽입)
+                if len(all_vals) > 1:
+                    migrated = []
+                    for old_row in all_vals[1:]:
+                        old_row = (old_row + [""] * 8)[:8]
+                        # ID, Date, [Engine삽입], Ticker, Score, Rank, Verdict, RS_Score, Mom_1M
+                        migrated.append([old_row[0], old_row[1], "Leaders"] + old_row[2:])
+                    ws.append_rows(migrated, value_input_option="USER_ENTERED")
 
         today_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
         uid_u = str(user_id).strip().upper()
