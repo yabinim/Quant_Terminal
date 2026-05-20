@@ -9052,8 +9052,12 @@ if st.session_state.get("logged_in"):
         st.markdown(f"**분석 티커:** `{selected_ticker}`")
 
         # ── 회사 기본 정보 ────────────────────────────────────────────────
-        with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
-            co = fetch_company_overview(str(selected_ticker).strip().upper())
+        try:
+            with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
+                co = fetch_company_overview(str(selected_ticker).strip().upper())
+        except Exception as _co_err:
+            co = {}
+            st.warning(f"회사 기본정보 조회 실패: {_co_err}")
 
         if co:
             name_str = co.get("name", selected_ticker)
@@ -9151,9 +9155,13 @@ if st.session_state.get("logged_in"):
                 st.caption("주요 ETF 20개 중 이 종목을 보유 중인 ETF를 자동으로 찾습니다.")
                 _etf_list_key = f"_etf_holding_{selected_ticker}"
                 if st.session_state.get(_etf_list_key) is None:
-                    with st.spinner(f"{selected_ticker} 보유 ETF 검색 중... (약 10초)"):
-                        _etf_list = find_etfs_holding_stock(selected_ticker)
-                    st.session_state[_etf_list_key] = _etf_list
+                    try:
+                        with st.spinner(f"{selected_ticker} 보유 ETF 검색 중... (약 10초)"):
+                            _etf_list = find_etfs_holding_stock(selected_ticker)
+                        st.session_state[_etf_list_key] = _etf_list
+                    except Exception as _etf_err:
+                        st.session_state[_etf_list_key] = []
+                        st.warning(f"ETF 보유 목록 조회 실패: {_etf_err}")
                 _etf_result = st.session_state.get(_etf_list_key, [])
                 if _etf_result:
                     st.success(f"**{selected_ticker}** 를 보유한 ETF **{len(_etf_result)}개** 발견!")
@@ -9525,8 +9533,8 @@ if st.session_state.get("logged_in"):
         # ── Earnings Surprise 히스토리 ────────────────────────────────────
         if not is_etf_mode:
             st.divider()
-            st.markdown("### 📅 Earnings Surprise 히스토리")
-            st.caption("최근 분기별 EPS 예상 vs 실제. 어닝 서프라이즈가 꾸준히 양수면 실적 퀄리티가 높은 종목입니다.")
+            st.markdown("### 📅 Earnings 히스토리")
+            st.caption("최근 분기별 실적 데이터입니다.")
             try:
                 with st.spinner("어닝 데이터 불러오는 중..."):
                     earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
@@ -9601,6 +9609,8 @@ if st.session_state.get("logged_in"):
             try:
                 with st.spinner("공매도 데이터 불러오는 중..."):
                     short_data = fetch_short_interest(str(selected_ticker).strip().upper())
+                    if short_data is None:
+                        short_data = {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
 
                 si_c1, si_c2, si_c3 = st.columns(3)
                 with si_c1:
