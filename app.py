@@ -8941,6 +8941,13 @@ if st.session_state.get("logged_in"):
                             st.warning("⚠️ 모멘텀 약화 초기 신호 — 매도 준비 또는 손절 라인 설정 권장")
     
     elif main_nav == _MAIN_NAV_OPTIONS[5]:
+        render_sync_button(
+            "sync_tab_stock",
+            [cached_evaluate_kpis_snapshot.clear, cached_etf_holdings_universe_str.clear,
+             cached_build_etf_holdings_performance_pairs.clear, cached_timing_price_history.clear,
+             fetch_company_overview.clear, fetch_price_history_by_period.clear],
+            "종목별 재무·차트·회사정보 캐시를 비우고 최신 데이터를 받습니다.",
+        )
         st.subheader(_MAIN_NAV_OPTIONS[5])
         st.caption(
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
@@ -8970,7 +8977,14 @@ if st.session_state.get("logged_in"):
             with info_c2:
                 industry_display = co.get("industry", "N/A")
                 industry_en = co.get("industry_en", "")
-                st.metric("산업", industry_display[:18] if industry_display else "N/A")
+                # ETF 소속 여부 확인
+                _universe = load_etf_universe_tickers_merged()
+                _tk_upper = str(selected_ticker).strip().upper()
+                if _tk_upper in [t.upper() for t in _universe]:
+                    st.metric("산업", industry_display[:14] if industry_display else "N/A")
+                    st.caption(f"📊 ETF Universe 포함")
+                else:
+                    st.metric("산업", industry_display[:18] if industry_display else "N/A")
                 if industry_en and industry_en != industry_display:
                     st.caption(industry_en[:25])
             with info_c3:
@@ -9079,12 +9093,8 @@ if st.session_state.get("logged_in"):
             st.warning("차트 데이터를 가져오지 못했습니다.")
 
         st.divider()
+        st.markdown("### 체력 검사 (Fundamentals)")
         st.caption("yfinance 기반 KPI 점검 (Pass/Fail)")
-        render_sync_button(
-            "sync_tab_fund",
-            [cached_evaluate_kpis_snapshot.clear, cached_etf_holdings_universe_str.clear, cached_build_etf_holdings_performance_pairs.clear],
-            "종목별 재무·ETF 보유 데이터 캐시를 비워 최신 데이터를 받습니다.",
-        )
     
         try:
             if is_etf_mode:
