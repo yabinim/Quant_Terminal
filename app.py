@@ -10534,8 +10534,10 @@ if st.session_state.get("logged_in"):
                                         st.error("해당 행이 더 이상 존재하지 않습니다. 화면을 새로고침했는지 확인해 주세요.")
                                     else:
                                         ix = upd.index[m][0]
-                                        upd.loc[ix, "Quantity"] = qty_ev
-                                        upd.loc[ix, "Purchase_Price"] = price_ev
+                                        upd["Quantity"] = pd.to_numeric(upd["Quantity"], errors="coerce")
+                                        upd["Purchase_Price"] = pd.to_numeric(upd["Purchase_Price"], errors="coerce")
+                                        upd.loc[ix, "Quantity"] = float(qty_ev)
+                                        upd.loc[ix, "Purchase_Price"] = float(price_ev)
                                         save_portfolio(upd)
                                         st.success(
                                             f"{edit_account} / {edit_ticker} 수량·평단가를 수정해 저장했습니다."
