@@ -4308,6 +4308,34 @@ def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def delete_from_watchlist(user_id: str, ticker: str) -> tuple[bool, str]:
+    """
+    Watchlist에서 특정 종목 삭제 - 해당 행만 직접 삭제 (빠름).
+    """
+    uid_u = str(user_id).strip().upper()
+    tk_u = str(ticker).strip().upper()
+    try:
+        ws, err = open_watchlist_worksheet()
+        if err or ws is None:
+            return False, err or "워크시트 열기 실패"
+        vals = ws.get_all_values() or []
+        # 삭제할 행 번호 찾기 (역순으로 삭제해야 인덱스 안 밀림)
+        to_del = []
+        for i, r in enumerate(vals[1:], start=2):
+            r = (r + [""] * 8)[:8]
+            if str(r[0]).strip().upper() == uid_u and str(r[1]).strip().upper() == tk_u:
+                to_del.append(i)
+        for row_idx in reversed(to_del):
+            ws.delete_rows(row_idx)
+        # 캐시 초기화
+        load_watchlist_sheet.clear()
+        st.session_state.pop("_sidebar_wl_count", None)
+        st.session_state["_watchlist_alert_checked"] = False
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
                      alert_rsi: float = None, alert_ma200: bool = False,
                      alert_price: float = None) -> tuple[bool, str]:
@@ -11646,21 +11674,22 @@ if st.session_state.get("logged_in"):
                             )
 
                         if st.button("💾 저장", key=f"wl_edit_save_{idx}_{tk}", type="primary", use_container_width=True):
-                            updated_item = dict(item)
-                            updated_item["alert_price"] = float(new_ap) if new_ap > 0 else np.nan
-                            updated_item["alert_rsi"] = float(new_ar) if new_ar > 0 else np.nan
-                            updated_item["alert_ma200"] = bool(new_am)
-                            updated_item["memo"] = new_memo.strip()
-                            new_wl = [updated_item if j == idx else x for j, x in enumerate(wl_items)]
-                            ok_edit, err_edit = save_watchlist_sheet(uid_wl, new_wl)
-                            if ok_edit:
-                                # 캐시 즉시 초기화 → 화면 즉시 반영
-                                load_watchlist_sheet.clear()
-                                st.session_state["_watchlist_alert_checked"] = False
-                                st.session_state.pop("_sidebar_wl_count", None)
-                                st.rerun()
+                            # 기존 항목 삭제 후 새 항목 추가 (행 단위 처리)
+                            _ok_del, _ = delete_from_watchlist(uid_wl, tk)
+                            if _ok_del:
+                                _ok_add, _err_add = add_to_watchlist(
+                                    uid_wl, tk,
+                                    memo=new_memo.strip(),
+                                    alert_price=float(new_ap) if new_ap > 0 else None,
+                                    alert_rsi=float(new_ar) if new_ar > 0 else None,
+                                    alert_ma200=bool(new_am),
+                                )
+                                if _ok_add:
+                                    st.rerun()
+                                else:
+                                    st.error(f"저장 실패: {_err_add}")
                             else:
-                                st.error(f"저장 실패: {err_edit}")
+                                st.error("기존 항목 삭제 실패")
 
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
@@ -11674,12 +11703,14 @@ if st.session_state.get("logged_in"):
                             on_click=_goto_analysis,
                         )
                     with btn_col2:
-                        if st.button(f"🗑️ 삭제", key=f"wl_del_{idx}", use_container_width=True):
-                            updated_wl = [x for j, x in enumerate(wl_items) if j != idx]
-                            save_watchlist_sheet(uid_wl, updated_wl)
-                            st.session_state["_watchlist_alert_checked"] = False
-                            st.session_state.pop("_sidebar_wl_count", None)
-                            st.rerun()
+                        def _do_wl_delete(tk_del=tk, uid_del=uid_wl):
+                            _ok_d, _err_d = delete_from_watchlist(uid_del, tk_del)
+                        st.button(
+                            f"🗑️ 삭제",
+                            key=f"wl_del_{idx}",
+                            use_container_width=True,
+                            on_click=_do_wl_delete,
+                        )
 
 
             # Alert 재체크 버튼
@@ -11703,6 +11734,7 @@ if st.session_state.get("logged_in"):
                         ok_clear, err_clear = save_watchlist_sheet(uid_wl, [])
                         if ok_clear:
                             st.session_state.pop("_wl_clear_confirm", None)
+                            load_watchlist_sheet.clear()
                             st.session_state.pop("_sidebar_wl_count", None)
                             st.session_state["_watchlist_alert_checked"] = False
                             st.success("✅ Watchlist를 모두 삭제했어요!")
