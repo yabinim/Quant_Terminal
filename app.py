@@ -7836,54 +7836,91 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.markdown("### 🤖 AI 내일 시장 예측")
-        st.caption("선행 신호 5가지 + 최신 뉴스를 종합해 Gemini AI가 내일 시장 방향을 분석합니다. 장 전/후 실행 권장.")
+        st.caption("선행 신호 5가지 + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 자기 전 또는 장 열리기 전 실행 권장.")
 
         if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
-            news_text = "\n".join([
-                f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
-                for n in news_items[:10]
-            ]) if news_items else "최신 뉴스 없음"
+            with st.spinner("최신 데이터 수집 중..."):
+                # 1) DRG 캐시 강제 갱신 → 신호/뉴스 최신화
+                compute_daily_risk_gauge.clear()
+                fresh_drg = compute_daily_risk_gauge(sector_filter=sector_choice)
+                fresh_sig = fresh_drg.get("signals", sig)
+                fresh_warnings = fresh_drg.get("warnings", [])
+
+                # 2) RSS 멀티소스 뉴스 수집 (Yahoo/CNBC/Google/MarketWatch, 최대 30개)
+                try:
+                    rss_news_list, _, _ = fetch_global_market_news()
+                    rss_news_text = "\n".join([
+                        f"- [{item.get('source','?')}] {item.get('title','')} | {item.get('summary','')[:80]}"
+                        for item in rss_news_list[:30]
+                    ]) if rss_news_list else "RSS 뉴스 없음"
+                    rss_news_count = len(rss_news_list)
+                except Exception:
+                    rss_news_text = "\n".join([
+                        f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
+                        for n in fresh_drg.get("news_items", [])[:10]
+                    ]) or "최신 뉴스 없음"
+                    rss_news_count = 0
+
+                # 3) 거시경제 지표
+                try:
+                    _macro_ctx = _build_macro_context_for_summary()
+                    macro_summary = "\n".join([
+                        f"- {k}: {v.get('value','N/A')} ({v.get('status','N/A')})"
+                        for k, v in list(_macro_ctx.items())[:8]
+                    ]) if _macro_ctx else "데이터 없음"
+                except Exception:
+                    macro_summary = "데이터 없음"
+
             signal_summary = "\n".join([
-                f"- {label}: {'정상' if sig.get(key, {}).get('ok', True) else '경고'} | {sig.get(key, {}).get('value', 'N/A')}"
+                f"- {label}: {'정상' if fresh_sig.get(key, {}).get('ok', True) else '경고'} | {fresh_sig.get(key, {}).get('value', 'N/A')}"
                 for key, label, _ in signal_defs
             ])
-            warning_text = "\n".join(warnings_drg) if warnings_drg else "없음"
+            warning_text = "\n".join(fresh_warnings) if fresh_warnings else "없음"
             now_kst = datetime.now(_KST_TZ)
             market_session = "장 전" if now_kst.hour < 9 else ("장 중" if now_kst.hour < 16 else "장 후")
+
             drg_prompt = (
-                "당신은 월가 수석 퀀트 전략가입니다.\n"
-                f"현재 시각: {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
-                f"분석 섹터: {sector_choice}\n\n"
-                "[선행 지표 5가지]\n" + signal_summary + "\n\n"
-                "[감지된 경고]\n" + warning_text + "\n\n"
-                "[최신 뉴스]\n" + news_text + "\n\n"
-                "중요: 각 항목은 반드시 3문장 이내로 간결하게 작성. 불필요한 서론/수식어 금지.\n\n"
-                "반드시 아래 형식으로 한국어 작성:\n\n"
-                "## 내일 시장 방향: [상승 우세 / 중립 / 하락 우세]\n\n"
-                "**기술적 근거:** (선행 지표 수치 기반, 3문장 이내)\n\n"
-                "**뉴스 센티먼트:** (뉴스 영향, 2문장 이내)\n\n"
-                "**주요 리스크:** (번호 목록, 각 1문장)\n"
-                "1. \n2. \n\n"
-                "**대응 전략:** (각 1~2문장)\n"
-                "- 보유 중이라면:\n"
-                "- 매수 고려 중이라면:\n"
-                "- 현금 비중이라면:\n\n"
-                "*본 분석은 참고용이며 투자 권유가 아닙니다.*"
+                "당신은 월가 수석 퀀트 전략가입니다. "
+                "아래 실시간 데이터를 바탕으로 내일 미국 주식시장을 예측하세요.\n\n"
+                f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
+                f"[분석 섹터] {sector_choice}\n\n"
+                f"[선행 신호 5가지]\n{signal_summary}\n\n"
+                f"[감지된 경고]\n{warning_text}\n\n"
+                f"[거시경제 지표]\n{macro_summary}\n\n"
+                f"[오늘의 주요 뉴스 ({rss_news_count}개 소스)]\n{rss_news_text}\n\n"
+                "---\n"
+                "아래 4개 항목을 각각 작성하세요. "
+                "반드시 위 데이터의 실제 수치(VIX 값, 신호 상태, 뉴스 종목명/이슈)를 직접 인용해 근거를 만드세요. "
+                "일반론이나 '시장을 주시해야 한다'류의 빈말은 금지입니다.\n\n"
+                "## 내일 시장 방향 판단: [상승 우세 / 중립 / 하락 우세]\n\n"
+                "**📊 핵심 근거** (위 수치를 직접 인용해 2~3문장):\n\n"
+                "**📰 뉴스 영향** (오늘 뉴스 중 내일 시장에 영향줄 종목/이슈 구체적으로 언급, 2문장):\n\n"
+                "**⚠️ 내일 주목할 리스크** (구체적 수치/종목/이벤트 기반, 2가지):\n"
+                "1. \n"
+                "2. \n\n"
+                "**🎯 실전 대응** (지금 상황에 맞는 구체적 행동, 보유/매수/현금 각 1문장):\n"
+                "- 보유 중: \n"
+                "- 매수 타이밍 보는 중: \n"
+                "- 현금 대기 중: \n\n"
+                "*본 분석은 AI 참고용이며 투자 권유가 아닙니다.*"
             )
-            with st.spinner("Gemini AI 분석 중... (약 15초)"):
+            with st.spinner("Gemini AI 분석 중... (약 15~20초)"):
                 _drg_model = _GenAIModel(
                     "gemini-2.5-flash",
-                    generation_config={"temperature": 0.0, "max_output_tokens": 4096}
+                    generation_config={"temperature": 0.7, "max_output_tokens": 4096}
                 )
                 _drg_response = _drg_model.generate_content(drg_prompt)
                 _drg_text = _gemini_response_text_utf8_safe(_drg_response)
             if _drg_text:
                 st.session_state["_drg_ai_result"] = _drg_text
                 st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
+                st.session_state["_drg_ai_news_count"] = rss_news_count
                 st.rerun()
 
         if st.session_state.get("_drg_ai_result"):
-            st.info(f"🕐 분석 시각: {st.session_state.get('_drg_ai_time', '')} KST")
+            _news_cnt = st.session_state.get("_drg_ai_news_count", 0)
+            _src_str = f"RSS {_news_cnt}개 뉴스 반영" if _news_cnt > 0 else "yfinance 뉴스 반영"
+            st.info(f"🕐 분석 시각: {st.session_state.get('_drg_ai_time', '')} KST · {_src_str}")
             _txt = st.session_state["_drg_ai_result"]
             if "하락 우세" in _txt:
                 st.error(_txt)
