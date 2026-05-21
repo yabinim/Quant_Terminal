@@ -11241,9 +11241,12 @@ if st.session_state.get("logged_in"):
                             ai_prompt = (
                                 "You are a quant investment expert. Analyze the portfolio below and respond ONLY with a valid JSON array. "
                                 "No explanation, no markdown, no extra text. Pure JSON only.\n"
-                                "Each item: {\"ticker\":\"XXX\",\"priority\":1,\"action\":\"SELL NOW or WATCH or HOLD\","
-                                "\"reason\":\"한국어로 20자 이내\",\"target_price\":\"price or N/A\"}\n"
-                                "priority 1 = most urgent to sell. Include ALL tickers. reason must be in Korean, under 20 characters.\n"
+                                "Each item MUST have exactly these 5 fields: "
+                                "{\"ticker\":\"XXX\",\"priority\":1,\"action\":\"SELL NOW or WATCH or HOLD\","
+                                "\"reason\":\"한국어로 20자 이내\",\"target_price\":\"$000.00 or N/A\"}\n"
+                                "priority 1 = most urgent to sell. Include ALL tickers. "
+                                "reason must be in Korean under 20 chars. "
+                                "target_price = suggested sell price in USD (e.g. $150.00), or N/A if no clear target.\n"
                                 "[PORTFOLIO]\n" + port_text
                             )
                             _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={
