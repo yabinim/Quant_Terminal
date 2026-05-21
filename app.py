@@ -2084,6 +2084,15 @@ def cached_analyze_us_macro_dashboard():
     return analyze_us_macro_dashboard()
 
 
+def get_macro_dashboard_with_validation():
+    """rows가 8개 미만이면 캐시를 자동 무효화하고 재호출."""
+    pack = cached_analyze_us_macro_dashboard()
+    if pack and len(pack.get("rows", [])) < 8:
+        cached_analyze_us_macro_dashboard.clear()
+        pack = cached_analyze_us_macro_dashboard()
+    return pack
+
+
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_sector_etf_closes(tickers_tuple: tuple[str, ...]):
     if not tickers_tuple:
@@ -8046,7 +8055,7 @@ if st.session_state.get("logged_in"):
 
         try:
             with st.spinner("매크로 지표를 불러오는 중..."):
-                macro_pack = cached_analyze_us_macro_dashboard()
+                macro_pack = get_macro_dashboard_with_validation()
 
             if macro_pack.get("na_total", 0) >= 4:
                 _notify_yfinance_fetch_failed()
