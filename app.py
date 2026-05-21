@@ -4339,73 +4339,49 @@ def delete_from_watchlist(user_id: str, ticker: str) -> tuple[bool, str]:
 def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
                      alert_rsi: float = None, alert_ma200: bool = False,
                      alert_price: float = None) -> tuple[bool, str]:
-    """
-    Watchlist 추가 - Optimistic UI 방식.
-    1) session_state에 즉시 반영 (화면 즉시 업데이트)
-    2) Sheets에 비동기 저장 (pending 큐에 넣기)
-    """
+    """Watchlist에 단일 종목 추가. append_row 방식."""
     uid = str(user_id).strip()
     tk = str(ticker).strip().upper()
     if not uid or not tk:
         return False, "유저ID 또는 티커 없음"
 
-    # 현재가 조회 (캐시 우선)
     try:
         cur_price = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
     except Exception:
         cur_price = np.nan
 
-    new_item = {
-        "ticker": tk,
-        "memo": str(memo).strip(),
-        "alert_price": float(alert_price) if alert_price is not None else np.nan,
-        "alert_rsi": float(alert_rsi) if alert_rsi is not None else np.nan,
-        "alert_ma200": bool(alert_ma200),
-        "saved_price": float(cur_price) if pd.notna(cur_price) else np.nan,
-        "date_added": _narrative_now_kst_string(),
-    }
-
-    # ── Step 1: session_state 즉시 업데이트 (UI 즉시 반영) ──────────────
-    _wl_cache_key = f"_wl_local_{uid}"
-    local_wl = st.session_state.get(_wl_cache_key)
-    if local_wl is None:
-        local_wl = load_watchlist_sheet(uid)
-    local_wl = [x for x in local_wl if str(x.get("ticker","")).upper() != tk]
-    local_wl.append(new_item)
-    st.session_state[_wl_cache_key] = local_wl
-    st.session_state[f"_wl_added_{tk}"] = True
-    st.session_state.pop("_sidebar_wl_count", None)
-
-    # ── Step 2: Sheets 저장 (append_row - 빠름) ──────────────────────────
     try:
         ws, err = open_watchlist_worksheet()
-        if ws is None:
-            return True, ""  # UI는 반영됐으므로 True 반환
+        if err or ws is None:
+            return False, err or "워크시트 열기 실패"
         # 기존 중복 행 삭제
         vals = ws.get_all_values() or []
         uid_u = uid.upper()
-        to_del = []
-        for i, r in enumerate(vals[1:], start=2):
-            r = (r + [""])[0:2]
-            if str(r[0]).strip().upper() == uid_u and str(r[1]).strip().upper() == tk:
-                to_del.append(i)
+        to_del = [
+            i for i, r in enumerate(vals[1:], start=2)
+            if (r + [""] * 2)[0].strip().upper() == uid_u
+            and (r + [""] * 2)[1].strip().upper() == tk
+        ]
         for row_idx in reversed(to_del):
             ws.delete_rows(row_idx)
         # 새 행 추가
         ws.append_row([
-            uid, tk, str(memo).strip(),
+            uid, tk,
+            str(memo).strip(),
             str(round(float(alert_price), 4)) if alert_price is not None else "",
             str(round(float(alert_rsi), 1)) if alert_rsi is not None else "",
             "true" if alert_ma200 else "false",
             str(round(float(cur_price), 4)) if pd.notna(cur_price) else "",
             _narrative_now_kst_string(),
         ], value_input_option="USER_ENTERED")
+        # 캐시 초기화
         load_watchlist_sheet.clear()
+        st.session_state.pop("_sidebar_wl_count", None)
         st.session_state["_watchlist_alert_checked"] = False
-    except Exception:
-        pass  # Sheets 저장 실패해도 UI는 유지
-
-    return True, ""
+        st.session_state[f"_wl_added_{tk}"] = True
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def check_watchlist_alerts(items: list[dict], price_map: dict, rsi_map: dict, ma200_map: dict) -> list[dict]:
@@ -11503,13 +11479,7 @@ if st.session_state.get("logged_in"):
             st.divider()
 
         # ── Watchlist 로드 ─────────────────────────────────────────────────
-        # local cache 우선 (즉시 반영된 데이터)
-        _wl_local_key = f"_wl_local_{uid_wl}"
-        if _wl_local_key in st.session_state:
-            wl_items = st.session_state[_wl_local_key]
-        else:
-            wl_items = load_watchlist_sheet(uid_wl)
-            st.session_state[_wl_local_key] = wl_items
+        wl_items = load_watchlist_sheet(uid_wl)
 
         # ── 종목 추가 폼 ───────────────────────────────────────────────────
         with st.expander("➕ 관심 종목 추가", expanded=not wl_items):
