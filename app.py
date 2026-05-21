@@ -11242,8 +11242,8 @@ if st.session_state.get("logged_in"):
                                 "You are a quant investment expert. Analyze the portfolio below and respond ONLY with a valid JSON array. "
                                 "No explanation, no markdown, no extra text. Pure JSON only.\n"
                                 "Each item: {\"ticker\":\"XXX\",\"priority\":1,\"action\":\"SELL NOW or WATCH or HOLD\","
-                                "\"reason\":\"max 20 words\",\"target_price\":\"price or N/A\"}\n"
-                                "priority 1 = most urgent to sell. Include ALL tickers. reason must be under 20 words.\n"
+                                "\"reason\":\"한국어로 20자 이내\",\"target_price\":\"price or N/A\"}\n"
+                                "priority 1 = most urgent to sell. Include ALL tickers. reason must be in Korean, under 20 characters.\n"
                                 "[PORTFOLIO]\n" + port_text
                             )
                             _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={
