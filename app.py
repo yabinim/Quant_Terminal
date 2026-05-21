@@ -10600,6 +10600,7 @@ if st.session_state.get("logged_in"):
                             if not ok_th:
                                 st.error(f"매도 기록 저장 실패: {err_th}")
                             else:
+                                _invalidate_trade_history_cache()  # 명시적 캐시 초기화
                                 upd_sell = portfolio_df.copy()
                                 m_sell = (upd_sell["Account"] == sell_acct_sel) & (upd_sell["Ticker"] == sell_ticker_sel)
                                 if m_sell.any():
@@ -11370,7 +11371,19 @@ if st.session_state.get("logged_in"):
         trade_hist_df = load_trade_history(puid)
 
         if trade_hist_df.empty:
-            st.info("아직 매매 기록이 없습니다. '종목 추가' 또는 '매도 기록'을 통해 거래를 기록하면 여기에 표시됩니다.")
+            # 시트 연결 상태 진단
+            _ws_check, _ws_err = open_trade_history_worksheet()
+            if _ws_err:
+                st.error(f"⚠️ Trade_History 시트 연결 실패: {_ws_err}")
+                st.caption("Google Sheets에 'Trade_History' 탭이 없거나 접근 권한이 없습니다. 매도 기록을 한 번 저장하면 자동 생성됩니다.")
+            else:
+                _raw_rows, _ = _trade_history_all_values_cached()
+                _total_rows = len(_raw_rows) - 1 if _raw_rows and len(_raw_rows) > 1 else 0
+                if _total_rows > 0:
+                    st.warning(f"⚠️ Trade_History 시트에 총 {_total_rows}개 행이 있지만 현재 계정({puid})의 기록이 없습니다. 저장 시 user_id가 일치하는지 확인해주세요.")
+                else:
+                    st.info("아직 매매 기록이 없습니다. '종목 추가' 또는 '매도 기록'을 통해 거래를 기록하면 여기에 표시됩니다.")
+                    st.caption("💡 동기화 버튼을 눌러도 안 나타나면 Google Sheets Quant_DB에 'Trade_History' 탭이 생성됐는지 확인해주세요.")
         else:
             th_tab1, th_tab2, th_tab3 = st.tabs(["📋 전체 거래 내역", "💰 실현 손익 분석", "📈 누적 손익 차트"])
 
