@@ -11530,22 +11530,16 @@ if st.session_state.get("logged_in"):
                 if not wl_ticker:
                     st.warning("티커를 입력해주세요.")
                 else:
-                    price_now = fetch_latest_prices_for_tickers((wl_ticker,))
-                    new_wl_item = {
-                        "ticker": wl_ticker,
-                        "memo": wl_memo.strip(),
-                        "alert_price": float(wl_alert_price) if wl_alert_price > 0 else np.nan,
-                        "alert_rsi": float(wl_alert_rsi) if wl_alert_rsi > 0 else np.nan,
-                        "alert_ma200": wl_alert_ma200,
-                        "saved_price": price_now.get(wl_ticker, np.nan),
-                        "date_added": _narrative_now_kst_string(),
-                    }
-                    wl_items = [i for i in wl_items if i["ticker"] != wl_ticker]
-                    wl_items.append(new_wl_item)
-                    ok_wl, err_wl = save_watchlist_sheet(uid_wl, wl_items)
+                    with st.spinner(f"{wl_ticker} 저장 중..."):
+                        ok_wl, err_wl = add_to_watchlist(
+                            uid_wl, wl_ticker,
+                            memo=wl_memo.strip(),
+                            alert_price=float(wl_alert_price) if wl_alert_price > 0 else None,
+                            alert_rsi=float(wl_alert_rsi) if wl_alert_rsi > 0 else None,
+                            alert_ma200=wl_alert_ma200,
+                        )
                     if ok_wl:
                         st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!")
-                        st.session_state["_watchlist_alert_checked"] = False
                         st.rerun()
                     else:
                         st.error(f"저장 실패: {err_wl}")
