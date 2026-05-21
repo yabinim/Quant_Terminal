@@ -964,7 +964,7 @@ class _GenAIModel:
 model = _GenAIModel(
     "gemini-2.5-flash",  # 1.5가 아닌 가장 최근에 입력했던 2.5로 통일!
     generation_config={
-        "temperature": 0.0,  # AI의 상상력을 0으로 통제 (일관성 극대화)
+        "temperature": 0.3,  # 내러티브 생성 — 매번 다른 인사이트를 위해 약간의 다양성 허용
         "top_p": 1,
         "top_k": 1,
         "max_output_tokens": 8192,
@@ -7327,7 +7327,7 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
         summary_model = _GenAIModel(
             "gemini-2.5-flash",
             generation_config={
-                "temperature": 0.0,
+                "temperature": 0.3,  # 주간 요약 — 매주 다른 인사이트를 위해 약간의 다양성 허용
                 "top_p": 1,
                 "top_k": 1,
                 "max_output_tokens": 4096,
@@ -10248,7 +10248,7 @@ if st.session_state.get("logged_in"):
                 with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
                     _diag_model = _GenAIModel(
                         "gemini-2.5-flash",
-                        generation_config={"temperature": 0.0, "max_output_tokens": 4096}
+                        generation_config={"temperature": 0.3, "max_output_tokens": 4096}  # 종목 진단 — 볼 때마다 다른 인사이트
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
                     _diag_text = _gemini_response_text_utf8_safe(_diag_response)
