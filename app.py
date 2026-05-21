@@ -9290,35 +9290,37 @@ if st.session_state.get("logged_in"):
                 )
             else:
                 etf_universe_sorted_tuple = tuple(sorted(set(etf_radar_universe)))
-                ret_cols = ["1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
                 with st.spinner("Hidden Alpha Radar: 유니버스 수익률·순위 계산 중 (포트폴리오와 동일 캐시)..."):
-                    radar_df = cached_etf_universe_rankings_full(etf_universe_sorted_tuple)
-    
-                if radar_df is None or radar_df.empty:
-                    st.warning(
-                        "유니버스 랭킹을 계산하지 못했습니다. `etf_universe.txt` 티커·네트워크를 확인해주세요."
-                    )
+                    _ha_result = cached_etf_universe_rankings_full(etf_universe_sorted_tuple)
+                if _ha_result is None or _ha_result.empty:
+                    st.session_state["_hidden_alpha_df"] = None
+                    st.warning("유니버스 랭킹을 계산하지 못했습니다. `etf_universe.txt` 티커·네트워크를 확인해주세요.")
                 else:
-                    tmp_show = radar_df.copy()
-                    tmp_show["티커"] = tmp_show.apply(
-                        lambda r: f"{r['Ticker']} 🔥" if bool(r["주도주"]) else r["Ticker"], axis=1
-                    )
-                    display_cols = ["순위", "티커", "1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
-                    display_df = tmp_show[display_cols].copy()
-    
-                    fmt = {c: "{:.2f}%" for c in ret_cols}
-                    styled_radar = display_df.style.format(fmt, na_rep="N/A").background_gradient(
-                        cmap="RdYlGn", subset=ret_cols, axis=None
-                    )
-                    st.dataframe(styled_radar, use_container_width=True, hide_index=True)
-                    st.caption(
-                        "과거 구간 데이터가 부족한 ETF는 해당 칸이 N/A일 수 있으나, 유니버스 순위는 포트폴리오 화면과 동일한 1개월 기준입니다."
-                    )
-                    st.markdown(
-                        "💡 [Ryan's Alpha Strategy] 1주와 1개월 수익률이 모두 초록색인 상위 3~5개 ETF에 분할 투자하는 방식은 "
-                        f"'추세 추종(Momentum)'의 정석입니다. 단, 매수 전 「{_MAIN_NAV_OPTIONS[4]}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
-                    )
-    
+                    st.session_state["_hidden_alpha_df"] = _ha_result
+
+        # 결과를 session_state에서 표시 (rerun 후에도 유지)
+        _ha_df = st.session_state.get("_hidden_alpha_df")
+        if _ha_df is not None and not _ha_df.empty:
+            ret_cols = ["1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
+            tmp_show = _ha_df.copy()
+            tmp_show["티커"] = tmp_show.apply(
+                lambda r: f"{r['Ticker']} 🔥" if bool(r["주도주"]) else r["Ticker"], axis=1
+            )
+            display_cols = ["순위", "티커", "1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
+            display_df = tmp_show[display_cols].copy()
+            fmt = {c: "{:.2f}%" for c in ret_cols}
+            styled_radar = display_df.style.format(fmt, na_rep="N/A").background_gradient(
+                cmap="RdYlGn", subset=ret_cols, axis=None
+            )
+            st.dataframe(styled_radar, use_container_width=True, hide_index=True)
+            st.caption(
+                "과거 구간 데이터가 부족한 ETF는 해당 칸이 N/A일 수 있으나, 유니버스 순위는 포트폴리오 화면과 동일한 1개월 기준입니다."
+            )
+            st.markdown(
+                "💡 [Ryan's Alpha Strategy] 1주와 1개월 수익률이 모두 초록색인 상위 3~5개 ETF에 분할 투자하는 방식은 "
+                f"'추세 추종(Momentum)'의 정석입니다. 단, 매수 전 「{_MAIN_NAV_OPTIONS[4]}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
+            )
+
         st.info(
             "💡 이 레이더에 잡힌 생소한 티커를 왼쪽 사이드바에 입력하여 해당 테마를 이끄는 개별 주도주를 찾아보세요."
         )
@@ -9406,44 +9408,49 @@ if st.session_state.get("logged_in"):
                 st.warning("스캔 대상 티커가 없어요. 필터를 변경하거나 포트폴리오/Watchlist에 종목을 추가해주세요.")
             else:
                 with st.spinner(f"RS Score 주간 변화율 계산 중... ({len(scan_target)}개 티커)"):
-                    rs_change_df = compute_rs_score_weekly_change(scan_target)
+                    _es_result = compute_rs_score_weekly_change(scan_target)
+                if _es_result.empty:
+                    st.session_state["_early_signal_df"] = None
+                    st.warning("RS 변화율 데이터를 가져오지 못했습니다.")
+                else:
+                    st.session_state["_early_signal_df"] = _es_result
 
-            if rs_change_df.empty:
-                st.warning("RS 변화율 데이터를 가져오지 못했습니다.")
-            else:
-                # 신호별 분류
-                early_df = rs_change_df[rs_change_df["RS_Signal"] == "🌱 Early Signal"]
-                surge_df = rs_change_df[rs_change_df["RS_Signal"] == "🚀 급부상"]
-                weak_df = rs_change_df[rs_change_df["RS_Signal"] == "⚠️ 모멘텀 약화"]
+        # 결과를 session_state에서 표시 (rerun 후에도 유지)
+        _es_df = st.session_state.get("_early_signal_df")
+        if _es_df is not None and not _es_df.empty:
+            rs_change_df = _es_df
+            early_df = rs_change_df[rs_change_df["RS_Signal"] == "🌱 Early Signal"]
+            surge_df = rs_change_df[rs_change_df["RS_Signal"] == "🚀 급부상"]
+            weak_df = rs_change_df[rs_change_df["RS_Signal"] == "⚠️ 모멘텀 약화"]
 
-                if not early_df.empty:
-                    st.success(f"🌱 **Early Signal {len(early_df)}개** — 아직 안 올랐지만 강해지기 시작한 섹터!")
-                    for _, row in early_df.iterrows():
-                        st.markdown(
-                            f"**{row['Ticker']}** — RS {row['RS_Now']:+.1f}%p "
-                            f"(1주 변화: {row['RS_Change']:+.1f}%p) "
-                            f"→ Watchlist 등록 고려"
-                        )
+            if not early_df.empty:
+                st.success(f"🌱 **Early Signal {len(early_df)}개** — 아직 안 올랐지만 강해지기 시작한 섹터!")
+                for _, row in early_df.iterrows():
+                    st.markdown(
+                        f"**{row['Ticker']}** — RS {row['RS_Now']:+.1f}%p "
+                        f"(1주 변화: {row['RS_Change']:+.1f}%p) "
+                        f"→ Watchlist 등록 고려"
+                    )
 
-                es_col1, es_col2 = st.columns(2)
-                with es_col1:
-                    if not surge_df.empty:
-                        st.info(f"🚀 **급부상 {len(surge_df)}개** — 강하면서 더 강해지는 중")
-                        for _, row in surge_df.iterrows():
-                            st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 +{row['RS_Change']:.1f}%p")
-                with es_col2:
-                    if not weak_df.empty:
-                        st.warning(f"⚠️ **모멘텀 약화 {len(weak_df)}개** — 주의 필요")
-                        for _, row in weak_df.iterrows():
-                            st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 {row['RS_Change']:.1f}%p")
+            es_col1, es_col2 = st.columns(2)
+            with es_col1:
+                if not surge_df.empty:
+                    st.info(f"🚀 **급부상 {len(surge_df)}개** — 강하면서 더 강해지는 중")
+                    for _, row in surge_df.iterrows():
+                        st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 +{row['RS_Change']:.1f}%p")
+            with es_col2:
+                if not weak_df.empty:
+                    st.warning(f"⚠️ **모멘텀 약화 {len(weak_df)}개** — 주의 필요")
+                    for _, row in weak_df.iterrows():
+                        st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 {row['RS_Change']:.1f}%p")
 
-                with st.expander("📋 전체 RS 변화율 테이블", expanded=False):
-                    def _style_rs_change(val):
-                        v = pd.to_numeric(val, errors="coerce")
-                        if pd.isna(v): return ""
-                        return "color:#16a34a;font-weight:600" if v > 2 else "color:#dc2626;font-weight:600" if v < -2 else ""
-                    styled_rs = rs_change_df.style.map(_style_rs_change, subset=["RS_Change"])
-                    st.dataframe(styled_rs, use_container_width=True, hide_index=True)
+            with st.expander("📋 전체 RS 변화율 테이블", expanded=False):
+                def _style_rs_change(val):
+                    v = pd.to_numeric(val, errors="coerce")
+                    if pd.isna(v): return ""
+                    return "color:#16a34a;font-weight:600" if v > 2 else "color:#dc2626;font-weight:600" if v < -2 else ""
+                styled_rs = rs_change_df.style.map(_style_rs_change, subset=["RS_Change"])
+                st.dataframe(styled_rs, use_container_width=True, hide_index=True)
 
         # ── 기능 3: 섹터 꺾임 감지 ───────────────────────────────────────
         st.divider()
@@ -11210,20 +11217,35 @@ if st.session_state.get("logged_in"):
                                 cur_p = sig.get("current_price", np.nan)
                                 rsi_v = sig.get("rsi", np.nan)
                                 pnl = ((float(cur_p) / avg_p) - 1.0) * 100.0 if pd.notna(cur_p) and avg_p > 0 else np.nan
+                                _cur_str = "N/A" if pd.isna(cur_p) else f"{cur_p:.2f}"
+                                _pnl_str = "N/A" if pd.isna(pnl) else f"{pnl:.1f}pct"
+                                _rsi_str = "N/A" if pd.isna(rsi_v) else f"{rsi_v:.1f}"
+                                _high_str = "N/A" if pd.isna(sig.get("pct_from_52w_high", np.nan)) else f"{sig.get('pct_from_52w_high'):.1f}pct"
+                                _ma200_str = "위" if sig.get("above_ma200") else ("아래" if sig.get("above_ma200") is False else "N/A")
+                                _macd_str = sig.get("macd_signal", "N/A")
                                 port_lines.append(
-                                    f"- {tk}: 평단가${avg_p:.2f} 현재가${'N/A' if pd.isna(cur_p) else f'{cur_p:.2f}'} "
-                                    f"수익률{'N/A' if pd.isna(pnl) else f'{pnl:.1f}%'} "
-                                    f"RSI={'N/A' if pd.isna(rsi_v) else f'{rsi_v:.1f}'} "
-                                    f"MACD={sig.get('macd_signal','N/A')} "
-                                    "52주고점대비=" + ("N/A" if pd.isna(sig.get('pct_from_52w_high', np.nan)) else f"{sig.get('pct_from_52w_high'):.1f}%") + " "
-                                    f"200일선={'위' if sig.get('above_ma200') else '아래' if sig.get('above_ma200') is False else 'N/A'}"
+                                    f"- {tk}: 평단가${avg_p:.2f} 현재가${_cur_str} "
+                                    f"수익률={_pnl_str} RSI={_rsi_str} MACD={_macd_str} "
+                                    f"52주고점대비={_high_str} 200일선={_ma200_str}"
                                 )
-                            ai_prompt = f"""당신은 퀀트 투자 전문가입니다. 아래 포트폴리오를 분석해 매도 우선순위를 JSON 배열로 응답하세요.
-[포트폴리오]
-{chr(10).join(port_lines)}
-[기준] RSI>70 과매수, MACD 데드크로스 단기하락, 52주고점 3% 이내 고점매도, 200일선 아래 추세붕괴
-[응답형식] [{{"ticker":"XXX","priority":1,"action":"SELL NOW|WATCH|HOLD","reason":"핵심근거 1-2줄","target_price":"목표매도가 또는 N/A"}}]
-priority 1이 매도 가장 시급. 모든 보유 종목 포함."""
+                            port_text = "\n".join(port_lines)
+                            _criteria = (
+                                "RSI>70 과매수, MACD DEAD_CROSS 단기하락, "
+                                "52주고점 3pct 이내 고점매도, 200일선 아래 추세붕괴"
+                            )
+                            _fmt = (
+                                '[{"ticker":"XXX","priority":1,'
+                                '"action":"SELL NOW|WATCH|HOLD",'
+                                '"reason":"핵심근거 1-2줄",'
+                                '"target_price":"목표매도가 또는 N/A"}]'
+                            )
+                            ai_prompt = (
+                                "당신은 퀀트 투자 전문가입니다. 포트폴리오를 분석해 매도 우선순위를 JSON 배열로만 응답하세요.\n"
+                                "[포트폴리오]\n" + port_text + "\n"
+                                "[기준] " + _criteria + "\n"
+                                "[응답형식] " + _fmt + "\n"
+                                "priority 1이 매도 가장 시급. 모든 종목 포함. JSON만 응답."
+                            )
                             _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={"temperature": 0.0, "max_output_tokens": 4096, "response_mime_type": "application/json"})
                             _resp = _ai_m.generate_content(ai_prompt)
                             raw = getattr(_resp, "text", "") or ""
@@ -11231,7 +11253,19 @@ priority 1이 매도 가장 시급. 모든 보유 종목 포함."""
                                 for _c in _resp.candidates:
                                     for _p in getattr(_c.content, "parts", []):
                                         raw += getattr(_p, "text", "")
-                            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+                            # 안전한 JSON 파싱
+                            raw = raw.strip()
+                            for _pfx in ["```json", "```"]:
+                                if raw.startswith(_pfx):
+                                    raw = raw[len(_pfx):]
+                            if raw.endswith("```"):
+                                raw = raw[:-3]
+                            raw = raw.strip()
+                            # JSON 배열 시작 위치 찾기
+                            _arr_start = raw.find("[")
+                            _arr_end = raw.rfind("]")
+                            if _arr_start != -1 and _arr_end != -1 and _arr_end > _arr_start:
+                                raw = raw[_arr_start:_arr_end+1]
                             ai_data = json.loads(raw)
                             if isinstance(ai_data, list) and ai_data:
                                 ai_df = pd.DataFrame(ai_data).sort_values("priority")
