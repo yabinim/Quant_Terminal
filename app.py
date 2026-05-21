@@ -4308,6 +4308,51 @@ def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
+                     alert_rsi: float = None, alert_ma200: bool = False,
+                     alert_price: float = None) -> tuple[bool, str]:
+    """
+    Watchlist에 단일 종목 추가/업데이트하는 공통 헬퍼.
+    - 기존에 같은 ticker가 있으면 업데이트, 없으면 추가
+    - session_state 캐시도 즉시 업데이트
+    """
+    uid = str(user_id).strip()
+    tk = str(ticker).strip().upper()
+    if not uid or not tk:
+        return False, "유저ID 또는 티커 없음"
+
+    # 현재가 조회
+    try:
+        cur_price = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+    except Exception:
+        cur_price = np.nan
+
+    new_item = {
+        "ticker": tk,
+        "memo": str(memo).strip(),
+        "alert_price": float(alert_price) if alert_price is not None else np.nan,
+        "alert_rsi": float(alert_rsi) if alert_rsi is not None else np.nan,
+        "alert_ma200": bool(alert_ma200),
+        "saved_price": float(cur_price) if pd.notna(cur_price) else np.nan,
+        "date_added": _narrative_now_kst_string(),
+    }
+
+    # 기존 목록에서 같은 ticker 제거 후 추가
+    existing = load_watchlist_sheet(uid)
+    updated = [x for x in existing if str(x.get("ticker","")).upper() != tk]
+    updated.append(new_item)
+
+    ok, err = save_watchlist_sheet(uid, updated)
+    if ok:
+        # 캐시 즉시 초기화
+        load_watchlist_sheet.clear()
+        st.session_state.pop("_sidebar_wl_count", None)
+        st.session_state["_watchlist_alert_checked"] = False
+        # session_state에 즉시 반영 (화면 갱신 전에도 저장됨을 표시)
+        st.session_state[f"_wl_added_{tk}"] = True
+    return ok, err
+
+
 def check_watchlist_alerts(items: list[dict], price_map: dict, rsi_map: dict, ma200_map: dict) -> list[dict]:
     """Watchlist 각 종목의 Alert 조건 체크. 발동된 Alert만 반환."""
     triggered = []
@@ -5395,22 +5440,12 @@ def render_opportunity_scanner_snapshot(snap):
         # Watchlist 추가 버튼 (on_click 방식)
         def _add_sc_top3_wl(tk=tk_scan, r=rank, _row=row):
             _uid_s = str(st.session_state.get("user_id") or "").strip()
-            _p_s = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
-            _item_s = {
-                "ticker": tk,
-                "memo": f"AI 스캐너 TOP{r} - Final Score: {_scanner_ui_fmt_2f(_row['Final Score'])}",
-                "alert_price": np.nan, "alert_rsi": np.nan, "alert_ma200": False,
-                "saved_price": float(_p_s) if pd.notna(_p_s) else np.nan,
-                "date_added": _narrative_now_kst_string(),
-            }
-            _wl_s = load_watchlist_sheet(_uid_s)
-            _wl_s = [x for x in _wl_s if x["ticker"] != tk]
-            _wl_s.append(_item_s)
-            _ok_s, _err_s = save_watchlist_sheet(_uid_s, _wl_s)
+            _ok_s, _err_s = add_to_watchlist(
+                _uid_s, tk,
+                memo=f"AI 스캐너 TOP{r} - Score: {_scanner_ui_fmt_2f(_row['Final Score'])}",
+            )
             if _ok_s:
                 st.session_state[f"_sc_wl_added_{tk}"] = True
-                st.session_state["_watchlist_alert_checked"] = False
-                st.session_state.pop("_sidebar_wl_count", None)
         btn_col1, btn_col2 = st.columns([1, 3])
         with btn_col1:
             if st.session_state.get(f"_sc_wl_added_{tk_scan}"):
@@ -5443,21 +5478,12 @@ def render_opportunity_scanner_snapshot(snap):
             with _rem_cols[_ri]:
                 def _add_rem_wl(tk=_rtk, row=_rrow):
                     _uid_r = str(st.session_state.get("user_id") or "").strip()
-                    _p_r = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
-                    _item_r = {
-                        "ticker": tk,
-                        "memo": f"AI 스캐너 - Final Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
-                        "alert_price": np.nan, "alert_rsi": np.nan, "alert_ma200": False,
-                        "saved_price": float(_p_r) if pd.notna(_p_r) else np.nan,
-                        "date_added": _narrative_now_kst_string(),
-                    }
-                    _wl_r = load_watchlist_sheet(_uid_r)
-                    _wl_r = [x for x in _wl_r if x["ticker"] != tk]
-                    _wl_r.append(_item_r)
-                    _ok_r, _ = save_watchlist_sheet(_uid_r, _wl_r)
+                    _ok_r, _ = add_to_watchlist(
+                        _uid_r, tk,
+                        memo=f"AI 스캐너 - Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
+                    )
                     if _ok_r:
                         st.session_state[f"_sc_wl_added_{tk}"] = True
-                        st.session_state.pop("_sidebar_wl_count", None)
                 if st.session_state.get(f"_sc_wl_added_{_rtk}"):
                     st.success(f"✅ {_rtk}")
                 else:
