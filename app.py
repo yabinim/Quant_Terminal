@@ -11238,31 +11238,27 @@ if st.session_state.get("logged_in"):
                                     f"52주고점대비={_high_str} 200일선={_ma200_str}"
                                 )
                             port_text = "\n".join(port_lines)
-                            _criteria = (
-                                "RSI>70 과매수, MACD DEAD_CROSS 단기하락, "
-                                "52주고점 3pct 이내 고점매도, 200일선 아래 추세붕괴"
-                            )
-                            _fmt = (
-                                '[{"ticker":"XXX","priority":1,'
-                                '"action":"SELL NOW|WATCH|HOLD",'
-                                '"reason":"핵심근거 1-2줄",'
-                                '"target_price":"목표매도가 또는 N/A"}]'
-                            )
                             ai_prompt = (
-                                "당신은 퀀트 투자 전문가입니다. 포트폴리오를 분석해 매도 우선순위를 JSON 배열로만 응답하세요.\n"
-                                "[포트폴리오]\n" + port_text + "\n"
-                                "[기준] " + _criteria + "\n"
-                                "[응답형식] " + _fmt + "\n"
-                                "priority 1이 매도 가장 시급. 모든 종목 포함. JSON만 응답."
+                                "You are a quant investment expert. Analyze the portfolio below and respond ONLY with a valid JSON array. "
+                                "No explanation, no markdown, no extra text. Pure JSON only.\n"
+                                "Each item: {\"ticker\":\"XXX\",\"priority\":1,\"action\":\"SELL NOW or WATCH or HOLD\","
+                                "\"reason\":\"max 20 words\",\"target_price\":\"price or N/A\"}\n"
+                                "priority 1 = most urgent to sell. Include ALL tickers. reason must be under 20 words.\n"
+                                "[PORTFOLIO]\n" + port_text
                             )
-                            _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={"temperature": 0.0, "max_output_tokens": 4096, "response_mime_type": "application/json"})
+                            _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={
+                                "temperature": 0.0,
+                                "max_output_tokens": 8192,
+                                "response_mime_type": "application/json",
+                            })
                             _resp = _ai_m.generate_content(ai_prompt)
                             raw = getattr(_resp, "text", "") or ""
                             if not raw and hasattr(_resp, "candidates"):
                                 for _c in _resp.candidates:
                                     for _p in getattr(_c.content, "parts", []):
                                         raw += getattr(_p, "text", "")
-                            # 안전한 JSON 파싱
+
+                            # 안전한 JSON 파싱: 코드블록 제거 → 배열 추출 → 불완전 JSON 복구
                             raw = raw.strip()
                             for _pfx in ["```json", "```"]:
                                 if raw.startswith(_pfx):
@@ -11270,12 +11266,38 @@ if st.session_state.get("logged_in"):
                             if raw.endswith("```"):
                                 raw = raw[:-3]
                             raw = raw.strip()
-                            # JSON 배열 시작 위치 찾기
+
+                            # JSON 배열 구간 추출
                             _arr_start = raw.find("[")
                             _arr_end = raw.rfind("]")
                             if _arr_start != -1 and _arr_end != -1 and _arr_end > _arr_start:
-                                raw = raw[_arr_start:_arr_end+1]
-                            ai_data = json.loads(raw)
+                                raw = raw[_arr_start:_arr_end + 1]
+
+                            # 파싱 시도 — 실패 시 완전한 객체만 추출 (잘린 JSON 복구)
+                            ai_data = None
+                            try:
+                                ai_data = json.loads(raw)
+                            except json.JSONDecodeError:
+                                # 완전한 JSON 객체만 추출 (마지막 불완전 객체 제거)
+                                _safe = []
+                                _depth = 0
+                                _obj_start = None
+                                for _ci, _ch in enumerate(raw):
+                                    if _ch == "{":
+                                        if _depth == 0:
+                                            _obj_start = _ci
+                                        _depth += 1
+                                    elif _ch == "}":
+                                        _depth -= 1
+                                        if _depth == 0 and _obj_start is not None:
+                                            try:
+                                                _safe.append(json.loads(raw[_obj_start:_ci + 1]))
+                                            except Exception:
+                                                pass
+                                            _obj_start = None
+                                if _safe:
+                                    ai_data = _safe
+
                             if isinstance(ai_data, list) and ai_data:
                                 ai_df = pd.DataFrame(ai_data).sort_values("priority")
                                 def _c_act(v):
@@ -11284,8 +11306,11 @@ if st.session_state.get("logged_in"):
                                     if "HOLD" in str(v): return "color:#16a34a;font-weight:700;"
                                     return ""
                                 st.dataframe(ai_df.style.map(_c_act, subset=["action"]), use_container_width=True, hide_index=True)
+                                _total = len(filtered_portfolio_df)
+                                if len(ai_df) < _total:
+                                    st.caption(f"⚠️ 응답이 잘려 {len(ai_df)}/{_total}개 종목만 표시됩니다. 종목 수를 줄이거나 계좌 필터를 좁혀주세요.")
                             else:
-                                st.info("AI 응답을 파싱할 수 없습니다.")
+                                st.warning("AI 응답을 파싱할 수 없습니다. 잠시 후 다시 시도해주세요.")
                         except Exception as _e_ai:
                             st.error(f"AI 분석 오류: {_e_ai}")
                 else:
