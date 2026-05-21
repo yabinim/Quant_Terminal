@@ -4313,8 +4313,9 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
                      alert_price: float = None) -> tuple[bool, str]:
     """
     Watchlist에 단일 종목 추가/업데이트하는 공통 헬퍼.
-    - 기존에 같은 ticker가 있으면 업데이트, 없으면 추가
-    - session_state 캐시도 즉시 업데이트
+    - 기존에 같은 ticker가 없으면 append_row(빠름)
+    - 기존에 같은 ticker가 있으면 전체 업데이트
+    - session_state 캐시도 즉시 초기화
     """
     uid = str(user_id).strip()
     tk = str(ticker).strip().upper()
@@ -4327,30 +4328,56 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
     except Exception:
         cur_price = np.nan
 
-    new_item = {
-        "ticker": tk,
-        "memo": str(memo).strip(),
-        "alert_price": float(alert_price) if alert_price is not None else np.nan,
-        "alert_rsi": float(alert_rsi) if alert_rsi is not None else np.nan,
-        "alert_ma200": bool(alert_ma200),
-        "saved_price": float(cur_price) if pd.notna(cur_price) else np.nan,
-        "date_added": _narrative_now_kst_string(),
-    }
+    date_str = _narrative_now_kst_string()
+    saved_price_str = str(round(float(cur_price), 4)) if pd.notna(cur_price) else ""
+    alert_price_str = str(round(float(alert_price), 4)) if alert_price is not None else ""
+    alert_rsi_str = str(round(float(alert_rsi), 1)) if alert_rsi is not None else ""
+    alert_ma200_str = "true" if alert_ma200 else "false"
 
-    # 기존 목록에서 같은 ticker 제거 후 추가
-    existing = load_watchlist_sheet(uid)
-    updated = [x for x in existing if str(x.get("ticker","")).upper() != tk]
-    updated.append(new_item)
+    try:
+        ws, err = open_watchlist_worksheet()
+        if err or ws is None:
+            return False, err or "워크시트 열기 실패"
 
-    ok, err = save_watchlist_sheet(uid, updated)
-    if ok:
+        # 기존 데이터에서 같은 user+ticker 행이 있는지 확인
+        vals = ws.get_all_values() or []
+        uid_u = uid.upper()
+        existing_rows = []
+        has_duplicate = False
+        for i, r in enumerate(vals[1:], start=2):
+            r = (r + [""] * 8)[:8]
+            if str(r[0]).strip().upper() == uid_u and str(r[1]).strip().upper() == tk:
+                has_duplicate = True
+            else:
+                existing_rows.append((i, r))
+
+        new_row = [
+            uid, tk, str(memo).strip(),
+            alert_price_str, alert_rsi_str, alert_ma200_str,
+            saved_price_str, date_str,
+        ]
+
+        if not has_duplicate:
+            # 중복 없으면 빠르게 append
+            ws.append_row(new_row, value_input_option="USER_ENTERED")
+        else:
+            # 중복 있으면 전체 재작성 (기존 방식)
+            other_rows = [r for _, r in existing_rows
+                          if str(r[0]).strip().upper() != uid_u]
+            user_other = [r for _, r in existing_rows
+                          if str(r[0]).strip().upper() == uid_u]
+            all_rows = [_WATCHLIST_SHEET_COLS] + other_rows + user_other + [new_row]
+            ws.clear()
+            ws.update(all_rows, range_name=f"A1:H{len(all_rows)}", value_input_option="USER_ENTERED")
+
         # 캐시 즉시 초기화
         load_watchlist_sheet.clear()
         st.session_state.pop("_sidebar_wl_count", None)
         st.session_state["_watchlist_alert_checked"] = False
-        # session_state에 즉시 반영 (화면 갱신 전에도 저장됨을 표시)
         st.session_state[f"_wl_added_{tk}"] = True
-    return ok, err
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def check_watchlist_alerts(items: list[dict], price_map: dict, rsi_map: dict, ma200_map: dict) -> list[dict]:
@@ -5570,11 +5597,12 @@ def render_opportunity_emerging_snapshot(snap):
     top3 = score_df.head(3).copy()
     for rank_idx, row in top3.iterrows():
         rank = rank_idx + 1
+        tk_em = str(row["Ticker"]).strip().upper()
         volx = row.get("Vol5/30x")
         volx_s = f"{float(volx):.2f}x" if pd.notna(volx) else "N/A"
         rsi_s = f"{float(row.get('RSI(14)')):.1f}" if pd.notna(row.get("RSI(14)")) else "N/A"
         st.success(
-            f"🌱 TOP {rank} | {row['Ticker']} ({row['Name']}) | Final {_scanner_ui_fmt_2f(row['Final Score'])} / 100\n"
+            f"🌱 TOP {rank} | {tk_em} ({row['Name']}) | Final {_scanner_ui_fmt_2f(row['Final Score'])} / 100\n"
             f"RSI(14): {rsi_s} · 5일/30일 거래량 비: {volx_s}"
         )
         fac_cols = st.columns(5)
@@ -5583,6 +5611,27 @@ def render_opportunity_emerging_snapshot(snap):
                 st.metric(label, _scanner_ui_fmt_2f(row[key]))
         st.markdown(f"**다음 타자 AI 코멘트:** {row['Narrative Why']}")
         st.markdown(f"**리스크:** {row['Risk']}")
+
+        # ── Watchlist 추가 버튼 ───────────────────────────────────────────
+        _em_wl_key = f"_em_snap_wl_{tk_em}"
+        def _do_add_em(tk=tk_em, r=rank, sc=row['Final Score']):
+            _uid = str(st.session_state.get("user_id") or "").strip()
+            _ok, _ = add_to_watchlist(
+                _uid, tk,
+                memo=f"Emerging TOP{r} - Score: {_scanner_ui_fmt_2f(sc)}",
+                alert_rsi=35.0,
+            )
+            if _ok:
+                st.session_state[f"_em_snap_wl_{tk}"] = True
+        if st.session_state.get(_em_wl_key):
+            st.success(f"✅ {tk_em} Watchlist 추가됨!")
+        else:
+            st.button(
+                f"🔔 {tk_em} Watchlist 추가",
+                key=f"em_snap_wl_{rank_idx}_{tk_em}",
+                on_click=_do_add_em,
+                use_container_width=False,
+            )
         st.divider()
 
     remain_df = score_df.iloc[3:].copy()
