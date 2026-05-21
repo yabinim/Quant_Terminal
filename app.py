@@ -4338,24 +4338,25 @@ def delete_from_watchlist(user_id: str, ticker: str) -> tuple[bool, str]:
 
 def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
                      alert_rsi: float = None, alert_ma200: bool = False,
-                     alert_price: float = None) -> tuple[bool, str]:
-    """Watchlist에 단일 종목 추가. append_row 방식. 현재가는 캐시에서만 조회."""
+                     alert_price: float = None,
+                     saved_price: float = None) -> tuple[bool, str]:
+    """Watchlist에 단일 종목 추가. append_row 방식.
+    saved_price를 직접 넘기면 yfinance 조회 생략 (빠름).
+    없으면 @st.cache_data 캐시 활용 조회.
+    """
     uid = str(user_id).strip()
     tk = str(ticker).strip().upper()
     if not uid or not tk:
         return False, "유저ID 또는 티커 없음"
 
-    # 현재가: yfinance 새 호출 없이 캐시에 있으면 사용, 없으면 빈값
-    cur_price = np.nan
-    try:
-        _price_cache = st.session_state.get("_price_cache_map", {})
-        if tk in _price_cache:
-            cur_price = _price_cache[tk]
-        else:
-            # 캐시된 데이터만 사용 (새 API 호출 안 함)
+    # 현재가: 직접 넘긴 값 우선, 없으면 캐시 조회
+    if saved_price is not None and pd.notna(saved_price):
+        cur_price = float(saved_price)
+    else:
+        try:
+            cur_price = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+        except Exception:
             cur_price = np.nan
-    except Exception:
-        cur_price = np.nan
 
     try:
         ws, err = open_watchlist_worksheet()
@@ -5478,9 +5479,12 @@ def render_opportunity_scanner_snapshot(snap):
         # Watchlist 추가 버튼 (on_click 방식)
         def _add_sc_top3_wl(tk=tk_scan, r=rank, _row=row):
             _uid_s = str(st.session_state.get("user_id") or "").strip()
+            # 스캐너 결과에서 현재가 추출 (있으면 yfinance 재조회 불필요)
+            _sp = pd.to_numeric(_row.get("Price", _row.get("Close", np.nan)), errors="coerce")
             _ok_s, _err_s = add_to_watchlist(
                 _uid_s, tk,
                 memo=f"AI 스캐너 TOP{r} - Score: {_scanner_ui_fmt_2f(_row['Final Score'])}",
+                saved_price=float(_sp) if pd.notna(_sp) else None,
             )
             if _ok_s:
                 st.session_state[f"_sc_wl_added_{tk}"] = True
@@ -5516,9 +5520,11 @@ def render_opportunity_scanner_snapshot(snap):
             with _rem_cols[_ri]:
                 def _add_rem_wl(tk=_rtk, row=_rrow):
                     _uid_r = str(st.session_state.get("user_id") or "").strip()
+                    _sp_r = pd.to_numeric(row.get("Price", row.get("Close", np.nan)), errors="coerce")
                     _ok_r, _ = add_to_watchlist(
                         _uid_r, tk,
                         memo=f"AI 스캐너 - Score: {_scanner_ui_fmt_2f(row['Final Score'])}",
+                        saved_price=float(_sp_r) if pd.notna(_sp_r) else None,
                     )
                     if _ok_r:
                         st.session_state[f"_sc_wl_added_{tk}"] = True
@@ -5625,12 +5631,14 @@ def render_opportunity_emerging_snapshot(snap):
 
         # ── Watchlist 추가 버튼 ───────────────────────────────────────────
         _em_wl_key = f"_em_snap_wl_{tk_em}"
-        def _do_add_em(tk=tk_em, r=rank, sc=row['Final Score']):
+        def _do_add_em(tk=tk_em, r=rank, sc=row['Final Score'], _row=row):
             _uid = str(st.session_state.get("user_id") or "").strip()
+            _sp_e = pd.to_numeric(_row.get("Price", _row.get("Close", np.nan)), errors="coerce")
             _ok, _ = add_to_watchlist(
                 _uid, tk,
                 memo=f"Emerging TOP{r} - Score: {_scanner_ui_fmt_2f(sc)}",
                 alert_rsi=35.0,
+                saved_price=float(_sp_e) if pd.notna(_sp_e) else None,
             )
             if _ok:
                 st.session_state[f"_em_snap_wl_{tk}"] = True
