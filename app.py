@@ -3354,7 +3354,7 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
             rows.append([uid, acct, tk, float(pp), float(qq), now_s])
         ws.clear()
         ws.update(rows, range_name=f"A1:F{len(rows)}", value_input_option="USER_ENTERED")
-        _invalidate_portfolio_sheet_cache()
+        _invalidate_portfolio_sheet_cache()  # 쓰기 완료 후 캐시 강제 클리어
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -8147,6 +8147,8 @@ if st.session_state.get("logged_in"):
                 )
                 if not _save_ok:
                     st.warning(f"⚠️ 예측 기록 저장 실패: {_save_err}")
+                else:
+                    _invalidate_drg_predictions_cache()  # 저장 후 캐시 강제 클리어
 
                 st.session_state["_drg_ai_result"] = _drg_text
                 st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
@@ -8331,6 +8333,12 @@ if st.session_state.get("logged_in"):
         st.caption("과거 AI 예측과 실제 시장 결과를 비교합니다. 예측 다음날 이후 '결과 검증' 버튼으로 실제 결과를 확인하세요.")
 
         _puid_hist = str(st.session_state.get("user_id") or "").strip()
+
+        # 히스토리 동기화 버튼
+        if st.button("🔄 히스토리 새로고침", key="drg_hist_sync_btn"):
+            _invalidate_drg_predictions_cache()
+            st.rerun()
+
         pred_hist_df = load_drg_predictions(_puid_hist)
 
         if pred_hist_df.empty:
@@ -11049,6 +11057,7 @@ if st.session_state.get("logged_in"):
                                         pnl_pct = ((sell_price_input / cur_avg_price) - 1.0) * 100.0 if cur_avg_price > 0 else 0
                                         pnl_emoji = "🟢" if realized >= 0 else "🔴"
                                         st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} {sell_qty_input:g}주 매도. 잔여 {new_qty:g}주 | 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%)")
+                                _invalidate_portfolio_sheet_cache()
                                 st.rerun()
 
         st.divider()
