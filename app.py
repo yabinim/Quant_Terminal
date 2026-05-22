@@ -57,69 +57,6 @@ def _notify_yfinance_fetch_failed() -> None:
     st.warning("야후 파이낸스 접속 제한으로 일부 데이터를 불러오지 못했습니다.")
 
 
-def _yf_download_with_retry(ticker, period="1mo", interval="1d", auto_adjust=True,
-                             progress=False, max_retries=3, delay=3, **kwargs):
-    """yf.download 래퍼 — rate limit 발생 시 자동 재시도."""
-    for attempt in range(max_retries):
-        try:
-            df = yf.download(ticker, period=period, interval=interval,
-                             auto_adjust=auto_adjust, progress=progress, **kwargs)
-            if df is not None and not df.empty:
-                return df
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-        except Exception as exc:
-            err_s = str(exc).lower()
-            if any(k in err_s for k in ["429", "rate limit", "too many", "blocked"]):
-                if attempt < max_retries - 1:
-                    time.sleep(delay * (attempt + 1))
-                    continue
-            if attempt == max_retries - 1:
-                return pd.DataFrame()
-            time.sleep(delay)
-    return pd.DataFrame()
-
-
-def _yf_ticker_history_with_retry(ticker, period="1mo", auto_adjust=False,
-                                   max_retries=3, delay=3):
-    """yf.Ticker().history() 래퍼 — rate limit 발생 시 자동 재시도."""
-    for attempt in range(max_retries):
-        try:
-            df = yf.Ticker(ticker).history(period=period, auto_adjust=auto_adjust)
-            if df is not None and not df.empty:
-                return df
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-        except Exception as exc:
-            err_s = str(exc).lower()
-            if any(k in err_s for k in ["429", "rate limit", "too many", "blocked"]):
-                if attempt < max_retries - 1:
-                    time.sleep(delay * (attempt + 1))
-                    continue
-            if attempt == max_retries - 1:
-                return pd.DataFrame()
-            time.sleep(delay)
-    return pd.DataFrame()
-
-
-@st.cache_data(ttl=120)
-def _check_yfinance_status() -> dict:
-    """SPY+VIX+HYG 3개 티커로 Yahoo Finance 연결 상태 체크."""
-    try:
-        t0 = time.time()
-        df = yf.download(["SPY", "^VIX", "HYG"], period="2d", interval="1d",
-                         progress=False, auto_adjust=True)
-        elapsed = int((time.time() - t0) * 1000)
-        if df is not None and not df.empty:
-            return {"ok": True, "message": f"정상 ({elapsed}ms)"}
-        return {"ok": False, "message": "데이터 없음 — 제한 가능성"}
-    except Exception as exc:
-        err_s = str(exc).lower()
-        if any(k in err_s for k in ["429", "rate limit", "too many", "blocked"]):
-            return {"ok": False, "message": "🚫 Rate Limit 감지"}
-        return {"ok": False, "message": f"연결 오류: {str(exc)[:50]}"}
-
-
 _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
 _USER_SHEET_COLS = ["ID", "Password", "Reason", "Source", "Status"]
@@ -2414,33 +2351,15 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
     try:
-        _vol_raw = _yf_download_with_retry(
-            sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False
-        )
-        if _vol_raw is not None and not _vol_raw.empty:
-            # 종가 추출 (MultiIndex 대응)
-            _vc = None
-            if "Close" in _vol_raw.columns:
-                _vc = pd.to_numeric(_vol_raw["Close"], errors="coerce").dropna()
-            if (_vc is None or _vc.empty) and hasattr(_vol_raw.columns, "levels"):
-                for _c in _vol_raw.columns:
-                    if "close" in str(_c).lower():
-                        _vc = pd.to_numeric(_vol_raw[_c], errors="coerce").dropna()
-                        break
-            # 거래량 추출
-            _vv = None
-            if "Volume" in _vol_raw.columns:
-                _vv = pd.to_numeric(_vol_raw["Volume"], errors="coerce").dropna()
-            if (_vv is None or _vv.empty) and hasattr(_vol_raw.columns, "levels"):
-                for _c in _vol_raw.columns:
-                    if "volume" in str(_c).lower():
-                        _vv = pd.to_numeric(_vol_raw[_c], errors="coerce").dropna()
-                        break
-            if _vc is not None and _vv is not None and len(_vc) >= 10 and len(_vv) >= 10:
-                price_5d = float((_vc.iloc[-1] / _vc.iloc[-6] - 1) * 100) if len(_vc) >= 6 else 0.0
-                vol_5d = float(_vv.tail(5).mean())
-                vol_20d = float(_vv.tail(20).mean())
-                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1.0
+        etf_s = pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if 'close_df' in dir() else pd.Series(dtype=float)
+        if close_df is not None and sector_etf in close_df.columns and not etf_s.empty:
+            raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
+            if len(etf_s) >= 10 and len(vol) >= 10:
+                price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
+                vol_5d = float(vol.tail(5).mean())
+                vol_20d = float(vol.tail(20).mean())
+                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
                 dist_selling = price_5d > 0 and vol_ratio < 0.8
                 vol_alert = dist_selling or vol_ratio < 0.7
                 signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
@@ -2816,53 +2735,97 @@ def translate_ko(text: str, mapping: dict) -> str:
     return mapping.get(str(text).strip(), str(text).strip())
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_company_overview(ticker_upper: str) -> dict:
-    """회사 기본 정보 조회 (섹터/산업 한글 포함)."""
-    try:
-        tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
-        info = tk_obj.info or {}
-        name = str(info.get("longName") or info.get("shortName") or ticker_upper)
-        sector_en = str(info.get("sector") or "")
-        industry_en = str(info.get("industry") or "")
-        quote_type = str(info.get("quoteType") or "").upper()
-        is_etf = quote_type in ("ETF", "MUTUALFUND") or "etf" in sector_en.lower()
-        country = str(info.get("country") or "N/A")
-        summary_en = str(info.get("longBusinessSummary") or "")
-        employees = info.get("fullTimeEmployees")
-        market_cap = to_float(info.get("marketCap"))
-        website = str(info.get("website") or "")
+def _fetch_company_overview_uncached(ticker_upper: str) -> dict:
+    """회사 기본 정보 조회 내부 로직 (캐시 없음)."""
+    tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
 
-        # 섹터/산업 한글 변환
-        sector_kr = translate_ko(sector_en, _SECTOR_KR) if sector_en else "N/A"
-        industry_kr = translate_ko(industry_en, _INDUSTRY_KR) if industry_en else "N/A"
-
-        # 다음 실적 발표일
-        next_earnings = None
+    # ── info 수집: 최대 2회 시도 ───────────────────────────────────────
+    info = {}
+    for _attempt in range(2):
         try:
-            ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
-            if ts and int(ts) > 0:
-                next_earnings = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+            raw = tk_obj.info
+            if isinstance(raw, dict) and len(raw) > 5:
+                info = raw
+                break
+        except Exception:
+            if _attempt == 0:
+                time.sleep(1)
+
+    # info가 너무 빈약하면 fast_info로 핵심 필드 보완
+    if not info or len(info) <= 5:
+        try:
+            fi = tk_obj.fast_info
+            info = {
+                "longName": getattr(fi, "currency", None) and ticker_upper,  # 이름은 없으므로 ticker 사용
+                "marketCap": getattr(fi, "market_cap", None),
+                "currentPrice": getattr(fi, "last_price", None),
+                "fiftyDayAverage": getattr(fi, "fifty_day_average", None),
+                "twoHundredDayAverage": getattr(fi, "two_hundred_day_average", None),
+            }
         except Exception:
             pass
-        if not next_earnings:
-            try:
-                ed_list = info.get("earningsDate") or []
-                if ed_list and isinstance(ed_list, list):
-                    next_earnings = str(ed_list[0])[:10]
-            except Exception:
-                pass
 
-        return {
-            "name": name,
-            "sector": sector_kr, "sector_en": sector_en,
-            "industry": industry_kr, "industry_en": industry_en,
-            "is_etf": is_etf,
-            "country": country,
-            "summary_en": summary_en,
-            "employees": employees, "market_cap": market_cap,
-            "website": website, "next_earnings": next_earnings,
-        }
+    name = str(info.get("longName") or info.get("shortName") or ticker_upper)
+    sector_en = str(info.get("sector") or "")
+    industry_en = str(info.get("industry") or "")
+    quote_type = str(info.get("quoteType") or "").upper()
+    is_etf = quote_type in ("ETF", "MUTUALFUND") or "etf" in sector_en.lower()
+    country = str(info.get("country") or "N/A")
+    summary_en = str(info.get("longBusinessSummary") or "")
+    employees = info.get("fullTimeEmployees")
+    market_cap = to_float(info.get("marketCap"))
+    website = str(info.get("website") or "")
+
+    # 섹터/산업 한글 변환
+    sector_kr = translate_ko(sector_en, _SECTOR_KR) if sector_en else "N/A"
+    industry_kr = translate_ko(industry_en, _INDUSTRY_KR) if industry_en else "N/A"
+
+    # 다음 실적 발표일
+    next_earnings = None
+    try:
+        ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
+        if ts and int(ts) > 0:
+            next_earnings = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    if not next_earnings:
+        try:
+            ed_list = info.get("earningsDate") or []
+            if ed_list and isinstance(ed_list, list):
+                next_earnings = str(ed_list[0])[:10]
+        except Exception:
+            pass
+
+    result = {
+        "name": name,
+        "sector": sector_kr, "sector_en": sector_en,
+        "industry": industry_kr, "industry_en": industry_en,
+        "is_etf": is_etf,
+        "country": country,
+        "summary_en": summary_en,
+        "employees": employees, "market_cap": market_cap,
+        "website": website, "next_earnings": next_earnings,
+        "_info_ok": bool(info and len(info) > 5),  # 캐시 유효성 판단용
+    }
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_company_overview(ticker_upper: str) -> dict:
+    """회사 기본 정보 조회 (섹터/산업 한글 포함).
+    info가 정상적으로 수신된 경우에만 결과를 캐싱합니다.
+    빈 dict 반환 시 캐시에 저장되지 않도록 예외를 발생시켜 Streamlit이 재시도합니다.
+    """
+    try:
+        result = _fetch_company_overview_uncached(ticker_upper)
+        # info가 너무 빈약하면 캐싱하지 않고 예외 raise → 다음 호출에서 재시도
+        if not result.get("_info_ok") and not result.get("market_cap"):
+            raise RuntimeError("yfinance info empty — skip cache")
+        return result
+    except RuntimeError:
+        # 캐시 저장을 막기 위해 빈 dict 대신 최소 정보만 반환
+        # (RuntimeError는 st.cache_data가 캐싱하지 않음)
+        raise
     except Exception:
         return {}
 
@@ -3083,6 +3046,12 @@ def evaluate_kpis(ticker_symbol):
     # PEG Ratio
     peg_ratio = to_float(info.get("pegRatio") or info.get("trailingPegRatio"))
 
+    # Forward / Trailing PE (Valuation 대체 지표)
+    forward_pe = to_float(info.get("forwardPE"))
+    trailing_pe = to_float(info.get("trailingPE"))
+    price_to_book = to_float(info.get("priceToBook"))
+    ev_to_ebitda = to_float(info.get("enterpriseToEbitda"))
+
     # EPS & Growth
     trailing_eps = to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
     earnings_growth = to_float(info.get("earningsGrowth") or info.get("revenueGrowth"))
@@ -3150,10 +3119,50 @@ def evaluate_kpis(ticker_symbol):
         },
         {
             "Category": "밸류에이션 (Valuation)",
+            "KPI": "Forward P/E",
+            "Value": num_str(forward_pe) if pd.notna(forward_pe) else "N/A",
+            "Rule": "5~50 합리적",
+            "Pass": pass_fail_badge(
+                pd.notna(forward_pe) and 0 < forward_pe <= 50,
+                pd.isna(forward_pe),
+            ),
+        },
+        {
+            "Category": "밸류에이션 (Valuation)",
+            "KPI": "Trailing P/E",
+            "Value": num_str(trailing_pe) if pd.notna(trailing_pe) else "N/A",
+            "Rule": "0 초과 & 60 이하",
+            "Pass": pass_fail_badge(
+                pd.notna(trailing_pe) and 0 < trailing_pe <= 60,
+                pd.isna(trailing_pe),
+            ),
+        },
+        {
+            "Category": "밸류에이션 (Valuation)",
             "KPI": "PEG Ratio",
             "Value": num_str(peg_ratio),
             "Rule": "1.0 미만",
             "Pass": pass_fail_badge(not pd.isna(peg_ratio) and peg_ratio < 1.0, pd.isna(peg_ratio)),
+        },
+        {
+            "Category": "밸류에이션 (Valuation)",
+            "KPI": "P/B (Price-to-Book)",
+            "Value": num_str(price_to_book) if pd.notna(price_to_book) else "N/A",
+            "Rule": "5.0 이하",
+            "Pass": pass_fail_badge(
+                pd.notna(price_to_book) and price_to_book <= 5.0,
+                pd.isna(price_to_book),
+            ),
+        },
+        {
+            "Category": "밸류에이션 (Valuation)",
+            "KPI": "EV/EBITDA",
+            "Value": num_str(ev_to_ebitda) if pd.notna(ev_to_ebitda) else "N/A",
+            "Rule": "25 이하",
+            "Pass": pass_fail_badge(
+                pd.notna(ev_to_ebitda) and 0 < ev_to_ebitda <= 25,
+                pd.isna(ev_to_ebitda),
+            ),
         },
         {
             "Category": "밸류에이션 (Valuation)",
@@ -3183,6 +3192,10 @@ def evaluate_kpis(ticker_symbol):
         "growth_percent": growth_percent,
         "current_price": current_price,
         "core_fcf_pass": core_fcf_pass,
+        "forward_pe": forward_pe,
+        "trailing_pe": trailing_pe,
+        "price_to_book": price_to_book,
+        "ev_to_ebitda": ev_to_ebitda,
     }
 
     return kpi_df, pass_count, fail_count, nodata_count, margin_context
@@ -3561,19 +3574,23 @@ def open_drg_predictions_worksheet():
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
         sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+    except Exception as exc:
+        return None, f"스프레드시트 접근 실패: {exc}"
+    # 탭 열기 시도 → 실패하면 무조건 생성
+    try:
         ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET_TITLE)
         return ws, None
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
-            try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET_TITLE, rows=2000, cols=len(_DRG_PREDICTIONS_SHEET_COLS))
-                ws.update([_DRG_PREDICTIONS_SHEET_COLS], range_name=f"A1:{chr(64+len(_DRG_PREDICTIONS_SHEET_COLS))}1", value_input_option="USER_ENTERED")
-                return ws, None
-            except Exception as exc2:
-                return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
-        return None, f"DRG_Predictions 시트 접근 실패: {exc}"
+    except Exception:
+        pass
+    try:
+        ncols = len(_DRG_PREDICTIONS_SHEET_COLS)
+        ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET_TITLE, rows=2000, cols=ncols)
+        ws.update([_DRG_PREDICTIONS_SHEET_COLS],
+                  range_name=f"A1:{chr(64+ncols)}1",
+                  value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc2:
+        return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
 
 
 @st.cache_data(ttl=300)
@@ -3592,12 +3609,19 @@ def _invalidate_drg_predictions_cache():
 
 
 def load_drg_predictions(user_id: str) -> pd.DataFrame:
-    """DRG_Predictions 시트에서 해당 user_id 행만 로드."""
+    """DRG_Predictions 시트에서 해당 user_id 행만 로드. 캐시 우회, 시트 직접 읽기."""
     empty = pd.DataFrame(columns=_DRG_PREDICTIONS_SHEET_COLS)
     if not user_id:
         return empty
-    rows, err = _drg_predictions_all_values_cached()
-    if err or not rows or len(rows) < 2:
+    # 캐시 우회 — 항상 시트 직접 읽기
+    try:
+        ws, err = open_drg_predictions_worksheet()
+        if err or ws is None:
+            return empty
+        rows = ws.get_all_values()
+    except Exception:
+        return empty
+    if not rows or len(rows) < 2:
         return empty
     try:
         header = [str(c).strip().lower() for c in rows[0]]
@@ -5040,22 +5064,6 @@ def render_global_market_watch_header():
             st.markdown(f"**📊 Status:** :green[{market_status}]")
         else:
             st.markdown(f"**📊 Status:** {market_status}")
-
-    # ── Yahoo Finance 연결 상태 표시 ──────────────────────────────────
-    _yf_col1, _yf_col2 = st.columns([5, 1])
-    with _yf_col2:
-        if st.button("🔄 상태 확인", key="yf_status_check_btn", use_container_width=True):
-            _check_yfinance_status.clear()
-            st.rerun()
-    with _yf_col1:
-        _yf_st = _check_yfinance_status()
-        if _yf_st["ok"]:
-            st.success(f"✅ Yahoo Finance 정상 연결 중 · {_yf_st['message']}")
-        else:
-            st.error(
-                f"🚫 **Yahoo Finance 접속 제한** — {_yf_st['message']}  "
-                "일부 지표가 N/A로 표시될 수 있습니다. 5~15분 후 '🔄 상태 확인' 버튼을 눌러주세요."
-            )
 
     st.divider()
 
@@ -6647,6 +6655,9 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
         revenue_growth = to_float(info.get("revenueGrowth"))
         trailing_eps = to_float(info.get("trailingEps"))
         forward_pe = to_float(info.get("forwardPE"))
+        # forwardPE 없으면 trailingPE로 대체
+        _trailing_pe_sc = to_float(info.get("trailingPE"))
+        _pe_used = forward_pe if (pd.notna(forward_pe) and forward_pe > 0) else _trailing_pe_sc
         long_name = str(info.get("longName") or info.get("shortName") or ticker).strip()
 
         vol_3d_avg = pd.to_numeric(vol_series, errors="coerce").tail(3).mean() if not vol_series.empty else np.nan
@@ -6661,9 +6672,9 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             or (pd.notna(trailing_eps) and trailing_eps > 0)
         )
         inst_pass = pd.notna(vol_ratio) and vol_ratio >= 1.2
-        # forwardPE가 None/NaN이거나 0 이하(적자 등으로 PE 해석 불가)면 결측으로 간주
-        valuation_data_available = pd.notna(forward_pe) and forward_pe > 0
-        valuation_pass = valuation_data_available and forward_pe <= 50
+        # forwardPE 또는 trailingPE 중 하나라도 유효하면 밸류에이션 데이터 있음으로 처리
+        valuation_data_available = pd.notna(_pe_used) and _pe_used > 0
+        valuation_pass = valuation_data_available and _pe_used <= 50
 
         narrative_score, narrative_why = narrative_map.get(ticker, (0.0, "배치 미응답"))
         narrative_available = narrative_why not in SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS
@@ -8040,10 +8051,8 @@ if st.session_state.get("logged_in"):
         with drg_col2:
             st.caption(f"선택 섹터: **{sector_choice}** | 30분 캐시")
 
-        if st.button("🔄 지금 스캔 (캐시 초기화 후 재분석)", key="drg_refresh_btn", use_container_width=True):
+        if st.button("🔄 지금 스캔", key="drg_refresh_btn", use_container_width=True):
             compute_daily_risk_gauge.clear()
-            _check_yfinance_status.clear()
-            st.rerun()
 
         with st.spinner("선행 지표 5가지 분석 중..."):
             drg = compute_daily_risk_gauge(sector_filter=sector_choice)
@@ -8258,162 +8267,6 @@ if st.session_state.get("logged_in"):
             else:
                 st.warning(_txt)
 
-    elif main_nav == _MAIN_NAV_OPTIONS[12]:
-        st.title("📖 Quant Terminal 사용 가이드")
-        st.markdown("처음 오셨나요? **실제 매수 결정부터 매도까지** 앱의 모든 탭을 어떤 순서로, 어떻게 활용하는지 단계별로 설명합니다.")
-        st.info("💡 **핵심 원칙:** 이 앱은 단 하나의 신호로 매수 결정을 내리지 않습니다. Macro → Sector → Stock 3개 레이어가 모두 같은 방향을 가리킬 때만 높은 확신으로 진입할 수 있습니다.")
-
-        st.divider()
-        st.markdown("## 🗺️ 전체 투자 흐름")
-        flow_cols = st.columns(5)
-        flow_data = [
-            ("🌐", "Step 1", "거시 환경 확인"),
-            ("📰", "Step 2", "테마 발굴"),
-            ("🔬", "Step 3", "종목 검증"),
-            ("💼", "Step 4", "매수 & 관리"),
-            ("🛡️", "Step 5", "매도 타이밍"),
-        ]
-        for col, (emoji, title, sub) in zip(flow_cols, flow_data):
-            with col:
-                st.markdown(
-                    "<div style='text-align:center;padding:12px;background:#1e293b;border-radius:8px;'>"
-                    f"<div style='font-size:28px'>{emoji}</div>"
-                    f"<div style='font-weight:700;margin:4px 0;font-size:12px'>{title}</div>"
-                    f"<div style='color:#94a3b8;font-size:11px'>{sub}</div></div>",
-                    unsafe_allow_html=True,
-                )
-
-        st.divider()
-
-        # Step 1
-        with st.expander("🌐 Step 1 — 거시경제 환경 확인 (탭: 거시경제 지표)", expanded=True):
-            g1c1, g1c2 = st.columns(2)
-            with g1c1:
-                st.success(
-                    "✅ 진입 가능 신호\n\n"
-                    "- Macro Score 60점 이상\n"
-                    "- VIX 20 이하\n"
-                    "- Fear & Greed 25~74\n"
-                    "- 장단기 금리차 플러스(+)"
-                )
-            with g1c2:
-                st.error(
-                    "❌ 주의/대기 신호\n\n"
-                    "- Macro Score 50점 미만\n"
-                    "- VIX 30 이상\n"
-                    "- Fear & Greed 10 이하\n"
-                    "- 경고 지표 5개 이상"
-                )
-            st.markdown("**💡 팁:** VIX 히스토리에서 추세를 보세요. 숫자 하나보다 방향이 중요해요. Fear & Greed 25 이하는 역발상 매수 기회일 수 있어요.")
-            st.markdown("**📌 예시:** Macro Score 74 / NEUTRAL, VIX 17.3 → 선별적 진입 가능")
-
-        # Step 2
-        with st.expander("📰 Step 2 — AI 내러티브로 테마 발굴 (탭: 시장 내러티브)", expanded=False):
-            g2c1, g2c2, g2c3 = st.columns(3)
-            with g2c1:
-                st.info("🏆 Top Quant Picks\n\n정량 모멘텀 + 뉴스 테마 동시 확인. 가장 신뢰도 높음.")
-            with g2c2:
-                st.success("🎯 Winners\n\n테마별 주요 수혜주. 가격 + 내러티브 모두 확인.")
-            with g2c3:
-                st.warning("🌱 Emerging\n\n뉴스는 있지만 가격 미확인. Watchlist에 등록 후 대기.")
-            st.markdown("**💡 팁:** Emerging 종목을 놓치지 마세요. 초기 발굴해서 Watchlist에 등록하면 타이밍을 잡을 수 있어요.")
-            st.markdown("**📌 예시:** Theme: AI 인프라 Capex / Winners: NVDA, SMH / Emerging: VST, CEG → NVDA는 스캐너 검증, VST는 Watchlist 등록")
-
-        # Step 3
-        with st.expander("🎯 Step 3 — 섹터 흐름 검증 (탭: 섹터 & 자금 흐름)", expanded=False):
-            st.markdown("Hidden Alpha Radar에서 내러티브 테마 ETF가 RS Score 상위에 있는지 확인하세요.")
-            st.markdown("- **RS Score 상위 + 거래량 급증** = 기관 자금 유입 신호\n- 내러티브와 섹터 RS가 일치할 때 진입 확신이 높아집니다.")
-            st.markdown("**📌 예시:** SOXX RS +18.3%p 거래량 1.9x → 반도체 섹터 강세. 내러티브와 완전 일치.")
-
-        # Step 4
-        with st.expander("🚀 Step 4 — AI 스캐너로 최종 종목 선별 (탭: AI 종목 스캐너)", expanded=False):
-            g4c1, g4c2, g4c3 = st.columns(3)
-            with g4c1:
-                st.success("80점 이상\n\n강력 매수 후보.")
-            with g4c2:
-                st.warning("60~79점\n\n조건부 매수. 타이밍 추가 확인.")
-            with g4c3:
-                st.error("60점 미만\n\n관망. 다음 기회 탐색.")
-            st.markdown("**💡 팁:** TOP3에 🔔 Watchlist 추가 버튼으로 바로 등록하세요. Narrative Score 높아도 Momentum Score 낮으면 시장이 아직 안 따라오는 신호예요.")
-
-        # Step 5
-        with st.expander("🔬 Step 5 — 개별 종목 진입 타이밍 (탭: 개별 종목 정밀 검사)", expanded=False):
-            g5c1, g5c2 = st.columns(2)
-            with g5c1:
-                st.success(
-                    "✅ 진입 조건\n\n"
-                    "- 현재가 200일선 위\n"
-                    "- RSI 40~65 사이\n"
-                    "- 최근 고점 대비 5~15% 조정\n"
-                    "- 실적 발표 2주 이상 남음"
-                )
-            with g5c2:
-                st.warning(
-                    "⚠️ 주의 신호\n\n"
-                    "- RSI 75 이상 (과매수)\n"
-                    "- 52주 신고가 바로 위\n"
-                    "- 실적 발표 1주 이내\n"
-                    "- 200일선 아래"
-                )
-            st.markdown("**📌 예시:** NVDA 현재가 $875 / 200일선 $812 ✅ / RSI 58 ✅ / 최근 고점 -8% ✅ → 진입 타이밍 양호")
-
-        # Step 6
-        with st.expander("🔔 Step 6 — Watchlist Alert 설정 (탭: Buy Watchlist & Alert)", expanded=False):
-            g6c1, g6c2, g6c3 = st.columns(3)
-            with g6c1:
-                st.info("💰 목표 매수가\n\n원하는 가격 이하 도달 시 알림.")
-            with g6c2:
-                st.info("📉 RSI 과매도\n\nRSI 30 이하 설정 권장.")
-            with g6c3:
-                st.info("📊 200일선 근접\n\n장기 지지선 테스트 시 알림.")
-            st.markdown("**💡 팁:** Alert 발동 시 바로 매수하지 말고 [3단계] 개별 종목 검사를 다시 확인하세요.")
-
-        # Step 7
-        with st.expander("💼 Step 7 — 포트폴리오 등록 & Thesis 기록 (탭: 포트폴리오 매도 레이더)", expanded=False):
-            st.markdown("매수 후 등록 시 **📌 투자 Thesis를 반드시 선택**하세요. 나중에 어떤 테마로 샀는지 추적할 수 있어요.")
-            st.markdown("- **Correlation Matrix:** 기존 보유 종목과 0.85 이상이면 분산 효과 없음\n- **Personal Benchmark:** 내 포트폴리오가 SPY를 이기고 있는지 확인\n- **Earnings Calendar:** 보유 종목 실적 발표일 확인")
-
-        # Step 8
-        with st.expander("🛡️ Step 8 — 매도 타이밍 잡기 (탭: 포트폴리오 매도 레이더)", expanded=False):
-            g8c1, g8c2 = st.columns(2)
-            with g8c1:
-                st.error(
-                    "🔴 즉시 매도 검토\n\n"
-                    "- 상태: SELL 표시\n"
-                    "- Drawdown -30% 이상\n"
-                    "- 200일선 아래\n"
-                    "- SPY Alpha -20%p 이하\n"
-                    "- Macro Score 45점 미만 급락"
-                )
-            with g8c2:
-                st.warning(
-                    "🟡 부분 매도 / 관망\n\n"
-                    "- SPY Alpha 0%p 이하\n"
-                    "- VIX 30 이상 급등\n"
-                    "- 내러티브 테마 약화\n"
-                    "- 실적 발표 1주 전\n"
-                    "- Correlation 종목 동시 하락"
-                )
-            st.markdown("**📌 주간 루틴:** 월요일 거시 확인 → 화요일 내러티브 실행 → 목요일 포트폴리오 점검 → 금요일 주간 AI 리포트")
-            st.markdown("**📌 매도 예시:** Macro Score 급락 + VIX 급등 + 주간 리포트 축소 권장 + Drawdown 18% → 4가지 동시 발생 시 보유 물량 50% 이상 매도")
-
-        st.divider()
-        st.markdown("## ✅ 매수 전 최종 체크리스트 (5개 이상 충족 시 진입)")
-        checklist = [
-            ("🌐", "Macro Score 60점 이상", "거시 환경 우호적"),
-            ("📰", "AI 내러티브 Winners 또는 Top Quant Picks 포함", "테마 확인"),
-            ("🎯", "Hidden Alpha Radar 상위 20% 이내", "섹터 강세"),
-            ("🚀", "AI 스캐너 Final Score 70점 이상", "종목 경쟁력"),
-            ("🔬", "RSI 40~70 사이", "과매수/과매도 아님"),
-            ("📊", "현재가 200일선 위", "장기 우상향 추세"),
-            ("📅", "실적 발표 2주 이상 남음", "이벤트 리스크 없음"),
-        ]
-        for emoji, item, desc in checklist:
-            st.markdown(f"{emoji} **{item}** — _{desc}_")
-
-        st.divider()
-        st.warning("⚠️ 면책 조항: 이 앱은 투자 참고 도구이며 투자 권유가 아닙니다. 모든 투자 결정과 결과는 투자자 본인의 책임입니다.")
-
         # ═══════════════════════════════════════════════════════════════════
         # AI 예측 히스토리 & 적중률
         # ═══════════════════════════════════════════════════════════════════
@@ -8422,148 +8275,120 @@ if st.session_state.get("logged_in"):
         st.caption("과거 AI 예측과 실제 시장 결과를 비교합니다. 예측 다음날 이후 '결과 검증' 버튼으로 실제 결과를 확인하세요.")
 
         _puid_hist = str(st.session_state.get("user_id") or "").strip()
+
+        if st.button("🔄 히스토리 새로고침", key="drg_hist_refresh_btn"):
+            st.rerun()
+
         pred_hist_df = load_drg_predictions(_puid_hist)
 
         if pred_hist_df.empty:
-            st.info("아직 AI 예측 기록이 없습니다. 위 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
+            _ws_diag, _err_diag = open_drg_predictions_worksheet()
+            if _err_diag:
+                st.error(f"시트 연결 실패: {_err_diag}")
+            else:
+                try:
+                    _rows_diag = _ws_diag.get_all_values()
+                    _total = len(_rows_diag) - 1 if _rows_diag and len(_rows_diag) > 1 else 0
+                    if _total > 0:
+                        _first_uid = _rows_diag[1][0] if _rows_diag[1] else "?"
+                        st.warning(f"시트에 {_total}개 행이 있지만 현재 user_id(`{_puid_hist}`)와 일치하는 행이 없습니다. 시트의 첫 데이터 user_id: `{_first_uid}`")
+                    else:
+                        st.info("아직 AI 예측 기록이 없습니다. 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
+                except Exception as _de:
+                    st.error(f"진단 오류: {_de}")
         else:
-            # 적중률 요약
             verified = pred_hist_df[pred_hist_df["is_correct"].astype(str).str.strip() != ""]
             total_v = len(verified)
-            correct_v = (verified["is_correct"] == "✅ 적중").sum()
-            hit_rate = (correct_v / total_v * 100) if total_v > 0 else np.nan
-
+            correct_v = (verified["is_correct"] == "✅ 적중").sum() if total_v else 0
+            hit_rate = (correct_v / total_v * 100) if total_v else np.nan
             hm1, hm2, hm3, hm4 = st.columns(4)
-            with hm1:
-                st.metric("총 예측 횟수", len(pred_hist_df))
-            with hm2:
-                st.metric("검증 완료", total_v)
-            with hm3:
-                st.metric("적중 횟수", correct_v)
-            with hm4:
-                st.metric("적중률", f"{hit_rate:.0f}%" if pd.notna(hit_rate) else "N/A")
-
+            hm1.metric("총 예측 횟수", len(pred_hist_df))
+            hm2.metric("검증 완료", total_v)
+            hm3.metric("적중 횟수", correct_v)
+            hm4.metric("적중률", f"{hit_rate:.0f}%" if pd.notna(hit_rate) else "N/A")
             st.divider()
 
-            # 미검증 예측 — 결과 검증 버튼
             unverified = pred_hist_df[pred_hist_df["is_correct"].astype(str).str.strip() == ""].copy()
             if not unverified.empty:
                 st.markdown("#### 🔍 결과 검증 대기 중")
                 for _, urow in unverified.iterrows():
-                    _pd_str = str(urow.get("pred_date", ""))
-                    _bench = str(urow.get("benchmark_etf", "SPY"))
-                    _dir = str(urow.get("direction", ""))
-                    _sec = str(urow.get("sector_filter", "전체"))
-                    ucol1, ucol2, ucol3 = st.columns([2, 2, 1])
-                    with ucol1:
-                        st.write(f"📅 **{_pd_str}** | 예측: {_dir}")
-                    with ucol2:
-                        st.write(f"📌 섹터: {_sec} | 벤치마크: {_bench}")
-                    with ucol3:
-                        if st.button("결과 검증", key=f"verify_drg_{_pd_str}"):
-                            with st.spinner(f"{_bench} 실제 결과 조회 중..."):
-                                _actual_dir, _actual_ret, _is_correct = verify_drg_prediction(urow)
-                            if _actual_dir:
-                                # AI 리뷰 생성
-                                with st.spinner("AI가 예측 리뷰 작성 중..."):
+                    uc1, uc2, uc3 = st.columns([2, 2, 1])
+                    uc1.write(f"📅 **{urow.get('pred_date','')}** | {urow.get('direction','')}")
+                    uc2.write(f"벤치마크: {urow.get('benchmark_etf','SPY')} | 섹터: {urow.get('sector_filter','전체')}")
+                    with uc3:
+                        if st.button("결과 검증", key=f"verify_{urow.get('pred_date','')}"):
+                            with st.spinner("실제 결과 조회 중..."):
+                                _ad, _ar, _ic = verify_drg_prediction(urow)
+                            if _ad:
+                                with st.spinner("AI 리뷰 작성 중..."):
                                     try:
-                                        _review_prompt = (
-                                            f"당신은 퀀트 투자 분석가입니다.\n"
-                                            f"[예측 날짜] {_pd_str}\n"
-                                            f"[AI 예측 방향] {_dir}\n"
-                                            f"[실제 결과] {_actual_dir} ({_actual_ret:+.2f}%)\n"
-                                            f"[적중 여부] {_is_correct}\n\n"
-                                            f"[당시 AI 예측 전문]\n{str(urow.get('full_text',''))[:1000]}\n\n"
-                                            "위 정보를 바탕으로 3~4문장으로 간결하게 리뷰하세요:\n"
-                                            "- 예측이 맞았다면: 어떤 근거가 정확했는지\n"
-                                            "- 틀렸다면: 무엇을 놓쳤는지, 왜 틀렸는지\n"
-                                            "- 다음 예측 시 참고할 인사이트\n"
-                                            "한국어로 작성하세요."
+                                        _rp = (
+                                            f"예측방향: {urow.get('direction','')} / 실제: {_ad} ({_ar:+.2f}%) / {_ic}\n"
+                                            f"예측 전문(앞 500자): {str(urow.get('full_text',''))[:500]}\n"
+                                            "3~4문장 한국어 리뷰: 맞았다면 어떤 근거가 적중했는지, 틀렸다면 무엇을 놓쳤는지, 다음 예측 시 참고할 인사이트."
                                         )
-                                        _rev_model = _GenAIModel("gemini-2.5-flash",
-                                            generation_config={"temperature": 0.3, "max_output_tokens": 1024})
-                                        _rev_resp = _rev_model.generate_content(_review_prompt)
-                                        _review_txt = _gemini_response_text_utf8_safe(_rev_resp) or ""
+                                        _rm = _GenAIModel("gemini-2.5-flash",
+                                            generation_config={"temperature": 0.3, "max_output_tokens": 512})
+                                        _rv = _gemini_response_text_utf8_safe(_rm.generate_content(_rp)) or ""
                                     except Exception:
-                                        _review_txt = "AI 리뷰 생성 실패"
-
-                                ok_upd, err_upd = update_drg_prediction_result(
-                                    _puid_hist, _pd_str, _actual_dir,
-                                    _actual_ret, _is_correct, _review_txt
-                                )
-                                if ok_upd:
-                                    st.success(f"{_is_correct} | {_bench} 실제 수익률: {_actual_ret:+.2f}%")
+                                        _rv = ""
+                                ok_u, err_u = update_drg_prediction_result(
+                                    _puid_hist, str(urow.get("pred_date", "")),
+                                    _ad, _ar, _ic, _rv)
+                                if ok_u:
+                                    st.success(f"{_ic} | 실제: {_ad} ({_ar:+.2f}%)")
                                     st.rerun()
                                 else:
-                                    st.error(f"저장 실패: {err_upd}")
+                                    st.error(f"저장 실패: {err_u}")
                             else:
-                                st.warning("아직 다음 거래일 데이터가 없습니다. 예측 다음날 장 마감 후 다시 시도해주세요.")
+                                st.warning("다음 거래일 데이터가 아직 없습니다. 장 마감 후 다시 시도해주세요.")
                 st.divider()
 
-            # 전체 히스토리 테이블
             st.markdown("#### 📋 전체 예측 기록")
-
-            # 벤치마크 옵션 선택
-            bench_opts = ["SPY (기본)"] + [f"{v} ({k})" for k, v in _SECTOR_BENCHMARK_ETF.items() if v != "SPY"]
-            _hist_bench = st.selectbox("검증 기준 ETF 필터", options=["전체 보기"] + bench_opts, key="drg_hist_bench_filter")
-
+            bench_opts = ["전체 보기"] + [f"{v} ({k})" for k, v in _SECTOR_BENCHMARK_ETF.items()]
+            _hist_bench = st.selectbox("벤치마크 ETF 필터", options=bench_opts, key="drg_hist_bench_filter")
             show_hist = pred_hist_df.copy()
             if _hist_bench != "전체 보기":
-                _filter_etf = _hist_bench.split(" ")[0]
-                show_hist = show_hist[show_hist["benchmark_etf"] == _filter_etf]
-
+                _fetf = _hist_bench.split(" ")[0]
+                show_hist = show_hist[show_hist["benchmark_etf"] == _fetf]
             show_hist = show_hist.sort_values("pred_date", ascending=False).reset_index(drop=True)
-            display_hist = show_hist.rename(columns={
-                "pred_date": "예측일", "direction": "예측방향",
-                "sector_filter": "섹터", "benchmark_etf": "벤치마크ETF",
-                "spy_close_at_pred": "예측시점가격",
-                "actual_direction": "실제방향", "actual_return_pct": "실제수익률(%)",
-                "is_correct": "적중여부", "review_comment": "AI리뷰",
-            })[["예측일", "예측방향", "섹터", "벤치마크ETF", "예측시점가격",
-                "실제방향", "실제수익률(%)", "적중여부", "AI리뷰"]]
+            show_hist["actual_return_pct"] = pd.to_numeric(show_hist["actual_return_pct"], errors="coerce")
 
-            display_hist["실제수익률(%)"] = pd.to_numeric(display_hist["실제수익률(%)"], errors="coerce")
-
-            def _c_correct(v):
+            def _cd(v):
+                if "상승" in str(v): return "color:#16a34a;font-weight:600;"
+                if "하락" in str(v): return "color:#dc2626;font-weight:600;"
+                return ""
+            def _cc(v):
                 if "✅" in str(v): return "color:#16a34a;font-weight:700;"
                 if "❌" in str(v): return "color:#dc2626;font-weight:700;"
                 return "color:#94a3b8;"
 
-            def _c_dir(v):
-                if "상승" in str(v): return "color:#16a34a;font-weight:600;"
-                if "하락" in str(v): return "color:#dc2626;font-weight:600;"
-                return ""
-
             st.dataframe(
-                display_hist.style
-                .format({"실제수익률(%)": "{:+.2f}%", "예측시점가격": "${:,.2f}"}, na_rep="대기중")
-                .map(_c_correct, subset=["적중여부"])
-                .map(_c_dir, subset=["예측방향", "실제방향"])
-                .background_gradient(cmap="RdYlGn", subset=["실제수익률(%)"], axis=0),
-                use_container_width=True, hide_index=True,
-            )
+                show_hist[["pred_date","direction","sector_filter","benchmark_etf",
+                            "actual_direction","actual_return_pct","is_correct","review_comment"]]
+                .rename(columns={"pred_date":"예측일","direction":"예측방향","sector_filter":"섹터",
+                                  "benchmark_etf":"ETF","actual_direction":"실제방향",
+                                  "actual_return_pct":"실제수익률(%)","is_correct":"적중여부","review_comment":"AI리뷰"})
+                .style
+                .format({"실제수익률(%)": "{:+.2f}%"}, na_rep="대기중")
+                .map(_cd, subset=["예측방향","실제방향"])
+                .map(_cc, subset=["적중여부"]),
+                use_container_width=True, hide_index=True)
 
-            # 예측 텍스트 전문 보기
             if not show_hist.empty:
                 st.markdown("#### 📄 예측 전문 보기")
-                _sel_date = st.selectbox(
-                    "날짜 선택",
-                    options=show_hist["pred_date"].tolist(),
-                    key="drg_hist_fulltext_sel"
-                )
-                _sel_row = show_hist[show_hist["pred_date"] == _sel_date]
+                _sel = st.selectbox("날짜 선택", options=show_hist["pred_date"].tolist(), key="drg_fulltext_sel")
+                _sel_row = show_hist[show_hist["pred_date"] == _sel]
                 if not _sel_row.empty:
-                    _row = _sel_row.iloc[0]
-                    _corr = str(_row.get("is_correct", ""))
-                    if "✅" in _corr:
-                        st.success(str(_row.get("full_text", "")))
-                    elif "❌" in _corr:
-                        st.error(str(_row.get("full_text", "")))
-                    else:
-                        st.info(str(_row.get("full_text", "")))
-                    if str(_row.get("review_comment", "")).strip():
+                    _r = _sel_row.iloc[0]
+                    _ft = str(_r.get("full_text", ""))
+                    _corr = str(_r.get("is_correct", ""))
+                    if "✅" in _corr: st.success(_ft)
+                    elif "❌" in _corr: st.error(_ft)
+                    else: st.info(_ft)
+                    if str(_r.get("review_comment", "")).strip():
                         st.markdown("**🤖 AI 리뷰:**")
-                        st.markdown(str(_row.get("review_comment", "")))
+                        st.markdown(str(_r.get("review_comment", "")))
 
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
@@ -10034,20 +9859,36 @@ if st.session_state.get("logged_in"):
         # ── 회사 기본 정보 ────────────────────────────────────────────────
         try:
             with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
-                co = fetch_company_overview(str(selected_ticker).strip().upper())
+                try:
+                    co = fetch_company_overview(str(selected_ticker).strip().upper())
+                except RuntimeError:
+                    # 캐싱 방지 예외 → 캐시 무효화 후 재시도
+                    fetch_company_overview.clear()
+                    try:
+                        co = _fetch_company_overview_uncached(str(selected_ticker).strip().upper())
+                    except Exception:
+                        co = {}
         except Exception as _co_err:
             co = {}
             st.warning(f"회사 기본정보 조회 실패: {_co_err}")
 
+        # co가 비어있으면 재시도 버튼 제공
+        if not co:
+            st.warning(f"⚠️ **{selected_ticker}** 회사 기본 정보를 불러오지 못했습니다. (Yahoo Finance 일시 제한)")
+            if st.button("🔄 회사 정보 다시 불러오기", key="co_retry_btn"):
+                fetch_company_overview.clear()
+                st.rerun()
+
+        name_str = co.get("name", selected_ticker) if co else selected_ticker
+        website = co.get("website", "") if co else ""
+        is_etf_co = co.get("is_etf", False) if co else False
+        etf_badge = " 🏷️ ETF" if is_etf_co else ""
+        st.markdown(
+            f"## {name_str}{etf_badge}"
+            + (f"  [{website.replace('https://','').replace('http://','')[:35]}]({website})" if website else "")
+        )
+
         if co:
-            name_str = co.get("name", selected_ticker)
-            website = co.get("website", "")
-            is_etf_co = co.get("is_etf", False)
-            etf_badge = " 🏷️ ETF" if is_etf_co else ""
-            st.markdown(
-                f"## {name_str}{etf_badge}"
-                + (f"  [{website.replace('https://','').replace('http://','')[:35]}]({website})" if website else "")
-            )
             info_c1, info_c2, info_c3, info_c4 = st.columns(4)
             with info_c1:
                 sector_display = co.get("sector", "N/A")
@@ -10076,44 +9917,48 @@ if st.session_state.get("logged_in"):
                 else:
                     st.metric("다음 실적 발표", "N/A")
 
-            # 회사 소개: 영문 원문을 Gemini로 번역
-            summary_en = co.get("summary_en", "")
-            if summary_en:
-                _sum_key = f"_co_summary_kr_{selected_ticker}"
-                with st.expander("📋 회사 소개", expanded=False):
-                    if st.session_state.get(_sum_key):
-                        # 한글 번역본 표시
-                        st.markdown(st.session_state[_sum_key])
-                        if st.button("🔄 다시 번역", key=f"retranslate_{selected_ticker}", use_container_width=False):
-                            del st.session_state[_sum_key]
-                            st.rerun()
-                    else:
-                        # 영문 원문 전체 표시
-                        st.markdown(summary_en)
-                        if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
-                            with st.spinner("한글로 번역 중..."):
-                                try:
-                                    # 입력 텍스트를 800단어로 제한 (출력 토큰 안정화)
-                                    _words_list = summary_en.split()
-                                    _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
-                                    _tr_model = _GenAIModel(
-                                        "gemini-2.5-flash",
-                                        generation_config={"temperature": 0.0, "max_output_tokens": 4096}
-                                    )
-                                    _tr_prompt = (
-                                        "다음 영문 회사 소개를 한국어로 번역하세요. "
-                                        "모든 문장을 빠짐없이 번역하고, 번역문만 출력하세요.\n\n"
-                                        + _capped
-                                    )
-                                    _tr_resp = _tr_model.generate_content(_tr_prompt)
-                                    _tr_text = (_gemini_response_text_utf8_safe(_tr_resp) or "").strip()
-                                    if _tr_text:
-                                        st.session_state[_sum_key] = _tr_text
-                                        st.rerun()
-                                    else:
-                                        st.warning("번역 결과를 받지 못했어요. 다시 시도해주세요.")
-                                except Exception as _te:
-                                    st.warning(f"번역 오류: {_te}")
+        # 회사 소개: 영문 원문을 Gemini로 번역 (summary 없어도 expander 항상 표시)
+        summary_en = co.get("summary_en", "") if co else ""
+        _sum_key = f"_co_summary_kr_{selected_ticker}"
+        with st.expander("📋 회사 소개", expanded=False):
+            if not summary_en:
+                st.info(
+                    "회사 소개 텍스트를 Yahoo Finance에서 불러오지 못했습니다. "
+                    "잠시 후 상단 🔄 새로고침 버튼을 눌러 다시 시도해주세요."
+                )
+            elif st.session_state.get(_sum_key):
+                # 한글 번역본 표시
+                st.markdown(st.session_state[_sum_key])
+                if st.button("🔄 다시 번역", key=f"retranslate_{selected_ticker}", use_container_width=False):
+                    del st.session_state[_sum_key]
+                    st.rerun()
+            else:
+                # 영문 원문 전체 표시
+                st.markdown(summary_en)
+                if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
+                    with st.spinner("한글로 번역 중..."):
+                        try:
+                            # 입력 텍스트를 800단어로 제한 (출력 토큰 안정화)
+                            _words_list = summary_en.split()
+                            _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
+                            _tr_model = _GenAIModel(
+                                "gemini-2.5-flash",
+                                generation_config={"temperature": 0.0, "max_output_tokens": 4096}
+                            )
+                            _tr_prompt = (
+                                "다음 영문 회사 소개를 한국어로 번역하세요. "
+                                "모든 문장을 빠짐없이 번역하고, 번역문만 출력하세요.\n\n"
+                                + _capped
+                            )
+                            _tr_resp = _tr_model.generate_content(_tr_prompt)
+                            _tr_text = (_gemini_response_text_utf8_safe(_tr_resp) or "").strip()
+                            if _tr_text:
+                                st.session_state[_sum_key] = _tr_text
+                                st.rerun()
+                            else:
+                                st.warning("번역 결과를 받지 못했어요. 다시 시도해주세요.")
+                        except Exception as _te:
+                            st.warning(f"번역 오류: {_te}")
 
         # ── 이 종목을 보유한 ETF 목록 (자동 조회) ────────────────────────
         if not is_etf_mode:
@@ -10322,21 +10167,50 @@ if st.session_state.get("logged_in"):
                                     st.markdown(f"판정: {row['Pass']}")
 
                     if category == "밸류에이션 (Valuation)":
-                        intrinsic_col, mos_col = st.columns(2)
-                        with intrinsic_col:
-                            st.metric(
-                                "적정 주가 (Intrinsic Value)",
-                                num_str(margin_context.get("intrinsic_value")),
-                                delta=(
-                                    f"EPS {num_str(margin_context.get('trailing_eps'))} / "
-                                    f"성장률 {pct_points_str(margin_context.get('growth_percent'))}"
-                                ),
-                            )
-                        with mos_col:
-                            st.metric(
-                                "안전마진 (Margin of Safety %)",
-                                pct_points_str(margin_context.get("margin_of_safety")),
-                                delta=f"현재가 {num_str(margin_context.get('current_price'))}",
+                        # ── 요약 밸류에이션 카드 ──────────────────────────────────
+                        _fpe = margin_context.get("forward_pe")
+                        _tpe = margin_context.get("trailing_pe")
+                        _pb  = margin_context.get("price_to_book")
+                        _ev  = margin_context.get("ev_to_ebitda")
+                        _iv  = margin_context.get("intrinsic_value")
+                        _mos = margin_context.get("margin_of_safety")
+                        _cp  = margin_context.get("current_price")
+                        _eps = margin_context.get("trailing_eps")
+                        _gro = margin_context.get("growth_percent")
+
+                        # 첫 줄: PE 계열
+                        pe_c1, pe_c2, pe_c3, pe_c4 = st.columns(4)
+                        with pe_c1:
+                            st.metric("Forward P/E", num_str(_fpe) if pd.notna(_fpe) else "N/A")
+                        with pe_c2:
+                            st.metric("Trailing P/E", num_str(_tpe) if pd.notna(_tpe) else "N/A")
+                        with pe_c3:
+                            st.metric("P/B", num_str(_pb) if pd.notna(_pb) else "N/A")
+                        with pe_c4:
+                            st.metric("EV/EBITDA", num_str(_ev) if pd.notna(_ev) else "N/A")
+
+                        # 둘째 줄: 벤저민 그레이엄 적정가
+                        if pd.notna(_iv) and pd.notna(_mos):
+                            intrinsic_col, mos_col = st.columns(2)
+                            with intrinsic_col:
+                                st.metric(
+                                    "적정 주가 (Graham)",
+                                    f"${num_str(_iv)}",
+                                    delta=(
+                                        f"EPS {num_str(_eps)} / "
+                                        f"성장률 {pct_points_str(_gro)}"
+                                    ),
+                                )
+                            with mos_col:
+                                st.metric(
+                                    "안전마진 (Margin of Safety %)",
+                                    pct_points_str(_mos),
+                                    delta=f"현재가 ${num_str(_cp)}",
+                                )
+                        else:
+                            st.caption(
+                                "💡 Graham 적정주가는 Trailing EPS + 이익성장률 데이터가 있을 때 계산됩니다. "
+                                "위 P/E · P/B · EV/EBITDA 지표로 밸류에이션을 확인하세요."
                             )
 
                     st.divider()
