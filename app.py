@@ -1283,8 +1283,8 @@ def macro_traffic_light(bad_total):
 
 def fetch_yield_spread_latest():
     try:
-        _yf_ticker_history_with_retry("^TNX", period="10d", auto_adjust=False)
-        _yf_ticker_history_with_retry("^IRX", period="10d", auto_adjust=False)
+        tnx = _yf_ticker_history_with_retry("^TNX", period="10d", auto_adjust=False)
+        irx = _yf_ticker_history_with_retry("^IRX", period="10d", auto_adjust=False)
         t10 = get_latest_close_from_history(tnx)
         t3m = get_latest_close_from_history(irx)
         if pd.isna(t10) or pd.isna(t3m):
@@ -1313,7 +1313,9 @@ def evaluate_vix_status(vix_value):
 
 def fetch_vix_latest_and_history():
     try:
-        _yf_ticker_history_with_retry("^VIX", period="1y", auto_adjust=False)
+        hist = _yf_ticker_history_with_retry("^VIX", period="1y", auto_adjust=False)
+        if hist is None or hist.empty:
+            return np.nan, None, "데이터 없음"
         cur = get_latest_close_from_history(hist)
         return cur, hist, None
     except Exception as exc:
@@ -1334,7 +1336,9 @@ def evaluate_wti_status(wti):
 
 def fetch_wti_latest():
     try:
-        _yf_ticker_history_with_retry("CL=F", period="14d", auto_adjust=False)
+        o = _yf_ticker_history_with_retry("CL=F", period="14d", auto_adjust=False)
+        if o is None or o.empty:
+            return np.nan
         return get_latest_close_from_history(o)
     except Exception:
         return np.nan
@@ -1411,10 +1415,10 @@ def evaluate_cpi_yoy():
 
 def fetch_dxy_latest_and_mean_deviation():
     try:
-        _yf_ticker_history_with_retry("DX-Y.NYB", period="400d", auto_adjust=False)
-        cur = get_latest_close_from_history(dxy_hist)
-        if dxy_hist is None or "Close" not in dxy_hist.columns:
+        dxy_hist = _yf_ticker_history_with_retry("DX-Y.NYB", period="400d", auto_adjust=False)
+        if dxy_hist is None or dxy_hist.empty or "Close" not in dxy_hist.columns:
             return np.nan, np.nan, MACRO_STATUS_NA
+        cur = get_latest_close_from_history(dxy_hist)
 
         closes = pd.to_numeric(dxy_hist["Close"], errors="coerce").dropna()
         ma252 = closes.rolling(window=252, min_periods=126).mean().iloc[-1]
