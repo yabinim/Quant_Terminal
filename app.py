@@ -2351,19 +2351,43 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
     try:
-        etf_s = pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if 'close_df' in dir() else pd.Series(dtype=float)
-        if close_df is not None and sector_etf in close_df.columns and not etf_s.empty:
-            raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
-            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
-            if len(etf_s) >= 10 and len(vol) >= 10:
-                price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
-                vol_5d = float(vol.tail(5).mean())
-                vol_20d = float(vol.tail(20).mean())
-                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
+        _vol_raw = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        if _vol_raw is not None and not _vol_raw.empty:
+            # 종가 추출
+            if "Close" in _vol_raw.columns:
+                _vol_close = pd.to_numeric(_vol_raw["Close"], errors="coerce").dropna()
+            else:
+                _vol_close = pd.Series(dtype=float)
+            # MultiIndex 처리 (yfinance 버전에 따라 컬럼이 튜플일 수 있음)
+            if _vol_close.empty and hasattr(_vol_raw.columns, "levels"):
+                for col in _vol_raw.columns:
+                    if "close" in str(col).lower():
+                        _vol_close = pd.to_numeric(_vol_raw[col], errors="coerce").dropna()
+                        break
+            # 거래량 추출
+            if "Volume" in _vol_raw.columns:
+                _vol_series = pd.to_numeric(_vol_raw["Volume"], errors="coerce").dropna()
+            else:
+                _vol_series = pd.Series(dtype=float)
+            if _vol_series.empty and hasattr(_vol_raw.columns, "levels"):
+                for col in _vol_raw.columns:
+                    if "volume" in str(col).lower():
+                        _vol_series = pd.to_numeric(_vol_raw[col], errors="coerce").dropna()
+                        break
+
+            if len(_vol_close) >= 10 and len(_vol_series) >= 10:
+                price_5d = float((_vol_close.iloc[-1] / _vol_close.iloc[-6] - 1) * 100) if len(_vol_close) >= 6 else 0.0
+                vol_5d = float(_vol_series.tail(5).mean())
+                vol_20d = float(_vol_series.tail(20).mean())
+                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1.0
                 dist_selling = price_5d > 0 and vol_ratio < 0.8
                 vol_alert = dist_selling or vol_ratio < 0.7
                 signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
-                details["거래량"] = {"5일 평균 비율": f"{vol_ratio:.2f}x", "가격 5일": f"{price_5d:+.1f}%", "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상")}
+                details["거래량"] = {
+                    "5일 평균 비율": f"{vol_ratio:.2f}x",
+                    "가격 5일": f"{price_5d:+.1f}%",
+                    "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상"),
+                }
                 if vol_alert:
                     warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
             else:
