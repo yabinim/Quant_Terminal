@@ -124,6 +124,28 @@ def _yf_ticker_history_with_retry(ticker, period="1mo", auto_adjust=False,
     return pd.DataFrame()
 
 
+def _yf_ticker_info_with_retry(ticker, max_retries=3, delay=3):
+    """yf.Ticker().info 래퍼 — rate limit 발생 시 자동 재시도."""
+    for attempt in range(max_retries):
+        try:
+            info = yf.Ticker(str(ticker).strip().upper()).info or {}
+            # rate limit이면 info가 빈 dict 또는 {"trailingPegRatio": None} 같은 최소값만 반환
+            if info and len(info) > 5:
+                return info
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(k in err for k in ["429", "rate limit", "too many", "blocked"]):
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1))
+                    continue
+            if attempt == max_retries - 1:
+                return {}
+            time.sleep(delay)
+    return {}
+
+
 _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
 _USER_SHEET_COLS = ["ID", "Password", "Reason", "Source", "Status"]
@@ -1835,36 +1857,48 @@ def build_etf_universe_returns_table(pool_tickers):
     """
     유니버스 티커별 수익률을 한 번에 계산한다. 신규 ETF 등 과거 일부 구간이 비어도 티커 행은 유지한다(NaN).
     """
+    import time as _t2
     cols = ["Ticker", "1주(%)", "2주(%)", "1개월(%)", "3개월(%)", "1-Month (%)"]
     if not pool_tickers:
         return pd.DataFrame(columns=cols)
-
-    unique_tickers = list(
-        dict.fromkeys(str(t).strip().upper() for t in pool_tickers if str(t).strip())
-    )
+    unique_tickers = list(dict.fromkeys(str(t).strip().upper() for t in pool_tickers if str(t).strip()))
     if not unique_tickers:
         return pd.DataFrame(columns=cols)
 
+    raw = pd.DataFrame()
     try:
-        raw = yf.download(
-            tickers=unique_tickers,
-            period="6mo",
-            interval="1d",
-            auto_adjust=False,
-            group_by="column",
-            progress=False,
-            threads=True,
+        raw = _yf_download_with_retry(
+            unique_tickers, period="6mo", interval="1d",
+            auto_adjust=False, progress=False,
         )
     except Exception:
         raw = pd.DataFrame()
-    close_df = get_close_prices_from_download(raw)
 
-    if close_df.empty:
-        rows = [
-            {"Ticker": t, "1주(%)": np.nan, "2주(%)": np.nan, "1개월(%)": np.nan, "3개월(%)": np.nan, "1-Month (%)": np.nan}
+    # 실패 시 10개씩 나눠서 재시도
+    if raw is None or raw.empty:
+        all_parts = []
+        for i in range(0, len(unique_tickers), 10):
+            chunk = unique_tickers[i:i + 10]
+            try:
+                _r = _yf_download_with_retry(chunk, period="6mo", interval="1d", auto_adjust=False, progress=False)
+                if _r is not None and not _r.empty:
+                    all_parts.append(_r)
+                _t2.sleep(1)
+            except Exception:
+                pass
+        if all_parts:
+            try:
+                raw = pd.concat(all_parts, axis=1)
+            except Exception:
+                raw = pd.DataFrame()
+
+    close_df = get_close_prices_from_download(raw)
+    if close_df is None or close_df.empty:
+        return pd.DataFrame([
+            {"Ticker": t, "1주(%)": float("nan"), "2주(%)": float("nan"),
+             "1개월(%)": float("nan"), "3개월(%)": float("nan"), "1-Month (%)": float("nan")}
             for t in unique_tickers
-        ]
-        return pd.DataFrame(rows)
+        ])
 
     if len(unique_tickers) == 1 and "SINGLE" in close_df.columns:
         close_df = close_df.copy()
@@ -1875,23 +1909,12 @@ def build_etf_universe_returns_table(pool_tickers):
         series = close_df[ticker] if ticker in close_df.columns else pd.Series(dtype=float)
         h = hidden_alpha_horizon_returns(series)
         one_m = h["1개월(%)"]
-        rows.append(
-            {
-                "Ticker": ticker,
-                "1주(%)": h["1주(%)"],
-                "2주(%)": h["2주(%)"],
-                "1개월(%)": one_m,
-                "3개월(%)": h["3개월(%)"],
-                "1-Month (%)": one_m,
-            }
-        )
-
+        rows.append({"Ticker": ticker, "1주(%)": h["1주(%)"], "2주(%)": h["2주(%)"],
+                     "1개월(%)": one_m, "3개월(%)": h["3개월(%)"], "1-Month (%)": one_m})
     result_df = pd.DataFrame(rows)
     for c in ("1주(%)", "2주(%)", "1개월(%)", "3개월(%)", "1-Month (%)"):
         result_df[c] = pd.to_numeric(result_df[c], errors="coerce")
     return result_df
-
-
 def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series = None) -> pd.DataFrame:
     """
     1주 전 RS Score 대비 현재 RS Score 변화율 계산.
@@ -2229,7 +2252,7 @@ def cached_etf_universe_momentum_rankings(universe_tickers_tuple: tuple[str, ...
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_yfinance_quote_type(ticker_upper: str):
     try:
-        info = yf.Ticker(str(ticker_upper).strip().upper()).info or {}
+        info = _yf_ticker_info_with_retry(ticker_upper)
         return str(info.get("quoteType") or "").strip()
     except Exception:
         return ""
@@ -2834,8 +2857,7 @@ def translate_ko(text: str, mapping: dict) -> str:
 def fetch_company_overview(ticker_upper: str) -> dict:
     """회사 기본 정보 조회 (섹터/산업 한글 포함)."""
     try:
-        tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
-        info = tk_obj.info or {}
+        info = _yf_ticker_info_with_retry(ticker_upper)
         name = str(info.get("longName") or info.get("shortName") or ticker_upper)
         sector_en = str(info.get("sector") or "")
         industry_en = str(info.get("industry") or "")
@@ -2998,12 +3020,10 @@ def evaluate_kpis(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
 
-        # ── info 수집 (여러 방법 시도) ──────────────────────────────────
+        # ── info 수집 (재시도 포함) ──────────────────────────────────
         info = {}
         try:
-            raw_info = ticker.info
-            if isinstance(raw_info, dict) and len(raw_info) > 5:
-                info = raw_info
+            info = _yf_ticker_info_with_retry(ticker_symbol)
         except Exception:
             pass
 
