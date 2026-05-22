@@ -8107,10 +8107,10 @@ if st.session_state.get("logged_in"):
                 try:
                     rss_news_list, _, _ = fetch_global_market_news()
                     rss_news_text = "\n".join([
-                        f"- [{item.get('source','?')}] {item.get('title','')} | {item.get('summary','')[:80]}"
-                        for item in rss_news_list[:30]
+                        f"- [{item.get('source','?')}] {item.get('title','')}"
+                        for item in rss_news_list[:15]
                     ]) if rss_news_list else "RSS 뉴스 없음"
-                    rss_news_count = len(rss_news_list)
+                    rss_news_count = len(rss_news_list[:15])
                 except Exception:
                     rss_news_text = "\n".join([
                         f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
@@ -8389,6 +8389,18 @@ if st.session_state.get("logged_in"):
             st.rerun()
 
         pred_hist_df = load_drg_predictions_fresh(_puid_hist)
+
+        # 임시 진단 (문제 해결 후 제거)
+        if pred_hist_df.empty:
+            try:
+                _ws_d, _err_d = open_drg_predictions_worksheet()
+                if _err_d:
+                    st.warning(f"시트 연결 오류: {_err_d}")
+                else:
+                    _rows_d = _ws_d.get_all_values()
+                    st.warning(f"시트 총 {len(_rows_d)}행 | 헤더: {_rows_d[0] if _rows_d else '없음'} | 첫데이터: {_rows_d[1] if len(_rows_d)>1 else '없음'} | 로그인ID: `{_puid_hist}`")
+            except Exception as _de:
+                st.warning(f"진단 오류: {_de}")
 
         if pred_hist_df.empty:
             st.info("아직 AI 예측 기록이 없습니다. 위 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
@@ -11085,32 +11097,40 @@ if st.session_state.get("logged_in"):
                             if not ok_th:
                                 st.error(f"매도 기록 저장 실패: {err_th}")
                             else:
-                                _invalidate_trade_history_cache()  # 명시적 캐시 초기화
-                                upd_sell = portfolio_df.copy()
-                                m_sell = (upd_sell["Account"] == sell_acct_sel) & (upd_sell["Ticker"] == sell_ticker_sel)
-                                if m_sell.any():
-                                    ix_sell = upd_sell.index[m_sell][0]
-                                    new_qty = cur_hold_qty - sell_qty_input
-                                    if new_qty < 1e-9:
-                                        upd_sell = upd_sell.drop(index=ix_sell).reset_index(drop=True)
-                                        save_portfolio(upd_sell)
-                                        _portfolio_sheet_all_values_cached.clear()  # 포트폴리오 캐시 초기화
+                                _invalidate_trade_history_cache()
+                                new_qty = cur_hold_qty - sell_qty_input
+                                if new_qty < 1e-9:
+                                    # 전량 매도 → 시트에서 직접 행 삭제
+                                    ok_del, err_del = delete_portfolio_sheet_row(puid, sell_acct_sel, sell_ticker_sel)
+                                    if ok_del:
                                         realized = (sell_price_input - cur_avg_price) * sell_qty_input
                                         pnl_pct = ((sell_price_input / cur_avg_price) - 1.0) * 100.0 if cur_avg_price > 0 else 0
                                         pnl_emoji = "🟢" if realized >= 0 else "🔴"
-                                        st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} 전량 매도. 평균단가 기준 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%). 포트폴리오에서 제거됩니다.")
+                                        st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} 전량 매도. 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%). 포트폴리오에서 제거됩니다.")
                                     else:
+                                        st.error(f"포트폴리오 업데이트 실패: {err_del}")
+                                else:
+                                    # 부분 매도 → 수량 차감 후 전체 재저장
+                                    upd_sell = portfolio_df.copy()
+                                    # 대소문자/공백 무시 매칭
+                                    m_sell = (
+                                        upd_sell["Account"].astype(str).str.strip().str.lower() == sell_acct_sel.strip().lower()
+                                    ) & (
+                                        upd_sell["Ticker"].astype(str).str.strip().str.upper() == sell_ticker_sel.strip().upper()
+                                    )
+                                    if m_sell.any():
+                                        ix_sell = upd_sell.index[m_sell][0]
                                         upd_sell = upd_sell.copy()
                                         upd_sell["Quantity"] = upd_sell["Quantity"].astype(object)
                                         upd_sell.at[ix_sell, "Quantity"] = float(new_qty)
                                         save_portfolio(upd_sell)
-                                        _portfolio_sheet_all_values_cached.clear()  # 포트폴리오 캐시 초기화
                                         realized = (sell_price_input - cur_avg_price) * sell_qty_input
                                         pnl_pct = ((sell_price_input / cur_avg_price) - 1.0) * 100.0 if cur_avg_price > 0 else 0
                                         pnl_emoji = "🟢" if realized >= 0 else "🔴"
                                         st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} {sell_qty_input:g}주 매도. 잔여 {new_qty:g}주 | 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%)")
+                                    else:
+                                        st.error(f"포트폴리오에서 {sell_acct_sel}/{sell_ticker_sel}을 찾을 수 없습니다. 동기화 후 다시 시도해주세요.")
                                 _invalidate_portfolio_sheet_cache()
-                                st.session_state["_portfolio_needs_refresh"] = True
                                 st.rerun()
 
         st.divider()
