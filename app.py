@@ -2957,144 +2957,242 @@ def fmp_get_short_float(ticker_upper: str) -> dict:
         return {}
 
 
+
+# ── FMP 재무제표 헬퍼 (cashflow·income·balance 대체) ────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fmp_get_financials(ticker_upper: str) -> dict:
+    """
+    FMP /financial-statements-full?statement=cashflow|income|balance 를
+    한 번에 가져오는 통합 함수.
+    반환: {"fcf": float, "roe": float, "op_margin": float, "debt_to_equity": float,
+           "eps_ttm": float, "revenue_growth": float, "net_income_growth": float}
+    실패 시 빈 dict.
+    FMP stable API 엔드포인트:
+      /income-statement?symbol=X&period=annual&limit=2
+      /cash-flow-statement?symbol=X&period=annual&limit=2
+      /balance-sheet-statement?symbol=X&period=annual&limit=2
+    """
+    key = _get_fmp_key()
+    if not key:
+        return {}
+
+    result = {}
+    try:
+        # ── Income Statement (최근 2년치) ─────────────────────────────
+        r = requests.get(
+            f"{_FMP_BASE}/income-statement?symbol={ticker_upper}&period=annual&limit=2&apikey={key}",
+            timeout=_FMP_TIMEOUT
+        )
+        r.raise_for_status()
+        inc = r.json()
+        if isinstance(inc, list) and inc:
+            latest = inc[0]
+            prev   = inc[1] if len(inc) > 1 else {}
+            # Operating Margin
+            rev = to_float(latest.get("revenue"))
+            op_inc = to_float(latest.get("operatingIncome"))
+            if pd.notna(rev) and rev != 0 and pd.notna(op_inc):
+                result["op_margin"] = float(op_inc / rev)
+            # EPS (diluted)
+            eps = to_float(latest.get("epsdiluted") or latest.get("eps"))
+            if pd.notna(eps):
+                result["eps_ttm"] = float(eps)
+            # Revenue Growth YoY
+            prev_rev = to_float(prev.get("revenue"))
+            if pd.notna(rev) and pd.notna(prev_rev) and prev_rev != 0:
+                result["revenue_growth"] = float((rev - prev_rev) / abs(prev_rev))
+            # Net Income Growth YoY
+            ni = to_float(latest.get("netIncome"))
+            prev_ni = to_float(prev.get("netIncome"))
+            if pd.notna(ni) and pd.notna(prev_ni) and prev_ni != 0:
+                result["net_income_growth"] = float((ni - prev_ni) / abs(prev_ni))
+    except Exception:
+        pass
+
+    try:
+        # ── Cash Flow Statement ───────────────────────────────────────
+        r = requests.get(
+            f"{_FMP_BASE}/cash-flow-statement?symbol={ticker_upper}&period=annual&limit=1&apikey={key}",
+            timeout=_FMP_TIMEOUT
+        )
+        r.raise_for_status()
+        cf = r.json()
+        if isinstance(cf, list) and cf:
+            item = cf[0]
+            fcf = to_float(item.get("freeCashFlow"))
+            if pd.isna(fcf):
+                # 직접 계산: OCF - CapEx
+                ocf = to_float(item.get("operatingCashFlow") or item.get("netCashProvidedByOperatingActivities"))
+                capex = to_float(item.get("capitalExpenditure") or item.get("investmentsInPropertyPlantAndEquipment"))
+                if pd.notna(ocf) and pd.notna(capex):
+                    fcf = float(ocf + capex)  # capex는 음수로 저장됨
+            if pd.notna(fcf):
+                result["fcf"] = float(fcf)
+    except Exception:
+        pass
+
+    try:
+        # ── Balance Sheet ─────────────────────────────────────────────
+        r = requests.get(
+            f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker_upper}&period=annual&limit=1&apikey={key}",
+            timeout=_FMP_TIMEOUT
+        )
+        r.raise_for_status()
+        bs = r.json()
+        if isinstance(bs, list) and bs:
+            item = bs[0]
+            equity = to_float(item.get("totalStockholdersEquity") or item.get("stockholdersEquity"))
+            total_debt = to_float(item.get("totalDebt") or item.get("longTermDebt"))
+            net_income_bs = to_float(item.get("retainedEarnings"))  # ROE 보완용 아님, 별도 계산
+            if pd.notna(equity) and equity != 0:
+                if pd.notna(total_debt):
+                    result["debt_to_equity"] = float(total_debt / equity * 100)
+                # ROE: income에서 net_income 가져와서 계산
+                if "eps_ttm" in result:
+                    pass  # ROE는 ratios-ttm에서 가져오는 게 정확
+    except Exception:
+        pass
+
+    return result
+
+
 def _fmp_patch_info(info: dict, ticker_upper: str) -> dict:
     """
-    yfinance info dict에 누락된 필드가 있을 때 FMP 데이터로 채워 반환.
-    FMP 호출은 빈 필드가 있는 경우에만 수행 (불필요한 API 소비 방지).
+    yfinance info dict에 누락된 필드를 FMP로 채워 반환.
+    FMP 호출은 실제로 빈 필드가 있을 때만 수행.
     """
-    # 보완이 필요한 필드 목록
+    info = dict(info)  # 원본 변경 방지
+
+    # ── 1) Profile: 회사명·섹터·설명·시총 ────────────────────────────
     need_profile = not all([
         info.get("longName") or info.get("shortName"),
         info.get("sector"),
         info.get("longBusinessSummary"),
         info.get("marketCap"),
     ])
+    if need_profile:
+        prof = fmp_get_profile(ticker_upper)
+        if prof:
+            if not (info.get("longName") or info.get("shortName")):
+                info["longName"] = str(prof.get("companyName") or prof.get("name") or ticker_upper)
+            if not info.get("sector"):
+                info["sector"] = str(prof.get("sector") or "")
+            if not info.get("industry"):
+                info["industry"] = str(prof.get("industry") or "")
+            if not info.get("longBusinessSummary"):
+                info["longBusinessSummary"] = str(prof.get("description") or "")
+            if not info.get("website"):
+                info["website"] = str(prof.get("website") or "")
+            if not info.get("country"):
+                info["country"] = str(prof.get("country") or "N/A")
+            if not info.get("fullTimeEmployees"):
+                info["fullTimeEmployees"] = prof.get("fullTimeEmployees")
+            if not info.get("marketCap"):
+                info["marketCap"] = prof.get("mktCap")
+            if not info.get("earningsDate"):
+                ea = prof.get("earningsAnnouncement")
+                if ea:
+                    info["earningsDate"] = [str(ea)[:10]]
+            if prof.get("isEtf") and not info.get("quoteType"):
+                info["quoteType"] = "ETF"
+            # forwardPE는 profile에 포함되는 경우 있음
+            if not info.get("forwardPE"):
+                _fpe = to_float(prof.get("pe") or prof.get("priceEarningsRatio"))
+                if pd.notna(_fpe) and _fpe > 0:
+                    info["forwardPE"] = _fpe
+
+    # ── 2) Ratios-TTM: P/E·P/B·EV/EBITDA·ROE·Margin·D/E ─────────────
     need_ratios = not all([
         info.get("trailingPE"),
         info.get("priceToBook"),
         info.get("returnOnEquity"),
         info.get("operatingMargins"),
     ])
-
-    if not need_profile and not need_ratios:
-        return info  # yfinance가 충분함 → FMP 호출 없음
-
-    info = dict(info)  # 원본 변경 방지
-
-    if need_profile:
-        prof = fmp_get_profile(ticker_upper)
-        if prof:
-            if not (info.get("longName") or info.get("shortName")):
-                info.setdefault("longName", prof.get("companyName") or prof.get("name") or ticker_upper)
-            if not info.get("sector"):
-                info.setdefault("sector", prof.get("sector") or "")
-            if not info.get("industry"):
-                info.setdefault("industry", prof.get("industry") or "")
-            if not info.get("longBusinessSummary"):
-                info.setdefault("longBusinessSummary", prof.get("description") or "")
-            if not info.get("website"):
-                info.setdefault("website", prof.get("website") or "")
-            if not info.get("country"):
-                info.setdefault("country", prof.get("country") or "N/A")
-            if not info.get("fullTimeEmployees"):
-                info.setdefault("fullTimeEmployees", prof.get("fullTimeEmployees"))
-            if not info.get("marketCap"):
-                info.setdefault("marketCap", prof.get("mktCap"))
-            # 다음 실적발표 (FMP: earningsAnnouncement)
-            if not info.get("earningsDate"):
-                ea = prof.get("earningsAnnouncement")
-                if ea:
-                    info.setdefault("earningsDate", [str(ea)[:10]])
-            # ETF 여부
-            if prof.get("isEtf") and not info.get("quoteType"):
-                info["quoteType"] = "ETF"
-
     if need_ratios:
         rat = fmp_get_ratios(ticker_upper)
         if rat:
-            # FMP stable /ratios-ttm 실제 필드명
-            # peRatioTTM, priceToBookRatioTTM, enterpriseValueMultipleTTM,
-            # pegRatioTTM, returnOnEquityTTM, operatingProfitMarginTTM, debtToEquityTTM
             if not info.get("trailingPE"):
-                _pe = to_float(rat.get("peRatioTTM") or rat.get("peRatio") or rat.get("priceEarningsRatioTTM"))
+                _pe = to_float(rat.get("peRatioTTM") or rat.get("peRatio"))
                 if pd.notna(_pe) and _pe > 0:
                     info["trailingPE"] = _pe
-            if not info.get("forwardPE"):
-                _fpe = to_float(rat.get("priceEarningsToGrowthRatioTTM"))  # FMP에서 forwardPE 없을 때 근사
-                # forwardPE는 profile에 있을 수 있음 (이미 위에서 처리)
             if not info.get("priceToBook"):
-                _pb = to_float(rat.get("priceToBookRatioTTM") or rat.get("priceBookValueRatioTTM"))
+                _pb = to_float(rat.get("priceToBookRatioTTM") or rat.get("priceToBookRatio"))
                 if pd.notna(_pb):
                     info["priceToBook"] = _pb
             if not info.get("enterpriseToEbitda"):
-                _ev = to_float(rat.get("enterpriseValueMultipleTTM") or rat.get("evToEbitdaTTM") or rat.get("enterpriseValueEbitdaTTM"))
+                _ev = to_float(rat.get("enterpriseValueMultipleTTM") or rat.get("evToEbitda"))
                 if pd.notna(_ev):
                     info["enterpriseToEbitda"] = _ev
             if not info.get("pegRatio"):
-                _peg = to_float(rat.get("pegRatioTTM") or rat.get("priceEarningsToGrowthRatioTTM"))
+                _peg = to_float(rat.get("pegRatioTTM") or rat.get("priceEarningsToGrowthRatio"))
                 if pd.notna(_peg):
                     info["pegRatio"] = _peg
             if not info.get("returnOnEquity"):
-                _roe = to_float(rat.get("returnOnEquityTTM"))
+                _roe = to_float(rat.get("returnOnEquityTTM") or rat.get("returnOnEquity"))
                 if pd.notna(_roe):
                     info["returnOnEquity"] = _roe
             if not info.get("operatingMargins"):
-                _om = to_float(rat.get("operatingProfitMarginTTM") or rat.get("operatingIncomeRatioTTM"))
+                _om = to_float(rat.get("operatingProfitMarginTTM") or rat.get("operatingProfitMargin"))
                 if pd.notna(_om):
                     info["operatingMargins"] = _om
             if not info.get("debtToEquity"):
-                _dte = to_float(rat.get("debtToEquityTTM") or rat.get("debtEquityRatioTTM"))
+                _dte = to_float(rat.get("debtToEquityTTM") or rat.get("debtToEquity"))
                 if pd.notna(_dte):
-                    # FMP 단위 확인: >10이면 이미 100배 단위, ≤10이면 소수 → 100배 변환
                     info["debtToEquity"] = _dte if _dte > 10 else _dte * 100
 
+        # ── 3) Key Metrics TTM: EPS ───────────────────────────────────
         km = fmp_get_key_metrics(ticker_upper)
         if km:
             if not info.get("trailingEps"):
                 _eps = to_float(km.get("netIncomePerShareTTM") or km.get("epsTTM"))
                 if pd.notna(_eps):
                     info["trailingEps"] = _eps
-            if not info.get("earningsGrowth"):
-                _eg = to_float(km.get("earningsYieldTTM"))  # 근사 사용
-                # earningsGrowth는 별도 income-statement에서 계산하는 게 정확하므로 생략
 
     return info
 
 
 def _fetch_company_overview_uncached(ticker_upper: str) -> dict:
-    """회사 기본 정보 조회 내부 로직 (캐시 없음).
-    1) yfinance 최대 2회 시도
-    2) 누락 필드 → FMP로 자동 보완 (_fmp_patch_info)
+    """회사 기본 정보 조회.
+    1) FMP profile + ratios 로 먼저 채움 (안정적)
+    2) yfinance는 FMP에서 못 가져온 필드만 보완 (1회만 시도)
     """
-    tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
+    # ── 1) FMP 먼저 ───────────────────────────────────────────────────
+    info = _fmp_patch_info({}, ticker_upper)
 
-    # ── yfinance info 수집: 최대 2회 시도 ─────────────────────────────
-    info = {}
-    for _attempt in range(2):
+    # ── 2) yfinance: FMP에서 비어있는 핵심 필드만 보완 ───────────────
+    _yf_needed = not all([
+        info.get("longName") or info.get("shortName"),
+        info.get("sector"),
+        info.get("longBusinessSummary"),
+        info.get("currentPrice") or info.get("regularMarketPrice"),
+        info.get("fiftyDayAverage"),
+        info.get("twoHundredDayAverage"),
+    ])
+    if _yf_needed:
         try:
+            tk_obj = yf.Ticker(ticker_upper)
             raw = tk_obj.info
             if isinstance(raw, dict) and len(raw) > 5:
-                info = raw
-                break
+                for k, v in raw.items():
+                    if k not in info or not info[k]:
+                        info[k] = v
         except Exception:
-            if _attempt == 0:
-                time.sleep(1)
-
-    # fast_info로 가격 계열만 보완 (info가 빈 경우)
-    if not info or len(info) <= 5:
-        try:
-            fi = tk_obj.fast_info
-            info = {
-                "marketCap": getattr(fi, "market_cap", None),
-                "currentPrice": getattr(fi, "last_price", None),
-                "fiftyDayAverage": getattr(fi, "fifty_day_average", None),
-                "twoHundredDayAverage": getattr(fi, "two_hundred_day_average", None),
-            }
-        except Exception:
-            pass
-
-    # ── FMP로 누락 필드 보완 ───────────────────────────────────────────
-    info = _fmp_patch_info(info, ticker_upper)
+            # yfinance 실패 → fast_info로 가격만
+            try:
+                fi = yf.Ticker(ticker_upper).fast_info
+                for attr, key in [
+                    ("market_cap", "marketCap"),
+                    ("last_price", "currentPrice"),
+                    ("fifty_day_average", "fiftyDayAverage"),
+                    ("two_hundred_day_average", "twoHundredDayAverage"),
+                ]:
+                    if not info.get(key):
+                        v = getattr(fi, attr, None)
+                        if v is not None:
+                            info[key] = v
+            except Exception:
+                pass
 
     name = str(info.get("longName") or info.get("shortName") or ticker_upper)
     sector_en = str(info.get("sector") or "")
@@ -3282,137 +3380,121 @@ def tab_sync_refresh(clear_callbacks, rerun_after=True):
 
 def evaluate_kpis(ticker_symbol):
     ticker_upper = str(ticker_symbol).strip().upper()
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 1 — FMP로 먼저 시도 (rate limit 걱정 없음)
+    # ══════════════════════════════════════════════════════════════════
+    info = _fmp_patch_info({}, ticker_upper)   # profile + ratios + key-metrics
+    fmp_fins = fmp_get_financials(ticker_upper) # income + cashflow + balance
+
+    # FMP 재무제표에서 직접 추출
+    fcf         = fmp_fins.get("fcf", np.nan)
+    if pd.isna(fcf): fcf = np.nan
+    op_margin_fmp = fmp_fins.get("op_margin", np.nan)
+    dte_fmp     = fmp_fins.get("debt_to_equity", np.nan)
+    eps_fmp     = fmp_fins.get("eps_ttm", np.nan)
+    rev_growth  = fmp_fins.get("revenue_growth", np.nan)
+    ni_growth   = fmp_fins.get("net_income_growth", np.nan)
+
+    # info에 FMP 재무제표값 보완
+    if pd.notna(op_margin_fmp) and not info.get("operatingMargins"):
+        info["operatingMargins"] = op_margin_fmp
+    if pd.notna(dte_fmp) and not info.get("debtToEquity"):
+        info["debtToEquity"] = dte_fmp
+    if pd.notna(eps_fmp) and not info.get("trailingEps"):
+        info["trailingEps"] = eps_fmp
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 2 — yfinance는 가격 이력(기술적 지표)만 사용
+    #           info·재무제표는 이미 FMP에서 충분하면 호출 생략
+    # ══════════════════════════════════════════════════════════════════
+    history = pd.DataFrame()
+    cashflow = None
+    income_stmt = None
+    balance_sheet = None
+
+    _yf_need_info = not all([
+        info.get("trailingPE") or info.get("forwardPE"),
+        info.get("returnOnEquity"),
+        info.get("operatingMargins"),
+    ])
+    _yf_need_fcf = pd.isna(fcf)
+
     try:
-        ticker = yf.Ticker(ticker_upper)
+        ticker_obj = yf.Ticker(ticker_upper)
 
-        # ── yfinance info 수집 ───────────────────────────────────────────
-        info = {}
+        # 주가 이력: 기술적 지표(MA50/MA200)에 필수 → 항상 시도
         try:
-            raw_info = ticker.info
-            if isinstance(raw_info, dict) and len(raw_info) > 5:
-                info = raw_info
+            history = ticker_obj.history(period="1y", auto_adjust=False)
         except Exception:
             pass
 
-        # fast_info로 가격 계열 보완
-        if not info:
+        # yfinance info: FMP가 충분히 채웠으면 호출 건너뜀
+        if _yf_need_info:
             try:
-                fi = ticker.fast_info
-                info = {
-                    "currentPrice": getattr(fi, "last_price", None),
-                    "fiftyDayAverage": getattr(fi, "fifty_day_average", None),
-                    "twoHundredDayAverage": getattr(fi, "two_hundred_day_average", None),
-                    "marketCap": getattr(fi, "market_cap", None),
-                }
+                raw_info = ticker_obj.info
+                if isinstance(raw_info, dict) and len(raw_info) > 5:
+                    # yfinance 값으로 FMP 빈 칸만 추가 보완
+                    for k, v in raw_info.items():
+                        if k not in info or not info[k]:
+                            info[k] = v
             except Exception:
                 pass
 
-        # ── FMP로 누락 필드 자동 보완 ────────────────────────────────────
-        info = _fmp_patch_info(info, ticker_upper)
-
-        cashflow = None
-        try:
-            cashflow = ticker.cashflow
-        except Exception:
-            pass
-        if cashflow is None or cashflow.empty:
+        # FCF: FMP에서 못 가져왔을 때만 yfinance cashflow 호출
+        if _yf_need_fcf:
             try:
-                cashflow = ticker.get_cashflow()
-            except Exception:
-                cashflow = None
-
-        history = pd.DataFrame()
-        try:
-            history = ticker.history(period="1y", auto_adjust=False)
-        except Exception:
-            pass
-
-        # ── 재무제표에서 직접 추출 시도 ─────────────────────────────────
-        income_stmt = None
-        try:
-            income_stmt = ticker.income_stmt
-        except Exception:
-            try:
-                income_stmt = ticker.get_income_stmt()
+                cashflow = ticker_obj.cashflow
             except Exception:
                 pass
-
-        balance_sheet = None
-        try:
-            balance_sheet = ticker.balance_sheet
-        except Exception:
-            try:
-                balance_sheet = ticker.get_balance_sheet()
-            except Exception:
-                pass
+            if cashflow is None or (hasattr(cashflow, "empty") and cashflow.empty):
+                try:
+                    cashflow = ticker_obj.get_cashflow()
+                except Exception:
+                    cashflow = None
 
     except Exception:
-        info, cashflow, history = {}, None, pd.DataFrame()
-        income_stmt, balance_sheet = None, None
-        # yfinance 완전 실패 시에도 FMP 단독으로 시도
-        try:
-            info = _fmp_patch_info({}, ticker_upper)
-        except Exception:
-            pass
+        pass
 
     # ── 지표 추출 ──────────────────────────────────────────────────────
-    # ROE
     roe = to_float(info.get("returnOnEquity"))
-    if pd.isna(roe) and income_stmt is not None and balance_sheet is not None:
-        try:
-            net_income = income_stmt.loc["Net Income"].iloc[0] if "Net Income" in income_stmt.index else np.nan
-            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
-            if pd.notna(net_income) and pd.notna(equity) and equity != 0:
-                roe = float(net_income / equity)
-        except Exception:
-            pass
 
-    # Operating Margin
     operating_margin = to_float(info.get("operatingMargins"))
-    if pd.isna(operating_margin) and income_stmt is not None:
-        try:
-            op_income = income_stmt.loc["Operating Income"].iloc[0] if "Operating Income" in income_stmt.index else np.nan
-            total_rev = income_stmt.loc["Total Revenue"].iloc[0] if "Total Revenue" in income_stmt.index else np.nan
-            if pd.notna(op_income) and pd.notna(total_rev) and total_rev != 0:
-                operating_margin = float(op_income / total_rev)
-        except Exception:
-            pass
+    if pd.isna(operating_margin) and pd.notna(op_margin_fmp):
+        operating_margin = op_margin_fmp
 
-    # Debt to Equity
     debt_to_equity = to_float(info.get("debtToEquity"))
-    if pd.isna(debt_to_equity) and balance_sheet is not None:
-        try:
-            total_debt = balance_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in balance_sheet.index else np.nan
-            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
-            if pd.notna(total_debt) and pd.notna(equity) and equity != 0:
-                debt_to_equity = float(total_debt / equity * 100)
-        except Exception:
-            pass
+    if pd.isna(debt_to_equity) and pd.notna(dte_fmp):
+        debt_to_equity = dte_fmp
 
-    # PEG Ratio
-    peg_ratio = to_float(info.get("pegRatio") or info.get("trailingPegRatio"))
-
-    # Forward / Trailing PE (Valuation 대체 지표)
-    forward_pe = to_float(info.get("forwardPE"))
-    trailing_pe = to_float(info.get("trailingPE"))
+    peg_ratio    = to_float(info.get("pegRatio") or info.get("trailingPegRatio"))
+    forward_pe   = to_float(info.get("forwardPE"))
+    trailing_pe  = to_float(info.get("trailingPE"))
     price_to_book = to_float(info.get("priceToBook"))
     ev_to_ebitda = to_float(info.get("enterpriseToEbitda"))
 
-    # EPS & Growth
     trailing_eps = to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
-    earnings_growth = to_float(info.get("earningsGrowth") or info.get("revenueGrowth"))
+    if pd.isna(trailing_eps) and pd.notna(eps_fmp):
+        trailing_eps = eps_fmp
 
-    # Free Cash Flow
-    fcf = get_latest_series_value(cashflow, "Free Cash Flow")
+    # earningsGrowth: FMP net_income_growth → revenue_growth 순으로 fallback
+    earnings_growth = to_float(info.get("earningsGrowth"))
+    if pd.isna(earnings_growth) and pd.notna(ni_growth):
+        earnings_growth = ni_growth
+    if pd.isna(earnings_growth) and pd.notna(rev_growth):
+        earnings_growth = rev_growth
+
+    # FCF: FMP 우선, yfinance cashflow 보완
     if pd.isna(fcf) and cashflow is not None:
-        for key in ["FreeCashFlow", "Free Cash Flow", "Operating Cash Flow"]:
-            fcf = get_latest_series_value(cashflow, key)
-            if not pd.isna(fcf):
-                break
+        fcf = get_latest_series_value(cashflow, "Free Cash Flow")
+        if pd.isna(fcf):
+            for k in ["FreeCashFlow", "Operating Cash Flow"]:
+                fcf = get_latest_series_value(cashflow, k)
+                if not pd.isna(fcf):
+                    break
 
-    # Momentum (가격 + MA)
+    # 기술적 지표 (history 기반)
     current_price, ma50, ma200 = get_momentum_values(history)
-    # info에서 보완
     if pd.isna(current_price):
         current_price = to_float(info.get("currentPrice") or info.get("regularMarketPrice"))
     if pd.isna(ma50):
@@ -3531,15 +3613,9 @@ def evaluate_kpis(ticker_symbol):
     fail_count = (kpi_df["Pass"] == ":red[Fail]").sum()
     nodata_count = (kpi_df["Pass"] == ":gray[No Data]").sum()
 
-    # ── 데이터 소스 추적 (UI 표시용) ──────────────────────────────────
-    _fmp_fields_used = [
-        f for f in ["trailingPE", "forwardPE", "priceToBook", "enterpriseToEbitda",
-                    "returnOnEquity", "operatingMargins", "debtToEquity", "trailingEps"]
-        if info.get(f) is not None
-    ]
-    # yfinance가 원래 갖고 있던 필드 수 추정: FMP 호출 없었으면 전부 yf
-    _has_fmp = bool(_get_fmp_key()) and bool(fmp_get_profile.cache_info if hasattr(fmp_get_profile, "cache_info") else True)
-    _data_source = "yfinance + FMP" if _get_fmp_key() else "yfinance"
+    # ── 데이터 소스 추적 ──────────────────────────────────────────────
+    _has_fmp_key = bool(_get_fmp_key())
+    _data_source = "FMP (primary) + yfinance (가격 이력)" if _has_fmp_key else "yfinance"
 
     margin_context = {
         "intrinsic_value": intrinsic_value,
