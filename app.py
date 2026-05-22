@@ -67,6 +67,12 @@ _PORTFOLIOS_SHEET_COLS = ["ID", "Account", "Ticker", "AvgPrice", "Quantity", "Da
 _PORTFOLIOS_LEGACY_HEADER = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
 _TRADE_HISTORY_WORKSHEET_TITLE = "Trade_History"
 _TRADE_HISTORY_SHEET_COLS = ["user_id", "account", "ticker", "action", "shares", "price", "date", "memo"]
+_DRG_PREDICTIONS_WORKSHEET_TITLE = "DRG_Predictions"
+_DRG_PREDICTIONS_SHEET_COLS = [
+    "user_id", "pred_date", "direction", "sector_filter", "benchmark_etf",
+    "spy_close_at_pred", "full_text", "actual_direction", "actual_return_pct",
+    "is_correct", "review_comment"
+]
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 _THESIS_WORKSHEET_TITLE = "Thesis"
 _WATCHLIST_SHEET_TITLE = "Watchlist"
@@ -3448,6 +3454,184 @@ def _validate_positive_portfolio_number(label_kr, value):
     if x <= 0:
         return False, None, f"{label_kr}은(는) 0보다 커야 합니다."
     return True, x, ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DRG_Predictions 시트 — AI 예측 저장 & 검증
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 섹터 필터 → 벤치마크 ETF 매핑
+_SECTOR_BENCHMARK_ETF = {
+    "전체": "SPY",
+    "테크/반도체": "SOXX",
+    "에너지": "XLE",
+    "금융": "XLF",
+    "헬스케어": "XLV",
+    "산업재": "XLI",
+    "소비재": "XLY",
+    "부동산": "XLRE",
+}
+
+
+def open_drg_predictions_worksheet():
+    """Quant_DB / DRG_Predictions 탭. 없으면 자동 생성."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET_TITLE)
+        return ws, None
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
+            try:
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET_TITLE, rows=2000, cols=len(_DRG_PREDICTIONS_SHEET_COLS))
+                ws.update([_DRG_PREDICTIONS_SHEET_COLS], range_name=f"A1:{chr(64+len(_DRG_PREDICTIONS_SHEET_COLS))}1", value_input_option="USER_ENTERED")
+                return ws, None
+            except Exception as exc2:
+                return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
+        return None, f"DRG_Predictions 시트 접근 실패: {exc}"
+
+
+@st.cache_data(ttl=300)
+def _drg_predictions_all_values_cached():
+    ws, err = open_drg_predictions_worksheet()
+    if err or ws is None:
+        return [], err
+    try:
+        return ws.get_all_values(), None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _invalidate_drg_predictions_cache():
+    _drg_predictions_all_values_cached.clear()
+
+
+def load_drg_predictions(user_id: str) -> pd.DataFrame:
+    """DRG_Predictions 시트에서 해당 user_id 행만 로드."""
+    empty = pd.DataFrame(columns=_DRG_PREDICTIONS_SHEET_COLS)
+    if not user_id:
+        return empty
+    rows, err = _drg_predictions_all_values_cached()
+    if err or not rows or len(rows) < 2:
+        return empty
+    try:
+        header = [str(c).strip().lower() for c in rows[0]]
+        df = pd.DataFrame(rows[1:], columns=header)
+    except Exception:
+        return empty
+    col_map = {c: s for c in df.columns for s in _DRG_PREDICTIONS_SHEET_COLS if c == s.lower()}
+    df = df.rename(columns=col_map)
+    for c in _DRG_PREDICTIONS_SHEET_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[df["user_id"].astype(str).str.strip() == str(user_id).strip()]
+    return df[_DRG_PREDICTIONS_SHEET_COLS].copy().reset_index(drop=True)
+
+
+def save_drg_prediction(user_id: str, pred_date: str, direction: str,
+                         sector_filter: str, benchmark_etf: str,
+                         spy_close: float, full_text: str) -> tuple[bool, str]:
+    """예측 결과를 DRG_Predictions 시트에 저장."""
+    ws, err = open_drg_predictions_worksheet()
+    if err or ws is None:
+        return False, err or "시트를 열 수 없습니다."
+    try:
+        row = [
+            str(user_id).strip(),
+            str(pred_date),
+            str(direction),
+            str(sector_filter),
+            str(benchmark_etf),
+            str(round(float(spy_close), 4)) if spy_close and not np.isnan(float(spy_close)) else "",
+            str(full_text).strip(),
+            "",   # actual_direction (나중에 업데이트)
+            "",   # actual_return_pct
+            "",   # is_correct
+            "",   # review_comment
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        _invalidate_drg_predictions_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def update_drg_prediction_result(user_id: str, pred_date: str,
+                                  actual_direction: str, actual_return_pct: float,
+                                  is_correct: str, review_comment: str) -> tuple[bool, str]:
+    """예측 행의 실제 결과 컬럼을 업데이트."""
+    ws, err = open_drg_predictions_worksheet()
+    if err or ws is None:
+        return False, err or "시트를 열 수 없습니다."
+    try:
+        rows = ws.get_all_values()
+        if not rows or len(rows) < 2:
+            return False, "데이터 없음"
+        header = [str(c).strip().lower() for c in rows[0]]
+        uid_idx = header.index("user_id") if "user_id" in header else 0
+        date_idx = header.index("pred_date") if "pred_date" in header else 1
+        actual_dir_idx = header.index("actual_direction") if "actual_direction" in header else 7
+        actual_ret_idx = header.index("actual_return_pct") if "actual_return_pct" in header else 8
+        correct_idx = header.index("is_correct") if "is_correct" in header else 9
+        comment_idx = header.index("review_comment") if "review_comment" in header else 10
+
+        for i, row in enumerate(rows[1:], start=2):
+            if (len(row) > uid_idx and str(row[uid_idx]).strip() == str(user_id).strip() and
+                    len(row) > date_idx and str(row[date_idx]).strip() == str(pred_date).strip()):
+                ws.update_cell(i, actual_dir_idx + 1, actual_direction)
+                ws.update_cell(i, actual_ret_idx + 1, str(round(actual_return_pct, 4)))
+                ws.update_cell(i, correct_idx + 1, is_correct)
+                ws.update_cell(i, comment_idx + 1, review_comment)
+                _invalidate_drg_predictions_cache()
+                return True, ""
+        return False, f"{pred_date} 예측 행을 찾을 수 없습니다."
+    except Exception as exc:
+        return False, str(exc)
+
+
+def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
+    """
+    예측 행에서 실제 결과를 계산.
+    반환: (actual_direction, actual_return_pct, is_correct)
+    """
+    try:
+        bench_etf = str(pred_row.get("benchmark_etf", "SPY") or "SPY").strip().upper()
+        pred_date_str = str(pred_row.get("pred_date", "")).strip()
+        pred_date = pd.to_datetime(pred_date_str, errors="coerce")
+        if pd.isna(pred_date):
+            return "", np.nan, ""
+
+        # 예측일 다음 거래일 종가 가져오기
+        end_date = pred_date + pd.Timedelta(days=5)
+        hist = yf.download(bench_etf, start=pred_date.strftime("%Y-%m-%d"),
+                           end=end_date.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
+        if hist is None or hist.empty or len(hist) < 2:
+            return "", np.nan, ""
+
+        pred_close = float(hist["Close"].iloc[0])
+        next_close = float(hist["Close"].iloc[1])
+        ret_pct = ((next_close / pred_close) - 1.0) * 100.0
+
+        # 방향 판정 (±0.3% 기준)
+        if ret_pct >= 0.3:
+            actual_dir = "상승"
+        elif ret_pct <= -0.3:
+            actual_dir = "하락"
+        else:
+            actual_dir = "중립"
+
+        # 예측 방향 추출
+        pred_dir = str(pred_row.get("direction", "")).strip()
+        pred_dir_norm = "상승" if "상승" in pred_dir else ("하락" if "하락" in pred_dir else "중립")
+
+        is_correct = "✅ 적중" if pred_dir_norm == actual_dir else "❌ 빗나감"
+        return actual_dir, ret_pct, is_correct
+    except Exception:
+        return "", np.nan, ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -7931,9 +8115,36 @@ if st.session_state.get("logged_in"):
                 _drg_response = _drg_model.generate_content(drg_prompt)
                 _drg_text = _gemini_response_text_utf8_safe(_drg_response)
             if _drg_text:
+                # 방향 추출
+                _pred_dir = "중립"
+                if "상승 우세" in _drg_text:
+                    _pred_dir = "상승 우세"
+                elif "하락 우세" in _drg_text:
+                    _pred_dir = "하락 우세"
+
+                # 벤치마크 ETF 결정
+                _bench_etf = _SECTOR_BENCHMARK_ETF.get(sector_choice, "SPY")
+
+                # 현재 벤치마크 ETF 종가 가져오기
+                try:
+                    _spy_hist = yf.download(_bench_etf, period="2d", progress=False, auto_adjust=True)
+                    _spy_close = float(_spy_hist["Close"].iloc[-1]) if _spy_hist is not None and not _spy_hist.empty else np.nan
+                except Exception:
+                    _spy_close = np.nan
+
+                # DRG_Predictions 시트에 저장
+                _pred_date_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+                _puid_drg = str(st.session_state.get("user_id") or "").strip()
+                save_drg_prediction(
+                    _puid_drg, _pred_date_str, _pred_dir,
+                    sector_choice, _bench_etf, _spy_close, _drg_text
+                )
+
                 st.session_state["_drg_ai_result"] = _drg_text
                 st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
                 st.session_state["_drg_ai_news_count"] = rss_news_count
+                st.session_state["_drg_pred_dir"] = _pred_dir
+                st.session_state["_drg_bench_etf"] = _bench_etf
                 st.rerun()
 
         if st.session_state.get("_drg_ai_result"):
@@ -8103,6 +8314,157 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.warning("⚠️ 면책 조항: 이 앱은 투자 참고 도구이며 투자 권유가 아닙니다. 모든 투자 결정과 결과는 투자자 본인의 책임입니다.")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # AI 예측 히스토리 & 적중률
+        # ═══════════════════════════════════════════════════════════════════
+        st.divider()
+        st.markdown("## 📊 AI 예측 히스토리 & 적중률")
+        st.caption("과거 AI 예측과 실제 시장 결과를 비교합니다. 예측 다음날 이후 '결과 검증' 버튼으로 실제 결과를 확인하세요.")
+
+        _puid_hist = str(st.session_state.get("user_id") or "").strip()
+        pred_hist_df = load_drg_predictions(_puid_hist)
+
+        if pred_hist_df.empty:
+            st.info("아직 AI 예측 기록이 없습니다. 위 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
+        else:
+            # 적중률 요약
+            verified = pred_hist_df[pred_hist_df["is_correct"].astype(str).str.strip() != ""]
+            total_v = len(verified)
+            correct_v = (verified["is_correct"] == "✅ 적중").sum()
+            hit_rate = (correct_v / total_v * 100) if total_v > 0 else np.nan
+
+            hm1, hm2, hm3, hm4 = st.columns(4)
+            with hm1:
+                st.metric("총 예측 횟수", len(pred_hist_df))
+            with hm2:
+                st.metric("검증 완료", total_v)
+            with hm3:
+                st.metric("적중 횟수", correct_v)
+            with hm4:
+                st.metric("적중률", f"{hit_rate:.0f}%" if pd.notna(hit_rate) else "N/A")
+
+            st.divider()
+
+            # 미검증 예측 — 결과 검증 버튼
+            unverified = pred_hist_df[pred_hist_df["is_correct"].astype(str).str.strip() == ""].copy()
+            if not unverified.empty:
+                st.markdown("#### 🔍 결과 검증 대기 중")
+                for _, urow in unverified.iterrows():
+                    _pd_str = str(urow.get("pred_date", ""))
+                    _bench = str(urow.get("benchmark_etf", "SPY"))
+                    _dir = str(urow.get("direction", ""))
+                    _sec = str(urow.get("sector_filter", "전체"))
+                    ucol1, ucol2, ucol3 = st.columns([2, 2, 1])
+                    with ucol1:
+                        st.write(f"📅 **{_pd_str}** | 예측: {_dir}")
+                    with ucol2:
+                        st.write(f"📌 섹터: {_sec} | 벤치마크: {_bench}")
+                    with ucol3:
+                        if st.button("결과 검증", key=f"verify_drg_{_pd_str}"):
+                            with st.spinner(f"{_bench} 실제 결과 조회 중..."):
+                                _actual_dir, _actual_ret, _is_correct = verify_drg_prediction(urow)
+                            if _actual_dir:
+                                # AI 리뷰 생성
+                                with st.spinner("AI가 예측 리뷰 작성 중..."):
+                                    try:
+                                        _review_prompt = (
+                                            f"당신은 퀀트 투자 분석가입니다.\n"
+                                            f"[예측 날짜] {_pd_str}\n"
+                                            f"[AI 예측 방향] {_dir}\n"
+                                            f"[실제 결과] {_actual_dir} ({_actual_ret:+.2f}%)\n"
+                                            f"[적중 여부] {_is_correct}\n\n"
+                                            f"[당시 AI 예측 전문]\n{str(urow.get('full_text',''))[:1000]}\n\n"
+                                            "위 정보를 바탕으로 3~4문장으로 간결하게 리뷰하세요:\n"
+                                            "- 예측이 맞았다면: 어떤 근거가 정확했는지\n"
+                                            "- 틀렸다면: 무엇을 놓쳤는지, 왜 틀렸는지\n"
+                                            "- 다음 예측 시 참고할 인사이트\n"
+                                            "한국어로 작성하세요."
+                                        )
+                                        _rev_model = _GenAIModel("gemini-2.5-flash",
+                                            generation_config={"temperature": 0.3, "max_output_tokens": 1024})
+                                        _rev_resp = _rev_model.generate_content(_review_prompt)
+                                        _review_txt = _gemini_response_text_utf8_safe(_rev_resp) or ""
+                                    except Exception:
+                                        _review_txt = "AI 리뷰 생성 실패"
+
+                                ok_upd, err_upd = update_drg_prediction_result(
+                                    _puid_hist, _pd_str, _actual_dir,
+                                    _actual_ret, _is_correct, _review_txt
+                                )
+                                if ok_upd:
+                                    st.success(f"{_is_correct} | {_bench} 실제 수익률: {_actual_ret:+.2f}%")
+                                    st.rerun()
+                                else:
+                                    st.error(f"저장 실패: {err_upd}")
+                            else:
+                                st.warning("아직 다음 거래일 데이터가 없습니다. 예측 다음날 장 마감 후 다시 시도해주세요.")
+                st.divider()
+
+            # 전체 히스토리 테이블
+            st.markdown("#### 📋 전체 예측 기록")
+
+            # 벤치마크 옵션 선택
+            bench_opts = ["SPY (기본)"] + [f"{v} ({k})" for k, v in _SECTOR_BENCHMARK_ETF.items() if v != "SPY"]
+            _hist_bench = st.selectbox("검증 기준 ETF 필터", options=["전체 보기"] + bench_opts, key="drg_hist_bench_filter")
+
+            show_hist = pred_hist_df.copy()
+            if _hist_bench != "전체 보기":
+                _filter_etf = _hist_bench.split(" ")[0]
+                show_hist = show_hist[show_hist["benchmark_etf"] == _filter_etf]
+
+            show_hist = show_hist.sort_values("pred_date", ascending=False).reset_index(drop=True)
+            display_hist = show_hist.rename(columns={
+                "pred_date": "예측일", "direction": "예측방향",
+                "sector_filter": "섹터", "benchmark_etf": "벤치마크ETF",
+                "spy_close_at_pred": "예측시점가격",
+                "actual_direction": "실제방향", "actual_return_pct": "실제수익률(%)",
+                "is_correct": "적중여부", "review_comment": "AI리뷰",
+            })[["예측일", "예측방향", "섹터", "벤치마크ETF", "예측시점가격",
+                "실제방향", "실제수익률(%)", "적중여부", "AI리뷰"]]
+
+            display_hist["실제수익률(%)"] = pd.to_numeric(display_hist["실제수익률(%)"], errors="coerce")
+
+            def _c_correct(v):
+                if "✅" in str(v): return "color:#16a34a;font-weight:700;"
+                if "❌" in str(v): return "color:#dc2626;font-weight:700;"
+                return "color:#94a3b8;"
+
+            def _c_dir(v):
+                if "상승" in str(v): return "color:#16a34a;font-weight:600;"
+                if "하락" in str(v): return "color:#dc2626;font-weight:600;"
+                return ""
+
+            st.dataframe(
+                display_hist.style
+                .format({"실제수익률(%)": "{:+.2f}%", "예측시점가격": "${:,.2f}"}, na_rep="대기중")
+                .map(_c_correct, subset=["적중여부"])
+                .map(_c_dir, subset=["예측방향", "실제방향"])
+                .background_gradient(cmap="RdYlGn", subset=["실제수익률(%)"], axis=0),
+                use_container_width=True, hide_index=True,
+            )
+
+            # 예측 텍스트 전문 보기
+            if not show_hist.empty:
+                st.markdown("#### 📄 예측 전문 보기")
+                _sel_date = st.selectbox(
+                    "날짜 선택",
+                    options=show_hist["pred_date"].tolist(),
+                    key="drg_hist_fulltext_sel"
+                )
+                _sel_row = show_hist[show_hist["pred_date"] == _sel_date]
+                if not _sel_row.empty:
+                    _row = _sel_row.iloc[0]
+                    _corr = str(_row.get("is_correct", ""))
+                    if "✅" in _corr:
+                        st.success(str(_row.get("full_text", "")))
+                    elif "❌" in _corr:
+                        st.error(str(_row.get("full_text", "")))
+                    else:
+                        st.info(str(_row.get("full_text", "")))
+                    if str(_row.get("review_comment", "")).strip():
+                        st.markdown("**🤖 AI 리뷰:**")
+                        st.markdown(str(_row.get("review_comment", "")))
 
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
