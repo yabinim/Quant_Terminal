@@ -73,6 +73,11 @@ _DRG_PREDICTIONS_SHEET_COLS = [
     "spy_close_at_pred", "full_text", "actual_direction", "actual_return_pct",
     "is_correct", "review_comment"
 ]
+_SECTOR_BENCHMARK_ETF = {
+    "전체": "SPY", "테크/반도체": "SOXX", "에너지": "XLE",
+    "금융": "XLF", "헬스케어": "XLV", "산업재": "XLI",
+    "소비재": "XLY", "부동산": "XLRE",
+}
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 _THESIS_WORKSHEET_TITLE = "Thesis"
 _WATCHLIST_SHEET_TITLE = "Watchlist"
@@ -970,7 +975,7 @@ class _GenAIModel:
 model = _GenAIModel(
     "gemini-2.5-flash",  # 1.5가 아닌 가장 최근에 입력했던 2.5로 통일!
     generation_config={
-        "temperature": 0.3,  # 내러티브 생성 — 매번 다른 인사이트를 위해 약간의 다양성 허용
+        "temperature": 0.0,  # AI의 상상력을 0으로 통제 (일관성 극대화)
         "top_p": 1,
         "top_k": 1,
         "max_output_tokens": 8192,
@@ -2090,15 +2095,6 @@ def cached_analyze_us_macro_dashboard():
     return analyze_us_macro_dashboard()
 
 
-def get_macro_dashboard_with_validation():
-    """rows가 8개 미만이면 캐시를 자동 무효화하고 재호출."""
-    pack = cached_analyze_us_macro_dashboard()
-    if pack and len(pack.get("rows", [])) < 8:
-        cached_analyze_us_macro_dashboard.clear()
-        pack = cached_analyze_us_macro_dashboard()
-    return pack
-
-
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_sector_etf_closes(tickers_tuple: tuple[str, ...]):
     if not tickers_tuple:
@@ -2351,15 +2347,14 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
     try:
-        raw_vol = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
-        _close_vol = get_close_prices_from_download(raw_vol)
-        etf_s = pd.to_numeric(_close_vol.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if _close_vol is not None else pd.Series(dtype=float)
-        if etf_s.empty:
-            # sector_etf 컬럼이 없으면 첫 번째 컬럼 사용
-            _cols = [c for c in (_close_vol.columns if _close_vol is not None else []) if c != "Date"]
-            if _cols:
-                etf_s = pd.to_numeric(_close_vol[_cols[0]], errors="coerce").dropna()
-        vol = pd.to_numeric(raw_vol.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna() if raw_vol is not None else pd.Series(dtype=float)
+        _raw_vol = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        _close_vol = get_close_prices_from_download(_raw_vol)
+        if _close_vol is not None and not _close_vol.empty:
+            _vol_col = sector_etf if sector_etf in _close_vol.columns else _close_vol.columns[0]
+            etf_s = pd.to_numeric(_close_vol[_vol_col], errors="coerce").dropna()
+        else:
+            etf_s = pd.Series(dtype=float)
+        vol = pd.to_numeric(_raw_vol["Volume"], errors="coerce").dropna() if _raw_vol is not None and "Volume" in _raw_vol.columns else pd.Series(dtype=float)
         if len(etf_s) >= 10 and len(vol) >= 10:
             price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
             vol_5d = float(vol.tail(5).mean())
@@ -3318,8 +3313,290 @@ def delete_portfolio_sheet_row(user_id: str, account: str, ticker: str) -> tuple
         return False, str(exc)
 
 
+# ── Trade_History 시트 ──────────────────────────────────────────────────────
+
+def _open_worksheet_auto_create(title: str, rows: int, cols: int):
+    """시트 열기. 없으면 자동 생성."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        try:
+            return sh.worksheet(title), None
+        except Exception:
+            ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+            return ws, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+@st.cache_data(ttl=60)
+def _trade_history_all_values_cached():
+    ws, err = _open_worksheet_auto_create(_TRADE_HISTORY_WORKSHEET_TITLE, 5000, 8)
+    if err or ws is None:
+        return [], err
+    try:
+        return ws.get_all_values(), None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _invalidate_trade_history_cache():
+    _trade_history_all_values_cached.clear()
+
+
+def load_trade_history(user_id: str) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=_TRADE_HISTORY_SHEET_COLS)
+    if not user_id:
+        return empty
+    rows, err = _trade_history_all_values_cached()
+    if err or not rows:
+        return empty
+    first_lower = [str(c).strip().lower() for c in rows[0]]
+    has_header = any(c in _TRADE_HISTORY_SHEET_COLS for c in first_lower)
+    data_rows = rows[1:] if has_header else rows
+    if not data_rows:
+        return empty
+    try:
+        ncols = min(len(_TRADE_HISTORY_SHEET_COLS), max(len(r) for r in data_rows))
+        df = pd.DataFrame([r[:ncols] for r in data_rows], columns=_TRADE_HISTORY_SHEET_COLS[:ncols])
+    except Exception:
+        return empty
+    for c in _TRADE_HISTORY_SHEET_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[df["user_id"].astype(str).str.strip() == str(user_id).strip()]
+    df = df[_TRADE_HISTORY_SHEET_COLS].copy().reset_index(drop=True)
+    df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    return df
+
+
+def append_trade_history_row(user_id, account, ticker, action, shares, price, date, memo=""):
+    ws, err = _open_worksheet_auto_create(_TRADE_HISTORY_WORKSHEET_TITLE, 5000, 8)
+    if err or ws is None:
+        return False, err or "시트 오류"
+    try:
+        # 헤더 없으면 추가
+        vals = ws.get_all_values()
+        if not vals or not any(str(c).strip().lower() in _TRADE_HISTORY_SHEET_COLS for c in vals[0]):
+            ws.update([_TRADE_HISTORY_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+        ws.append_row([str(user_id), str(account), str(ticker).upper(), str(action).upper(),
+                       str(round(float(shares), 6)), str(round(float(price), 6)), str(date), str(memo)],
+                      value_input_option="USER_ENTERED")
+        _invalidate_trade_history_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def compute_realized_pnl(trade_df: pd.DataFrame) -> pd.DataFrame:
+    _cols = ["ticker","account","sell_date","shares_sold","sell_price",
+             "fifo_cost","avg_cost","fifo_pnl","avg_pnl","fifo_pnl_pct","avg_pnl_pct","memo"]
+    if trade_df is None or trade_df.empty:
+        return pd.DataFrame(columns=_cols)
+    results = []
+    for (ticker, account), grp in trade_df.groupby(["ticker","account"]):
+        grp = grp.copy()
+        grp["date"] = pd.to_datetime(grp["date"], errors="coerce")
+        grp = grp.sort_values("date").reset_index(drop=True)
+        fifo_q = []
+        avg_shares, avg_cost_total = 0.0, 0.0
+        for _, row in grp.iterrows():
+            act = str(row.get("action","")).upper()
+            sh = float(row.get("shares") or 0)
+            pr = float(row.get("price") or 0)
+            dt = row.get("date")
+            memo = str(row.get("memo") or "")
+            if act == "BUY" and sh > 0 and pr > 0:
+                fifo_q.append([sh, pr])
+                avg_cost_total += sh * pr
+                avg_shares += sh
+            elif act == "SELL" and sh > 0 and pr > 0:
+                fifo_cost = 0.0
+                rem = sh
+                tmp = [list(q) for q in fifo_q]
+                for lot in tmp:
+                    if rem <= 0: break
+                    use = min(lot[0], rem)
+                    fifo_cost += use * lot[1]
+                    lot[0] -= use; rem -= use
+                fifo_q = [[q[0],q[1]] for q in tmp if q[0]>1e-9]
+                avg_per = (avg_cost_total/avg_shares) if avg_shares>1e-9 else 0.0
+                avg_c = sh * avg_per
+                avg_cost_total = max(0.0, avg_cost_total - avg_c)
+                avg_shares = max(0.0, avg_shares - sh)
+                proceeds = sh * pr
+                fp = proceeds - fifo_cost; ap = proceeds - avg_c
+                fcp = fifo_cost/sh if sh>0 else 0; acp = avg_c/sh if sh>0 else 0
+                results.append({"ticker":ticker,"account":account,
+                    "sell_date":dt.strftime("%Y-%m-%d") if pd.notna(dt) else "",
+                    "shares_sold":sh,"sell_price":pr,"fifo_cost":fcp,"avg_cost":acp,
+                    "fifo_pnl":fp,"avg_pnl":ap,
+                    "fifo_pnl_pct":((pr/fcp)-1)*100 if fcp>0 else np.nan,
+                    "avg_pnl_pct":((pr/acp)-1)*100 if acp>0 else np.nan,"memo":memo})
+    if not results:
+        return pd.DataFrame(columns=_cols)
+    return pd.DataFrame(results).sort_values("sell_date",ascending=False).reset_index(drop=True)
+
+
+# ── DRG_Predictions 시트 ────────────────────────────────────────────────────
+
+@st.cache_data(ttl=60)
+def _drg_predictions_cached():
+    ws, err = _open_worksheet_auto_create(_DRG_PREDICTIONS_WORKSHEET_TITLE, 2000, 11)
+    if err or ws is None:
+        return [], err
+    try:
+        return ws.get_all_values(), None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _invalidate_drg_predictions_cache():
+    _drg_predictions_cached.clear()
+
+
+def load_drg_predictions(user_id: str) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=_DRG_PREDICTIONS_SHEET_COLS)
+    if not user_id:
+        return empty
+    # 캐시 우회하여 직접 읽기
+    try:
+        ws, err = _open_worksheet_auto_create(_DRG_PREDICTIONS_WORKSHEET_TITLE, 2000, 11)
+        if err or ws is None:
+            return empty
+        rows = ws.get_all_values()
+    except Exception:
+        return empty
+    if not rows or len(rows) < 2:
+        return empty
+    try:
+        header = [str(c).strip().lower() for c in rows[0]]
+        df = pd.DataFrame(rows[1:], columns=header)
+    except Exception:
+        return empty
+    col_map = {c: s for c in df.columns for s in _DRG_PREDICTIONS_SHEET_COLS if c == s.lower()}
+    df = df.rename(columns=col_map)
+    for c in _DRG_PREDICTIONS_SHEET_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[df["user_id"].astype(str).str.strip() == str(user_id).strip()]
+    return df[_DRG_PREDICTIONS_SHEET_COLS].copy().reset_index(drop=True)
+
+
+def save_drg_prediction(user_id, pred_date, direction, sector_filter, benchmark_etf, spy_close, full_text):
+    ws, err = _open_worksheet_auto_create(_DRG_PREDICTIONS_WORKSHEET_TITLE, 2000, 11)
+    if err or ws is None:
+        return False, err or "시트 오류"
+    try:
+        vals = ws.get_all_values()
+        if not vals or not any(str(c).strip().lower() == "user_id" for c in vals[0]):
+            ws.update([_DRG_PREDICTIONS_SHEET_COLS],
+                      range_name=f"A1:K1", value_input_option="USER_ENTERED")
+        spy_str = str(round(float(spy_close), 4)) if spy_close and not np.isnan(float(spy_close)) else ""
+        ws.append_row([str(user_id), str(pred_date), str(direction), str(sector_filter),
+                       str(benchmark_etf), spy_str, str(full_text).strip(),
+                       "", "", "", ""], value_input_option="USER_ENTERED")
+        _invalidate_drg_predictions_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def update_drg_prediction_result(user_id, pred_date, actual_direction, actual_return_pct, is_correct, review_comment):
+    ws, err = _open_worksheet_auto_create(_DRG_PREDICTIONS_WORKSHEET_TITLE, 2000, 11)
+    if err or ws is None:
+        return False, err or "시트 오류"
+    try:
+        rows = ws.get_all_values()
+        if not rows or len(rows) < 2:
+            return False, "데이터 없음"
+        header = [str(c).strip().lower() for c in rows[0]]
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and str(row[0]).strip() == str(user_id).strip():
+                if len(row) > 1 and str(row[1]).strip() == str(pred_date).strip():
+                    ws.update_cell(i, 8, actual_direction)
+                    ws.update_cell(i, 9, str(round(actual_return_pct, 4)))
+                    ws.update_cell(i, 10, is_correct)
+                    ws.update_cell(i, 11, review_comment)
+                    _invalidate_drg_predictions_cache()
+                    return True, ""
+        return False, "해당 행 없음"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def verify_drg_prediction(pred_row):
+    try:
+        bench = str(pred_row.get("benchmark_etf","SPY") or "SPY").upper()
+        pred_date = pd.to_datetime(str(pred_row.get("pred_date","")), errors="coerce")
+        if pd.isna(pred_date):
+            return "", np.nan, ""
+        end = pred_date + pd.Timedelta(days=5)
+        hist = yf.download(bench, start=pred_date.strftime("%Y-%m-%d"),
+                           end=end.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
+        if hist is None or hist.empty or len(hist) < 2:
+            return "", np.nan, ""
+        ret = (float(hist["Close"].iloc[1]) / float(hist["Close"].iloc[0]) - 1.0) * 100.0
+        actual = "상승" if ret >= 0.3 else ("하락" if ret <= -0.3 else "중립")
+        pred_dir = str(pred_row.get("direction",""))
+        pred_norm = "상승" if "상승" in pred_dir else ("하락" if "하락" in pred_dir else "중립")
+        correct = "✅ 적중" if pred_norm == actual else "❌ 빗나감"
+        return actual, ret, correct
+    except Exception:
+        return "", np.nan, ""
+
+
+# ── load_portfolio_fresh ─────────────────────────────────────────────────────
+
+def load_portfolio_fresh():
+    """캐시 우회하여 시트 직접 읽기."""
+    try:
+        _invalidate_portfolio_sheet_cache()
+    except Exception:
+        pass
+    base_columns = ["Account", "Ticker", "Purchase_Price", "Quantity"]
+    uid = str(st.session_state.get("user_id") or "").strip()
+    if not uid:
+        return pd.DataFrame(columns=base_columns)
+    try:
+        ws, err = open_portfolios_worksheet()
+        if err or ws is None:
+            return pd.DataFrame(columns=base_columns)
+        vals = ws.get_all_values()
+    except Exception:
+        return pd.DataFrame(columns=base_columns)
+    if not vals or len(vals) < 2:
+        return pd.DataFrame(columns=base_columns)
+    hk = _portfolio_sheet_header_kind(vals[0])
+    if hk == "unknown":
+        hk = "new"
+    rows = []
+    uid_u = uid.upper()
+    for r in vals[1:]:
+        cells = _portfolio_row_to_new_six_cells(hk, r)
+        if not cells:
+            continue
+        if str(cells[0]).strip().upper() != uid_u:
+            continue
+        rows.append({"Account": str(cells[1]).strip(),
+                     "Ticker": str(cells[2]).strip().upper(),
+                     "Purchase_Price": pd.to_numeric(cells[3], errors="coerce"),
+                     "Quantity": pd.to_numeric(cells[4], errors="coerce")})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=base_columns)
+    df["Quantity"] = df["Quantity"].fillna(1.0)
+    df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN") & df["Account"].astype(str).str.strip().ne("")]
+    df = df.drop_duplicates(subset=["Account","Ticker"], keep="last").reset_index(drop=True)
+    return df[base_columns].copy()
+
+
 def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[bool, str]:
     """해당 user_id 행만 시트에서 교체하고 다른 사용자 행은 유지한다."""
+
     uid = str(user_id or "").strip()
     if not uid:
         return False, "user_id 가 비어 있습니다."
@@ -3357,44 +3634,19 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
             rows.append([uid, acct, tk, float(pp), float(qq), now_s])
         ws.clear()
         ws.update(rows, range_name=f"A1:F{len(rows)}", value_input_option="USER_ENTERED")
-        _invalidate_portfolio_sheet_cache()  # 쓰기 완료 후 캐시 강제 클리어
+        _invalidate_portfolio_sheet_cache()
         return True, ""
     except Exception as exc:
         return False, str(exc)
 
 
 def load_portfolio():
-    return _load_portfolio_internal(use_cache=True)
-
-
-def load_portfolio_fresh():
-    """캐시 없이 시트에서 직접 읽음 — 매도/추가 직후 사용."""
-    _invalidate_portfolio_sheet_cache()
-    return _load_portfolio_internal(use_cache=False)
-
-
-def _load_portfolio_internal(use_cache: bool = True):
     base_columns = ["Account", "Ticker", "Purchase_Price", "Quantity"]
     uid = str(st.session_state.get("user_id") or "").strip()
     if not uid:
         return pd.DataFrame(columns=base_columns)
     st.session_state.pop("_portfolio_last_sheet_error", None)
-
-    if use_cache:
-        vals, err = _portfolio_sheet_all_values_cached()
-    else:
-        # 캐시 우회 — 시트 직접 읽기
-        try:
-            ws, err = open_portfolios_worksheet()
-            if err or ws is None:
-                st.session_state["_portfolio_last_sheet_error"] = err
-                return pd.DataFrame(columns=base_columns)
-            vals = ws.get_all_values()
-            err = None
-        except Exception as exc:
-            st.session_state["_portfolio_last_sheet_error"] = str(exc)
-            return pd.DataFrame(columns=base_columns)
-
+    vals, err = _portfolio_sheet_all_values_cached()
     if err:
         st.session_state["_portfolio_last_sheet_error"] = err
         return pd.DataFrame(columns=base_columns)
@@ -3482,488 +3734,6 @@ def _validate_positive_portfolio_number(label_kr, value):
     if x <= 0:
         return False, None, f"{label_kr}은(는) 0보다 커야 합니다."
     return True, x, ""
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DRG_Predictions 시트 — AI 예측 저장 & 검증
-# ──────────────────────────────────────────────────────────────────────────────
-
-# 섹터 필터 → 벤치마크 ETF 매핑
-_SECTOR_BENCHMARK_ETF = {
-    "전체": "SPY",
-    "테크/반도체": "SOXX",
-    "에너지": "XLE",
-    "금융": "XLF",
-    "헬스케어": "XLV",
-    "산업재": "XLI",
-    "소비재": "XLY",
-    "부동산": "XLRE",
-}
-
-
-def open_drg_predictions_worksheet():
-    """Quant_DB / DRG_Predictions 탭. 없으면 자동 생성."""
-    import gspread.exceptions
-    gc = get_gspread_client()
-    if gc is None:
-        return None, "Google 서비스 계정이 설정되지 않았습니다."
-    try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        try:
-            ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET_TITLE)
-            return ws, None
-        except Exception:
-            # 탭이 없으면 생성
-            try:
-                ncols = len(_DRG_PREDICTIONS_SHEET_COLS)
-                ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET_TITLE, rows=2000, cols=ncols)
-                ws.update(
-                    [_DRG_PREDICTIONS_SHEET_COLS],
-                    range_name=f"A1:{chr(64 + ncols)}1",
-                    value_input_option="USER_ENTERED"
-                )
-                return ws, None
-            except Exception as exc2:
-                return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
-    except Exception as exc:
-        return None, f"스프레드시트 접근 실패: {exc}"
-
-
-@st.cache_data(ttl=300)
-def _drg_predictions_all_values_cached():
-    ws, err = open_drg_predictions_worksheet()
-    if err or ws is None:
-        return [], err
-    try:
-        return ws.get_all_values(), None
-    except Exception as exc:
-        return [], str(exc)
-
-
-def _invalidate_drg_predictions_cache():
-    _drg_predictions_all_values_cached.clear()
-
-
-def load_drg_predictions(user_id: str) -> pd.DataFrame:
-    """DRG_Predictions 시트에서 해당 user_id 행만 로드."""
-    return _load_drg_predictions_internal(user_id, use_cache=True)
-
-
-def load_drg_predictions_fresh(user_id: str) -> pd.DataFrame:
-    """캐시 없이 직접 읽음."""
-    _invalidate_drg_predictions_cache()
-    return _load_drg_predictions_internal(user_id, use_cache=False)
-
-
-def _load_drg_predictions_internal(user_id: str, use_cache: bool = True) -> pd.DataFrame:
-    empty = pd.DataFrame(columns=_DRG_PREDICTIONS_SHEET_COLS)
-    if not user_id:
-        return empty
-    if use_cache:
-        rows, err = _drg_predictions_all_values_cached()
-    else:
-        try:
-            ws, err = open_drg_predictions_worksheet()
-            if err or ws is None:
-                return empty
-            rows = ws.get_all_values()
-            err = None
-        except Exception:
-            return empty
-    if err or not rows or len(rows) < 2:
-        return empty
-    try:
-        header = [str(c).strip().lower() for c in rows[0]]
-        df = pd.DataFrame(rows[1:], columns=header)
-    except Exception:
-        return empty
-    col_map = {c: s for c in df.columns for s in _DRG_PREDICTIONS_SHEET_COLS if c == s.lower()}
-    df = df.rename(columns=col_map)
-    for c in _DRG_PREDICTIONS_SHEET_COLS:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[df["user_id"].astype(str).str.strip() == str(user_id).strip()]
-    return df[_DRG_PREDICTIONS_SHEET_COLS].copy().reset_index(drop=True)
-
-
-def save_drg_prediction(user_id: str, pred_date: str, direction: str,
-                         sector_filter: str, benchmark_etf: str,
-                         spy_close: float, full_text: str) -> tuple[bool, str]:
-    """예측 결과를 DRG_Predictions 시트에 저장."""
-    ws, err = open_drg_predictions_worksheet()
-    if err or ws is None:
-        return False, err or "시트를 열 수 없습니다."
-    try:
-        row = [
-            str(user_id).strip(),
-            str(pred_date),
-            str(direction),
-            str(sector_filter),
-            str(benchmark_etf),
-            str(round(float(spy_close), 4)) if spy_close and not np.isnan(float(spy_close)) else "",
-            str(full_text).strip(),
-            "",   # actual_direction (나중에 업데이트)
-            "",   # actual_return_pct
-            "",   # is_correct
-            "",   # review_comment
-        ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        _invalidate_drg_predictions_cache()
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
-
-
-def update_drg_prediction_result(user_id: str, pred_date: str,
-                                  actual_direction: str, actual_return_pct: float,
-                                  is_correct: str, review_comment: str) -> tuple[bool, str]:
-    """예측 행의 실제 결과 컬럼을 업데이트."""
-    ws, err = open_drg_predictions_worksheet()
-    if err or ws is None:
-        return False, err or "시트를 열 수 없습니다."
-    try:
-        rows = ws.get_all_values()
-        if not rows or len(rows) < 2:
-            return False, "데이터 없음"
-        header = [str(c).strip().lower() for c in rows[0]]
-        uid_idx = header.index("user_id") if "user_id" in header else 0
-        date_idx = header.index("pred_date") if "pred_date" in header else 1
-        actual_dir_idx = header.index("actual_direction") if "actual_direction" in header else 7
-        actual_ret_idx = header.index("actual_return_pct") if "actual_return_pct" in header else 8
-        correct_idx = header.index("is_correct") if "is_correct" in header else 9
-        comment_idx = header.index("review_comment") if "review_comment" in header else 10
-
-        for i, row in enumerate(rows[1:], start=2):
-            if (len(row) > uid_idx and str(row[uid_idx]).strip() == str(user_id).strip() and
-                    len(row) > date_idx and str(row[date_idx]).strip() == str(pred_date).strip()):
-                ws.update_cell(i, actual_dir_idx + 1, actual_direction)
-                ws.update_cell(i, actual_ret_idx + 1, str(round(actual_return_pct, 4)))
-                ws.update_cell(i, correct_idx + 1, is_correct)
-                ws.update_cell(i, comment_idx + 1, review_comment)
-                _invalidate_drg_predictions_cache()
-                return True, ""
-        return False, f"{pred_date} 예측 행을 찾을 수 없습니다."
-    except Exception as exc:
-        return False, str(exc)
-
-
-def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
-    """
-    예측 행에서 실제 결과를 계산.
-    반환: (actual_direction, actual_return_pct, is_correct)
-    """
-    try:
-        bench_etf = str(pred_row.get("benchmark_etf", "SPY") or "SPY").strip().upper()
-        pred_date_str = str(pred_row.get("pred_date", "")).strip()
-        pred_date = pd.to_datetime(pred_date_str, errors="coerce")
-        if pd.isna(pred_date):
-            return "", np.nan, ""
-
-        # 예측일 다음 거래일 종가 가져오기
-        end_date = pred_date + pd.Timedelta(days=5)
-        hist = yf.download(bench_etf, start=pred_date.strftime("%Y-%m-%d"),
-                           end=end_date.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
-        if hist is None or hist.empty or len(hist) < 2:
-            return "", np.nan, ""
-
-        pred_close = float(hist["Close"].iloc[0])
-        next_close = float(hist["Close"].iloc[1])
-        ret_pct = ((next_close / pred_close) - 1.0) * 100.0
-
-        # 방향 판정 (±0.3% 기준)
-        if ret_pct >= 0.3:
-            actual_dir = "상승"
-        elif ret_pct <= -0.3:
-            actual_dir = "하락"
-        else:
-            actual_dir = "중립"
-
-        # 예측 방향 추출
-        pred_dir = str(pred_row.get("direction", "")).strip()
-        pred_dir_norm = "상승" if "상승" in pred_dir else ("하락" if "하락" in pred_dir else "중립")
-
-        is_correct = "✅ 적중" if pred_dir_norm == actual_dir else "❌ 빗나감"
-        return actual_dir, ret_pct, is_correct
-    except Exception:
-        return "", np.nan, ""
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Trade_History 시트 — 매수/매도 기록 CRUD
-# ──────────────────────────────────────────────────────────────────────────────
-
-def open_trade_history_worksheet():
-    """Quant_DB / Trade_History 탭. 없으면 자동 생성."""
-    gc = get_gspread_client()
-    if gc is None:
-        return None, "Google 서비스 계정이 설정되지 않았습니다."
-    try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_TRADE_HISTORY_WORKSHEET_TITLE)
-        return ws, None
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
-            try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_TRADE_HISTORY_WORKSHEET_TITLE, rows=5000, cols=8)
-                ws.update([_TRADE_HISTORY_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
-                return ws, None
-            except Exception as exc2:
-                return None, f"Trade_History 시트를 만들 수 없습니다: {exc2}"
-        return None, f"Trade_History 시트를 열 수 없습니다: {exc}"
-
-
-@st.cache_data(ttl=60)
-def _trade_history_all_values_cached():
-    ws, err = open_trade_history_worksheet()
-    if err or ws is None:
-        return [], err
-    try:
-        return ws.get_all_values(), None
-    except Exception as exc:
-        return [], str(exc)
-
-
-def _invalidate_trade_history_cache():
-    _trade_history_all_values_cached.clear()
-
-
-def load_trade_history(user_id: str) -> pd.DataFrame:
-    """Trade_History 시트에서 해당 user_id 행만 로드."""
-    empty = pd.DataFrame(columns=_TRADE_HISTORY_SHEET_COLS)
-    if not user_id:
-        return empty
-    rows, err = _trade_history_all_values_cached()
-    if err or not rows:
-        return empty
-
-    # 헤더가 없거나 비어있으면 자동으로 표준 헤더로 간주
-    first_row_lower = [str(c).strip().lower() for c in rows[0]]
-    has_valid_header = any(c in _TRADE_HISTORY_SHEET_COLS for c in first_row_lower)
-
-    if not has_valid_header or len(rows) < 2:
-        # 헤더 없이 데이터만 있는 경우 — 컬럼 수로 맞추기
-        data_rows = rows if not has_valid_header else rows[1:]
-        if not data_rows:
-            return empty
-        try:
-            ncols = max(len(r) for r in data_rows)
-            cols = _TRADE_HISTORY_SHEET_COLS[:ncols]
-            df = pd.DataFrame([r[:ncols] for r in data_rows], columns=cols)
-        except Exception:
-            return empty
-    else:
-        try:
-            df = pd.DataFrame(rows[1:], columns=first_row_lower)
-        except Exception:
-            return empty
-        # 컬럼 정규화 (대소문자 불일치 보정)
-        col_map = {c: s for c in df.columns for s in _TRADE_HISTORY_SHEET_COLS if c == s.lower()}
-        df = df.rename(columns=col_map)
-
-    for c in _TRADE_HISTORY_SHEET_COLS:
-        if c not in df.columns:
-            df[c] = ""
-
-    df = df[df["user_id"].astype(str).str.strip() == str(user_id).strip()]
-    df = df[_TRADE_HISTORY_SHEET_COLS].copy().reset_index(drop=True)
-    df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    return df
-
-
-def append_trade_history_row(user_id: str, account: str, ticker: str, action: str,
-                              shares: float, price: float, date: str, memo: str = "") -> tuple[bool, str]:
-    """Trade_History 시트에 한 행 추가."""
-    ws, err = open_trade_history_worksheet()
-    if err or ws is None:
-        return False, err or "시트를 열 수 없습니다."
-    try:
-        row = [
-            str(user_id).strip(),
-            str(account).strip(),
-            str(ticker).strip().upper(),
-            str(action).strip().upper(),
-            str(round(float(shares), 6)),
-            str(round(float(price), 6)),
-            str(date).strip(),
-            str(memo).strip(),
-        ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        _invalidate_trade_history_cache()
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 실현 손익 계산 (FIFO + 평균단가)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def compute_realized_pnl(trade_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    BUY/SELL 기록에서 종목·계좌별 실현 손익 계산.
-    - FIFO: 먼저 매수한 lot부터 소진
-    - 평균단가: 전체 매수 평균가 기준
-    """
-    _cols = ["ticker", "account", "sell_date", "shares_sold", "sell_price",
-             "fifo_cost", "avg_cost", "fifo_pnl", "avg_pnl", "fifo_pnl_pct", "avg_pnl_pct", "memo"]
-    if trade_df is None or trade_df.empty:
-        return pd.DataFrame(columns=_cols)
-
-    results = []
-    for (ticker, account), grp in trade_df.groupby(["ticker", "account"]):
-        grp = grp.copy()
-        grp["date"] = pd.to_datetime(grp["date"], errors="coerce")
-        grp = grp.sort_values("date").reset_index(drop=True)
-        fifo_queue = []          # [[shares, price], ...]
-        avg_total_shares = 0.0
-        avg_total_cost = 0.0
-
-        for _, row in grp.iterrows():
-            act = str(row.get("action", "")).strip().upper()
-            sh = float(row.get("shares") or 0)
-            pr = float(row.get("price") or 0)
-            dt = row.get("date")
-            memo = str(row.get("memo") or "")
-
-            if act == "BUY" and sh > 0 and pr > 0:
-                fifo_queue.append([sh, pr])
-                avg_total_cost += sh * pr
-                avg_total_shares += sh
-
-            elif act == "SELL" and sh > 0 and pr > 0:
-                # FIFO 비용
-                fifo_cost_total = 0.0
-                remaining = sh
-                temp_q = [list(q) for q in fifo_queue]
-                for lot in temp_q:
-                    if remaining <= 0:
-                        break
-                    use = min(lot[0], remaining)
-                    fifo_cost_total += use * lot[1]
-                    lot[0] -= use
-                    remaining -= use
-                fifo_queue = [[q[0], q[1]] for q in temp_q if q[0] > 1e-9]
-
-                # 평균단가 비용
-                avg_per = (avg_total_cost / avg_total_shares) if avg_total_shares > 1e-9 else 0.0
-                avg_cost_total = sh * avg_per
-                avg_total_cost = max(0.0, avg_total_cost - avg_cost_total)
-                avg_total_shares = max(0.0, avg_total_shares - sh)
-                if avg_total_shares < 1e-9:
-                    avg_total_shares = avg_total_cost = 0.0
-
-                proceeds = sh * pr
-                fifo_pnl = proceeds - fifo_cost_total
-                avg_pnl = proceeds - avg_cost_total
-                fifo_cost_per = fifo_cost_total / sh if sh > 0 else 0
-                avg_cost_per = avg_cost_total / sh if sh > 0 else 0
-                fifo_pct = ((pr / fifo_cost_per) - 1.0) * 100.0 if fifo_cost_per > 0 else np.nan
-                avg_pct = ((pr / avg_cost_per) - 1.0) * 100.0 if avg_cost_per > 0 else np.nan
-
-                results.append({
-                    "ticker": ticker, "account": account,
-                    "sell_date": dt.strftime("%Y-%m-%d") if pd.notna(dt) else "",
-                    "shares_sold": sh, "sell_price": pr,
-                    "fifo_cost": fifo_cost_per, "avg_cost": avg_cost_per,
-                    "fifo_pnl": fifo_pnl, "avg_pnl": avg_pnl,
-                    "fifo_pnl_pct": fifo_pct, "avg_pnl_pct": avg_pct, "memo": memo,
-                })
-
-    if not results:
-        return pd.DataFrame(columns=_cols)
-    return pd.DataFrame(results).sort_values("sell_date", ascending=False).reset_index(drop=True)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 매도 타이밍 기술적 신호 계산
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _empty_sell_signal():
-    return {
-        "rsi": np.nan, "macd_signal": "N/A", "pct_from_52w_high": np.nan,
-        "above_ma200": None, "ma200": np.nan, "current_price": np.nan,
-        "signal_score": 0, "signal_label": "⚪ 데이터 없음",
-    }
-
-
-def compute_sell_signal_indicators(tickers: list) -> dict:
-    """
-    종목별 매도 타이밍 기술적 신호 계산.
-    반환: {ticker: {rsi, macd_signal, pct_from_52w_high, above_ma200, signal_score, signal_label, ...}}
-    """
-    if not tickers:
-        return {}
-    tickers_tuple = tuple(sorted(set(str(t).upper() for t in tickers)))
-    close_df = cached_portfolio_yf_close_1y(tickers_tuple)
-    results = {}
-    for ticker in tickers:
-        try:
-            if close_df is None or ticker not in close_df.columns:
-                results[ticker] = _empty_sell_signal()
-                continue
-            series = pd.to_numeric(close_df[ticker], errors="coerce").dropna()
-            if len(series) < 30:
-                results[ticker] = _empty_sell_signal()
-                continue
-
-            # RSI (14일)
-            delta = series.diff()
-            gain = delta.clip(lower=0).rolling(14).mean()
-            loss = (-delta.clip(upper=0)).rolling(14).mean()
-            rs = gain / loss.replace(0, np.nan)
-            rsi = float((100 - 100 / (1 + rs)).iloc[-1])
-
-            # MACD (12, 26, 9)
-            ema12 = series.ewm(span=12, adjust=False).mean()
-            ema26 = series.ewm(span=26, adjust=False).mean()
-            macd_line = ema12 - ema26
-            signal_line = macd_line.ewm(span=9, adjust=False).mean()
-            m_now, m_prev = float(macd_line.iloc[-1]), float(macd_line.iloc[-2]) if len(macd_line) > 1 else float(macd_line.iloc[-1])
-            s_now, s_prev = float(signal_line.iloc[-1]), float(signal_line.iloc[-2]) if len(signal_line) > 1 else float(signal_line.iloc[-1])
-            if m_prev >= s_prev and m_now < s_now:
-                macd_signal = "DEAD_CROSS"
-            elif m_now < s_now:
-                macd_signal = "BELOW_SIGNAL"
-            elif m_prev <= s_prev and m_now > s_now:
-                macd_signal = "GOLDEN_CROSS"
-            else:
-                macd_signal = "ABOVE_SIGNAL"
-
-            # 52주 고점 대비
-            high_52w = float(series.rolling(252, min_periods=1).max().iloc[-1])
-            current = float(series.iloc[-1])
-            pct_from_high = ((current / high_52w) - 1.0) * 100.0 if high_52w > 0 else np.nan
-
-            # 200일선
-            ma200 = float(series.rolling(200, min_periods=200).mean().iloc[-1]) if len(series) >= 200 else np.nan
-            above_ma200 = (current > ma200) if pd.notna(ma200) else None
-
-            # 위험 점수 (높을수록 매도 위험)
-            score = 0
-            if pd.notna(rsi):
-                if rsi > 75: score += 3
-                elif rsi > 70: score += 2
-                elif rsi > 65: score += 1
-            if macd_signal == "DEAD_CROSS": score += 3
-            elif macd_signal == "BELOW_SIGNAL": score += 1
-            if pd.notna(pct_from_high):
-                if pct_from_high > -3: score += 2
-                elif pct_from_high > -7: score += 1
-            if above_ma200 is False: score += 3
-
-            label = "🔴 매도 검토" if score >= 6 else ("🟡 주의" if score >= 3 else "🟢 보유")
-            results[ticker] = {
-                "rsi": rsi, "macd_signal": macd_signal,
-                "pct_from_52w_high": pct_from_high, "above_ma200": above_ma200,
-                "ma200": ma200, "current_price": current,
-                "signal_score": score, "signal_label": label,
-            }
-        except Exception:
-            results[ticker] = _empty_sell_signal()
-    return results
 
 
 def build_portfolio_sell_radar_df(portfolio_df):
@@ -7584,7 +7354,7 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
         summary_model = _GenAIModel(
             "gemini-2.5-flash",
             generation_config={
-                "temperature": 0.3,  # 주간 요약 — 매주 다른 인사이트를 위해 약간의 다양성 허용
+                "temperature": 0.0,
                 "top_p": 1,
                 "top_k": 1,
                 "max_output_tokens": 4096,
@@ -8093,123 +7863,67 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.markdown("### 🤖 AI 내일 시장 예측")
-        st.caption("선행 신호 5가지 + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 자기 전 또는 장 열리기 전 실행 권장.")
+        st.caption("선행 신호 5가지 + 최신 뉴스를 종합해 Gemini AI가 내일 시장 방향을 분석합니다. 장 전/후 실행 권장.")
 
         if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
-            with st.spinner("최신 데이터 수집 중..."):
-                # 1) DRG 캐시 강제 갱신 → 신호/뉴스 최신화
-                compute_daily_risk_gauge.clear()
-                fresh_drg = compute_daily_risk_gauge(sector_filter=sector_choice)
-                fresh_sig = fresh_drg.get("signals", sig)
-                fresh_warnings = fresh_drg.get("warnings", [])
-
-                # 2) RSS 멀티소스 뉴스 수집 (Yahoo/CNBC/Google/MarketWatch, 최대 30개)
-                try:
-                    rss_news_list, _, _ = fetch_global_market_news()
-                    rss_news_text = "\n".join([
-                        f"- [{item.get('source','?')}] {item.get('title','')}"
-                        for item in rss_news_list[:15]
-                    ]) if rss_news_list else "RSS 뉴스 없음"
-                    rss_news_count = len(rss_news_list[:15])
-                except Exception:
-                    rss_news_text = "\n".join([
-                        f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
-                        for n in fresh_drg.get("news_items", [])[:10]
-                    ]) or "최신 뉴스 없음"
-                    rss_news_count = 0
-
-                # 3) 거시경제 지표
-                try:
-                    _macro_ctx = _build_macro_context_for_summary()
-                    macro_summary = "\n".join([
-                        f"- {k}: {v.get('value','N/A')} ({v.get('status','N/A')})"
-                        for k, v in list(_macro_ctx.items())[:8]
-                    ]) if _macro_ctx else "데이터 없음"
-                except Exception:
-                    macro_summary = "데이터 없음"
-
+            news_text = "\n".join([
+                f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
+                for n in news_items[:10]
+            ]) if news_items else "최신 뉴스 없음"
             signal_summary = "\n".join([
-                f"- {label}: {'정상' if fresh_sig.get(key, {}).get('ok', True) else '경고'} | {fresh_sig.get(key, {}).get('value', 'N/A')}"
+                f"- {label}: {'정상' if sig.get(key, {}).get('ok', True) else '경고'} | {sig.get(key, {}).get('value', 'N/A')}"
                 for key, label, _ in signal_defs
             ])
-            warning_text = "\n".join(fresh_warnings) if fresh_warnings else "없음"
+            warning_text = "\n".join(warnings_drg) if warnings_drg else "없음"
             now_kst = datetime.now(_KST_TZ)
             market_session = "장 전" if now_kst.hour < 9 else ("장 중" if now_kst.hour < 16 else "장 후")
-
             drg_prompt = (
-                "당신은 월가 수석 퀀트 전략가입니다. "
-                "아래 실시간 데이터를 바탕으로 내일 미국 주식시장을 예측하세요.\n\n"
-                f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
-                f"[분석 섹터] {sector_choice}\n\n"
-                f"[선행 신호 5가지]\n{signal_summary}\n\n"
-                f"[감지된 경고]\n{warning_text}\n\n"
-                f"[거시경제 지표]\n{macro_summary}\n\n"
-                f"[오늘의 주요 뉴스 ({rss_news_count}개 소스)]\n{rss_news_text}\n\n"
-                "---\n"
-                "아래 4개 항목을 각각 작성하세요. "
-                "반드시 위 데이터의 실제 수치(VIX 값, 신호 상태, 뉴스 종목명/이슈)를 직접 인용해 근거를 만드세요. "
-                "일반론이나 '시장을 주시해야 한다'류의 빈말은 금지입니다.\n\n"
-                "## 내일 시장 방향 판단: [상승 우세 / 중립 / 하락 우세]\n\n"
-                "**📊 핵심 근거** (위 수치를 직접 인용해 2~3문장):\n\n"
-                "**📰 뉴스 영향** (오늘 뉴스 중 내일 시장에 영향줄 종목/이슈 구체적으로 언급, 2문장):\n\n"
-                "**⚠️ 내일 주목할 리스크** (구체적 수치/종목/이벤트 기반, 2가지):\n"
-                "1. \n"
-                "2. \n\n"
-                "**🎯 실전 대응** (지금 상황에 맞는 구체적 행동, 보유/매수/현금 각 1문장):\n"
-                "- 보유 중: \n"
-                "- 매수 타이밍 보는 중: \n"
-                "- 현금 대기 중: \n\n"
-                "*본 분석은 AI 참고용이며 투자 권유가 아닙니다.*"
+                "당신은 월가 수석 퀀트 전략가입니다.\n"
+                f"현재 시각: {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
+                f"분석 섹터: {sector_choice}\n\n"
+                "[선행 지표 5가지]\n" + signal_summary + "\n\n"
+                "[감지된 경고]\n" + warning_text + "\n\n"
+                "[최신 뉴스]\n" + news_text + "\n\n"
+                "중요: 각 항목은 반드시 3문장 이내로 간결하게 작성. 불필요한 서론/수식어 금지.\n\n"
+                "반드시 아래 형식으로 한국어 작성:\n\n"
+                "## 내일 시장 방향: [상승 우세 / 중립 / 하락 우세]\n\n"
+                "**기술적 근거:** (선행 지표 수치 기반, 3문장 이내)\n\n"
+                "**뉴스 센티먼트:** (뉴스 영향, 2문장 이내)\n\n"
+                "**주요 리스크:** (번호 목록, 각 1문장)\n"
+                "1. \n2. \n\n"
+                "**대응 전략:** (각 1~2문장)\n"
+                "- 보유 중이라면:\n"
+                "- 매수 고려 중이라면:\n"
+                "- 현금 비중이라면:\n\n"
+                "*본 분석은 참고용이며 투자 권유가 아닙니다.*"
             )
-            with st.spinner("Gemini AI 분석 중... (약 15~20초)"):
+            with st.spinner("Gemini AI 분석 중... (약 15초)"):
                 _drg_model = _GenAIModel(
                     "gemini-2.5-flash",
-                    generation_config={"temperature": 0.7, "max_output_tokens": 4096}
+                    generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                 )
                 _drg_response = _drg_model.generate_content(drg_prompt)
                 _drg_text = _gemini_response_text_utf8_safe(_drg_response)
             if _drg_text:
-                # 방향 추출
+                # 방향 추출 후 DRG_Predictions에 저장
                 _pred_dir = "중립"
-                if "상승 우세" in _drg_text:
-                    _pred_dir = "상승 우세"
-                elif "하락 우세" in _drg_text:
-                    _pred_dir = "하락 우세"
-
-                # 벤치마크 ETF 결정
-                _bench_etf = _SECTOR_BENCHMARK_ETF.get(sector_choice, "SPY")
-
-                # 현재 벤치마크 ETF 종가 가져오기
+                if "상승 우세" in _drg_text: _pred_dir = "상승 우세"
+                elif "하락 우세" in _drg_text: _pred_dir = "하락 우세"
+                _bench = _SECTOR_BENCHMARK_ETF.get(sector_choice, "SPY")
                 try:
-                    _spy_hist = yf.download(_bench_etf, period="2d", progress=False, auto_adjust=True)
-                    _spy_close = float(_spy_hist["Close"].iloc[-1]) if _spy_hist is not None and not _spy_hist.empty else np.nan
+                    _sh = yf.download(_bench, period="2d", progress=False, auto_adjust=True)
+                    _spy_c = float(_sh["Close"].iloc[-1]) if _sh is not None and not _sh.empty else np.nan
                 except Exception:
-                    _spy_close = np.nan
-
-                # DRG_Predictions 시트에 저장
-                _pred_date_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
-                _puid_drg = str(st.session_state.get("user_id") or "").strip()
-                _save_ok, _save_err = save_drg_prediction(
-                    _puid_drg, _pred_date_str, _pred_dir,
-                    sector_choice, _bench_etf, _spy_close, _drg_text
-                )
-                if not _save_ok:
-                    st.warning(f"⚠️ 예측 기록 저장 실패: {_save_err}")
-                else:
-                    _invalidate_drg_predictions_cache()
-                    st.session_state["_drg_pred_needs_refresh"] = True
-
+                    _spy_c = np.nan
+                _puid_pred = str(st.session_state.get("user_id") or "").strip()
+                save_drg_prediction(_puid_pred, now_kst.strftime("%Y-%m-%d"),
+                                    _pred_dir, sector_choice, _bench, _spy_c, _drg_text)
                 st.session_state["_drg_ai_result"] = _drg_text
-                st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
-                st.session_state["_drg_ai_news_count"] = rss_news_count
-                st.session_state["_drg_pred_dir"] = _pred_dir
-                st.session_state["_drg_bench_etf"] = _bench_etf
+                st.session_state["_drg_ai_time"] = now_kst.strftime("%m/%d %H:%M")
                 st.rerun()
 
         if st.session_state.get("_drg_ai_result"):
-            _news_cnt = st.session_state.get("_drg_ai_news_count", 0)
-            _src_str = f"RSS {_news_cnt}개 뉴스 반영" if _news_cnt > 0 else "yfinance 뉴스 반영"
-            st.info(f"🕐 분석 시각: {st.session_state.get('_drg_ai_time', '')} KST · {_src_str}")
+            st.info(f"🕐 분석 시각: {st.session_state.get('_drg_ai_time', '')} KST")
             _txt = st.session_state["_drg_ai_result"]
             if "하락 우세" in _txt:
                 st.error(_txt)
@@ -8217,6 +7931,75 @@ if st.session_state.get("logged_in"):
                 st.success(_txt)
             else:
                 st.warning(_txt)
+
+        # ── AI 예측 히스토리 ───────────────────────────────────────────────
+        st.divider()
+        st.markdown("## 📊 AI 예측 히스토리 & 적중률")
+        if st.button("🔄 히스토리 새로고침", key="drg_hist_refresh"):
+            _invalidate_drg_predictions_cache()
+            st.rerun()
+        _ph_uid = str(st.session_state.get("user_id") or "").strip()
+        _ph_df = load_drg_predictions(_ph_uid)
+        if _ph_df.empty:
+            st.info("아직 예측 기록이 없습니다. AI 내일 시장 예측을 실행하면 자동으로 기록됩니다.")
+        else:
+            _vf = _ph_df[_ph_df["is_correct"].astype(str).str.strip() != ""]
+            _tv = len(_vf); _cv = (_vf["is_correct"]=="✅ 적중").sum() if _tv else 0
+            _hr = (_cv/_tv*100) if _tv else np.nan
+            _hc1,_hc2,_hc3,_hc4 = st.columns(4)
+            _hc1.metric("총 예측", len(_ph_df))
+            _hc2.metric("검증 완료", _tv)
+            _hc3.metric("적중", _cv)
+            _hc4.metric("적중률", f"{_hr:.0f}%" if pd.notna(_hr) else "N/A")
+            st.divider()
+            # 미검증 행
+            _uv = _ph_df[_ph_df["is_correct"].astype(str).str.strip() == ""].copy()
+            if not _uv.empty:
+                st.markdown("#### 🔍 결과 검증 대기")
+                for _, _ur in _uv.iterrows():
+                    _uc1,_uc2,_uc3 = st.columns([2,2,1])
+                    _uc1.write(f"📅 **{_ur.get('pred_date','')}** | {_ur.get('direction','')}")
+                    _uc2.write(f"벤치마크: {_ur.get('benchmark_etf','SPY')}")
+                    with _uc3:
+                        if st.button("결과 검증", key=f"vrfy_{_ur.get('pred_date','')}"):
+                            with st.spinner("실제 결과 조회 중..."):
+                                _ad, _ar, _ic = verify_drg_prediction(_ur)
+                            if _ad:
+                                with st.spinner("AI 리뷰 작성 중..."):
+                                    try:
+                                        _rp = (f"예측:{_ur.get('direction','')} / 실제:{_ad}({_ar:+.2f}%) / {_ic}\n"
+                                               f"예측 전문(요약):{str(_ur.get('full_text',''))[:500]}\n"
+                                               "3문장 이내로 한국어 리뷰: 맞았다면 근거, 틀렸다면 이유와 교훈.")
+                                        _rm = _GenAIModel("gemini-2.5-flash", generation_config={"temperature":0.3,"max_output_tokens":512})
+                                        _rv = _gemini_response_text_utf8_safe(_rm.generate_content(_rp)) or ""
+                                    except Exception: _rv = ""
+                                ok_u, err_u = update_drg_prediction_result(_ph_uid, str(_ur.get("pred_date","")), _ad, _ar, _ic, _rv)
+                                if ok_u:
+                                    st.success(f"{_ic} | 실제: {_ad} ({_ar:+.2f}%)")
+                                    st.rerun()
+                                else:
+                                    st.error(f"저장 실패: {err_u}")
+                            else:
+                                st.warning("다음 거래일 데이터가 아직 없습니다.")
+                st.divider()
+            # 전체 테이블
+            _ph_show = _ph_df.sort_values("pred_date", ascending=False).reset_index(drop=True)
+            def _cd(v):
+                if "상승" in str(v): return "color:#16a34a;font-weight:600;"
+                if "하락" in str(v): return "color:#dc2626;font-weight:600;"
+                return ""
+            def _cc(v):
+                if "✅" in str(v): return "color:#16a34a;font-weight:700;"
+                if "❌" in str(v): return "color:#dc2626;font-weight:700;"
+                return "color:#94a3b8;"
+            _ph_show["actual_return_pct"] = pd.to_numeric(_ph_show["actual_return_pct"], errors="coerce")
+            st.dataframe(
+                _ph_show[["pred_date","direction","sector_filter","benchmark_etf","actual_direction","actual_return_pct","is_correct","review_comment"]]
+                .rename(columns={"pred_date":"예측일","direction":"예측방향","sector_filter":"섹터","benchmark_etf":"ETF","actual_direction":"실제방향","actual_return_pct":"실제수익률(%)","is_correct":"적중여부","review_comment":"AI리뷰"})
+                .style.format({"실제수익률(%)" :"{:+.2f}%"}, na_rep="대기중")
+                .map(_cd, subset=["예측방향","실제방향"])
+                .map(_cc, subset=["적중여부"]),
+                use_container_width=True, hide_index=True)
 
     elif main_nav == _MAIN_NAV_OPTIONS[12]:
         st.title("📖 Quant Terminal 사용 가이드")
@@ -8374,175 +8157,6 @@ if st.session_state.get("logged_in"):
         st.divider()
         st.warning("⚠️ 면책 조항: 이 앱은 투자 참고 도구이며 투자 권유가 아닙니다. 모든 투자 결정과 결과는 투자자 본인의 책임입니다.")
 
-        # ═══════════════════════════════════════════════════════════════════
-        # AI 예측 히스토리 & 적중률
-        # ═══════════════════════════════════════════════════════════════════
-        st.divider()
-        st.markdown("## 📊 AI 예측 히스토리 & 적중률")
-        st.caption("과거 AI 예측과 실제 시장 결과를 비교합니다. 예측 다음날 이후 '결과 검증' 버튼으로 실제 결과를 확인하세요.")
-
-        _puid_hist = str(st.session_state.get("user_id") or "").strip()
-
-        # 히스토리 동기화 버튼
-        if st.button("🔄 히스토리 새로고침", key="drg_hist_sync_btn"):
-            _invalidate_drg_predictions_cache()
-            st.rerun()
-
-        pred_hist_df = load_drg_predictions_fresh(_puid_hist)
-
-        # 임시 진단 (문제 해결 후 제거)
-        if pred_hist_df.empty:
-            try:
-                _ws_d, _err_d = open_drg_predictions_worksheet()
-                if _err_d:
-                    st.warning(f"시트 연결 오류: {_err_d}")
-                else:
-                    _rows_d = _ws_d.get_all_values()
-                    st.warning(f"시트 총 {len(_rows_d)}행 | 헤더: {_rows_d[0] if _rows_d else '없음'} | 첫데이터: {_rows_d[1] if len(_rows_d)>1 else '없음'} | 로그인ID: `{_puid_hist}`")
-            except Exception as _de:
-                st.warning(f"진단 오류: {_de}")
-
-        if pred_hist_df.empty:
-            st.info("아직 AI 예측 기록이 없습니다. 위 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
-        else:
-            # 적중률 요약
-            verified = pred_hist_df[pred_hist_df["is_correct"].astype(str).str.strip() != ""]
-            total_v = len(verified)
-            correct_v = (verified["is_correct"] == "✅ 적중").sum()
-            hit_rate = (correct_v / total_v * 100) if total_v > 0 else np.nan
-
-            hm1, hm2, hm3, hm4 = st.columns(4)
-            with hm1:
-                st.metric("총 예측 횟수", len(pred_hist_df))
-            with hm2:
-                st.metric("검증 완료", total_v)
-            with hm3:
-                st.metric("적중 횟수", correct_v)
-            with hm4:
-                st.metric("적중률", f"{hit_rate:.0f}%" if pd.notna(hit_rate) else "N/A")
-
-            st.divider()
-
-            # 미검증 예측 — 결과 검증 버튼
-            unverified = pred_hist_df[pred_hist_df["is_correct"].astype(str).str.strip() == ""].copy()
-            if not unverified.empty:
-                st.markdown("#### 🔍 결과 검증 대기 중")
-                for _, urow in unverified.iterrows():
-                    _pd_str = str(urow.get("pred_date", ""))
-                    _bench = str(urow.get("benchmark_etf", "SPY"))
-                    _dir = str(urow.get("direction", ""))
-                    _sec = str(urow.get("sector_filter", "전체"))
-                    ucol1, ucol2, ucol3 = st.columns([2, 2, 1])
-                    with ucol1:
-                        st.write(f"📅 **{_pd_str}** | 예측: {_dir}")
-                    with ucol2:
-                        st.write(f"📌 섹터: {_sec} | 벤치마크: {_bench}")
-                    with ucol3:
-                        if st.button("결과 검증", key=f"verify_drg_{_pd_str}"):
-                            with st.spinner(f"{_bench} 실제 결과 조회 중..."):
-                                _actual_dir, _actual_ret, _is_correct = verify_drg_prediction(urow)
-                            if _actual_dir:
-                                # AI 리뷰 생성
-                                with st.spinner("AI가 예측 리뷰 작성 중..."):
-                                    try:
-                                        _review_prompt = (
-                                            f"당신은 퀀트 투자 분석가입니다.\n"
-                                            f"[예측 날짜] {_pd_str}\n"
-                                            f"[AI 예측 방향] {_dir}\n"
-                                            f"[실제 결과] {_actual_dir} ({_actual_ret:+.2f}%)\n"
-                                            f"[적중 여부] {_is_correct}\n\n"
-                                            f"[당시 AI 예측 전문]\n{str(urow.get('full_text',''))[:1000]}\n\n"
-                                            "위 정보를 바탕으로 3~4문장으로 간결하게 리뷰하세요:\n"
-                                            "- 예측이 맞았다면: 어떤 근거가 정확했는지\n"
-                                            "- 틀렸다면: 무엇을 놓쳤는지, 왜 틀렸는지\n"
-                                            "- 다음 예측 시 참고할 인사이트\n"
-                                            "한국어로 작성하세요."
-                                        )
-                                        _rev_model = _GenAIModel("gemini-2.5-flash",
-                                            generation_config={"temperature": 0.3, "max_output_tokens": 1024})
-                                        _rev_resp = _rev_model.generate_content(_review_prompt)
-                                        _review_txt = _gemini_response_text_utf8_safe(_rev_resp) or ""
-                                    except Exception:
-                                        _review_txt = "AI 리뷰 생성 실패"
-
-                                ok_upd, err_upd = update_drg_prediction_result(
-                                    _puid_hist, _pd_str, _actual_dir,
-                                    _actual_ret, _is_correct, _review_txt
-                                )
-                                if ok_upd:
-                                    st.success(f"{_is_correct} | {_bench} 실제 수익률: {_actual_ret:+.2f}%")
-                                    st.rerun()
-                                else:
-                                    st.error(f"저장 실패: {err_upd}")
-                            else:
-                                st.warning("아직 다음 거래일 데이터가 없습니다. 예측 다음날 장 마감 후 다시 시도해주세요.")
-                st.divider()
-
-            # 전체 히스토리 테이블
-            st.markdown("#### 📋 전체 예측 기록")
-
-            # 벤치마크 옵션 선택
-            bench_opts = ["SPY (기본)"] + [f"{v} ({k})" for k, v in _SECTOR_BENCHMARK_ETF.items() if v != "SPY"]
-            _hist_bench = st.selectbox("검증 기준 ETF 필터", options=["전체 보기"] + bench_opts, key="drg_hist_bench_filter")
-
-            show_hist = pred_hist_df.copy()
-            if _hist_bench != "전체 보기":
-                _filter_etf = _hist_bench.split(" ")[0]
-                show_hist = show_hist[show_hist["benchmark_etf"] == _filter_etf]
-
-            show_hist = show_hist.sort_values("pred_date", ascending=False).reset_index(drop=True)
-            display_hist = show_hist.rename(columns={
-                "pred_date": "예측일", "direction": "예측방향",
-                "sector_filter": "섹터", "benchmark_etf": "벤치마크ETF",
-                "spy_close_at_pred": "예측시점가격",
-                "actual_direction": "실제방향", "actual_return_pct": "실제수익률(%)",
-                "is_correct": "적중여부", "review_comment": "AI리뷰",
-            })[["예측일", "예측방향", "섹터", "벤치마크ETF", "예측시점가격",
-                "실제방향", "실제수익률(%)", "적중여부", "AI리뷰"]]
-
-            display_hist["실제수익률(%)"] = pd.to_numeric(display_hist["실제수익률(%)"], errors="coerce")
-
-            def _c_correct(v):
-                if "✅" in str(v): return "color:#16a34a;font-weight:700;"
-                if "❌" in str(v): return "color:#dc2626;font-weight:700;"
-                return "color:#94a3b8;"
-
-            def _c_dir(v):
-                if "상승" in str(v): return "color:#16a34a;font-weight:600;"
-                if "하락" in str(v): return "color:#dc2626;font-weight:600;"
-                return ""
-
-            st.dataframe(
-                display_hist.style
-                .format({"실제수익률(%)": "{:+.2f}%", "예측시점가격": "${:,.2f}"}, na_rep="대기중")
-                .map(_c_correct, subset=["적중여부"])
-                .map(_c_dir, subset=["예측방향", "실제방향"])
-                .background_gradient(cmap="RdYlGn", subset=["실제수익률(%)"], axis=0),
-                use_container_width=True, hide_index=True,
-            )
-
-            # 예측 텍스트 전문 보기
-            if not show_hist.empty:
-                st.markdown("#### 📄 예측 전문 보기")
-                _sel_date = st.selectbox(
-                    "날짜 선택",
-                    options=show_hist["pred_date"].tolist(),
-                    key="drg_hist_fulltext_sel"
-                )
-                _sel_row = show_hist[show_hist["pred_date"] == _sel_date]
-                if not _sel_row.empty:
-                    _row = _sel_row.iloc[0]
-                    _corr = str(_row.get("is_correct", ""))
-                    if "✅" in _corr:
-                        st.success(str(_row.get("full_text", "")))
-                    elif "❌" in _corr:
-                        st.error(str(_row.get("full_text", "")))
-                    else:
-                        st.info(str(_row.get("full_text", "")))
-                    if str(_row.get("review_comment", "")).strip():
-                        st.markdown("**🤖 AI 리뷰:**")
-                        st.markdown(str(_row.get("review_comment", "")))
-
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
         st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 미국 거시경제 대시보드")
@@ -8550,7 +8164,7 @@ if st.session_state.get("logged_in"):
 
         try:
             with st.spinner("매크로 지표를 불러오는 중..."):
-                macro_pack = get_macro_dashboard_with_validation()
+                macro_pack = cached_analyze_us_macro_dashboard()
 
             if macro_pack.get("na_total", 0) >= 4:
                 _notify_yfinance_fetch_failed()
@@ -9794,37 +9408,35 @@ if st.session_state.get("logged_in"):
                 )
             else:
                 etf_universe_sorted_tuple = tuple(sorted(set(etf_radar_universe)))
+                ret_cols = ["1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
                 with st.spinner("Hidden Alpha Radar: 유니버스 수익률·순위 계산 중 (포트폴리오와 동일 캐시)..."):
-                    _ha_result = cached_etf_universe_rankings_full(etf_universe_sorted_tuple)
-                if _ha_result is None or _ha_result.empty:
-                    st.session_state["_hidden_alpha_df"] = None
-                    st.warning("유니버스 랭킹을 계산하지 못했습니다. `etf_universe.txt` 티커·네트워크를 확인해주세요.")
+                    radar_df = cached_etf_universe_rankings_full(etf_universe_sorted_tuple)
+    
+                if radar_df is None or radar_df.empty:
+                    st.warning(
+                        "유니버스 랭킹을 계산하지 못했습니다. `etf_universe.txt` 티커·네트워크를 확인해주세요."
+                    )
                 else:
-                    st.session_state["_hidden_alpha_df"] = _ha_result
-
-        # 결과를 session_state에서 표시 (rerun 후에도 유지)
-        _ha_df = st.session_state.get("_hidden_alpha_df")
-        if _ha_df is not None and not _ha_df.empty:
-            ret_cols = ["1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
-            tmp_show = _ha_df.copy()
-            tmp_show["티커"] = tmp_show.apply(
-                lambda r: f"{r['Ticker']} 🔥" if bool(r["주도주"]) else r["Ticker"], axis=1
-            )
-            display_cols = ["순위", "티커", "1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
-            display_df = tmp_show[display_cols].copy()
-            fmt = {c: "{:.2f}%" for c in ret_cols}
-            styled_radar = display_df.style.format(fmt, na_rep="N/A").background_gradient(
-                cmap="RdYlGn", subset=ret_cols, axis=None
-            )
-            st.dataframe(styled_radar, use_container_width=True, hide_index=True)
-            st.caption(
-                "과거 구간 데이터가 부족한 ETF는 해당 칸이 N/A일 수 있으나, 유니버스 순위는 포트폴리오 화면과 동일한 1개월 기준입니다."
-            )
-            st.markdown(
-                "💡 [Ryan's Alpha Strategy] 1주와 1개월 수익률이 모두 초록색인 상위 3~5개 ETF에 분할 투자하는 방식은 "
-                f"'추세 추종(Momentum)'의 정석입니다. 단, 매수 전 「{_MAIN_NAV_OPTIONS[4]}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
-            )
-
+                    tmp_show = radar_df.copy()
+                    tmp_show["티커"] = tmp_show.apply(
+                        lambda r: f"{r['Ticker']} 🔥" if bool(r["주도주"]) else r["Ticker"], axis=1
+                    )
+                    display_cols = ["순위", "티커", "1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
+                    display_df = tmp_show[display_cols].copy()
+    
+                    fmt = {c: "{:.2f}%" for c in ret_cols}
+                    styled_radar = display_df.style.format(fmt, na_rep="N/A").background_gradient(
+                        cmap="RdYlGn", subset=ret_cols, axis=None
+                    )
+                    st.dataframe(styled_radar, use_container_width=True, hide_index=True)
+                    st.caption(
+                        "과거 구간 데이터가 부족한 ETF는 해당 칸이 N/A일 수 있으나, 유니버스 순위는 포트폴리오 화면과 동일한 1개월 기준입니다."
+                    )
+                    st.markdown(
+                        "💡 [Ryan's Alpha Strategy] 1주와 1개월 수익률이 모두 초록색인 상위 3~5개 ETF에 분할 투자하는 방식은 "
+                        f"'추세 추종(Momentum)'의 정석입니다. 단, 매수 전 「{_MAIN_NAV_OPTIONS[4]}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
+                    )
+    
         st.info(
             "💡 이 레이더에 잡힌 생소한 티커를 왼쪽 사이드바에 입력하여 해당 테마를 이끄는 개별 주도주를 찾아보세요."
         )
@@ -9912,49 +9524,44 @@ if st.session_state.get("logged_in"):
                 st.warning("스캔 대상 티커가 없어요. 필터를 변경하거나 포트폴리오/Watchlist에 종목을 추가해주세요.")
             else:
                 with st.spinner(f"RS Score 주간 변화율 계산 중... ({len(scan_target)}개 티커)"):
-                    _es_result = compute_rs_score_weekly_change(scan_target)
-                if _es_result.empty:
-                    st.session_state["_early_signal_df"] = None
-                    st.warning("RS 변화율 데이터를 가져오지 못했습니다.")
-                else:
-                    st.session_state["_early_signal_df"] = _es_result
+                    rs_change_df = compute_rs_score_weekly_change(scan_target)
 
-        # 결과를 session_state에서 표시 (rerun 후에도 유지)
-        _es_df = st.session_state.get("_early_signal_df")
-        if _es_df is not None and not _es_df.empty:
-            rs_change_df = _es_df
-            early_df = rs_change_df[rs_change_df["RS_Signal"] == "🌱 Early Signal"]
-            surge_df = rs_change_df[rs_change_df["RS_Signal"] == "🚀 급부상"]
-            weak_df = rs_change_df[rs_change_df["RS_Signal"] == "⚠️ 모멘텀 약화"]
+            if rs_change_df.empty:
+                st.warning("RS 변화율 데이터를 가져오지 못했습니다.")
+            else:
+                # 신호별 분류
+                early_df = rs_change_df[rs_change_df["RS_Signal"] == "🌱 Early Signal"]
+                surge_df = rs_change_df[rs_change_df["RS_Signal"] == "🚀 급부상"]
+                weak_df = rs_change_df[rs_change_df["RS_Signal"] == "⚠️ 모멘텀 약화"]
 
-            if not early_df.empty:
-                st.success(f"🌱 **Early Signal {len(early_df)}개** — 아직 안 올랐지만 강해지기 시작한 섹터!")
-                for _, row in early_df.iterrows():
-                    st.markdown(
-                        f"**{row['Ticker']}** — RS {row['RS_Now']:+.1f}%p "
-                        f"(1주 변화: {row['RS_Change']:+.1f}%p) "
-                        f"→ Watchlist 등록 고려"
-                    )
+                if not early_df.empty:
+                    st.success(f"🌱 **Early Signal {len(early_df)}개** — 아직 안 올랐지만 강해지기 시작한 섹터!")
+                    for _, row in early_df.iterrows():
+                        st.markdown(
+                            f"**{row['Ticker']}** — RS {row['RS_Now']:+.1f}%p "
+                            f"(1주 변화: {row['RS_Change']:+.1f}%p) "
+                            f"→ Watchlist 등록 고려"
+                        )
 
-            es_col1, es_col2 = st.columns(2)
-            with es_col1:
-                if not surge_df.empty:
-                    st.info(f"🚀 **급부상 {len(surge_df)}개** — 강하면서 더 강해지는 중")
-                    for _, row in surge_df.iterrows():
-                        st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 +{row['RS_Change']:.1f}%p")
-            with es_col2:
-                if not weak_df.empty:
-                    st.warning(f"⚠️ **모멘텀 약화 {len(weak_df)}개** — 주의 필요")
-                    for _, row in weak_df.iterrows():
-                        st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 {row['RS_Change']:.1f}%p")
+                es_col1, es_col2 = st.columns(2)
+                with es_col1:
+                    if not surge_df.empty:
+                        st.info(f"🚀 **급부상 {len(surge_df)}개** — 강하면서 더 강해지는 중")
+                        for _, row in surge_df.iterrows():
+                            st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 +{row['RS_Change']:.1f}%p")
+                with es_col2:
+                    if not weak_df.empty:
+                        st.warning(f"⚠️ **모멘텀 약화 {len(weak_df)}개** — 주의 필요")
+                        for _, row in weak_df.iterrows():
+                            st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 {row['RS_Change']:.1f}%p")
 
-            with st.expander("📋 전체 RS 변화율 테이블", expanded=False):
-                def _style_rs_change(val):
-                    v = pd.to_numeric(val, errors="coerce")
-                    if pd.isna(v): return ""
-                    return "color:#16a34a;font-weight:600" if v > 2 else "color:#dc2626;font-weight:600" if v < -2 else ""
-                styled_rs = rs_change_df.style.map(_style_rs_change, subset=["RS_Change"])
-                st.dataframe(styled_rs, use_container_width=True, hide_index=True)
+                with st.expander("📋 전체 RS 변화율 테이블", expanded=False):
+                    def _style_rs_change(val):
+                        v = pd.to_numeric(val, errors="coerce")
+                        if pd.isna(v): return ""
+                        return "color:#16a34a;font-weight:600" if v > 2 else "color:#dc2626;font-weight:600" if v < -2 else ""
+                    styled_rs = rs_change_df.style.map(_style_rs_change, subset=["RS_Change"])
+                    st.dataframe(styled_rs, use_container_width=True, hide_index=True)
 
         # ── 기능 3: 섹터 꺾임 감지 ───────────────────────────────────────
         st.divider()
@@ -10706,7 +10313,7 @@ if st.session_state.get("logged_in"):
                 with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
                     _diag_model = _GenAIModel(
                         "gemini-2.5-flash",
-                        generation_config={"temperature": 0.3, "max_output_tokens": 4096}  # 종목 진단 — 볼 때마다 다른 인사이트
+                        generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
                     _diag_text = _gemini_response_text_utf8_safe(_diag_response)
@@ -10733,7 +10340,6 @@ if st.session_state.get("logged_in"):
                         cached_etf_universe_rankings_full.clear,
                         cached_yfinance_quote_type.clear,
                         _portfolio_sheet_all_values_cached.clear,
-                        _trade_history_all_values_cached.clear,
                     ],
                     rerun_after=True,
                 )
@@ -10879,14 +10485,10 @@ if st.session_state.get("logged_in"):
                                         updated_df.loc[idx, "Quantity"] = new_qty_total
                                         updated_df.loc[idx, "Purchase_Price"] = new_avg
                                         save_portfolio(updated_df)
-                                        # Trade_History에 BUY 기록
-                                        _buy_date = _narrative_now_kst_string()[:10]
-                                        append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "추가 매수")
                                         st.success(
                                             f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
                                             f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
                                         )
-                                        st.session_state["_portfolio_needs_refresh"] = True
                                         st.rerun()
                                 else:
                                     updated_df = pd.concat(
@@ -10906,9 +10508,6 @@ if st.session_state.get("logged_in"):
                                         ignore_index=True,
                                     )
                                     save_portfolio(updated_df)
-                                    # Trade_History에 BUY 기록
-                                    _buy_date = _narrative_now_kst_string()[:10]
-                                    append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "신규 매수")
                                     # Thesis 선택 시 Thesis 시트에도 저장
                                     if selected_thesis_label != "(Thesis 없음 - 일반 매수)":
                                         matched = next((o for o in thesis_options if o["label"] == selected_thesis_label), None)
@@ -10922,7 +10521,6 @@ if st.session_state.get("logged_in"):
                                                 matched["narrative_date"],
                                             )
                                     st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다. (시트 ID={puid})")
-                                    st.session_state["_portfolio_needs_refresh"] = True
                                     st.rerun()
 
         with st.expander("데이터 수정하기", expanded=False):
@@ -10994,143 +10592,103 @@ if st.session_state.get("logged_in"):
                                         st.error("해당 행이 더 이상 존재하지 않습니다. 화면을 새로고침했는지 확인해 주세요.")
                                     else:
                                         ix = upd.index[m][0]
-                                        upd = upd.copy()
-                                        upd["Quantity"] = upd["Quantity"].astype(object)
-                                        upd["Purchase_Price"] = upd["Purchase_Price"].astype(object)
-                                        upd.at[ix, "Quantity"] = float(qty_ev)
-                                        upd.at[ix, "Purchase_Price"] = float(price_ev)
+                                        upd.loc[ix, "Quantity"] = qty_ev
+                                        upd.loc[ix, "Purchase_Price"] = price_ev
                                         save_portfolio(upd)
                                         st.success(
                                             f"{edit_account} / {edit_ticker} 수량·평단가를 수정해 저장했습니다."
                                         )
                                         st.rerun()
 
-        with st.expander("🗑️ 종목 삭제 (매도 기록 없이 포지션 제거)", expanded=False):
-            st.caption("매도 기록 없이 포지션만 제거합니다. 실현 손익 추적이 필요하면 아래 '매도 기록'을 이용하세요.")
-            if portfolio_df.empty:
-                st.info("삭제할 종목이 없습니다.")
-            else:
-                del_col1, del_col2, del_col3 = st.columns([1.4, 1.4, 1.0])
-                with del_col1:
-                    del_acct_opts = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist())
-                    del_account = st.selectbox(
-                        "삭제할 계좌 선택",
-                        options=del_acct_opts if del_acct_opts else ["(등록된 계좌 없음)"],
-                        key="portfolio_delete_account_select",
-                    )
-                with del_col2:
-                    del_cand = portfolio_df[portfolio_df["Account"] == del_account].copy() if del_acct_opts else pd.DataFrame()
-                    del_ticker_opts = del_cand["Ticker"].dropna().astype(str).tolist() if not del_cand.empty else []
-                    del_target = st.selectbox(
-                        "삭제할 티커 선택",
-                        options=del_ticker_opts if del_ticker_opts else ["(등록된 티커 없음)"],
-                        key="portfolio_delete_select",
-                    )
-                with del_col3:
-                    st.write("")
-                    st.write("")
-                    if st.button("선택 종목 삭제", use_container_width=True, type="primary"):
-                        if del_account == "(등록된 계좌 없음)" or del_target == "(등록된 티커 없음)":
-                            st.info("삭제할 계좌/종목을 선택해주세요.")
-                        else:
-                            uid_del = str(st.session_state.get("user_id") or "").strip()
-                            ok_del, derr = delete_portfolio_sheet_row(uid_del, del_account, del_target)
-                            if not ok_del:
-                                st.error(derr)
-                            else:
-                                st.success(f"{del_account} / {del_target} 종목을 삭제했습니다.")
-                                st.session_state["_portfolio_needs_refresh"] = True
-                            st.rerun()
+        st.markdown("### 포트폴리오 종목 삭제")
+        delete_col1, delete_col2, delete_col3 = st.columns([1.4, 1.4, 1.0])
+        with delete_col1:
+            delete_account_options = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist()) if not portfolio_df.empty else []
+            delete_account = st.selectbox(
+                "삭제할 계좌 선택",
+                options=delete_account_options if delete_account_options else ["(등록된 계좌 없음)"],
+                index=0,
+                key="portfolio_delete_account_select",
+            )
+        with delete_col2:
+            candidate_df = portfolio_df[portfolio_df["Account"] == delete_account].copy() if not portfolio_df.empty else pd.DataFrame()
+            ticker_options = candidate_df["Ticker"].dropna().astype(str).tolist() if not candidate_df.empty else []
+            delete_target = st.selectbox(
+                "삭제할 티커 선택",
+                options=ticker_options if ticker_options else ["(등록된 티커 없음)"],
+                index=0,
+                key="portfolio_delete_select",
+            )
+        with delete_col3:
+            st.write("")
+            st.write("")
+            if st.button("선택 종목 삭제", use_container_width=True):
+                if portfolio_df.empty:
+                    st.info("삭제할 종목이 없습니다.")
+                elif delete_account == "(등록된 계좌 없음)":
+                    st.info("삭제할 계좌가 없습니다.")
+                elif delete_target == "(등록된 티커 없음)":
+                    st.info("삭제할 종목이 없습니다.")
+                else:
+                    uid_del = str(st.session_state.get("user_id") or "").strip()
+                    ok_del, derr = delete_portfolio_sheet_row(uid_del, delete_account, delete_target)
+                    if not ok_del:
+                        st.error(derr)
+                    else:
+                        st.success(f"{delete_account} / {delete_target} 종목을 삭제했습니다.")
+                    st.rerun()
 
-        st.markdown("### 💸 매도 기록")
-        with st.expander("매도 기록 (부분 매도 포함)", expanded=False):
+        # ── 매도 기록 ──────────────────────────────────────────────────────
+        with st.expander("💸 매도 기록 (부분/전량 매도)", expanded=False):
             if portfolio_df.empty:
                 st.info("포트폴리오에 종목이 없습니다.")
             else:
-                sell_accounts = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist())
-                sell_acct_sel = st.selectbox("계좌 선택", options=sell_accounts, key="sell_form_account_sel")
-                sell_tickers_avail = (
-                    portfolio_df[portfolio_df["Account"] == sell_acct_sel]["Ticker"]
-                    .dropna().astype(str).tolist()
-                ) if sell_acct_sel else []
-                with st.form("portfolio_sell_form", clear_on_submit=False):
-                    sell_ticker_sel = st.selectbox(
-                        "매도할 종목",
-                        options=sell_tickers_avail if sell_tickers_avail else ["(종목 없음)"],
-                        key="sell_form_ticker_sel",
-                    )
-                    hold_row = portfolio_df[
-                        (portfolio_df["Account"] == sell_acct_sel) &
-                        (portfolio_df["Ticker"] == sell_ticker_sel)
-                    ]
-                    cur_hold_qty = float(pd.to_numeric(hold_row["Quantity"].values[0], errors="coerce") or 0) if not hold_row.empty else 0.0
-                    cur_avg_price = float(pd.to_numeric(hold_row["Purchase_Price"].values[0], errors="coerce") or 0) if not hold_row.empty else 0.0
-                    st.caption(f"현재 보유 수량: **{cur_hold_qty:g}주** | 평균 매수가: **${cur_avg_price:,.4f}**")
-                    sell_price_input = st.number_input("매도가 (1주당 $)", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="sell_form_price")
-                    sell_qty_input = st.number_input(
-                        f"매도 수량 (최대 {cur_hold_qty:g}주)",
-                        min_value=0.0,
-                        max_value=float(max(cur_hold_qty, 0.0001)),
-                        value=0.0, step=1.0, format="%.4f", key="sell_form_qty",
-                    )
-                    sell_date_input = st.date_input("매도 날짜", value=datetime.now(pytz.timezone("US/Eastern")).date(), key="sell_form_date")
-                    sell_memo_input = st.text_input("메모 (선택)", placeholder="예: 목표가 도달, 섹터 약세", key="sell_form_memo")
-                    submitted_sell = st.form_submit_button("매도 기록 저장", use_container_width=True, type="primary")
-
-                    if submitted_sell:
-                        if not puid:
-                            st.error("로그인 user_id가 없습니다.")
-                        elif sell_ticker_sel == "(종목 없음)":
-                            st.warning("종목을 선택해주세요.")
-                        elif sell_price_input <= 0:
-                            st.error("매도가를 입력해주세요.")
-                        elif sell_qty_input <= 0:
-                            st.error("매도 수량을 입력해주세요.")
-                        elif sell_qty_input > cur_hold_qty + 1e-9:
-                            st.error(f"매도 수량({sell_qty_input:g})이 보유 수량({cur_hold_qty:g})을 초과합니다.")
+                _sell_accts = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist())
+                _sell_acct = st.selectbox("계좌 선택", options=_sell_accts, key="sell_acct_sel")
+                _sell_tickers = portfolio_df[portfolio_df["Account"] == _sell_acct]["Ticker"].dropna().astype(str).tolist() if _sell_acct else []
+                with st.form("sell_form_main", clear_on_submit=False):
+                    _sell_tk = st.selectbox("매도 종목", options=_sell_tickers if _sell_tickers else ["(없음)"], key="sell_tk_sel")
+                    _hold_row = portfolio_df[(portfolio_df["Account"].astype(str).str.strip().str.lower() == (_sell_acct or "").strip().lower()) & (portfolio_df["Ticker"].astype(str).str.upper() == (_sell_tk or "").upper())]
+                    _cur_qty = float(pd.to_numeric(_hold_row["Quantity"].values[0], errors="coerce") or 0) if not _hold_row.empty else 0.0
+                    _cur_avg = float(pd.to_numeric(_hold_row["Purchase_Price"].values[0], errors="coerce") or 0) if not _hold_row.empty else 0.0
+                    st.caption(f"보유 수량: **{_cur_qty:g}주** | 평균매수가: **${_cur_avg:,.4f}**")
+                    _sell_price = st.number_input("매도가 (1주당 $)", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="sell_price_in")
+                    _sell_qty = st.number_input(f"매도 수량 (최대 {_cur_qty:g}주)", min_value=0.0, max_value=float(max(_cur_qty, 0.0001)), value=0.0, step=1.0, format="%.4f", key="sell_qty_in")
+                    _sell_date = st.date_input("매도 날짜", value=datetime.now(pytz.timezone("US/Eastern")).date(), key="sell_date_in")
+                    _sell_memo = st.text_input("메모", placeholder="예: 목표가 도달", key="sell_memo_in")
+                    _sell_sub = st.form_submit_button("매도 저장", use_container_width=True, type="primary")
+                    if _sell_sub:
+                        _spuid = str(st.session_state.get("user_id") or "").strip()
+                        if not _spuid: st.error("로그인 필요")
+                        elif _sell_tk == "(없음)": st.warning("종목 선택")
+                        elif _sell_price <= 0: st.error("매도가 입력")
+                        elif _sell_qty <= 0: st.error("수량 입력")
+                        elif _sell_qty > _cur_qty + 1e-9: st.error(f"보유({_cur_qty:g})초과")
                         else:
-                            sell_date_str = sell_date_input.strftime("%Y-%m-%d")
-                            ok_th, err_th = append_trade_history_row(
-                                puid, sell_acct_sel, sell_ticker_sel, "SELL",
-                                sell_qty_input, sell_price_input, sell_date_str, sell_memo_input
-                            )
-                            if not ok_th:
-                                st.error(f"매도 기록 저장 실패: {err_th}")
+                            _ok_th, _err_th = append_trade_history_row(_spuid, _sell_acct, _sell_tk, "SELL", _sell_qty, _sell_price, _sell_date.strftime("%Y-%m-%d"), _sell_memo)
+                            if not _ok_th:
+                                st.error(f"거래 기록 실패: {_err_th}")
                             else:
-                                _invalidate_trade_history_cache()
-                                new_qty = cur_hold_qty - sell_qty_input
-                                if new_qty < 1e-9:
-                                    # 전량 매도 → 시트에서 직접 행 삭제
-                                    ok_del, err_del = delete_portfolio_sheet_row(puid, sell_acct_sel, sell_ticker_sel)
-                                    if ok_del:
-                                        realized = (sell_price_input - cur_avg_price) * sell_qty_input
-                                        pnl_pct = ((sell_price_input / cur_avg_price) - 1.0) * 100.0 if cur_avg_price > 0 else 0
-                                        pnl_emoji = "🟢" if realized >= 0 else "🔴"
-                                        st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} 전량 매도. 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%). 포트폴리오에서 제거됩니다.")
+                                _new_qty = _cur_qty - _sell_qty
+                                if _new_qty < 1e-9:
+                                    _ok_d, _err_d = delete_portfolio_sheet_row(_spuid, _sell_acct, _sell_tk)
+                                    _realized = (_sell_price - _cur_avg) * _sell_qty
+                                    _pct = ((_sell_price / _cur_avg) - 1) * 100 if _cur_avg > 0 else 0
+                                    if _ok_d:
+                                        st.success(f"{'🟢' if _realized>=0 else '🔴'} 전량 매도 완료. 손익: ${_realized:+,.2f} ({_pct:+.2f}%)")
                                     else:
-                                        st.error(f"포트폴리오 업데이트 실패: {err_del}")
+                                        st.error(f"포트폴리오 제거 실패: {_err_d}")
                                 else:
-                                    # 부분 매도 → 수량 차감 후 전체 재저장
-                                    upd_sell = portfolio_df.copy()
-                                    # 대소문자/공백 무시 매칭
-                                    m_sell = (
-                                        upd_sell["Account"].astype(str).str.strip().str.lower() == sell_acct_sel.strip().lower()
-                                    ) & (
-                                        upd_sell["Ticker"].astype(str).str.strip().str.upper() == sell_ticker_sel.strip().upper()
-                                    )
-                                    if m_sell.any():
-                                        ix_sell = upd_sell.index[m_sell][0]
-                                        upd_sell = upd_sell.copy()
-                                        upd_sell["Quantity"] = upd_sell["Quantity"].astype(object)
-                                        upd_sell.at[ix_sell, "Quantity"] = float(new_qty)
-                                        save_portfolio(upd_sell)
-                                        realized = (sell_price_input - cur_avg_price) * sell_qty_input
-                                        pnl_pct = ((sell_price_input / cur_avg_price) - 1.0) * 100.0 if cur_avg_price > 0 else 0
-                                        pnl_emoji = "🟢" if realized >= 0 else "🔴"
-                                        st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} {sell_qty_input:g}주 매도. 잔여 {new_qty:g}주 | 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%)")
-                                    else:
-                                        st.error(f"포트폴리오에서 {sell_acct_sel}/{sell_ticker_sel}을 찾을 수 없습니다. 동기화 후 다시 시도해주세요.")
-                                _invalidate_portfolio_sheet_cache()
+                                    _upd = portfolio_df.copy()
+                                    _m = (_upd["Account"].astype(str).str.strip().str.lower() == _sell_acct.strip().lower()) & (_upd["Ticker"].astype(str).str.upper() == _sell_tk.upper())
+                                    if _m.any():
+                                        _ix = _upd.index[_m][0]
+                                        _upd["Quantity"] = _upd["Quantity"].astype(object)
+                                        _upd.at[_ix, "Quantity"] = float(_new_qty)
+                                        save_portfolio(_upd)
+                                    _realized = (_sell_price - _cur_avg) * _sell_qty
+                                    _pct = ((_sell_price / _cur_avg) - 1) * 100 if _cur_avg > 0 else 0
+                                    st.success(f"{'🟢' if _realized>=0 else '🔴'} {_sell_qty:g}주 매도. 잔여 {_new_qty:g}주 | 손익: ${_realized:+,.2f} ({_pct:+.2f}%)")
                                 st.rerun()
 
         st.divider()
@@ -11671,300 +11229,48 @@ if st.session_state.get("logged_in"):
                 except Exception as _earn_e:
                     st.warning(f"실적 캘린더 로드 중 오류: {_earn_e}")
 
-        # ═══════════════════════════════════════════════════════════════════
-        # 섹션 B: 🎯 매도 타이밍 레이더 (기술적 신호 + AI)
-        # ═══════════════════════════════════════════════════════════════════
-        st.divider()
-        st.markdown("## 🎯 매도 타이밍 레이더")
-        st.caption("RSI·MACD·52주 고점·200일선 기반 위험점수와 AI 분석으로 매도 우선순위를 제시합니다.")
-
-        if not filtered_portfolio_df.empty:
-            radar_tickers = filtered_portfolio_df["Ticker"].dropna().astype(str).str.upper().unique().tolist()
-            with st.spinner("매도 신호 분석 중..."):
-                sell_signals = compute_sell_signal_indicators(radar_tickers)
-
-            sig_rows = []
-            for tk in radar_tickers:
-                sig = sell_signals.get(tk, _empty_sell_signal())
-                rsi_v = sig.get("rsi", np.nan)
-                pct_high = sig.get("pct_from_52w_high", np.nan)
-                above200 = sig.get("above_ma200")
-                macd_s = sig.get("macd_signal", "N/A")
-                macd_display = {"DEAD_CROSS": "💀 데드크로스", "BELOW_SIGNAL": "📉 시그널 하회",
-                                "GOLDEN_CROSS": "✨ 골든크로스", "ABOVE_SIGNAL": "📈 시그널 상회"}.get(macd_s, macd_s)
-                sig_rows.append({
-                    "신호": sig.get("signal_label", "⚪"),
-                    "티커": tk,
-                    "위험점수": sig.get("signal_score", 0),
-                    "RSI(14)": f"{rsi_v:.1f}" if pd.notna(rsi_v) else "N/A",
-                    "MACD": macd_display,
-                    "52주고점대비": f"{pct_high:+.1f}%" if pd.notna(pct_high) else "N/A",
-                    "200일선": "✅ 위" if above200 is True else ("🔴 아래" if above200 is False else "N/A"),
-                    "200일선가격": f"${sig.get('ma200', np.nan):,.2f}" if pd.notna(sig.get("ma200")) else "N/A",
-                })
-
-            if sig_rows:
-                sig_df = pd.DataFrame(sig_rows).sort_values("위험점수", ascending=False).reset_index(drop=True)
-
-                def _c_signal(v):
-                    if "🔴" in str(v): return "color:#dc2626;font-weight:700;"
-                    if "🟡" in str(v): return "color:#d97706;font-weight:700;"
-                    if "🟢" in str(v): return "color:#16a34a;font-weight:700;"
-                    return ""
-
-                def _c_rsi(v):
-                    try:
-                        f = float(str(v))
-                        if f > 75: return "color:#dc2626;font-weight:700;"
-                        if f > 70: return "color:#d97706;font-weight:700;"
-                    except Exception: pass
-                    return ""
-
-                st.dataframe(
-                    sig_df.drop(columns=["위험점수"]).style
-                    .map(_c_signal, subset=["신호"]).map(_c_rsi, subset=["RSI(14)"]),
-                    use_container_width=True, hide_index=True,
-                )
-
-            # AI 매도 분석
-            st.markdown("#### 🤖 AI 매도 우선순위 분석")
-            if st.button("AI 매도 분석 실행", key="btn_ai_sell_analysis", type="primary"):
-                if not filtered_portfolio_df.empty and sell_signals:
-                    with st.spinner("Gemini가 포트폴리오를 분석하는 중..."):
-                        try:
-                            port_lines = []
-                            for _, pr in filtered_portfolio_df.iterrows():
-                                tk = str(pr.get("Ticker", "")).upper()
-                                avg_p = float(pr.get("Purchase_Price") or 0)
-                                sig = sell_signals.get(tk, {})
-                                cur_p = sig.get("current_price", np.nan)
-                                rsi_v = sig.get("rsi", np.nan)
-                                pnl = ((float(cur_p) / avg_p) - 1.0) * 100.0 if pd.notna(cur_p) and avg_p > 0 else np.nan
-                                _cur_str = "N/A" if pd.isna(cur_p) else f"{cur_p:.2f}"
-                                _pnl_str = "N/A" if pd.isna(pnl) else f"{pnl:.1f}pct"
-                                _rsi_str = "N/A" if pd.isna(rsi_v) else f"{rsi_v:.1f}"
-                                _high_str = "N/A" if pd.isna(sig.get("pct_from_52w_high", np.nan)) else f"{sig.get('pct_from_52w_high'):.1f}pct"
-                                _ma200_str = "위" if sig.get("above_ma200") else ("아래" if sig.get("above_ma200") is False else "N/A")
-                                _macd_str = sig.get("macd_signal", "N/A")
-                                port_lines.append(
-                                    f"- {tk}: 평단가${avg_p:.2f} 현재가${_cur_str} "
-                                    f"수익률={_pnl_str} RSI={_rsi_str} MACD={_macd_str} "
-                                    f"52주고점대비={_high_str} 200일선={_ma200_str}"
-                                )
-                            port_text = "\n".join(port_lines)
-                            ai_prompt = (
-                                "You are a quant investment expert. Analyze the portfolio below and respond ONLY with a valid JSON array. "
-                                "No explanation, no markdown, no extra text. Pure JSON only.\n"
-                                "Each item MUST have exactly these 5 fields: "
-                                "{\"ticker\":\"XXX\",\"priority\":1,\"action\":\"SELL NOW or WATCH or HOLD\","
-                                "\"reason\":\"한국어로 20자 이내\",\"target_price\":\"$000.00 or N/A\"}\n"
-                                "priority 1 = most urgent to sell. Include ALL tickers. "
-                                "reason must be in Korean under 20 chars. "
-                                "target_price = suggested sell price in USD (e.g. $150.00), or N/A if no clear target.\n"
-                                "[PORTFOLIO]\n" + port_text
-                            )
-                            _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={
-                                "temperature": 0.0,
-                                "max_output_tokens": 8192,
-                                "response_mime_type": "application/json",
-                            })
-                            _resp = _ai_m.generate_content(ai_prompt)
-                            raw = getattr(_resp, "text", "") or ""
-                            if not raw and hasattr(_resp, "candidates"):
-                                for _c in _resp.candidates:
-                                    for _p in getattr(_c.content, "parts", []):
-                                        raw += getattr(_p, "text", "")
-
-                            # 안전한 JSON 파싱: 코드블록 제거 → 배열 추출 → 불완전 JSON 복구
-                            raw = raw.strip()
-                            for _pfx in ["```json", "```"]:
-                                if raw.startswith(_pfx):
-                                    raw = raw[len(_pfx):]
-                            if raw.endswith("```"):
-                                raw = raw[:-3]
-                            raw = raw.strip()
-
-                            # JSON 배열 구간 추출
-                            _arr_start = raw.find("[")
-                            _arr_end = raw.rfind("]")
-                            if _arr_start != -1 and _arr_end != -1 and _arr_end > _arr_start:
-                                raw = raw[_arr_start:_arr_end + 1]
-
-                            # 파싱 시도 — 실패 시 완전한 객체만 추출 (잘린 JSON 복구)
-                            ai_data = None
-                            try:
-                                ai_data = json.loads(raw)
-                            except json.JSONDecodeError:
-                                # 완전한 JSON 객체만 추출 (마지막 불완전 객체 제거)
-                                _safe = []
-                                _depth = 0
-                                _obj_start = None
-                                for _ci, _ch in enumerate(raw):
-                                    if _ch == "{":
-                                        if _depth == 0:
-                                            _obj_start = _ci
-                                        _depth += 1
-                                    elif _ch == "}":
-                                        _depth -= 1
-                                        if _depth == 0 and _obj_start is not None:
-                                            try:
-                                                _safe.append(json.loads(raw[_obj_start:_ci + 1]))
-                                            except Exception:
-                                                pass
-                                            _obj_start = None
-                                if _safe:
-                                    ai_data = _safe
-
-                            if isinstance(ai_data, list) and ai_data:
-                                ai_df = pd.DataFrame(ai_data).sort_values("priority")
-                                def _c_act(v):
-                                    if "SELL NOW" in str(v): return "color:#dc2626;font-weight:700;"
-                                    if "WATCH" in str(v): return "color:#d97706;font-weight:700;"
-                                    if "HOLD" in str(v): return "color:#16a34a;font-weight:700;"
-                                    return ""
-                                st.dataframe(ai_df.style.map(_c_act, subset=["action"]), use_container_width=True, hide_index=True)
-                                _total = len(filtered_portfolio_df)
-                                if len(ai_df) < _total:
-                                    st.caption(f"⚠️ 응답이 잘려 {len(ai_df)}/{_total}개 종목만 표시됩니다. 종목 수를 줄이거나 계좌 필터를 좁혀주세요.")
-                            else:
-                                st.warning("AI 응답을 파싱할 수 없습니다. 잠시 후 다시 시도해주세요.")
-                        except Exception as _e_ai:
-                            st.error(f"AI 분석 오류: {_e_ai}")
-                else:
-                    st.info("포트폴리오가 비어있습니다.")
-        else:
-            st.info("포트폴리오가 비어있거나 계좌 필터 조건에 맞는 종목이 없습니다.")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 섹션 C: 📒 매매 히스토리 & 실현 손익
-        # ═══════════════════════════════════════════════════════════════════
+        # ── 매매 히스토리 & 실현 손익 ──────────────────────────────────────
         st.divider()
         st.markdown("## 📒 매매 히스토리 & 실현 손익")
-
-        trade_hist_df = load_trade_history(puid)
-
-        if trade_hist_df.empty:
-            # 시트 연결 상태 진단
-            _ws_check, _ws_err = open_trade_history_worksheet()
-            if _ws_err:
-                st.error(f"⚠️ Trade_History 시트 연결 실패: {_ws_err}")
-                st.caption("Google Sheets에 'Trade_History' 탭이 없거나 접근 권한이 없습니다. 매도 기록을 한 번 저장하면 자동 생성됩니다.")
-            else:
-                _raw_rows, _ = _trade_history_all_values_cached()
-                _total_rows = len(_raw_rows) - 1 if _raw_rows and len(_raw_rows) > 1 else 0
-                if _total_rows > 0:
-                    st.warning(f"⚠️ Trade_History 시트에 총 {_total_rows}개 행이 있지만 현재 계정({puid})의 기록이 없습니다. 저장 시 user_id가 일치하는지 확인해주세요.")
-                else:
-                    st.info("아직 매매 기록이 없습니다. '종목 추가' 또는 '매도 기록'을 통해 거래를 기록하면 여기에 표시됩니다.")
-                    st.caption("💡 동기화 버튼을 눌러도 안 나타나면 Google Sheets Quant_DB에 'Trade_History' 탭이 생성됐는지 확인해주세요.")
+        _th_uid = str(st.session_state.get("user_id") or "").strip()
+        _th_df = load_trade_history(_th_uid)
+        if _th_df.empty:
+            st.info("매매 기록이 없습니다. 종목 추가/매도 시 자동으로 기록됩니다.")
         else:
-            th_tab1, th_tab2, th_tab3 = st.tabs(["📋 전체 거래 내역", "💰 실현 손익 분석", "📈 누적 손익 차트"])
-
-            with th_tab1:
-                show_df = trade_hist_df.copy()
-                show_df["거래금액"] = show_df["shares"] * show_df["price"]
-                disp = show_df.rename(columns={
-                    "account": "계좌", "ticker": "티커", "action": "매수/매도",
-                    "shares": "수량", "price": "가격", "date": "날짜", "memo": "메모"
-                })[["날짜", "계좌", "티커", "매수/매도", "수량", "가격", "거래금액", "메모"]]
-
-                def _c_act2(v):
-                    if str(v).upper() == "BUY": return "color:#2563eb;font-weight:700;"
-                    if str(v).upper() == "SELL": return "color:#dc2626;font-weight:700;"
+            _th_t1, _th_t2 = st.tabs(["📋 전체 거래 내역", "💰 실현 손익"])
+            with _th_t1:
+                _th_show = _th_df.copy()
+                _th_show["거래금액"] = _th_show["shares"] * _th_show["price"]
+                def _ca(v):
+                    if str(v).upper()=="BUY": return "color:#2563eb;font-weight:700;"
+                    if str(v).upper()=="SELL": return "color:#dc2626;font-weight:700;"
                     return ""
-
                 st.dataframe(
-                    disp.style
-                    .format({"수량": "{:,.4f}", "가격": "${:,.4f}", "거래금액": "${:,.2f}"}, na_rep="N/A")
-                    .map(_c_act2, subset=["매수/매도"]),
-                    use_container_width=True, hide_index=True,
-                )
-
-            with th_tab2:
-                pnl_df = compute_realized_pnl(trade_hist_df)
-                if pnl_df.empty:
-                    st.info("실현된 손익이 없습니다. 매도 기록이 있어야 계산됩니다.")
+                    _th_show.rename(columns={"account":"계좌","ticker":"티커","action":"매수/매도","shares":"수량","price":"가격","date":"날짜","memo":"메모"})[["날짜","계좌","티커","매수/매도","수량","가격","거래금액","메모"]]
+                    .style.format({"수량":"{:,.4f}","가격":"${:,.4f}","거래금액":"${:,.2f}"},na_rep="N/A")
+                    .map(_ca,subset=["매수/매도"]),
+                    use_container_width=True, hide_index=True)
+            with _th_t2:
+                _pnl_df = compute_realized_pnl(_th_df)
+                if _pnl_df.empty:
+                    st.info("실현 손익이 없습니다. 매도 기록이 있어야 계산됩니다.")
                 else:
-                    total_fifo = pnl_df["fifo_pnl"].sum()
-                    total_avg = pnl_df["avg_pnl"].sum()
-                    total_trades = len(pnl_df)
-                    win_trades = (pnl_df["fifo_pnl"] > 0).sum()
-                    pm1, pm2, pm3 = st.columns(3)
-                    with pm1:
-                        st.metric("총 실현 손익 (FIFO)", f"${total_fifo:+,.2f}")
-                    with pm2:
-                        st.metric("총 실현 손익 (평균단가)", f"${total_avg:+,.2f}")
-                    with pm3:
-                        st.metric("승률 (FIFO 기준)", f"{win_trades}/{total_trades} ({win_trades/total_trades*100:.0f}%)" if total_trades else "N/A")
-                    st.divider()
-
-                    def _c_pnl(v):
+                    _tf = _pnl_df["fifo_pnl"].sum(); _ta = _pnl_df["avg_pnl"].sum()
+                    _tw = len(_pnl_df); _ww = (_pnl_df["fifo_pnl"]>0).sum()
+                    _c1,_c2,_c3 = st.columns(3)
+                    _c1.metric("총 실현손익(FIFO)", f"${_tf:+,.2f}")
+                    _c2.metric("총 실현손익(평균단가)", f"${_ta:+,.2f}")
+                    _c3.metric("승률", f"{_ww}/{_tw} ({_ww/_tw*100:.0f}%)" if _tw else "N/A")
+                    def _cp(v):
                         try:
-                            f = float(str(v).replace("$","").replace("+","").replace(",",""))
-                            if f > 0: return "color:#16a34a;font-weight:700;"
-                            if f < 0: return "color:#dc2626;font-weight:700;"
-                        except Exception: pass
-                        return ""
-
-                    disp_pnl = pnl_df.rename(columns={
-                        "ticker": "티커", "account": "계좌", "sell_date": "매도일",
-                        "shares_sold": "매도수량", "sell_price": "매도가",
-                        "fifo_cost": "FIFO매수가", "avg_cost": "평균매수가",
-                        "fifo_pnl": "FIFO손익($)", "avg_pnl": "평균단가손익($)",
-                        "fifo_pnl_pct": "FIFO손익(%)", "avg_pnl_pct": "평균단가손익(%)", "memo": "메모",
-                    })
+                            f=float(str(v).replace("$","").replace("+","").replace(",",""))
+                            return "color:#16a34a;font-weight:700;" if f>0 else ("color:#dc2626;font-weight:700;" if f<0 else "")
+                        except: return ""
                     st.dataframe(
-                        disp_pnl.style
-                        .format({"매도수량": "{:,.4f}", "매도가": "${:,.4f}", "FIFO매수가": "${:,.4f}",
-                                 "평균매수가": "${:,.4f}", "FIFO손익($)": "${:+,.2f}", "평균단가손익($)": "${:+,.2f}",
-                                 "FIFO손익(%)": "{:+.2f}%", "평균단가손익(%)": "{:+.2f}%"}, na_rep="N/A")
-                        .map(_c_pnl, subset=["FIFO손익($)", "평균단가손익($)"]),
-                        use_container_width=True, hide_index=True,
-                    )
-
-            with th_tab3:
-                pnl_c = compute_realized_pnl(trade_hist_df)
-                if pnl_c.empty:
-                    st.info("실현 손익 데이터가 없습니다.")
-                else:
-                    pnl_c["sell_date"] = pd.to_datetime(pnl_c["sell_date"], errors="coerce")
-                    pnl_c = pnl_c.dropna(subset=["sell_date"]).sort_values("sell_date")
-                    pnl_c["cum_fifo"] = pnl_c["fifo_pnl"].cumsum()
-                    pnl_c["cum_avg"] = pnl_c["avg_pnl"].cumsum()
-
-                    cum_long = pd.concat([
-                        pnl_c[["sell_date", "cum_fifo"]].rename(columns={"cum_fifo": "손익"}).assign(방식="FIFO"),
-                        pnl_c[["sell_date", "cum_avg"]].rename(columns={"cum_avg": "손익"}).assign(방식="평균단가"),
-                    ])
-                    cum_chart = (
-                        alt.Chart(cum_long).mark_line(point=True)
-                        .encode(
-                            x=alt.X("sell_date:T", title="매도일"),
-                            y=alt.Y("손익:Q", title="누적 실현 손익 ($)"),
-                            color=alt.Color("방식:N"),
-                            tooltip=[alt.Tooltip("sell_date:T", title="날짜"), alt.Tooltip("방식:N"), alt.Tooltip("손익:Q", format="$,.2f")],
-                        ).properties(title="누적 실현 손익 추이")
-                    )
-                    zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="gray", strokeDash=[4,4]).encode(y="y:Q")
-                    st.altair_chart(cum_chart + zero_rule, use_container_width=True)
-
-                    # 종목별 바 차트
-                    tk_pnl = pnl_c.groupby("ticker")[["fifo_pnl","avg_pnl"]].sum().reset_index()
-                    tk_long = pd.concat([
-                        tk_pnl[["ticker","fifo_pnl"]].rename(columns={"fifo_pnl":"손익"}).assign(방식="FIFO"),
-                        tk_pnl[["ticker","avg_pnl"]].rename(columns={"avg_pnl":"손익"}).assign(방식="평균단가"),
-                    ])
-                    bar_chart = (
-                        alt.Chart(tk_long).mark_bar()
-                        .encode(
-                            x=alt.X("ticker:N", title="티커"),
-                            y=alt.Y("손익:Q", title="실현 손익 ($)"),
-                            color=alt.Color("방식:N"),
-                            xOffset="방식:N",
-                            tooltip=[alt.Tooltip("ticker:N"), alt.Tooltip("방식:N"), alt.Tooltip("손익:Q", format="$,.2f")],
-                        ).properties(title="종목별 실현 손익 (FIFO vs 평균단가)")
-                    )
-                    st.altair_chart(bar_chart, use_container_width=True)
+                        _pnl_df.rename(columns={"ticker":"티커","account":"계좌","sell_date":"매도일","shares_sold":"수량","sell_price":"매도가","fifo_cost":"FIFO매수가","avg_cost":"평균매수가","fifo_pnl":"FIFO손익($)","avg_pnl":"평단손익($)","fifo_pnl_pct":"FIFO(%)","avg_pnl_pct":"평단(%)","memo":"메모"})
+                        .style.format({"수량":"{:,.4f}","매도가":"${:,.4f}","FIFO매수가":"${:,.4f}","평균매수가":"${:,.4f}","FIFO손익($)":"${:+,.2f}","평단손익($)":"${:+,.2f}","FIFO(%)":"{:+.2f}%","평단(%)":"{:+.2f}%"},na_rep="N/A")
+                        .map(_cp,subset=["FIFO손익($)","평단손익($)"]),
+                        use_container_width=True, hide_index=True)
 
     elif main_nav == _MAIN_NAV_OPTIONS[8]:
         # ─────────────────────────────────────────────────────────────────────
