@@ -2735,11 +2735,183 @@ def translate_ko(text: str, mapping: dict) -> str:
     return mapping.get(str(text).strip(), str(text).strip())
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# FMP (Financial Modeling Prep) fallback helpers
+# secrets key: FMP_API_KEY  /  base: https://financialmodelingprep.com/stable
+# ═══════════════════════════════════════════════════════════════════════════
+
+_FMP_BASE = "https://financialmodelingprep.com/stable"
+_FMP_TIMEOUT = 8  # seconds
+
+
+def _get_fmp_key() -> str:
+    """st.secrets 에서 FMP_API_KEY 반환. 없으면 빈 문자열."""
+    try:
+        return str(st.secrets.get("FMP_API_KEY", "") or "").strip()
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fmp_get_profile(ticker_upper: str) -> dict:
+    """
+    FMP /profile 엔드포인트 → 회사 기본 정보 dict.
+    반환 키: name, sector, industry, country, mktCap, website,
+             description, fullTimeEmployees, ipoDate, isEtf
+    실패 시 빈 dict.
+    """
+    key = _get_fmp_key()
+    if not key:
+        return {}
+    try:
+        url = f"{_FMP_BASE}/profile?symbol={ticker_upper}&apikey={key}"
+        resp = requests.get(url, timeout=_FMP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        # 응답은 list[dict] 또는 dict
+        item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+        return item if isinstance(item, dict) else {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fmp_get_ratios(ticker_upper: str) -> dict:
+    """
+    FMP /ratios-ttm 엔드포인트 → 핵심 밸류에이션·수익성 지표 dict.
+    반환 키: peRatioTTM, forwardPE, priceToBookRatioTTM,
+             enterpriseValueMultipleTTM, pegRatioTTM,
+             returnOnEquityTTM, operatingProfitMarginTTM,
+             debtToEquityTTM, freeCashFlowPerShareTTM
+    실패 시 빈 dict.
+    """
+    key = _get_fmp_key()
+    if not key:
+        return {}
+    try:
+        url = f"{_FMP_BASE}/ratios-ttm?symbol={ticker_upper}&apikey={key}"
+        resp = requests.get(url, timeout=_FMP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+        return item if isinstance(item, dict) else {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fmp_get_key_metrics(ticker_upper: str) -> dict:
+    """
+    FMP /key-metrics-ttm 엔드포인트 → EPS·FCF·시장가치 등.
+    반환 키: netIncomePerShareTTM (=EPS), freeCashFlowPerShareTTM,
+             marketCapTTM, enterpriseValueTTM
+    실패 시 빈 dict.
+    """
+    key = _get_fmp_key()
+    if not key:
+        return {}
+    try:
+        url = f"{_FMP_BASE}/key-metrics-ttm?symbol={ticker_upper}&apikey={key}"
+        resp = requests.get(url, timeout=_FMP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+        return item if isinstance(item, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fmp_patch_info(info: dict, ticker_upper: str) -> dict:
+    """
+    yfinance info dict에 누락된 필드가 있을 때 FMP 데이터로 채워 반환.
+    FMP 호출은 빈 필드가 있는 경우에만 수행 (불필요한 API 소비 방지).
+    """
+    # 보완이 필요한 필드 목록
+    need_profile = not all([
+        info.get("longName") or info.get("shortName"),
+        info.get("sector"),
+        info.get("longBusinessSummary"),
+        info.get("marketCap"),
+    ])
+    need_ratios = not all([
+        info.get("trailingPE"),
+        info.get("priceToBook"),
+        info.get("returnOnEquity"),
+        info.get("operatingMargins"),
+    ])
+
+    if not need_profile and not need_ratios:
+        return info  # yfinance가 충분함 → FMP 호출 없음
+
+    info = dict(info)  # 원본 변경 방지
+
+    if need_profile:
+        prof = fmp_get_profile(ticker_upper)
+        if prof:
+            if not (info.get("longName") or info.get("shortName")):
+                info.setdefault("longName", prof.get("companyName") or prof.get("name") or ticker_upper)
+            if not info.get("sector"):
+                info.setdefault("sector", prof.get("sector") or "")
+            if not info.get("industry"):
+                info.setdefault("industry", prof.get("industry") or "")
+            if not info.get("longBusinessSummary"):
+                info.setdefault("longBusinessSummary", prof.get("description") or "")
+            if not info.get("website"):
+                info.setdefault("website", prof.get("website") or "")
+            if not info.get("country"):
+                info.setdefault("country", prof.get("country") or "N/A")
+            if not info.get("fullTimeEmployees"):
+                info.setdefault("fullTimeEmployees", prof.get("fullTimeEmployees"))
+            if not info.get("marketCap"):
+                info.setdefault("marketCap", prof.get("mktCap"))
+            # 다음 실적발표 (FMP: earningsAnnouncement)
+            if not info.get("earningsDate"):
+                ea = prof.get("earningsAnnouncement")
+                if ea:
+                    info.setdefault("earningsDate", [str(ea)[:10]])
+            # ETF 여부
+            if prof.get("isEtf") and not info.get("quoteType"):
+                info["quoteType"] = "ETF"
+
+    if need_ratios:
+        rat = fmp_get_ratios(ticker_upper)
+        if rat:
+            if not info.get("trailingPE"):
+                info.setdefault("trailingPE", rat.get("peRatioTTM"))
+            if not info.get("forwardPE"):
+                info.setdefault("forwardPE", rat.get("forwardPE"))
+            if not info.get("priceToBook"):
+                info.setdefault("priceToBook", rat.get("priceToBookRatioTTM"))
+            if not info.get("enterpriseToEbitda"):
+                info.setdefault("enterpriseToEbitda", rat.get("enterpriseValueMultipleTTM"))
+            if not info.get("pegRatio"):
+                info.setdefault("pegRatio", rat.get("pegRatioTTM"))
+            if not info.get("returnOnEquity"):
+                info.setdefault("returnOnEquity", rat.get("returnOnEquityTTM"))
+            if not info.get("operatingMargins"):
+                info.setdefault("operatingMargins", rat.get("operatingProfitMarginTTM"))
+            if not info.get("debtToEquity"):
+                # FMP debtToEquity는 소수 (0.5 = 50%) → yfinance 단위(100배)로 맞춤
+                dte = to_float(rat.get("debtToEquityTTM"))
+                if pd.notna(dte):
+                    info.setdefault("debtToEquity", dte * 100)
+
+        km = fmp_get_key_metrics(ticker_upper)
+        if km:
+            if not info.get("trailingEps"):
+                info.setdefault("trailingEps", km.get("netIncomePerShareTTM"))
+
+    return info
+
+
 def _fetch_company_overview_uncached(ticker_upper: str) -> dict:
-    """회사 기본 정보 조회 내부 로직 (캐시 없음)."""
+    """회사 기본 정보 조회 내부 로직 (캐시 없음).
+    1) yfinance 최대 2회 시도
+    2) 누락 필드 → FMP로 자동 보완 (_fmp_patch_info)
+    """
     tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
 
-    # ── info 수집: 최대 2회 시도 ───────────────────────────────────────
+    # ── yfinance info 수집: 최대 2회 시도 ─────────────────────────────
     info = {}
     for _attempt in range(2):
         try:
@@ -2751,12 +2923,11 @@ def _fetch_company_overview_uncached(ticker_upper: str) -> dict:
             if _attempt == 0:
                 time.sleep(1)
 
-    # info가 너무 빈약하면 fast_info로 핵심 필드 보완
+    # fast_info로 가격 계열만 보완 (info가 빈 경우)
     if not info or len(info) <= 5:
         try:
             fi = tk_obj.fast_info
             info = {
-                "longName": getattr(fi, "currency", None) and ticker_upper,  # 이름은 없으므로 ticker 사용
                 "marketCap": getattr(fi, "market_cap", None),
                 "currentPrice": getattr(fi, "last_price", None),
                 "fiftyDayAverage": getattr(fi, "fifty_day_average", None),
@@ -2764,6 +2935,9 @@ def _fetch_company_overview_uncached(ticker_upper: str) -> dict:
             }
         except Exception:
             pass
+
+    # ── FMP로 누락 필드 보완 ───────────────────────────────────────────
+    info = _fmp_patch_info(info, ticker_upper)
 
     name = str(info.get("longName") or info.get("shortName") or ticker_upper)
     sector_en = str(info.get("sector") or "")
@@ -2805,7 +2979,13 @@ def _fetch_company_overview_uncached(ticker_upper: str) -> dict:
         "summary_en": summary_en,
         "employees": employees, "market_cap": market_cap,
         "website": website, "next_earnings": next_earnings,
-        "_info_ok": bool(info and len(info) > 5),  # 캐시 유효성 판단용
+        # FMP로 채워진 경우에도 _info_ok=True 처리
+        "_info_ok": bool(
+            (info and len(info) > 5)
+            or name != ticker_upper
+            or market_cap
+            or sector_en
+        ),
     }
     return result
 
@@ -2944,10 +3124,11 @@ def tab_sync_refresh(clear_callbacks, rerun_after=True):
 
 
 def evaluate_kpis(ticker_symbol):
+    ticker_upper = str(ticker_symbol).strip().upper()
     try:
-        ticker = yf.Ticker(ticker_symbol)
+        ticker = yf.Ticker(ticker_upper)
 
-        # ── info 수집 (여러 방법 시도) ──────────────────────────────────
+        # ── yfinance info 수집 ───────────────────────────────────────────
         info = {}
         try:
             raw_info = ticker.info
@@ -2956,7 +3137,7 @@ def evaluate_kpis(ticker_symbol):
         except Exception:
             pass
 
-        # info가 비어있으면 fast_info로 보완
+        # fast_info로 가격 계열 보완
         if not info:
             try:
                 fi = ticker.fast_info
@@ -2968,6 +3149,9 @@ def evaluate_kpis(ticker_symbol):
                 }
             except Exception:
                 pass
+
+        # ── FMP로 누락 필드 자동 보완 ────────────────────────────────────
+        info = _fmp_patch_info(info, ticker_upper)
 
         cashflow = None
         try:
@@ -3008,6 +3192,11 @@ def evaluate_kpis(ticker_symbol):
     except Exception:
         info, cashflow, history = {}, None, pd.DataFrame()
         income_stmt, balance_sheet = None, None
+        # yfinance 완전 실패 시에도 FMP 단독으로 시도
+        try:
+            info = _fmp_patch_info({}, ticker_upper)
+        except Exception:
+            pass
 
     # ── 지표 추출 ──────────────────────────────────────────────────────
     # ROE
@@ -3185,6 +3374,16 @@ def evaluate_kpis(ticker_symbol):
     fail_count = (kpi_df["Pass"] == ":red[Fail]").sum()
     nodata_count = (kpi_df["Pass"] == ":gray[No Data]").sum()
 
+    # ── 데이터 소스 추적 (UI 표시용) ──────────────────────────────────
+    _fmp_fields_used = [
+        f for f in ["trailingPE", "forwardPE", "priceToBook", "enterpriseToEbitda",
+                    "returnOnEquity", "operatingMargins", "debtToEquity", "trailingEps"]
+        if info.get(f) is not None
+    ]
+    # yfinance가 원래 갖고 있던 필드 수 추정: FMP 호출 없었으면 전부 yf
+    _has_fmp = bool(_get_fmp_key()) and bool(fmp_get_profile.cache_info if hasattr(fmp_get_profile, "cache_info") else True)
+    _data_source = "yfinance + FMP" if _get_fmp_key() else "yfinance"
+
     margin_context = {
         "intrinsic_value": intrinsic_value,
         "margin_of_safety": margin_of_safety,
@@ -3196,6 +3395,7 @@ def evaluate_kpis(ticker_symbol):
         "trailing_pe": trailing_pe,
         "price_to_book": price_to_book,
         "ev_to_ebitda": ev_to_ebitda,
+        "data_source": _data_source,
     }
 
     return kpi_df, pass_count, fail_count, nodata_count, margin_context
@@ -9883,9 +10083,11 @@ if st.session_state.get("logged_in"):
         website = co.get("website", "") if co else ""
         is_etf_co = co.get("is_etf", False) if co else False
         etf_badge = " 🏷️ ETF" if is_etf_co else ""
+        _co_src_note = "  <sub style='color:#64748b;font-size:11px;'>📡 yfinance + FMP</sub>" if (co and _get_fmp_key()) else ""
         st.markdown(
-            f"## {name_str}{etf_badge}"
-            + (f"  [{website.replace('https://','').replace('http://','')[:35]}]({website})" if website else "")
+            f"## {name_str}{etf_badge}" + _co_src_note
+            + (f"  [{website.replace('https://','').replace('http://','')[:35]}]({website})" if website else ""),
+            unsafe_allow_html=True,
         )
 
         if co:
@@ -10121,6 +10323,12 @@ if st.session_state.get("logged_in"):
     
                 st.divider()
                 st.subheader(f"{selected_ticker} KPI 대시보드")
+                # 데이터 소스 badge
+                _src = margin_context.get("data_source", "yfinance")
+                if "FMP" in _src:
+                    st.caption("📡 데이터 소스: **yfinance** (기본) + **Financial Modeling Prep** (자동 보완)")
+                else:
+                    st.caption("📡 데이터 소스: **yfinance**")
     
                 category_order = [
                     "수익성 (Profitability)",
