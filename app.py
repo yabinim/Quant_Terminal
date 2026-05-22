@@ -3480,19 +3480,23 @@ def open_drg_predictions_worksheet():
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
         sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+    except Exception as exc:
+        return None, f"스프레드시트 접근 실패: {exc}"
+    # 탭 열기 시도 → 실패하면 무조건 생성
+    try:
         ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET_TITLE)
         return ws, None
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
-            try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET_TITLE, rows=2000, cols=len(_DRG_PREDICTIONS_SHEET_COLS))
-                ws.update([_DRG_PREDICTIONS_SHEET_COLS], range_name=f"A1:{chr(64+len(_DRG_PREDICTIONS_SHEET_COLS))}1", value_input_option="USER_ENTERED")
-                return ws, None
-            except Exception as exc2:
-                return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
-        return None, f"DRG_Predictions 시트 접근 실패: {exc}"
+    except Exception:
+        pass
+    try:
+        ncols = len(_DRG_PREDICTIONS_SHEET_COLS)
+        ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET_TITLE, rows=2000, cols=ncols)
+        ws.update([_DRG_PREDICTIONS_SHEET_COLS],
+                  range_name=f"A1:{chr(64+ncols)}1",
+                  value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc2:
+        return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
 
 
 @st.cache_data(ttl=300)
@@ -3511,12 +3515,19 @@ def _invalidate_drg_predictions_cache():
 
 
 def load_drg_predictions(user_id: str) -> pd.DataFrame:
-    """DRG_Predictions 시트에서 해당 user_id 행만 로드."""
+    """DRG_Predictions 시트에서 해당 user_id 행만 로드. 캐시 우회, 시트 직접 읽기."""
     empty = pd.DataFrame(columns=_DRG_PREDICTIONS_SHEET_COLS)
     if not user_id:
         return empty
-    rows, err = _drg_predictions_all_values_cached()
-    if err or not rows or len(rows) < 2:
+    # 캐시 우회 — 항상 시트 직접 읽기
+    try:
+        ws, err = open_drg_predictions_worksheet()
+        if err or ws is None:
+            return empty
+        rows = ws.get_all_values()
+    except Exception:
+        return empty
+    if not rows or len(rows) < 2:
         return empty
     try:
         header = [str(c).strip().lower() for c in rows[0]]
@@ -8323,10 +8334,28 @@ if st.session_state.get("logged_in"):
         st.caption("과거 AI 예측과 실제 시장 결과를 비교합니다. 예측 다음날 이후 '결과 검증' 버튼으로 실제 결과를 확인하세요.")
 
         _puid_hist = str(st.session_state.get("user_id") or "").strip()
+
+        if st.button("🔄 히스토리 새로고침", key="drg_hist_refresh_btn"):
+            st.rerun()
+
         pred_hist_df = load_drg_predictions(_puid_hist)
 
         if pred_hist_df.empty:
-            st.info("아직 AI 예측 기록이 없습니다. 위 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
+            # 원인 진단
+            _ws_diag, _err_diag = open_drg_predictions_worksheet()
+            if _err_diag:
+                st.error(f"시트 연결 실패: {_err_diag}")
+            else:
+                try:
+                    _rows_diag = _ws_diag.get_all_values()
+                    _total = len(_rows_diag) - 1 if _rows_diag and len(_rows_diag) > 1 else 0
+                    if _total > 0:
+                        _first_uid = _rows_diag[1][0] if _rows_diag[1] else "?"
+                        st.warning(f"시트에 {_total}개 행이 있지만 현재 user_id(`{_puid_hist}`)와 일치하는 행이 없습니다. 시트의 첫 데이터 user_id: `{_first_uid}`")
+                    else:
+                        st.info("아직 AI 예측 기록이 없습니다. 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
+                except Exception as _de:
+                    st.error(f"진단 오류: {_de}")
         else:
             # 적중률 요약
             verified = pred_hist_df[pred_hist_df["is_correct"].astype(str).str.strip() != ""]
