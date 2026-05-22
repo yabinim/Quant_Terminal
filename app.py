@@ -2351,23 +2351,26 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
     try:
-        etf_s = pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if 'close_df' in dir() else pd.Series(dtype=float)
-        if close_df is not None and sector_etf in close_df.columns and not etf_s.empty:
-            raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
-            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
-            if len(etf_s) >= 10 and len(vol) >= 10:
-                price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
-                vol_5d = float(vol.tail(5).mean())
-                vol_20d = float(vol.tail(20).mean())
-                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
-                dist_selling = price_5d > 0 and vol_ratio < 0.8
-                vol_alert = dist_selling or vol_ratio < 0.7
-                signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
-                details["거래량"] = {"5일 평균 비율": f"{vol_ratio:.2f}x", "가격 5일": f"{price_5d:+.1f}%", "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상")}
-                if vol_alert:
-                    warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
-            else:
-                signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+        raw_vol = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        _close_vol = get_close_prices_from_download(raw_vol)
+        etf_s = pd.to_numeric(_close_vol.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if _close_vol is not None else pd.Series(dtype=float)
+        if etf_s.empty:
+            # sector_etf 컬럼이 없으면 첫 번째 컬럼 사용
+            _cols = [c for c in (_close_vol.columns if _close_vol is not None else []) if c != "Date"]
+            if _cols:
+                etf_s = pd.to_numeric(_close_vol[_cols[0]], errors="coerce").dropna()
+        vol = pd.to_numeric(raw_vol.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna() if raw_vol is not None else pd.Series(dtype=float)
+        if len(etf_s) >= 10 and len(vol) >= 10:
+            price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
+            vol_5d = float(vol.tail(5).mean())
+            vol_20d = float(vol.tail(20).mean())
+            vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
+            dist_selling = price_5d > 0 and vol_ratio < 0.8
+            vol_alert = dist_selling or vol_ratio < 0.7
+            signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
+            details["거래량"] = {"5일 평균 비율": f"{vol_ratio:.2f}x", "가격 5일": f"{price_5d:+.1f}%", "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상")}
+            if vol_alert:
+                warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
         else:
             signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
     except Exception:
@@ -8385,11 +8388,7 @@ if st.session_state.get("logged_in"):
             _invalidate_drg_predictions_cache()
             st.rerun()
 
-        pred_hist_df = (
-            load_drg_predictions_fresh(_puid_hist)
-            if st.session_state.pop("_drg_pred_needs_refresh", False)
-            else load_drg_predictions(_puid_hist)
-        )
+        pred_hist_df = load_drg_predictions_fresh(_puid_hist)
 
         if pred_hist_df.empty:
             st.info("아직 AI 예측 기록이 없습니다. 위 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
@@ -10738,7 +10737,7 @@ if st.session_state.get("logged_in"):
             "**ID** 열에는 항상 현재 로그인 `user_id` 만 기록하고, 증권사·계좌 구분 이름은 **Account** 열에만 저장합니다."
         )
 
-        portfolio_df = load_portfolio_fresh() if st.session_state.pop("_portfolio_needs_refresh", False) else load_portfolio()
+        portfolio_df = load_portfolio_fresh()
         puid = str(st.session_state.get("user_id") or "").strip()
         if st.session_state.get("_portfolio_last_sheet_error"):
             st.warning(f"Portfolios 시트: {st.session_state['_portfolio_last_sheet_error']}")
