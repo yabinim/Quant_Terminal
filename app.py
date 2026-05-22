@@ -3475,24 +3475,30 @@ _SECTOR_BENCHMARK_ETF = {
 
 def open_drg_predictions_worksheet():
     """Quant_DB / DRG_Predictions 탭. 없으면 자동 생성."""
+    import gspread.exceptions
     gc = get_gspread_client()
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
         sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET_TITLE)
-        return ws, None
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
+        try:
+            ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET_TITLE)
+            return ws, None
+        except Exception:
+            # 탭이 없으면 생성
             try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-                ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET_TITLE, rows=2000, cols=len(_DRG_PREDICTIONS_SHEET_COLS))
-                ws.update([_DRG_PREDICTIONS_SHEET_COLS], range_name=f"A1:{chr(64+len(_DRG_PREDICTIONS_SHEET_COLS))}1", value_input_option="USER_ENTERED")
+                ncols = len(_DRG_PREDICTIONS_SHEET_COLS)
+                ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET_TITLE, rows=2000, cols=ncols)
+                ws.update(
+                    [_DRG_PREDICTIONS_SHEET_COLS],
+                    range_name=f"A1:{chr(64 + ncols)}1",
+                    value_input_option="USER_ENTERED"
+                )
                 return ws, None
             except Exception as exc2:
                 return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
-        return None, f"DRG_Predictions 시트 접근 실패: {exc}"
+    except Exception as exc:
+        return None, f"스프레드시트 접근 실패: {exc}"
 
 
 @st.cache_data(ttl=300)
@@ -8135,10 +8141,12 @@ if st.session_state.get("logged_in"):
                 # DRG_Predictions 시트에 저장
                 _pred_date_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
                 _puid_drg = str(st.session_state.get("user_id") or "").strip()
-                save_drg_prediction(
+                _save_ok, _save_err = save_drg_prediction(
                     _puid_drg, _pred_date_str, _pred_dir,
                     sector_choice, _bench_etf, _spy_close, _drg_text
                 )
+                if not _save_ok:
+                    st.warning(f"⚠️ 예측 기록 저장 실패: {_save_err}")
 
                 st.session_state["_drg_ai_result"] = _drg_text
                 st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
@@ -11026,13 +11034,17 @@ if st.session_state.get("logged_in"):
                                     if new_qty < 1e-9:
                                         upd_sell = upd_sell.drop(index=ix_sell).reset_index(drop=True)
                                         save_portfolio(upd_sell)
+                                        _portfolio_sheet_all_values_cached.clear()  # 포트폴리오 캐시 초기화
                                         realized = (sell_price_input - cur_avg_price) * sell_qty_input
                                         pnl_pct = ((sell_price_input / cur_avg_price) - 1.0) * 100.0 if cur_avg_price > 0 else 0
                                         pnl_emoji = "🟢" if realized >= 0 else "🔴"
                                         st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} 전량 매도. 평균단가 기준 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%). 포트폴리오에서 제거됩니다.")
                                     else:
-                                        upd_sell.loc[ix_sell, "Quantity"] = new_qty
+                                        upd_sell = upd_sell.copy()
+                                        upd_sell["Quantity"] = upd_sell["Quantity"].astype(object)
+                                        upd_sell.at[ix_sell, "Quantity"] = float(new_qty)
                                         save_portfolio(upd_sell)
+                                        _portfolio_sheet_all_values_cached.clear()  # 포트폴리오 캐시 초기화
                                         realized = (sell_price_input - cur_avg_price) * sell_qty_input
                                         pnl_pct = ((sell_price_input / cur_avg_price) - 1.0) * 100.0 if cur_avg_price > 0 else 0
                                         pnl_emoji = "🟢" if realized >= 0 else "🔴"
