@@ -57,6 +57,51 @@ def _notify_yfinance_fetch_failed() -> None:
     st.warning("야후 파이낸스 접속 제한으로 일부 데이터를 불러오지 못했습니다.")
 
 
+def _yf_download_with_retry(ticker, period="1mo", interval="1d", auto_adjust=True,
+                             progress=False, max_retries=3, delay=3):
+    """yf.download 래퍼 — rate limit(429) 발생 시 자동 재시도."""
+    for attempt in range(max_retries):
+        try:
+            df = yf.download(ticker, period=period, interval=interval,
+                             auto_adjust=auto_adjust, progress=progress)
+            if df is not None and not df.empty:
+                return df
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(k in err for k in ["429", "rate limit", "too many", "blocked"]):
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1))
+                    continue
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(delay)
+    return pd.DataFrame()
+
+
+def _yf_ticker_history_with_retry(ticker, period="1mo", auto_adjust=False,
+                                   max_retries=3, delay=3):
+    """yf.Ticker().history() 래퍼 — rate limit 발생 시 자동 재시도."""
+    for attempt in range(max_retries):
+        try:
+            df = yf.Ticker(ticker).history(period=period, auto_adjust=auto_adjust)
+            if df is not None and not df.empty:
+                return df
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(k in err for k in ["429", "rate limit", "too many", "blocked"]):
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1))
+                    continue
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(delay)
+    return pd.DataFrame()
+
+
 _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
 _USER_SHEET_COLS = ["ID", "Password", "Reason", "Source", "Status"]
@@ -1216,8 +1261,8 @@ def macro_traffic_light(bad_total):
 
 def fetch_yield_spread_latest():
     try:
-        tnx = yf.Ticker("^TNX").history(period="10d", auto_adjust=False)
-        irx = yf.Ticker("^IRX").history(period="10d", auto_adjust=False)
+        _yf_ticker_history_with_retry("^TNX", period="10d", auto_adjust=False)
+        _yf_ticker_history_with_retry("^IRX", period="10d", auto_adjust=False)
         t10 = get_latest_close_from_history(tnx)
         t3m = get_latest_close_from_history(irx)
         if pd.isna(t10) or pd.isna(t3m):
@@ -1246,7 +1291,7 @@ def evaluate_vix_status(vix_value):
 
 def fetch_vix_latest_and_history():
     try:
-        hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
+        _yf_ticker_history_with_retry("^VIX", period="1y", auto_adjust=False)
         cur = get_latest_close_from_history(hist)
         return cur, hist, None
     except Exception as exc:
@@ -1267,7 +1312,7 @@ def evaluate_wti_status(wti):
 
 def fetch_wti_latest():
     try:
-        o = yf.Ticker("CL=F").history(period="14d", auto_adjust=False)
+        _yf_ticker_history_with_retry("CL=F", period="14d", auto_adjust=False)
         return get_latest_close_from_history(o)
     except Exception:
         return np.nan
@@ -1344,7 +1389,7 @@ def evaluate_cpi_yoy():
 
 def fetch_dxy_latest_and_mean_deviation():
     try:
-        dxy_hist = yf.Ticker("DX-Y.NYB").history(period="400d", auto_adjust=False)
+        _yf_ticker_history_with_retry("DX-Y.NYB", period="400d", auto_adjust=False)
         cur = get_latest_close_from_history(dxy_hist)
         if dxy_hist is None or "Close" not in dxy_hist.columns:
             return np.nan, np.nan, MACRO_STATUS_NA
@@ -2104,8 +2149,8 @@ def cached_sector_etf_closes(tickers_tuple: tuple[str, ...]):
     if not tickers_tuple:
         return pd.DataFrame()
     try:
-        raw = yf.download(
-            tickers=list(tickers_tuple),
+        raw = _yf_download_with_retry(
+            tickers_tuple,
             period="2y",
             interval="1d",
             auto_adjust=False,
@@ -2280,7 +2325,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 1: VIX 방향 전환 ───────────────────────────────────────────
     try:
-        vix_hist = yf.Ticker("^VIX").history(period="1mo", auto_adjust=False)
+        vix_hist = _yf_ticker_history_with_retry("^VIX", period="1mo", auto_adjust=False)
         vix_close = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
         if len(vix_close) >= 10:
             vix_now = float(vix_close.iloc[-1])
@@ -2297,8 +2342,8 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 2: Put/Call Ratio (HYG/LQD 스프레드로 근사) ─────────────────
     try:
-        hyg = pd.to_numeric(yf.Ticker("HYG").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
-        lqd = pd.to_numeric(yf.Ticker("LQD").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        hyg = pd.to_numeric(_yf_ticker_history_with_retry("HYG", period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        lqd = pd.to_numeric(_yf_ticker_history_with_retry("LQD", period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
         if len(hyg) >= 10 and len(lqd) >= 10:
             spread_now = float(hyg.iloc[-1] / lqd.iloc[-1])
             spread_5d = float(hyg.iloc[-6] / lqd.iloc[-6]) if len(hyg) >= 6 else spread_now
@@ -2316,7 +2361,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         leader_alerts = []
         leader_details = {}
         tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
-        raw = yf.download(tickers_dl, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        raw = _yf_download_with_retry(tickers_dl, period="1mo", interval="1d", auto_adjust=False, progress=False)
         close_df = get_close_prices_from_download(raw)
 
         spy_s = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
@@ -2351,7 +2396,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
     try:
-        _vol_raw = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        _vol_raw = _yf_download_with_retry(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
         if _vol_raw is not None and not _vol_raw.empty:
             # 종가 추출
             if "Close" in _vol_raw.columns:
@@ -2399,7 +2444,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 5: VIX 선물 구조 (VIX > VXN 비율) ────────────────────────────
     try:
-        vxn = pd.to_numeric(yf.Ticker("^VXN").history(period="5d", auto_adjust=False)["Close"], errors="coerce").dropna()
+        vxn = pd.to_numeric(_yf_ticker_history_with_retry("^VXN", period="5d", auto_adjust=False)["Close"], errors="coerce").dropna()
         if not vxn.empty and "vix" in signals and signals["vix"]["value"] != "N/A":
             vix_now2 = float(vix_close.iloc[-1])
             vxn_now = float(vxn.iloc[-1])
