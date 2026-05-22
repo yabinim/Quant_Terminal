@@ -10280,7 +10280,10 @@ if st.session_state.get("logged_in"):
             "sync_tab_stock",
             [cached_evaluate_kpis_snapshot.clear, cached_etf_holdings_universe_str.clear,
              cached_build_etf_holdings_performance_pairs.clear, cached_timing_price_history.clear,
-             fetch_company_overview.clear, fetch_price_history_by_period.clear],
+             fetch_company_overview.clear, fetch_price_history_by_period.clear,
+             fmp_get_profile.clear, fmp_get_ratios.clear, fmp_get_key_metrics.clear,
+             fmp_get_financials.clear, fmp_get_earnings_surprises.clear,
+             fmp_get_institutional_holders.clear, fmp_get_short_float.clear],
             "종목별 재무·차트·회사정보 캐시를 비우고 최신 데이터를 받습니다.",
         )
         st.subheader(_MAIN_NAV_OPTIONS[5])
@@ -10288,6 +10291,117 @@ if st.session_state.get("logged_in"):
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
         )
         st.markdown(f"**분석 티커:** `{selected_ticker}`")
+
+        # ── 🛠️ FMP 진단 패널 (관리자용) ────────────────────────────────
+        with st.expander("🛠️ FMP 데이터 소스 진단 (클릭하여 확인)", expanded=False):
+            _diag_ticker = str(selected_ticker).strip().upper()
+            _fmp_diag_key = _get_fmp_key()
+            if not _fmp_diag_key:
+                st.error("❌ FMP_API_KEY 가 st.secrets 에 없습니다. Streamlit Cloud → Settings → Secrets 를 확인하세요.")
+            else:
+                st.success(f"✅ FMP_API_KEY 확인됨 (끝 4자리: ...{_fmp_diag_key[-4:]})")
+
+            if st.button("🔬 FMP 실시간 응답 테스트", key="fmp_diag_run"):
+                _diag_results = {}
+
+                with st.spinner("FMP /profile 테스트 중..."):
+                    try:
+                        _r = requests.get(
+                            f"{_FMP_BASE}/profile?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
+                            timeout=8
+                        )
+                        _diag_results["profile"] = {
+                            "status": _r.status_code,
+                            "data": _r.json()[:1] if isinstance(_r.json(), list) else _r.json(),
+                        }
+                    except Exception as _e:
+                        _diag_results["profile"] = {"error": str(_e)}
+
+                with st.spinner("FMP /ratios-ttm 테스트 중..."):
+                    try:
+                        _r = requests.get(
+                            f"{_FMP_BASE}/ratios-ttm?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
+                            timeout=8
+                        )
+                        _diag_results["ratios-ttm"] = {
+                            "status": _r.status_code,
+                            "keys": list((_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).keys())[:15],
+                            "pe": (_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).get("peRatioTTM"),
+                            "pb": (_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).get("priceToBookRatioTTM"),
+                            "ev": (_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).get("enterpriseValueMultipleTTM"),
+                            "roe": (_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).get("returnOnEquityTTM"),
+                        }
+                    except Exception as _e:
+                        _diag_results["ratios-ttm"] = {"error": str(_e)}
+
+                with st.spinner("FMP /income-statement 테스트 중..."):
+                    try:
+                        _r = requests.get(
+                            f"{_FMP_BASE}/income-statement?symbol={_diag_ticker}&period=annual&limit=1&apikey={_fmp_diag_key}",
+                            timeout=8
+                        )
+                        _item = _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}
+                        _diag_results["income-statement"] = {
+                            "status": _r.status_code,
+                            "revenue": _item.get("revenue"),
+                            "operatingIncome": _item.get("operatingIncome"),
+                            "netIncome": _item.get("netIncome"),
+                            "eps": _item.get("epsdiluted"),
+                        }
+                    except Exception as _e:
+                        _diag_results["income-statement"] = {"error": str(_e)}
+
+                with st.spinner("FMP /earnings-surprises 테스트 중..."):
+                    try:
+                        _r = requests.get(
+                            f"{_FMP_BASE}/earnings-surprises?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
+                            timeout=8
+                        )
+                        _diag_results["earnings-surprises"] = {
+                            "status": _r.status_code,
+                            "count": len(_r.json()) if isinstance(_r.json(), list) else 0,
+                            "sample": _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {},
+                        }
+                    except Exception as _e:
+                        _diag_results["earnings-surprises"] = {"error": str(_e)}
+
+                with st.spinner("FMP /institutional-holder 테스트 중..."):
+                    try:
+                        _r = requests.get(
+                            f"{_FMP_BASE}/institutional-holder?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
+                            timeout=8
+                        )
+                        _diag_results["institutional-holder"] = {
+                            "status": _r.status_code,
+                            "count": len(_r.json()) if isinstance(_r.json(), list) else 0,
+                            "sample": _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {},
+                        }
+                    except Exception as _e:
+                        _diag_results["institutional-holder"] = {"error": str(_e)}
+
+                with st.spinner("FMP /short-float 테스트 중..."):
+                    try:
+                        _r = requests.get(
+                            f"{_FMP_BASE}/short-float?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
+                            timeout=8
+                        )
+                        _diag_results["short-float"] = {
+                            "status": _r.status_code,
+                            "raw": _r.json()[:1] if isinstance(_r.json(), list) else _r.json(),
+                        }
+                    except Exception as _e:
+                        _diag_results["short-float"] = {"error": str(_e)}
+
+                # 결과 출력
+                for _ep, _res in _diag_results.items():
+                    if "error" in _res:
+                        st.error(f"❌ `/{_ep}` → 오류: {_res['error']}")
+                    elif _res.get("status") == 200 and (_res.get("count", 1) > 0 or _res.get("data") or _res.get("pe") or _res.get("revenue")):
+                        st.success(f"✅ `/{_ep}` → 응답 정상")
+                        st.json(_res)
+                    else:
+                        st.warning(f"⚠️ `/{_ep}` → HTTP {_res.get('status')} / 데이터 없음")
+                        st.json(_res)
 
         # ── 회사 기본 정보 ────────────────────────────────────────────────
         try:
