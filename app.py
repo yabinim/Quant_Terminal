@@ -50,23 +50,24 @@ if "_yf_cloud_limit_warn_shown" not in st.session_state:
 
 
 def _notify_yfinance_fetch_failed() -> None:
-    """클라우드 등에서 Yahoo 제한 시 한 세션당 한 번만 안내."""
-    if st.session_state.get("_yf_cloud_limit_warn_shown"):
-        return
-    st.session_state["_yf_cloud_limit_warn_shown"] = True
-    st.warning("야후 파이낸스 접속 제한으로 일부 데이터를 불러오지 못했습니다.")
+    """야후 파이낸스 제한 감지 — 상단 상태바가 이미 표시하므로 중복 경고 생략."""
+    # 상단 상태 표시(_check_yfinance_status)에서 이미 사용자에게 알리므로
+    # 탭별 중복 노란 경고는 표시하지 않음
+    pass
 
 
 @st.cache_data(ttl=120)
 def _check_yfinance_status() -> dict:
     """
-    SPY 최근 2일 데이터로 Yahoo Finance 연결 상태를 빠르게 체크.
+    실제 사용 패턴과 유사하게 여러 티커로 Yahoo Finance 연결 상태 체크.
     반환: {"ok": bool, "latency_ms": int, "message": str}
     """
     import time as _t
     try:
         t0 = _t.time()
-        df = yf.download("SPY", period="2d", interval="1d", progress=False, auto_adjust=True)
+        # 실제 DRG에서 쓰는 티커들로 체크 (단순 SPY 1개보다 현실적)
+        df = yf.download(["SPY", "^VIX", "HYG"], period="2d", interval="1d",
+                         progress=False, auto_adjust=True)
         elapsed = int((_t.time() - t0) * 1000)
         if df is not None and not df.empty:
             return {"ok": True, "latency_ms": elapsed, "message": f"정상 ({elapsed}ms)"}
@@ -5062,15 +5063,21 @@ def render_global_market_watch_header():
             st.markdown(f"**📊 Status:** {market_status}")
 
     # ── 야후 파이낸스 연결 상태 표시 ──────────────────────────────────
-    yf_status = _check_yfinance_status()
-    if yf_status["ok"]:
-        st.success(f"✅ Yahoo Finance 정상 연결 중 · {yf_status['message']}", icon=None)
-    else:
-        st.error(
-            f"🚫 **Yahoo Finance 접속 제한 감지** — {yf_status['message']}\n\n"
-            "일부 지표/차트가 N/A 또는 빈 값으로 표시될 수 있습니다. "
-            "**5~15분 후 동기화 버튼을 눌러주세요.**"
-        )
+    _yf_col1, _yf_col2 = st.columns([5, 1])
+    with _yf_col2:
+        if st.button("🔄 상태 확인", key="yf_status_check_btn", use_container_width=True):
+            _check_yfinance_status.clear()
+            st.rerun()
+    with _yf_col1:
+        yf_status = _check_yfinance_status()
+        if yf_status["ok"]:
+            st.success(f"✅ Yahoo Finance 정상 연결 중 · {yf_status['message']}")
+        else:
+            st.error(
+                f"🚫 **Yahoo Finance 접속 제한 감지** — {yf_status['message']}  "
+                "일부 지표/차트가 N/A로 표시될 수 있습니다. "
+                "**5~15분 후 '🔄 상태 확인' 버튼을 눌러주세요.**"
+            )
 
     st.divider()
 
