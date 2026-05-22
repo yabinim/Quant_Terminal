@@ -3361,12 +3361,37 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
 
 
 def load_portfolio():
+    return _load_portfolio_internal(use_cache=True)
+
+
+def load_portfolio_fresh():
+    """캐시 없이 시트에서 직접 읽음 — 매도/추가 직후 사용."""
+    _invalidate_portfolio_sheet_cache()
+    return _load_portfolio_internal(use_cache=False)
+
+
+def _load_portfolio_internal(use_cache: bool = True):
     base_columns = ["Account", "Ticker", "Purchase_Price", "Quantity"]
     uid = str(st.session_state.get("user_id") or "").strip()
     if not uid:
         return pd.DataFrame(columns=base_columns)
     st.session_state.pop("_portfolio_last_sheet_error", None)
-    vals, err = _portfolio_sheet_all_values_cached()
+
+    if use_cache:
+        vals, err = _portfolio_sheet_all_values_cached()
+    else:
+        # 캐시 우회 — 시트 직접 읽기
+        try:
+            ws, err = open_portfolios_worksheet()
+            if err or ws is None:
+                st.session_state["_portfolio_last_sheet_error"] = err
+                return pd.DataFrame(columns=base_columns)
+            vals = ws.get_all_values()
+            err = None
+        except Exception as exc:
+            st.session_state["_portfolio_last_sheet_error"] = str(exc)
+            return pd.DataFrame(columns=base_columns)
+
     if err:
         st.session_state["_portfolio_last_sheet_error"] = err
         return pd.DataFrame(columns=base_columns)
@@ -3518,10 +3543,30 @@ def _invalidate_drg_predictions_cache():
 
 def load_drg_predictions(user_id: str) -> pd.DataFrame:
     """DRG_Predictions 시트에서 해당 user_id 행만 로드."""
+    return _load_drg_predictions_internal(user_id, use_cache=True)
+
+
+def load_drg_predictions_fresh(user_id: str) -> pd.DataFrame:
+    """캐시 없이 직접 읽음."""
+    _invalidate_drg_predictions_cache()
+    return _load_drg_predictions_internal(user_id, use_cache=False)
+
+
+def _load_drg_predictions_internal(user_id: str, use_cache: bool = True) -> pd.DataFrame:
     empty = pd.DataFrame(columns=_DRG_PREDICTIONS_SHEET_COLS)
     if not user_id:
         return empty
-    rows, err = _drg_predictions_all_values_cached()
+    if use_cache:
+        rows, err = _drg_predictions_all_values_cached()
+    else:
+        try:
+            ws, err = open_drg_predictions_worksheet()
+            if err or ws is None:
+                return empty
+            rows = ws.get_all_values()
+            err = None
+        except Exception:
+            return empty
     if err or not rows or len(rows) < 2:
         return empty
     try:
@@ -8148,7 +8193,8 @@ if st.session_state.get("logged_in"):
                 if not _save_ok:
                     st.warning(f"⚠️ 예측 기록 저장 실패: {_save_err}")
                 else:
-                    _invalidate_drg_predictions_cache()  # 저장 후 캐시 강제 클리어
+                    _invalidate_drg_predictions_cache()
+                    st.session_state["_drg_pred_needs_refresh"] = True
 
                 st.session_state["_drg_ai_result"] = _drg_text
                 st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
@@ -8339,7 +8385,11 @@ if st.session_state.get("logged_in"):
             _invalidate_drg_predictions_cache()
             st.rerun()
 
-        pred_hist_df = load_drg_predictions(_puid_hist)
+        pred_hist_df = (
+            load_drg_predictions_fresh(_puid_hist)
+            if st.session_state.pop("_drg_pred_needs_refresh", False)
+            else load_drg_predictions(_puid_hist)
+        )
 
         if pred_hist_df.empty:
             st.info("아직 AI 예측 기록이 없습니다. 위 'AI 내일 시장 예측 실행' 버튼을 누르면 자동으로 기록됩니다.")
@@ -10688,7 +10738,7 @@ if st.session_state.get("logged_in"):
             "**ID** 열에는 항상 현재 로그인 `user_id` 만 기록하고, 증권사·계좌 구분 이름은 **Account** 열에만 저장합니다."
         )
 
-        portfolio_df = load_portfolio()
+        portfolio_df = load_portfolio_fresh() if st.session_state.pop("_portfolio_needs_refresh", False) else load_portfolio()
         puid = str(st.session_state.get("user_id") or "").strip()
         if st.session_state.get("_portfolio_last_sheet_error"):
             st.warning(f"Portfolios 시트: {st.session_state['_portfolio_last_sheet_error']}")
@@ -10825,6 +10875,7 @@ if st.session_state.get("logged_in"):
                                             f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
                                             f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
                                         )
+                                        st.session_state["_portfolio_needs_refresh"] = True
                                         st.rerun()
                                 else:
                                     updated_df = pd.concat(
@@ -10860,6 +10911,7 @@ if st.session_state.get("logged_in"):
                                                 matched["narrative_date"],
                                             )
                                     st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다. (시트 ID={puid})")
+                                    st.session_state["_portfolio_needs_refresh"] = True
                                     st.rerun()
 
         with st.expander("데이터 수정하기", expanded=False):
@@ -10976,6 +11028,7 @@ if st.session_state.get("logged_in"):
                                 st.error(derr)
                             else:
                                 st.success(f"{del_account} / {del_target} 종목을 삭제했습니다.")
+                                st.session_state["_portfolio_needs_refresh"] = True
                             st.rerun()
 
         st.markdown("### 💸 매도 기록")
@@ -11058,6 +11111,7 @@ if st.session_state.get("logged_in"):
                                         pnl_emoji = "🟢" if realized >= 0 else "🔴"
                                         st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} {sell_qty_input:g}주 매도. 잔여 {new_qty:g}주 | 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%)")
                                 _invalidate_portfolio_sheet_cache()
+                                st.session_state["_portfolio_needs_refresh"] = True
                                 st.rerun()
 
         st.divider()
