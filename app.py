@@ -3497,18 +3497,37 @@ def load_trade_history(user_id: str) -> pd.DataFrame:
     if not user_id:
         return empty
     rows, err = _trade_history_all_values_cached()
-    if err or not rows or len(rows) < 2:
+    if err or not rows:
         return empty
-    try:
-        df = pd.DataFrame(rows[1:], columns=[str(c).strip().lower() for c in rows[0]])
-    except Exception:
-        return empty
-    # 컬럼 정규화
-    col_map = {c: s for c in df.columns for s in _TRADE_HISTORY_SHEET_COLS if c == s.lower()}
-    df = df.rename(columns=col_map)
+
+    # 헤더가 없거나 비어있으면 자동으로 표준 헤더로 간주
+    first_row_lower = [str(c).strip().lower() for c in rows[0]]
+    has_valid_header = any(c in _TRADE_HISTORY_SHEET_COLS for c in first_row_lower)
+
+    if not has_valid_header or len(rows) < 2:
+        # 헤더 없이 데이터만 있는 경우 — 컬럼 수로 맞추기
+        data_rows = rows if not has_valid_header else rows[1:]
+        if not data_rows:
+            return empty
+        try:
+            ncols = max(len(r) for r in data_rows)
+            cols = _TRADE_HISTORY_SHEET_COLS[:ncols]
+            df = pd.DataFrame([r[:ncols] for r in data_rows], columns=cols)
+        except Exception:
+            return empty
+    else:
+        try:
+            df = pd.DataFrame(rows[1:], columns=first_row_lower)
+        except Exception:
+            return empty
+        # 컬럼 정규화 (대소문자 불일치 보정)
+        col_map = {c: s for c in df.columns for s in _TRADE_HISTORY_SHEET_COLS if c == s.lower()}
+        df = df.rename(columns=col_map)
+
     for c in _TRADE_HISTORY_SHEET_COLS:
         if c not in df.columns:
             df[c] = ""
+
     df = df[df["user_id"].astype(str).str.strip() == str(user_id).strip()]
     df = df[_TRADE_HISTORY_SHEET_COLS].copy().reset_index(drop=True)
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
@@ -10545,6 +10564,42 @@ if st.session_state.get("logged_in"):
                                         )
                                         st.rerun()
 
+        with st.expander("🗑️ 종목 삭제 (매도 기록 없이 포지션 제거)", expanded=False):
+            st.caption("매도 기록 없이 포지션만 제거합니다. 실현 손익 추적이 필요하면 아래 '매도 기록'을 이용하세요.")
+            if portfolio_df.empty:
+                st.info("삭제할 종목이 없습니다.")
+            else:
+                del_col1, del_col2, del_col3 = st.columns([1.4, 1.4, 1.0])
+                with del_col1:
+                    del_acct_opts = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist())
+                    del_account = st.selectbox(
+                        "삭제할 계좌 선택",
+                        options=del_acct_opts if del_acct_opts else ["(등록된 계좌 없음)"],
+                        key="portfolio_delete_account_select",
+                    )
+                with del_col2:
+                    del_cand = portfolio_df[portfolio_df["Account"] == del_account].copy() if del_acct_opts else pd.DataFrame()
+                    del_ticker_opts = del_cand["Ticker"].dropna().astype(str).tolist() if not del_cand.empty else []
+                    del_target = st.selectbox(
+                        "삭제할 티커 선택",
+                        options=del_ticker_opts if del_ticker_opts else ["(등록된 티커 없음)"],
+                        key="portfolio_delete_select",
+                    )
+                with del_col3:
+                    st.write("")
+                    st.write("")
+                    if st.button("선택 종목 삭제", use_container_width=True, type="primary"):
+                        if del_account == "(등록된 계좌 없음)" or del_target == "(등록된 티커 없음)":
+                            st.info("삭제할 계좌/종목을 선택해주세요.")
+                        else:
+                            uid_del = str(st.session_state.get("user_id") or "").strip()
+                            ok_del, derr = delete_portfolio_sheet_row(uid_del, del_account, del_target)
+                            if not ok_del:
+                                st.error(derr)
+                            else:
+                                st.success(f"{del_account} / {del_target} 종목을 삭제했습니다.")
+                            st.rerun()
+
         st.markdown("### 💸 매도 기록")
         with st.expander("매도 기록 (부분 매도 포함)", expanded=False):
             if portfolio_df.empty:
@@ -10622,44 +10677,6 @@ if st.session_state.get("logged_in"):
                                         st.success(f"{pnl_emoji} {sell_acct_sel}/{sell_ticker_sel} {sell_qty_input:g}주 매도. 잔여 {new_qty:g}주 | 손익: ${realized:+,.2f} ({pnl_pct:+.2f}%)")
                                 st.rerun()
 
-        st.markdown("### 포트폴리오 종목 삭제")
-        delete_col1, delete_col2, delete_col3 = st.columns([1.4, 1.4, 1.0])
-        with delete_col1:
-            delete_account_options = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist()) if not portfolio_df.empty else []
-            delete_account = st.selectbox(
-                "삭제할 계좌 선택",
-                options=delete_account_options if delete_account_options else ["(등록된 계좌 없음)"],
-                index=0,
-                key="portfolio_delete_account_select",
-            )
-        with delete_col2:
-            candidate_df = portfolio_df[portfolio_df["Account"] == delete_account].copy() if not portfolio_df.empty else pd.DataFrame()
-            ticker_options = candidate_df["Ticker"].dropna().astype(str).tolist() if not candidate_df.empty else []
-            delete_target = st.selectbox(
-                "삭제할 티커 선택",
-                options=ticker_options if ticker_options else ["(등록된 티커 없음)"],
-                index=0,
-                key="portfolio_delete_select",
-            )
-        with delete_col3:
-            st.write("")
-            st.write("")
-            if st.button("선택 종목 삭제", use_container_width=True):
-                if portfolio_df.empty:
-                    st.info("삭제할 종목이 없습니다.")
-                elif delete_account == "(등록된 계좌 없음)":
-                    st.info("삭제할 계좌가 없습니다.")
-                elif delete_target == "(등록된 티커 없음)":
-                    st.info("삭제할 종목이 없습니다.")
-                else:
-                    uid_del = str(st.session_state.get("user_id") or "").strip()
-                    ok_del, derr = delete_portfolio_sheet_row(uid_del, delete_account, delete_target)
-                    if not ok_del:
-                        st.error(derr)
-                    else:
-                        st.success(f"{delete_account} / {delete_target} 종목을 삭제했습니다.")
-                    st.rerun()
-    
         st.divider()
         if filtered_portfolio_df.empty:
             st.info("조건에 맞는 포트폴리오가 없습니다. 계좌 필터를 변경하거나 상단에서 종목을 추가해주세요.")
