@@ -2821,6 +2821,142 @@ def fmp_get_key_metrics(ticker_upper: str) -> dict:
         return {}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fmp_get_earnings_surprises(ticker_upper: str) -> pd.DataFrame:
+    """
+    FMP /earnings-surprises → 분기별 EPS Actual vs Estimate.
+    컬럼: date, quarter, fiscalYear, estimatedEps, actualEarningResult, surprisePercent
+    실패 시 빈 DataFrame.
+    """
+    key = _get_fmp_key()
+    if not key:
+        return pd.DataFrame()
+    try:
+        url = f"{_FMP_BASE}/earnings-surprises?symbol={ticker_upper}&apikey={key}"
+        resp = requests.get(url, timeout=_FMP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list) or not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data[:8])  # 최근 8분기
+        # 핵심 컬럼만 추려서 정리
+        col_map = {
+            "date": "분기",
+            "fiscalYear": "회계연도",
+            "quarter": "분기",
+            "estimatedEps": "추정 EPS",
+            "actualEarningResult": "실제 EPS",
+            "surprisePercent": "Surprise(%)",
+        }
+        rename = {k: v for k, v in col_map.items() if k in df.columns}
+        df = df.rename(columns=rename)
+        # date → 분기 처리
+        if "date" in df.columns and "분기" not in df.columns:
+            df["분기"] = df["date"].astype(str).str[:10]
+        elif "분기" in df.columns:
+            df["분기"] = df["분기"].astype(str).str[:10]
+        # Surprise% 반올림
+        if "Surprise(%)" in df.columns:
+            df["Surprise(%)"] = pd.to_numeric(df["Surprise(%)"], errors="coerce").round(2)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fmp_get_institutional_holders(ticker_upper: str) -> pd.DataFrame:
+    """
+    FMP /institutional-holder → 기관 투자자 상위 보유 목록.
+    컬럼: holder, shares, dateReported, change, weightPercent
+    실패 시 빈 DataFrame.
+    """
+    key = _get_fmp_key()
+    if not key:
+        return pd.DataFrame()
+    try:
+        url = f"{_FMP_BASE}/institutional-holder?symbol={ticker_upper}&apikey={key}"
+        resp = requests.get(url, timeout=_FMP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list) or not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data[:10])
+        col_map = {
+            "holder": "기관명",
+            "shares": "보유 주식수",
+            "dateReported": "보고일",
+            "change": "변동",
+            "weightPercent": "비중(%)",
+        }
+        rename = {k: v for k, v in col_map.items() if k in df.columns}
+        df = df.rename(columns=rename)
+        if "보유 주식수" in df.columns:
+            df["보유 주식수"] = pd.to_numeric(df["보유 주식수"], errors="coerce").apply(
+                lambda x: f"{int(x):,}" if pd.notna(x) else "N/A"
+            )
+        if "변동" in df.columns:
+            df["변동"] = pd.to_numeric(df["변동"], errors="coerce").apply(
+                lambda x: f"+{int(x):,}" if pd.notna(x) and x > 0 else (f"{int(x):,}" if pd.notna(x) else "N/A")
+            )
+        if "비중(%)" in df.columns:
+            df["비중(%)"] = pd.to_numeric(df["비중(%)"], errors="coerce").round(4)
+        return df[list(rename.values())].dropna(how="all") if rename else df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fmp_get_short_float(ticker_upper: str) -> dict:
+    """
+    FMP /short-float → 공매도 비율·Days to Cover.
+    반환 키: short_pct, days_to_cover, shares_short, squeeze_risk
+    실패 시 빈 dict.
+    """
+    key = _get_fmp_key()
+    if not key:
+        return {}
+    try:
+        url = f"{_FMP_BASE}/short-float?symbol={ticker_upper}&apikey={key}"
+        resp = requests.get(url, timeout=_FMP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+        if not isinstance(item, dict):
+            return {}
+
+        # FMP 필드: shortFloat (%), shortRatio (days), shortOutstanding
+        short_pct_raw = to_float(item.get("shortFloat") or item.get("shortPercentFloat"))
+        short_ratio = to_float(item.get("shortRatio") or item.get("daysTocover") or item.get("daysToCover"))
+        shares_short = to_float(item.get("shortOutstanding") or item.get("sharesShort"))
+
+        # shortFloat가 이미 % 단위인지 소수인지 판단
+        if short_pct_raw is not None and short_pct_raw <= 1.0:
+            short_pct = round(float(short_pct_raw) * 100, 2)
+        elif short_pct_raw is not None:
+            short_pct = round(float(short_pct_raw), 2)
+        else:
+            short_pct = None
+
+        squeeze_risk = "N/A"
+        if short_pct is not None:
+            if short_pct >= 20:
+                squeeze_risk = "🔥 높음 (Short Squeeze 주의)"
+            elif short_pct >= 10:
+                squeeze_risk = "⚠️ 중간"
+            else:
+                squeeze_risk = "✅ 낮음"
+
+        return {
+            "short_pct": short_pct,
+            "days_to_cover": round(float(short_ratio), 1) if pd.notna(short_ratio) else None,
+            "shares_short": int(shares_short) if pd.notna(shares_short) else None,
+            "squeeze_risk": squeeze_risk,
+            "_source": "FMP",
+        }
+    except Exception:
+        return {}
+
+
 def _fmp_patch_info(info: dict, ticker_upper: str) -> dict:
     """
     yfinance info dict에 누락된 필드가 있을 때 FMP 데이터로 채워 반환.
@@ -2876,30 +3012,51 @@ def _fmp_patch_info(info: dict, ticker_upper: str) -> dict:
     if need_ratios:
         rat = fmp_get_ratios(ticker_upper)
         if rat:
+            # FMP stable /ratios-ttm 실제 필드명
+            # peRatioTTM, priceToBookRatioTTM, enterpriseValueMultipleTTM,
+            # pegRatioTTM, returnOnEquityTTM, operatingProfitMarginTTM, debtToEquityTTM
             if not info.get("trailingPE"):
-                info.setdefault("trailingPE", rat.get("peRatioTTM"))
+                _pe = to_float(rat.get("peRatioTTM") or rat.get("peRatio") or rat.get("priceEarningsRatioTTM"))
+                if pd.notna(_pe) and _pe > 0:
+                    info["trailingPE"] = _pe
             if not info.get("forwardPE"):
-                info.setdefault("forwardPE", rat.get("forwardPE"))
+                _fpe = to_float(rat.get("priceEarningsToGrowthRatioTTM"))  # FMP에서 forwardPE 없을 때 근사
+                # forwardPE는 profile에 있을 수 있음 (이미 위에서 처리)
             if not info.get("priceToBook"):
-                info.setdefault("priceToBook", rat.get("priceToBookRatioTTM"))
+                _pb = to_float(rat.get("priceToBookRatioTTM") or rat.get("priceBookValueRatioTTM"))
+                if pd.notna(_pb):
+                    info["priceToBook"] = _pb
             if not info.get("enterpriseToEbitda"):
-                info.setdefault("enterpriseToEbitda", rat.get("enterpriseValueMultipleTTM"))
+                _ev = to_float(rat.get("enterpriseValueMultipleTTM") or rat.get("evToEbitdaTTM") or rat.get("enterpriseValueEbitdaTTM"))
+                if pd.notna(_ev):
+                    info["enterpriseToEbitda"] = _ev
             if not info.get("pegRatio"):
-                info.setdefault("pegRatio", rat.get("pegRatioTTM"))
+                _peg = to_float(rat.get("pegRatioTTM") or rat.get("priceEarningsToGrowthRatioTTM"))
+                if pd.notna(_peg):
+                    info["pegRatio"] = _peg
             if not info.get("returnOnEquity"):
-                info.setdefault("returnOnEquity", rat.get("returnOnEquityTTM"))
+                _roe = to_float(rat.get("returnOnEquityTTM"))
+                if pd.notna(_roe):
+                    info["returnOnEquity"] = _roe
             if not info.get("operatingMargins"):
-                info.setdefault("operatingMargins", rat.get("operatingProfitMarginTTM"))
+                _om = to_float(rat.get("operatingProfitMarginTTM") or rat.get("operatingIncomeRatioTTM"))
+                if pd.notna(_om):
+                    info["operatingMargins"] = _om
             if not info.get("debtToEquity"):
-                # FMP debtToEquity는 소수 (0.5 = 50%) → yfinance 단위(100배)로 맞춤
-                dte = to_float(rat.get("debtToEquityTTM"))
-                if pd.notna(dte):
-                    info.setdefault("debtToEquity", dte * 100)
+                _dte = to_float(rat.get("debtToEquityTTM") or rat.get("debtEquityRatioTTM"))
+                if pd.notna(_dte):
+                    # FMP 단위 확인: >10이면 이미 100배 단위, ≤10이면 소수 → 100배 변환
+                    info["debtToEquity"] = _dte if _dte > 10 else _dte * 100
 
         km = fmp_get_key_metrics(ticker_upper)
         if km:
             if not info.get("trailingEps"):
-                info.setdefault("trailingEps", km.get("netIncomePerShareTTM"))
+                _eps = to_float(km.get("netIncomePerShareTTM") or km.get("epsTTM"))
+                if pd.notna(_eps):
+                    info["trailingEps"] = _eps
+            if not info.get("earningsGrowth"):
+                _eg = to_float(km.get("earningsYieldTTM"))  # 근사 사용
+                # earningsGrowth는 별도 income-statement에서 계산하는 게 정확하므로 생략
 
     return info
 
@@ -10587,6 +10744,13 @@ if st.session_state.get("logged_in"):
                 with st.spinner("어닝 데이터 불러오는 중..."):
                     earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
 
+                # yfinance 실패 시 FMP fallback
+                if earn_df.empty:
+                    with st.spinner("FMP에서 어닝 데이터 조회 중..."):
+                        earn_df = fmp_get_earnings_surprises(str(selected_ticker).strip().upper())
+                    if not earn_df.empty:
+                        st.caption("📡 데이터 소스: Financial Modeling Prep (FMP)")
+
                 if earn_df.empty:
                     st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
                 else:
@@ -10637,11 +10801,21 @@ if st.session_state.get("logged_in"):
                 with st.spinner("기관 보유 데이터 불러오는 중..."):
                     inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
 
+                # yfinance 실패 시 FMP fallback
+                _inst_src = "yfinance"
+                if inst_df.empty:
+                    with st.spinner("FMP에서 기관 보유 데이터 조회 중..."):
+                        inst_df = fmp_get_institutional_holders(str(selected_ticker).strip().upper())
+                    if not inst_df.empty:
+                        _inst_src = "FMP"
+
                 if inst_df.empty:
                     st.info("기관 보유 데이터를 가져오지 못했습니다.")
                 else:
+                    if _inst_src == "FMP":
+                        st.caption("📡 데이터 소스: Financial Modeling Prep (FMP)")
                     inst_df.columns = [str(c).strip() for c in inst_df.columns]
-                    pct_col = next((c for c in inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
+                    pct_col = next((c for c in inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower() or "비중" in c.lower()), None)
                     if pct_col:
                         inst_df[pct_col] = pd.to_numeric(inst_df[pct_col], errors="coerce")
                         total_inst = inst_df[pct_col].sum() * 100 if inst_df[pct_col].max() <= 1 else inst_df[pct_col].sum()
@@ -10659,6 +10833,14 @@ if st.session_state.get("logged_in"):
                     short_data = fetch_short_interest(str(selected_ticker).strip().upper())
                     if short_data is None:
                         short_data = {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
+
+                # yfinance에서 short_pct를 못 가져왔으면 FMP fallback
+                if not short_data.get("short_pct"):
+                    with st.spinner("FMP에서 공매도 데이터 조회 중..."):
+                        fmp_short = fmp_get_short_float(str(selected_ticker).strip().upper())
+                    if fmp_short.get("short_pct"):
+                        short_data = fmp_short
+                        st.caption("📡 데이터 소스: Financial Modeling Prep (FMP)")
 
                 si_c1, si_c2, si_c3 = st.columns(3)
                 with si_c1:
