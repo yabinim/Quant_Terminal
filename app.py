@@ -57,6 +57,27 @@ def _notify_yfinance_fetch_failed() -> None:
     st.warning("야후 파이낸스 접속 제한으로 일부 데이터를 불러오지 못했습니다.")
 
 
+@st.cache_data(ttl=120)
+def _check_yfinance_status() -> dict:
+    """
+    SPY 최근 2일 데이터로 Yahoo Finance 연결 상태를 빠르게 체크.
+    반환: {"ok": bool, "latency_ms": int, "message": str}
+    """
+    import time as _t
+    try:
+        t0 = _t.time()
+        df = yf.download("SPY", period="2d", interval="1d", progress=False, auto_adjust=True)
+        elapsed = int((_t.time() - t0) * 1000)
+        if df is not None and not df.empty:
+            return {"ok": True, "latency_ms": elapsed, "message": f"정상 ({elapsed}ms)"}
+        return {"ok": False, "latency_ms": elapsed, "message": "데이터 없음 — 제한 가능성"}
+    except Exception as exc:
+        err = str(exc).lower()
+        if any(k in err for k in ["429", "rate limit", "too many", "blocked"]):
+            return {"ok": False, "latency_ms": -1, "message": "🚫 Rate Limit 감지"}
+        return {"ok": False, "latency_ms": -1, "message": f"연결 오류: {str(exc)[:60]}"}
+
+
 def _yf_download_with_retry(ticker, period="1mo", interval="1d", auto_adjust=True,
                              progress=False, max_retries=3, delay=3):
     """yf.download 래퍼 — rate limit(429) 발생 시 자동 재시도."""
@@ -5040,6 +5061,17 @@ def render_global_market_watch_header():
         else:
             st.markdown(f"**📊 Status:** {market_status}")
 
+    # ── 야후 파이낸스 연결 상태 표시 ──────────────────────────────────
+    yf_status = _check_yfinance_status()
+    if yf_status["ok"]:
+        st.success(f"✅ Yahoo Finance 정상 연결 중 · {yf_status['message']}", icon=None)
+    else:
+        st.error(
+            f"🚫 **Yahoo Finance 접속 제한 감지** — {yf_status['message']}\n\n"
+            "일부 지표/차트가 N/A 또는 빈 값으로 표시될 수 있습니다. "
+            "**5~15분 후 동기화 버튼을 눌러주세요.**"
+        )
+
     st.divider()
 
 
@@ -8023,8 +8055,11 @@ if st.session_state.get("logged_in"):
         with drg_col2:
             st.caption(f"선택 섹터: **{sector_choice}** | 30분 캐시")
 
-        if st.button("🔄 지금 스캔", key="drg_refresh_btn", use_container_width=True):
+        if st.button("🔄 지금 스캔 (캐시 초기화 후 재분석)", key="drg_refresh_btn", use_container_width=True):
             compute_daily_risk_gauge.clear()
+            _check_yfinance_status.clear()
+            st.session_state.pop("_yf_cloud_limit_warn_shown", None)
+            st.rerun()
 
         with st.spinner("선행 지표 5가지 분석 중..."):
             drg = compute_daily_risk_gauge(sector_filter=sector_choice)
