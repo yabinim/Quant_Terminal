@@ -2312,12 +2312,29 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         signals["credit"] = {"ok": True, "value": "N/A", "trend": ""}
 
     # ── 신호 3: 대장주 모멘텀 약화 ─────────────────────────────────────
+    # sector_etf도 tickers_dl에 포함시켜 신호 4 거래량 계산에 재사용
+    raw = None
+    close_df = None
+    _raw_volume_df = pd.DataFrame()  # 신호 4에서 재사용할 Volume 데이터
     try:
         leader_alerts = []
         leader_details = {}
-        tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
+        tickers_dl = list(dict.fromkeys(leaders + ["SPY", sector_etf]))
         raw = yf.download(tickers_dl, period="1mo", interval="1d", auto_adjust=False, progress=False)
         close_df = get_close_prices_from_download(raw)
+
+        # ── Volume 추출 (멀티인덱스 / 단일인덱스 모두 대응) ──────────────
+        if raw is not None and not raw.empty:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if "Volume" in raw.columns.get_level_values(0):
+                    _raw_volume_df = raw["Volume"].copy()
+            else:
+                vol_cols = [c for c in raw.columns if str(c).lower() == "volume"]
+                if vol_cols:
+                    # 단일 ticker 다운로드 시 컬럼명이 "Volume" 하나
+                    _raw_volume_df = raw[vol_cols].copy()
+                    if len(tickers_dl) == 1:
+                        _raw_volume_df.columns = [tickers_dl[0]]
 
         spy_s = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
         spy_5d = float((spy_s.iloc[-1]/spy_s.iloc[-6] - 1)*100) if len(spy_s) >= 6 else 0
@@ -2350,24 +2367,34 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         signals["leaders"] = {"ok": True, "value": "N/A", "trend": ""}
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
+    # 신호 3에서 이미 다운받은 raw/_raw_volume_df를 재사용 → 추가 API 호출 없음
     try:
-        etf_s = pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if 'close_df' in dir() else pd.Series(dtype=float)
-        if close_df is not None and sector_etf in close_df.columns and not etf_s.empty:
-            raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
-            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
-            if len(etf_s) >= 10 and len(vol) >= 10:
-                price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
-                vol_5d = float(vol.tail(5).mean())
-                vol_20d = float(vol.tail(20).mean())
-                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
-                dist_selling = price_5d > 0 and vol_ratio < 0.8
-                vol_alert = dist_selling or vol_ratio < 0.7
-                signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
-                details["거래량"] = {"5일 평균 비율": f"{vol_ratio:.2f}x", "가격 5일": f"{price_5d:+.1f}%", "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상")}
-                if vol_alert:
-                    warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
-            else:
-                signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+        etf_s = (
+            pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna()
+            if close_df is not None and sector_etf in close_df.columns
+            else pd.Series(dtype=float)
+        )
+
+        # sector_etf Volume 시리즈 추출
+        vol = pd.Series(dtype=float)
+        if not _raw_volume_df.empty and sector_etf in _raw_volume_df.columns:
+            vol = pd.to_numeric(_raw_volume_df[sector_etf], errors="coerce").dropna()
+
+        if not etf_s.empty and len(etf_s) >= 10 and len(vol) >= 10:
+            price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
+            vol_5d = float(vol.tail(5).mean())
+            vol_20d = float(vol.tail(20).mean())
+            vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
+            dist_selling = price_5d > 0 and vol_ratio < 0.8
+            vol_alert = dist_selling or vol_ratio < 0.7
+            signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
+            details["거래량"] = {
+                "5일 평균 비율": f"{vol_ratio:.2f}x",
+                "가격 5일": f"{price_5d:+.1f}%",
+                "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상"),
+            }
+            if vol_alert:
+                warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
         else:
             signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
     except Exception:
