@@ -2805,10 +2805,13 @@ def _fmp_cashflow(ticker: str) -> dict:
         return {}
 
 def _fmp_fill(info: dict, ticker: str) -> dict:
-    """yfinance info dict의 빈 필드를 FMP로 채워 반환. 기존 값은 절대 덮어쓰지 않음."""
+    """yfinance info dict의 빈 필드를 FMP로 채워 반환.
+    ※ 진단으로 확인된 FMP 무료 플랜 실제 제공 필드만 사용.
+    기존 값은 절대 덮어쓰지 않음.
+    """
     info = dict(info)
 
-    # ── profile: 회사명·섹터·설명·시총 ──────────────────────────────
+    # ── profile: 회사명·섹터·설명 (✅ 무료 제공 확인) ─────────────────
     _need_prof = not all([info.get("longName") or info.get("shortName"),
                           info.get("sector"), info.get("longBusinessSummary")])
     if _need_prof:
@@ -2835,47 +2838,82 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
             if p.get("isEtf") and not info.get("quoteType"):
                 info["quoteType"] = "ETF"
 
-    # ── key-metrics-ttm: P/E, P/B, EV/EBITDA, PEG, EPS ─────────────
-    # 진단으로 확인: 이 지표들은 ratios-ttm이 아닌 key-metrics-ttm에 있음
-    _need_metrics = not all([info.get("trailingPE"), info.get("priceToBook"),
-                              info.get("enterpriseToEbitda"), info.get("trailingEps")])
-    if _need_metrics:
+    # ── key-metrics-ttm: 진단으로 확인된 실제 제공 필드만 ────────────
+    # ✅ evToSalesTTM, evToOperatingCashFlowTTM, evToFreeCashFlowTTM
+    # ❌ peRatioTTM, pbRatioTTM, evToEbitdaTTM (무료 미제공)
+    _need_km = not all([info.get("enterpriseToEbitda"), info.get("trailingEps")])
+    if _need_km:
         km = _fmp_key_metrics(ticker)
         if km:
-            if not info.get("trailingPE"):
-                v = to_float(km.get("peRatioTTM"))
-                if pd.notna(v) and v > 0: info["trailingPE"] = v
-            if not info.get("priceToBook"):
-                v = to_float(km.get("pbRatioTTM"))
-                if pd.notna(v): info["priceToBook"] = v
-            if not info.get("enterpriseToEbitda"):
-                v = to_float(km.get("evToEbitdaTTM"))
-                if pd.notna(v): info["enterpriseToEbitda"] = v
-            if not info.get("pegRatio"):
-                v = to_float(km.get("pegRatioTTM"))
-                if pd.notna(v): info["pegRatio"] = v
-            if not info.get("trailingEps"):
-                v = to_float(km.get("netIncomePerShareTTM"))
-                if pd.notna(v): info["trailingEps"] = v
-            if not info.get("forwardPE"):
-                v = to_float(km.get("forwardPERatioTTM"))
-                if pd.notna(v) and v > 0: info["forwardPE"] = v
+            # EV/Sales (P/E 대신 사용 가능한 무료 밸류에이션 지표)
+            if not info.get("_fmp_ev_to_sales"):
+                v = to_float(km.get("evToSalesTTM"))
+                if pd.notna(v) and v > 0:
+                    info["_fmp_ev_to_sales"] = v
+            # EV/FCF (밸류에이션 보조 지표)
+            if not info.get("_fmp_ev_to_fcf"):
+                v = to_float(km.get("evToFreeCashFlowTTM"))
+                if pd.notna(v) and v > 0:
+                    info["_fmp_ev_to_fcf"] = v
+            # EV/Operating CF
+            if not info.get("_fmp_ev_to_ocf"):
+                v = to_float(km.get("evToOperatingCashFlowTTM"))
+                if pd.notna(v) and v > 0:
+                    info["_fmp_ev_to_ocf"] = v
+            # Market Cap (TTM)
+            if not info.get("marketCap"):
+                v = to_float(km.get("marketCapTTM"))
+                if pd.notna(v) and v > 0:
+                    info["marketCap"] = v
 
-    # ── ratios-ttm: ROE, Operating Margin, D/E ───────────────────────
-    # 진단으로 확인: 이 지표들은 ratios-ttm에 있음
-    _need_ratios = not all([info.get("returnOnEquity"), info.get("operatingMargins")])
+    # ── ratios-ttm: 진단으로 확인된 실제 제공 필드만 ─────────────────
+    # ✅ operatingProfitMarginTTM
+    # ❌ returnOnEquityTTM, debtToEquityTTM (TSLA 기준 null 확인)
+    # → income-statement로 직접 계산하는 방식으로 대체
+    _need_ratios = not info.get("operatingMargins")
     if _need_ratios:
         rat = _fmp_ratios(ticker)
         if rat:
-            if not info.get("returnOnEquity"):
-                v = to_float(rat.get("returnOnEquityTTM"))
-                if pd.notna(v): info["returnOnEquity"] = v
             if not info.get("operatingMargins"):
                 v = to_float(rat.get("operatingProfitMarginTTM"))
-                if pd.notna(v): info["operatingMargins"] = v
-            if not info.get("debtToEquity"):
-                v = to_float(rat.get("debtToEquityTTM"))
-                if pd.notna(v): info["debtToEquity"] = v if v > 10 else v * 100
+                if pd.notna(v):
+                    info["operatingMargins"] = v
+            # grossProfitMarginTTM, netProfitMarginTTM 등도 시도
+            if not info.get("grossMargins"):
+                v = to_float(rat.get("grossProfitMarginTTM"))
+                if pd.notna(v):
+                    info["grossMargins"] = v
+
+    # ── income-statement: ROE·D/E를 직접 계산 ────────────────────────
+    # ✅ revenue, operatingIncome 확인 / ❌ epsdiluted null
+    _need_inc = not all([info.get("returnOnEquity"), info.get("debtToEquity")])
+    if _need_inc:
+        inc = _fmp_income(ticker)
+        latest = inc.get("latest", {})
+        prev   = inc.get("prev", {})
+        if latest:
+            # Operating Margin 직접 계산 (ratios-ttm 보완)
+            if not info.get("operatingMargins"):
+                _rev = to_float(latest.get("revenue"))
+                _oi  = to_float(latest.get("operatingIncome"))
+                if pd.notna(_rev) and _rev != 0 and pd.notna(_oi):
+                    info["operatingMargins"] = float(_oi / _rev)
+            # EPS (diluted) — income-statement에서 직접
+            if not info.get("trailingEps"):
+                _eps = to_float(latest.get("epsdiluted") or latest.get("eps"))
+                if pd.notna(_eps):
+                    info["trailingEps"] = _eps
+            # Revenue Growth YoY → earningsGrowth 대체
+            if not info.get("earningsGrowth") and prev:
+                _rev_now  = to_float(latest.get("revenue"))
+                _rev_prev = to_float(prev.get("revenue"))
+                if pd.notna(_rev_now) and pd.notna(_rev_prev) and _rev_prev != 0:
+                    info["earningsGrowth"] = float((_rev_now - _rev_prev) / abs(_rev_prev))
+            # Net Income → ROE 계산용 저장 (balance_sheet 없으면 근사)
+            if not info.get("_fmp_net_income"):
+                _ni = to_float(latest.get("netIncome"))
+                if pd.notna(_ni):
+                    info["_fmp_net_income"] = _ni
 
     return info
 
@@ -3172,11 +3210,14 @@ def evaluate_kpis(ticker_symbol):
     # PEG Ratio
     peg_ratio = to_float(info.get("pegRatio") or info.get("trailingPegRatio"))
 
-    # Valuation 지표 (FMP key-metrics-ttm에서 채워짐)
+    # Valuation 지표 — FMP 무료 플랜 실제 제공 필드 기준
     forward_pe    = to_float(info.get("forwardPE"))
     trailing_pe   = to_float(info.get("trailingPE"))
     price_to_book = to_float(info.get("priceToBook"))
     ev_to_ebitda  = to_float(info.get("enterpriseToEbitda"))
+    # FMP 무료 대체 지표
+    ev_to_sales   = to_float(info.get("_fmp_ev_to_sales"))
+    ev_to_fcf     = to_float(info.get("_fmp_ev_to_fcf"))
 
     # EPS & Growth
     trailing_eps = to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
@@ -3279,6 +3320,21 @@ def evaluate_kpis(ticker_symbol):
             "Rule": "25 이하",
             "Pass": pass_fail_badge(pd.notna(ev_to_ebitda) and 0 < ev_to_ebitda <= 25, pd.isna(ev_to_ebitda)),
         },
+        # FMP 무료 플랜 실제 제공 밸류에이션 지표
+        {
+            "Category": "밸류에이션 (Valuation)",
+            "KPI": "EV/Sales",
+            "Value": num_str(ev_to_sales) if pd.notna(ev_to_sales) else "N/A",
+            "Rule": "10 이하",
+            "Pass": pass_fail_badge(pd.notna(ev_to_sales) and 0 < ev_to_sales <= 10, pd.isna(ev_to_sales)),
+        },
+        {
+            "Category": "밸류에이션 (Valuation)",
+            "KPI": "EV/FCF",
+            "Value": num_str(ev_to_fcf) if pd.notna(ev_to_fcf) else "N/A",
+            "Rule": "40 이하",
+            "Pass": pass_fail_badge(pd.notna(ev_to_fcf) and 0 < ev_to_fcf <= 40, pd.isna(ev_to_fcf)),
+        },
         {
             "Category": "밸류에이션 (Valuation)",
             "KPI": "PEG Ratio",
@@ -3318,6 +3374,8 @@ def evaluate_kpis(ticker_symbol):
         "trailing_pe": trailing_pe,
         "price_to_book": price_to_book,
         "ev_to_ebitda": ev_to_ebitda,
+        "ev_to_sales": ev_to_sales,
+        "ev_to_fcf": ev_to_fcf,
     }
 
     return kpi_df, pass_count, fail_count, nodata_count, margin_context
@@ -10303,18 +10361,27 @@ if st.session_state.get("logged_in"):
                         _tpe  = margin_context.get("trailing_pe")
                         _pb   = margin_context.get("price_to_book")
                         _ev   = margin_context.get("ev_to_ebitda")
+                        _evs  = margin_context.get("ev_to_sales")
+                        _evf  = margin_context.get("ev_to_fcf")
                         _iv   = margin_context.get("intrinsic_value")
                         _mos  = margin_context.get("margin_of_safety")
                         _cp   = margin_context.get("current_price")
 
-                        # 요약 행: Forward P/E · Trailing P/E · P/B · EV/EBITDA
+                        # 1행: yfinance 기반 (있을 때만 의미있음)
                         _vc1, _vc2, _vc3, _vc4 = st.columns(4)
                         with _vc1: st.metric("Forward P/E",  num_str(_fpe) if pd.notna(_fpe) else "N/A")
                         with _vc2: st.metric("Trailing P/E", num_str(_tpe) if pd.notna(_tpe) else "N/A")
                         with _vc3: st.metric("P/B",          num_str(_pb)  if pd.notna(_pb)  else "N/A")
                         with _vc4: st.metric("EV/EBITDA",    num_str(_ev)  if pd.notna(_ev)  else "N/A")
 
-                        # Graham 적정주가 (EPS + 성장률 있을 때만)
+                        # 2행: FMP 무료 플랜 제공 지표 (항상 표시)
+                        _vc5, _vc6, _, _ = st.columns(4)
+                        with _vc5: st.metric("EV/Sales", num_str(_evs) if pd.notna(_evs) else "N/A",
+                                             help="기업가치/매출액. 10 이하 합리적. FMP 제공.")
+                        with _vc6: st.metric("EV/FCF",   num_str(_evf) if pd.notna(_evf) else "N/A",
+                                             help="기업가치/잉여현금흐름. 40 이하 합리적. FMP 제공.")
+
+                        # Graham 적정주가
                         if pd.notna(_iv) and pd.notna(_mos):
                             intrinsic_col, mos_col = st.columns(2)
                             with intrinsic_col:
@@ -10333,7 +10400,7 @@ if st.session_state.get("logged_in"):
                                     delta=f"현재가 ${num_str(_cp)}",
                                 )
                         else:
-                            st.caption("💡 Graham 적정주가는 EPS + 이익성장률 데이터가 있을 때 계산됩니다.")
+                            st.caption("💡 Graham 적정주가는 EPS > 0 + 성장률 > 0 일 때 계산됩니다.")
 
                     st.divider()
 
