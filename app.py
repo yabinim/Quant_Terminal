@@ -4038,7 +4038,7 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
             if pd.isna(pp) or pd.isna(qq):
                 continue
             # 수량 0 이하(전량 매도 완료) 행은 시트에 기록하지 않음
-            if float(qq) <= 1e-9:
+            if float(qq) < 0.001:  # 0.001주 미만 = 부동소수점 오차 포함 전량 매도로 간주
                 continue
             rows.append([uid, acct, tk, float(pp), float(qq), now_s])
         ws.clear()
@@ -4098,8 +4098,8 @@ def load_portfolio():
     df["Quantity"] = df["Quantity"].fillna(1.0)
     df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN") & df["Account"].astype(str).str.strip().ne("")]
     df = df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
-    # 수량이 0 이하인 종목(전량 매도 완료)은 포트폴리오에서 제외
-    df = df[pd.to_numeric(df["Quantity"], errors="coerce").fillna(0) > 1e-9].reset_index(drop=True)
+    # 0.001주 미만(부동소수점 오차 포함 전량 매도)은 포트폴리오에서 제외
+    df = df[pd.to_numeric(df["Quantity"], errors="coerce").fillna(0) >= 0.001].reset_index(drop=True)
     return df[base_columns].copy()
 
 
@@ -4126,8 +4126,8 @@ def save_portfolio(df):
         return
     safe_df = safe_df[safe_df["Ticker"].ne("") & safe_df["Ticker"].ne("NAN")]
     safe_df = safe_df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
-    # 수량이 0 이하인 종목(전량 매도 완료)은 DB에 저장하지 않음
-    safe_df = safe_df[pd.to_numeric(safe_df["Quantity"], errors="coerce").fillna(0) > 1e-9].reset_index(drop=True)
+    # 0.001주 미만(부동소수점 오차 포함 전량 매도)은 DB에 저장하지 않음
+    safe_df = safe_df[pd.to_numeric(safe_df["Quantity"], errors="coerce").fillna(0) >= 0.001].reset_index(drop=True)
     ok, msg = replace_user_portfolio_sheet_rows(uid, safe_df)
     if not ok:
         try:
@@ -4643,8 +4643,8 @@ def build_portfolio_sell_radar_df(portfolio_df):
     clean_portfolio["Quantity"] = pd.to_numeric(clean_portfolio["Quantity"], errors="coerce")
     clean_portfolio["Quantity"] = clean_portfolio["Quantity"].fillna(1.0)
     clean_portfolio = clean_portfolio.drop_duplicates(subset=["Account", "Ticker"], keep="last")
-    # 전량 매도 완료(수량 0 이하) 종목은 레이더에서 제외
-    clean_portfolio = clean_portfolio[clean_portfolio["Quantity"] > 1e-9].reset_index(drop=True)
+    # 0.001주 미만(부동소수점 오차 포함 전량 매도) 종목은 레이더에서 제외
+    clean_portfolio = clean_portfolio[clean_portfolio["Quantity"] >= 0.001].reset_index(drop=True)
 
     clean_tickers = clean_portfolio["Ticker"].dropna().astype(str).tolist()
     clean_tickers = [t for t in clean_tickers if t]
@@ -11301,12 +11301,64 @@ if st.session_state.get("logged_in"):
         portfolio_df = load_portfolio()
         puid = str(st.session_state.get("user_id") or "").strip()
 
+        # ── [진단] 시트 원본값 확인 expander ─────────────────────────────────
+        with st.expander("🔧 [진단] 시트 원본 데이터 확인 (문제 해결 후 삭제 예정)", expanded=False):
+            try:
+                _diag_vals, _diag_err = _portfolio_sheet_all_values_cached()
+                if _diag_err:
+                    st.error(f"시트 읽기 오류: {_diag_err}")
+                elif not _diag_vals:
+                    st.warning("시트가 비어 있습니다.")
+                else:
+                    uid_u = puid.upper()
+                    _diag_rows = [r for r in _diag_vals[1:] if len(r) > 0 and str(r[0]).strip().upper() == uid_u]
+                    st.caption(f"시트에서 `{puid}` 유저 행 **{len(_diag_rows)}개** 원본:")
+                    for i, r in enumerate(_diag_rows):
+                        st.code(f"행{i+1}: {r}")
+                    st.caption(f"load_portfolio() 결과 (필터 후): {len(portfolio_df)}행")
+                    st.dataframe(portfolio_df, use_container_width=True, hide_index=True)
+            except Exception as _de:
+                st.error(f"진단 오류: {_de}")
+
+            if st.button("🗑️ 수량 0 행 즉시 강제 삭제 (시트 직접 정리)", key="force_cleanup_zero_qty", type="primary"):
+                try:
+                    _ws_fc, _err_fc = open_portfolios_worksheet()
+                    if _err_fc:
+                        st.error(_err_fc)
+                    else:
+                        _all_fc = _ws_fc.get_all_values() or []
+                        if len(_all_fc) > 1:
+                            uid_u2 = puid.upper()
+                            hk_fc = _portfolio_sheet_header_kind(_all_fc[0])
+                            if hk_fc == "unknown": hk_fc = "new"
+                            others_fc = []
+                            removed_fc = 0
+                            for r in _all_fc[1:]:
+                                cells = _portfolio_row_to_new_six_cells(hk_fc, r)
+                                if not cells:
+                                    continue
+                                if str(cells[0]).strip().upper() == uid_u2:
+                                    qty_val = pd.to_numeric(cells[4], errors="coerce")
+                                    if pd.isna(qty_val) or float(qty_val) < 0.001:
+                                        removed_fc += 1
+                                        st.write(f"삭제: {cells}")
+                                        continue
+                                others_fc.append(cells)
+                            new_rows = [_PORTFOLIOS_SHEET_COLS] + others_fc
+                            _ws_fc.clear()
+                            _ws_fc.update(new_rows, range_name=f"A1:F{len(new_rows)}", value_input_option="USER_ENTERED")
+                            _invalidate_portfolio_sheet_cache()
+                            st.success(f"✅ 수량 0 행 {removed_fc}개 삭제 완료. 새로고침하세요.")
+                        else:
+                            st.info("시트에 데이터가 없습니다.")
+                except Exception as _fe:
+                    st.error(f"강제 삭제 오류: {_fe}")
+        # ─────────────────────────────────────────────────────────────────────
+
         # ── DB 잔존 수량 0 행 자동 클린업 (동기화 버튼 또는 첫 진입 시) ────
         _cleanup_key = f"_pf_zero_qty_cleaned_{puid}"
         if puid and not st.session_state.get(_cleanup_key):
             st.session_state[_cleanup_key] = True
-            # portfolio_df는 이미 Quantity>0 필터 적용된 상태.
-            # 비어있더라도 save_portfolio를 호출해 시트의 해당 유저 행을 전부 정리.
             save_portfolio(portfolio_df)
             _invalidate_portfolio_sheet_cache()
         # ────────────────────────────────────────────────────────────────────
@@ -11659,7 +11711,7 @@ if st.session_state.get("logged_in"):
                                 if m_sell.any():
                                     ix_sell = upd_sell.index[m_sell][0]
                                     new_qty = cur_hold_qty - sell_qty_input
-                                    if new_qty < 1e-9:
+                                    if new_qty < 0.001:  # 0.001주 미만 잔여 = 전량 매도로 간주 (부동소수점 오차 방지)
                                         upd_sell = upd_sell.drop(index=ix_sell).reset_index(drop=True)
                                         save_portfolio(upd_sell)
                                         realized = (sell_price_input - cur_avg_price) * sell_qty_input
