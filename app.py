@@ -2351,25 +2351,36 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
     try:
-        etf_s = pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if 'close_df' in dir() else pd.Series(dtype=float)
-        if close_df is not None and sector_etf in close_df.columns and not etf_s.empty:
-            raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
-            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
-            if len(etf_s) >= 10 and len(vol) >= 10:
-                price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
-                vol_5d = float(vol.tail(5).mean())
-                vol_20d = float(vol.tail(20).mean())
-                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
+        # close_df 없어도 sector_etf로 직접 조회
+        raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        if raw_full is not None and not raw_full.empty and len(raw_full) >= 10:
+            # Close 컬럼 (MultiIndex 대응)
+            if isinstance(raw_full.columns, pd.MultiIndex):
+                etf_close = pd.to_numeric(raw_full["Close"].iloc[:, 0], errors="coerce").dropna()
+                vol = pd.to_numeric(raw_full["Volume"].iloc[:, 0], errors="coerce").dropna()
+            else:
+                etf_close = pd.to_numeric(raw_full["Close"], errors="coerce").dropna()
+                vol = pd.to_numeric(raw_full["Volume"], errors="coerce").dropna()
+
+            if len(etf_close) >= 6 and len(vol) >= 10:
+                price_5d  = float((etf_close.iloc[-1] / etf_close.iloc[-6] - 1) * 100)
+                vol_5d    = float(vol.tail(5).mean())
+                vol_20d   = float(vol.tail(20).mean())
+                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1.0
                 dist_selling = price_5d > 0 and vol_ratio < 0.8
-                vol_alert = dist_selling or vol_ratio < 0.7
+                vol_alert    = dist_selling or vol_ratio < 0.7
                 signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
-                details["거래량"] = {"5일 평균 비율": f"{vol_ratio:.2f}x", "가격 5일": f"{price_5d:+.1f}%", "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상")}
+                details["거래량"] = {
+                    "5일 평균 비율": f"{vol_ratio:.2f}x",
+                    "가격 5일": f"{price_5d:+.1f}%",
+                    "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상"),
+                }
                 if vol_alert:
                     warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
             else:
-                signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+                signals["volume"] = {"ok": True, "value": "N/A", "trend": "데이터 부족"}
         else:
-            signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+            signals["volume"] = {"ok": True, "value": "N/A", "trend": "데이터 없음"}
     except Exception:
         signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
 
@@ -4304,10 +4315,12 @@ def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         if pd.isna(pred_date):
             return "", np.nan, ""
 
-        # 예측일 포함 직전 5거래일 데이터 가져오기
-        # start를 넉넉히 10일 전으로 잡아 주말·공휴일을 건너뜀
-        start_date = pred_date - pd.Timedelta(days=10)
-        end_date   = pred_date + pd.Timedelta(days=1)  # yfinance end는 exclusive
+        pred_date_naive = pred_date.date()  # datetime.date 객체
+
+        # 예측일 포함 직전 10거래일 데이터 (주말·공휴일 건너뜀)
+        start_date = pred_date - pd.Timedelta(days=14)
+        end_date   = pred_date + pd.Timedelta(days=2)  # exclusive이므로 +2
+
         hist = yf.download(
             bench_etf,
             start=start_date.strftime("%Y-%m-%d"),
@@ -4318,23 +4331,40 @@ def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         if hist is None or hist.empty:
             return "", np.nan, ""
 
-        # 예측일 당일 데이터 확인
-        hist.index = pd.to_datetime(hist.index)
-        pred_date_ts = pd.Timestamp(pred_date.date())
-        hist_on_pred = hist[hist.index.date == pred_date_ts.date()]
+        # timezone 제거 후 date 비교
+        hist.index = pd.to_datetime(hist.index).tz_localize(None)
+        hist_dates = hist.index.normalize()  # 시간 제거, date만 남김
+
+        pred_ts = pd.Timestamp(pred_date_naive)
+
+        hist_on_pred = hist[hist_dates == pred_ts]
+        hist_before  = hist[hist_dates < pred_ts]
+
         if hist_on_pred.empty:
-            # 예측일이 휴장일이거나 아직 장이 마감 안 됨
+            # 예측일 데이터 없음 = 휴장일이거나 아직 장 마감 전
             return "", np.nan, ""
-
-        pred_day_close = float(hist_on_pred["Close"].iloc[-1])
-
-        # 예측일 직전 거래일 종가
-        hist_before = hist[hist.index.date < pred_date_ts.date()]
         if hist_before.empty:
             return "", np.nan, ""
-        prev_close = float(hist_before["Close"].iloc[-1])
 
-        ret_pct = ((pred_day_close / prev_close) - 1.0) * 100.0
+        # Close 컬럼 처리 (MultiIndex 대응)
+        def _get_close(df):
+            if isinstance(df.columns, pd.MultiIndex):
+                return pd.to_numeric(df["Close"].iloc[:, 0], errors="coerce").dropna()
+            return pd.to_numeric(df["Close"], errors="coerce").dropna()
+
+        pred_close_s = _get_close(hist_on_pred)
+        prev_close_s = _get_close(hist_before)
+
+        if pred_close_s.empty or prev_close_s.empty:
+            return "", np.nan, ""
+
+        pred_day_close = float(pred_close_s.iloc[-1])
+        prev_close     = float(prev_close_s.iloc[-1])
+
+        if prev_close <= 0:
+            return "", np.nan, ""
+
+        ret_pct = (pred_day_close / prev_close - 1.0) * 100.0
 
         # 방향 판정 (±0.3% 기준)
         if ret_pct >= 0.3:
