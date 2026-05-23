@@ -3410,6 +3410,389 @@ def evaluate_kpis(ticker_symbol):
     return kpi_df, pass_count, fail_count, nodata_count, margin_context
 
 
+def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> dict:
+    """
+    3가지 투자 스타일 점수 계산.
+    CAN SLIM / 가치투자 / 장기 우량주 각 100점 만점.
+    """
+    ticker_upper = str(ticker_symbol).strip().upper()
+
+    # ── 공통 데이터 수집 ──────────────────────────────────────────────
+    try:
+        tk = yf.Ticker(ticker_upper)
+        info = {}
+        try:
+            raw = tk.info
+            if isinstance(raw, dict) and len(raw) > 5:
+                info = raw
+        except Exception:
+            pass
+        info = _fmp_fill(info, ticker_upper)
+
+        # Earnings 히스토리 (분기별 EPS 성장)
+        earn_df = pd.DataFrame()
+        try:
+            eh = tk.get_earnings_history()
+            if eh is not None and not eh.empty:
+                earn_df = eh.reset_index()
+        except Exception:
+            pass
+
+        # 기관 보유
+        inst_df = pd.DataFrame()
+        try:
+            ih = tk.institutional_holders
+            if ih is not None and not ih.empty:
+                inst_df = ih
+        except Exception:
+            pass
+
+        # 거래량 (최근 vs 3개월 평균)
+        hist = pd.DataFrame()
+        try:
+            hist = tk.history(period="3mo", auto_adjust=False)
+        except Exception:
+            pass
+
+    except Exception:
+        info = _fmp_fill({}, ticker_upper)
+        earn_df = inst_df = hist = pd.DataFrame()
+
+    # ── 지표 추출 ──────────────────────────────────────────────────────
+    trailing_pe   = to_float(info.get("trailingPE"))
+    forward_pe    = to_float(info.get("forwardPE"))
+    price_to_book = to_float(info.get("priceToBook"))
+    ev_to_ebitda  = to_float(info.get("enterpriseToEbitda"))
+    ev_to_sales   = to_float(info.get("_fmp_ev_to_sales"))
+    roe           = to_float(info.get("returnOnEquity"))
+    op_margin     = to_float(info.get("operatingMargins"))
+    debt_to_eq    = to_float(info.get("debtToEquity"))
+    trailing_eps  = to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
+    earnings_gr   = to_float(info.get("earningsGrowth"))
+    revenue_gr    = to_float(info.get("revenueGrowth"))
+    dividend_rate = to_float(info.get("dividendRate") or info.get("trailingAnnualDividendRate"))
+    dividend_yld  = to_float(info.get("dividendYield") or info.get("trailingAnnualDividendYield"))
+    current_price = margin_context.get("current_price") or to_float(info.get("currentPrice"))
+    ma50          = to_float(info.get("fiftyDayAverage"))
+    ma200         = to_float(info.get("twoHundredDayAverage"))
+    week52_high   = to_float(info.get("fiftyTwoWeekHigh"))
+    fcf_val       = to_float(info.get("freeCashflow"))
+    market_cap    = to_float(info.get("marketCap"))
+
+    # 분기 EPS 성장 (QoQ) — Earnings 히스토리에서
+    qoq_eps_growth = np.nan
+    if not earn_df.empty:
+        try:
+            est_col = next((c for c in earn_df.columns if "estimate" in c.lower()), None)
+            act_col = next((c for c in earn_df.columns if "actual" in c.lower() or "reported" in c.lower()), None)
+            if act_col and len(earn_df) >= 2:
+                acts = pd.to_numeric(earn_df[act_col], errors="coerce").dropna()
+                if len(acts) >= 2 and acts.iloc[1] != 0:
+                    qoq_eps_growth = float((acts.iloc[0] - acts.iloc[1]) / abs(acts.iloc[1]) * 100)
+        except Exception:
+            pass
+
+    # 기관 보유율
+    inst_pct = np.nan
+    try:
+        pct_col = next((c for c in inst_df.columns if "%" in c or "held" in c.lower() or "pct" in c.lower()), None)
+        if pct_col and not inst_df.empty:
+            vals = pd.to_numeric(inst_df[pct_col], errors="coerce").dropna()
+            total = float(vals.sum())
+            inst_pct = total * 100 if total <= 1 else total
+    except Exception:
+        pass
+
+    # 거래량 비율 (최근 5일 / 3개월 평균)
+    vol_ratio = np.nan
+    if not hist.empty and "Volume" in hist.columns:
+        try:
+            vols = pd.to_numeric(hist["Volume"], errors="coerce").dropna()
+            if len(vols) >= 10:
+                vol_ratio = float(vols.tail(5).mean() / vols.mean())
+        except Exception:
+            pass
+
+    # 52주 고점 근접도
+    near_high_pct = np.nan
+    if pd.notna(current_price) and pd.notna(week52_high) and week52_high > 0:
+        near_high_pct = float(current_price / week52_high * 100)
+
+    # FCF Yield
+    fcf_yield = np.nan
+    if pd.notna(fcf_val) and pd.notna(market_cap) and market_cap > 0:
+        fcf_yield = float(fcf_val / market_cap * 100)
+
+    # ══════════════════════════════════════════════════════════════════
+    # 1. CAN SLIM 점수 (100점)
+    # ══════════════════════════════════════════════════════════════════
+    cs_score = 0
+    cs_detail = {}
+
+    # C: 현재 분기 EPS 성장 (25점)
+    if pd.notna(qoq_eps_growth):
+        if qoq_eps_growth >= 25:   pts = 25
+        elif qoq_eps_growth >= 15: pts = 18
+        elif qoq_eps_growth >= 5:  pts = 10
+        elif qoq_eps_growth > 0:   pts = 5
+        else:                      pts = 0
+        cs_score += pts
+        cs_detail["C_분기EPS성장"] = f"{qoq_eps_growth:.1f}% → {pts}점"
+    else:
+        cs_detail["C_분기EPS성장"] = "데이터 없음"
+
+    # A: 연간 EPS 성장 (20점)
+    _a_growth = earnings_gr * 100 if pd.notna(earnings_gr) else np.nan
+    if pd.notna(_a_growth):
+        if _a_growth >= 25:   pts = 20
+        elif _a_growth >= 15: pts = 14
+        elif _a_growth >= 5:  pts = 8
+        elif _a_growth > 0:   pts = 4
+        else:                 pts = 0
+        cs_score += pts
+        cs_detail["A_연간EPS성장"] = f"{_a_growth:.1f}% → {pts}점"
+    else:
+        cs_detail["A_연간EPS성장"] = "데이터 없음"
+
+    # A보조: 매출 성장 (10점)
+    _r_growth = revenue_gr * 100 if pd.notna(revenue_gr) else np.nan
+    if pd.notna(_r_growth):
+        if _r_growth >= 20:   pts = 10
+        elif _r_growth >= 10: pts = 7
+        elif _r_growth >= 5:  pts = 4
+        elif _r_growth > 0:   pts = 2
+        else:                 pts = 0
+        cs_score += pts
+        cs_detail["A_매출성장"] = f"{_r_growth:.1f}% → {pts}점"
+    else:
+        cs_detail["A_매출성장"] = "데이터 없음"
+
+    # L+N: 모멘텀 / 52주 고점 근접 (20점)
+    momentum_pts = 0
+    _pe_check = trailing_pe if pd.notna(trailing_pe) else forward_pe
+    if pd.notna(current_price) and pd.notna(ma50) and pd.notna(ma200):
+        if current_price > ma50 and current_price > ma200:
+            momentum_pts += 12
+    if pd.notna(near_high_pct):
+        if near_high_pct >= 95:   momentum_pts += 8
+        elif near_high_pct >= 85: momentum_pts += 5
+        elif near_high_pct >= 75: momentum_pts += 2
+    cs_score += momentum_pts
+    cs_detail["L+N_모멘텀"] = f"MA정배열+고점근접 → {momentum_pts}점"
+
+    # I: 기관 보유 (15점)
+    if pd.notna(inst_pct):
+        if inst_pct >= 60:   pts = 15
+        elif inst_pct >= 40: pts = 10
+        elif inst_pct >= 20: pts = 5
+        else:                pts = 2
+        cs_score += pts
+        cs_detail["I_기관보유"] = f"{inst_pct:.1f}% → {pts}점"
+    else:
+        cs_detail["I_기관보유"] = "데이터 없음"
+
+    # S: 거래량 (10점)
+    if pd.notna(vol_ratio):
+        if vol_ratio >= 1.5:   pts = 10
+        elif vol_ratio >= 1.2: pts = 7
+        elif vol_ratio >= 1.0: pts = 4
+        else:                  pts = 0
+        cs_score += pts
+        cs_detail["S_거래량"] = f"평균대비 {vol_ratio:.2f}x → {pts}점"
+    else:
+        cs_detail["S_거래량"] = "데이터 없음"
+
+    # ══════════════════════════════════════════════════════════════════
+    # 2. 가치투자 점수 (100점)
+    # ══════════════════════════════════════════════════════════════════
+    val_score = 0
+    val_detail = {}
+
+    # P/E (25점)
+    _pe = trailing_pe if pd.notna(trailing_pe) else forward_pe
+    if pd.notna(_pe) and _pe > 0:
+        if _pe <= 10:    pts = 25
+        elif _pe <= 15:  pts = 20
+        elif _pe <= 20:  pts = 14
+        elif _pe <= 25:  pts = 8
+        elif _pe <= 35:  pts = 3
+        else:            pts = 0
+        val_score += pts
+        val_detail["P/E"] = f"{_pe:.1f} → {pts}점"
+    else:
+        val_detail["P/E"] = "데이터 없음"
+
+    # P/B (20점)
+    if pd.notna(price_to_book) and price_to_book > 0:
+        if price_to_book <= 1:   pts = 20
+        elif price_to_book <= 2: pts = 15
+        elif price_to_book <= 3: pts = 10
+        elif price_to_book <= 5: pts = 5
+        else:                    pts = 0
+        val_score += pts
+        val_detail["P/B"] = f"{price_to_book:.2f} → {pts}점"
+    else:
+        val_detail["P/B"] = "데이터 없음"
+
+    # EV/EBITDA 또는 EV/Sales (20점)
+    if pd.notna(ev_to_ebitda) and ev_to_ebitda > 0:
+        if ev_to_ebitda <= 8:    pts = 20
+        elif ev_to_ebitda <= 12: pts = 15
+        elif ev_to_ebitda <= 18: pts = 10
+        elif ev_to_ebitda <= 25: pts = 5
+        else:                    pts = 0
+        val_score += pts
+        val_detail["EV/EBITDA"] = f"{ev_to_ebitda:.1f} → {pts}점"
+    elif pd.notna(ev_to_sales) and ev_to_sales > 0:
+        if ev_to_sales <= 2:   pts = 20
+        elif ev_to_sales <= 5: pts = 12
+        elif ev_to_sales <= 10: pts = 5
+        else:                   pts = 0
+        val_score += pts
+        val_detail["EV/Sales"] = f"{ev_to_sales:.1f} → {pts}점"
+    else:
+        val_detail["EV/EBITDA"] = "데이터 없음"
+
+    # Graham 안전마진 (20점)
+    _mos = margin_context.get("margin_of_safety")
+    if pd.notna(_mos):
+        if _mos >= 40:   pts = 20
+        elif _mos >= 25: pts = 15
+        elif _mos >= 10: pts = 8
+        elif _mos >= 0:  pts = 3
+        else:            pts = 0
+        val_score += pts
+        val_detail["Graham안전마진"] = f"{_mos:.1f}% → {pts}점"
+    else:
+        val_detail["Graham안전마진"] = "해당없음(성장주)"
+
+    # FCF Yield (15점)
+    if pd.notna(fcf_yield):
+        if fcf_yield >= 8:   pts = 15
+        elif fcf_yield >= 5: pts = 10
+        elif fcf_yield >= 3: pts = 6
+        elif fcf_yield > 0:  pts = 3
+        else:                pts = 0
+        val_score += pts
+        val_detail["FCF_Yield"] = f"{fcf_yield:.1f}% → {pts}점"
+    else:
+        val_detail["FCF_Yield"] = "데이터 없음"
+
+    # ══════════════════════════════════════════════════════════════════
+    # 3. 장기 우량주 점수 (100점)
+    # ══════════════════════════════════════════════════════════════════
+    quality_score = 0
+    quality_detail = {}
+
+    # ROE (25점)
+    if pd.notna(roe):
+        roe_pct = roe * 100 if abs(roe) <= 1 else roe
+        if roe_pct >= 25:   pts = 25
+        elif roe_pct >= 20: pts = 20
+        elif roe_pct >= 15: pts = 14
+        elif roe_pct >= 10: pts = 7
+        elif roe_pct > 0:   pts = 3
+        else:               pts = 0
+        quality_score += pts
+        quality_detail["ROE"] = f"{roe_pct:.1f}% → {pts}점"
+    else:
+        quality_detail["ROE"] = "데이터 없음"
+
+    # Operating Margin (20점)
+    if pd.notna(op_margin):
+        om_pct = op_margin * 100 if abs(op_margin) <= 1 else op_margin
+        if om_pct >= 25:   pts = 20
+        elif om_pct >= 15: pts = 15
+        elif om_pct >= 10: pts = 10
+        elif om_pct >= 5:  pts = 5
+        elif om_pct > 0:   pts = 2
+        else:              pts = 0
+        quality_score += pts
+        quality_detail["영업이익률"] = f"{om_pct:.1f}% → {pts}점"
+    else:
+        quality_detail["영업이익률"] = "데이터 없음"
+
+    # D/E 건전성 (20점)
+    if pd.notna(debt_to_eq):
+        if debt_to_eq <= 30:    pts = 20
+        elif debt_to_eq <= 50:  pts = 15
+        elif debt_to_eq <= 100: pts = 8
+        elif debt_to_eq <= 200: pts = 3
+        else:                   pts = 0
+        quality_score += pts
+        quality_detail["부채비율(D/E)"] = f"{debt_to_eq:.1f} → {pts}점"
+    else:
+        quality_detail["부채비율(D/E)"] = "데이터 없음"
+
+    # FCF 양수 (20점)
+    _fcf = to_float(margin_context.get("core_fcf_pass") and 1) or np.nan
+    _fcf_raw = fcf_val if pd.notna(fcf_val) else np.nan
+    if pd.notna(_fcf_raw):
+        if _fcf_raw > 0:
+            # FCF 규모에 따라 차등
+            if pd.notna(market_cap) and market_cap > 0:
+                fcf_ratio = _fcf_raw / market_cap * 100
+                if fcf_ratio >= 5:   pts = 20
+                elif fcf_ratio >= 3: pts = 15
+                elif fcf_ratio >= 1: pts = 10
+                else:                pts = 7
+            else:
+                pts = 10
+        else:
+            pts = 0
+        quality_score += pts
+        quality_detail["FCF"] = f"{'양수' if _fcf_raw > 0 else '음수'} → {pts}점"
+    else:
+        quality_detail["FCF"] = "데이터 없음"
+
+    # 배당 지속성 (15점)
+    if pd.notna(dividend_yld) and dividend_yld > 0:
+        dy_pct = dividend_yld * 100 if dividend_yld <= 1 else dividend_yld
+        if dy_pct >= 4:    pts = 15
+        elif dy_pct >= 2:  pts = 10
+        elif dy_pct >= 1:  pts = 6
+        else:              pts = 3
+        quality_score += pts
+        quality_detail["배당수익률"] = f"{dy_pct:.2f}% → {pts}점"
+    else:
+        pts = 5  # 무배당이어도 성장 가능성으로 부분 점수
+        quality_score += pts
+        quality_detail["배당수익률"] = f"무배당 → {pts}점(성장주 보정)"
+
+    # ── 등급 판정 ──────────────────────────────────────────────────────
+    def _grade(score):
+        if score >= 75:   return "🟢 우수", "#16a34a"
+        elif score >= 55: return "🟡 양호", "#ca8a04"
+        elif score >= 35: return "🟠 보통", "#ea580c"
+        else:             return "🔴 미흡", "#dc2626"
+
+    cs_grade,  cs_color  = _grade(cs_score)
+    val_grade, val_color = _grade(val_score)
+    q_grade,   q_color   = _grade(quality_score)
+
+    # 주도 스타일 판정
+    scores = {
+        "CAN SLIM 성장주": cs_score,
+        "가치투자": val_score,
+        "장기 우량주": quality_score,
+    }
+    dominant = max(scores, key=scores.get)
+
+    return {
+        "canslim": {"score": cs_score, "grade": cs_grade, "color": cs_color, "detail": cs_detail},
+        "value":   {"score": val_score, "grade": val_grade, "color": val_color, "detail": val_detail},
+        "quality": {"score": quality_score, "grade": q_grade, "color": q_color, "detail": quality_detail},
+        "dominant": dominant,
+        "scores": scores,
+    }
+
+
+@st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
+def cached_style_scores(ticker_upper: str, _margin_context_key: str, _kpi_hash: str):
+    """style score 캐싱용 래퍼 — margin_context는 JSON key로 전달."""
+    return None  # 실제 계산은 렌더링 시점에 직접 호출
+
+
 def detect_quote_type(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
@@ -10054,8 +10437,7 @@ if st.session_state.get("logged_in"):
             [cached_evaluate_kpis_snapshot.clear, cached_etf_holdings_universe_str.clear,
              cached_build_etf_holdings_performance_pairs.clear, cached_timing_price_history.clear,
              fetch_company_overview.clear, fetch_price_history_by_period.clear,
-             _fmp_profile.clear, _fmp_ratios.clear, _fmp_key_metrics.clear,
-             _fmp_cashflow.clear],
+             _fmp_profile.clear, _fmp_ratios.clear, _fmp_key_metrics.clear, _fmp_cashflow.clear],
             "종목별 재무·차트·회사정보 캐시를 비우고 최신 데이터를 받습니다.",
         )
         st.subheader(_MAIN_NAV_OPTIONS[5])
@@ -10063,37 +10445,6 @@ if st.session_state.get("logged_in"):
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
         )
         st.markdown(f"**분석 티커:** `{selected_ticker}`")
-
-        # ── FMP 진단 패널 ─────────────────────────────────────────────
-        with st.expander("🛠️ FMP 데이터 진단 (문제 발생 시 확인)", expanded=False):
-            _dt = str(selected_ticker).strip().upper()
-            _dk = _fmp_key()
-            if not _dk:
-                st.error("❌ FMP_API_KEY 가 Streamlit Secrets에 없습니다.")
-            else:
-                st.success(f"✅ FMP_API_KEY 확인됨 (...{_dk[-4:]})")
-            if st.button("🔬 FMP 응답 테스트 실행", key="fmp_diag_btn"):
-                for _ep, _params, _extract in [
-                    ("profile",         f"symbol={_dt}",                          lambda d: {"name": d.get("companyName"), "sector": d.get("sector"), "mktCap": d.get("mktCap")}),
-                    ("ratios-ttm",      f"symbol={_dt}",                          lambda d: {"operatingProfitMarginTTM": d.get("operatingProfitMarginTTM"), "returnOnEquityTTM": d.get("returnOnEquityTTM"), "debtToEquityTTM": d.get("debtToEquityTTM")}),
-                    ("key-metrics-ttm", f"symbol={_dt}",                          lambda d: {"peRatioTTM": d.get("peRatioTTM"), "pbRatioTTM": d.get("pbRatioTTM"), "evToEbitdaTTM": d.get("evToEbitdaTTM"), "netIncomePerShareTTM": d.get("netIncomePerShareTTM")}),
-                    ("income-statement",f"symbol={_dt}&period=annual&limit=1",    lambda d: {"revenue": d.get("revenue"), "operatingIncome": d.get("operatingIncome"), "epsdiluted": d.get("epsdiluted")}),
-                    ("cash-flow-statement", f"symbol={_dt}&period=annual&limit=1",lambda d: {"freeCashFlow": d.get("freeCashFlow")}),
-                ]:
-                    try:
-                        _r = requests.get(f"{_FMP_BASE}/{_ep}?{_params}&apikey={_dk}", timeout=8)
-                        _raw = _r.json()
-                        _item = _raw[0] if isinstance(_raw, list) and _raw else (_raw if isinstance(_raw, dict) else {})
-                        _vals = _extract(_item)
-                        _has_data = any(v is not None for v in _vals.values())
-                        if _r.status_code == 200 and _has_data:
-                            st.success(f"✅ /{_ep}")
-                            st.json(_vals)
-                        else:
-                            st.warning(f"⚠️ /{_ep} HTTP {_r.status_code} — 데이터 없음 또는 플랜 제한")
-                            st.json({"status": _r.status_code, "raw_preview": str(_raw)[:200]})
-                    except Exception as _e:
-                        st.error(f"❌ /{_ep} 오류: {_e}")
 
         # ── 회사 기본 정보 ────────────────────────────────────────────────
         try:
@@ -10140,48 +10491,42 @@ if st.session_state.get("logged_in"):
                 else:
                     st.metric("다음 실적 발표", "N/A")
 
-            # 회사 소개: 영문 원문을 Gemini로 번역
+            # ── 회사 소개: 항상 한글로 표시 (자동 번역) ─────────────────
             summary_en = co.get("summary_en", "")
             if summary_en:
                 _sum_key = f"_co_summary_kr_{selected_ticker}"
-                with st.expander("📋 회사 소개", expanded=False):
+                with st.expander("📋 회사 소개", expanded=True):
                     if st.session_state.get(_sum_key):
-                        # 한글 번역본 표시
                         st.markdown(st.session_state[_sum_key])
-                        if st.button("🔄 다시 번역", key=f"retranslate_{selected_ticker}", use_container_width=False):
+                        if st.button("🔄 다시 번역", key=f"retranslate_{selected_ticker}"):
                             del st.session_state[_sum_key]
                             st.rerun()
                     else:
-                        # 영문 원문 전체 표시
-                        st.markdown(summary_en)
-                        if st.button("🌐 한글로 번역", key=f"translate_summary_{selected_ticker}", type="primary"):
-                            with st.spinner("한글로 번역 중..."):
-                                try:
-                                    # 입력 텍스트를 800단어로 제한 (출력 토큰 안정화)
-                                    _words_list = summary_en.split()
-                                    _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
-                                    _tr_model = _GenAIModel(
-                                        "gemini-2.5-flash",
-                                        generation_config={"temperature": 0.0, "max_output_tokens": 4096}
-                                    )
-                                    _tr_prompt = (
-                                        "다음 영문 회사 소개를 한국어로 번역하세요. "
-                                        "모든 문장을 빠짐없이 번역하고, 번역문만 출력하세요.\n\n"
-                                        + _capped
-                                    )
-                                    _tr_resp = _tr_model.generate_content(_tr_prompt)
-                                    _tr_text = (_gemini_response_text_utf8_safe(_tr_resp) or "").strip()
-                                    if _tr_text:
-                                        st.session_state[_sum_key] = _tr_text
-                                        st.rerun()
-                                    else:
-                                        st.warning("번역 결과를 받지 못했어요. 다시 시도해주세요.")
-                                except Exception as _te:
-                                    st.warning(f"번역 오류: {_te}")
+                        # 한글 번역본 없으면 자동 번역 실행
+                        with st.spinner("회사 소개 번역 중..."):
+                            try:
+                                _words_list = summary_en.split()
+                                _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
+                                _tr_model = _GenAIModel(
+                                    "gemini-2.5-flash",
+                                    generation_config={"temperature": 0.0, "max_output_tokens": 4096}
+                                )
+                                _tr_resp = _tr_model.generate_content(
+                                    "다음 영문 회사 소개를 한국어로 번역하세요. "
+                                    "모든 문장을 빠짐없이 번역하고, 번역문만 출력하세요.\n\n" + _capped
+                                )
+                                _tr_text = (_gemini_response_text_utf8_safe(_tr_resp) or "").strip()
+                                if _tr_text:
+                                    st.session_state[_sum_key] = _tr_text
+                                    st.markdown(_tr_text)
+                                else:
+                                    st.markdown(summary_en)
+                            except Exception:
+                                st.markdown(summary_en)
 
-        # ── 이 종목을 보유한 ETF 목록 (자동 조회) ────────────────────────
+        # ── 이 종목을 보유한 ETF 목록 (기본 접힘) ────────────────────────
         if not is_etf_mode:
-            with st.expander("📊 이 종목을 보유한 ETF 목록", expanded=True):
+            with st.expander("📊 이 종목을 보유한 ETF 목록", expanded=False):
                 st.caption("주요 ETF 20개 중 이 종목을 보유 중인 ETF를 자동으로 찾습니다.")
                 _etf_list_key = f"_etf_holding_{selected_ticker}"
                 if st.session_state.get(_etf_list_key) is None:
@@ -10202,11 +10547,7 @@ if st.session_state.get("logged_in"):
                             "보유 비중": f"{e['weight']:.2f}%" if e.get("weight") else "N/A",
                             "보유 순위": f"Top {e['rank']}" if e.get("rank") else "N/A",
                         })
-                    st.dataframe(
-                        pd.DataFrame(_etf_rows),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                    st.dataframe(pd.DataFrame(_etf_rows), use_container_width=True, hide_index=True)
                 else:
                     st.info(f"조회한 주요 ETF 20개 중 {selected_ticker}를 보유한 ETF를 찾지 못했습니다.")
                 if st.button("🔄 다시 조회", key=f"re_find_etf_{selected_ticker}"):
@@ -10340,6 +10681,68 @@ if st.session_state.get("logged_in"):
     
                 st.divider()
                 st.subheader(f"{selected_ticker} KPI 대시보드")
+
+                # ── 투자 스타일 점수 (KPI 위) ─────────────────────────────
+                st.markdown("#### 🎯 투자 스타일 적합도")
+                st.caption("CAN SLIM · 가치투자 · 장기 우량주 3가지 관점에서 이 종목을 평가합니다.")
+                with st.spinner("투자 스타일 점수 계산 중..."):
+                    try:
+                        _style = calculate_style_scores(
+                            str(selected_ticker).strip().upper(),
+                            margin_context,
+                            kpi_df,
+                        )
+                        _sc1, _sc2, _sc3 = st.columns(3)
+                        for _col, _key, _label, _desc in [
+                            (_sc1, "canslim",  "📈 CAN SLIM",    "고성장 모멘텀"),
+                            (_sc2, "value",    "💰 가치투자",    "저평가 발굴"),
+                            (_sc3, "quality",  "🏆 장기 우량주", "퀄리티 투자"),
+                        ]:
+                            _d = _style[_key]
+                            with _col:
+                                st.markdown(
+                                    f"<div style='background:#1e293b;border-radius:12px;padding:16px;"
+                                    f"border-top:4px solid {_d['color']};text-align:center;'>"
+                                    f"<div style='font-size:14px;color:#94a3b8;'>{_label}</div>"
+                                    f"<div style='font-size:36px;font-weight:800;color:{_d['color']};'>{_d['score']}</div>"
+                                    f"<div style='font-size:13px;color:#cbd5e1;'>/ 100점</div>"
+                                    f"<div style='font-size:15px;margin-top:4px;'>{_d['grade']}</div>"
+                                    f"<div style='font-size:11px;color:#64748b;margin-top:2px;'>{_desc}</div>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+
+                        # 주도 스타일 배너
+                        _dom = _style["dominant"]
+                        _dom_score = _style["scores"][_dom]
+                        st.markdown(
+                            f"<div style='background:#0f172a;border:1px solid #334155;"
+                            f"border-radius:8px;padding:10px 16px;margin-top:12px;'>"
+                            f"<span style='color:#94a3b8;'>💡 이 종목의 주도 스타일: </span>"
+                            f"<strong style='color:#f1f5f9;font-size:16px;'>{_dom}</strong>"
+                            f"<span style='color:#64748b;font-size:13px;'> ({_dom_score}점)</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        # 세부 점수 expander
+                        with st.expander("📊 세부 점수 보기", expanded=False):
+                            _det_c1, _det_c2, _det_c3 = st.columns(3)
+                            for _dc, _key, _label in [
+                                (_det_c1, "canslim",  "📈 CAN SLIM"),
+                                (_det_c2, "value",    "💰 가치투자"),
+                                (_det_c3, "quality",  "🏆 장기 우량주"),
+                            ]:
+                                with _dc:
+                                    st.markdown(f"**{_label}**")
+                                    for _k, _v in _style[_key]["detail"].items():
+                                        _kname = _k.replace("_", " ")
+                                        st.caption(f"{_kname}: {_v}")
+
+                    except Exception as _se:
+                        st.warning(f"스타일 점수 계산 오류: {_se}")
+
+                st.divider()
     
                 category_order = [
                     "수익성 (Profitability)",
