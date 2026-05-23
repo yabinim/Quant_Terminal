@@ -5298,6 +5298,46 @@ def open_emerging_tracker_worksheet():
         return None, f"Emerging_Tracker 워크시트 열기/생성 실패: {exc}"
 
 
+_EMERGING_TRACKER_DEFAULT_TTL_DAYS = 30  # Last_Seen 기준 기본 만료일
+
+
+def _parse_emerging_last_seen(val: str):
+    """Last_Seen 문자열 → datetime (KST). 파싱 실패 시 None."""
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(val).strip()[:16], fmt).replace(tzinfo=_KST_TZ)
+        except Exception:
+            continue
+    return None
+
+
+def purge_expired_emerging_tracker(user_id: str, ttl_days: int = _EMERGING_TRACKER_DEFAULT_TTL_DAYS) -> int:
+    """Last_Seen이 ttl_days일 이상 지난 행을 시트에서 영구 삭제. 삭제 건수 반환."""
+    ws, err = open_emerging_tracker_worksheet()
+    if err or ws is None:
+        return 0
+    try:
+        vals = ws.get_all_values()
+        if not vals or len(vals) < 2:
+            return 0
+        uid_u = str(user_id).strip().upper()
+        now = datetime.now(_KST_TZ)
+        cutoff = now - timedelta(days=ttl_days)
+        to_del = []
+        for i, r in enumerate(vals[1:], start=2):
+            r = (r + [""] * 9)[:9]
+            if str(r[0]).strip().upper() != uid_u:
+                continue
+            last_seen_dt = _parse_emerging_last_seen(r[4])
+            if last_seen_dt is None or last_seen_dt < cutoff:
+                to_del.append(i)
+        for idx in reversed(to_del):
+            ws.delete_rows(idx)
+        return len(to_del)
+    except Exception:
+        return 0
+
+
 def load_emerging_tracker(user_id: str) -> pd.DataFrame:
     """현재 유저의 Emerging 추적 기록 전체 로드."""
     ws, err = open_emerging_tracker_worksheet()
@@ -13542,6 +13582,37 @@ if st.session_state.get("logged_in"):
 
         uid_et = str(st.session_state.get("user_id") or "").strip()
 
+        # ── 설정 패널 ─────────────────────────────────────────────────────
+        with st.expander("⚙️ 필터 & 만료 설정", expanded=False):
+            cfg_col1, cfg_col2 = st.columns(2)
+            with cfg_col1:
+                ttl_days = st.slider(
+                    "📅 자동 만료 기준 (Last_Seen 기준)",
+                    min_value=7, max_value=60, value=30, step=7,
+                    help="마지막 등장일이 이 일수보다 오래된 종목은 '만료 임박' 표시 및 수동/자동 정리 대상이 됩니다.",
+                    key="et_ttl_slider",
+                )
+            with cfg_col2:
+                min_count = st.slider(
+                    "🔢 최소 등장 횟수 (메인 뷰 기준)",
+                    min_value=1, max_value=5, value=2, step=1,
+                    help="이 횟수 미만인 종목은 메인 뷰에서 숨깁니다. 전체 목록에서는 계속 확인 가능.",
+                    key="et_min_count_slider",
+                )
+
+            purge_col1, purge_col2 = st.columns([1, 2])
+            with purge_col1:
+                if st.button(f"🗑️ {ttl_days}일 이상 오래된 종목 일괄 삭제", key="et_purge_btn", type="primary", use_container_width=True):
+                    with st.spinner("만료 종목 삭제 중..."):
+                        purged = purge_expired_emerging_tracker(uid_et, ttl_days=ttl_days)
+                    if purged > 0:
+                        st.success(f"✅ {purged}개 만료 종목 삭제 완료!")
+                        st.rerun()
+                    else:
+                        st.info(f"만료된 종목({ttl_days}일 이상)이 없습니다.")
+            with purge_col2:
+                st.caption(f"현재 기준: Last_Seen이 **{ttl_days}일 이상** 지난 종목을 시트에서 영구 삭제합니다.")
+
         with st.spinner("Emerging 추적 기록 불러오는 중..."):
             et_df = load_emerging_tracker(uid_et)
 
@@ -13552,48 +13623,85 @@ if st.session_state.get("logged_in"):
                 "자동으로 기록이 쌓입니다."
             )
         else:
-            # ── 요약 지표 ──────────────────────────────────────────────────
-            total = len(et_df)
-            hot = (et_df["Count"].astype(int) >= 3).sum() if "Count" in et_df.columns else 0
-            new_ones = (et_df["Status"].str.contains("신규", na=False)).sum()
-            best_ones = et_df[et_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)]
+            # ── 만료 임박 계산 ──────────────────────────────────────────────
+            now_et = datetime.now(_KST_TZ)
+            cutoff_et = now_et - timedelta(days=ttl_days)
 
-            m1, m2, m3, m4 = st.columns(4)
+            def _days_since_last_seen(val):
+                dt = _parse_emerging_last_seen(str(val))
+                if dt is None:
+                    return 9999
+                return (now_et - dt).days
+
+            et_df["_days_ago"] = et_df["Last_Seen"].apply(_days_since_last_seen)
+            expired_mask = et_df["_days_ago"] >= ttl_days
+            active_df = et_df[~expired_mask].copy()
+            expired_df = et_df[expired_mask].copy()
+
+            # ── 요약 지표 ──────────────────────────────────────────────────
+            total = len(active_df)
+            hot = (active_df["Count"].astype(int) >= 3).sum() if not active_df.empty else 0
+            new_ones = (active_df["Status"].str.contains("신규", na=False)).sum() if not active_df.empty else 0
+            best_ones = active_df[active_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)] if not active_df.empty else pd.DataFrame()
+            expiring_soon = ((active_df["_days_ago"] >= ttl_days * 0.7) & (active_df["_days_ago"] < ttl_days)).sum() if not active_df.empty else 0
+
+            m1, m2, m3, m4, m5 = st.columns(5)
             with m1:
-                st.metric("전체 추적 종목", f"{total}개")
+                st.metric("활성 추적 종목", f"{total}개", delta=f"만료 {len(expired_df)}개" if len(expired_df) > 0 else None, delta_color="inverse")
             with m2:
                 st.metric("🔥 반복 등장 (3회+)", f"{hot}개")
             with m3:
                 st.metric("🆕 신규 등장", f"{new_ones}개")
             with m4:
                 st.metric("🎯 매수 신호 종목", f"{len(best_ones)}개")
+            with m5:
+                st.metric("⏳ 만료 임박", f"{expiring_soon}개", help=f"Last_Seen이 TTL의 70% ({int(ttl_days*0.7)}일) 이상 지난 종목")
+
+            # ── 만료 임박 경고 배너 ─────────────────────────────────────────
+            if len(expired_df) > 0:
+                expired_tickers = ", ".join(expired_df["Ticker"].tolist()[:10])
+                st.warning(
+                    f"⏰ **{len(expired_df)}개 종목**이 {ttl_days}일 이상 재등장 없이 오래됐어요: `{expired_tickers}` "
+                    f"— 위 설정 패널에서 일괄 삭제하거나 개별 삭제하세요.",
+                    icon="⚠️"
+                )
+
+            # 이하 메인 뷰는 active_df 기준 + min_count 필터 적용
+            view_df = active_df[active_df["Count"].astype(int) >= min_count].copy() if not active_df.empty else pd.DataFrame()
+
+            if min_count > 1 and len(active_df) > len(view_df):
+                hidden_n = len(active_df) - len(view_df)
+                st.caption(f"ℹ️ 등장 {min_count}회 미만 종목 **{hidden_n}개** 숨김 중 (전체 목록에서 확인 가능)")
 
             # ── 최우선 관심 종목 ───────────────────────────────────────────
             if not best_ones.empty:
-                st.divider()
-                st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드)")
-                st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 종목들이에요.")
-                for _, row in best_ones.sort_values("Count", ascending=False).iterrows():
-                    count = int(row["Count"]) if str(row["Count"]).isdigit() else 1
-                    rs_str = f"RS {float(row['RS_Score']):.1f}%p" if row["RS_Score"] else ""
-                    st.markdown(
-                        f"**{row['Ticker']}** — {row['Best_Verdict']} | "
-                        f"등장 **{count}회** | {rs_str} | 최근: {row['Last_Seen']}"
-                    )
-                    col_a, col_b = st.columns([1, 4])
-                    with col_a:
-                        def _goto_stock(tk=row["Ticker"]):
-                            st.session_state["selected_ticker"] = tk
-                            st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
-                        st.button(f"🔬 {row['Ticker']} 분석", key=f"et_goto_{row['Ticker']}", on_click=_goto_stock)
+                best_view = best_ones[best_ones["Count"].astype(int) >= min_count]
+                if not best_view.empty:
+                    st.divider()
+                    st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드)")
+                    st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 종목들이에요.")
+                    for _, row in best_view.sort_values("Count", ascending=False).iterrows():
+                        count = int(row["Count"]) if str(row["Count"]).isdigit() else 1
+                        rs_str = f"RS {float(row['RS_Score']):.1f}%p" if row["RS_Score"] else ""
+                        days_ago = int(row["_days_ago"])
+                        freshness = f"🟢 {days_ago}일 전" if days_ago <= 7 else (f"🟡 {days_ago}일 전" if days_ago <= 14 else f"🔴 {days_ago}일 전")
+                        st.markdown(
+                            f"**{row['Ticker']}** — {row['Best_Verdict']} | "
+                            f"등장 **{count}회** | {rs_str} | {freshness}"
+                        )
+                        col_a, col_b = st.columns([1, 4])
+                        with col_a:
+                            def _goto_stock(tk=row["Ticker"]):
+                                st.session_state["selected_ticker"] = tk
+                                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                            st.button(f"🔬 {row['Ticker']} 분석", key=f"et_goto_{row['Ticker']}", on_click=_goto_stock)
 
             # ── 반복 등장 종목 ─────────────────────────────────────────────
             st.divider()
-            st.markdown("### 🔥 반복 등장 종목 (관심 집중)")
+            st.markdown(f"### 🔥 반복 등장 종목 ({min_count}회 이상, 활성)")
 
-            hot_df = et_df[et_df["Count"].astype(int) >= 2].sort_values("Count", ascending=False)
-            if hot_df.empty:
-                st.info("아직 2회 이상 등장한 종목이 없어요. 내러티브 분석을 더 진행하면 쌓입니다.")
+            if view_df.empty:
+                st.info(f"등장 {min_count}회 이상인 활성 종목이 없어요. 슬라이더에서 최소 횟수를 낮춰보세요.")
             else:
                 def _style_count(val):
                     v = int(val) if str(val).isdigit() else 0
@@ -13606,22 +13714,32 @@ if st.session_state.get("logged_in"):
                     if "얼리" in str(val): return "color:#0ea5e9;font-weight:600"
                     return ""
 
+                def _style_freshness(val):
+                    try:
+                        d = int(val)
+                        if d <= 7: return "color:#16a34a"
+                        if d <= 14: return "color:#f97316"
+                        return "color:#dc2626"
+                    except Exception:
+                        return ""
+
+                display_df = view_df[["Ticker", "Theme", "First_Seen", "Last_Seen", "_days_ago", "Count", "Best_Verdict", "RS_Score", "Status"]].rename(columns={"_days_ago": "경과일"}).sort_values("Count", ascending=False)
                 styled_hot = (
-                    hot_df[["Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]]
+                    display_df
                     .style
                     .map(_style_count, subset=["Count"])
                     .map(_style_verdict, subset=["Best_Verdict"])
+                    .map(_style_freshness, subset=["경과일"])
                 )
                 st.dataframe(styled_hot, use_container_width=True, hide_index=True)
 
-            # ── 전체 목록 ──────────────────────────────────────────────────
+            # ── 전체 목록 (만료 포함) ──────────────────────────────────────
             st.divider()
-            st.markdown("### 📋 전체 추적 목록")
+            st.markdown("### 📋 전체 추적 목록 (만료 포함)")
             with st.expander("전체 보기", expanded=False):
-                st.dataframe(
-                    et_df.sort_values("Count", ascending=False),
-                    use_container_width=True, hide_index=True
-                )
+                full_display = et_df[["Ticker", "Theme", "First_Seen", "Last_Seen", "_days_ago", "Count", "Best_Verdict", "RS_Score", "Status"]].rename(columns={"_days_ago": "경과일"}).sort_values("Count", ascending=False)
+                st.dataframe(full_display, use_container_width=True, hide_index=True)
+                st.caption(f"총 {len(et_df)}개 (활성 {len(active_df)}개 + 만료 {len(expired_df)}개)")
 
             # ── 개별 삭제 ──────────────────────────────────────────────────
             st.divider()
