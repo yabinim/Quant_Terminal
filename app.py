@@ -3207,8 +3207,15 @@ def evaluate_kpis(ticker_symbol):
     )
     growth_percent = earnings_growth * 100 if not pd.isna(earnings_growth) else np.nan
     intrinsic_value = np.nan
-    if not pd.isna(trailing_eps) and not pd.isna(growth_percent):
+    # Graham 공식: EPS > 0 이고 성장률 > 0 일 때만 의미있음
+    # 성장률 음수 or EPS 음수면 공식 결과가 왜곡됨 → 계산 생략
+    if (not pd.isna(trailing_eps) and trailing_eps > 0
+            and not pd.isna(growth_percent) and growth_percent > 0):
         intrinsic_value = trailing_eps * (8.5 + (2 * growth_percent))
+        # 결과가 비현실적으로 크면(현재가 10배 이상) 신뢰도 낮으므로 표시만 경고
+        if not pd.isna(current_price) and current_price > 0:
+            if intrinsic_value > current_price * 10 or intrinsic_value < 0:
+                intrinsic_value = np.nan  # 비현실적 값 제거
 
     margin_of_safety = np.nan
     if not pd.isna(intrinsic_value) and intrinsic_value != 0 and not pd.isna(current_price):
@@ -9959,7 +9966,9 @@ if st.session_state.get("logged_in"):
             "sync_tab_stock",
             [cached_evaluate_kpis_snapshot.clear, cached_etf_holdings_universe_str.clear,
              cached_build_etf_holdings_performance_pairs.clear, cached_timing_price_history.clear,
-             fetch_company_overview.clear, fetch_price_history_by_period.clear],
+             fetch_company_overview.clear, fetch_price_history_by_period.clear,
+             _fmp_profile.clear, _fmp_ratios.clear, _fmp_key_metrics.clear,
+             _fmp_cashflow.clear],
             "종목별 재무·차트·회사정보 캐시를 비우고 최신 데이터를 받습니다.",
         )
         st.subheader(_MAIN_NAV_OPTIONS[5])
@@ -9967,6 +9976,37 @@ if st.session_state.get("logged_in"):
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
         )
         st.markdown(f"**분석 티커:** `{selected_ticker}`")
+
+        # ── FMP 진단 패널 ─────────────────────────────────────────────
+        with st.expander("🛠️ FMP 데이터 진단 (문제 발생 시 확인)", expanded=False):
+            _dt = str(selected_ticker).strip().upper()
+            _dk = _fmp_key()
+            if not _dk:
+                st.error("❌ FMP_API_KEY 가 Streamlit Secrets에 없습니다.")
+            else:
+                st.success(f"✅ FMP_API_KEY 확인됨 (...{_dk[-4:]})")
+            if st.button("🔬 FMP 응답 테스트 실행", key="fmp_diag_btn"):
+                for _ep, _params, _extract in [
+                    ("profile",         f"symbol={_dt}",                          lambda d: {"name": d.get("companyName"), "sector": d.get("sector"), "mktCap": d.get("mktCap")}),
+                    ("ratios-ttm",      f"symbol={_dt}",                          lambda d: {"operatingProfitMarginTTM": d.get("operatingProfitMarginTTM"), "returnOnEquityTTM": d.get("returnOnEquityTTM"), "debtToEquityTTM": d.get("debtToEquityTTM")}),
+                    ("key-metrics-ttm", f"symbol={_dt}",                          lambda d: {"peRatioTTM": d.get("peRatioTTM"), "pbRatioTTM": d.get("pbRatioTTM"), "evToEbitdaTTM": d.get("evToEbitdaTTM"), "netIncomePerShareTTM": d.get("netIncomePerShareTTM")}),
+                    ("income-statement",f"symbol={_dt}&period=annual&limit=1",    lambda d: {"revenue": d.get("revenue"), "operatingIncome": d.get("operatingIncome"), "epsdiluted": d.get("epsdiluted")}),
+                    ("cash-flow-statement", f"symbol={_dt}&period=annual&limit=1",lambda d: {"freeCashFlow": d.get("freeCashFlow")}),
+                ]:
+                    try:
+                        _r = requests.get(f"{_FMP_BASE}/{_ep}?{_params}&apikey={_dk}", timeout=8)
+                        _raw = _r.json()
+                        _item = _raw[0] if isinstance(_raw, list) and _raw else (_raw if isinstance(_raw, dict) else {})
+                        _vals = _extract(_item)
+                        _has_data = any(v is not None for v in _vals.values())
+                        if _r.status_code == 200 and _has_data:
+                            st.success(f"✅ /{_ep}")
+                            st.json(_vals)
+                        else:
+                            st.warning(f"⚠️ /{_ep} HTTP {_r.status_code} — 데이터 없음 또는 플랜 제한")
+                            st.json({"status": _r.status_code, "raw_preview": str(_raw)[:200]})
+                    except Exception as _e:
+                        st.error(f"❌ /{_ep} 오류: {_e}")
 
         # ── 회사 기본 정보 ────────────────────────────────────────────────
         try:
