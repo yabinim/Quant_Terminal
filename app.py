@@ -8204,26 +8204,30 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
 {portfolio_json}
 
 [2] 최근 AI 내러티브 요약 (최신 10개)
+각 항목의 winners_csv = AI가 수혜주로 꼽은 티커, emerging_csv = AI가 주목한 신흥 티커.
+포트폴리오 보유 종목이 winners/emerging에 **없으면** 내러티브 상 위험 종목으로 분류하세요.
 {narrative_json}
 
-[3] 거시경제 지표 현황
+[3] 거시경제 지표 현황 (status: "pass"=정상, "warning"=경고, "danger"=위험, "N/A"=데이터없음)
 {macro_json}
 
 ---
 작성 규칙:
 1) 데이터에 없는 내용은 추측하지 마세요.
-2) 반드시 아래 섹션 구조를 지켜 마크다운으로 작성하세요.
-3) 각 섹션은 간결하고 실전적으로, 투자 판단에 바로 쓸 수 있는 내용으로.
+2) [3] 거시경제 지표에서 status가 "warning" 또는 "danger"인 항목은 반드시 언급하세요. 모두 "pass"라면 "현재 거시경제 지표는 전반적으로 안정적입니다"라고 작성하세요.
+3) 반드시 아래 섹션 구조를 지켜 마크다운으로 작성하세요.
+4) 각 섹션은 간결하고 실전적으로, 투자 판단에 바로 쓸 수 있는 내용으로.
 
 ## 📊 이번 주 포트폴리오 요약
 - 전체 수익률, 최고/최저 종목, 주목할 변화 한 줄씩
 
 ## 🌐 거시경제 환경 점검
-- 현재 Macro 지표가 포트폴리오에 미치는 영향 (긍정/부정 요인)
+- [3] 데이터의 각 지표 value와 status를 직접 인용해 포트폴리오 영향 분석 (긍정/부정 요인)
 
 ## 🧠 AI 내러티브와 포트폴리오 연결
 - 이번 주 AI가 강조한 테마와 내 포트폴리오 종목의 연관성
-- 내러티브 상 수혜가 예상되는 보유 종목 vs 위험 종목
+- 내러티브 상 수혜가 예상되는 보유 종목 (winners_csv/emerging_csv에 포함된 보유 티커)
+- 내러티브 상 위험 종목 (보유 중이지만 winners_csv/emerging_csv 어디에도 없는 티커)
 
 ## ⚠️ 리스크 점검
 - 고상관 종목 쌍, 섹터 편중, Drawdown 주의 종목
@@ -8289,13 +8293,20 @@ def _build_narrative_context_for_summary(user_id: str) -> list:
         saved_at = rec.get("saved_at", "")
         themes = analysis.get("themes", [])
         theme_titles = [str(t.get("title", "")) for t in themes if isinstance(t, dict)]
+        # 테마별 위험 신호 추출
+        risk_themes = [
+            str(t.get("title", "")) for t in themes
+            if isinstance(t, dict) and str(t.get("risk_level", "")).lower() in ("high", "위험", "경고")
+        ]
         out.append({
             "saved_at": saved_at,
             "session": rec.get("session_label", ""),
             "regime": analysis.get("regime", {}),
             "themes": theme_titles[:5],
+            "risk_themes": risk_themes[:3],  # 위험 테마
             "rotation": str(analysis.get("rotation", ""))[:300],
             "winners_csv": str(rec.get("_sheet_winners_csv", ""))[:200],
+            "emerging_csv": str(rec.get("_sheet_emerging_csv", ""))[:200],
         })
     return out
 
@@ -8303,7 +8314,11 @@ def _build_narrative_context_for_summary(user_id: str) -> list:
 def _build_macro_context_for_summary() -> dict:
     """cached_analyze_us_macro_dashboard에서 Gemini 입력용 macro context 생성."""
     try:
-        macro_rows = cached_analyze_us_macro_dashboard()
+        macro_pack = cached_analyze_us_macro_dashboard()
+        if not macro_pack:
+            return {}
+        # analyze_us_macro_dashboard()는 {"rows": [...], "bad_total": ..., ...} 구조를 반환
+        macro_rows = macro_pack.get("rows", []) if isinstance(macro_pack, dict) else []
         if not macro_rows:
             return {}
         out = {}
@@ -12971,6 +12986,8 @@ if st.session_state.get("logged_in"):
 
         with st.spinner("Thesis 기록 불러오는 중..."):
             thesis_df = load_thesis_records(uid_thesis)
+            # Thesis별 포지션 현황에서 매수가/수량 조회용 포트폴리오 로드
+            portfolio_df_thesis = load_portfolio()
 
         if thesis_df.empty:
             st.info(
