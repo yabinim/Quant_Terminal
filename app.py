@@ -2312,29 +2312,12 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         signals["credit"] = {"ok": True, "value": "N/A", "trend": ""}
 
     # ── 신호 3: 대장주 모멘텀 약화 ─────────────────────────────────────
-    # sector_etf도 tickers_dl에 포함시켜 신호 4 거래량 계산에 재사용
-    raw = None
-    close_df = None
-    _raw_volume_df = pd.DataFrame()  # 신호 4에서 재사용할 Volume 데이터
     try:
         leader_alerts = []
         leader_details = {}
-        tickers_dl = list(dict.fromkeys(leaders + ["SPY", sector_etf]))
+        tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
         raw = yf.download(tickers_dl, period="1mo", interval="1d", auto_adjust=False, progress=False)
         close_df = get_close_prices_from_download(raw)
-
-        # ── Volume 추출 (멀티인덱스 / 단일인덱스 모두 대응) ──────────────
-        if raw is not None and not raw.empty:
-            if isinstance(raw.columns, pd.MultiIndex):
-                if "Volume" in raw.columns.get_level_values(0):
-                    _raw_volume_df = raw["Volume"].copy()
-            else:
-                vol_cols = [c for c in raw.columns if str(c).lower() == "volume"]
-                if vol_cols:
-                    # 단일 ticker 다운로드 시 컬럼명이 "Volume" 하나
-                    _raw_volume_df = raw[vol_cols].copy()
-                    if len(tickers_dl) == 1:
-                        _raw_volume_df.columns = [tickers_dl[0]]
 
         spy_s = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
         spy_5d = float((spy_s.iloc[-1]/spy_s.iloc[-6] - 1)*100) if len(spy_s) >= 6 else 0
@@ -2367,34 +2350,24 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         signals["leaders"] = {"ok": True, "value": "N/A", "trend": ""}
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
-    # 신호 3에서 이미 다운받은 raw/_raw_volume_df를 재사용 → 추가 API 호출 없음
     try:
-        etf_s = (
-            pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna()
-            if close_df is not None and sector_etf in close_df.columns
-            else pd.Series(dtype=float)
-        )
-
-        # sector_etf Volume 시리즈 추출
-        vol = pd.Series(dtype=float)
-        if not _raw_volume_df.empty and sector_etf in _raw_volume_df.columns:
-            vol = pd.to_numeric(_raw_volume_df[sector_etf], errors="coerce").dropna()
-
-        if not etf_s.empty and len(etf_s) >= 10 and len(vol) >= 10:
-            price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
-            vol_5d = float(vol.tail(5).mean())
-            vol_20d = float(vol.tail(20).mean())
-            vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
-            dist_selling = price_5d > 0 and vol_ratio < 0.8
-            vol_alert = dist_selling or vol_ratio < 0.7
-            signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
-            details["거래량"] = {
-                "5일 평균 비율": f"{vol_ratio:.2f}x",
-                "가격 5일": f"{price_5d:+.1f}%",
-                "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상"),
-            }
-            if vol_alert:
-                warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
+        etf_s = pd.to_numeric(close_df.get(sector_etf, pd.Series(dtype=float)), errors="coerce").dropna() if 'close_df' in dir() else pd.Series(dtype=float)
+        if close_df is not None and sector_etf in close_df.columns and not etf_s.empty:
+            raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
+            if len(etf_s) >= 10 and len(vol) >= 10:
+                price_5d = float((etf_s.iloc[-1]/etf_s.iloc[-6] - 1)*100) if len(etf_s) >= 6 else 0
+                vol_5d = float(vol.tail(5).mean())
+                vol_20d = float(vol.tail(20).mean())
+                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1
+                dist_selling = price_5d > 0 and vol_ratio < 0.8
+                vol_alert = dist_selling or vol_ratio < 0.7
+                signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
+                details["거래량"] = {"5일 평균 비율": f"{vol_ratio:.2f}x", "가격 5일": f"{price_5d:+.1f}%", "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상")}
+                if vol_alert:
+                    warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
+            else:
+                signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
         else:
             signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
     except Exception:
@@ -4122,6 +4095,8 @@ def load_portfolio():
     df["Quantity"] = df["Quantity"].fillna(1.0)
     df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN") & df["Account"].astype(str).str.strip().ne("")]
     df = df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
+    # 수량이 0 이하인 종목(전량 매도 완료)은 포트폴리오에서 제외
+    df = df[pd.to_numeric(df["Quantity"], errors="coerce").fillna(0) > 1e-9].reset_index(drop=True)
     return df[base_columns].copy()
 
 
@@ -4148,6 +4123,8 @@ def save_portfolio(df):
         return
     safe_df = safe_df[safe_df["Ticker"].ne("") & safe_df["Ticker"].ne("NAN")]
     safe_df = safe_df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
+    # 수량이 0 이하인 종목(전량 매도 완료)은 DB에 저장하지 않음
+    safe_df = safe_df[pd.to_numeric(safe_df["Quantity"], errors="coerce").fillna(0) > 1e-9].reset_index(drop=True)
     ok, msg = replace_user_portfolio_sheet_rows(uid, safe_df)
     if not ok:
         try:
@@ -4663,6 +4640,8 @@ def build_portfolio_sell_radar_df(portfolio_df):
     clean_portfolio["Quantity"] = pd.to_numeric(clean_portfolio["Quantity"], errors="coerce")
     clean_portfolio["Quantity"] = clean_portfolio["Quantity"].fillna(1.0)
     clean_portfolio = clean_portfolio.drop_duplicates(subset=["Account", "Ticker"], keep="last")
+    # 전량 매도 완료(수량 0 이하) 종목은 레이더에서 제외
+    clean_portfolio = clean_portfolio[clean_portfolio["Quantity"] > 1e-9].reset_index(drop=True)
 
     clean_tickers = clean_portfolio["Ticker"].dropna().astype(str).tolist()
     clean_tickers = [t for t in clean_tickers if t]
@@ -11315,6 +11294,17 @@ if st.session_state.get("logged_in"):
 
         portfolio_df = load_portfolio()
         puid = str(st.session_state.get("user_id") or "").strip()
+
+        # ── DB 잔존 수량 0 행 자동 클린업 (세션당 1회) ──────────────────────
+        # load_portfolio()는 이미 Quantity>0 필터를 적용하므로,
+        # 시트에 Quantity=0 잔존 행이 있으면 여기서 덮어쓰기로 영구 삭제.
+        _cleanup_key = f"_pf_zero_qty_cleaned_{puid}"
+        if puid and not st.session_state.get(_cleanup_key):
+            st.session_state[_cleanup_key] = True  # 중복 실행 방지
+            if not portfolio_df.empty:
+                save_portfolio(portfolio_df)   # Quantity>0 행만 재저장 → 시트 정리
+                _invalidate_portfolio_sheet_cache()
+        # ────────────────────────────────────────────────────────────────────
         if st.session_state.get("_portfolio_last_sheet_error"):
             st.warning(f"Portfolios 시트: {st.session_state['_portfolio_last_sheet_error']}")
 
