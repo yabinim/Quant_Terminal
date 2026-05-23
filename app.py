@@ -4037,6 +4037,9 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
             qq = pd.to_numeric(row.get("Quantity"), errors="coerce")
             if pd.isna(pp) or pd.isna(qq):
                 continue
+            # 수량 0 이하(전량 매도 완료) 행은 시트에 기록하지 않음
+            if float(qq) <= 1e-9:
+                continue
             rows.append([uid, acct, tk, float(pp), float(qq), now_s])
         ws.clear()
         ws.update(rows, range_name=f"A1:F{len(rows)}", value_input_option="USER_ENTERED")
@@ -11270,6 +11273,9 @@ if st.session_state.get("logged_in"):
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_portfolio", use_container_width=True):
+                # 클린업 플래그 초기화 → 다음 렌더 시 Quantity=0 행 재정리
+                _sync_puid = str(st.session_state.get("user_id") or "").strip()
+                st.session_state.pop(f"_pf_zero_qty_cleaned_{_sync_puid}", None)
                 tab_sync_refresh(
                     [
                         cached_portfolio_yf_close_1y.clear,
@@ -11295,15 +11301,14 @@ if st.session_state.get("logged_in"):
         portfolio_df = load_portfolio()
         puid = str(st.session_state.get("user_id") or "").strip()
 
-        # ── DB 잔존 수량 0 행 자동 클린업 (세션당 1회) ──────────────────────
-        # load_portfolio()는 이미 Quantity>0 필터를 적용하므로,
-        # 시트에 Quantity=0 잔존 행이 있으면 여기서 덮어쓰기로 영구 삭제.
+        # ── DB 잔존 수량 0 행 자동 클린업 (동기화 버튼 또는 첫 진입 시) ────
         _cleanup_key = f"_pf_zero_qty_cleaned_{puid}"
         if puid and not st.session_state.get(_cleanup_key):
-            st.session_state[_cleanup_key] = True  # 중복 실행 방지
-            if not portfolio_df.empty:
-                save_portfolio(portfolio_df)   # Quantity>0 행만 재저장 → 시트 정리
-                _invalidate_portfolio_sheet_cache()
+            st.session_state[_cleanup_key] = True
+            # portfolio_df는 이미 Quantity>0 필터 적용된 상태.
+            # 비어있더라도 save_portfolio를 호출해 시트의 해당 유저 행을 전부 정리.
+            save_portfolio(portfolio_df)
+            _invalidate_portfolio_sheet_cache()
         # ────────────────────────────────────────────────────────────────────
         if st.session_state.get("_portfolio_last_sheet_error"):
             st.warning(f"Portfolios 시트: {st.session_state['_portfolio_last_sheet_error']}")
