@@ -3102,50 +3102,57 @@ def _fmp_patch_info(info: dict, ticker_upper: str) -> dict:
                 if pd.notna(_fpe) and _fpe > 0:
                     info["forwardPE"] = _fpe
 
-    # ── 2) Ratios-TTM: P/E·P/B·EV/EBITDA·ROE·Margin·D/E ─────────────
+    # ── 2) Ratios-TTM: 마진·ROE·D/E (ratios-ttm에 실제로 있는 필드만) ──
     need_ratios = not all([
-        info.get("trailingPE"),
-        info.get("priceToBook"),
         info.get("returnOnEquity"),
         info.get("operatingMargins"),
+        info.get("debtToEquity"),
     ])
     if need_ratios:
         rat = fmp_get_ratios(ticker_upper)
         if rat:
-            if not info.get("trailingPE"):
-                _pe = to_float(rat.get("peRatioTTM") or rat.get("peRatio"))
-                if pd.notna(_pe) and _pe > 0:
-                    info["trailingPE"] = _pe
-            if not info.get("priceToBook"):
-                _pb = to_float(rat.get("priceToBookRatioTTM") or rat.get("priceToBookRatio"))
-                if pd.notna(_pb):
-                    info["priceToBook"] = _pb
-            if not info.get("enterpriseToEbitda"):
-                _ev = to_float(rat.get("enterpriseValueMultipleTTM") or rat.get("evToEbitda"))
-                if pd.notna(_ev):
-                    info["enterpriseToEbitda"] = _ev
-            if not info.get("pegRatio"):
-                _peg = to_float(rat.get("pegRatioTTM") or rat.get("priceEarningsToGrowthRatio"))
-                if pd.notna(_peg):
-                    info["pegRatio"] = _peg
-            if not info.get("returnOnEquity"):
-                _roe = to_float(rat.get("returnOnEquityTTM") or rat.get("returnOnEquity"))
-                if pd.notna(_roe):
-                    info["returnOnEquity"] = _roe
             if not info.get("operatingMargins"):
                 _om = to_float(rat.get("operatingProfitMarginTTM") or rat.get("operatingProfitMargin"))
                 if pd.notna(_om):
                     info["operatingMargins"] = _om
+            if not info.get("returnOnEquity"):
+                _roe = to_float(rat.get("returnOnEquityTTM") or rat.get("returnOnEquity"))
+                if pd.notna(_roe):
+                    info["returnOnEquity"] = _roe
             if not info.get("debtToEquity"):
                 _dte = to_float(rat.get("debtToEquityTTM") or rat.get("debtToEquity"))
                 if pd.notna(_dte):
                     info["debtToEquity"] = _dte if _dte > 10 else _dte * 100
 
-        # ── 3) Key Metrics TTM: EPS ───────────────────────────────────
+    # ── 3) Key Metrics TTM: P/E·P/B·EV/EBITDA·PEG·EPS ──────────────
+    # P/E, P/B, EV/EBITDA, PEG 는 ratios-ttm 이 아닌 key-metrics-ttm 에 있음
+    need_metrics = not all([
+        info.get("trailingPE"),
+        info.get("priceToBook"),
+        info.get("enterpriseToEbitda"),
+        info.get("trailingEps"),
+    ])
+    if need_metrics:
         km = fmp_get_key_metrics(ticker_upper)
         if km:
+            if not info.get("trailingPE"):
+                _pe = to_float(km.get("peRatioTTM") or km.get("peRatio"))
+                if pd.notna(_pe) and _pe > 0:
+                    info["trailingPE"] = _pe
+            if not info.get("priceToBook"):
+                _pb = to_float(km.get("pbRatioTTM") or km.get("pbRatio") or km.get("priceToBookRatioTTM"))
+                if pd.notna(_pb):
+                    info["priceToBook"] = _pb
+            if not info.get("enterpriseToEbitda"):
+                _ev = to_float(km.get("evToEbitdaTTM") or km.get("enterpriseValueOverEBITDATTM") or km.get("evToEbitda"))
+                if pd.notna(_ev):
+                    info["enterpriseToEbitda"] = _ev
+            if not info.get("pegRatio"):
+                _peg = to_float(km.get("pegRatioTTM") or km.get("priceEarningsToGrowthRatio"))
+                if pd.notna(_peg):
+                    info["pegRatio"] = _peg
             if not info.get("trailingEps"):
-                _eps = to_float(km.get("netIncomePerShareTTM") or km.get("epsTTM"))
+                _eps = to_float(km.get("netIncomePerShareTTM") or km.get("earningsPerShareTTM"))
                 if pd.notna(_eps):
                     info["trailingEps"] = _eps
 
@@ -10323,16 +10330,35 @@ if st.session_state.get("logged_in"):
                             f"{_FMP_BASE}/ratios-ttm?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
                             timeout=8
                         )
+                        _item0 = _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}
                         _diag_results["ratios-ttm"] = {
                             "status": _r.status_code,
-                            "keys": list((_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).keys())[:15],
-                            "pe": (_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).get("peRatioTTM"),
-                            "pb": (_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).get("priceToBookRatioTTM"),
-                            "ev": (_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).get("enterpriseValueMultipleTTM"),
-                            "roe": (_r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}).get("returnOnEquityTTM"),
+                            "keys": list(_item0.keys())[:20],
+                            "operatingProfitMarginTTM": _item0.get("operatingProfitMarginTTM"),
+                            "returnOnEquityTTM": _item0.get("returnOnEquityTTM"),
+                            "debtToEquityTTM": _item0.get("debtToEquityTTM"),
                         }
                     except Exception as _e:
                         _diag_results["ratios-ttm"] = {"error": str(_e)}
+
+                with st.spinner("FMP /key-metrics-ttm 테스트 중..."):
+                    try:
+                        _r = requests.get(
+                            f"{_FMP_BASE}/key-metrics-ttm?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
+                            timeout=8
+                        )
+                        _item0 = _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {}
+                        _diag_results["key-metrics-ttm"] = {
+                            "status": _r.status_code,
+                            "keys": list(_item0.keys())[:20],
+                            "peRatioTTM": _item0.get("peRatioTTM"),
+                            "pbRatioTTM": _item0.get("pbRatioTTM"),
+                            "evToEbitdaTTM": _item0.get("evToEbitdaTTM"),
+                            "netIncomePerShareTTM": _item0.get("netIncomePerShareTTM"),
+                            "pegRatioTTM": _item0.get("pegRatioTTM"),
+                        }
+                    except Exception as _e:
+                        _diag_results["key-metrics-ttm"] = {"error": str(_e)}
 
                 with st.spinner("FMP /income-statement 테스트 중..."):
                     try:
@@ -10357,11 +10383,14 @@ if st.session_state.get("logged_in"):
                             f"{_FMP_BASE}/earnings-surprises?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
                             timeout=8
                         )
-                        _diag_results["earnings-surprises"] = {
-                            "status": _r.status_code,
-                            "count": len(_r.json()) if isinstance(_r.json(), list) else 0,
-                            "sample": _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {},
-                        }
+                        if _r.status_code == 404:
+                            _diag_results["earnings-surprises"] = {"status": 404, "note": "무료 플랜 미지원 — yfinance 전용 사용"}
+                        else:
+                            _diag_results["earnings-surprises"] = {
+                                "status": _r.status_code,
+                                "count": len(_r.json()) if isinstance(_r.json(), list) else 0,
+                                "sample": _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {},
+                            }
                     except Exception as _e:
                         _diag_results["earnings-surprises"] = {"error": str(_e)}
 
@@ -10371,11 +10400,14 @@ if st.session_state.get("logged_in"):
                             f"{_FMP_BASE}/institutional-holder?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
                             timeout=8
                         )
-                        _diag_results["institutional-holder"] = {
-                            "status": _r.status_code,
-                            "count": len(_r.json()) if isinstance(_r.json(), list) else 0,
-                            "sample": _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {},
-                        }
+                        if _r.status_code == 404:
+                            _diag_results["institutional-holder"] = {"status": 404, "note": "무료 플랜 미지원 — yfinance 전용 사용"}
+                        else:
+                            _diag_results["institutional-holder"] = {
+                                "status": _r.status_code,
+                                "count": len(_r.json()) if isinstance(_r.json(), list) else 0,
+                                "sample": _r.json()[0] if isinstance(_r.json(), list) and _r.json() else {},
+                            }
                     except Exception as _e:
                         _diag_results["institutional-holder"] = {"error": str(_e)}
 
@@ -10385,10 +10417,13 @@ if st.session_state.get("logged_in"):
                             f"{_FMP_BASE}/short-float?symbol={_diag_ticker}&apikey={_fmp_diag_key}",
                             timeout=8
                         )
-                        _diag_results["short-float"] = {
-                            "status": _r.status_code,
-                            "raw": _r.json()[:1] if isinstance(_r.json(), list) else _r.json(),
-                        }
+                        if _r.status_code == 404:
+                            _diag_results["short-float"] = {"status": 404, "note": "무료 플랜 미지원 — yfinance 전용 사용"}
+                        else:
+                            _diag_results["short-float"] = {
+                                "status": _r.status_code,
+                                "raw": _r.json()[:1] if isinstance(_r.json(), list) else _r.json(),
+                            }
                     except Exception as _e:
                         _diag_results["short-float"] = {"error": str(_e)}
 
@@ -10934,15 +10969,8 @@ if st.session_state.get("logged_in"):
                 with st.spinner("어닝 데이터 불러오는 중..."):
                     earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
 
-                # yfinance 실패 시 FMP fallback
                 if earn_df.empty:
-                    with st.spinner("FMP에서 어닝 데이터 조회 중..."):
-                        earn_df = fmp_get_earnings_surprises(str(selected_ticker).strip().upper())
-                    if not earn_df.empty:
-                        st.caption("📡 데이터 소스: Financial Modeling Prep (FMP)")
-
-                if earn_df.empty:
-                    st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
+                    st.info("어닝 히스토리 데이터를 가져오지 못했습니다. (Yahoo Finance 일시 제한 — 잠시 후 🔄 동기화 버튼을 눌러주세요)")
                 else:
                     # 컬럼 정규화
                     earn_df.columns = [str(c).strip() for c in earn_df.columns]
@@ -10991,16 +11019,10 @@ if st.session_state.get("logged_in"):
                 with st.spinner("기관 보유 데이터 불러오는 중..."):
                     inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
 
-                # yfinance 실패 시 FMP fallback
+                # yfinance 실패 시 안내
                 _inst_src = "yfinance"
                 if inst_df.empty:
-                    with st.spinner("FMP에서 기관 보유 데이터 조회 중..."):
-                        inst_df = fmp_get_institutional_holders(str(selected_ticker).strip().upper())
-                    if not inst_df.empty:
-                        _inst_src = "FMP"
-
-                if inst_df.empty:
-                    st.info("기관 보유 데이터를 가져오지 못했습니다.")
+                    st.info("기관 보유 데이터를 가져오지 못했습니다. (Yahoo Finance 일시 제한 — 잠시 후 🔄 동기화 버튼을 눌러주세요)")
                 else:
                     if _inst_src == "FMP":
                         st.caption("📡 데이터 소스: Financial Modeling Prep (FMP)")
@@ -11024,13 +11046,9 @@ if st.session_state.get("logged_in"):
                     if short_data is None:
                         short_data = {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
 
-                # yfinance에서 short_pct를 못 가져왔으면 FMP fallback
+                # yfinance에서 못 가져오면 안내
                 if not short_data.get("short_pct"):
-                    with st.spinner("FMP에서 공매도 데이터 조회 중..."):
-                        fmp_short = fmp_get_short_float(str(selected_ticker).strip().upper())
-                    if fmp_short.get("short_pct"):
-                        short_data = fmp_short
-                        st.caption("📡 데이터 소스: Financial Modeling Prep (FMP)")
+                    pass  # 아래 N/A 표시로 자연스럽게 처리
 
                 si_c1, si_c2, si_c3 = st.columns(3)
                 with si_c1:
