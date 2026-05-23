@@ -2838,33 +2838,52 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
             if p.get("isEtf") and not info.get("quoteType"):
                 info["quoteType"] = "ETF"
 
-    # ── key-metrics-ttm: 진단으로 확인된 실제 제공 필드만 ────────────
-    # ✅ evToSalesTTM, evToOperatingCashFlowTTM, evToFreeCashFlowTTM
-    # ❌ peRatioTTM, pbRatioTTM, evToEbitdaTTM (무료 미제공)
-    _need_km = not all([info.get("enterpriseToEbitda"), info.get("trailingEps")])
-    if _need_km:
+    # ── key-metrics-ttm: EV/Sales, EV/FCF (항상 시도) ───────────────
+    # yfinance가 제공하지 않는 지표 → FMP에서 항상 가져옴
+    if not info.get("_fmp_ev_to_sales") or not info.get("_fmp_ev_to_fcf"):
         km = _fmp_key_metrics(ticker)
         if km:
-            # EV/Sales (P/E 대신 사용 가능한 무료 밸류에이션 지표)
             if not info.get("_fmp_ev_to_sales"):
                 v = to_float(km.get("evToSalesTTM"))
                 if pd.notna(v) and v > 0:
                     info["_fmp_ev_to_sales"] = v
-            # EV/FCF (밸류에이션 보조 지표)
             if not info.get("_fmp_ev_to_fcf"):
                 v = to_float(km.get("evToFreeCashFlowTTM"))
                 if pd.notna(v) and v > 0:
                     info["_fmp_ev_to_fcf"] = v
-            # EV/Operating CF
             if not info.get("_fmp_ev_to_ocf"):
                 v = to_float(km.get("evToOperatingCashFlowTTM"))
                 if pd.notna(v) and v > 0:
                     info["_fmp_ev_to_ocf"] = v
-            # Market Cap (TTM)
             if not info.get("marketCap"):
                 v = to_float(km.get("marketCapTTM"))
                 if pd.notna(v) and v > 0:
                     info["marketCap"] = v
+
+    # ── key-metrics-ttm: P/E, P/B, EV/EBITDA, PEG, EPS (yfinance 없을 때만) ─
+    _need_km = not all([info.get("trailingPE"), info.get("priceToBook"),
+                        info.get("enterpriseToEbitda"), info.get("trailingEps")])
+    if _need_km:
+        km = _fmp_key_metrics(ticker)  # 캐시돼 있으므로 추가 API 호출 없음
+        if km:
+            if not info.get("trailingPE"):
+                v = to_float(km.get("peRatioTTM"))
+                if pd.notna(v) and v > 0: info["trailingPE"] = v
+            if not info.get("priceToBook"):
+                v = to_float(km.get("pbRatioTTM"))
+                if pd.notna(v): info["priceToBook"] = v
+            if not info.get("enterpriseToEbitda"):
+                v = to_float(km.get("evToEbitdaTTM"))
+                if pd.notna(v): info["enterpriseToEbitda"] = v
+            if not info.get("pegRatio"):
+                v = to_float(km.get("pegRatioTTM"))
+                if pd.notna(v): info["pegRatio"] = v
+            if not info.get("trailingEps"):
+                v = to_float(km.get("netIncomePerShareTTM"))
+                if pd.notna(v): info["trailingEps"] = v
+            if not info.get("forwardPE"):
+                v = to_float(km.get("forwardPERatioTTM"))
+                if pd.notna(v) and v > 0: info["forwardPE"] = v
 
     # ── ratios-ttm: 진단으로 확인된 실제 제공 필드만 ─────────────────
     # ✅ operatingProfitMarginTTM
@@ -3342,21 +3361,31 @@ def evaluate_kpis(ticker_symbol):
             "Rule": "1.0 미만",
             "Pass": pass_fail_badge(not pd.isna(peg_ratio) and peg_ratio < 1.0, pd.isna(peg_ratio)),
         },
-        {
+    ]
+
+    # Margin of Safety — 가치주 조건 만족 시에만 KPI 행 추가
+    # 조건: EPS > 0, 성장률 0~20%, P/E < 25
+    _pe_for_check = trailing_pe if pd.notna(trailing_pe) else forward_pe
+    _is_value_stock_kpi = (
+        not pd.isna(trailing_eps) and trailing_eps > 0
+        and not pd.isna(growth_percent) and 0 < growth_percent < 20
+        and (pd.isna(_pe_for_check) or _pe_for_check < 25)
+    )
+    if _is_value_stock_kpi:
+        rows.append({
             "Category": "밸류에이션 (Valuation)",
-            "KPI": "Margin of Safety",
+            "KPI": "Margin of Safety (가치주)",
             "Value": pct_points_str(margin_of_safety),
             "Rule": "20% 이상",
             "Pass": pass_fail_badge(not pd.isna(margin_of_safety) and margin_of_safety >= 20, pd.isna(margin_of_safety)),
-        },
-        {
-            "Category": "모멘텀 (Momentum)",
-            "KPI": "가격>MA50&MA200",
-            "Value": f"${num_str(current_price)} / MA50 ${num_str(ma50)} / MA200 ${num_str(ma200)}",
-            "Rule": "정배열",
-            "Pass": pass_fail_badge(momentum_pass, pd.isna(current_price) or pd.isna(ma50) or pd.isna(ma200)),
-        },
-    ]
+        })
+    rows.append({
+        "Category": "모멘텀 (Momentum)",
+        "KPI": "가격>MA50&MA200",
+        "Value": f"${num_str(current_price)} / MA50 ${num_str(ma50)} / MA200 ${num_str(ma200)}",
+        "Rule": "정배열",
+        "Pass": pass_fail_badge(momentum_pass, pd.isna(current_price) or pd.isna(ma50) or pd.isna(ma200)),
+    })
 
     kpi_df = pd.DataFrame(rows)
     pass_count  = (kpi_df["Pass"] == ":green[Pass]").sum()
@@ -10381,26 +10410,46 @@ if st.session_state.get("logged_in"):
                         with _vc6: st.metric("EV/FCF",   num_str(_evf) if pd.notna(_evf) else "N/A",
                                              help="기업가치/잉여현금흐름. 40 이하 합리적. FMP 제공.")
 
-                        # Graham 적정주가
-                        if pd.notna(_iv) and pd.notna(_mos):
+                        # Graham 적정주가 — 가치주 조건 만족 시에만 표시
+                        # 조건: EPS > 0, 성장률 0~20%, P/E < 25 (성장주·적자기업 제외)
+                        _eps_val    = margin_context.get("trailing_eps")
+                        _growth_val = margin_context.get("growth_percent")
+                        _pe_val     = _tpe if pd.notna(_tpe) else _fpe
+
+                        _is_value_stock = (
+                            pd.notna(_eps_val) and _eps_val > 0
+                            and pd.notna(_growth_val) and 0 < _growth_val < 20
+                            and (pd.isna(_pe_val) or _pe_val < 25)
+                        )
+
+                        if _is_value_stock and pd.notna(_iv) and pd.notna(_mos):
+                            st.divider()
+                            st.caption(
+                                "📌 **Graham 안전마진** — 저PER·저성장 가치주 전용 지표입니다. "
+                                "성장주(P/E ≥ 25 또는 성장률 ≥ 20%)에는 표시되지 않습니다."
+                            )
                             intrinsic_col, mos_col = st.columns(2)
                             with intrinsic_col:
                                 st.metric(
                                     "적정 주가 (Graham)",
                                     f"${num_str(_iv)}",
                                     delta=(
-                                        f"EPS {num_str(margin_context.get('trailing_eps'))} / "
-                                        f"성장률 {pct_points_str(margin_context.get('growth_percent'))}"
+                                        f"EPS {num_str(_eps_val)} / "
+                                        f"성장률 {pct_points_str(_growth_val)}"
                                     ),
                                 )
                             with mos_col:
+                                _mos_color = "normal" if _mos >= 20 else "inverse"
                                 st.metric(
                                     "안전마진 (Margin of Safety %)",
                                     pct_points_str(_mos),
                                     delta=f"현재가 ${num_str(_cp)}",
+                                    delta_color=_mos_color,
                                 )
-                        else:
-                            st.caption("💡 Graham 적정주가는 EPS > 0 + 성장률 > 0 일 때 계산됩니다.")
+                            if _mos < 0:
+                                st.warning("⚠️ 현재가가 Graham 적정가보다 높습니다. 고평가 구간일 수 있습니다.")
+                            elif _mos >= 20:
+                                st.success(f"✅ 안전마진 {_mos:.1f}% — Graham 기준 매력적인 가격대입니다.")
 
                     st.divider()
 
