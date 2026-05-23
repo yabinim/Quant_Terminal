@@ -4037,9 +4037,6 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
             qq = pd.to_numeric(row.get("Quantity"), errors="coerce")
             if pd.isna(pp) or pd.isna(qq):
                 continue
-            # 수량 0 이하(전량 매도 완료) 행은 시트에 기록하지 않음
-            if float(qq) < 0.001:  # 0.001주 미만 = 부동소수점 오차 포함 전량 매도로 간주
-                continue
             rows.append([uid, acct, tk, float(pp), float(qq), now_s])
         ws.clear()
         ws.update(rows, range_name=f"A1:F{len(rows)}", value_input_option="USER_ENTERED")
@@ -4098,8 +4095,6 @@ def load_portfolio():
     df["Quantity"] = df["Quantity"].fillna(1.0)
     df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN") & df["Account"].astype(str).str.strip().ne("")]
     df = df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
-    # 0.001주 미만(부동소수점 오차 포함 전량 매도)은 포트폴리오에서 제외
-    df = df[pd.to_numeric(df["Quantity"], errors="coerce").fillna(0) >= 0.001].reset_index(drop=True)
     return df[base_columns].copy()
 
 
@@ -4126,8 +4121,6 @@ def save_portfolio(df):
         return
     safe_df = safe_df[safe_df["Ticker"].ne("") & safe_df["Ticker"].ne("NAN")]
     safe_df = safe_df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
-    # 0.001주 미만(부동소수점 오차 포함 전량 매도)은 DB에 저장하지 않음
-    safe_df = safe_df[pd.to_numeric(safe_df["Quantity"], errors="coerce").fillna(0) >= 0.001].reset_index(drop=True)
     ok, msg = replace_user_portfolio_sheet_rows(uid, safe_df)
     if not ok:
         try:
@@ -4300,6 +4293,8 @@ def update_drg_prediction_result(user_id: str, pred_date: str,
 def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
     """
     예측 행에서 실제 결과를 계산.
+    로직: 예측일(pred_date) 당일 종가 vs 직전 거래일 종가 비교.
+    → "내일 시장 방향" 예측이므로 예측일 당일 장이 마감되면 즉시 검증 가능.
     반환: (actual_direction, actual_return_pct, is_correct)
     """
     try:
@@ -4309,16 +4304,37 @@ def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         if pd.isna(pred_date):
             return "", np.nan, ""
 
-        # 예측일 다음 거래일 종가 가져오기
-        end_date = pred_date + pd.Timedelta(days=5)
-        hist = yf.download(bench_etf, start=pred_date.strftime("%Y-%m-%d"),
-                           end=end_date.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
-        if hist is None or hist.empty or len(hist) < 2:
+        # 예측일 포함 직전 5거래일 데이터 가져오기
+        # start를 넉넉히 10일 전으로 잡아 주말·공휴일을 건너뜀
+        start_date = pred_date - pd.Timedelta(days=10)
+        end_date   = pred_date + pd.Timedelta(days=1)  # yfinance end는 exclusive
+        hist = yf.download(
+            bench_etf,
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_date.strftime("%Y-%m-%d"),
+            progress=False,
+            auto_adjust=True,
+        )
+        if hist is None or hist.empty:
             return "", np.nan, ""
 
-        pred_close = float(hist["Close"].iloc[0])
-        next_close = float(hist["Close"].iloc[1])
-        ret_pct = ((next_close / pred_close) - 1.0) * 100.0
+        # 예측일 당일 데이터 확인
+        hist.index = pd.to_datetime(hist.index)
+        pred_date_ts = pd.Timestamp(pred_date.date())
+        hist_on_pred = hist[hist.index.date == pred_date_ts.date()]
+        if hist_on_pred.empty:
+            # 예측일이 휴장일이거나 아직 장이 마감 안 됨
+            return "", np.nan, ""
+
+        pred_day_close = float(hist_on_pred["Close"].iloc[-1])
+
+        # 예측일 직전 거래일 종가
+        hist_before = hist[hist.index.date < pred_date_ts.date()]
+        if hist_before.empty:
+            return "", np.nan, ""
+        prev_close = float(hist_before["Close"].iloc[-1])
+
+        ret_pct = ((pred_day_close / prev_close) - 1.0) * 100.0
 
         # 방향 판정 (±0.3% 기준)
         if ret_pct >= 0.3:
@@ -4643,8 +4659,6 @@ def build_portfolio_sell_radar_df(portfolio_df):
     clean_portfolio["Quantity"] = pd.to_numeric(clean_portfolio["Quantity"], errors="coerce")
     clean_portfolio["Quantity"] = clean_portfolio["Quantity"].fillna(1.0)
     clean_portfolio = clean_portfolio.drop_duplicates(subset=["Account", "Ticker"], keep="last")
-    # 0.001주 미만(부동소수점 오차 포함 전량 매도) 종목은 레이더에서 제외
-    clean_portfolio = clean_portfolio[clean_portfolio["Quantity"] >= 0.001].reset_index(drop=True)
 
     clean_tickers = clean_portfolio["Ticker"].dropna().astype(str).tolist()
     clean_tickers = [t for t in clean_tickers if t]
@@ -5296,46 +5310,6 @@ def open_emerging_tracker_worksheet():
         return ws, None
     except Exception as exc:
         return None, f"Emerging_Tracker 워크시트 열기/생성 실패: {exc}"
-
-
-_EMERGING_TRACKER_DEFAULT_TTL_DAYS = 30  # Last_Seen 기준 기본 만료일
-
-
-def _parse_emerging_last_seen(val: str):
-    """Last_Seen 문자열 → datetime (KST). 파싱 실패 시 None."""
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(str(val).strip()[:16], fmt).replace(tzinfo=_KST_TZ)
-        except Exception:
-            continue
-    return None
-
-
-def purge_expired_emerging_tracker(user_id: str, ttl_days: int = _EMERGING_TRACKER_DEFAULT_TTL_DAYS) -> int:
-    """Last_Seen이 ttl_days일 이상 지난 행을 시트에서 영구 삭제. 삭제 건수 반환."""
-    ws, err = open_emerging_tracker_worksheet()
-    if err or ws is None:
-        return 0
-    try:
-        vals = ws.get_all_values()
-        if not vals or len(vals) < 2:
-            return 0
-        uid_u = str(user_id).strip().upper()
-        now = datetime.now(_KST_TZ)
-        cutoff = now - timedelta(days=ttl_days)
-        to_del = []
-        for i, r in enumerate(vals[1:], start=2):
-            r = (r + [""] * 9)[:9]
-            if str(r[0]).strip().upper() != uid_u:
-                continue
-            last_seen_dt = _parse_emerging_last_seen(r[4])
-            if last_seen_dt is None or last_seen_dt < cutoff:
-                to_del.append(i)
-        for idx in reversed(to_del):
-            ws.delete_rows(idx)
-        return len(to_del)
-    except Exception:
-        return 0
 
 
 def load_emerging_tracker(user_id: str) -> pd.DataFrame:
@@ -8244,30 +8218,26 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
 {portfolio_json}
 
 [2] 최근 AI 내러티브 요약 (최신 10개)
-각 항목의 winners_csv = AI가 수혜주로 꼽은 티커, emerging_csv = AI가 주목한 신흥 티커.
-포트폴리오 보유 종목이 winners/emerging에 **없으면** 내러티브 상 위험 종목으로 분류하세요.
 {narrative_json}
 
-[3] 거시경제 지표 현황 (status: "pass"=정상, "warning"=경고, "danger"=위험, "N/A"=데이터없음)
+[3] 거시경제 지표 현황
 {macro_json}
 
 ---
 작성 규칙:
 1) 데이터에 없는 내용은 추측하지 마세요.
-2) [3] 거시경제 지표에서 status가 "warning" 또는 "danger"인 항목은 반드시 언급하세요. 모두 "pass"라면 "현재 거시경제 지표는 전반적으로 안정적입니다"라고 작성하세요.
-3) 반드시 아래 섹션 구조를 지켜 마크다운으로 작성하세요.
-4) 각 섹션은 간결하고 실전적으로, 투자 판단에 바로 쓸 수 있는 내용으로.
+2) 반드시 아래 섹션 구조를 지켜 마크다운으로 작성하세요.
+3) 각 섹션은 간결하고 실전적으로, 투자 판단에 바로 쓸 수 있는 내용으로.
 
 ## 📊 이번 주 포트폴리오 요약
 - 전체 수익률, 최고/최저 종목, 주목할 변화 한 줄씩
 
 ## 🌐 거시경제 환경 점검
-- [3] 데이터의 각 지표 value와 status를 직접 인용해 포트폴리오 영향 분석 (긍정/부정 요인)
+- 현재 Macro 지표가 포트폴리오에 미치는 영향 (긍정/부정 요인)
 
 ## 🧠 AI 내러티브와 포트폴리오 연결
 - 이번 주 AI가 강조한 테마와 내 포트폴리오 종목의 연관성
-- 내러티브 상 수혜가 예상되는 보유 종목 (winners_csv/emerging_csv에 포함된 보유 티커)
-- 내러티브 상 위험 종목 (보유 중이지만 winners_csv/emerging_csv 어디에도 없는 티커)
+- 내러티브 상 수혜가 예상되는 보유 종목 vs 위험 종목
 
 ## ⚠️ 리스크 점검
 - 고상관 종목 쌍, 섹터 편중, Drawdown 주의 종목
@@ -8333,20 +8303,13 @@ def _build_narrative_context_for_summary(user_id: str) -> list:
         saved_at = rec.get("saved_at", "")
         themes = analysis.get("themes", [])
         theme_titles = [str(t.get("title", "")) for t in themes if isinstance(t, dict)]
-        # 테마별 위험 신호 추출
-        risk_themes = [
-            str(t.get("title", "")) for t in themes
-            if isinstance(t, dict) and str(t.get("risk_level", "")).lower() in ("high", "위험", "경고")
-        ]
         out.append({
             "saved_at": saved_at,
             "session": rec.get("session_label", ""),
             "regime": analysis.get("regime", {}),
             "themes": theme_titles[:5],
-            "risk_themes": risk_themes[:3],  # 위험 테마
             "rotation": str(analysis.get("rotation", ""))[:300],
             "winners_csv": str(rec.get("_sheet_winners_csv", ""))[:200],
-            "emerging_csv": str(rec.get("_sheet_emerging_csv", ""))[:200],
         })
     return out
 
@@ -8354,11 +8317,7 @@ def _build_narrative_context_for_summary(user_id: str) -> list:
 def _build_macro_context_for_summary() -> dict:
     """cached_analyze_us_macro_dashboard에서 Gemini 입력용 macro context 생성."""
     try:
-        macro_pack = cached_analyze_us_macro_dashboard()
-        if not macro_pack:
-            return {}
-        # analyze_us_macro_dashboard()는 {"rows": [...], "bad_total": ..., ...} 구조를 반환
-        macro_rows = macro_pack.get("rows", []) if isinstance(macro_pack, dict) else []
+        macro_rows = cached_analyze_us_macro_dashboard()
         if not macro_rows:
             return {}
         out = {}
@@ -8994,7 +8953,7 @@ if st.session_state.get("logged_in"):
                                 else:
                                     st.error(f"저장 실패: {err_u}")
                             else:
-                                st.warning("다음 거래일 데이터가 아직 없습니다. 장 마감 후 다시 시도해주세요.")
+                                st.warning("예측일 당일 장이 아직 마감되지 않았거나 휴장일입니다. 장 마감(오후 4시 ET) 후 다시 시도해주세요.")
                 st.divider()
 
             st.markdown("#### 📋 전체 예측 기록")
@@ -11328,9 +11287,6 @@ if st.session_state.get("logged_in"):
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_portfolio", use_container_width=True):
-                # 클린업 플래그 초기화 → 다음 렌더 시 Quantity=0 행 재정리
-                _sync_puid = str(st.session_state.get("user_id") or "").strip()
-                st.session_state.pop(f"_pf_zero_qty_cleaned_{_sync_puid}", None)
                 tab_sync_refresh(
                     [
                         cached_portfolio_yf_close_1y.clear,
@@ -11355,68 +11311,6 @@ if st.session_state.get("logged_in"):
 
         portfolio_df = load_portfolio()
         puid = str(st.session_state.get("user_id") or "").strip()
-
-        # ── [진단] 시트 원본값 확인 expander ─────────────────────────────────
-        with st.expander("🔧 [진단] 시트 원본 데이터 확인 (문제 해결 후 삭제 예정)", expanded=False):
-            try:
-                _diag_vals, _diag_err = _portfolio_sheet_all_values_cached()
-                if _diag_err:
-                    st.error(f"시트 읽기 오류: {_diag_err}")
-                elif not _diag_vals:
-                    st.warning("시트가 비어 있습니다.")
-                else:
-                    uid_u = puid.upper()
-                    _diag_rows = [r for r in _diag_vals[1:] if len(r) > 0 and str(r[0]).strip().upper() == uid_u]
-                    st.caption(f"시트에서 `{puid}` 유저 행 **{len(_diag_rows)}개** 원본:")
-                    for i, r in enumerate(_diag_rows):
-                        st.code(f"행{i+1}: {r}")
-                    st.caption(f"load_portfolio() 결과 (필터 후): {len(portfolio_df)}행")
-                    st.dataframe(portfolio_df, use_container_width=True, hide_index=True)
-            except Exception as _de:
-                st.error(f"진단 오류: {_de}")
-
-            if st.button("🗑️ 수량 0 행 즉시 강제 삭제 (시트 직접 정리)", key="force_cleanup_zero_qty", type="primary"):
-                try:
-                    _ws_fc, _err_fc = open_portfolios_worksheet()
-                    if _err_fc:
-                        st.error(_err_fc)
-                    else:
-                        _all_fc = _ws_fc.get_all_values() or []
-                        if len(_all_fc) > 1:
-                            uid_u2 = puid.upper()
-                            hk_fc = _portfolio_sheet_header_kind(_all_fc[0])
-                            if hk_fc == "unknown": hk_fc = "new"
-                            others_fc = []
-                            removed_fc = 0
-                            for r in _all_fc[1:]:
-                                cells = _portfolio_row_to_new_six_cells(hk_fc, r)
-                                if not cells:
-                                    continue
-                                if str(cells[0]).strip().upper() == uid_u2:
-                                    qty_val = pd.to_numeric(cells[4], errors="coerce")
-                                    if pd.isna(qty_val) or float(qty_val) < 0.001:
-                                        removed_fc += 1
-                                        st.write(f"삭제: {cells}")
-                                        continue
-                                others_fc.append(cells)
-                            new_rows = [_PORTFOLIOS_SHEET_COLS] + others_fc
-                            _ws_fc.clear()
-                            _ws_fc.update(new_rows, range_name=f"A1:F{len(new_rows)}", value_input_option="USER_ENTERED")
-                            _invalidate_portfolio_sheet_cache()
-                            st.success(f"✅ 수량 0 행 {removed_fc}개 삭제 완료. 새로고침하세요.")
-                        else:
-                            st.info("시트에 데이터가 없습니다.")
-                except Exception as _fe:
-                    st.error(f"강제 삭제 오류: {_fe}")
-        # ─────────────────────────────────────────────────────────────────────
-
-        # ── DB 잔존 수량 0 행 자동 클린업 (동기화 버튼 또는 첫 진입 시) ────
-        _cleanup_key = f"_pf_zero_qty_cleaned_{puid}"
-        if puid and not st.session_state.get(_cleanup_key):
-            st.session_state[_cleanup_key] = True
-            save_portfolio(portfolio_df)
-            _invalidate_portfolio_sheet_cache()
-        # ────────────────────────────────────────────────────────────────────
         if st.session_state.get("_portfolio_last_sheet_error"):
             st.warning(f"Portfolios 시트: {st.session_state['_portfolio_last_sheet_error']}")
 
@@ -11766,7 +11660,7 @@ if st.session_state.get("logged_in"):
                                 if m_sell.any():
                                     ix_sell = upd_sell.index[m_sell][0]
                                     new_qty = cur_hold_qty - sell_qty_input
-                                    if new_qty < 0.001:  # 0.001주 미만 잔여 = 전량 매도로 간주 (부동소수점 오차 방지)
+                                    if new_qty < 1e-9:
                                         upd_sell = upd_sell.drop(index=ix_sell).reset_index(drop=True)
                                         save_portfolio(upd_sell)
                                         realized = (sell_price_input - cur_avg_price) * sell_qty_input
@@ -13026,8 +12920,6 @@ if st.session_state.get("logged_in"):
 
         with st.spinner("Thesis 기록 불러오는 중..."):
             thesis_df = load_thesis_records(uid_thesis)
-            # Thesis별 포지션 현황에서 매수가/수량 조회용 포트폴리오 로드
-            portfolio_df_thesis = load_portfolio()
 
         if thesis_df.empty:
             st.info(
@@ -13582,37 +13474,6 @@ if st.session_state.get("logged_in"):
 
         uid_et = str(st.session_state.get("user_id") or "").strip()
 
-        # ── 설정 패널 ─────────────────────────────────────────────────────
-        with st.expander("⚙️ 필터 & 만료 설정", expanded=False):
-            cfg_col1, cfg_col2 = st.columns(2)
-            with cfg_col1:
-                ttl_days = st.slider(
-                    "📅 자동 만료 기준 (Last_Seen 기준)",
-                    min_value=7, max_value=60, value=30, step=7,
-                    help="마지막 등장일이 이 일수보다 오래된 종목은 '만료 임박' 표시 및 수동/자동 정리 대상이 됩니다.",
-                    key="et_ttl_slider",
-                )
-            with cfg_col2:
-                min_count = st.slider(
-                    "🔢 최소 등장 횟수 (메인 뷰 기준)",
-                    min_value=1, max_value=5, value=2, step=1,
-                    help="이 횟수 미만인 종목은 메인 뷰에서 숨깁니다. 전체 목록에서는 계속 확인 가능.",
-                    key="et_min_count_slider",
-                )
-
-            purge_col1, purge_col2 = st.columns([1, 2])
-            with purge_col1:
-                if st.button(f"🗑️ {ttl_days}일 이상 오래된 종목 일괄 삭제", key="et_purge_btn", type="primary", use_container_width=True):
-                    with st.spinner("만료 종목 삭제 중..."):
-                        purged = purge_expired_emerging_tracker(uid_et, ttl_days=ttl_days)
-                    if purged > 0:
-                        st.success(f"✅ {purged}개 만료 종목 삭제 완료!")
-                        st.rerun()
-                    else:
-                        st.info(f"만료된 종목({ttl_days}일 이상)이 없습니다.")
-            with purge_col2:
-                st.caption(f"현재 기준: Last_Seen이 **{ttl_days}일 이상** 지난 종목을 시트에서 영구 삭제합니다.")
-
         with st.spinner("Emerging 추적 기록 불러오는 중..."):
             et_df = load_emerging_tracker(uid_et)
 
@@ -13623,85 +13484,48 @@ if st.session_state.get("logged_in"):
                 "자동으로 기록이 쌓입니다."
             )
         else:
-            # ── 만료 임박 계산 ──────────────────────────────────────────────
-            now_et = datetime.now(_KST_TZ)
-            cutoff_et = now_et - timedelta(days=ttl_days)
-
-            def _days_since_last_seen(val):
-                dt = _parse_emerging_last_seen(str(val))
-                if dt is None:
-                    return 9999
-                return (now_et - dt).days
-
-            et_df["_days_ago"] = et_df["Last_Seen"].apply(_days_since_last_seen)
-            expired_mask = et_df["_days_ago"] >= ttl_days
-            active_df = et_df[~expired_mask].copy()
-            expired_df = et_df[expired_mask].copy()
-
             # ── 요약 지표 ──────────────────────────────────────────────────
-            total = len(active_df)
-            hot = (active_df["Count"].astype(int) >= 3).sum() if not active_df.empty else 0
-            new_ones = (active_df["Status"].str.contains("신규", na=False)).sum() if not active_df.empty else 0
-            best_ones = active_df[active_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)] if not active_df.empty else pd.DataFrame()
-            expiring_soon = ((active_df["_days_ago"] >= ttl_days * 0.7) & (active_df["_days_ago"] < ttl_days)).sum() if not active_df.empty else 0
+            total = len(et_df)
+            hot = (et_df["Count"].astype(int) >= 3).sum() if "Count" in et_df.columns else 0
+            new_ones = (et_df["Status"].str.contains("신규", na=False)).sum()
+            best_ones = et_df[et_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)]
 
-            m1, m2, m3, m4, m5 = st.columns(5)
+            m1, m2, m3, m4 = st.columns(4)
             with m1:
-                st.metric("활성 추적 종목", f"{total}개", delta=f"만료 {len(expired_df)}개" if len(expired_df) > 0 else None, delta_color="inverse")
+                st.metric("전체 추적 종목", f"{total}개")
             with m2:
                 st.metric("🔥 반복 등장 (3회+)", f"{hot}개")
             with m3:
                 st.metric("🆕 신규 등장", f"{new_ones}개")
             with m4:
                 st.metric("🎯 매수 신호 종목", f"{len(best_ones)}개")
-            with m5:
-                st.metric("⏳ 만료 임박", f"{expiring_soon}개", help=f"Last_Seen이 TTL의 70% ({int(ttl_days*0.7)}일) 이상 지난 종목")
-
-            # ── 만료 임박 경고 배너 ─────────────────────────────────────────
-            if len(expired_df) > 0:
-                expired_tickers = ", ".join(expired_df["Ticker"].tolist()[:10])
-                st.warning(
-                    f"⏰ **{len(expired_df)}개 종목**이 {ttl_days}일 이상 재등장 없이 오래됐어요: `{expired_tickers}` "
-                    f"— 위 설정 패널에서 일괄 삭제하거나 개별 삭제하세요.",
-                    icon="⚠️"
-                )
-
-            # 이하 메인 뷰는 active_df 기준 + min_count 필터 적용
-            view_df = active_df[active_df["Count"].astype(int) >= min_count].copy() if not active_df.empty else pd.DataFrame()
-
-            if min_count > 1 and len(active_df) > len(view_df):
-                hidden_n = len(active_df) - len(view_df)
-                st.caption(f"ℹ️ 등장 {min_count}회 미만 종목 **{hidden_n}개** 숨김 중 (전체 목록에서 확인 가능)")
 
             # ── 최우선 관심 종목 ───────────────────────────────────────────
             if not best_ones.empty:
-                best_view = best_ones[best_ones["Count"].astype(int) >= min_count]
-                if not best_view.empty:
-                    st.divider()
-                    st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드)")
-                    st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 종목들이에요.")
-                    for _, row in best_view.sort_values("Count", ascending=False).iterrows():
-                        count = int(row["Count"]) if str(row["Count"]).isdigit() else 1
-                        rs_str = f"RS {float(row['RS_Score']):.1f}%p" if row["RS_Score"] else ""
-                        days_ago = int(row["_days_ago"])
-                        freshness = f"🟢 {days_ago}일 전" if days_ago <= 7 else (f"🟡 {days_ago}일 전" if days_ago <= 14 else f"🔴 {days_ago}일 전")
-                        st.markdown(
-                            f"**{row['Ticker']}** — {row['Best_Verdict']} | "
-                            f"등장 **{count}회** | {rs_str} | {freshness}"
-                        )
-                        col_a, col_b = st.columns([1, 4])
-                        with col_a:
-                            def _goto_stock(tk=row["Ticker"]):
-                                st.session_state["selected_ticker"] = tk
-                                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
-                            st.button(f"🔬 {row['Ticker']} 분석", key=f"et_goto_{row['Ticker']}", on_click=_goto_stock)
+                st.divider()
+                st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드)")
+                st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 종목들이에요.")
+                for _, row in best_ones.sort_values("Count", ascending=False).iterrows():
+                    count = int(row["Count"]) if str(row["Count"]).isdigit() else 1
+                    rs_str = f"RS {float(row['RS_Score']):.1f}%p" if row["RS_Score"] else ""
+                    st.markdown(
+                        f"**{row['Ticker']}** — {row['Best_Verdict']} | "
+                        f"등장 **{count}회** | {rs_str} | 최근: {row['Last_Seen']}"
+                    )
+                    col_a, col_b = st.columns([1, 4])
+                    with col_a:
+                        def _goto_stock(tk=row["Ticker"]):
+                            st.session_state["selected_ticker"] = tk
+                            st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                        st.button(f"🔬 {row['Ticker']} 분석", key=f"et_goto_{row['Ticker']}", on_click=_goto_stock)
 
             # ── 반복 등장 종목 ─────────────────────────────────────────────
             st.divider()
-            st.markdown(f"### 🔥 반복 등장 종목 ({min_count}회 이상, 활성)")
+            st.markdown("### 🔥 반복 등장 종목 (관심 집중)")
 
-            if view_df.empty:
-                st.info(f"등장 {min_count}회 이상인 활성 종목이 없어요. 슬라이더에서 최소 횟수를 낮춰보세요.")
+            hot_df = et_df[et_df["Count"].astype(int) >= 2].sort_values("Count", ascending=False)
+            if hot_df.empty:
+                st.info("아직 2회 이상 등장한 종목이 없어요. 내러티브 분석을 더 진행하면 쌓입니다.")
             else:
                 def _style_count(val):
                     v = int(val) if str(val).isdigit() else 0
@@ -13714,32 +13538,22 @@ if st.session_state.get("logged_in"):
                     if "얼리" in str(val): return "color:#0ea5e9;font-weight:600"
                     return ""
 
-                def _style_freshness(val):
-                    try:
-                        d = int(val)
-                        if d <= 7: return "color:#16a34a"
-                        if d <= 14: return "color:#f97316"
-                        return "color:#dc2626"
-                    except Exception:
-                        return ""
-
-                display_df = view_df[["Ticker", "Theme", "First_Seen", "Last_Seen", "_days_ago", "Count", "Best_Verdict", "RS_Score", "Status"]].rename(columns={"_days_ago": "경과일"}).sort_values("Count", ascending=False)
                 styled_hot = (
-                    display_df
+                    hot_df[["Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]]
                     .style
                     .map(_style_count, subset=["Count"])
                     .map(_style_verdict, subset=["Best_Verdict"])
-                    .map(_style_freshness, subset=["경과일"])
                 )
                 st.dataframe(styled_hot, use_container_width=True, hide_index=True)
 
-            # ── 전체 목록 (만료 포함) ──────────────────────────────────────
+            # ── 전체 목록 ──────────────────────────────────────────────────
             st.divider()
-            st.markdown("### 📋 전체 추적 목록 (만료 포함)")
+            st.markdown("### 📋 전체 추적 목록")
             with st.expander("전체 보기", expanded=False):
-                full_display = et_df[["Ticker", "Theme", "First_Seen", "Last_Seen", "_days_ago", "Count", "Best_Verdict", "RS_Score", "Status"]].rename(columns={"_days_ago": "경과일"}).sort_values("Count", ascending=False)
-                st.dataframe(full_display, use_container_width=True, hide_index=True)
-                st.caption(f"총 {len(et_df)}개 (활성 {len(active_df)}개 + 만료 {len(expired_df)}개)")
+                st.dataframe(
+                    et_df.sort_values("Count", ascending=False),
+                    use_container_width=True, hide_index=True
+                )
 
             # ── 개별 삭제 ──────────────────────────────────────────────────
             st.divider()
