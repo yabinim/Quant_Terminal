@@ -44,7 +44,7 @@ _KST = pytz.timezone("Asia/Seoul")
 _ET  = pytz.timezone("America/New_York")
 _SPREADSHEET_TITLE   = "Quant_DB"
 _NARRATIVES_WORKSHEET = "Narratives"
-_ADMIN_USER_ID       = "admin"
+_ADMIN_USER_ID       = "yab"
 
 # ── FRED 공휴일 체크용 NYSE 휴장일 목록 (고정 + 동적) ────────────────────────
 _NYSE_FIXED_HOLIDAYS_2025 = {
