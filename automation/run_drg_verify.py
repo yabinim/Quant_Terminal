@@ -39,7 +39,7 @@ _DRG_SHEET_COLS = [
     "spy_close_at_pred", "full_text", "actual_direction", "actual_return_pct",
     "is_correct", "review_comment"
 ]
-_ADMIN_USER_ID = "admin"
+_ADMIN_USER_ID = "yab"
 
 _NYSE_HOLIDAYS_2025 = {
     "2025-01-01","2025-01-20","2025-02-17","2025-04-18",
