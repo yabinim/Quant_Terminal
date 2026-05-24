@@ -9454,14 +9454,19 @@ if st.session_state.get("logged_in"):
             with t_col1:
                 if top_themes:
                     st.markdown("**🔥 반복 등장 테마 Top 5:**")
+                    max_theme_cnt = max(c for _, c in top_themes) if top_themes else 1
                     for theme, cnt in top_themes:
-                        bar = "█" * min(cnt, 10)
-                        st.markdown(f"`{theme}` — {cnt}회 {bar}")
+                        filled = round(cnt / max_theme_cnt * 8)
+                        bar = "🟩" * filled + "⬜" * (8 - filled)
+                        st.markdown(f"`{theme}` — {cnt}회  \n{bar}")
             with t_col2:
                 if top_tickers:
                     st.markdown("**📌 반복 등장 종목 Top 10:**")
+                    max_ticker_cnt = max(c for _, c in top_tickers[:10]) if top_tickers else 1
                     for tk, cnt in top_tickers[:10]:
-                        st.markdown(f"**{tk}** — {cnt}회")
+                        filled = round(cnt / max_ticker_cnt * 8)
+                        bar = "🟦" * filled + "⬜" * (8 - filled)
+                        st.markdown(f"**{tk}** — {cnt}회  \n{bar}")
 
         # ── 기능 2: Emerging 종목 정량 교차 검증 ─────────────────────────
         if themes_data and isinstance(themes_data, list):
