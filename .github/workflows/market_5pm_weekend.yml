@@ -1,0 +1,55 @@
+name: 📅 5PM 주말·휴일 (내러티브만)
+
+on:
+  schedule:
+    # 주말(토·일) 5PM ET = UTC 21:00
+    - cron: '0 21 * * 0,6'
+  workflow_dispatch:
+
+jobs:
+  run-5pm-weekend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install \
+            google-genai \
+            google-auth \
+            gspread \
+            feedparser \
+            requests \
+            numpy \
+            pandas \
+            pytz \
+            yfinance \
+            fredapi
+
+      - name: 📰 시장 내러티브 생성 (주말)
+        env:
+          GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
+          FRED_API_KEY:      ${{ secrets.FRED_API_KEY }}
+          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:          ${{ secrets.GMAIL_TO }}
+          GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/run_narrative.py
+
+      - name: 📋 실행 로그 요약
+        if: always()
+        run: |
+          echo "======================================"
+          echo "5PM 주말 자동화 완료"
+          echo "실행 시각 (UTC): $(date -u)"
+          echo "======================================"
