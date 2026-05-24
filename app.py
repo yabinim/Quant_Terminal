@@ -427,6 +427,8 @@ def _narrative_sheet_title_for_record(rec: dict) -> str:
     base = _narrative_core_theme_display(analysis, max_chars=100)
     if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
         return "주간 트렌드(7일) 브리핑"
+    if analysis.get("source") == "wow_trend_7d":
+        return "⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)"
     return base if base and base != "N/A" else "시장 내러티브 스냅샷"
 
 
@@ -5958,6 +5960,64 @@ def append_weekly_trend_narrative_record(briefing_markdown: str, language: str, 
     load_narrative_history_records()
 
 
+def append_wow_trend_narrative_record(briefing_markdown: str, language: str,
+                                       this_week_recs: list, last_week_recs: list):
+    """
+    WoW(트렌드 변곡점) Gemini 결과를 Quant_DB / Narratives 시트에 저장.
+    source = 'wow_trend_7d', session_label = '⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)'
+    """
+    md = str(briefing_markdown or "").strip()
+    if not md:
+        return
+
+    # 이번 주 + 저번 주 티커 합집합 추출
+    ordered, seen = [], set()
+    for rec in (this_week_recs or []) + (last_week_recs or []):
+        if not isinstance(rec, dict):
+            continue
+        a = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+        for tk in universe_tickers_from_theme_analysis(a):
+            if tk not in seen:
+                seen.add(tk)
+                ordered.append(tk)
+    for tk in parse_tickers_from_text(md):
+        if tk not in seen:
+            seen.add(tk)
+            ordered.append(tk)
+
+    now_utc = datetime.now(timezone.utc)
+    analysis_dict = {
+        "source": "wow_trend_7d",
+        "themes": [],
+        "regime": {},
+        "rotation": (
+            f"WoW 변곡점 분석 · 이번 주 {len(this_week_recs or [])}건 "
+            f"vs 저번 주 {len(last_week_recs or [])}건 기반"
+        ),
+        "summary": md,
+        "wow_briefing_markdown": md,
+        "precomputed_universe": filter_scanner_ticker_list(ordered),
+    }
+    record = {
+        "saved_at": now_utc.isoformat(),
+        "session_label": "⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)",
+        "language": str(language or "ko"),
+        "analysis": analysis_dict,
+    }
+    uid = str(st.session_state.get("user_id") or "").strip()
+    if not uid:
+        st.error("로그인 user_id 가 없습니다. 다시 로그인해 주세요.")
+        return
+    ok, err = append_narrative_row_to_sheet(_narrative_record_to_sheet_row(record, uid))
+    if not ok:
+        st.error(f"Google 시트 `Quant_DB` / `Narratives` 저장에 실패했습니다: {err}")
+        return
+    st.session_state.pop("_narratives_cached_records", None)
+    st.session_state.pop("_narratives_cache_time", None)
+    load_narrative_history_records()
+    st.success("✅ 트렌드 변곡점 분석이 Narratives 시트에 저장되었습니다.")
+
+
 def clear_narrative_history_file_and_session():
     save_narrative_history_records([])
     st.session_state["narrative_history"] = []
@@ -9693,6 +9753,16 @@ if st.session_state.get("logged_in"):
                             "factcheck_kind": "wow",
                             "factcheck_df": factcheck_df,
                         }
+                        # ── Sheets 자동 저장 (주간 트렌드와 동일 방식) ──
+                        append_wow_trend_narrative_record(text, selected_language, this_w, last_w)
+                        st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
+                        st.session_state["narrative_history"] = [
+                            r["analysis"] for r in st.session_state["narrative_history_disk_records"]
+                        ]
+                        st.info(
+                            "트렌드 변곡점 분석 결과를 Google 시트 **`Narratives`**에 저장했습니다. "
+                            "과거 분석 기록에서 확인할 수 있습니다."
+                        )
     
         nb_ts = st.session_state.get("narrative_timeseries_briefing")
         if isinstance(nb_ts, dict) and str(nb_ts.get("markdown") or "").strip():
