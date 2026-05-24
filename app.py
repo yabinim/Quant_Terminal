@@ -2660,8 +2660,38 @@ def fetch_options_flow_summary(ticker_upper: str) -> dict:
 def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14) -> dict:
     """
     최근 N일간 내러티브에서 테마/종목이 얼마나 일관되게 등장했는지 점수화.
-    반환: {"top_themes": [(theme, count)], "top_tickers": [(ticker, count)], "consistency_score": 0~100}
+
+    [점수 계산 방식 — v2]
+    - 테마 제목은 AI마다 표현이 달라 문자열 완전 일치로는 집계가 불가능.
+    - 대신 Winners/Emerging 티커(정확히 일치)의 반복 등장 비율로 점수를 산정.
+    - 점수 = 상위 5개 티커의 평균 등장 비율 × 100
+      (예: 17회 분석 중 NVDA가 14회 등장 → 14/17 = 82점 기여)
+    - 테마는 키워드 정규화(AI·반도체·클라우드 등)로 묶어서 표시.
+
+    반환: {"top_themes": [(theme, count)], "top_tickers": [(ticker, count)],
+           "consistency_score": 0~100}
     """
+    # 테마 키워드 정규화 맵: 포함 키워드 → 대표 테마명
+    _THEME_KEYWORD_MAP = [
+        (["AI", "인공지능", "Artificial"],          "🤖 AI / 인공지능"),
+        (["반도체", "Semiconductor", "Chip", "칩"],  "💾 반도체"),
+        (["클라우드", "Cloud", "데이터센터"],         "☁️ 클라우드 / 데이터센터"),
+        (["에너지", "Energy", "원자력", "Nuclear"],   "⚡ 에너지"),
+        (["방산", "Defense", "항공우주", "Aerospace"],"🛡️ 방산 / 항공우주"),
+        (["바이오", "Bio", "헬스", "Health", "제약"], "💊 바이오 / 헬스케어"),
+        (["금융", "Finance", "Bank", "은행"],         "🏦 금융"),
+        (["소비재", "Consumer", "리테일", "Retail"],  "🛒 소비재 / 리테일"),
+        (["인프라", "Infra", "산업재", "Industrial"], "🏗️ 인프라 / 산업재"),
+        (["지정학", "Geo", "무역", "Trade", "관세"],  "🌍 지정학 / 무역"),
+    ]
+
+    def _normalize_theme(title: str) -> str:
+        t_upper = str(title).upper()
+        for keywords, label in _THEME_KEYWORD_MAP:
+            if any(kw.upper() in t_upper for kw in keywords):
+                return label
+        return str(title)[:30]  # 매칭 안 되면 원본 앞 30자
+
     try:
         records, _ = fetch_narrative_records_from_sheet()
         if not records:
@@ -2682,10 +2712,15 @@ def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14)
 
         for rec in user_recs:
             analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+
+            # 테마: 키워드 정규화 후 카운트
             themes = analysis.get("themes", [])
             for t in themes:
                 if isinstance(t, dict) and t.get("title"):
-                    theme_counter[str(t["title"])[:40]] += 1
+                    normalized = _normalize_theme(str(t["title"]))
+                    theme_counter[normalized] += 1
+
+            # 티커: Winners + Emerging 모두 카운트 (정확히 일치하므로 신뢰도 높음)
             winners_csv = str(rec.get("_sheet_winners_csv") or "").strip()
             emerging_csv = str(rec.get("_sheet_emerging_csv") or "").strip()
             for tk in filter_scanner_ticker_list(
@@ -2694,22 +2729,26 @@ def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14)
                 ticker_counter[tk] += 1
 
         total_recs = len(user_recs)
-        top_themes = theme_counter.most_common(5)
+        top_themes  = theme_counter.most_common(5)
         top_tickers = ticker_counter.most_common(10)
 
-        # 일관성 점수: 상위 3개 테마의 등장 비율 평균
-        if top_themes and total_recs > 0:
-            top3_avg = sum(c for _, c in top_themes[:3]) / (3 * total_recs)
-            consistency_score = min(100, int(top3_avg * 100))
+        # ── 점수 계산: 티커 반복도 기반 ──────────────────────────────────
+        # 상위 5개 티커의 평균 등장 비율 → 100점 만점
+        # 예) 17회 분석에서 상위 5 티커가 [14,13,12,11,10]회 등장
+        #     → avg = (14+13+12+11+10)/(5×17) = 60/85 ≈ 0.706 → 70점
+        if top_tickers and total_recs > 0:
+            top5_counts = [c for _, c in top_tickers[:5]]
+            top5_avg = sum(top5_counts) / (len(top5_counts) * total_recs)
+            consistency_score = min(100, int(top5_avg * 100))
         else:
             consistency_score = 0
 
         return {
-            "top_themes": top_themes,
-            "top_tickers": top_tickers,
-            "total_records": total_recs,
+            "top_themes":        top_themes,
+            "top_tickers":       top_tickers,
+            "total_records":     total_recs,
             "consistency_score": consistency_score,
-            "lookback_days": lookback_days,
+            "lookback_days":     lookback_days,
         }
     except Exception:
         return {}
