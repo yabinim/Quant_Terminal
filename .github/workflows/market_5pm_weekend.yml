@@ -2,9 +2,8 @@
 name: 📅 5PM 주말·휴일 (내러티브만)
 
 on:
-  schedule:
-    # 주말(토·일) 5PM ET = UTC 21:00
-    - cron: '0 21 * * 0,6'
+  repository_dispatch:
+    types: [trigger-5pm-weekend]
   workflow_dispatch:
 
 jobs:
