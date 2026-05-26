@@ -116,48 +116,7 @@ def get_todays_major_releases(fred: Fred) -> list[str]:
             releases.append(event_name)
             print(f"[INFO] 하드코딩 캘린더 발표: {event_name}")
 
-    # 2차: FRED API 보조 (긴급 발표 감지)
-    try:
-        url = "https://api.stlouisfed.org/fred/releases/dates"
-        params = {
-            "api_key": FRED_API_KEY,
-            "realtime_start": today_str,
-            "realtime_end": today_str,
-            "file_type": "json",
-            "include_release_dates_with_no_data": "true",
-            "limit": 50,
-        }
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            release_dates = resp.json().get("release_dates", [])
-            seen_ids = set()
-            for rd in release_dates:
-                rid = rd.get("release_id")
-                if not rid or rid in seen_ids:
-                    continue
-                seen_ids.add(rid)
-                try:
-                    r2 = requests.get(
-                        "https://api.stlouisfed.org/fred/release",
-                        params={"api_key": FRED_API_KEY, "release_id": rid, "file_type": "json"},
-                        timeout=8,
-                    )
-                    if r2.status_code != 200:
-                        continue
-                    name = r2.json().get("releases", [{}])[0].get("name", "").strip()
-                    if not name:
-                        continue
-                    already = any(name.lower() in r.lower() or r.lower() in name.lower()
-                                  for r in releases)
-                    if already:
-                        continue
-                    if any(kw in name.lower() for kw in _MAJOR_RELEASE_KEYWORDS):
-                        releases.append(f"{name} (FRED 감지)")
-                        print(f"[INFO] FRED 보조 감지: {name}")
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"[WARN] FRED API 보조 조회 실패: {e}")
+    # FRED API 보조 제거 (오탐 방지) — 하드코딩 캘린더만 사용
 
     return releases
 

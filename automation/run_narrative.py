@@ -109,65 +109,15 @@ _MAJOR_RELEASE_KEYWORDS = [
 
 
 def get_todays_major_releases(fred: Fred) -> list[str]:
-    """오늘 날짜의 주요 경제지표 발표 목록 반환.
-    1차: 하드코딩된 공식 캘린더 (정확)
-    2차: FRED API 보조 (긴급/추가 발표 감지)
-    """
+    """오늘 날짜의 주요 경제지표 발표 목록 반환 (하드코딩 캘린더만 사용)."""
     today_str = datetime.now(_ET).strftime("%Y-%m-%d")
     releases = []
-
-    # ── 1차: 하드코딩 캘린더 (정확) ──────────────────────────────────────────
     for event_name, dates in _HARDCODED_CALENDAR_2026.items():
         if today_str in dates:
             releases.append(event_name)
-            print(f"[INFO] 하드코딩 캘린더 발표: {event_name}")
-
-    # ── 2차: FRED API 보조 (긴급 발표 감지) ──────────────────────────────────
-    try:
-        url = "https://api.stlouisfed.org/fred/releases/dates"
-        params = {
-            "api_key": FRED_API_KEY,
-            "realtime_start": today_str,
-            "realtime_end": today_str,
-            "file_type": "json",
-            "include_release_dates_with_no_data": "true",
-            "limit": 50,
-        }
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            release_dates = resp.json().get("release_dates", [])
-            seen_ids = set()
-            for rd in release_dates:
-                rid = rd.get("release_id")
-                if not rid or rid in seen_ids:
-                    continue
-                seen_ids.add(rid)
-                try:
-                    r2 = requests.get(
-                        "https://api.stlouisfed.org/fred/release",
-                        params={"api_key": FRED_API_KEY, "release_id": rid, "file_type": "json"},
-                        timeout=8,
-                    )
-                    if r2.status_code != 200:
-                        continue
-                    name = r2.json().get("releases", [{}])[0].get("name", "").strip()
-                    if not name:
-                        continue
-                    # 하드코딩에 이미 있는 것은 스킵
-                    already = any(name.lower() in r.lower() or r.lower() in name.lower()
-                                  for r in releases)
-                    if already:
-                        continue
-                    # 주요 키워드 매칭
-                    if any(kw in name.lower() for kw in _MAJOR_RELEASE_KEYWORDS):
-                        releases.append(f"{name} (FRED 감지)")
-                        print(f"[INFO] FRED 보조 감지: {name}")
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"[WARN] FRED API 보조 조회 실패: {e}")
-
+            print(f"[INFO] 경제지표 발표일: {event_name}")
     return releases
+
 
 
 def build_fred_alert_text(releases: list[str]) -> str:
