@@ -80,18 +80,45 @@ _MAJOR_RELEASE_KEYWORDS = [
 ]
 
 def get_todays_major_releases(fred: Fred) -> list[str]:
+    """오늘 날짜의 주요 경제지표 발표 목록 반환 (FRED REST API 직접 호출)."""
     today_str = datetime.now(_ET).strftime("%Y-%m-%d")
     releases = []
     try:
-        df = fred.get_releases_for_date(today_str)
-        if df is None or df.empty:
+        url = "https://api.stlouisfed.org/fred/releases/dates"
+        params = {
+            "api_key": FRED_API_KEY,
+            "realtime_start": today_str,
+            "realtime_end": today_str,
+            "file_type": "json",
+            "include_release_dates_with_no_data": "true",
+            "limit": 100,
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code != 200:
+            print(f"[WARN] FRED releases/dates API 오류: {resp.status_code}")
             return []
-        name_col = next((c for c in df.columns if "name" in c.lower()), None)
-        if not name_col:
+        release_dates = resp.json().get("release_dates", [])
+        if not release_dates:
             return []
-        for name in df[name_col].dropna():
-            if any(kw in str(name).lower() for kw in _MAJOR_RELEASE_KEYWORDS):
-                releases.append(str(name).strip())
+        seen_ids = set()
+        for rd in release_dates:
+            rid = rd.get("release_id")
+            if not rid or rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            try:
+                r2 = requests.get(
+                    "https://api.stlouisfed.org/fred/release",
+                    params={"api_key": FRED_API_KEY, "release_id": rid, "file_type": "json"},
+                    timeout=8,
+                )
+                if r2.status_code != 200:
+                    continue
+                name = r2.json().get("releases", [{}])[0].get("name", "")
+                if any(kw in str(name).lower() for kw in _MAJOR_RELEASE_KEYWORDS):
+                    releases.append(str(name).strip())
+            except Exception:
+                continue
     except Exception as e:
         print(f"[WARN] FRED 캘린더 조회 실패: {e}")
     return releases
