@@ -7,7 +7,7 @@ on:
   workflow_dispatch:   # 수동 실행 허용 (테스트용)
 
 jobs:
-  run-8am:
+  run-9am:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
