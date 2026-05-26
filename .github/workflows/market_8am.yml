@@ -1,9 +1,9 @@
 # cron refresh 2026-05-26
-name: 📰 8AM Pre-Market (내러티브 + DRG 예측)
+name: 📰 9AM Pre-Market (내러티브 + DRG 예측)
 
 on:
   repository_dispatch:
-    types: [trigger-8am]
+    types: [trigger-9am]
   workflow_dispatch:   # 수동 실행 허용 (테스트용)
 
 jobs:
