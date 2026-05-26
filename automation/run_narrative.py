@@ -302,8 +302,40 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
+def _session_label_for_utc(dt_utc) -> str:
+    """app.py와 동일한 세션 라벨."""
+    dt_et = dt_utc.astimezone(_ET)
+    m = dt_et.hour * 60 + dt_et.minute
+    if 240 <= m <= 569:  return "🌅 Pre-market Prep"
+    if 570 <= m <= 960:  return "🟢 Market Hours Analysis"
+    if 961 <= m <= 1200: return "🔔 Daily Recap (Post-Market)"
+    return "🌙 Overnight Strategy"
+
+
+def parse_tickers_from_csv(text: str) -> list[str]:
+    return [t.strip().upper() for t in str(text or "").split(",")
+            if re.match(r"^[A-Z]{1,5}$", t.strip().upper())]
+
+
+def winners_from_analysis(analysis: dict) -> list[str]:
+    out, seen = [], set()
+    for theme in analysis.get("themes", []):
+        for t in parse_tickers_from_csv(theme.get("winners", "")):
+            if t not in seen: seen.add(t); out.append(t)
+    return out
+
+
+def emerging_from_analysis(analysis: dict) -> list[str]:
+    out, seen = [], set()
+    for theme in analysis.get("themes", []):
+        for flow in theme.get("expanding_to", []):
+            for t in parse_tickers_from_csv(flow.get("expected_tickers", "")):
+                if t not in seen: seen.add(t); out.append(t)
+    return out
+
+
 def save_narrative_to_sheet(analysis: dict, news_count: int, fred_releases: list[str]) -> bool:
-    """내러티브 결과를 Narratives 시트에 저장."""
+    """app.py와 완전히 동일한 형식으로 Narratives 시트에 저장."""
     try:
         gc = get_gspread_client()
         sh = gc.open(_SPREADSHEET_TITLE)
@@ -311,39 +343,38 @@ def save_narrative_to_sheet(analysis: dict, news_count: int, fred_releases: list
             ws = sh.worksheet(_NARRATIVES_WORKSHEET)
         except gspread.exceptions.WorksheetNotFound:
             ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET, rows=3000, cols=7)
-            ws.append_row(["ID", "Date", "Category", "Title", "Content", "Winners", "Emerging"],
+            ws.append_row(["ID","Date","Category","Title","Content","Winners","Emerging"],
                           value_input_option="USER_ENTERED")
 
-        now_kst = datetime.now(_KST)
-        date_str = now_kst.strftime("%Y-%m-%d %H:%M KST")
-        session = "Pre-Market" if now_kst.hour < 9 else ("After-Close" if now_kst.hour >= 17 else "Mid-Session")
+        from datetime import timezone
+        now_utc = datetime.now(timezone.utc)
 
-        # Winners / Emerging 추출
-        winners_set, emerging_set = set(), set()
-        for theme in analysis.get("themes", []):
-            for t in str(theme.get("winners", "")).split(","):
-                t = t.strip().upper()
-                if t: winners_set.add(t)
-            for t in str(theme.get("emerging", "")).split(","):
-                t = t.strip().upper()
-                if t: emerging_set.add(t)
+        # ── app.py append_narrative_history_record 와 동일한 record 구조 ──
+        session_label = _session_label_for_utc(now_utc)
+        record = {
+            "saved_at":      now_utc.isoformat(),
+            "session_label": session_label,
+            "language":      "ko",
+            "analysis":      analysis,
+        }
 
-        fred_note = f" [FRED: {', '.join(fred_releases[:3])}]" if fred_releases else ""
-        summary = str(analysis.get("summary", ""))[:500]
-        regime  = analysis.get("regime", {})
-        title   = f"[{session}] {regime.get('risk','?')} | {regime.get('growth_value','?')}{fred_note}"
+        # ── app.py _narrative_record_to_sheet_row 와 동일한 변환 ──
+        date_kst  = now_utc.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S")
+        category  = str(analysis.get("source") or "market_narrative")
+        themes    = analysis.get("themes", [])
+        if themes and isinstance(themes[0], dict):
+            title = str(themes[0].get("title", "") or "").strip() or "시장 내러티브 스냅샷"
+        else:
+            title = "시장 내러티브 스냅샷"
+        if len(title) > 500: title = title[:497] + "..."
 
-        row = [
-            _ADMIN_USER_ID,
-            date_str,
-            "자동생성",
-            title,
-            json.dumps(analysis, ensure_ascii=False),
-            ", ".join(sorted(winners_set)),
-            ", ".join(sorted(emerging_set)),
-        ]
+        content = json.dumps(record, ensure_ascii=False)
+        w_csv   = ",".join(winners_from_analysis(analysis))
+        e_csv   = ",".join(emerging_from_analysis(analysis))
+
+        row = [_ADMIN_USER_ID, date_kst, category, title, content, w_csv, e_csv]
         ws.append_row(row, value_input_option="USER_ENTERED")
-        print(f"[OK] Sheets 저장 완료: {title}")
+        print(f"[OK] Sheets 저장 완료: {title} | {session_label}")
         return True
     except Exception as e:
         print(f"[ERROR] Sheets 저장 실패: {e}")
