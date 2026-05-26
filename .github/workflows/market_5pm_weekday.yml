@@ -2,10 +2,8 @@
 name: 📊 5PM After-Close 평일 (내러티브 + DRG 검증)
 
 on:
-  schedule:
-    # 평일 5PM ET = UTC 21:00 (서머타임: UTC 20:00)
-    # → 보수적으로 21:00 UTC 사용
-    - cron: '0 21 * * 1-5'
+  repository_dispatch:
+    types: [trigger-5pm-weekday]
   workflow_dispatch:
 
 jobs:
