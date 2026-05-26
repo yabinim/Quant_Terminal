@@ -48,7 +48,7 @@ _DRG_SHEET_COLS = [
     "spy_close_at_pred", "full_text", "actual_direction", "actual_return_pct",
     "is_correct", "review_comment"
 ]
-_ADMIN_USER_ID = "admin"
+_ADMIN_USER_ID = "yab"
 
 _NYSE_HOLIDAYS_2025 = {
     "2025-01-01","2025-01-20","2025-02-17","2025-04-18",
@@ -68,7 +68,30 @@ def is_market_open_today() -> bool:
     return et_now.weekday() < 5 and et_now.strftime("%Y-%m-%d") not in _NYSE_HOLIDAYS
 
 
-# ── FRED 경제지표 캘린더 ───────────────────────────────────────────────────────
+# ── 경제지표 캘린더 (하드코딩 + FRED API 보조) ────────────────────────────────
+
+# 2026년 주요 경제지표 발표 일정 (공식 캘린더 기준)
+# 출처: federalreserve.gov, bls.gov
+_HARDCODED_CALENDAR_2026 = {
+    "FOMC 금리 결정": [
+        "2026-01-28", "2026-03-18", "2026-04-29",
+        "2026-06-17", "2026-07-29", "2026-09-16",
+        "2026-10-28", "2026-12-09",
+    ],
+    "CPI 소비자물가지수": [
+        "2026-01-14", "2026-02-11", "2026-03-11",
+        "2026-04-10", "2026-05-13", "2026-06-10",
+        "2026-07-15", "2026-08-12", "2026-09-11",
+        "2026-10-13", "2026-11-12", "2026-12-10",
+    ],
+    "NFP 고용보고서": [
+        "2026-01-09", "2026-02-06", "2026-03-06",
+        "2026-04-03", "2026-05-08", "2026-06-05",
+        "2026-07-10", "2026-08-07", "2026-09-04",
+        "2026-10-02", "2026-11-06", "2026-12-04",
+    ],
+}
+
 _MAJOR_RELEASE_KEYWORDS = [
     "consumer price","cpi","producer price","ppi",
     "employment situation","nonfarm","payroll",
@@ -80,9 +103,20 @@ _MAJOR_RELEASE_KEYWORDS = [
 ]
 
 def get_todays_major_releases(fred: Fred) -> list[str]:
-    """오늘 날짜의 주요 경제지표 발표 목록 반환 (FRED REST API 직접 호출)."""
+    """오늘 날짜의 주요 경제지표 발표 목록 반환.
+    1차: 하드코딩된 공식 캘린더 (정확)
+    2차: FRED API 보조 (긴급/추가 발표 감지)
+    """
     today_str = datetime.now(_ET).strftime("%Y-%m-%d")
     releases = []
+
+    # 1차: 하드코딩 캘린더
+    for event_name, dates in _HARDCODED_CALENDAR_2026.items():
+        if today_str in dates:
+            releases.append(event_name)
+            print(f"[INFO] 하드코딩 캘린더 발표: {event_name}")
+
+    # 2차: FRED API 보조 (긴급 발표 감지)
     try:
         url = "https://api.stlouisfed.org/fred/releases/dates"
         params = {
@@ -91,36 +125,40 @@ def get_todays_major_releases(fred: Fred) -> list[str]:
             "realtime_end": today_str,
             "file_type": "json",
             "include_release_dates_with_no_data": "true",
-            "limit": 100,
+            "limit": 50,
         }
         resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code != 200:
-            print(f"[WARN] FRED releases/dates API 오류: {resp.status_code}")
-            return []
-        release_dates = resp.json().get("release_dates", [])
-        if not release_dates:
-            return []
-        seen_ids = set()
-        for rd in release_dates:
-            rid = rd.get("release_id")
-            if not rid or rid in seen_ids:
-                continue
-            seen_ids.add(rid)
-            try:
-                r2 = requests.get(
-                    "https://api.stlouisfed.org/fred/release",
-                    params={"api_key": FRED_API_KEY, "release_id": rid, "file_type": "json"},
-                    timeout=8,
-                )
-                if r2.status_code != 200:
+        if resp.status_code == 200:
+            release_dates = resp.json().get("release_dates", [])
+            seen_ids = set()
+            for rd in release_dates:
+                rid = rd.get("release_id")
+                if not rid or rid in seen_ids:
                     continue
-                name = r2.json().get("releases", [{}])[0].get("name", "")
-                if any(kw in str(name).lower() for kw in _MAJOR_RELEASE_KEYWORDS):
-                    releases.append(str(name).strip())
-            except Exception:
-                continue
+                seen_ids.add(rid)
+                try:
+                    r2 = requests.get(
+                        "https://api.stlouisfed.org/fred/release",
+                        params={"api_key": FRED_API_KEY, "release_id": rid, "file_type": "json"},
+                        timeout=8,
+                    )
+                    if r2.status_code != 200:
+                        continue
+                    name = r2.json().get("releases", [{}])[0].get("name", "").strip()
+                    if not name:
+                        continue
+                    already = any(name.lower() in r.lower() or r.lower() in name.lower()
+                                  for r in releases)
+                    if already:
+                        continue
+                    if any(kw in name.lower() for kw in _MAJOR_RELEASE_KEYWORDS):
+                        releases.append(f"{name} (FRED 감지)")
+                        print(f"[INFO] FRED 보조 감지: {name}")
+                except Exception:
+                    continue
     except Exception as e:
-        print(f"[WARN] FRED 캘린더 조회 실패: {e}")
+        print(f"[WARN] FRED API 보조 조회 실패: {e}")
+
     return releases
 
 
