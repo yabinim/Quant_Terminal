@@ -180,46 +180,130 @@ def fetch_global_market_news() -> tuple[list, str, int]:
     return ranked, "\n".join(chunks), len(all_news)
 
 
-# ── 거시지표 수집 ─────────────────────────────────────────────────────────────
+# ── 거시지표 수집 (앱의 Daily Risk Gauge 5가지 신호와 동일) ──────────────────
 def fetch_macro_context(fred: Fred) -> str:
+    """앱의 compute_daily_risk_gauge와 동일한 5가지 선행 신호 수집."""
     lines = []
+    signals_summary = []
+
+    # ── 신호 1: VIX 방향 ─────────────────────────────────────────────────────
+    vix_close = None
     try:
-        vix_hist = yf.download("^VIX", period="5d", progress=False, auto_adjust=True)
-        if vix_hist is not None and not vix_hist.empty:
-            vix_val = float(vix_hist["Close"].iloc[-1])
-            vix_status = "위험" if vix_val > 25 else ("경계" if vix_val > 18 else "안정")
-            lines.append(f"- VIX: {vix_val:.1f} ({vix_status})")
+        vix_hist = yf.Ticker("^VIX").history(period="1mo", auto_adjust=False)
+        vix_s = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
+        if len(vix_s) >= 10:
+            vix_now = float(vix_s.iloc[-1])
+            vix_trend = vix_now - float(vix_s.iloc[-6]) if len(vix_s) >= 6 else 0
+            vix_20d = float(vix_s.tail(20).mean())
+            vix_alert = vix_trend > 2 or vix_now > vix_20d * 1.15
+            vix_close = vix_s
+            status = "⚠️ 상승전환" if vix_alert else "✅ 정상"
+            lines.append(f"- VIX: {vix_now:.1f} ({vix_trend:+.1f}/5일) [{status}]")
+            signals_summary.append(f"VIX {'경고' if vix_alert else '정상'}")
+    except Exception:
+        lines.append("- VIX: 조회 실패")
+
+    # ── 신호 2: 신용 스프레드 (HYG/LQD) ────────────────────────────────────
+    try:
+        hyg = pd.to_numeric(yf.Ticker("HYG").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        lqd = pd.to_numeric(yf.Ticker("LQD").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        if len(hyg) >= 6 and len(lqd) >= 6:
+            spread_now = float(hyg.iloc[-1] / lqd.iloc[-1])
+            spread_5d  = float(hyg.iloc[-6] / lqd.iloc[-6])
+            spread_chg = (spread_now / spread_5d - 1) * 100
+            alert = spread_chg < -0.5
+            status = "⚠️ 축소(위험)" if alert else "✅ 정상"
+            lines.append(f"- 신용 스프레드(HYG/LQD): {spread_chg:+.2f}%/5일 [{status}]")
+            signals_summary.append(f"신용스프레드 {'경고' if alert else '정상'}")
+    except Exception:
+        lines.append("- 신용 스프레드: 조회 실패")
+
+    # ── 신호 3: 대장주 모멘텀 (SPY, QQQ, NVDA, AAPL, MSFT) ─────────────────
+    try:
+        leaders = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT"]
+        raw = yf.download(leaders, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            close_df = raw["Close"]
+        else:
+            close_df = raw[["Close"]]
+        spy_s = pd.to_numeric(close_df["SPY"], errors="coerce").dropna()
+        spy_5d = float((spy_s.iloc[-1]/spy_s.iloc[-6] - 1)*100) if len(spy_s) >= 6 else 0
+        weak_count = 0
+        checked = 0
+        for ldr in ["QQQ", "NVDA", "AAPL", "MSFT"]:
+            if ldr not in close_df.columns:
+                continue
+            s = pd.to_numeric(close_df[ldr], errors="coerce").dropna()
+            if len(s) < 10:
+                continue
+            ret_5d = float((s.iloc[-1]/s.iloc[-6] - 1)*100) if len(s) >= 6 else 0
+            ma20 = float(s.rolling(20, min_periods=10).mean().iloc[-1])
+            below_ma20 = float(s.iloc[-1]) < ma20
+            rel_strength = ret_5d - spy_5d
+            if below_ma20 or rel_strength < -3:
+                weak_count += 1
+            checked += 1
+        alert = weak_count >= 2
+        status = f"⚠️ {weak_count}/{checked}개 약세" if alert else f"✅ {weak_count}/{checked}개 약세"
+        lines.append(f"- 대장주 모멘텀: {status}")
+        signals_summary.append(f"대장주 {'경고' if alert else '정상'}")
+    except Exception:
+        lines.append("- 대장주 모멘텀: 조회 실패")
+
+    # ── 신호 4: 거래량 패턴 (SPY 기준) ─────────────────────────────────────
+    try:
+        raw_spy = yf.download("SPY", period="1mo", interval="1d", auto_adjust=False, progress=False)
+        if raw_spy is not None and not raw_spy.empty and len(raw_spy) >= 10:
+            if isinstance(raw_spy.columns, pd.MultiIndex):
+                etf_close = pd.to_numeric(raw_spy["Close"].iloc[:, 0], errors="coerce").dropna()
+                vol = pd.to_numeric(raw_spy["Volume"].iloc[:, 0], errors="coerce").dropna()
+            else:
+                etf_close = pd.to_numeric(raw_spy["Close"], errors="coerce").dropna()
+                vol = pd.to_numeric(raw_spy["Volume"], errors="coerce").dropna()
+            if len(etf_close) >= 6 and len(vol) >= 10:
+                price_5d = float((etf_close.iloc[-1] / etf_close.iloc[-6] - 1) * 100)
+                vol_ratio = float(vol.tail(5).mean()) / float(vol.tail(20).mean())
+                dist_selling = price_5d > 0 and vol_ratio < 0.8
+                vol_alert = dist_selling or vol_ratio < 0.7
+                status = "⚠️ 분산매도" if dist_selling else ("⚠️ 거래량급감" if vol_ratio < 0.7 else "✅ 정상")
+                lines.append(f"- 거래량 패턴: {vol_ratio:.2f}x (가격 {price_5d:+.1f}%) [{status}]")
+                signals_summary.append(f"거래량 {'경고' if vol_alert else '정상'}")
+    except Exception:
+        lines.append("- 거래량 패턴: 조회 실패")
+
+    # ── 신호 5: VIX/VXN 비율 ────────────────────────────────────────────────
+    try:
+        vxn_hist = yf.Ticker("^VXN").history(period="5d", auto_adjust=False)
+        vxn_s = pd.to_numeric(vxn_hist["Close"], errors="coerce").dropna()
+        if not vxn_s.empty and vix_close is not None and len(vix_close) > 0:
+            vix_now2 = float(vix_close.iloc[-1])
+            vxn_now = float(vxn_s.iloc[-1])
+            ratio = vix_now2 / vxn_now if vxn_now > 0 else 1
+            fear_spike = ratio > 0.95
+            status = "⚠️ 공포급등" if fear_spike else "✅ 정상"
+            lines.append(f"- VIX/VXN 비율: {ratio:.3f} [{status}]")
+            signals_summary.append(f"VIX/VXN {'경고' if fear_spike else '정상'}")
+    except Exception:
+        lines.append("- VIX/VXN 비율: 조회 실패")
+
+    # ── FRED 기준금리 + CPI (추가 컨텍스트) ────────────────────────────────
+    try:
+        rate = float(fred.get_series("FEDFUNDS").dropna().iloc[-1])
+        lines.append(f"- 기준금리(Fed Funds): {rate:.2f}%")
     except Exception:
         pass
-
     try:
-        spy_hist = yf.download("SPY", period="10d", progress=False, auto_adjust=True)
-        if spy_hist is not None and not spy_hist.empty:
-            closes = spy_hist["Close"].dropna()
-            if len(closes) >= 2:
-                spy_close = float(closes.iloc[-1])
-                spy_prev  = float(closes.iloc[-2])
-                spy_chg   = (spy_close / spy_prev - 1) * 100
-                lines.append(f"- SPY: ${spy_close:.2f} (전일비 {spy_chg:+.2f}%)")
-    except Exception:
-        pass
-
-    try:
-        series = fred.get_series("FEDFUNDS")
-        if series is not None and len(series) > 0:
-            rate = float(series.dropna().iloc[-1])
-            lines.append(f"- 기준금리(Fed Funds): {rate:.2f}%")
-    except Exception:
-        pass
-
-    try:
-        cpi = fred.get_series("CPIAUCSL")
-        if cpi is not None and len(cpi) >= 13:
-            cpi_clean = cpi.dropna()
-            yoy = (cpi_clean.iloc[-1] / cpi_clean.iloc[-13] - 1) * 100
+        cpi = fred.get_series("CPIAUCSL").dropna()
+        if len(cpi) >= 13:
+            yoy = (cpi.iloc[-1] / cpi.iloc[-13] - 1) * 100
             lines.append(f"- CPI YoY: {yoy:.2f}%")
     except Exception:
         pass
+
+    # ── 종합 신호 요약 ───────────────────────────────────────────────────────
+    warning_count = sum(1 for s in signals_summary if "경고" in s)
+    risk_level = "🔴 HIGH RISK" if warning_count >= 3 else ("🟡 MEDIUM RISK" if warning_count >= 1 else "🟢 LOW RISK")
+    lines.insert(0, f"[선행 신호 종합: {risk_level} | 경고 {warning_count}/5개]")
 
     return "\n".join(lines) if lines else "데이터 없음"
 
