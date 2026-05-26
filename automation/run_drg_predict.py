@@ -48,7 +48,7 @@ _DRG_SHEET_COLS = [
     "spy_close_at_pred", "full_text", "actual_direction", "actual_return_pct",
     "is_correct", "review_comment"
 ]
-_ADMIN_USER_ID = "yab"
+_ADMIN_USER_ID = "admin"
 
 _NYSE_HOLIDAYS_2025 = {
     "2025-01-01","2025-01-20","2025-02-17","2025-04-18",
@@ -238,17 +238,22 @@ def generate_drg_prediction(rss_news_text: str, macro_summary: str,
         "*본 분석은 AI 참고용이며 투자 권유가 아닙니다.*"
     )
 
-    for attempt in range(3):
+    _RETRY_WAITS = [10, 30, 60, 120]
+    for attempt in range(5):
         try:
             cfg = genai_types.GenerateContentConfig(temperature=0.7, max_output_tokens=4096)
             response = client.models.generate_content(
                 model="gemini-2.5-flash", contents=prompt, config=cfg
             )
-            return str(getattr(response, "text", "") or "").strip()
+            result = str(getattr(response, "text", "") or "").strip()
+            if result:
+                return result
+            raise ValueError("빈 응답")
         except Exception as e:
-            print(f"[WARN] Gemini 시도 {attempt+1}/3 실패: {e}")
-            if attempt < 2:
-                time.sleep([5, 15][attempt])
+            wait = _RETRY_WAITS[min(attempt, len(_RETRY_WAITS)-1)]
+            print(f"[WARN] Gemini 시도 {attempt+1}/5 실패: {e} → {wait}초 대기")
+            if attempt < 4:
+                time.sleep(wait)
     return ""
 
 
