@@ -1,14 +1,16 @@
-name: 📊 5PM After-Close 평일 (내러티브 + DRG 검증)
+name: 📰 8AM Pre-Market (내러티브 + DRG 예측)
 
 on:
   schedule:
-    # 평일 5PM ET = UTC 21:00 (서머타임: UTC 20:00)
-    # → 보수적으로 21:00 UTC 사용
-    - cron: '0 21 * * 1-5'
-  workflow_dispatch:
+    # 평일 8AM ET = UTC 12:00 (서머타임: UTC 11:00)
+    # 서머타임(3월~11월): 0 11 * * 1-5
+    # 표준시(11월~3월):   0 12 * * 1-5
+    # → 보수적으로 12:00 UTC 사용 (서머타임 기간엔 8AM ET보다 1시간 늦지만 허용 범위)
+    - cron: '0 12 * * 1-5'
+  workflow_dispatch:   # 수동 실행 허용 (테스트용)
 
 jobs:
-  run-5pm-weekday:
+  run-8am:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -35,7 +37,13 @@ jobs:
             pytz \
             fredapi
 
-      - name: 📰 시장 내러티브 생성 (After-Close)
+      - name: 🔑 GCP 서비스 계정 키 준비
+        env:
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+        run: |
+          echo "GSPREAD_KEY 확인 완료"
+
+      - name: 📰 시장 내러티브 생성
         env:
           GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
           FRED_API_KEY:      ${{ secrets.FRED_API_KEY }}
@@ -46,23 +54,25 @@ jobs:
         run: |
           python automation/run_narrative.py
 
-      - name: ⏳ 30초 대기
+      - name: ⏳ 내러티브-DRG 간 30초 대기 (API 부하 분산)
         run: sleep 30
 
-      - name: ✅ DRG 예측 결과 검증
+      - name: 🚨 DRG 시장 예측 생성
         env:
+          GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
+          FRED_API_KEY:      ${{ secrets.FRED_API_KEY }}
           FMP_API_KEY:       ${{ secrets.FMP_API_KEY }}
           GMAIL_USER:        ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GMAIL_TO:          ${{ secrets.GMAIL_TO }}
           GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
         run: |
-          python automation/run_drg_verify.py
+          python automation/run_drg_predict.py
 
       - name: 📋 실행 로그 요약
         if: always()
         run: |
           echo "======================================"
-          echo "5PM 평일 자동화 완료"
+          echo "8AM 자동화 완료"
           echo "실행 시각 (UTC): $(date -u)"
           echo "======================================"

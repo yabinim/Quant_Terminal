@@ -1,9 +1,9 @@
-# cron refresh 2026-05-26
 name: 📅 5PM 주말·휴일 (내러티브만)
 
 on:
-  repository_dispatch:
-    types: [trigger-5pm-weekend]
+  schedule:
+    # 주말(토·일) 5PM ET = UTC 21:00
+    - cron: '0 21 * * 0,6'
   workflow_dispatch:
 
 jobs:
@@ -32,7 +32,6 @@ jobs:
             numpy \
             pandas \
             pytz \
-            yfinance \
             fredapi
 
       - name: 📰 시장 내러티브 생성 (주말)
