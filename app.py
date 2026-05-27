@@ -1392,6 +1392,7 @@ def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
             data = r.json() if r.status_code == 200 else []
             if isinstance(data, list) and data:
                 future_items = []
+                tomorrow_dt = today + timedelta(days=1)
                 for item in data:
                     date_str = str(item.get("date") or "")[:10]
                     if not date_str or len(date_str) < 10:
@@ -1399,7 +1400,7 @@ def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
                     try:
                         dt = datetime.strptime(date_str, "%Y-%m-%d").date()
                         days_until = (dt - today).days
-                        if days_until >= 0:
+                        if dt >= tomorrow_dt:  # 내일 이후만
                             future_items.append((days_until, date_str, item))
                     except Exception:
                         continue
@@ -2161,12 +2162,12 @@ def cached_evaluate_kpis_snapshot(ticker_upper: str):
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
-    """분기별 EPS 히스토리 — FMP income-statement(quarter) + earnings-surprises 사용."""
+    """분기별 EPS 어닝 서프라이즈 — FMP earnings-surprises + income-statement 사용."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
 
-    # 방법 1: earnings-surprises (과거 실적 발표 기록, 가장 정확)
+    # 방법 1: earnings-surprises (과거 EPS 실제 vs 예상)
     try:
         r = requests.get(
             f"{_FMP_BASE}/earnings-surprises?symbol={ticker_upper}&apikey={k}",
@@ -2175,19 +2176,21 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
         data = r.json() if r.status_code == 200 else []
         if isinstance(data, list) and len(data) >= 2:
             rows = []
+            today_str = str(datetime.now().date())
             for item in data[:8]:
                 date_str = str(item.get("date") or item.get("fiscalDateEnding") or "")[:10]
+                if not date_str or date_str >= today_str:
+                    continue
                 eps_actual = to_float(
                     item.get("actualEarningResult") or item.get("actualEPS") or item.get("eps")
                 )
                 eps_est = to_float(
                     item.get("estimatedEarning") or item.get("estimatedEPS") or item.get("epsEstimated")
                 )
-                if not date_str or date_str == str(datetime.now().date()):
-                    continue
                 surprise = "N/A"
                 if pd.notna(eps_actual) and pd.notna(eps_est) and eps_est != 0:
-                    surprise = f"{((eps_actual - eps_est) / abs(eps_est) * 100):+.1f}%"
+                    surprise_pct = (eps_actual - eps_est) / abs(eps_est) * 100
+                    surprise = f"{surprise_pct:+.1f}%"
                 rows.append({
                     "분기": date_str,
                     "EPS 실제": f"${eps_actual:.3f}" if pd.notna(eps_actual) else "N/A",
@@ -2199,7 +2202,7 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # 방법 2: quarterly income-statement에서 직접 EPS 계산
+    # 방법 2: income-statement (quarterly)
     try:
         r = requests.get(
             f"{_FMP_BASE}/income-statement?symbol={ticker_upper}&period=quarter&limit=8&apikey={k}",
@@ -2225,7 +2228,6 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
                 return pd.DataFrame(rows)
     except Exception:
         pass
-
     return pd.DataFrame()
 
 
@@ -2237,72 +2239,83 @@ def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
     if not k:
         return pd.DataFrame()
 
-    # 최근 완료된 분기 계산
+    # 최근 3개 분기 순서로 시도 (데이터가 있는 분기까지)
     now = datetime.now()
-    q = (now.month - 1) // 3
-    year = now.year
-    if q == 0:
-        q = 4
-        year -= 1
-    quarter = str(q)
+    q_now = (now.month - 1) // 3
+    year_now = now.year
+    if q_now == 0:
+        q_now = 4
+        year_now -= 1
 
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/institutional-ownership/extract-analytics/holder"
-            f"?symbol={ticker_upper}&year={year}&quarter={quarter}&limit=10&apikey={k}",
-            timeout=_FMP_TIMEOUT
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data:
-                rows = []
-                for item in data[:10]:
-                    investor = str(item.get("investorName") or item.get("name") or "")
-                    weight = to_float(item.get("weight"))
-                    last_weight = to_float(item.get("lastWeight"))
-                    change_pct = to_float(item.get("changeInWeightPercentage") or item.get("changeInWeight"))
-                    shares = to_float(item.get("sharesNumber") or item.get("shares"))
-                    if not investor:
-                        continue
-                    rows.append({
-                        "기관명": investor[:28],
-                        "비중(%)": f"{float(weight):.2f}%" if pd.notna(weight) else "N/A",
-                        "전분기 비중": f"{float(last_weight):.2f}%" if pd.notna(last_weight) else "N/A",
-                        "비중 변화": f"{float(change_pct):+.2f}%" if pd.notna(change_pct) else "N/A",
-                        "보유 주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
-                    })
-                if rows:
+    # 최근 3개 분기 목록
+    quarters_to_try = []
+    y, q = year_now, q_now
+    for _ in range(3):
+        quarters_to_try.append((str(y), str(q)))
+        q -= 1
+        if q == 0:
+            q = 4
+            y -= 1
+
+    for year, quarter in quarters_to_try:
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/institutional-ownership/extract-analytics/holder"
+                f"?symbol={ticker_upper}&year={year}&quarter={quarter}&limit=10&apikey={k}",
+                timeout=_FMP_TIMEOUT
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    rows = []
+                    for item in data[:10]:
+                        investor = str(item.get("investorName") or item.get("name") or "")
+                        weight = to_float(item.get("weight"))
+                        last_weight = to_float(item.get("lastWeight"))
+                        change_pct = to_float(item.get("changeInWeightPercentage") or item.get("changeInWeight"))
+                        shares = to_float(item.get("sharesNumber") or item.get("shares"))
+                        if not investor:
+                            continue
+                        rows.append({
+                            "기관명": investor[:28],
+                            "비중(%)": f"{float(weight):.2f}%" if pd.notna(weight) else "N/A",
+                            "전분기 비중": f"{float(last_weight):.2f}%" if pd.notna(last_weight) else "N/A",
+                            "비중 변화": f"{float(change_pct):+.2f}%" if pd.notna(change_pct) else "N/A",
+                            "보유 주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
+                        })
+                    if rows:
+                        return pd.DataFrame(rows)
+        except Exception:
+            continue
+
+    # fallback: symbol-positions-summary
+    for year, quarter in quarters_to_try:
+        try:
+            r2 = requests.get(
+                f"{_FMP_BASE}/institutional-ownership/symbol-positions-summary"
+                f"?symbol={ticker_upper}&year={year}&quarter={quarter}&apikey={k}",
+                timeout=_FMP_TIMEOUT
+            )
+            if r2.status_code == 200:
+                data2 = r2.json()
+                item = data2[0] if isinstance(data2, list) and data2 else {}
+                if item:
+                    rows = [{
+                        "항목": "기관 투자자 수",
+                        "값": f"{int(item.get('investorsHolding', 0)):,}",
+                        "전분기 대비": f"{int(item.get('investorsHoldingChange', 0)):+,}",
+                    }, {
+                        "항목": "13F 보유 주식 수",
+                        "값": f"{int(item.get('numberOfOf13Fshares', 0)):,}",
+                        "전분기 대비": f"{int(item.get('numberOfOf13FsharesChange', 0)):+,}",
+                    }, {
+                        "항목": "기관 보유 비율",
+                        "값": f"{float(item.get('ownershipPercent', 0)):.2f}%",
+                        "전분기 대비": f"{float(item.get('ownershipPercentChange', 0)):+.2f}%",
+                    }]
                     return pd.DataFrame(rows)
-    except Exception:
-        pass
-
-    # fallback: symbol-positions-summary (요약 통계)
-    try:
-        r2 = requests.get(
-            f"{_FMP_BASE}/institutional-ownership/symbol-positions-summary"
-            f"?symbol={ticker_upper}&year={year}&quarter={quarter}&apikey={k}",
-            timeout=_FMP_TIMEOUT
-        )
-        if r2.status_code == 200:
-            data2 = r2.json()
-            item = data2[0] if isinstance(data2, list) and data2 else {}
-            if item:
-                rows = [{
-                    "항목": "기관 투자자 수",
-                    "값": f"{int(item.get('investorsHolding', 0)):,}",
-                    "전분기 대비": f"{int(item.get('investorsHoldingChange', 0)):+,}",
-                }, {
-                    "항목": "13F 보유 주식 수",
-                    "값": f"{int(item.get('numberOfOf13Fshares', 0)):,}",
-                    "전분기 대비": f"{int(item.get('numberOfOf13FsharesChange', 0)):+,}",
-                }, {
-                    "항목": "기관 보유 비율",
-                    "값": f"{float(item.get('ownershipPercent', 0)):.2f}%",
-                    "전분기 대비": f"{float(item.get('ownershipPercentChange', 0)):+.2f}%",
-                }]
-                return pd.DataFrame(rows)
-    except Exception:
-        pass
+        except Exception:
+            continue
 
     return pd.DataFrame()
 
@@ -3371,9 +3384,10 @@ def fetch_company_overview(ticker_upper: str) -> dict:
         website = str(info.get("website") or p.get("website") or "")
         sector_kr = translate_ko(sector_en, _SECTOR_KR) if sector_en else "N/A"
         industry_kr = translate_ko(industry_en, _INDUSTRY_KR) if industry_en else "N/A"
-        # 다음 실적 발표일 — FMP earnings-calendar
+        # 다음 실적 발표일 — FMP earnings-calendar (내일 이후만)
         next_earnings = None
         k = _fmp_key()
+        tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1))
         if k:
             try:
                 r = requests.get(
@@ -3381,7 +3395,6 @@ def fetch_company_overview(ticker_upper: str) -> dict:
                     timeout=_FMP_TIMEOUT
                 )
                 cal = r.json() if r.status_code == 200 else []
-                today_dt = datetime.now(timezone.utc).date()
                 future_dates = []
                 for item in (cal if isinstance(cal, list) else []):
                     date_str = str(item.get("date") or "")[:10]
@@ -3389,7 +3402,7 @@ def fetch_company_overview(ticker_upper: str) -> dict:
                         continue
                     try:
                         dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-                        if dt >= today_dt:
+                        if dt >= tomorrow:  # 내일 이후만
                             future_dates.append(date_str)
                     except Exception:
                         continue
@@ -3397,10 +3410,16 @@ def fetch_company_overview(ticker_upper: str) -> dict:
                     next_earnings = sorted(future_dates)[0]
             except Exception:
                 pass
+        # profile fallback도 내일 이후만
         if not next_earnings:
             ann = str(p.get("earningsAnnouncement") or "")[:10]
-            if ann:
-                next_earnings = ann
+            if ann and len(ann) == 10:
+                try:
+                    ann_dt = datetime.strptime(ann, "%Y-%m-%d").date()
+                    if ann_dt >= tomorrow:
+                        next_earnings = ann
+                except Exception:
+                    pass
         return {
             "name": name,
             "sector": sector_kr, "sector_en": sector_en,
