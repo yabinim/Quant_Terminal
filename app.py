@@ -2151,8 +2151,36 @@ def cached_yfinance_quote_type(ticker_upper: str):
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_timing_price_history(ticker_upper: str):
-    """1년 일봉 히스토리 — FMP historical-price-eod 사용."""
-    return _fmp_price_history(ticker_upper, limit=252)
+    """1년 일봉 히스토리 — 기술적 분석 전용 (1Y 기간만)."""
+    k = _fmp_key()
+    if not k:
+        return pd.DataFrame()
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker_upper.strip().upper()}&limit=260&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json()
+        rows = data.get("historical", data) if isinstance(data, dict) else data
+        if not isinstance(rows, list) or not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        rename_map = {"close": "Close", "open": "Open", "high": "High",
+                      "low": "Low", "volume": "Volume"}
+        df = df.rename(columns=rename_map)
+        for col in ["Close", "Open", "High", "Low", "Volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        # 정확히 1년치만 반환
+        cutoff = pd.Timestamp.now() - pd.DateOffset(years=1)
+        df = df[df.index >= cutoff]
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -3420,6 +3448,29 @@ def fetch_company_overview(ticker_upper: str) -> dict:
                         next_earnings = ann
                 except Exception:
                     pass
+        # analyst-estimates fallback (날짜 정보 포함될 때)
+        if not next_earnings and k:
+            try:
+                r3 = requests.get(
+                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker_upper}&period=quarter&limit=4&apikey={k}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if r3.status_code == 200:
+                    ae_data = r3.json()
+                    if isinstance(ae_data, list):
+                        for ae in ae_data:
+                            ae_date = str(ae.get("date") or "")[:10]
+                            if not ae_date or len(ae_date) < 10:
+                                continue
+                            try:
+                                ae_dt = datetime.strptime(ae_date, "%Y-%m-%d").date()
+                                if ae_dt >= tomorrow:
+                                    next_earnings = ae_date
+                                    break
+                            except Exception:
+                                continue
+            except Exception:
+                pass
         return {
             "name": name,
             "sector": sector_kr, "sector_en": sector_en,
@@ -3436,34 +3487,44 @@ def fetch_company_overview(ticker_upper: str) -> dict:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_price_history_by_period(ticker_upper: str, period: str) -> pd.DataFrame:
-    """기간별 주가 히스토리 — FMP historical-price-eod 사용. (ticker+period 조합으로 캐시)"""
+    """기간별 주가 히스토리 — FMP historical-price-eod 사용. period별 독립 캐시."""
+    # period별 필요 limit (넉넉하게 요청 후 슬라이싱)
     period_limit_map = {
-        "1D": 2,
-        "1M": 22,
-        "3M": 66,
-        "YTD": 252,
-        "1Y": 252,
-        "5Y": 1260,
-        "MAX": 5000,
+        "1D":  3,
+        "1M":  25,
+        "3M":  70,
+        "YTD": 365,
+        "1Y":  260,
+        "5Y":  1300,
+        "MAX": 6000,
     }
-    limit = period_limit_map.get(period, 252)
-    # 캐시 키에 period가 포함되도록 ticker_upper에 suffix 추가
-    _cache_key = f"{ticker_upper}__{period}"  # noqa: 캐시 구분용
+    limit = period_limit_map.get(period, 260)
     df = _fmp_price_history(ticker_upper, limit=limit)
     if df.empty:
         return df
-    # 1M, 3M은 limit으로 자름
-    if period == "1M":
-        df = df.tail(22)
-    elif period == "3M":
-        df = df.tail(66)
-    elif period == "1D":
+
+    # 기간에 맞게 정확히 슬라이싱
+    now = pd.Timestamp.now()
+    if period == "1D":
         df = df.tail(2)
-    # YTD: 올해 1월 1일 이후만
+    elif period == "1M":
+        cutoff = now - pd.DateOffset(months=1)
+        df = df[df.index >= cutoff]
+    elif period == "3M":
+        cutoff = now - pd.DateOffset(months=3)
+        df = df[df.index >= cutoff]
     elif period == "YTD":
-        ytd_start = pd.Timestamp(f"{datetime.now().year}-01-01")
-        df = df[df.index >= ytd_start]
-    return df
+        cutoff = pd.Timestamp(f"{now.year}-01-01")
+        df = df[df.index >= cutoff]
+    elif period == "1Y":
+        cutoff = now - pd.DateOffset(years=1)
+        df = df[df.index >= cutoff]
+    elif period == "5Y":
+        cutoff = now - pd.DateOffset(years=5)
+        df = df[df.index >= cutoff]
+    # MAX는 전체 반환
+
+    return df if not df.empty else pd.DataFrame()
 
 
 def calculate_macd(close_series: pd.Series, fast=12, slow=26, signal=9):
@@ -9343,12 +9404,12 @@ if st.session_state.get("logged_in"):
             unverified = pred_hist_df[pred_hist_df["is_correct"].astype(str).str.strip() == ""].copy()
             if not unverified.empty:
                 st.markdown("#### 🔍 결과 검증 대기 중")
-                for _, urow in unverified.iterrows():
+                for _uidx, (_, urow) in enumerate(unverified.iterrows()):
                     uc1, uc2, uc3 = st.columns([2, 2, 1])
                     uc1.write(f"📅 **{urow.get('pred_date','')}** | {urow.get('direction','')}")
                     uc2.write(f"벤치마크: {urow.get('benchmark_etf','SPY')} | 섹터: {urow.get('sector_filter','전체')}")
                     with uc3:
-                        if st.button("결과 검증", key=f"verify_{urow.get('pred_date','')}"):
+                        if st.button("결과 검증", key=f"verify_{urow.get('pred_date','')}_{_uidx}"):
                             with st.spinner("실제 결과 조회 중..."):
                                 _ad, _ar, _ic = verify_drg_prediction(urow)
                             if _ad:
