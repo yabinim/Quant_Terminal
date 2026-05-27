@@ -24,7 +24,6 @@ import pandas as pd
 import pytz
 import requests
 import streamlit as st
-import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 from fredapi import Fred
@@ -1217,14 +1216,15 @@ def macro_traffic_light(bad_total):
 
 
 def fetch_yield_spread_latest():
+    """10Y-3M 국채 금리차 — FRED DGS10 / DTB3 사용."""
     try:
-        tnx = yf.Ticker("^TNX").history(period="10d", auto_adjust=False)
-        irx = yf.Ticker("^IRX").history(period="10d", auto_adjust=False)
-        t10 = get_latest_close_from_history(tnx)
-        t3m = get_latest_close_from_history(irx)
+        t10_s = fred.get_series("DGS10")
+        t3m_s = fred.get_series("DTB3")
+        t10 = float(pd.to_numeric(t10_s, errors="coerce").dropna().iloc[-1])
+        t3m = float(pd.to_numeric(t3m_s, errors="coerce").dropna().iloc[-1])
         if pd.isna(t10) or pd.isna(t3m):
             return np.nan, MACRO_STATUS_NA, "데이터 부족 (N/A)"
-        spread = float(t10) - float(t3m)
+        spread = t10 - t3m
         if spread < 0:
             status = MACRO_STATUS_WARN
             note = "수익률 곡선 역전(단기금리 > 장기): 침체·신용경색 우려 신호입니다."
@@ -1247,9 +1247,16 @@ def evaluate_vix_status(vix_value):
 
 
 def fetch_vix_latest_and_history():
+    """VIX 현재값 + 1년 히스토리 — FRED VIXCLS 사용."""
     try:
-        hist = yf.Ticker("^VIX").history(period="1y", auto_adjust=False)
-        cur = get_latest_close_from_history(hist)
+        s = fred.get_series("VIXCLS")
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            return np.nan, None, "FRED VIXCLS 데이터 없음"
+        s = s.tail(252)
+        hist = pd.DataFrame({"Close": s})
+        hist.index = pd.to_datetime(hist.index)
+        cur = float(s.iloc[-1])
         return cur, hist, None
     except Exception as exc:
         return np.nan, None, str(exc)
@@ -1268,9 +1275,11 @@ def evaluate_wti_status(wti):
 
 
 def fetch_wti_latest():
+    """WTI 유가 최신값 — FRED DCOILWTICO 사용."""
     try:
-        o = yf.Ticker("CL=F").history(period="14d", auto_adjust=False)
-        return get_latest_close_from_history(o)
+        s = fred.get_series("DCOILWTICO")
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return float(s.iloc[-1]) if not s.empty else np.nan
     except Exception:
         return np.nan
 
@@ -1345,19 +1354,18 @@ def evaluate_cpi_yoy():
 
 
 def fetch_dxy_latest_and_mean_deviation():
+    """DXY 달러 인덱스 — FRED DTWEXBGS 사용."""
     try:
-        dxy_hist = yf.Ticker("DX-Y.NYB").history(period="400d", auto_adjust=False)
-        cur = get_latest_close_from_history(dxy_hist)
-        if dxy_hist is None or "Close" not in dxy_hist.columns:
+        s = fred.get_series("DTWEXBGS")
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
             return np.nan, np.nan, MACRO_STATUS_NA
-
-        closes = pd.to_numeric(dxy_hist["Close"], errors="coerce").dropna()
-        ma252 = closes.rolling(window=252, min_periods=126).mean().iloc[-1]
+        closes = s.tail(400)
+        cur = float(closes.iloc[-1])
+        ma252 = float(closes.rolling(window=252, min_periods=126).mean().iloc[-1])
         dev_pct = np.nan if pd.isna(cur) or pd.isna(ma252) or ma252 == 0 else (cur / ma252 - 1.0) * 100
-
         if pd.isna(cur) or pd.isna(ma252):
             return cur, np.nan, MACRO_STATUS_NA
-
         if dev_pct >= 5.5:
             return cur, dev_pct, MACRO_STATUS_FAIL
         if dev_pct >= 2.5:
@@ -1369,40 +1377,38 @@ def fetch_dxy_latest_and_mean_deviation():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
-    """
-    보유 종목의 다음 실적 발표일을 yfinance로 조회.
-    반환: [{"ticker", "earnings_date", "days_until", "eps_estimate"}]
-    """
+    """보유 종목의 다음 실적 발표일 — FMP earnings-calendar 사용."""
+    k = _fmp_key()
     results = []
+    now_utc = datetime.now(timezone.utc)
     for tk in tickers:
         try:
-            info = yf.Ticker(tk).info
-            # yfinance earnings date
-            earnings_ts = info.get("earningsTimestamp") or info.get("earningsDate")
-            eps_fwd = info.get("forwardEps")
-
-            earnings_dt = None
-            if earnings_ts:
-                try:
-                    if isinstance(earnings_ts, (int, float)):
-                        earnings_dt = datetime.fromtimestamp(earnings_ts, tz=timezone.utc)
-                    elif isinstance(earnings_ts, list) and earnings_ts:
-                        earnings_dt = datetime.fromtimestamp(earnings_ts[0], tz=timezone.utc)
-                except Exception:
-                    pass
-
-            if earnings_dt:
-                now_utc = datetime.now(timezone.utc)
-                days_until = (earnings_dt.date() - now_utc.date()).days
-                results.append({
-                    "ticker": tk,
-                    "earnings_date": earnings_dt.strftime("%Y-%m-%d"),
-                    "days_until": days_until,
-                    "eps_estimate": round(float(eps_fwd), 2) if eps_fwd else None,
-                })
+            if k:
+                r = requests.get(
+                    f"{_FMP_BASE}/earnings-calendar?symbol={tk}&apikey={k}",
+                    timeout=_FMP_TIMEOUT
+                )
+                data = r.json() if r.status_code == 200 else []
+                if isinstance(data, list) and data:
+                    for item in data:
+                        date_str = str(item.get("date") or "")[:10]
+                        if not date_str:
+                            continue
+                        try:
+                            earnings_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                            days_until = (earnings_dt.date() - now_utc.date()).days
+                            if days_until >= -1:
+                                results.append({
+                                    "ticker": tk,
+                                    "earnings_date": date_str,
+                                    "days_until": days_until,
+                                    "eps_estimate": to_float(item.get("epsEstimated")),
+                                })
+                                break
+                        except Exception:
+                            continue
         except Exception:
             continue
-
     results.sort(key=lambda x: x["days_until"])
     return results
 
@@ -1449,9 +1455,9 @@ def fetch_macro_history_series() -> dict:
     except Exception:
         pass
     try:
-        dxy_hist = yf.Ticker("DX-Y.NYB").history(period="2y", auto_adjust=False)
-        if dxy_hist is not None and not dxy_hist.empty and "Close" in dxy_hist.columns:
-            out["dxy"] = pd.to_numeric(dxy_hist["Close"], errors="coerce").dropna()
+        dxy_s = fred.get_series("DTWEXBGS")
+        if dxy_s is not None and not dxy_s.empty:
+            out["dxy"] = pd.to_numeric(dxy_s, errors="coerce").dropna().tail(500)
     except Exception:
         pass
     return out
@@ -1777,18 +1783,9 @@ def build_etf_universe_returns_table(pool_tickers):
         return pd.DataFrame(columns=cols)
 
     try:
-        raw = yf.download(
-            tickers=unique_tickers,
-            period="6mo",
-            interval="1d",
-            auto_adjust=False,
-            group_by="column",
-            progress=False,
-            threads=True,
-        )
+        close_df = _fmp_batch_to_close_df(unique_tickers, limit=130)
     except Exception:
-        raw = pd.DataFrame()
-    close_df = get_close_prices_from_download(raw)
+        close_df = pd.DataFrame()
 
     if close_df.empty:
         rows = [
@@ -1835,11 +1832,7 @@ def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series
     try:
         unique = list(dict.fromkeys(str(t).strip().upper() for t in pool_tickers if str(t).strip()))
         all_tickers = list(dict.fromkeys(unique + ["SPY"]))
-        raw = yf.download(
-            tickers=all_tickers, period="6mo", interval="1d",
-            auto_adjust=False, group_by="column", progress=False, threads=True
-        )
-        close_df = get_close_prices_from_download(raw)
+        close_df = _fmp_batch_to_close_df(all_tickers, limit=130)
         if close_df.empty:
             return pd.DataFrame()
 
@@ -1901,11 +1894,7 @@ def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "")
     try:
         unique = list(dict.fromkeys(str(t).strip().upper() for t in emerging_tickers if str(t).strip()))
         all_tickers = list(dict.fromkeys(unique + ["SPY"]))
-        raw = yf.download(
-            tickers=all_tickers, period="6mo", interval="1d",
-            auto_adjust=False, group_by="column", progress=False, threads=True
-        )
-        close_df = get_close_prices_from_download(raw)
+        close_df = _fmp_batch_to_close_df(all_tickers, limit=130)
         if close_df.empty:
             return []
 
@@ -1989,17 +1978,9 @@ def detect_sector_momentum_reversal(universe_tickers: list) -> list[dict]:
         return []
     try:
         all_tickers = list(dict.fromkeys([t.strip().upper() for t in universe_tickers if t.strip()] + ["SPY"]))
-        raw = yf.download(
-            tickers=all_tickers, period="6mo", interval="1d",
-            auto_adjust=False, group_by="column", progress=False, threads=True
-        )
-        close_df = get_close_prices_from_download(raw)
-        vol_raw = pd.DataFrame()
-        try:
-            if isinstance(raw.columns, pd.MultiIndex) and "Volume" in raw.columns.get_level_values(0):
-                vol_raw = raw["Volume"]
-        except Exception:
-            pass
+        batch = _fmp_batch_price_history(all_tickers, limit=130)
+        close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch.items() if "Close" in df.columns}).sort_index()
+        vol_raw = pd.DataFrame({tk: df["Volume"] for tk, df in batch.items() if "Volume" in df.columns}).sort_index()
         if close_df.empty:
             return []
 
@@ -2105,18 +2086,7 @@ def get_macro_dashboard_with_validation():
 def cached_sector_etf_closes(tickers_tuple: tuple[str, ...]):
     if not tickers_tuple:
         return pd.DataFrame()
-    try:
-        raw = yf.download(
-            tickers=list(tickers_tuple),
-            period="2y",
-            interval="1d",
-            auto_adjust=False,
-            group_by="column",
-            progress=False,
-        )
-    except Exception:
-        raw = pd.DataFrame()
-    return get_close_prices_from_download(raw)
+    return _fmp_batch_to_close_df(list(tickers_tuple), limit=500)
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -2159,21 +2129,24 @@ def cached_etf_universe_momentum_rankings(universe_tickers_tuple: tuple[str, ...
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_yfinance_quote_type(ticker_upper: str):
+    """종목 타입 (EQUITY/ETF 등) — FMP profile 사용."""
     try:
-        info = yf.Ticker(str(ticker_upper).strip().upper()).info or {}
-        return str(info.get("quoteType") or "").strip()
+        p = _fmp_profile(ticker_upper)
+        if p:
+            if p.get("isEtf") or p.get("isActivelyTrading") is False:
+                return "ETF"
+            qt = str(p.get("quoteType") or "").strip().upper()
+            if qt:
+                return qt
+        return "EQUITY"
     except Exception:
         return ""
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_timing_price_history(ticker_upper: str):
-    try:
-        return yf.Ticker(str(ticker_upper).strip().upper()).history(
-            period="1y", auto_adjust=False
-        )
-    except Exception:
-        return pd.DataFrame()
+    """1년 일봉 히스토리 — FMP historical-price-eod 사용."""
+    return _fmp_price_history(ticker_upper, limit=252)
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -2183,74 +2156,60 @@ def cached_evaluate_kpis_snapshot(ticker_upper: str):
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
-    """분기별 EPS 히스토리 — income_stmt 기반으로 직접 계산."""
-    tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
-
-    # 방법 1: get_earnings_history (신버전 API)
+    """분기별 EPS 히스토리 — FMP earnings-calendar 사용."""
+    k = _fmp_key()
+    if not k:
+        return pd.DataFrame()
     try:
-        eh = tk_obj.get_earnings_history()
-        if eh is not None and not eh.empty:
-            return eh.reset_index()
-    except Exception:
-        pass
-
-    # 방법 2: quarterly_income_stmt에서 EPS 직접 계산
-    try:
-        q_income = tk_obj.quarterly_income_stmt
-        if q_income is not None and not q_income.empty:
-            net_row = next(
-                (q_income.loc[i] for i in q_income.index if "net income" in str(i).lower()),
-                None
-            )
-            if net_row is not None:
-                info = tk_obj.info or {}
-                shares = to_float(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding"))
-                rows = []
-                for col in q_income.columns[:8]:
-                    ni = to_float(net_row.get(col))
-                    if pd.isna(ni):
-                        continue
-                    eps = float(ni / shares) if shares and shares > 0 else np.nan
-                    rows.append({
-                        "분기": str(col)[:10],
-                        "Net Income": f"${ni/1e9:.2f}B" if abs(ni) >= 1e9 else f"${ni/1e6:.0f}M",
-                        "EPS": f"${eps:.3f}" if pd.notna(eps) else "N/A",
-                    })
-                if rows:
-                    return pd.DataFrame(rows)
-    except Exception:
-        pass
-
-    # 방법 3: info EPS 요약
-    try:
-        info = tk_obj.info or {}
+        r = requests.get(
+            f"{_FMP_BASE}/earnings-calendar?symbol={ticker_upper}&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        data = r.json() if r.status_code == 200 else []
+        if not isinstance(data, list) or not data:
+            return pd.DataFrame()
         rows = []
-        eps_t = to_float(info.get("trailingEps"))
-        eps_f = to_float(info.get("forwardEps"))
-        if pd.notna(eps_t):
-            rows.append({"구분": "Trailing EPS (TTM)", "EPS": f"${eps_t:.3f}", "비고": "최근 12개월 실제"})
-        if pd.notna(eps_f):
-            rows.append({"구분": "Forward EPS", "EPS": f"${eps_f:.3f}", "비고": "향후 12개월 예상"})
-        if rows:
-            return pd.DataFrame(rows)
+        for item in data[:8]:
+            date_str = str(item.get("date") or "")[:10]
+            eps_actual = to_float(item.get("eps"))
+            eps_est = to_float(item.get("epsEstimated"))
+            if not date_str:
+                continue
+            rows.append({
+                "분기": date_str,
+                "EPS 실제": f"${eps_actual:.3f}" if pd.notna(eps_actual) else "N/A",
+                "EPS 예상": f"${eps_est:.3f}" if pd.notna(eps_est) else "N/A",
+                "어닝 서프라이즈": f"{((eps_actual - eps_est) / abs(eps_est) * 100):+.1f}%"
+                    if pd.notna(eps_actual) and pd.notna(eps_est) and eps_est != 0 else "N/A",
+            })
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
-        pass
-
-    return pd.DataFrame()
+        return pd.DataFrame()
 
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
-    """기관 보유 비중 상위 목록."""
+    """기관 보유 비중 — FINRA Equity Short Interest API 사용 (무료).
+    기관보유 상세는 FMP Starter에서 제공 안 되므로 FINRA short interest로 대체 표시."""
     try:
-        tk = yf.Ticker(str(ticker_upper).strip().upper())
-        ih = tk.institutional_holders
-        if ih is not None and not ih.empty:
-            return ih.head(10)
-        return pd.DataFrame()
+        url = "https://api.finra.org/data/group/otcmarket/name/consolidatedShortInterest"
+        params = {"limit": 100, "filter": f'[{{"fieldName":"symbolCode","fieldValue":"{ticker_upper}","compareType":"equal"}}]'}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and data:
+                rows = []
+                for item in data[:10]:
+                    rows.append({
+                        "정산일": str(item.get("settlementDate") or "")[:10],
+                        "공매도 잔량": f"{int(item.get('shortInterestQty', 0)):,}",
+                        "전월 대비": f"{int(item.get('shortInterestQty', 0)) - int(item.get('prevShortInterestQty', 0)):+,}",
+                    })
+                return pd.DataFrame(rows)
     except Exception:
-        return pd.DataFrame()
+        pass
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2282,8 +2241,8 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 1: VIX 방향 전환 ───────────────────────────────────────────
     try:
-        vix_hist = yf.Ticker("^VIX").history(period="1mo", auto_adjust=False)
-        vix_close = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
+        vix_s = fred.get_series("VIXCLS")
+        vix_close = pd.to_numeric(vix_s, errors="coerce").dropna().tail(30)
         if len(vix_close) >= 10:
             vix_now = float(vix_close.iloc[-1])
             vix_5d_avg = float(vix_close.tail(5).mean())
@@ -2299,8 +2258,10 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 2: Put/Call Ratio (HYG/LQD 스프레드로 근사) ─────────────────
     try:
-        hyg = pd.to_numeric(yf.Ticker("HYG").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
-        lqd = pd.to_numeric(yf.Ticker("LQD").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        hyg_df = _fmp_price_history("HYG", limit=30)
+        lqd_df = _fmp_price_history("LQD", limit=30)
+        hyg = pd.to_numeric(hyg_df["Close"], errors="coerce").dropna() if not hyg_df.empty else pd.Series(dtype=float)
+        lqd = pd.to_numeric(lqd_df["Close"], errors="coerce").dropna() if not lqd_df.empty else pd.Series(dtype=float)
         if len(hyg) >= 10 and len(lqd) >= 10:
             spread_now = float(hyg.iloc[-1] / lqd.iloc[-1])
             spread_5d = float(hyg.iloc[-6] / lqd.iloc[-6]) if len(hyg) >= 6 else spread_now
@@ -2318,8 +2279,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         leader_alerts = []
         leader_details = {}
         tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
-        raw = yf.download(tickers_dl, period="1mo", interval="1d", auto_adjust=False, progress=False)
-        close_df = get_close_prices_from_download(raw)
+        close_df = _fmp_batch_to_close_df(tickers_dl, limit=30)
 
         spy_s = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
         spy_5d = float((spy_s.iloc[-1]/spy_s.iloc[-6] - 1)*100) if len(spy_s) >= 6 else 0
@@ -2353,16 +2313,10 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
     try:
-        # close_df 없어도 sector_etf로 직접 조회
-        raw_full = yf.download(sector_etf, period="1mo", interval="1d", auto_adjust=False, progress=False)
+        raw_full = _fmp_price_history(sector_etf, limit=30)
         if raw_full is not None and not raw_full.empty and len(raw_full) >= 10:
-            # Close 컬럼 (MultiIndex 대응)
-            if isinstance(raw_full.columns, pd.MultiIndex):
-                etf_close = pd.to_numeric(raw_full["Close"].iloc[:, 0], errors="coerce").dropna()
-                vol = pd.to_numeric(raw_full["Volume"].iloc[:, 0], errors="coerce").dropna()
-            else:
-                etf_close = pd.to_numeric(raw_full["Close"], errors="coerce").dropna()
-                vol = pd.to_numeric(raw_full["Volume"], errors="coerce").dropna()
+            etf_close = pd.to_numeric(raw_full["Close"], errors="coerce").dropna()
+            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
 
             if len(etf_close) >= 6 and len(vol) >= 10:
                 price_5d  = float((etf_close.iloc[-1] / etf_close.iloc[-6] - 1) * 100)
@@ -2388,7 +2342,16 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 신호 5: VIX 선물 구조 (VIX > VXN 비율) ────────────────────────────
     try:
-        vxn = pd.to_numeric(yf.Ticker("^VXN").history(period="5d", auto_adjust=False)["Close"], errors="coerce").dropna()
+        vxn_df = _fmp_price_history("^VXN", limit=10)
+        if vxn_df.empty:
+            # FMP에서 ^VXN 안되면 FRED VXN 시도
+            try:
+                vxn_s = fred.get_series("VXNCLS")
+                vxn = pd.to_numeric(vxn_s, errors="coerce").dropna().tail(5)
+            except Exception:
+                vxn = pd.Series(dtype=float)
+        else:
+            vxn = pd.to_numeric(vxn_df["Close"], errors="coerce").dropna()
         if not vxn.empty and "vix" in signals and signals["vix"]["value"] != "N/A":
             vix_now2 = float(vix_close.iloc[-1])
             vxn_now = float(vxn.iloc[-1])
@@ -2405,25 +2368,29 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     # ── 뉴스 수집 ─────────────────────────────────────────────────────────
     news_items = []
+    k = _fmp_key()
     try:
         risk_tickers = ["SPY", sector_etf] + leaders[:2]
         for tk in risk_tickers[:3]:
             try:
-                tk_news = yf.Ticker(tk).news
-                if tk_news:
-                    for n in tk_news[:3]:
-                        title = str(n.get("title", "") or n.get("headline", "") or "")
-                        publisher = str(n.get("publisher", "") or n.get("source", "") or "")
-                        link = str(n.get("link", "") or n.get("url", "") or "")
-                        pub_time = n.get("providerPublishTime") or n.get("pubDate")
-                        if title:
-                            news_items.append({
-                                "ticker": tk,
-                                "title": title,
-                                "publisher": publisher,
-                                "link": link,
-                                "time": pub_time,
-                            })
+                if k:
+                    r = requests.get(
+                        f"{_FMP_BASE}/stock-news?symbols={tk}&limit=3&apikey={k}",
+                        timeout=_FMP_TIMEOUT
+                    )
+                    tk_news = r.json() if r.status_code == 200 else []
+                    if isinstance(tk_news, list):
+                        for n in tk_news[:3]:
+                            title = str(n.get("title") or "")
+                            publisher = str(n.get("site") or n.get("publisher") or "")
+                            link = str(n.get("url") or n.get("link") or "")
+                            pub_time = n.get("publishedDate") or n.get("date")
+                            if title:
+                                news_items.append({
+                                    "ticker": tk, "title": title,
+                                    "publisher": publisher, "link": link,
+                                    "pub_time": pub_time,
+                                })
                 _time.sleep(0.3)
             except Exception:
                 continue
@@ -2498,27 +2465,21 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
                 return round(float(num), 3)
         return np.nan
 
+    k = _fmp_key()
     for etf_tk in check_list:
         try:
-            tk = yf.Ticker(str(etf_tk).strip().upper())
             holdings_df = None
-
-            # 방법 1: funds_data.top_holdings
-            try:
-                fd = tk.funds_data
-                if fd is not None:
-                    h = fd.top_holdings
-                    if h is not None and not h.empty:
-                        holdings_df = h.copy()
-            except Exception:
-                pass
-
-            # 방법 2: fund_top_holdings 속성
-            if holdings_df is None or holdings_df.empty:
+            # FMP ETF holdings
+            if k:
                 try:
-                    h2 = tk.fund_top_holdings
-                    if h2 is not None and not h2.empty:
-                        holdings_df = h2.copy()
+                    r = requests.get(
+                        f"{_FMP_BASE}/etf-holder/{etf_tk}?apikey={k}",
+                        timeout=_FMP_TIMEOUT
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        if isinstance(data, list) and data:
+                            holdings_df = pd.DataFrame(data)
                 except Exception:
                     pass
 
@@ -2563,101 +2524,49 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
     return results
 
 def fetch_short_interest(ticker_upper: str) -> dict:
-    """공매도 비율 + 숏 스퀴즈 가능성 계산."""
+    """공매도 비율 + 숏 스퀴즈 가능성 — FINRA Equity API 사용 (무료)."""
     try:
-        tk = yf.Ticker(str(ticker_upper).strip().upper())
-        info = tk.info or {}
-        short_pct = to_float(info.get("shortPercentOfFloat") or info.get("shortRatio"))
-        short_ratio = to_float(info.get("shortRatio"))  # Days to Cover
-        shares_short = to_float(info.get("sharesShort"))
-        float_shares = to_float(info.get("floatShares"))
-
-        # 숏 스퀴즈 가능성
-        squeeze_risk = "N/A"
-        if pd.notna(short_pct):
-            pct = short_pct * 100 if short_pct <= 1 else short_pct
-            if pct >= 20:
-                squeeze_risk = "🔥 높음 (Short Squeeze 주의)"
-            elif pct >= 10:
-                squeeze_risk = "⚠️ 중간"
-            else:
-                squeeze_risk = "✅ 낮음"
-        else:
-            pct = np.nan
-
-        return {
-            "short_pct": round(float(pct), 2) if pd.notna(pct) else None,
-            "days_to_cover": round(float(short_ratio), 1) if pd.notna(short_ratio) else None,
-            "shares_short": int(shares_short) if pd.notna(shares_short) else None,
-            "squeeze_risk": squeeze_risk,
+        url = "https://api.finra.org/data/group/otcmarket/name/consolidatedShortInterest"
+        params = {
+            "limit": 2,
+            "filter": f'[{{"fieldName":"symbolCode","fieldValue":"{ticker_upper}","compareType":"equal"}}]',
+            "sort": '[{"fieldName":"settlementDate","sortType":"DESC"}]',
         }
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and data:
+                latest = data[0]
+                short_qty = to_float(latest.get("shortInterestQty"))
+                avg_vol = to_float(latest.get("averageDailyVolume"))
+                days_to_cover = round(float(short_qty / avg_vol), 1) if avg_vol and avg_vol > 0 and short_qty else None
+                # FMP profile에서 float shares 가져와서 비율 계산
+                p = _fmp_profile(ticker_upper)
+                float_shares = to_float(p.get("floatShares") or p.get("sharesOutstanding"))
+                short_pct = round(float(short_qty / float_shares * 100), 2) if float_shares and float_shares > 0 and short_qty else None
+                squeeze_risk = "N/A"
+                if short_pct is not None:
+                    if short_pct >= 20:
+                        squeeze_risk = "🔥 높음 (Short Squeeze 주의)"
+                    elif short_pct >= 10:
+                        squeeze_risk = "⚠️ 중간"
+                    else:
+                        squeeze_risk = "✅ 낮음"
+                return {
+                    "short_pct": short_pct,
+                    "days_to_cover": days_to_cover,
+                    "shares_short": int(short_qty) if short_qty else None,
+                    "squeeze_risk": squeeze_risk,
+                }
     except Exception:
-        return {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
+        pass
+    return {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_options_flow_summary(ticker_upper: str) -> dict:
-    """
-    Options Flow 간이 분석.
-    Put/Call Ratio + 최근 만기 옵션 거래량으로 기관 방향성 추정.
-    """
-    try:
-        tk = yf.Ticker(str(ticker_upper).strip().upper())
-        expirations = tk.options
-        if not expirations:
-            return {}
-
-        # 가장 가까운 만기 2개 분석
-        results = []
-        for exp in expirations[:2]:
-            try:
-                chain = tk.option_chain(exp)
-                calls = chain.calls
-                puts = chain.puts
-                if calls.empty or puts.empty:
-                    continue
-                call_vol = float(pd.to_numeric(calls["volume"], errors="coerce").sum())
-                put_vol = float(pd.to_numeric(puts["volume"], errors="coerce").sum())
-                call_oi = float(pd.to_numeric(calls["openInterest"], errors="coerce").sum())
-                put_oi = float(pd.to_numeric(puts["openInterest"], errors="coerce").sum())
-                pc_ratio = put_vol / call_vol if call_vol > 0 else np.nan
-                oi_ratio = put_oi / call_oi if call_oi > 0 else np.nan
-
-                results.append({
-                    "expiry": exp,
-                    "call_vol": int(call_vol),
-                    "put_vol": int(put_vol),
-                    "pc_ratio": round(pc_ratio, 3) if pd.notna(pc_ratio) else None,
-                    "call_oi": int(call_oi),
-                    "put_oi": int(put_oi),
-                    "oi_ratio": round(oi_ratio, 3) if pd.notna(oi_ratio) else None,
-                })
-            except Exception:
-                continue
-
-        if not results:
-            return {}
-
-        # 종합 방향성 판단
-        avg_pc = float(pd.DataFrame(results)["pc_ratio"].dropna().mean()) if results else np.nan
-        if pd.notna(avg_pc):
-            if avg_pc < 0.7:
-                direction = "🟢 Bullish (콜 우세 — 기관 매수 포지션)"
-            elif avg_pc > 1.3:
-                direction = "🔴 Bearish (풋 우세 — 기관 헤지/매도 포지션)"
-            else:
-                direction = "🟡 Neutral (균형)"
-        else:
-            direction = "N/A"
-
-        return {
-            "chains": results,
-            "avg_pc_ratio": round(avg_pc, 3) if pd.notna(avg_pc) else None,
-            "direction": direction,
-        }
-    except Exception:
-        return {}
-
+    """Options Flow — 현재 무료 대안 없음. 추후 전용 API 연동 예정."""
+    return {}
 
 def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14) -> dict:
     """
@@ -2856,9 +2765,69 @@ def _fmp_cashflow(ticker: str) -> dict:
     except Exception:
         return {}
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
+    """FMP historical-price-eod → Close/Open/High/Low/Volume DataFrame 반환."""
+    k = _fmp_key()
+    if not k:
+        return pd.DataFrame()
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json()
+        rows = data.get("historical", data) if isinstance(data, dict) else data
+        if not isinstance(rows, list) or not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        if "date" not in df.columns:
+            return pd.DataFrame()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        rename_map = {"close": "Close", "open": "Open", "high": "High",
+                      "low": "Low", "volume": "Volume", "adjClose": "Adj Close"}
+        df = df.rename(columns=rename_map)
+        for col in ["Close", "Open", "High", "Low"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "Volume" in df.columns:
+            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fmp_batch_price_history(tickers: list, limit: int = 130) -> dict:
+    """여러 티커를 개별 FMP 호출로 수집 → {ticker: DataFrame} 반환."""
+    result = {}
+    for tk in tickers:
+        df = _fmp_price_history(tk, limit=limit)
+        if not df.empty:
+            result[tk] = df
+    return result
+
+
+def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
+    """FMP 배치 조회 → Close 컬럼만 모은 DataFrame 반환."""
+    batch = _fmp_batch_price_history(tickers, limit=limit)
+    if not batch:
+        return pd.DataFrame()
+    close_dict = {}
+    for tk, df in batch.items():
+        if "Close" in df.columns:
+            close_dict[tk] = df["Close"]
+    if not close_dict:
+        return pd.DataFrame()
+    return pd.DataFrame(close_dict).sort_index()
+
+
 def _fmp_fill(info: dict, ticker: str) -> dict:
     """yfinance info dict의 빈 필드를 FMP로 채워 반환.
-    ※ 진단으로 확인된 FMP 무료 플랜 실제 제공 필드만 사용.
+    ※ FMP Starter 플랜 실제 제공 필드만 사용.
     기존 값은 절대 덮어쓰지 않음.
     """
     info = dict(info)
@@ -2991,46 +2960,51 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_company_overview(ticker_upper: str) -> dict:
-    """회사 기본 정보 조회 (섹터/산업 한글 포함)."""
+    """회사 기본 정보 조회 — FMP profile primary, _fmp_fill 보완."""
     try:
-        tk_obj = yf.Ticker(str(ticker_upper).strip().upper())
-        try:
-            info = tk_obj.info or {}
-        except Exception:
-            info = {}
-        # yfinance 실패 또는 빈 필드 → FMP로 보완
+        info = {}
         info = _fmp_fill(info, ticker_upper)
-        name = str(info.get("longName") or info.get("shortName") or ticker_upper)
-        sector_en = str(info.get("sector") or "")
-        industry_en = str(info.get("industry") or "")
+        p = _fmp_profile(ticker_upper)
+        name = str(info.get("longName") or info.get("shortName") or p.get("companyName") or ticker_upper)
+        sector_en = str(info.get("sector") or p.get("sector") or "")
+        industry_en = str(info.get("industry") or p.get("industry") or "")
         quote_type = str(info.get("quoteType") or "").upper()
-        is_etf = quote_type in ("ETF", "MUTUALFUND") or "etf" in sector_en.lower()
-        country = str(info.get("country") or "N/A")
-        summary_en = str(info.get("longBusinessSummary") or "")
-        employees = info.get("fullTimeEmployees")
-        market_cap = to_float(info.get("marketCap"))
-        website = str(info.get("website") or "")
-
-        # 섹터/산업 한글 변환
+        is_etf = quote_type in ("ETF", "MUTUALFUND") or bool(p.get("isEtf"))
+        country = str(info.get("country") or p.get("country") or "N/A")
+        summary_en = str(info.get("longBusinessSummary") or p.get("description") or "")
+        employees = info.get("fullTimeEmployees") or p.get("fullTimeEmployees")
+        market_cap = to_float(info.get("marketCap") or p.get("mktCap"))
+        website = str(info.get("website") or p.get("website") or "")
         sector_kr = translate_ko(sector_en, _SECTOR_KR) if sector_en else "N/A"
         industry_kr = translate_ko(industry_en, _INDUSTRY_KR) if industry_en else "N/A"
-
-        # 다음 실적 발표일
+        # 다음 실적 발표일 — FMP earnings-calendar
         next_earnings = None
-        try:
-            ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
-            if ts and int(ts) > 0:
-                next_earnings = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-        if not next_earnings:
+        k = _fmp_key()
+        if k:
             try:
-                ed_list = info.get("earningsDate") or []
-                if ed_list and isinstance(ed_list, list):
-                    next_earnings = str(ed_list[0])[:10]
+                r = requests.get(
+                    f"{_FMP_BASE}/earnings-calendar?symbol={ticker_upper}&apikey={k}",
+                    timeout=_FMP_TIMEOUT
+                )
+                cal = r.json() if r.status_code == 200 else []
+                now_utc = datetime.now(timezone.utc)
+                for item in (cal if isinstance(cal, list) else []):
+                    date_str = str(item.get("date") or "")[:10]
+                    if not date_str:
+                        continue
+                    try:
+                        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        if dt.date() >= now_utc.date():
+                            next_earnings = date_str
+                            break
+                    except Exception:
+                        continue
             except Exception:
                 pass
-
+        if not next_earnings:
+            ann = str(p.get("earningsAnnouncement") or "")[:10]
+            if ann:
+                next_earnings = ann
         return {
             "name": name,
             "sector": sector_kr, "sector_en": sector_en,
@@ -3047,19 +3021,13 @@ def fetch_company_overview(ticker_upper: str) -> dict:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_price_history_by_period(ticker_upper: str, period: str) -> pd.DataFrame:
-    """기간별 주가 히스토리 조회."""
-    period_map = {
-        "1D": ("1d", "5m"), "1M": ("1mo", "1d"), "3M": ("3mo", "1d"),
-        "YTD": ("ytd", "1d"), "1Y": ("1y", "1d"), "5Y": ("5y", "1wk"), "MAX": ("max", "1mo"),
+    """기간별 주가 히스토리 — FMP historical-price-eod 사용."""
+    period_limit_map = {
+        "1D": 2, "1M": 30, "3M": 90,
+        "YTD": 365, "1Y": 252, "5Y": 1260, "MAX": 5000,
     }
-    yf_period, interval = period_map.get(period, ("1y", "1d"))
-    try:
-        hist = yf.Ticker(str(ticker_upper).strip().upper()).history(
-            period=yf_period, interval=interval, auto_adjust=True
-        )
-        return hist if hist is not None else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+    limit = period_limit_map.get(period, 252)
+    return _fmp_price_history(ticker_upper, limit=limit)
 
 
 def calculate_macd(close_series: pd.Series, fast=12, slow=26, signal=9):
@@ -3107,7 +3075,18 @@ def cached_build_etf_holdings_performance_pairs(holding_pairs):
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_etf_holdings_universe_str(etf_ticker: str):
     t_clean = str(etf_ticker or "").strip().upper()
-    return build_etf_holdings_universe(yf.Ticker(t_clean))
+    k = _fmp_key()
+    if not k:
+        return []
+    try:
+        r = requests.get(f"{_FMP_BASE}/etf-holder/{t_clean}?apikey={k}", timeout=_FMP_TIMEOUT)
+        data = r.json() if r.status_code == 200 else []
+        if isinstance(data, list) and data:
+            return [str(item.get("asset") or item.get("symbol") or "").strip().upper()
+                    for item in data if item.get("asset") or item.get("symbol")]
+    except Exception:
+        pass
+    return []
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -3115,19 +3094,7 @@ def cached_portfolio_yf_close_1y(tuple_tickers: tuple[str, ...]):
     tickers_list = list(dict.fromkeys([t for t in tuple_tickers if str(t).strip()]))
     if not tickers_list:
         return pd.DataFrame()
-    try:
-        raw = yf.download(
-            tickers=tickers_list,
-            period="1y",
-            interval="1d",
-            auto_adjust=False,
-            group_by="column",
-            progress=False,
-            threads=True,
-        )
-    except Exception:
-        raw = pd.DataFrame()
-    close_df = get_close_prices_from_download(raw)
+    close_df = _fmp_batch_to_close_df(tickers_list, limit=252)
     if close_df.empty:
         return close_df
     if len(tickers_list) == 1 and "SINGLE" in close_df.columns:
@@ -3160,89 +3127,34 @@ def tab_sync_refresh(clear_callbacks, rerun_after=True):
 
 def evaluate_kpis(ticker_symbol):
     try:
-        ticker = yf.Ticker(ticker_symbol)
-
-        # ── info 수집 (여러 방법 시도) ──────────────────────────────────
-        info = {}
-        try:
-            raw_info = ticker.info
-            if isinstance(raw_info, dict) and len(raw_info) > 5:
-                info = raw_info
-        except Exception:
-            pass
-
-        # info가 비어있으면 fast_info로 보완
-        if not info:
-            try:
-                fi = ticker.fast_info
-                info = {
-                    "currentPrice": getattr(fi, "last_price", None),
-                    "fiftyDayAverage": getattr(fi, "fifty_day_average", None),
-                    "twoHundredDayAverage": getattr(fi, "two_hundred_day_average", None),
-                    "marketCap": getattr(fi, "market_cap", None),
-                }
-            except Exception:
-                pass
-
-        # ── FMP로 빈 필드 보완 (yfinance 값은 절대 덮어쓰지 않음) ────
-        info = _fmp_fill(info, str(ticker_symbol).strip().upper())
-
-        cashflow = None
-        try:
-            cashflow = ticker.cashflow
-        except Exception:
-            pass
-        if cashflow is None or cashflow.empty:
-            try:
-                cashflow = ticker.get_cashflow()
-            except Exception:
-                cashflow = None
-
-        # FCF: yfinance cashflow도 없으면 FMP income-statement에서 보완
-        if cashflow is None or (hasattr(cashflow, "empty") and cashflow.empty):
-            try:
-                cf = _fmp_cashflow(str(ticker_symbol).strip().upper())
-                _fcf_val = to_float(cf.get("freeCashFlow"))
-                if pd.isna(_fcf_val):
-                    _ocf = to_float(cf.get("operatingCashFlow"))
-                    _capex = to_float(cf.get("capitalExpenditure"))
-                    if pd.notna(_ocf) and pd.notna(_capex):
-                        _fcf_val = float(_ocf + _capex)  # capex는 음수
-                if pd.notna(_fcf_val):
-                    info["_fmp_fcf"] = _fcf_val
-            except Exception:
-                pass
-
-        history = pd.DataFrame()
-        try:
-            history = ticker.history(period="1y", auto_adjust=False)
-        except Exception:
-            pass
-
-        # ── 재무제표에서 직접 추출 시도 ─────────────────────────────────
+        tk_upper = str(ticker_symbol).strip().upper()
+        # FMP primary
+        info = _fmp_fill({}, tk_upper)
+        # 주가 히스토리 (MA200 등 계산용)
+        history = _fmp_price_history(tk_upper, limit=252)
+        # FMP 재무제표 활용
+        inc = _fmp_income(tk_upper)
+        cf = _fmp_cashflow(tk_upper)
+        latest_inc = inc.get("latest", {})
+        prev_inc = inc.get("prev", {})
+        # FCF
+        _fcf_val = to_float(cf.get("freeCashFlow"))
+        if pd.isna(_fcf_val):
+            _ocf = to_float(cf.get("operatingCashFlow"))
+            _capex = to_float(cf.get("capitalExpenditure"))
+            if pd.notna(_ocf) and pd.notna(_capex):
+                _fcf_val = float(_ocf + _capex)
+        if pd.notna(_fcf_val):
+            info["_fmp_fcf"] = _fcf_val
+        # income_stmt / balance_sheet은 None으로 처리 (FMP fill로 대체)
         income_stmt = None
-        try:
-            income_stmt = ticker.income_stmt
-        except Exception:
-            try:
-                income_stmt = ticker.get_income_stmt()
-            except Exception:
-                pass
-
         balance_sheet = None
-        try:
-            balance_sheet = ticker.balance_sheet
-        except Exception:
-            try:
-                balance_sheet = ticker.get_balance_sheet()
-            except Exception:
-                pass
-
     except Exception:
-        info, cashflow, history = {}, None, pd.DataFrame()
+        tk_upper = str(ticker_symbol).strip().upper()
+        info = _fmp_fill({}, tk_upper)
+        history = pd.DataFrame()
         income_stmt, balance_sheet = None, None
-        # yfinance 완전 실패 시 FMP만으로 시도
-        info = _fmp_fill({}, str(ticker_symbol).strip().upper())
+        latest_inc, prev_inc = {}, {}
 
     # ── 지표 추출 ──────────────────────────────────────────────────────
     # ROE
@@ -3471,41 +3383,13 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
 
     # ── 공통 데이터 수집 ──────────────────────────────────────────────
     try:
-        tk = yf.Ticker(ticker_upper)
-        info = {}
-        try:
-            raw = tk.info
-            if isinstance(raw, dict) and len(raw) > 5:
-                info = raw
-        except Exception:
-            pass
-        info = _fmp_fill(info, ticker_upper)
-
-        # Earnings 히스토리 (분기별 EPS 성장)
-        earn_df = pd.DataFrame()
-        try:
-            eh = tk.get_earnings_history()
-            if eh is not None and not eh.empty:
-                earn_df = eh.reset_index()
-        except Exception:
-            pass
-
-        # 기관 보유
-        inst_df = pd.DataFrame()
-        try:
-            ih = tk.institutional_holders
-            if ih is not None and not ih.empty:
-                inst_df = ih
-        except Exception:
-            pass
-
-        # 거래량 (최근 vs 3개월 평균)
-        hist = pd.DataFrame()
-        try:
-            hist = tk.history(period="3mo", auto_adjust=False)
-        except Exception:
-            pass
-
+        info = _fmp_fill({}, ticker_upper)
+        # Earnings 히스토리 — FMP
+        earn_df = cached_earnings_history(ticker_upper)
+        # 기관 보유 — FINRA (short interest 기반)
+        inst_df = cached_institutional_holders(ticker_upper)
+        # 거래량 (최근 3개월)
+        hist = _fmp_price_history(ticker_upper, limit=65)
     except Exception:
         info = _fmp_fill({}, ticker_upper)
         earn_df = inst_df = hist = pd.DataFrame()
@@ -3847,13 +3731,12 @@ def cached_style_scores(ticker_upper: str, _margin_context_key: str, _kpi_hash: 
 
 def detect_quote_type(ticker_symbol):
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info if ticker.info else {}
-        quote_type = str(info.get("quoteType") or "").upper()
-        return quote_type, ticker, info
+        tk_upper = str(ticker_symbol).strip().upper()
+        p = _fmp_profile(tk_upper)
+        quote_type = "ETF" if p.get("isEtf") else str(p.get("quoteType") or "EQUITY").upper()
+        return quote_type, None, p
     except Exception:
-        _notify_yfinance_fetch_failed()
-        return "", yf.Ticker(ticker_symbol), {}
+        return "", None, {}
 
 
 def get_etf_top_holdings(ticker_obj):
@@ -3924,18 +3807,9 @@ def build_etf_holdings_performance(holdings_df):
         return pd.DataFrame(columns=["Ticker", "현재가", "1개월(%)", "3개월(%)", "6개월(%)", "12개월(%)", "비중(%)"])
 
     try:
-        raw = yf.download(
-            tickers=tickers,
-            period="2y",
-            interval="1d",
-            auto_adjust=False,
-            group_by="column",
-            progress=False,
-            threads=True,
-        )
+        close_df = _fmp_batch_to_close_df(tickers, limit=500)
     except Exception:
-        raw = pd.DataFrame()
-    close_df = get_close_prices_from_download(raw)
+        close_df = pd.DataFrame()
     if close_df.empty:
         return pd.DataFrame(columns=["Ticker", "현재가", "1개월(%)", "3개월(%)", "6개월(%)", "12개월(%)", "비중(%)"])
 
@@ -4356,25 +4230,16 @@ def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         if pd.isna(pred_date):
             return "", np.nan, ""
 
-        pred_date_naive = pred_date.date()  # datetime.date 객체
+        pred_date_naive = pred_date.date()
 
-        # 예측일 포함 직전 10거래일 데이터 (주말·공휴일 건너뜀)
-        start_date = pred_date - pd.Timedelta(days=14)
-        end_date   = pred_date + pd.Timedelta(days=2)  # exclusive이므로 +2
-
-        hist = yf.download(
-            bench_etf,
-            start=start_date.strftime("%Y-%m-%d"),
-            end=end_date.strftime("%Y-%m-%d"),
-            progress=False,
-            auto_adjust=True,
-        )
+        # FMP로 예측일 전후 20일치 데이터 조회
+        hist = _fmp_price_history(bench_etf, limit=20)
         if hist is None or hist.empty:
             return "", np.nan, ""
 
         # timezone 제거 후 date 비교
         hist.index = pd.to_datetime(hist.index).tz_localize(None)
-        hist_dates = hist.index.normalize()  # 시간 제거, date만 남김
+        hist_dates = hist.index.normalize()
 
         pred_ts = pd.Timestamp(pred_date_naive)
 
@@ -5006,17 +4871,17 @@ def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) ->
                 "ipo_date": ipo_date_str[:10],
             })
 
-        # AUM 필터링 (yfinance로 빠르게 체크)
+        # AUM 필터링 — FMP profile로 체크
         filtered = []
-        for etf in new_etfs[:50]:  # 최대 50개만 체크 (rate limit 방지)
+        k = _fmp_key()
+        for etf in new_etfs[:50]:
             try:
-                info = yf.Ticker(etf["ticker"]).info
-                aum = float(info.get("totalAssets", 0) or 0) / 1_000_000
+                p = _fmp_profile(etf["ticker"]) if k else {}
+                aum = float(p.get("totalAssets") or p.get("mktCap") or 0) / 1_000_000
                 if aum >= min_aum_m:
                     etf["aum_m"] = f"{aum:.0f}"
                     filtered.append(etf)
             except Exception:
-                # AUM 확인 실패해도 포함 (보수적으로)
                 filtered.append(etf)
 
         return filtered
@@ -5063,12 +4928,12 @@ def cleanup_low_quality_etfs_from_sheet(min_avg_volume_m: float = 1.0, min_aum_m
             except Exception:
                 continue
 
-            # yfinance로 AUM + 거래량 체크
+            # FMP로 AUM + 거래량 체크
             try:
-                info = yf.Ticker(ticker).info
-                aum = float(info.get("totalAssets", 0) or 0) / 1_000_000
-                avg_vol = float(info.get("averageVolume", 0) or 0)
-                price = float(info.get("regularMarketPrice", 0) or info.get("previousClose", 0) or 0)
+                p = _fmp_profile(ticker)
+                aum = float(p.get("totalAssets") or p.get("mktCap") or 0) / 1_000_000
+                avg_vol = float(p.get("volAvg") or p.get("averageVolume") or 0)
+                price = float(p.get("price") or p.get("regularMarketPrice") or 0)
                 avg_vol_m = avg_vol * price / 1_000_000
 
                 if aum < min_aum_m or avg_vol_m < min_avg_volume_m:
@@ -6117,36 +5982,35 @@ def hydrate_narrative_from_disk_once():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
-    """현재가 조회. tickers는 반드시 tuple로 전달해야 캐싱 가능."""
+    """현재가 조회 — FMP stock-quote 사용."""
     clean_tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
     clean_tickers = list(dict.fromkeys(clean_tickers))
     if not clean_tickers:
         return {}
+    k = _fmp_key()
+    if not k:
+        return {}
     try:
-        raw = yf.download(
-            tickers=clean_tickers,
-            period="10d",
-            interval="1d",
-            auto_adjust=False,
-            group_by="column",
-            progress=False,
-            threads=True,
+        symbols = ",".join(clean_tickers)
+        r = requests.get(
+            f"{_FMP_BASE}/quote/{symbols}?apikey={k}",
+            timeout=_FMP_TIMEOUT
         )
-        close_df = get_close_prices_from_download(raw)
-        if close_df.empty:
+        data = r.json() if r.status_code == 200 else []
+        if not isinstance(data, list):
             return {}
-        if len(clean_tickers) == 1 and "SINGLE" in close_df.columns:
-            close_df.columns = [clean_tickers[0]]
         price_map = {}
-        for ticker in clean_tickers:
-            if ticker not in close_df.columns:
-                price_map[ticker] = np.nan
-                continue
-            series = pd.to_numeric(close_df[ticker], errors="coerce").dropna()
-            price_map[ticker] = float(series.iloc[-1]) if not series.empty else np.nan
+        for item in data:
+            sym = str(item.get("symbol") or "").strip().upper()
+            price = to_float(item.get("price") or item.get("previousClose"))
+            if sym:
+                price_map[sym] = price
+        # 없는 티커는 nan
+        for tk in clean_tickers:
+            if tk not in price_map:
+                price_map[tk] = np.nan
         return price_map
     except Exception:
-        _notify_yfinance_fetch_failed()
         return {}
 
 
@@ -6358,48 +6222,24 @@ def _factcheck_to_yahoo_symbol(ticker: str) -> str:
 
 
 def _factcheck_download_closes(tickers, period: str = "60d") -> pd.DataFrame:
-    """팩트 체크용 종가 시계열. 누락 티커는 NaN 컬럼으로 보존하여 호출부 'N/A' 처리.
-    내부적으로 yfinance용 심볼 매핑을 적용하되, 반환 컬럼은 사용자 라벨(원본)으로 유지."""
+    """팩트 체크용 종가 시계열 — FMP 사용. 누락 티커는 NaN 컬럼 보존."""
     clean = [str(t).strip().upper() for t in tickers if str(t).strip()]
     clean = list(dict.fromkeys(clean))
     if not clean:
         return pd.DataFrame()
-
-    # 사용자 라벨 → 야후 심볼 매핑 (역매핑도 함께 구성)
-    yf_map = {t: _factcheck_to_yahoo_symbol(t) for t in clean}
-    yf_to_user = {}
-    for user_t, yf_t in yf_map.items():
-        yf_to_user.setdefault(yf_t, user_t)
-    yf_symbols = list(yf_to_user.keys())
-
+    # period 문자열 → limit 변환
+    period_limit = {"30d": 30, "60d": 65, "90d": 95, "6mo": 130, "1y": 252}
+    limit = period_limit.get(period, 65)
     try:
-        raw = yf.download(
-            tickers=yf_symbols,
-            period=period,
-            interval="1d",
-            auto_adjust=True,
-            group_by="column",
-            progress=False,
-            threads=True,
-        )
+        close_df = _fmp_batch_to_close_df(clean, limit=limit)
+        if close_df is None or close_df.empty:
+            return pd.DataFrame({t: pd.Series(dtype=float) for t in clean})
+        for t in clean:
+            if t not in close_df.columns:
+                close_df[t] = np.nan
+        return close_df[clean]
     except Exception:
-        _notify_yfinance_fetch_failed()
         return pd.DataFrame({t: pd.Series(dtype=float) for t in clean})
-    close_df = get_close_prices_from_download(raw)
-    if close_df is None or close_df.empty:
-        # 다운로드 실패 — 빈 데이터로라도 컬럼은 보존해 호출부가 N/A 처리할 수 있게 한다
-        return pd.DataFrame({t: pd.Series(dtype=float) for t in clean})
-    if len(yf_symbols) == 1 and "SINGLE" in close_df.columns:
-        close_df = close_df.rename(columns={"SINGLE": yf_symbols[0]})
-    # 야후 심볼 컬럼을 사용자 라벨로 되돌리기
-    rename_back = {yf_t: user_t for yf_t, user_t in yf_to_user.items() if yf_t in close_df.columns}
-    if rename_back:
-        close_df = close_df.rename(columns=rename_back)
-    # 누락된 사용자 라벨 컬럼은 NaN으로 보존
-    for t in clean:
-        if t not in close_df.columns:
-            close_df[t] = np.nan
-    return close_df[clean]
 
 
 def _factcheck_return_over_window(series, latest_offset: int, base_offset: int):
@@ -7341,35 +7181,17 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
 
     with st.spinner("가격/거래량 데이터 다운로드 중..."):
         try:
-            raw = yf.download(
-                tickers=tickers,
-                period="6mo",
-                interval="1d",
-                auto_adjust=False,
-                group_by="column",
-                progress=False,
-                threads=True,
-            )
-            spy_hist = yf.Ticker("SPY").history(period="6mo", auto_adjust=False)
+            batch = _fmp_batch_price_history(tickers + ["SPY"], limit=130)
+            close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch.items() if "Close" in df.columns}).sort_index()
+            volume_df = pd.DataFrame({tk: df["Volume"] for tk, df in batch.items() if "Volume" in df.columns}).sort_index()
+            spy_hist = batch.get("SPY", pd.DataFrame())
         except Exception:
-            _notify_yfinance_fetch_failed()
-            raw = pd.DataFrame()
+            close_df = pd.DataFrame()
+            volume_df = pd.DataFrame()
             spy_hist = pd.DataFrame()
 
-    close_df = get_close_prices_from_download(raw)
-    if len(tickers) == 1 and "SINGLE" in close_df.columns:
-        close_df.columns = [tickers[0]]
-
-    volume_df = pd.DataFrame()
-    if raw is not None and not raw.empty:
-        if isinstance(raw.columns, pd.MultiIndex):
-            if "Volume" in raw.columns.get_level_values(0):
-                volume_df = raw["Volume"].copy()
-        elif "Volume" in raw.columns:
-            volume_df = raw[["Volume"]].copy()
-            volume_df.columns = ["SINGLE"]
-    if len(tickers) == 1 and "SINGLE" in volume_df.columns:
-        volume_df.columns = [tickers[0]]
+    if len(tickers) == 1 and close_df.columns.tolist() == list(batch.keys())[:1]:
+        pass  # FMP batch already uses ticker as column name
 
     spy_3m = calculate_period_return(spy_hist["Close"], 63) if "Close" in spy_hist.columns else np.nan
     spy_3m = to_float(spy_3m)
@@ -7389,14 +7211,9 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
         m3_ret = calculate_period_return(close_series, 63)
         rs_raw = to_float(m3_ret) - to_float(spy_3m)
 
-        info = {}
-        try:
-            info = yf.Ticker(ticker).info or {}
-        except Exception:
-            _notify_yfinance_fetch_failed()
-            info = {}
+        info = _fmp_fill({}, ticker)
 
-        revenue_growth = to_float(info.get("revenueGrowth"))
+        revenue_growth = to_float(info.get("revenueGrowth") or info.get("earningsGrowth"))
         trailing_eps = to_float(info.get("trailingEps"))
         forward_pe = to_float(info.get("forwardPE"))
         long_name = str(info.get("longName") or info.get("shortName") or ticker).strip()
@@ -7500,33 +7317,12 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
 
     with st.spinner("Emerging: 가격·거래량 데이터 다운로드 중..."):
         try:
-            raw = yf.download(
-                tickers=tickers,
-                period="6mo",
-                interval="1d",
-                auto_adjust=False,
-                group_by="column",
-                progress=False,
-                threads=True,
-            )
+            batch_em = _fmp_batch_price_history(tickers, limit=130)
+            close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch_em.items() if "Close" in df.columns}).sort_index()
+            volume_df = pd.DataFrame({tk: df["Volume"] for tk, df in batch_em.items() if "Volume" in df.columns}).sort_index()
         except Exception:
-            _notify_yfinance_fetch_failed()
-            raw = pd.DataFrame()
-
-    close_df = get_close_prices_from_download(raw)
-    if len(tickers) == 1 and "SINGLE" in close_df.columns:
-        close_df.columns = [tickers[0]]
-
-    volume_df = pd.DataFrame()
-    if raw is not None and not raw.empty:
-        if isinstance(raw.columns, pd.MultiIndex):
-            if "Volume" in raw.columns.get_level_values(0):
-                volume_df = raw["Volume"].copy()
-        elif "Volume" in raw.columns:
-            volume_df = raw[["Volume"]].copy()
-            volume_df.columns = ["SINGLE"]
-    if len(tickers) == 1 and "SINGLE" in volume_df.columns:
-        volume_df.columns = [tickers[0]]
+            close_df = pd.DataFrame()
+            volume_df = pd.DataFrame()
 
     with st.spinner("Emerging Gemini 내러티브 배치 평가 중 (티커 청크별, gemini-2.5-flash)..."):
         narrative_map_em = batch_narrative_emerging_second_order_scores(tickers, narrative_text)
@@ -7598,12 +7394,7 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
         else:
             over_raw = np.nan
 
-        info = {}
-        try:
-            info = yf.Ticker(ticker).info or {}
-        except Exception:
-            _notify_yfinance_fetch_failed()
-            info = {}
+        info = _fmp_fill({}, ticker)
 
         eg = to_float(info.get("earningsGrowth"))
         if pd.isna(eg):
@@ -7989,19 +7780,11 @@ def compute_quantitative_sector_leaders(top_n: int = 30) -> dict:
 
         # 전체 유니버스 + SPY 가격 다운로드
         all_tickers = list(dict.fromkeys(universe + [spy_ticker] + sector_etfs))
-        all_tuple = tuple(sorted(set(all_tickers)))
 
         try:
-            raw = yf.download(
-                list(all_tuple), period="1y", interval="1d",
-                auto_adjust=True, progress=False, threads=True
-            )
-            if isinstance(raw.columns, pd.MultiIndex):
-                closes = raw["Close"] if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
-                volumes = raw["Volume"] if "Volume" in raw.columns.get_level_values(0) else pd.DataFrame()
-            else:
-                closes = raw
-                volumes = pd.DataFrame()
+            batch_ql = _fmp_batch_price_history(all_tickers, limit=252)
+            closes = pd.DataFrame({tk: df["Close"] for tk, df in batch_ql.items() if "Close" in df.columns}).sort_index()
+            volumes = pd.DataFrame({tk: df["Volume"] for tk, df in batch_ql.items() if "Volume" in df.columns}).sort_index()
         except Exception:
             return {"leaders": [], "top_sectors": [], "summary_text": ""}
 
@@ -8633,7 +8416,7 @@ if st.session_state.get("logged_in"):
                 _rsi_map, _ma200_map = {}, {}
                 for _tk in _wl_tickers:
                     try:
-                        _hist = yf.Ticker(_tk).history(period="1y", auto_adjust=False)
+                        _hist = _fmp_price_history(_tk, limit=252)
                         _close = pd.to_numeric(_hist["Close"], errors="coerce").dropna() if not _hist.empty else pd.Series(dtype=float)
                         _rsi_map[_tk] = float(calculate_rsi(_close).dropna().iloc[-1]) if not calculate_rsi(_close).dropna().empty else np.nan
                         _ma200_map[_tk] = float(_close.rolling(200, min_periods=200).mean().iloc[-1]) if len(_close) >= 200 else np.nan
@@ -8976,8 +8759,8 @@ if st.session_state.get("logged_in"):
 
                 # 현재 벤치마크 ETF 종가 가져오기
                 try:
-                    _spy_hist = yf.download(_bench_etf, period="2d", progress=False, auto_adjust=True)
-                    _spy_close = float(_spy_hist["Close"].iloc[-1]) if _spy_hist is not None and not _spy_hist.empty else np.nan
+                    _spy_df = _fmp_price_history(_bench_etf, limit=3)
+                    _spy_close = float(_spy_df["Close"].iloc[-1]) if _spy_df is not None and not _spy_df.empty else np.nan
                 except Exception:
                     _spy_close = np.nan
 
@@ -13422,7 +13205,7 @@ if st.session_state.get("logged_in"):
                 rsi_map_wl, ma200_map_wl = {}, {}
                 for tk in wl_tickers:
                     try:
-                        hist = yf.Ticker(tk).history(period="1y", auto_adjust=False)
+                        hist = _fmp_price_history(tk, limit=252)
                         close = pd.to_numeric(hist["Close"], errors="coerce").dropna() if not hist.empty else pd.Series(dtype=float)
                         rsi_series = calculate_rsi(close).dropna()
                         rsi_map_wl[tk] = float(rsi_series.iloc[-1]) if not rsi_series.empty else np.nan
