@@ -2976,85 +2976,65 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                 v = to_float(p.get("dcf"))
                 if pd.notna(v) and v > 0: info["_fmp_dcf"] = v
 
-    # ── key-metrics-ttm: EV/Sales, EV/FCF (항상 시도) ───────────────
-    # yfinance가 제공하지 않는 지표 → FMP에서 항상 가져옴
+    # ── key-metrics-ttm: EV/Sales, EV/FCF, ROE (실제 확인 필드) ────────
     if not info.get("_fmp_ev_to_sales") or not info.get("_fmp_ev_to_fcf"):
         km = _fmp_key_metrics(ticker)
         if km:
             if not info.get("_fmp_ev_to_sales"):
                 v = to_float(km.get("evToSalesTTM"))
-                if pd.notna(v) and v > 0:
-                    info["_fmp_ev_to_sales"] = v
+                if pd.notna(v) and v > 0: info["_fmp_ev_to_sales"] = v
             if not info.get("_fmp_ev_to_fcf"):
                 v = to_float(km.get("evToFreeCashFlowTTM"))
-                if pd.notna(v) and v > 0:
-                    info["_fmp_ev_to_fcf"] = v
-            if not info.get("_fmp_ev_to_ocf"):
-                v = to_float(km.get("evToOperatingCashFlowTTM"))
-                if pd.notna(v) and v > 0:
-                    info["_fmp_ev_to_ocf"] = v
+                if pd.notna(v) and v > 0: info["_fmp_ev_to_fcf"] = v
             if not info.get("marketCap"):
                 v = to_float(km.get("marketCapTTM"))
-                if pd.notna(v) and v > 0:
-                    info["marketCap"] = v
+                if pd.notna(v) and v > 0: info["marketCap"] = v
+            if not info.get("returnOnEquity"):
+                v = to_float(km.get("returnOnEquityTTM"))
+                if pd.notna(v): info["returnOnEquity"] = v
 
-    # ── key-metrics-ttm: P/E, P/B, EV/EBITDA, PEG, EPS (항상 시도) ─────
-    _need_km = not all([info.get("trailingPE"), info.get("priceToBook"),
-                        info.get("enterpriseToEbitda"), info.get("trailingEps")])
-    if _need_km:
-        km = _fmp_key_metrics(ticker)
-        if km:
-            if not info.get("trailingPE"):
-                v = to_float(km.get("peRatioTTM") or km.get("priceEarningsRatioTTM") or km.get("peRatio"))
-                if pd.notna(v) and v > 0: info["trailingPE"] = v
-            if not info.get("forwardPE"):
-                v = to_float(km.get("forwardPERatioTTM") or km.get("forwardPE") or km.get("forwardPriceToEarningsTTM"))
-                if pd.notna(v) and v > 0: info["forwardPE"] = v
-            if not info.get("priceToBook"):
-                v = to_float(km.get("pbRatioTTM") or km.get("priceToBookRatioTTM") or km.get("priceToBook"))
-                if pd.notna(v): info["priceToBook"] = v
-            if not info.get("enterpriseToEbitda"):
-                v = to_float(km.get("evToEbitdaTTM") or km.get("enterpriseValueOverEBITDATTM") or km.get("evEbitda"))
-                if pd.notna(v): info["enterpriseToEbitda"] = v
-            if not info.get("pegRatio"):
-                v = to_float(km.get("pegRatioTTM") or km.get("priceEarningsToGrowthRatioTTM"))
-                if pd.notna(v): info["pegRatio"] = v
-            if not info.get("trailingEps"):
-                v = to_float(km.get("netIncomePerShareTTM") or km.get("epsttm") or km.get("epsTTM"))
-                if pd.notna(v): info["trailingEps"] = v
-            if not info.get("revenueGrowth"):
-                v = to_float(km.get("revenueGrowthTTM") or km.get("revenueGrowth"))
-                if pd.notna(v): info["revenueGrowth"] = v
-            if not info.get("forwardPE"):
-                v = to_float(km.get("forwardPERatioTTM"))
-                if pd.notna(v) and v > 0: info["forwardPE"] = v
-
-    # ── ratios-ttm ────────────────────────────────────────────────────
-    _need_ratios = not info.get("operatingMargins")
+    # ── ratios-ttm: 실제 API 응답에서 확인된 정확한 필드명 ────────────
+    _need_ratios = not all([info.get("trailingPE"), info.get("priceToBook"),
+                            info.get("debtToEquity"), info.get("operatingMargins")])
     if _need_ratios:
         rat = _fmp_ratios(ticker)
         if rat:
+            if not info.get("trailingPE"):
+                v = to_float(rat.get("priceToEarningsRatioTTM"))
+                if pd.notna(v) and v > 0: info["trailingPE"] = v
+            if not info.get("forwardPE"):
+                v = to_float(rat.get("forwardPriceToEarningsGrowthRatioTTM"))
+                if pd.notna(v) and v > 0: info["forwardPE"] = v
+            if not info.get("priceToBook"):
+                v = to_float(rat.get("priceToBookRatioTTM"))
+                if pd.notna(v) and v > 0: info["priceToBook"] = v
+            if not info.get("enterpriseToEbitda"):
+                v = to_float(rat.get("enterpriseValueMultipleTTM"))
+                if pd.notna(v) and v > 0: info["enterpriseToEbitda"] = v
+            if not info.get("pegRatio"):
+                v = to_float(rat.get("priceToEarningsGrowthRatioTTM"))
+                if pd.notna(v): info["pegRatio"] = v
+            if not info.get("debtToEquity"):
+                v = to_float(rat.get("debtToEquityRatioTTM"))
+                if pd.notna(v): info["debtToEquity"] = v
             if not info.get("operatingMargins"):
-                v = to_float(rat.get("operatingProfitMarginTTM") or rat.get("operatingProfitMargin") or rat.get("operatingMarginTTM"))
+                v = to_float(rat.get("operatingProfitMarginTTM"))
                 if pd.notna(v): info["operatingMargins"] = v
             if not info.get("grossMargins"):
-                v = to_float(rat.get("grossProfitMarginTTM") or rat.get("grossProfitMargin") or rat.get("grossMarginTTM"))
+                v = to_float(rat.get("grossProfitMarginTTM"))
                 if pd.notna(v): info["grossMargins"] = v
-            if not info.get("returnOnEquity"):
-                v = to_float(rat.get("returnOnEquityTTM") or rat.get("roe") or rat.get("returnOnEquity"))
-                if pd.notna(v): info["returnOnEquity"] = v
-            if not info.get("debtToEquity"):
-                v = to_float(rat.get("debtEquityRatioTTM") or rat.get("debtToEquityRatioTTM") or rat.get("debtToEquity") or rat.get("debtEquityRatio"))
-                if pd.notna(v): info["debtToEquity"] = v
-            if not info.get("trailingPE"):
-                v = to_float(rat.get("peRatioTTM") or rat.get("priceEarningsRatioTTM"))
-                if pd.notna(v) and v > 0: info["trailingPE"] = v
-            if not info.get("priceToBook"):
-                v = to_float(rat.get("priceToBookRatioTTM") or rat.get("pbRatioTTM"))
-                if pd.notna(v): info["priceToBook"] = v
             if not info.get("netMargins"):
-                v = to_float(rat.get("netProfitMarginTTM") or rat.get("netProfitMargin"))
+                v = to_float(rat.get("netProfitMarginTTM"))
                 if pd.notna(v): info["netMargins"] = v
+            if not info.get("_fmp_ev_to_sales"):
+                v = to_float(rat.get("priceToSalesRatioTTM"))
+                if pd.notna(v) and v > 0: info["_fmp_ev_to_sales"] = v
+            if not info.get("returnOnEquity"):
+                v = to_float(rat.get("returnOnEquityTTM"))
+                if pd.notna(v): info["returnOnEquity"] = v
+            if not info.get("trailingEps"):
+                v = to_float(rat.get("netIncomePerEBTTTM"))
+                if pd.notna(v): info["trailingEps"] = v
 
     # ── income-statement + balance-sheet: ROE·D/E 직접 계산 ─────────
     _need_calc = not all([info.get("returnOnEquity"), info.get("debtToEquity")])
@@ -11197,7 +11177,7 @@ if st.session_state.get("logged_in"):
                     inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
 
                 if inst_df.empty:
-                    st.info("기관 보유 데이터를 가져오지 못했습니다. (FMP Starter 플랜 데이터 제공 범위 확인 필요)")
+                    st.info("기관 보유 데이터를 가져오지 못했습니다. (FMP Starter 플랜에서 미제공 — Premium 이상 필요)")
                 else:
                     inst_df.columns = [str(c).strip() for c in inst_df.columns]
                     pct_col = next((c for c in inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
@@ -11234,46 +11214,9 @@ if st.session_state.get("logged_in"):
 
                 _sp_val = short_data.get('short_pct')
                 if _sp_val is not None and pd.notna(_sp_val) and float(_sp_val) >= 15:
-                    st.warning(f"⚠️ 공매도 비율 {float(_sp_val):.1f}% — 높은 수준. 급등 시 Short Squeeze로 추가 상승 가능. 단, 하락 베팅이 많다는 의미이기도 해요.")
-                # 디버그: stable API 응답 원문 확인 (임시)
+                    st.warning(f"⚠️ 공매도 비율 {float(_sp_val):.1f}% — 높은 수준.")
                 if _sp is None:
-                    with st.expander("🔧 데이터 확인 (임시)", expanded=False):
-                        k_debug = _fmp_key()
-                        if k_debug:
-                            _tk_debug = str(selected_ticker).strip().upper()
-                            try:
-                                # stable/short-interest
-                                r1 = requests.get(f"{_FMP_BASE}/short-interest?symbol={_tk_debug}&apikey={k_debug}", timeout=5)
-                                st.write(f"stable/short-interest 상태: {r1.status_code}")
-                                if r1.status_code == 200:
-                                    st.write(r1.json())
-                                else:
-                                    st.write(r1.text[:300])
-                                # stable/institutional-ownership
-                                r2 = requests.get(f"{_FMP_BASE}/institutional-ownership?symbol={_tk_debug}&apikey={k_debug}", timeout=5)
-                                st.write(f"stable/institutional-ownership 상태: {r2.status_code}")
-                                if r2.status_code == 200:
-                                    st.write(r2.json()[:3] if isinstance(r2.json(), list) else r2.json())
-                                else:
-                                    st.write(r2.text[:300])
-                                # stable/key-metrics-ttm (Valuation 확인용)
-                                r3 = requests.get(f"{_FMP_BASE}/key-metrics-ttm?symbol={_tk_debug}&apikey={k_debug}", timeout=5)
-                                st.write(f"stable/key-metrics-ttm 상태: {r3.status_code}")
-                                if r3.status_code == 200:
-                                    d3 = r3.json()
-                                    st.write(d3[0] if isinstance(d3, list) and d3 else d3)
-                                else:
-                                    st.write(r3.text[:300])
-                                # stable/ratios-ttm
-                                r4 = requests.get(f"{_FMP_BASE}/ratios-ttm?symbol={_tk_debug}&apikey={k_debug}", timeout=5)
-                                st.write(f"stable/ratios-ttm 상태: {r4.status_code}")
-                                if r4.status_code == 200:
-                                    d4 = r4.json()
-                                    st.write(d4[0] if isinstance(d4, list) and d4 else d4)
-                                else:
-                                    st.write(r4.text[:300])
-                            except Exception as _de:
-                                st.write(f"디버그 오류: {_de}")
+                    st.caption("※ FMP Starter 플랜에서 Short Interest 미제공 (Premium 이상 필요)")
             except Exception as _si_e:
                 st.warning(f"공매도 데이터 로드 오류: {_si_e}")
 
