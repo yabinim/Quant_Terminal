@@ -1381,6 +1381,7 @@ def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
     k = _fmp_key()
     results = []
     now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
     for tk in tickers:
         try:
             if k:
@@ -1390,23 +1391,28 @@ def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
                 )
                 data = r.json() if r.status_code == 200 else []
                 if isinstance(data, list) and data:
+                    # 날짜 기준 정렬 (오름차순) 후 오늘 이후 첫 번째 항목
+                    future_items = []
                     for item in data:
                         date_str = str(item.get("date") or "")[:10]
-                        if not date_str:
+                        if not date_str or len(date_str) < 10:
                             continue
                         try:
-                            earnings_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                            days_until = (earnings_dt.date() - now_utc.date()).days
-                            if days_until >= -1:
-                                results.append({
-                                    "ticker": tk,
-                                    "earnings_date": date_str,
-                                    "days_until": days_until,
-                                    "eps_estimate": to_float(item.get("epsEstimated")),
-                                })
-                                break
+                            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                            days_until = (dt - today).days
+                            if days_until >= 0:  # 오늘 포함 미래만
+                                future_items.append((days_until, date_str, item))
                         except Exception:
                             continue
+                    if future_items:
+                        future_items.sort(key=lambda x: x[0])
+                        days_until, date_str, item = future_items[0]
+                        results.append({
+                            "ticker": tk,
+                            "earnings_date": date_str,
+                            "days_until": days_until,
+                            "eps_estimate": to_float(item.get("epsEstimated")),
+                        })
         except Exception:
             continue
     results.sort(key=lambda x: x["days_until"])
@@ -2156,27 +2162,33 @@ def cached_evaluate_kpis_snapshot(ticker_upper: str):
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
-    """분기별 EPS 히스토리 — FMP earnings-surprises + earnings-calendar 사용."""
+    """분기별 EPS 히스토리 — FMP income-statement(quarter) + earnings-surprises 사용."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
-    # 방법 1: earnings-surprises (실적 발표 기록)
+
+    # 방법 1: earnings-surprises (과거 실적 발표 기록, 가장 정확)
     try:
         r = requests.get(
             f"{_FMP_BASE}/earnings-surprises?symbol={ticker_upper}&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         data = r.json() if r.status_code == 200 else []
-        if isinstance(data, list) and data:
+        if isinstance(data, list) and len(data) >= 2:
             rows = []
             for item in data[:8]:
                 date_str = str(item.get("date") or item.get("fiscalDateEnding") or "")[:10]
-                eps_actual = to_float(item.get("actualEarningResult") or item.get("eps") or item.get("actualEPS"))
-                eps_est = to_float(item.get("estimatedEarning") or item.get("epsEstimated") or item.get("estimatedEPS"))
-                if not date_str:
+                eps_actual = to_float(
+                    item.get("actualEarningResult") or item.get("actualEPS") or item.get("eps")
+                )
+                eps_est = to_float(
+                    item.get("estimatedEarning") or item.get("estimatedEPS") or item.get("epsEstimated")
+                )
+                if not date_str or date_str == str(datetime.now().date()):
                     continue
-                surprise = f"{((eps_actual - eps_est) / abs(eps_est) * 100):+.1f}%" \
-                    if pd.notna(eps_actual) and pd.notna(eps_est) and eps_est != 0 else "N/A"
+                surprise = "N/A"
+                if pd.notna(eps_actual) and pd.notna(eps_est) and eps_est != 0:
+                    surprise = f"{((eps_actual - eps_est) / abs(eps_est) * 100):+.1f}%"
                 rows.append({
                     "분기": date_str,
                     "EPS 실제": f"${eps_actual:.3f}" if pd.notna(eps_actual) else "N/A",
@@ -2187,32 +2199,34 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
                 return pd.DataFrame(rows)
     except Exception:
         pass
-    # 방법 2: earnings-calendar (미래 포함)
+
+    # 방법 2: quarterly income-statement에서 직접 EPS 계산
     try:
         r = requests.get(
-            f"{_FMP_BASE}/earnings-calendar?symbol={ticker_upper}&apikey={k}",
+            f"{_FMP_BASE}/income-statement?symbol={ticker_upper}&period=quarter&limit=8&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         data = r.json() if r.status_code == 200 else []
         if isinstance(data, list) and data:
             rows = []
             for item in data[:8]:
-                date_str = str(item.get("date") or "")[:10]
-                eps_actual = to_float(item.get("eps") or item.get("epsActual"))
-                eps_est = to_float(item.get("epsEstimated") or item.get("revenueEstimated"))
+                date_str = str(item.get("date") or item.get("period") or "")[:10]
+                eps = to_float(item.get("eps") or item.get("epsdiluted"))
+                revenue = to_float(item.get("revenue"))
+                net_income = to_float(item.get("netIncome"))
                 if not date_str:
                     continue
                 rows.append({
                     "분기": date_str,
-                    "EPS 실제": f"${eps_actual:.3f}" if pd.notna(eps_actual) else "N/A",
-                    "EPS 예상": f"${eps_est:.3f}" if pd.notna(eps_est) else "N/A",
-                    "어닝 서프라이즈": f"{((eps_actual - eps_est) / abs(eps_est) * 100):+.1f}%"
-                        if pd.notna(eps_actual) and pd.notna(eps_est) and eps_est != 0 else "N/A",
+                    "EPS 실제": f"${eps:.3f}" if pd.notna(eps) else "N/A",
+                    "매출": f"${revenue/1e9:.2f}B" if pd.notna(revenue) else "N/A",
+                    "순이익": f"${net_income/1e9:.2f}B" if pd.notna(net_income) else "N/A",
                 })
             if rows:
                 return pd.DataFrame(rows)
     except Exception:
         pass
+
     return pd.DataFrame()
 
 
@@ -2982,54 +2996,76 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                 v = to_float(km.get("forwardPERatioTTM"))
                 if pd.notna(v) and v > 0: info["forwardPE"] = v
 
-    # ── ratios-ttm: 진단으로 확인된 실제 제공 필드만 ─────────────────
-    # ✅ operatingProfitMarginTTM
-    # ❌ returnOnEquityTTM, debtToEquityTTM (TSLA 기준 null 확인)
-    # → income-statement로 직접 계산하는 방식으로 대체
+    # ── ratios-ttm ────────────────────────────────────────────────────
     _need_ratios = not info.get("operatingMargins")
     if _need_ratios:
         rat = _fmp_ratios(ticker)
         if rat:
             if not info.get("operatingMargins"):
                 v = to_float(rat.get("operatingProfitMarginTTM"))
-                if pd.notna(v):
-                    info["operatingMargins"] = v
-            # grossProfitMarginTTM, netProfitMarginTTM 등도 시도
+                if pd.notna(v): info["operatingMargins"] = v
             if not info.get("grossMargins"):
                 v = to_float(rat.get("grossProfitMarginTTM"))
-                if pd.notna(v):
-                    info["grossMargins"] = v
+                if pd.notna(v): info["grossMargins"] = v
+            # ROE, D/E ratios-ttm에서 시도
+            if not info.get("returnOnEquity"):
+                v = to_float(rat.get("returnOnEquityTTM") or rat.get("roe"))
+                if pd.notna(v): info["returnOnEquity"] = v
+            if not info.get("debtToEquity"):
+                v = to_float(rat.get("debtEquityRatioTTM") or rat.get("debtToEquity"))
+                if pd.notna(v): info["debtToEquity"] = v
+            if not info.get("trailingPE"):
+                v = to_float(rat.get("peRatioTTM"))
+                if pd.notna(v) and v > 0: info["trailingPE"] = v
+            if not info.get("priceToBook"):
+                v = to_float(rat.get("priceToBookRatioTTM") or rat.get("pbRatioTTM"))
+                if pd.notna(v): info["priceToBook"] = v
 
-    # ── income-statement: ROE·D/E를 직접 계산 ────────────────────────
-    # ✅ revenue, operatingIncome 확인 / ❌ epsdiluted null
-    _need_inc = not all([info.get("returnOnEquity"), info.get("debtToEquity")])
-    if _need_inc:
+    # ── income-statement + balance-sheet: ROE·D/E 직접 계산 ─────────
+    _need_calc = not all([info.get("returnOnEquity"), info.get("debtToEquity")])
+    if _need_calc:
         inc = _fmp_income(ticker)
         latest = inc.get("latest", {})
         prev   = inc.get("prev", {})
         if latest:
-            # Operating Margin 직접 계산 (ratios-ttm 보완)
             if not info.get("operatingMargins"):
                 _rev = to_float(latest.get("revenue"))
                 _oi  = to_float(latest.get("operatingIncome"))
                 if pd.notna(_rev) and _rev != 0 and pd.notna(_oi):
                     info["operatingMargins"] = float(_oi / _rev)
-            # EPS (diluted) — income-statement에서 직접
             if not info.get("trailingEps"):
                 _eps = to_float(latest.get("epsdiluted") or latest.get("eps"))
-                if pd.notna(_eps):
-                    info["trailingEps"] = _eps
-            # Revenue Growth YoY → earningsGrowth 대체
+                if pd.notna(_eps): info["trailingEps"] = _eps
             if not info.get("earningsGrowth") and prev:
                 _rev_now  = to_float(latest.get("revenue"))
                 _rev_prev = to_float(prev.get("revenue"))
                 if pd.notna(_rev_now) and pd.notna(_rev_prev) and _rev_prev != 0:
                     info["earningsGrowth"] = float((_rev_now - _rev_prev) / abs(_rev_prev))
-            # Net Income → ROE 계산용 저장 (balance_sheet 없으면 근사)
-            if not info.get("_fmp_net_income"):
-                _ni = to_float(latest.get("netIncome"))
-                if pd.notna(_ni):
-                    info["_fmp_net_income"] = _ni
+            _ni = to_float(latest.get("netIncome"))
+            if pd.notna(_ni): info["_fmp_net_income"] = _ni
+
+        # balance-sheet에서 직접 ROE, D/E 계산
+        try:
+            k_val = _fmp_key()
+            if k_val and (not info.get("returnOnEquity") or not info.get("debtToEquity")):
+                rb = requests.get(
+                    f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit=2&apikey={k_val}",
+                    timeout=_FMP_TIMEOUT
+                )
+                bs_data = rb.json() if rb.status_code == 200 else []
+                if isinstance(bs_data, list) and bs_data:
+                    bs = bs_data[0]
+                    equity = to_float(bs.get("totalStockholdersEquity") or bs.get("stockholdersEquity"))
+                    total_debt = to_float(bs.get("totalDebt") or bs.get("longTermDebt"))
+                    net_income = to_float(latest.get("netIncome")) if latest else np.nan
+                    # ROE = Net Income / Equity
+                    if not info.get("returnOnEquity") and pd.notna(net_income) and pd.notna(equity) and equity != 0:
+                        info["returnOnEquity"] = float(net_income / equity)
+                    # D/E = Total Debt / Equity
+                    if not info.get("debtToEquity") and pd.notna(total_debt) and pd.notna(equity) and equity != 0:
+                        info["debtToEquity"] = float(total_debt / equity)
+        except Exception:
+            pass
 
     return info
 
@@ -3063,18 +3099,20 @@ def fetch_company_overview(ticker_upper: str) -> dict:
                     timeout=_FMP_TIMEOUT
                 )
                 cal = r.json() if r.status_code == 200 else []
-                now_utc = datetime.now(timezone.utc)
+                today = datetime.now(timezone.utc).date()
+                future_dates = []
                 for item in (cal if isinstance(cal, list) else []):
                     date_str = str(item.get("date") or "")[:10]
-                    if not date_str:
+                    if not date_str or len(date_str) < 10:
                         continue
                     try:
-                        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                        if dt.date() >= now_utc.date():
-                            next_earnings = date_str
-                            break
+                        dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        if dt >= today:
+                            future_dates.append(date_str)
                     except Exception:
                         continue
+                if future_dates:
+                    next_earnings = sorted(future_dates)[0]
             except Exception:
                 pass
         if not next_earnings:
@@ -3097,13 +3135,34 @@ def fetch_company_overview(ticker_upper: str) -> dict:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_price_history_by_period(ticker_upper: str, period: str) -> pd.DataFrame:
-    """기간별 주가 히스토리 — FMP historical-price-eod 사용."""
+    """기간별 주가 히스토리 — FMP historical-price-eod 사용. (ticker+period 조합으로 캐시)"""
     period_limit_map = {
-        "1D": 2, "1M": 30, "3M": 90,
-        "YTD": 365, "1Y": 252, "5Y": 1260, "MAX": 5000,
+        "1D": 2,
+        "1M": 22,
+        "3M": 66,
+        "YTD": 252,
+        "1Y": 252,
+        "5Y": 1260,
+        "MAX": 5000,
     }
     limit = period_limit_map.get(period, 252)
-    return _fmp_price_history(ticker_upper, limit=limit)
+    # 캐시 키에 period가 포함되도록 ticker_upper에 suffix 추가
+    _cache_key = f"{ticker_upper}__{period}"  # noqa: 캐시 구분용
+    df = _fmp_price_history(ticker_upper, limit=limit)
+    if df.empty:
+        return df
+    # 1M, 3M은 limit으로 자름
+    if period == "1M":
+        df = df.tail(22)
+    elif period == "3M":
+        df = df.tail(66)
+    elif period == "1D":
+        df = df.tail(2)
+    # YTD: 올해 1월 1일 이후만
+    elif period == "YTD":
+        ytd_start = pd.Timestamp(f"{datetime.now().year}-01-01")
+        df = df[df.index >= ytd_start]
+    return df
 
 
 def calculate_macd(close_series: pd.Series, fast=12, slow=26, signal=9):
@@ -11124,15 +11183,20 @@ if st.session_state.get("logged_in"):
 
                 si_c1, si_c2, si_c3 = st.columns(3)
                 with si_c1:
-                    st.metric("공매도 비율 (Float)", f"{short_data['short_pct']:.1f}%" if short_data['short_pct'] else "N/A")
+                    _sp = short_data.get('short_pct')
+                    st.metric("공매도 비율 (Float)",
+                              f"{float(_sp):.1f}%" if _sp is not None and pd.notna(_sp) else "N/A")
                 with si_c2:
-                    st.metric("Days to Cover", f"{short_data['days_to_cover']:.1f}일" if short_data['days_to_cover'] else "N/A",
+                    _dc = short_data.get('days_to_cover')
+                    st.metric("Days to Cover",
+                              f"{float(_dc):.1f}일" if _dc is not None and pd.notna(_dc) else "N/A",
                               help="현재 공매도 포지션을 청산하는 데 걸리는 평균 거래일")
                 with si_c3:
-                    st.metric("Short Squeeze 위험", short_data['squeeze_risk'])
+                    st.metric("Short Squeeze 위험", short_data.get('squeeze_risk', 'N/A'))
 
-                if short_data['short_pct'] and short_data['short_pct'] >= 15:
-                    st.warning(f"⚠️ 공매도 비율 {short_data['short_pct']:.1f}% — 높은 수준. 급등 시 Short Squeeze로 추가 상승 가능. 단, 하락 베팅이 많다는 의미이기도 해요.")
+                _sp_val = short_data.get('short_pct')
+                if _sp_val is not None and pd.notna(_sp_val) and float(_sp_val) >= 15:
+                    st.warning(f"⚠️ 공매도 비율 {float(_sp_val):.1f}% — 높은 수준. 급등 시 Short Squeeze로 추가 상승 가능. 단, 하락 베팅이 많다는 의미이기도 해요.")
             except Exception as _si_e:
                 st.warning(f"공매도 데이터 로드 오류: {_si_e}")
 
