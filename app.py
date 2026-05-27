@@ -1377,42 +1377,44 @@ def fetch_dxy_latest_and_mean_deviation():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
-    """보유 종목의 다음 실적 발표일 — FMP earnings-calendar 사용."""
+    """보유 종목의 다음 실적 발표일 — FMP earnings-calendar (날짜 범위 파라미터 사용)."""
     k = _fmp_key()
     results = []
-    now_utc = datetime.now(timezone.utc)
-    today = now_utc.date()
+    today = datetime.now(timezone.utc).date()
+    # 오늘부터 6개월 후까지 범위로 요청
+    from_str = today.strftime("%Y-%m-%d")
+    to_str = (today + timedelta(days=180)).strftime("%Y-%m-%d")
     for tk in tickers:
         try:
-            if k:
-                r = requests.get(
-                    f"{_FMP_BASE}/earnings-calendar?symbol={tk}&apikey={k}",
-                    timeout=_FMP_TIMEOUT
-                )
-                data = r.json() if r.status_code == 200 else []
-                if isinstance(data, list) and data:
-                    # 날짜 기준 정렬 (오름차순) 후 오늘 이후 첫 번째 항목
-                    future_items = []
-                    for item in data:
-                        date_str = str(item.get("date") or "")[:10]
-                        if not date_str or len(date_str) < 10:
-                            continue
-                        try:
-                            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-                            days_until = (dt - today).days
-                            if days_until >= 0:  # 오늘 포함 미래만
-                                future_items.append((days_until, date_str, item))
-                        except Exception:
-                            continue
-                    if future_items:
-                        future_items.sort(key=lambda x: x[0])
-                        days_until, date_str, item = future_items[0]
-                        results.append({
-                            "ticker": tk,
-                            "earnings_date": date_str,
-                            "days_until": days_until,
-                            "eps_estimate": to_float(item.get("epsEstimated")),
-                        })
+            if not k:
+                continue
+            r = requests.get(
+                f"{_FMP_BASE}/earnings-calendar?symbol={tk}&from={from_str}&to={to_str}&apikey={k}",
+                timeout=_FMP_TIMEOUT
+            )
+            data = r.json() if r.status_code == 200 else []
+            if isinstance(data, list) and data:
+                # 날짜 오름차순 정렬 후 첫 번째
+                dated = []
+                for item in data:
+                    date_str = str(item.get("date") or "")[:10]
+                    if not date_str or len(date_str) < 10:
+                        continue
+                    try:
+                        dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        dated.append((dt, date_str, item))
+                    except Exception:
+                        continue
+                if dated:
+                    dated.sort(key=lambda x: x[0])
+                    dt, date_str, item = dated[0]
+                    days_until = (dt - today).days
+                    results.append({
+                        "ticker": tk,
+                        "earnings_date": date_str,
+                        "days_until": days_until,
+                        "eps_estimate": to_float(item.get("epsEstimated")),
+                    })
         except Exception:
             continue
     results.sort(key=lambda x: x["days_until"])
@@ -2233,30 +2235,64 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
-    """공매도 추이 (FINRA) — 기관보유 대용으로 표시."""
-    for dataset in ["consolidatedShortInterest", "otcShortInterest"]:
-        try:
-            url = f"https://api.finra.org/data/group/otcmarket/name/{dataset}"
-            params = {
-                "limit": 6,
-                "filter": f'[{{"fieldName":"symbolCode","fieldValue":"{ticker_upper}","compareType":"equal"}}]',
-                "sort": '[{"fieldName":"settlementDate","sortType":"DESC"}]',
-            }
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    rows = []
-                    for item in data:
-                        rows.append({
-                            "정산일": str(item.get("settlementDate") or "")[:10],
-                            "공매도 잔량": f"{int(item.get('shortInterestQty') or item.get('totalShortInterest') or 0):,}",
-                            "일평균 거래량": f"{int(item.get('averageDailyVolume') or item.get('avgDailyShareVolume') or 0):,}",
-                        })
-                    if rows:
-                        return pd.DataFrame(rows)
-        except Exception:
-            continue
+    """기관 보유 비중 — FMP institutional-holder 사용."""
+    k = _fmp_key()
+    if not k:
+        return pd.DataFrame()
+
+    # 방법 1: FMP /institutional-holder (v3)
+    try:
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v3/institutional-holder/{ticker_upper}?apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and data:
+                rows = []
+                for item in data[:10]:
+                    holder = str(item.get("holder") or item.get("name") or "")
+                    shares = to_float(item.get("shares") or item.get("sharesNumber"))
+                    pct = to_float(item.get("dateReported") or item.get("weightPercent") or item.get("percentage"))
+                    change = to_float(item.get("change") or item.get("changeInShares"))
+                    if not holder:
+                        continue
+                    rows.append({
+                        "기관명": holder,
+                        "보유 주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
+                        "변동": f"{int(change):+,}" if pd.notna(change) and change != 0 else "-",
+                    })
+                if rows:
+                    return pd.DataFrame(rows)
+    except Exception:
+        pass
+
+    # 방법 2: FMP /stable/institutional-ownership
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/institutional-ownership?symbol={ticker_upper}&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and data:
+                rows = []
+                for item in data[:10]:
+                    holder = str(item.get("investorName") or item.get("holder") or item.get("name") or "")
+                    shares = to_float(item.get("sharesNumber") or item.get("shares"))
+                    change = to_float(item.get("changeInSharesNumber") or item.get("change"))
+                    if not holder:
+                        continue
+                    rows.append({
+                        "기관명": holder,
+                        "보유 주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
+                        "변동": f"{int(change):+,}" if pd.notna(change) and change != 0 else "-",
+                    })
+                if rows:
+                    return pd.DataFrame(rows)
+    except Exception:
+        pass
+
     return pd.DataFrame()
 
 
@@ -2572,71 +2608,84 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
     return results
 
 def fetch_short_interest(ticker_upper: str) -> dict:
-    """공매도 비율 + 숏 스퀴즈 가능성 — FINRA Equity API + FMP profile 사용."""
-    def _try_finra(dataset: str) -> dict:
-        try:
-            url = f"https://api.finra.org/data/group/otcmarket/name/{dataset}"
-            params = {
-                "limit": 2,
-                "filter": f'[{{"fieldName":"symbolCode","fieldValue":"{ticker_upper}","compareType":"equal"}}]',
-                "sort": '[{"fieldName":"settlementDate","sortType":"DESC"}]',
-            }
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    return data[0]
-        except Exception:
-            pass
-        return {}
+    """공매도 비율 + 숏 스퀴즈 — FMP short-float + key-metrics 사용."""
+    k = _fmp_key()
+    if not k:
+        return {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
 
-    # exchange-listed 먼저, 없으면 OTC
-    latest = _try_finra("consolidatedShortInterest")
-    if not latest:
-        latest = _try_finra("otcShortInterest")
+    short_pct = None
+    days_to_cover = None
+    shares_short = None
 
-    if latest:
-        short_qty = to_float(latest.get("shortInterestQty") or latest.get("totalShortInterest"))
-        avg_vol = to_float(latest.get("averageDailyVolume") or latest.get("avgDailyShareVolume"))
-        days_to_cover = round(float(short_qty / avg_vol), 1) \
-            if avg_vol and avg_vol > 0 and short_qty else None
-        p = _fmp_profile(ticker_upper)
-        float_shares = to_float(p.get("floatShares") or p.get("sharesOutstanding"))
-        short_pct = round(float(short_qty / float_shares * 100), 2) \
-            if float_shares and float_shares > 0 and short_qty else None
-        squeeze_risk = "N/A"
-        if short_pct is not None:
-            squeeze_risk = "🔥 높음 (Short Squeeze 주의)" if short_pct >= 20 \
-                else ("⚠️ 중간" if short_pct >= 10 else "✅ 낮음")
-        return {
-            "short_pct": short_pct,
-            "days_to_cover": days_to_cover,
-            "shares_short": int(short_qty) if short_qty else None,
-            "squeeze_risk": squeeze_risk,
-        }
-
-    # FINRA 실패 시 FMP profile float/short 데이터 시도
+    # 방법 1: FMP /short-float (Starter 플랜 제공)
     try:
-        p = _fmp_profile(ticker_upper)
-        short_pct = to_float(p.get("shortRatio") or p.get("shortPercentOfFloat"))
-        if short_pct and short_pct <= 1:
-            short_pct = round(short_pct * 100, 2)
-        days_to_cover = to_float(p.get("shortRatio"))
-        squeeze_risk = "N/A"
-        if short_pct:
-            squeeze_risk = "🔥 높음 (Short Squeeze 주의)" if short_pct >= 20 \
-                else ("⚠️ 중간" if short_pct >= 10 else "✅ 낮음")
-        if short_pct:
-            return {
-                "short_pct": round(float(short_pct), 2),
-                "days_to_cover": round(float(days_to_cover), 1) if days_to_cover else None,
-                "shares_short": None,
-                "squeeze_risk": squeeze_risk,
-            }
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v4/short-float?symbol={ticker_upper}&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code == 200:
+            data = r.json()
+            item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+            if item:
+                short_pct = to_float(
+                    item.get("shortFloatPercent") or item.get("shortFloat") or
+                    item.get("shortPercentOfFloat") or item.get("shortInterestPercent")
+                )
+                if short_pct and short_pct <= 1.0:
+                    short_pct = round(short_pct * 100, 2)
+                days_to_cover = to_float(
+                    item.get("daysToCover") or item.get("shortRatio") or item.get("daysTocover")
+                )
+                shares_short = to_float(
+                    item.get("shortInterest") or item.get("sharesShort") or item.get("shortVolume")
+                )
     except Exception:
         pass
 
-    return {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
+    # 방법 2: FMP key-metrics-ttm (short ratio 포함)
+    if short_pct is None:
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/key-metrics-ttm?symbol={ticker_upper}&apikey={k}",
+                timeout=_FMP_TIMEOUT
+            )
+            if r.status_code == 200:
+                data = r.json()
+                km = data[0] if isinstance(data, list) and data else {}
+                sp = to_float(km.get("shortRatioTTM") or km.get("shortRatio"))
+                if pd.notna(sp):
+                    days_to_cover = sp
+        except Exception:
+            pass
+
+    # 방법 3: FMP profile (floatShares + sharesShort)
+    if short_pct is None:
+        try:
+            p = _fmp_profile(ticker_upper)
+            sp = to_float(
+                p.get("shortPercentOfFloat") or p.get("shortRatio") or
+                p.get("floatShort") or p.get("shortFloatPercent")
+            )
+            if pd.notna(sp):
+                short_pct = sp * 100 if sp <= 1.0 else sp
+        except Exception:
+            pass
+
+    squeeze_risk = "N/A"
+    if short_pct is not None and pd.notna(short_pct):
+        if float(short_pct) >= 20:
+            squeeze_risk = "🔥 높음 (Short Squeeze 주의)"
+        elif float(short_pct) >= 10:
+            squeeze_risk = "⚠️ 중간"
+        else:
+            squeeze_risk = "✅ 낮음"
+
+    return {
+        "short_pct": round(float(short_pct), 2) if short_pct is not None and pd.notna(short_pct) else None,
+        "days_to_cover": round(float(days_to_cover), 1) if days_to_cover is not None and pd.notna(days_to_cover) else None,
+        "shares_short": int(shares_short) if shares_short is not None and pd.notna(shares_short) else None,
+        "squeeze_risk": squeeze_risk,
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2795,27 +2844,58 @@ def _fmp_profile(ticker: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fmp_ratios(ticker: str) -> dict:
-    """ratios-ttm: ROE, Operating Margin, D/E, gross margin"""
+    """ratios-ttm: ROE, Operating Margin, D/E, P/E, P/B — stable + v3 fallback"""
     k = _fmp_key()
     if not k: return {}
+    # stable API 먼저
     try:
         r = requests.get(f"{_FMP_BASE}/ratios-ttm?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
-        d = r.json()
-        return d[0] if isinstance(d, list) and d else {}
+        if r.status_code == 200:
+            d = r.json()
+            result = d[0] if isinstance(d, list) and d else {}
+            if result and any(result.get(f) for f in ["returnOnEquityTTM","peRatioTTM","operatingProfitMarginTTM"]):
+                return result
     except Exception:
-        return {}
+        pass
+    # v3 fallback
+    try:
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v3/ratios-ttm/{ticker}?apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d[0] if isinstance(d, list) and d else {}
+    except Exception:
+        pass
+    return {}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fmp_key_metrics(ticker: str) -> dict:
-    """key-metrics-ttm: P/E, P/B, EV/EBITDA, PEG, EPS"""
+    """key-metrics-ttm: P/E, P/B, EV/EBITDA, PEG, EPS — stable + v3 fallback"""
     k = _fmp_key()
     if not k: return {}
     try:
         r = requests.get(f"{_FMP_BASE}/key-metrics-ttm?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
-        d = r.json()
-        return d[0] if isinstance(d, list) and d else {}
+        if r.status_code == 200:
+            d = r.json()
+            result = d[0] if isinstance(d, list) and d else {}
+            if result and any(result.get(f) for f in ["peRatioTTM","pbRatioTTM","evToEbitdaTTM"]):
+                return result
     except Exception:
-        return {}
+        pass
+    # v3 fallback
+    try:
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d[0] if isinstance(d, list) and d else {}
+    except Exception:
+        pass
+    return {}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fmp_income(ticker: str) -> dict:
@@ -2971,27 +3051,33 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                 if pd.notna(v) and v > 0:
                     info["marketCap"] = v
 
-    # ── key-metrics-ttm: P/E, P/B, EV/EBITDA, PEG, EPS (yfinance 없을 때만) ─
+    # ── key-metrics-ttm: P/E, P/B, EV/EBITDA, PEG, EPS (항상 시도) ─────
     _need_km = not all([info.get("trailingPE"), info.get("priceToBook"),
                         info.get("enterpriseToEbitda"), info.get("trailingEps")])
     if _need_km:
-        km = _fmp_key_metrics(ticker)  # 캐시돼 있으므로 추가 API 호출 없음
+        km = _fmp_key_metrics(ticker)
         if km:
             if not info.get("trailingPE"):
-                v = to_float(km.get("peRatioTTM"))
+                v = to_float(km.get("peRatioTTM") or km.get("priceEarningsRatioTTM") or km.get("peRatio"))
                 if pd.notna(v) and v > 0: info["trailingPE"] = v
+            if not info.get("forwardPE"):
+                v = to_float(km.get("forwardPERatioTTM") or km.get("forwardPE") or km.get("forwardPriceToEarningsTTM"))
+                if pd.notna(v) and v > 0: info["forwardPE"] = v
             if not info.get("priceToBook"):
-                v = to_float(km.get("pbRatioTTM"))
+                v = to_float(km.get("pbRatioTTM") or km.get("priceToBookRatioTTM") or km.get("priceToBook"))
                 if pd.notna(v): info["priceToBook"] = v
             if not info.get("enterpriseToEbitda"):
-                v = to_float(km.get("evToEbitdaTTM"))
+                v = to_float(km.get("evToEbitdaTTM") or km.get("enterpriseValueOverEBITDATTM") or km.get("evEbitda"))
                 if pd.notna(v): info["enterpriseToEbitda"] = v
             if not info.get("pegRatio"):
-                v = to_float(km.get("pegRatioTTM"))
+                v = to_float(km.get("pegRatioTTM") or km.get("priceEarningsToGrowthRatioTTM"))
                 if pd.notna(v): info["pegRatio"] = v
             if not info.get("trailingEps"):
-                v = to_float(km.get("netIncomePerShareTTM"))
+                v = to_float(km.get("netIncomePerShareTTM") or km.get("epsttm") or km.get("epsTTM"))
                 if pd.notna(v): info["trailingEps"] = v
+            if not info.get("revenueGrowth"):
+                v = to_float(km.get("revenueGrowthTTM") or km.get("revenueGrowth"))
+                if pd.notna(v): info["revenueGrowth"] = v
             if not info.get("forwardPE"):
                 v = to_float(km.get("forwardPERatioTTM"))
                 if pd.notna(v) and v > 0: info["forwardPE"] = v
@@ -3002,24 +3088,26 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
         rat = _fmp_ratios(ticker)
         if rat:
             if not info.get("operatingMargins"):
-                v = to_float(rat.get("operatingProfitMarginTTM"))
+                v = to_float(rat.get("operatingProfitMarginTTM") or rat.get("operatingProfitMargin") or rat.get("operatingMarginTTM"))
                 if pd.notna(v): info["operatingMargins"] = v
             if not info.get("grossMargins"):
-                v = to_float(rat.get("grossProfitMarginTTM"))
+                v = to_float(rat.get("grossProfitMarginTTM") or rat.get("grossProfitMargin") or rat.get("grossMarginTTM"))
                 if pd.notna(v): info["grossMargins"] = v
-            # ROE, D/E ratios-ttm에서 시도
             if not info.get("returnOnEquity"):
-                v = to_float(rat.get("returnOnEquityTTM") or rat.get("roe"))
+                v = to_float(rat.get("returnOnEquityTTM") or rat.get("roe") or rat.get("returnOnEquity"))
                 if pd.notna(v): info["returnOnEquity"] = v
             if not info.get("debtToEquity"):
-                v = to_float(rat.get("debtEquityRatioTTM") or rat.get("debtToEquity"))
+                v = to_float(rat.get("debtEquityRatioTTM") or rat.get("debtToEquityRatioTTM") or rat.get("debtToEquity") or rat.get("debtEquityRatio"))
                 if pd.notna(v): info["debtToEquity"] = v
             if not info.get("trailingPE"):
-                v = to_float(rat.get("peRatioTTM"))
+                v = to_float(rat.get("peRatioTTM") or rat.get("priceEarningsRatioTTM"))
                 if pd.notna(v) and v > 0: info["trailingPE"] = v
             if not info.get("priceToBook"):
                 v = to_float(rat.get("priceToBookRatioTTM") or rat.get("pbRatioTTM"))
                 if pd.notna(v): info["priceToBook"] = v
+            if not info.get("netMargins"):
+                v = to_float(rat.get("netProfitMarginTTM") or rat.get("netProfitMargin"))
+                if pd.notna(v): info["netMargins"] = v
 
     # ── income-statement + balance-sheet: ROE·D/E 직접 계산 ─────────
     _need_calc = not all([info.get("returnOnEquity"), info.get("debtToEquity")])
@@ -3094,12 +3182,14 @@ def fetch_company_overview(ticker_upper: str) -> dict:
         k = _fmp_key()
         if k:
             try:
+                today_str = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
+                to_str = (datetime.now(timezone.utc).date() + timedelta(days=180)).strftime("%Y-%m-%d")
                 r = requests.get(
-                    f"{_FMP_BASE}/earnings-calendar?symbol={ticker_upper}&apikey={k}",
+                    f"{_FMP_BASE}/earnings-calendar?symbol={ticker_upper}&from={today_str}&to={to_str}&apikey={k}",
                     timeout=_FMP_TIMEOUT
                 )
                 cal = r.json() if r.status_code == 200 else []
-                today = datetime.now(timezone.utc).date()
+                today_dt = datetime.now(timezone.utc).date()
                 future_dates = []
                 for item in (cal if isinstance(cal, list) else []):
                     date_str = str(item.get("date") or "")[:10]
@@ -3107,7 +3197,7 @@ def fetch_company_overview(ticker_upper: str) -> dict:
                         continue
                     try:
                         dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-                        if dt >= today:
+                        if dt >= today_dt:
                             future_dates.append(date_str)
                     except Exception:
                         continue
