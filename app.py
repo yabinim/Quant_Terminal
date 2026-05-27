@@ -2637,6 +2637,138 @@ def fetch_options_flow_summary(ticker_upper: str) -> dict:
     """Options Flow — 현재 무료 대안 없음. 추후 전용 API 연동 예정."""
     return {}
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_insider_trading(ticker_upper: str) -> pd.DataFrame:
+    """인사이더 트레이딩 — FMP stable/insider-trading 사용."""
+    k = _fmp_key()
+    if not k:
+        return pd.DataFrame()
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/insider-trading?symbol={ticker_upper}&limit=20&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return pd.DataFrame()
+        rows = []
+        for item in data[:15]:
+            name = str(item.get("reportingName") or item.get("name") or item.get("filerName") or "")
+            title = str(item.get("typeOfOwner") or item.get("title") or item.get("officerTitle") or "")
+            tx_type = str(item.get("transactionType") or item.get("acquistionOrDisposition") or "")
+            shares = to_float(item.get("securitiesTransacted") or item.get("shares") or item.get("sharesTransacted"))
+            price = to_float(item.get("price") or item.get("transactionPrice"))
+            date_str = str(item.get("transactionDate") or item.get("filingDate") or item.get("date") or "")[:10]
+            if not name or not date_str:
+                continue
+            # 매수/매도 구분
+            is_buy = any(w in tx_type.upper() for w in ["P-", "PURCHASE", "BUY", "ACQUI", "A"])
+            is_sell = any(w in tx_type.upper() for w in ["S-", "SALE", "SELL", "DISPO", "D"])
+            direction = "🟢 매수" if is_buy else ("🔴 매도" if is_sell else tx_type[:10])
+            value = shares * price if pd.notna(shares) and pd.notna(price) else None
+            rows.append({
+                "날짜": date_str,
+                "이름": name[:25],
+                "직책": title[:20],
+                "거래": direction,
+                "주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
+                "거래가": f"${price:.2f}" if pd.notna(price) else "N/A",
+                "거래금액": f"${value/1e6:.2f}M" if value and value >= 1e6 else (f"${value:,.0f}" if value else "N/A"),
+            })
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_analyst_price_targets(ticker_upper: str) -> dict:
+    """애널리스트 목표주가 — FMP stable/price-target-consensus + price-target 사용."""
+    k = _fmp_key()
+    if not k:
+        return {}
+    result = {}
+    # 컨센서스 (평균/중간/고/저)
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/price-target-consensus?symbol={ticker_upper}&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code == 200:
+            data = r.json()
+            item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+            if item:
+                result["target_high"] = to_float(item.get("targetHigh") or item.get("priceTargetHigh"))
+                result["target_low"] = to_float(item.get("targetLow") or item.get("priceTargetLow"))
+                result["target_mean"] = to_float(item.get("targetMean") or item.get("priceTargetMean") or item.get("targetConsensus"))
+                result["target_median"] = to_float(item.get("targetMedian") or item.get("priceTargetMedian"))
+    except Exception:
+        pass
+    # 최근 개별 애널리스트 추천
+    try:
+        r2 = requests.get(
+            f"{_FMP_BASE}/price-target?symbol={ticker_upper}&limit=8&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r2.status_code == 200:
+            data2 = r2.json()
+            if isinstance(data2, list) and data2:
+                recent = []
+                for item in data2[:8]:
+                    analyst = str(item.get("analystCompany") or item.get("publishedDate") or "")[:25]
+                    target = to_float(item.get("adjPriceTarget") or item.get("priceTarget") or item.get("price"))
+                    rating = str(item.get("priceGrade") or item.get("newGrade") or item.get("rating") or "")
+                    date_s = str(item.get("publishedDate") or item.get("date") or "")[:10]
+                    if not analyst:
+                        continue
+                    recent.append({
+                        "날짜": date_s,
+                        "기관": analyst,
+                        "목표주가": f"${target:.2f}" if pd.notna(target) else "N/A",
+                        "등급": rating or "N/A",
+                    })
+                result["recent"] = recent
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_senate_house_trading(ticker_upper: str) -> pd.DataFrame:
+    """상원/하원 의원 거래 — FMP stable/senate-trading + house-disclosure 사용."""
+    k = _fmp_key()
+    if not k:
+        return pd.DataFrame()
+    rows = []
+    for endpoint, source in [("senate-trading", "상원"), ("house-disclosure", "하원")]:
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/{endpoint}?symbol={ticker_upper}&apikey={k}",
+                timeout=_FMP_TIMEOUT
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    for item in data[:8]:
+                        name = str(item.get("senator") or item.get("representative") or item.get("name") or "")
+                        tx_type = str(item.get("type") or item.get("transactionType") or "")
+                        amount = str(item.get("amount") or item.get("transactionAmount") or "")
+                        date_s = str(item.get("transactionDate") or item.get("disclosureDate") or item.get("date") or "")[:10]
+                        if not name:
+                            continue
+                        rows.append({
+                            "구분": source,
+                            "의원명": name[:20],
+                            "거래유형": tx_type[:15],
+                            "금액범위": amount[:20],
+                            "거래일": date_s,
+                        })
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
 def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14) -> dict:
     """
     최근 N일간 내러티브에서 테마/종목이 얼마나 일관되게 등장했는지 점수화.
@@ -2957,6 +3089,39 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
             if not info.get("forwardPE"):
                 v = to_float(p.get("forwardPE") or p.get("forwardPe"))
                 if pd.notna(v) and v > 0: info["forwardPE"] = v
+
+    # ── analyst-estimates: Forward P/E 계산 (profile에 없을 때) ─────
+    if not info.get("forwardPE"):
+        try:
+            k_val = _fmp_key()
+            if k_val:
+                r_ae = requests.get(
+                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&limit=4&apikey={k_val}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if r_ae.status_code == 200:
+                    ae_data = r_ae.json()
+                    if isinstance(ae_data, list) and ae_data:
+                        # 현재 연도 이후 첫 번째 예상치 사용
+                        current_year = datetime.now().year
+                        for ae in ae_data:
+                            ae_date = str(ae.get("date") or ae.get("year") or "")[:4]
+                            try:
+                                if int(ae_date) >= current_year:
+                                    est_eps = to_float(
+                                        ae.get("estimatedEpsAvg") or ae.get("estimatedEps") or
+                                        ae.get("epsAvg") or ae.get("eps")
+                                    )
+                                    cur_price = to_float(info.get("currentPrice") or info.get("price"))
+                                    if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
+                                        fwd_pe = round(cur_price / est_eps, 2)
+                                        if 0 < fwd_pe < 2000:
+                                            info["forwardPE"] = fwd_pe
+                                        break
+                            except Exception:
+                                continue
+        except Exception:
+            pass
             if not info.get("trailingEps"):
                 v = to_float(p.get("eps") or p.get("epsActual"))
                 if pd.notna(v): info["trailingEps"] = v
@@ -11228,36 +11393,85 @@ if st.session_state.get("logged_in"):
             except Exception as _si_e:
                 st.warning(f"공매도 데이터 로드 오류: {_si_e}")
 
-            # ── Options Flow ──────────────────────────────────────────────
+            # ── 인사이더 트레이딩 ─────────────────────────────────────────
             st.divider()
-            st.markdown("### 📊 Options Flow (기관 방향성)")
-            st.caption("Put/Call 비율로 기관 투자자의 방향성 포지션을 추정합니다. P/C < 0.7 = 콜 우세(강세), P/C > 1.3 = 풋 우세(약세)")
+            st.markdown("### 🕵️ 인사이더 트레이딩")
+            st.caption("CEO·CFO 등 내부자의 실제 매수/매도 거래. 대량 매수는 강한 내부 확신 신호입니다.")
             try:
-                with st.spinner("Options 데이터 불러오는 중..."):
-                    opt_data = fetch_options_flow_summary(str(selected_ticker).strip().upper())
-
-                if not opt_data:
-                    st.info("Options 데이터를 가져오지 못했습니다. (ETF이거나 옵션 미상장 종목)")
+                with st.spinner("인사이더 거래 데이터 불러오는 중..."):
+                    insider_df = fetch_insider_trading(str(selected_ticker).strip().upper())
+                if insider_df.empty:
+                    st.info("인사이더 트레이딩 데이터를 가져오지 못했습니다.")
                 else:
-                    st.markdown(f"**종합 판단:** {opt_data.get('direction', 'N/A')}")
-                    st.metric("평균 Put/Call Ratio", f"{opt_data['avg_pc_ratio']:.3f}" if opt_data.get('avg_pc_ratio') else "N/A")
+                    # 매수/매도 요약
+                    buy_rows = insider_df[insider_df["거래"].str.contains("매수", na=False)]
+                    sell_rows = insider_df[insider_df["거래"].str.contains("매도", na=False)]
+                    ins_c1, ins_c2, ins_c3 = st.columns(3)
+                    with ins_c1:
+                        st.metric("최근 매수 건수", f"{len(buy_rows)}건")
+                    with ins_c2:
+                        st.metric("최근 매도 건수", f"{len(sell_rows)}건")
+                    with ins_c3:
+                        signal = "🟢 매수 우세" if len(buy_rows) > len(sell_rows) else ("🔴 매도 우세" if len(sell_rows) > len(buy_rows) else "⚪ 중립")
+                        st.metric("내부자 방향성", signal)
+                    st.dataframe(insider_df, use_container_width=True, hide_index=True)
+            except Exception as _ins_e:
+                st.warning(f"인사이더 트레이딩 로드 오류: {_ins_e}")
 
-                    chains = opt_data.get("chains", [])
-                    if chains:
-                        chain_rows = []
-                        for c in chains:
-                            chain_rows.append({
-                                "만기일": c["expiry"],
-                                "Call 거래량": f"{c['call_vol']:,}",
-                                "Put 거래량": f"{c['put_vol']:,}",
-                                "P/C Ratio": f"{c['pc_ratio']:.3f}" if c['pc_ratio'] else "N/A",
-                                "Call OI": f"{c['call_oi']:,}",
-                                "Put OI": f"{c['put_oi']:,}",
-                            })
-                        st.dataframe(pd.DataFrame(chain_rows), use_container_width=True, hide_index=True)
-                        st.caption("OI = Open Interest (미결제 약정). 높을수록 해당 방향 포지션이 많음.")
-            except Exception as _opt_e:
-                st.warning(f"Options Flow 데이터 로드 오류: {_opt_e}")
+            # ── 애널리스트 목표주가 ──────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🎯 애널리스트 목표주가")
+            st.caption("월가 애널리스트들의 목표주가 컨센서스. 현재가 대비 상승여력을 확인합니다.")
+            try:
+                with st.spinner("애널리스트 데이터 불러오는 중..."):
+                    analyst_data = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
+                if not analyst_data:
+                    st.info("애널리스트 목표주가 데이터를 가져오지 못했습니다.")
+                else:
+                    cur_price = to_float(selected_ticker_info.get("currentPrice") or selected_ticker_info.get("regularMarketPrice"))
+                    tgt_mean = analyst_data.get("target_mean")
+                    tgt_high = analyst_data.get("target_high")
+                    tgt_low = analyst_data.get("target_low")
+                    tgt_med = analyst_data.get("target_median")
+
+                    at_c1, at_c2, at_c3, at_c4 = st.columns(4)
+                    with at_c1:
+                        upside = f"{((tgt_mean / cur_price - 1) * 100):+.1f}%" if tgt_mean and cur_price else "N/A"
+                        st.metric("평균 목표가", f"${tgt_mean:.2f}" if tgt_mean else "N/A", delta=upside)
+                    with at_c2:
+                        st.metric("중간값 목표가", f"${tgt_med:.2f}" if tgt_med else "N/A")
+                    with at_c3:
+                        st.metric("최고 목표가", f"${tgt_high:.2f}" if tgt_high else "N/A")
+                    with at_c4:
+                        st.metric("최저 목표가", f"${tgt_low:.2f}" if tgt_low else "N/A")
+
+                    recent = analyst_data.get("recent", [])
+                    if recent:
+                        st.markdown("**최근 애널리스트 추천**")
+                        st.dataframe(pd.DataFrame(recent), use_container_width=True, hide_index=True)
+            except Exception as _at_e:
+                st.warning(f"애널리스트 데이터 로드 오류: {_at_e}")
+
+            # ── 상원/하원 의원 거래 ──────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🏛️ 상원/하원 의원 거래")
+            st.caption("미국 의회 의원들의 주식 거래 공시. 정책 방향 선행 지표로 활용됩니다.")
+            try:
+                with st.spinner("의회 거래 데이터 불러오는 중..."):
+                    congress_df = fetch_senate_house_trading(str(selected_ticker).strip().upper())
+                if congress_df.empty:
+                    st.info("의회 거래 데이터를 가져오지 못했습니다.")
+                else:
+                    buy_cnt = congress_df[congress_df["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)]
+                    sell_cnt = congress_df[congress_df["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)]
+                    cg_c1, cg_c2 = st.columns(2)
+                    with cg_c1:
+                        st.metric("의회 매수 건수", f"{len(buy_cnt)}건")
+                    with cg_c2:
+                        st.metric("의회 매도 건수", f"{len(sell_cnt)}건")
+                    st.dataframe(congress_df, use_container_width=True, hide_index=True)
+            except Exception as _cg_e:
+                st.warning(f"의회 거래 데이터 로드 오류: {_cg_e}")
 
         # ── AI 종합 진단 ─────────────────────────────────────────────────
         st.divider()
