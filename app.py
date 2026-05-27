@@ -2640,47 +2640,53 @@ def fetch_options_flow_summary(ticker_upper: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_insider_trading(ticker_upper: str) -> pd.DataFrame:
-    """인사이더 트레이딩 — FMP stable/insider-trading 사용."""
+    """인사이더 트레이딩 — FMP stable 여러 엔드포인트 시도."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/insider-trading?symbol={ticker_upper}&limit=20&apikey={k}",
-            timeout=_FMP_TIMEOUT
-        )
-        if r.status_code != 200:
-            return pd.DataFrame()
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            return pd.DataFrame()
-        rows = []
-        for item in data[:15]:
-            name = str(item.get("reportingName") or item.get("name") or item.get("filerName") or "")
-            title = str(item.get("typeOfOwner") or item.get("title") or item.get("officerTitle") or "")
-            tx_type = str(item.get("transactionType") or item.get("acquistionOrDisposition") or "")
-            shares = to_float(item.get("securitiesTransacted") or item.get("shares") or item.get("sharesTransacted"))
-            price = to_float(item.get("price") or item.get("transactionPrice"))
-            date_str = str(item.get("transactionDate") or item.get("filingDate") or item.get("date") or "")[:10]
-            if not name or not date_str:
-                continue
-            # 매수/매도 구분
-            is_buy = any(w in tx_type.upper() for w in ["P-", "PURCHASE", "BUY", "ACQUI", "A"])
-            is_sell = any(w in tx_type.upper() for w in ["S-", "SALE", "SELL", "DISPO", "D"])
-            direction = "🟢 매수" if is_buy else ("🔴 매도" if is_sell else tx_type[:10])
-            value = shares * price if pd.notna(shares) and pd.notna(price) else None
-            rows.append({
-                "날짜": date_str,
-                "이름": name[:25],
-                "직책": title[:20],
-                "거래": direction,
-                "주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
-                "거래가": f"${price:.2f}" if pd.notna(price) else "N/A",
-                "거래금액": f"${value/1e6:.2f}M" if value and value >= 1e6 else (f"${value:,.0f}" if value else "N/A"),
-            })
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
-    except Exception:
+
+    data = []
+    for endpoint in ["insider-trading", "insider-trading-rss-feed"]:
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/{endpoint}?symbol={ticker_upper}&limit=20&apikey={k}",
+                timeout=_FMP_TIMEOUT
+            )
+            if r.status_code == 200:
+                d = r.json()
+                if isinstance(d, list) and d:
+                    data = d
+                    break
+        except Exception:
+            continue
+
+    if not data:
         return pd.DataFrame()
+
+    rows = []
+    for item in data[:15]:
+        name = str(item.get("reportingName") or item.get("name") or item.get("filerName") or item.get("reporter") or "")
+        title = str(item.get("typeOfOwner") or item.get("title") or item.get("officerTitle") or item.get("relationship") or "")
+        tx_type = str(item.get("transactionType") or item.get("acquistionOrDisposition") or item.get("type") or "")
+        shares = to_float(item.get("securitiesTransacted") or item.get("shares") or item.get("sharesTransacted") or item.get("numberOfShares"))
+        price = to_float(item.get("price") or item.get("transactionPrice") or item.get("sharePrice"))
+        date_str = str(item.get("transactionDate") or item.get("filingDate") or item.get("date") or "")[:10]
+        if not name or not date_str:
+            continue
+        is_buy = any(w in tx_type.upper() for w in ["P-", "PURCHASE", "BUY", "ACQUI", "A-"])
+        is_sell = any(w in tx_type.upper() for w in ["S-", "SALE", "SELL", "DISPO", "D-"])
+        direction = "🟢 매수" if is_buy else ("🔴 매도" if is_sell else tx_type[:10])
+        value = shares * price if pd.notna(shares) and pd.notna(price) else None
+        rows.append({
+            "날짜": date_str,
+            "이름": name[:25],
+            "직책": title[:20],
+            "거래": direction,
+            "주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
+            "거래가": f"${price:.2f}" if pd.notna(price) else "N/A",
+            "거래금액": f"${value/1e6:.2f}M" if value and value >= 1e6 else (f"${value:,.0f}" if value else "N/A"),
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2737,12 +2743,21 @@ def fetch_analyst_price_targets(ticker_upper: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_senate_house_trading(ticker_upper: str) -> pd.DataFrame:
-    """상원/하원 의원 거래 — FMP stable/senate-trading + house-disclosure 사용."""
+    """상원/하원 의원 거래 — FMP stable 여러 엔드포인트 시도."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
     rows = []
-    for endpoint, source in [("senate-trading", "상원"), ("house-disclosure", "하원")]:
+    sources = [
+        ("senate-trading", "상원"),
+        ("senate-disclosure", "상원"),
+        ("house-disclosure", "하원"),
+        ("house-trading", "하원"),
+    ]
+    tried = set()
+    for endpoint, source in sources:
+        if source in tried:
+            continue
         try:
             r = requests.get(
                 f"{_FMP_BASE}/{endpoint}?symbol={ticker_upper}&apikey={k}",
@@ -2751,11 +2766,12 @@ def fetch_senate_house_trading(ticker_upper: str) -> pd.DataFrame:
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, list) and data:
+                    tried.add(source)
                     for item in data[:8]:
-                        name = str(item.get("senator") or item.get("representative") or item.get("name") or "")
-                        tx_type = str(item.get("type") or item.get("transactionType") or "")
-                        amount = str(item.get("amount") or item.get("transactionAmount") or "")
-                        date_s = str(item.get("transactionDate") or item.get("disclosureDate") or item.get("date") or "")[:10]
+                        name = str(item.get("senator") or item.get("representative") or item.get("name") or item.get("member") or "")
+                        tx_type = str(item.get("type") or item.get("transactionType") or item.get("assetType") or "")
+                        amount = str(item.get("amount") or item.get("transactionAmount") or item.get("range") or "")
+                        date_s = str(item.get("transactionDate") or item.get("disclosureDate") or item.get("date") or item.get("dateRecieved") or "")[:10]
                         if not name:
                             continue
                         rows.append({
@@ -11428,7 +11444,12 @@ if st.session_state.get("logged_in"):
                 if not analyst_data:
                     st.info("애널리스트 목표주가 데이터를 가져오지 못했습니다.")
                 else:
-                    cur_price = to_float(selected_ticker_info.get("currentPrice") or selected_ticker_info.get("regularMarketPrice"))
+                    cur_price = to_float(
+                        selected_ticker_info.get("price") or
+                        selected_ticker_info.get("currentPrice") or
+                        selected_ticker_info.get("regularMarketPrice") or
+                        selected_ticker_info.get("lastPrice")
+                    )
                     tgt_mean = analyst_data.get("target_mean")
                     tgt_high = analyst_data.get("target_high")
                     tgt_low = analyst_data.get("target_low")
