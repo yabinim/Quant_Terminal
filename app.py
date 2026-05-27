@@ -3685,13 +3685,60 @@ def evaluate_kpis(ticker_symbol):
         margin_of_safety = ((intrinsic_value - current_price) / intrinsic_value) * 100
     core_fcf_pass = (not pd.isna(fcf)) and (fcf > 0)
 
+    # ── 섹터 파악 ─────────────────────────────────────────────────────
+    sector_en = str(info.get("sector_en") or info.get("sector") or "").lower()
+
+    # 섹터별 밸류에이션 기준 (절대값)
+    # 기술/성장주는 높은 P/E 허용, 가치주/금융은 엄격
+    _is_tech   = any(w in sector_en for w in ["technology", "communication", "tech"])
+    _is_growth = any(w in sector_en for w in ["consumer cyclical", "automotive", "discretionary"])
+    _is_value  = any(w in sector_en for w in ["financial", "utilities", "real estate", "energy", "materials", "industrial"])
+    _is_health = "health" in sector_en or "pharma" in sector_en or "biotech" in sector_en
+
+    # 섹터별 P/E 상한선
+    if _is_tech or _is_growth:
+        pe_max = 120       # 기술/성장주: P/E 120까지 허용
+        pb_max = 20        # P/B 20까지
+        ev_sales_max = 20  # EV/Sales 20까지
+        roe_min = 0.10     # ROE 10% 이상
+    elif _is_health:
+        pe_max = 80
+        pb_max = 10
+        ev_sales_max = 15
+        roe_min = 0.10
+    elif _is_value:
+        pe_max = 20
+        pb_max = 3
+        ev_sales_max = 5
+        roe_min = 0.12
+    else:  # 기타
+        pe_max = 60
+        pb_max = 5
+        ev_sales_max = 10
+        roe_min = 0.15
+
+    # ── 상대 평가: 성장률 대비 밸류에이션 ─────────────────────────────
+    # PEG < 2 = 성장 대비 합리적, PEG < 1 = 저평가
+    peg_pass_threshold = 2.0  # 섹터 관계없이 PEG 2 이하면 OK
+
+    # EV/EBITDA 섹터별
+    ev_ebitda_max = 60 if (_is_tech or _is_growth) else (40 if _is_health else 25)
+    ev_fcf_max = 80 if (_is_tech or _is_growth) else (50 if _is_health else 40)
+
+    # D/E 섹터별 (금융은 레버리지 높음)
+    de_max = 300 if _is_value and "financial" in sector_en else 100
+
+    # ── KPI 행 구성 ───────────────────────────────────────────────────
+    # 섹터 라벨
+    sector_label = "기술/성장주" if (_is_tech or _is_growth) else ("헬스케어" if _is_health else ("가치주" if _is_value else "일반"))
+
     rows = [
         {
             "Category": "수익성 (Profitability)",
             "KPI": "ROE",
             "Value": pct_str(roe),
-            "Rule": "15% 이상",
-            "Pass": pass_fail_badge(not pd.isna(roe) and roe >= 0.15, pd.isna(roe)),
+            "Rule": f"{int(roe_min*100)}% 이상 [{sector_label}]",
+            "Pass": pass_fail_badge(not pd.isna(roe) and roe >= roe_min, pd.isna(roe)),
         },
         {
             "Category": "수익성 (Profitability)",
@@ -3704,8 +3751,8 @@ def evaluate_kpis(ticker_symbol):
             "Category": "건전성 (Financial Strength)",
             "KPI": "Debt-to-Equity",
             "Value": num_str(debt_to_equity),
-            "Rule": "100 미만",
-            "Pass": pass_fail_badge(not pd.isna(debt_to_equity) and debt_to_equity < 100, pd.isna(debt_to_equity)),
+            "Rule": f"{de_max} 미만 [{sector_label}]",
+            "Pass": pass_fail_badge(not pd.isna(debt_to_equity) and debt_to_equity < de_max, pd.isna(debt_to_equity)),
         },
         {
             "Category": "건전성 (Financial Strength)",
@@ -3718,51 +3765,50 @@ def evaluate_kpis(ticker_symbol):
             "Category": "밸류에이션 (Valuation)",
             "KPI": "Forward P/E",
             "Value": num_str(forward_pe) if pd.notna(forward_pe) else "N/A",
-            "Rule": "5~50",
-            "Pass": pass_fail_badge(pd.notna(forward_pe) and 0 < forward_pe <= 50, pd.isna(forward_pe)),
+            "Rule": f"5~{pe_max} [{sector_label}]",
+            "Pass": pass_fail_badge(pd.notna(forward_pe) and 0 < forward_pe <= pe_max, pd.isna(forward_pe)),
         },
         {
             "Category": "밸류에이션 (Valuation)",
             "KPI": "Trailing P/E",
             "Value": num_str(trailing_pe) if pd.notna(trailing_pe) else "N/A",
-            "Rule": "0 초과 & 60 이하",
-            "Pass": pass_fail_badge(pd.notna(trailing_pe) and 0 < trailing_pe <= 60, pd.isna(trailing_pe)),
+            "Rule": f"0 초과 & {pe_max} 이하 [{sector_label}]",
+            "Pass": pass_fail_badge(pd.notna(trailing_pe) and 0 < trailing_pe <= pe_max, pd.isna(trailing_pe)),
         },
         {
             "Category": "밸류에이션 (Valuation)",
             "KPI": "P/B (Price-to-Book)",
             "Value": num_str(price_to_book) if pd.notna(price_to_book) else "N/A",
-            "Rule": "5.0 이하",
-            "Pass": pass_fail_badge(pd.notna(price_to_book) and price_to_book <= 5.0, pd.isna(price_to_book)),
+            "Rule": f"{pb_max:.0f} 이하 [{sector_label}]",
+            "Pass": pass_fail_badge(pd.notna(price_to_book) and price_to_book <= pb_max, pd.isna(price_to_book)),
         },
         {
             "Category": "밸류에이션 (Valuation)",
             "KPI": "EV/EBITDA",
             "Value": num_str(ev_to_ebitda) if pd.notna(ev_to_ebitda) else "N/A",
-            "Rule": "25 이하",
-            "Pass": pass_fail_badge(pd.notna(ev_to_ebitda) and 0 < ev_to_ebitda <= 25, pd.isna(ev_to_ebitda)),
+            "Rule": f"{ev_ebitda_max} 이하 [{sector_label}]",
+            "Pass": pass_fail_badge(pd.notna(ev_to_ebitda) and 0 < ev_to_ebitda <= ev_ebitda_max, pd.isna(ev_to_ebitda)),
         },
-        # FMP 무료 플랜 실제 제공 밸류에이션 지표
         {
             "Category": "밸류에이션 (Valuation)",
             "KPI": "EV/Sales",
             "Value": num_str(ev_to_sales) if pd.notna(ev_to_sales) else "N/A",
-            "Rule": "10 이하",
-            "Pass": pass_fail_badge(pd.notna(ev_to_sales) and 0 < ev_to_sales <= 10, pd.isna(ev_to_sales)),
+            "Rule": f"{ev_sales_max} 이하 [{sector_label}]",
+            "Pass": pass_fail_badge(pd.notna(ev_to_sales) and 0 < ev_to_sales <= ev_sales_max, pd.isna(ev_to_sales)),
         },
         {
             "Category": "밸류에이션 (Valuation)",
             "KPI": "EV/FCF",
             "Value": num_str(ev_to_fcf) if pd.notna(ev_to_fcf) else "N/A",
-            "Rule": "40 이하",
-            "Pass": pass_fail_badge(pd.notna(ev_to_fcf) and 0 < ev_to_fcf <= 40, pd.isna(ev_to_fcf)),
+            "Rule": f"{ev_fcf_max} 이하 [{sector_label}]",
+            "Pass": pass_fail_badge(pd.notna(ev_to_fcf) and 0 < ev_to_fcf <= ev_fcf_max, pd.isna(ev_to_fcf)),
         },
         {
-            "Category": "밸류에이션 (Valuation)",
-            "KPI": "PEG Ratio",
+            "Category": "밸류에이션 (Valuation) — 상대평가",
+            "KPI": "PEG Ratio (성장 대비)",
             "Value": num_str(peg_ratio),
-            "Rule": "1.0 미만",
-            "Pass": pass_fail_badge(not pd.isna(peg_ratio) and peg_ratio < 1.0, pd.isna(peg_ratio)),
+            "Rule": f"{peg_pass_threshold} 미만 = 성장 대비 합리적",
+            "Pass": pass_fail_badge(not pd.isna(peg_ratio) and peg_ratio < peg_pass_threshold, pd.isna(peg_ratio)),
         },
     ]
 
@@ -3980,49 +4026,72 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     # ══════════════════════════════════════════════════════════════════
     # 2. 가치투자 점수 (100점)
     # ══════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
+    # 섹터 파악 (스타일 점수용)
+    _sector_en = str(info.get("sector_en") or info.get("sector") or "").lower()
+    _s_tech   = any(w in _sector_en for w in ["technology", "communication", "tech"])
+    _s_growth = any(w in _sector_en for w in ["consumer cyclical", "automotive", "discretionary"])
+    _s_value  = any(w in _sector_en for w in ["financial", "utilities", "real estate", "energy", "materials"])
+
+    # 섹터별 P/E 점수 기준
+    if _s_tech or _s_growth:
+        _pe_tiers = [(30, 25), (50, 20), (80, 14), (120, 8), (200, 3)]   # 기술/성장주
+    elif _s_value:
+        _pe_tiers = [(10, 25), (15, 20), (20, 14), (25, 8), (35, 3)]     # 가치주
+    else:
+        _pe_tiers = [(15, 25), (20, 20), (30, 14), (50, 8), (80, 3)]     # 일반
+
+    # 섹터별 P/B 기준
+    if _s_tech or _s_growth:
+        _pb_tiers = [(3, 20), (8, 15), (15, 10), (20, 5)]
+    else:
+        _pb_tiers = [(1, 20), (2, 15), (3, 10), (5, 5)]
+
     val_score = 0
     val_detail = {}
 
-    # P/E (25점)
+    # P/E (25점) — 섹터별 기준
     _pe = trailing_pe if pd.notna(trailing_pe) else forward_pe
     if pd.notna(_pe) and _pe > 0:
-        if _pe <= 10:    pts = 25
-        elif _pe <= 15:  pts = 20
-        elif _pe <= 20:  pts = 14
-        elif _pe <= 25:  pts = 8
-        elif _pe <= 35:  pts = 3
-        else:            pts = 0
+        pts = 0
+        for threshold, score in _pe_tiers:
+            if _pe <= threshold:
+                pts = score
+                break
         val_score += pts
         val_detail["P/E"] = f"{_pe:.1f} → {pts}점"
     else:
         val_detail["P/E"] = "데이터 없음"
 
-    # P/B (20점)
+    # P/B (20점) — 섹터별 기준
     if pd.notna(price_to_book) and price_to_book > 0:
-        if price_to_book <= 1:   pts = 20
-        elif price_to_book <= 2: pts = 15
-        elif price_to_book <= 3: pts = 10
-        elif price_to_book <= 5: pts = 5
-        else:                    pts = 0
+        pts = 0
+        for threshold, score in _pb_tiers:
+            if price_to_book <= threshold:
+                pts = score
+                break
         val_score += pts
         val_detail["P/B"] = f"{price_to_book:.2f} → {pts}점"
     else:
         val_detail["P/B"] = "데이터 없음"
 
-    # EV/EBITDA 또는 EV/Sales (20점)
+    # EV/EBITDA 또는 EV/Sales (20점) — 섹터별 기준
+    _ev_ebitda_tiers = [(15, 20), (25, 15), (40, 10), (60, 5)] if (_s_tech or _s_growth) else [(8, 20), (12, 15), (18, 10), (25, 5)]
     if pd.notna(ev_to_ebitda) and ev_to_ebitda > 0:
-        if ev_to_ebitda <= 8:    pts = 20
-        elif ev_to_ebitda <= 12: pts = 15
-        elif ev_to_ebitda <= 18: pts = 10
-        elif ev_to_ebitda <= 25: pts = 5
-        else:                    pts = 0
+        pts = 0
+        for threshold, score in _ev_ebitda_tiers:
+            if ev_to_ebitda <= threshold:
+                pts = score
+                break
         val_score += pts
         val_detail["EV/EBITDA"] = f"{ev_to_ebitda:.1f} → {pts}점"
     elif pd.notna(ev_to_sales) and ev_to_sales > 0:
-        if ev_to_sales <= 2:   pts = 20
-        elif ev_to_sales <= 5: pts = 12
-        elif ev_to_sales <= 10: pts = 5
-        else:                   pts = 0
+        _ev_sales_tiers = [(5, 20), (10, 12), (20, 5)] if (_s_tech or _s_growth) else [(2, 20), (5, 12), (10, 5)]
+        pts = 0
+        for threshold, score in _ev_sales_tiers:
+            if ev_to_sales <= threshold:
+                pts = score
+                break
         val_score += pts
         val_detail["EV/Sales"] = f"{ev_to_sales:.1f} → {pts}점"
     else:
