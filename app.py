@@ -2761,15 +2761,14 @@ def fetch_analyst_price_targets(ticker_upper: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_senate_house_trading(ticker_upper: str) -> pd.DataFrame:
-    """상원/하원 의원 거래 — FMP stable/senate-trading/search + house-disclosure/search 사용."""
+    """상원/하원 의원 거래 — FMP stable/senate-trades + house-trades 사용."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
     rows = []
-    # FMP 문서 기준 정확한 엔드포인트
     sources = [
-        ("senate-trading/search", "상원"),
-        ("house-disclosure/search", "하원"),
+        ("senate-trades", "상원"),
+        ("house-trades", "하원"),
     ]
     for endpoint, source in sources:
         try:
@@ -2781,18 +2780,25 @@ def fetch_senate_house_trading(ticker_upper: str) -> pd.DataFrame:
                 data = r.json()
                 if isinstance(data, list) and data:
                     for item in data[:8]:
-                        name = str(item.get("senator") or item.get("representative") or item.get("name") or item.get("firstName", "") + " " + item.get("lastName", "") or "").strip()
-                        tx_type = str(item.get("type") or item.get("transactionType") or "")
-                        amount = str(item.get("amount") or item.get("transactionAmount") or "")
-                        date_s = str(item.get("transactionDate") or item.get("disclosureDate") or item.get("date") or "")[:10]
-                        asset = str(item.get("assetName") or item.get("asset") or ticker_upper)
+                        first = str(item.get("firstName") or "")
+                        last = str(item.get("lastName") or "")
+                        office = str(item.get("office") or "")
+                        name = office if office else f"{first} {last}".strip()
+                        tx_type = str(item.get("type") or "")
+                        amount = str(item.get("amount") or "")
+                        asset = str(item.get("assetDescription") or ticker_upper)
+                        date_s = str(item.get("transactionDate") or item.get("disclosureDate") or "")[:10]
                         if not name:
                             continue
+                        is_buy = "purchase" in tx_type.lower() or "buy" in tx_type.lower()
+                        is_sell = "sale" in tx_type.lower() or "sell" in tx_type.lower()
+                        direction = "🟢 매수" if is_buy else ("🔴 매도" if is_sell else tx_type[:15])
                         rows.append({
                             "구분": source,
-                            "의원명": name[:20],
-                            "거래유형": tx_type[:15],
+                            "의원명": name[:22],
+                            "거래유형": direction,
                             "금액범위": amount[:20],
+                            "종목": asset[:20],
                             "거래일": date_s,
                         })
         except Exception:
