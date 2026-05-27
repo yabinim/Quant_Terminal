@@ -3213,6 +3213,38 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
             if not info.get("fiftyTwoWeekLow"):
                 v = to_float(p.get("range", "").split("-")[0] if "-" in str(p.get("range","")) else None)
                 if pd.notna(v): info["fiftyTwoWeekLow"] = v
+
+    # ── quote: MA50/MA200/yearHigh/yearLow (기술적 분석용) ───────────
+    _need_quote = not all([info.get("fiftyDayAverage"), info.get("twoHundredDayAverage")])
+    if _need_quote:
+        try:
+            k_q = _fmp_key()
+            if k_q:
+                rq = requests.get(f"{_FMP_BASE}/quote/{ticker}?apikey={k_q}", timeout=_FMP_TIMEOUT)
+                if rq.status_code == 200:
+                    qd = rq.json()
+                    q_item = qd[0] if isinstance(qd, list) and qd else {}
+                    if q_item:
+                        if not info.get("fiftyDayAverage"):
+                            v = to_float(q_item.get("priceAvg50"))
+                            if pd.notna(v): info["fiftyDayAverage"] = v
+                        if not info.get("twoHundredDayAverage"):
+                            v = to_float(q_item.get("priceAvg200"))
+                            if pd.notna(v): info["twoHundredDayAverage"] = v
+                        if not info.get("fiftyTwoWeekHigh"):
+                            v = to_float(q_item.get("yearHigh"))
+                            if pd.notna(v): info["fiftyTwoWeekHigh"] = v
+                        if not info.get("fiftyTwoWeekLow"):
+                            v = to_float(q_item.get("yearLow"))
+                            if pd.notna(v): info["fiftyTwoWeekLow"] = v
+                        if not info.get("currentPrice"):
+                            v = to_float(q_item.get("price"))
+                            if pd.notna(v): info["currentPrice"] = v
+                        if not info.get("marketCap"):
+                            v = to_float(q_item.get("marketCap"))
+                            if pd.notna(v): info["marketCap"] = v
+        except Exception:
+            pass
             if not info.get("earningsDate") and p.get("earningsAnnouncement"):
                 info["earningsDate"] = [str(p["earningsAnnouncement"])[:10]]
             if p.get("isEtf") and not info.get("quoteType"):
@@ -3469,6 +3501,23 @@ def fetch_company_overview(ticker_upper: str) -> dict:
                                     break
                             except Exception:
                                 continue
+            except Exception:
+                pass
+        # quote의 earningsAnnouncement 필드
+        if not next_earnings and k:
+            try:
+                rq = requests.get(f"{_FMP_BASE}/quote/{ticker_upper}?apikey={k}", timeout=_FMP_TIMEOUT)
+                if rq.status_code == 200:
+                    qd = rq.json()
+                    q_item = qd[0] if isinstance(qd, list) and qd else {}
+                    ann = str(q_item.get("earningsAnnouncement") or "")[:10]
+                    if ann and len(ann) == 10:
+                        try:
+                            ann_dt = datetime.strptime(ann, "%Y-%m-%d").date()
+                            if ann_dt >= tomorrow:
+                                next_earnings = ann
+                        except Exception:
+                            pass
             except Exception:
                 pass
         return {
@@ -3930,15 +3979,62 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     # ── 공통 데이터 수집 ──────────────────────────────────────────────
     try:
         info = _fmp_fill({}, ticker_upper)
-        # Earnings 히스토리 — FMP
         earn_df = cached_earnings_history(ticker_upper)
-        # 기관 보유 — FINRA (short interest 기반)
         inst_df = cached_institutional_holders(ticker_upper)
-        # 거래량 (최근 3개월)
         hist = _fmp_price_history(ticker_upper, limit=65)
     except Exception:
         info = _fmp_fill({}, ticker_upper)
         earn_df = inst_df = hist = pd.DataFrame()
+
+    # ── FMP income-statement에서 직접 성장률 계산 ─────────────────────
+    _inc_annual = {}
+    _cf_latest = {}
+    k_val = _fmp_key()
+    if k_val:
+        try:
+            r_inc = requests.get(
+                f"{_FMP_BASE}/income-statement?symbol={ticker_upper}&period=annual&limit=3&apikey={k_val}",
+                timeout=_FMP_TIMEOUT
+            )
+            inc_data = r_inc.json() if r_inc.status_code == 200 else []
+            if isinstance(inc_data, list) and len(inc_data) >= 2:
+                latest_inc = inc_data[0]
+                prev_inc   = inc_data[1]
+                rev_now  = to_float(latest_inc.get("revenue"))
+                rev_prev = to_float(prev_inc.get("revenue"))
+                ni_now   = to_float(latest_inc.get("netIncome"))
+                ni_prev  = to_float(prev_inc.get("netIncome"))
+                eps_now  = to_float(latest_inc.get("epsdiluted") or latest_inc.get("eps"))
+                eps_prev = to_float(prev_inc.get("epsdiluted") or prev_inc.get("eps"))
+                if pd.notna(rev_now) and pd.notna(rev_prev) and rev_prev != 0:
+                    _inc_annual["revenue_gr"] = (rev_now - rev_prev) / abs(rev_prev)
+                if pd.notna(ni_now) and pd.notna(ni_prev) and ni_prev != 0:
+                    _inc_annual["earnings_gr"] = (ni_now - ni_prev) / abs(ni_prev)
+                if pd.notna(eps_now):
+                    _inc_annual["trailing_eps"] = eps_now
+                if pd.notna(eps_now) and pd.notna(eps_prev) and eps_prev != 0:
+                    _inc_annual["eps_gr"] = (eps_now - eps_prev) / abs(eps_prev)
+                _inc_annual["op_margin"] = to_float(latest_inc.get("operatingIncomeRatio") or
+                    ((to_float(latest_inc.get("operatingIncome")) or 0) / rev_now if rev_now else None))
+        except Exception:
+            pass
+        try:
+            r_cf = requests.get(
+                f"{_FMP_BASE}/cash-flow-statement?symbol={ticker_upper}&period=annual&limit=1&apikey={k_val}",
+                timeout=_FMP_TIMEOUT
+            )
+            cf_data = r_cf.json() if r_cf.status_code == 200 else []
+            if isinstance(cf_data, list) and cf_data:
+                cf = cf_data[0]
+                fcf = to_float(cf.get("freeCashFlow"))
+                if pd.isna(fcf):
+                    ocf = to_float(cf.get("operatingCashFlow"))
+                    capex = to_float(cf.get("capitalExpenditure"))
+                    if pd.notna(ocf) and pd.notna(capex):
+                        fcf = ocf + capex
+                _cf_latest["fcf"] = fcf
+        except Exception:
+            pass
 
     # ── 지표 추출 ──────────────────────────────────────────────────────
     trailing_pe   = to_float(info.get("trailingPE"))
@@ -3947,18 +4043,19 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     ev_to_ebitda  = to_float(info.get("enterpriseToEbitda"))
     ev_to_sales   = to_float(info.get("_fmp_ev_to_sales"))
     roe           = to_float(info.get("returnOnEquity"))
-    op_margin     = to_float(info.get("operatingMargins"))
+    op_margin     = to_float(_inc_annual.get("op_margin") or info.get("operatingMargins"))
     debt_to_eq    = to_float(info.get("debtToEquity"))
-    trailing_eps  = to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
-    earnings_gr   = to_float(info.get("earningsGrowth"))
-    revenue_gr    = to_float(info.get("revenueGrowth"))
+    trailing_eps  = to_float(_inc_annual.get("trailing_eps") or info.get("trailingEps"))
+    earnings_gr   = to_float(_inc_annual.get("earnings_gr") or info.get("earningsGrowth"))
+    revenue_gr    = to_float(_inc_annual.get("revenue_gr") or info.get("revenueGrowth"))
+    eps_yoy_gr    = to_float(_inc_annual.get("eps_gr") or earnings_gr)
     dividend_rate = to_float(info.get("dividendRate") or info.get("trailingAnnualDividendRate"))
     dividend_yld  = to_float(info.get("dividendYield") or info.get("trailingAnnualDividendYield"))
-    current_price = margin_context.get("current_price") or to_float(info.get("currentPrice"))
-    ma50          = to_float(info.get("fiftyDayAverage"))
-    ma200         = to_float(info.get("twoHundredDayAverage"))
-    week52_high   = to_float(info.get("fiftyTwoWeekHigh"))
-    fcf_val       = to_float(info.get("freeCashflow"))
+    current_price = margin_context.get("current_price") or to_float(info.get("currentPrice") or info.get("price"))
+    ma50          = to_float(info.get("fiftyDayAverage") or info.get("priceAvg50"))
+    ma200         = to_float(info.get("twoHundredDayAverage") or info.get("priceAvg200"))
+    week52_high   = to_float(info.get("fiftyTwoWeekHigh") or info.get("yearHigh"))
+    fcf_val       = to_float(_cf_latest.get("fcf") or info.get("freeCashflow") or info.get("_fmp_fcf"))
     market_cap    = to_float(info.get("marketCap"))
 
     # 분기 EPS 성장 (QoQ) — Earnings 히스토리에서
@@ -3974,16 +4071,51 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
         except Exception:
             pass
 
-    # 기관 보유율
+    # 기관 보유율 — positions-summary의 ownershipPercent 우선 사용
     inst_pct = np.nan
     try:
-        pct_col = next((c for c in inst_df.columns if "%" in c or "held" in c.lower() or "pct" in c.lower()), None)
-        if pct_col and not inst_df.empty:
-            vals = pd.to_numeric(inst_df[pct_col], errors="coerce").dropna()
-            total = float(vals.sum())
-            inst_pct = total * 100 if total <= 1 else total
+        # inst_df가 "항목/값/전분기대비" 형식이면 ownershipPercent 행에서 추출
+        if not inst_df.empty:
+            if "항목" in inst_df.columns and "값" in inst_df.columns:
+                own_row = inst_df[inst_df["항목"].str.contains("보유 비율|ownershipPercent", na=False)]
+                if not own_row.empty:
+                    val_str = str(own_row["값"].iloc[0]).replace("%", "").strip()
+                    inst_pct = to_float(val_str)
+            else:
+                # 기관명/비중 형식
+                pct_col = next((c for c in inst_df.columns if "비중" in c or "%" in c), None)
+                if pct_col:
+                    vals = pd.to_numeric(
+                        inst_df[pct_col].astype(str).str.replace("%", "").str.strip(),
+                        errors="coerce"
+                    ).dropna()
+                    if not vals.empty:
+                        total = float(vals.sum())
+                        inst_pct = total * 100 if total <= 1 else total
     except Exception:
         pass
+
+    # inst_pct가 여전히 nan이면 FMP positions-summary 직접 호출
+    if pd.isna(inst_pct) and k_val:
+        try:
+            now_q = datetime.now()
+            q_n = (now_q.month - 1) // 3
+            y_n = now_q.year
+            if q_n == 0: q_n = 4; y_n -= 1
+            for y_try, q_try in [(y_n, q_n), (y_n if q_n > 1 else y_n-1, q_n-1 if q_n > 1 else 4)]:
+                r_pos = requests.get(
+                    f"{_FMP_BASE}/institutional-ownership/symbol-positions-summary"
+                    f"?symbol={ticker_upper}&year={y_try}&quarter={q_try}&apikey={k_val}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if r_pos.status_code == 200:
+                    pos_data = r_pos.json()
+                    pos_item = pos_data[0] if isinstance(pos_data, list) and pos_data else {}
+                    if pos_item:
+                        inst_pct = to_float(pos_item.get("ownershipPercent"))
+                        break
+        except Exception:
+            pass
 
     # 거래량 비율 (최근 5일 / 3개월 평균)
     vol_ratio = np.nan
@@ -4024,7 +4156,7 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
         cs_detail["C_분기EPS성장"] = "데이터 없음"
 
     # A: 연간 EPS 성장 (20점)
-    _a_growth = earnings_gr * 100 if pd.notna(earnings_gr) else np.nan
+    _a_growth = eps_yoy_gr * 100 if pd.notna(eps_yoy_gr) else (earnings_gr * 100 if pd.notna(earnings_gr) else np.nan)
     if pd.notna(_a_growth):
         if _a_growth >= 25:   pts = 20
         elif _a_growth >= 15: pts = 14
