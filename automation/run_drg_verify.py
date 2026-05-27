@@ -18,7 +18,7 @@ from email.mime.text import MIMEText
 import numpy as np
 import pandas as pd
 import pytz
-import yfinance as yf
+import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -145,12 +145,20 @@ def verify_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         start_date = pred_date - pd.Timedelta(days=14)
         end_date   = pred_date + pd.Timedelta(days=2)
 
-        hist = yf.download(
-            bench_etf,
-            start=start_date.strftime("%Y-%m-%d"),
-            end=end_date.strftime("%Y-%m-%d"),
-            progress=False, auto_adjust=True,
+        FMP_KEY_V = os.environ.get("FMP_API_KEY", "")
+        fmp_r = requests.get(
+            f"https://financialmodelingprep.com/stable/historical-price-eod/full?symbol={bench_etf}&limit=20&apikey={FMP_KEY_V}",
+            timeout=8
         )
+        fmp_data = fmp_r.json()
+        fmp_rows = fmp_data.get("historical", fmp_data) if isinstance(fmp_data, dict) else fmp_data
+        if not isinstance(fmp_rows, list) or not fmp_rows:
+            return "", np.nan, ""
+        hist_df = pd.DataFrame(fmp_rows)
+        hist_df["date"] = pd.to_datetime(hist_df["date"])
+        hist_df = hist_df.set_index("date").sort_index()
+        hist_df["Close"] = pd.to_numeric(hist_df["close"], errors="coerce")
+        hist = hist_df[["Close"]]
         if hist is None or hist.empty:
             return "", np.nan, ""
 

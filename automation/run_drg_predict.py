@@ -22,7 +22,6 @@ import feedparser
 import numpy as np
 import pandas as pd
 import pytz
-import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 from google import genai
@@ -186,8 +185,8 @@ def fetch_macro_context(fred: Fred) -> str:
     # ── 신호 1: VIX 방향 ─────────────────────────────────────────────────────
     vix_close = None
     try:
-        vix_hist = yf.Ticker("^VIX").history(period="1mo", auto_adjust=False)
-        vix_s = pd.to_numeric(vix_hist["Close"], errors="coerce").dropna()
+        vix_s = fred.get_series("VIXCLS")
+        vix_s = pd.to_numeric(vix_s, errors="coerce").dropna().tail(30)
         if len(vix_s) >= 10:
             vix_now = float(vix_s.iloc[-1])
             vix_trend = vix_now - float(vix_s.iloc[-6]) if len(vix_s) >= 6 else 0
@@ -202,8 +201,19 @@ def fetch_macro_context(fred: Fred) -> str:
 
     # ── 신호 2: 신용 스프레드 (HYG/LQD) ────────────────────────────────────
     try:
-        hyg = pd.to_numeric(yf.Ticker("HYG").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
-        lqd = pd.to_numeric(yf.Ticker("LQD").history(period="1mo", auto_adjust=False)["Close"], errors="coerce").dropna()
+        FMP_KEY = os.environ.get("FMP_API_KEY", "")
+        FMP_BASE = "https://financialmodelingprep.com/stable"
+        def _fmp_hist(sym, limit=30):
+            r = requests.get(f"{FMP_BASE}/historical-price-eod/full?symbol={sym}&limit={limit}&apikey={FMP_KEY}", timeout=8)
+            data = r.json()
+            rows = data.get("historical", data) if isinstance(data, dict) else data
+            if not isinstance(rows, list) or not rows: return pd.Series(dtype=float)
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
+            return pd.to_numeric(df["close"], errors="coerce").dropna()
+        hyg = _fmp_hist("HYG")
+        lqd = _fmp_hist("LQD")
         if len(hyg) >= 6 and len(lqd) >= 6:
             spread_now = float(hyg.iloc[-1] / lqd.iloc[-1])
             spread_5d  = float(hyg.iloc[-6] / lqd.iloc[-6])
@@ -218,11 +228,12 @@ def fetch_macro_context(fred: Fred) -> str:
     # ── 신호 3: 대장주 모멘텀 (SPY, QQQ, NVDA, AAPL, MSFT) ─────────────────
     try:
         leaders = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT"]
-        raw = yf.download(leaders, period="1mo", interval="1d", auto_adjust=False, progress=False)
-        if isinstance(raw.columns, pd.MultiIndex):
-            close_df = raw["Close"]
-        else:
-            close_df = raw[["Close"]]
+        close_dict = {}
+        for sym in leaders:
+            s = _fmp_hist(sym, limit=30)
+            if not s.empty:
+                close_dict[sym] = s
+        close_df = pd.DataFrame(close_dict).sort_index() if close_dict else pd.DataFrame()
         spy_s = pd.to_numeric(close_df["SPY"], errors="coerce").dropna()
         spy_5d = float((spy_s.iloc[-1]/spy_s.iloc[-6] - 1)*100) if len(spy_s) >= 6 else 0
         weak_count = 0
@@ -249,14 +260,14 @@ def fetch_macro_context(fred: Fred) -> str:
 
     # ── 신호 4: 거래량 패턴 (SPY 기준) ─────────────────────────────────────
     try:
-        raw_spy = yf.download("SPY", period="1mo", interval="1d", auto_adjust=False, progress=False)
-        if raw_spy is not None and not raw_spy.empty and len(raw_spy) >= 10:
-            if isinstance(raw_spy.columns, pd.MultiIndex):
-                etf_close = pd.to_numeric(raw_spy["Close"].iloc[:, 0], errors="coerce").dropna()
-                vol = pd.to_numeric(raw_spy["Volume"].iloc[:, 0], errors="coerce").dropna()
-            else:
-                etf_close = pd.to_numeric(raw_spy["Close"], errors="coerce").dropna()
-                vol = pd.to_numeric(raw_spy["Volume"], errors="coerce").dropna()
+        spy_df_raw = requests.get(f"{FMP_BASE}/historical-price-eod/full?symbol=SPY&limit=30&apikey={FMP_KEY}", timeout=8).json()
+        spy_rows = spy_df_raw.get("historical", spy_df_raw) if isinstance(spy_df_raw, dict) else spy_df_raw
+        spy_df = pd.DataFrame(spy_rows) if isinstance(spy_rows, list) and spy_rows else pd.DataFrame()
+        if not spy_df.empty:
+            spy_df["date"] = pd.to_datetime(spy_df["date"])
+            spy_df = spy_df.set_index("date").sort_index()
+            etf_close = pd.to_numeric(spy_df["close"], errors="coerce").dropna()
+            vol = pd.to_numeric(spy_df.get("volume", pd.Series(dtype=float)), errors="coerce").dropna()
             if len(etf_close) >= 6 and len(vol) >= 10:
                 price_5d = float((etf_close.iloc[-1] / etf_close.iloc[-6] - 1) * 100)
                 vol_ratio = float(vol.tail(5).mean()) / float(vol.tail(20).mean())
@@ -270,8 +281,8 @@ def fetch_macro_context(fred: Fred) -> str:
 
     # ── 신호 5: VIX/VXN 비율 ────────────────────────────────────────────────
     try:
-        vxn_hist = yf.Ticker("^VXN").history(period="5d", auto_adjust=False)
-        vxn_s = pd.to_numeric(vxn_hist["Close"], errors="coerce").dropna()
+        vxn_s_raw = fred.get_series("VXNCLS")
+        vxn_s = pd.to_numeric(vxn_s_raw, errors="coerce").dropna().tail(5)
         if not vxn_s.empty and vix_close is not None and len(vix_close) > 0:
             vix_now2 = float(vix_close.iloc[-1])
             vxn_now = float(vxn_s.iloc[-1])
@@ -526,10 +537,13 @@ def main():
     direction = extract_direction(full_text)
     print(f"[INFO] 예측 방향: {direction}")
 
-    # SPY 현재가
+    # SPY 현재가 — FMP
     try:
-        spy_hist = yf.download("SPY", period="2d", progress=False, auto_adjust=True)
-        spy_close = float(spy_hist["Close"].iloc[-1]) if spy_hist is not None and not spy_hist.empty else np.nan
+        FMP_KEY_MAIN = os.environ.get("FMP_API_KEY", "")
+        spy_r = requests.get(f"https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=SPY&limit=2&apikey={FMP_KEY_MAIN}", timeout=8)
+        spy_data = spy_r.json()
+        spy_rows = spy_data.get("historical", spy_data) if isinstance(spy_data, dict) else spy_data
+        spy_close = float(spy_rows[0]["close"]) if isinstance(spy_rows, list) and spy_rows else np.nan
     except Exception:
         spy_close = np.nan
 
