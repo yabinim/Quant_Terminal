@@ -2235,39 +2235,10 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
-    """기관 보유 비중 — FMP institutional-holder 사용."""
+    """기관 보유 비중 — FMP stable/institutional-ownership 사용."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
-
-    # 방법 1: FMP /institutional-holder (v3)
-    try:
-        r = requests.get(
-            f"https://financialmodelingprep.com/api/v3/institutional-holder/{ticker_upper}?apikey={k}",
-            timeout=_FMP_TIMEOUT
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data:
-                rows = []
-                for item in data[:10]:
-                    holder = str(item.get("holder") or item.get("name") or "")
-                    shares = to_float(item.get("shares") or item.get("sharesNumber"))
-                    pct = to_float(item.get("dateReported") or item.get("weightPercent") or item.get("percentage"))
-                    change = to_float(item.get("change") or item.get("changeInShares"))
-                    if not holder:
-                        continue
-                    rows.append({
-                        "기관명": holder,
-                        "보유 주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
-                        "변동": f"{int(change):+,}" if pd.notna(change) and change != 0 else "-",
-                    })
-                if rows:
-                    return pd.DataFrame(rows)
-    except Exception:
-        pass
-
-    # 방법 2: FMP /stable/institutional-ownership
     try:
         r = requests.get(
             f"{_FMP_BASE}/institutional-ownership?symbol={ticker_upper}&apikey={k}",
@@ -2278,21 +2249,25 @@ def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
             if isinstance(data, list) and data:
                 rows = []
                 for item in data[:10]:
-                    holder = str(item.get("investorName") or item.get("holder") or item.get("name") or "")
-                    shares = to_float(item.get("sharesNumber") or item.get("shares"))
-                    change = to_float(item.get("changeInSharesNumber") or item.get("change"))
+                    holder = str(
+                        item.get("investorName") or item.get("holder") or
+                        item.get("name") or item.get("cik") or ""
+                    )
+                    shares = to_float(item.get("sharesNumber") or item.get("shares") or item.get("shareNumber"))
+                    weight = to_float(item.get("weightPercent") or item.get("weight") or item.get("percentage"))
+                    change = to_float(item.get("changeInSharesNumber") or item.get("change") or item.get("sharesChange"))
                     if not holder:
                         continue
                     rows.append({
                         "기관명": holder,
                         "보유 주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
+                        "비중(%)": f"{float(weight)*100:.2f}%" if pd.notna(weight) and weight < 10 else (f"{float(weight):.2f}%" if pd.notna(weight) else "N/A"),
                         "변동": f"{int(change):+,}" if pd.notna(change) and change != 0 else "-",
                     })
                 if rows:
                     return pd.DataFrame(rows)
     except Exception:
         pass
-
     return pd.DataFrame()
 
 
@@ -2608,19 +2583,20 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
     return results
 
 def fetch_short_interest(ticker_upper: str) -> dict:
-    """공매도 비율 + 숏 스퀴즈 — FMP short-float + key-metrics 사용."""
+    """공매도 비율 — FMP stable/short-interest 사용."""
     k = _fmp_key()
+    empty = {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
     if not k:
-        return {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
+        return empty
 
     short_pct = None
     days_to_cover = None
     shares_short = None
 
-    # 방법 1: FMP /short-float (Starter 플랜 제공)
+    # stable/short-interest
     try:
         r = requests.get(
-            f"https://financialmodelingprep.com/api/v4/short-float?symbol={ticker_upper}&apikey={k}",
+            f"{_FMP_BASE}/short-interest?symbol={ticker_upper}&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         if r.status_code == 200:
@@ -2628,11 +2604,12 @@ def fetch_short_interest(ticker_upper: str) -> dict:
             item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
             if item:
                 short_pct = to_float(
-                    item.get("shortFloatPercent") or item.get("shortFloat") or
-                    item.get("shortPercentOfFloat") or item.get("shortInterestPercent")
+                    item.get("shortPercent") or item.get("shortPercentFloat") or
+                    item.get("shortFloatPercent") or item.get("shortInterestPercent") or
+                    item.get("shortPercentOfFloat")
                 )
-                if short_pct and short_pct <= 1.0:
-                    short_pct = round(short_pct * 100, 2)
+                if short_pct is not None and pd.notna(short_pct) and float(short_pct) <= 1.0:
+                    short_pct = round(float(short_pct) * 100, 2)
                 days_to_cover = to_float(
                     item.get("daysToCover") or item.get("shortRatio") or item.get("daysTocover")
                 )
@@ -2642,43 +2619,10 @@ def fetch_short_interest(ticker_upper: str) -> dict:
     except Exception:
         pass
 
-    # 방법 2: FMP key-metrics-ttm (short ratio 포함)
-    if short_pct is None:
-        try:
-            r = requests.get(
-                f"{_FMP_BASE}/key-metrics-ttm?symbol={ticker_upper}&apikey={k}",
-                timeout=_FMP_TIMEOUT
-            )
-            if r.status_code == 200:
-                data = r.json()
-                km = data[0] if isinstance(data, list) and data else {}
-                sp = to_float(km.get("shortRatioTTM") or km.get("shortRatio"))
-                if pd.notna(sp):
-                    days_to_cover = sp
-        except Exception:
-            pass
-
-    # 방법 3: FMP profile (floatShares + sharesShort)
-    if short_pct is None:
-        try:
-            p = _fmp_profile(ticker_upper)
-            sp = to_float(
-                p.get("shortPercentOfFloat") or p.get("shortRatio") or
-                p.get("floatShort") or p.get("shortFloatPercent")
-            )
-            if pd.notna(sp):
-                short_pct = sp * 100 if sp <= 1.0 else sp
-        except Exception:
-            pass
-
     squeeze_risk = "N/A"
     if short_pct is not None and pd.notna(short_pct):
-        if float(short_pct) >= 20:
-            squeeze_risk = "🔥 높음 (Short Squeeze 주의)"
-        elif float(short_pct) >= 10:
-            squeeze_risk = "⚠️ 중간"
-        else:
-            squeeze_risk = "✅ 낮음"
+        v = float(short_pct)
+        squeeze_risk = "🔥 높음 (Short Squeeze 주의)" if v >= 20 else ("⚠️ 중간" if v >= 10 else "✅ 낮음")
 
     return {
         "short_pct": round(float(short_pct), 2) if short_pct is not None and pd.notna(short_pct) else None,
@@ -2844,55 +2788,28 @@ def _fmp_profile(ticker: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fmp_ratios(ticker: str) -> dict:
-    """ratios-ttm: ROE, Operating Margin, D/E, P/E, P/B — stable + v3 fallback"""
+    """ratios-ttm — stable API only (v3 legacy 차단됨)"""
     k = _fmp_key()
     if not k: return {}
-    # stable API 먼저
     try:
         r = requests.get(f"{_FMP_BASE}/ratios-ttm?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
         if r.status_code == 200:
             d = r.json()
-            result = d[0] if isinstance(d, list) and d else {}
-            if result and any(result.get(f) for f in ["returnOnEquityTTM","peRatioTTM","operatingProfitMarginTTM"]):
-                return result
-    except Exception:
-        pass
-    # v3 fallback
-    try:
-        r = requests.get(
-            f"https://financialmodelingprep.com/api/v3/ratios-ttm/{ticker}?apikey={k}",
-            timeout=_FMP_TIMEOUT
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d[0] if isinstance(d, list) and d else {}
+            return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
     except Exception:
         pass
     return {}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fmp_key_metrics(ticker: str) -> dict:
-    """key-metrics-ttm: P/E, P/B, EV/EBITDA, PEG, EPS — stable + v3 fallback"""
+    """key-metrics-ttm — stable API only (v3 legacy 차단됨)"""
     k = _fmp_key()
     if not k: return {}
     try:
         r = requests.get(f"{_FMP_BASE}/key-metrics-ttm?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
         if r.status_code == 200:
             d = r.json()
-            result = d[0] if isinstance(d, list) and d else {}
-            if result and any(result.get(f) for f in ["peRatioTTM","pbRatioTTM","evToEbitdaTTM"]):
-                return result
-    except Exception:
-        pass
-    # v3 fallback
-    try:
-        r = requests.get(
-            f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?apikey={k}",
-            timeout=_FMP_TIMEOUT
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d[0] if isinstance(d, list) and d else {}
+            return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
     except Exception:
         pass
     return {}
@@ -11318,18 +11235,43 @@ if st.session_state.get("logged_in"):
                 _sp_val = short_data.get('short_pct')
                 if _sp_val is not None and pd.notna(_sp_val) and float(_sp_val) >= 15:
                     st.warning(f"⚠️ 공매도 비율 {float(_sp_val):.1f}% — 높은 수준. 급등 시 Short Squeeze로 추가 상승 가능. 단, 하락 베팅이 많다는 의미이기도 해요.")
-                # 디버그: API 응답 원문 확인 (임시)
+                # 디버그: stable API 응답 원문 확인 (임시)
                 if _sp is None:
                     with st.expander("🔧 데이터 확인 (임시)", expanded=False):
                         k_debug = _fmp_key()
                         if k_debug:
+                            _tk_debug = str(selected_ticker).strip().upper()
                             try:
-                                r1 = requests.get(f"https://financialmodelingprep.com/api/v4/short-float?symbol={str(selected_ticker).strip().upper()}&apikey={k_debug}", timeout=5)
-                                st.write(f"v4/short-float 상태: {r1.status_code}")
-                                st.write(r1.json() if r1.status_code == 200 else r1.text[:200])
-                                r2 = requests.get(f"https://financialmodelingprep.com/api/v3/institutional-holder/{str(selected_ticker).strip().upper()}?apikey={k_debug}", timeout=5)
-                                st.write(f"v3/institutional-holder 상태: {r2.status_code}")
-                                st.write(r2.json() if r2.status_code == 200 else r2.text[:200])
+                                # stable/short-interest
+                                r1 = requests.get(f"{_FMP_BASE}/short-interest?symbol={_tk_debug}&apikey={k_debug}", timeout=5)
+                                st.write(f"stable/short-interest 상태: {r1.status_code}")
+                                if r1.status_code == 200:
+                                    st.write(r1.json())
+                                else:
+                                    st.write(r1.text[:300])
+                                # stable/institutional-ownership
+                                r2 = requests.get(f"{_FMP_BASE}/institutional-ownership?symbol={_tk_debug}&apikey={k_debug}", timeout=5)
+                                st.write(f"stable/institutional-ownership 상태: {r2.status_code}")
+                                if r2.status_code == 200:
+                                    st.write(r2.json()[:3] if isinstance(r2.json(), list) else r2.json())
+                                else:
+                                    st.write(r2.text[:300])
+                                # stable/key-metrics-ttm (Valuation 확인용)
+                                r3 = requests.get(f"{_FMP_BASE}/key-metrics-ttm?symbol={_tk_debug}&apikey={k_debug}", timeout=5)
+                                st.write(f"stable/key-metrics-ttm 상태: {r3.status_code}")
+                                if r3.status_code == 200:
+                                    d3 = r3.json()
+                                    st.write(d3[0] if isinstance(d3, list) and d3 else d3)
+                                else:
+                                    st.write(r3.text[:300])
+                                # stable/ratios-ttm
+                                r4 = requests.get(f"{_FMP_BASE}/ratios-ttm?symbol={_tk_debug}&apikey={k_debug}", timeout=5)
+                                st.write(f"stable/ratios-ttm 상태: {r4.status_code}")
+                                if r4.status_code == 200:
+                                    d4 = r4.json()
+                                    st.write(d4[0] if isinstance(d4, list) and d4 else d4)
+                                else:
+                                    st.write(r4.text[:300])
                             except Exception as _de:
                                 st.write(f"디버그 오류: {_de}")
             except Exception as _si_e:
