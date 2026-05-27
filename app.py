@@ -2232,13 +2232,24 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
-    """기관 보유 비중 — FMP stable/institutional-ownership 사용."""
+    """기관 보유 비중 — FMP stable/institutional-ownership/extract-analytics/holder 사용."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
+
+    # 최근 완료된 분기 계산
+    now = datetime.now()
+    q = (now.month - 1) // 3
+    year = now.year
+    if q == 0:
+        q = 4
+        year -= 1
+    quarter = str(q)
+
     try:
         r = requests.get(
-            f"{_FMP_BASE}/institutional-ownership?symbol={ticker_upper}&apikey={k}",
+            f"{_FMP_BASE}/institutional-ownership/extract-analytics/holder"
+            f"?symbol={ticker_upper}&year={year}&quarter={quarter}&limit=10&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         if r.status_code == 200:
@@ -2246,25 +2257,53 @@ def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
             if isinstance(data, list) and data:
                 rows = []
                 for item in data[:10]:
-                    holder = str(
-                        item.get("investorName") or item.get("holder") or
-                        item.get("name") or item.get("cik") or ""
-                    )
-                    shares = to_float(item.get("sharesNumber") or item.get("shares") or item.get("shareNumber"))
-                    weight = to_float(item.get("weightPercent") or item.get("weight") or item.get("percentage"))
-                    change = to_float(item.get("changeInSharesNumber") or item.get("change") or item.get("sharesChange"))
-                    if not holder:
+                    investor = str(item.get("investorName") or item.get("name") or "")
+                    weight = to_float(item.get("weight"))
+                    last_weight = to_float(item.get("lastWeight"))
+                    change_pct = to_float(item.get("changeInWeightPercentage") or item.get("changeInWeight"))
+                    shares = to_float(item.get("sharesNumber") or item.get("shares"))
+                    if not investor:
                         continue
                     rows.append({
-                        "기관명": holder,
+                        "기관명": investor[:28],
+                        "비중(%)": f"{float(weight):.2f}%" if pd.notna(weight) else "N/A",
+                        "전분기 비중": f"{float(last_weight):.2f}%" if pd.notna(last_weight) else "N/A",
+                        "비중 변화": f"{float(change_pct):+.2f}%" if pd.notna(change_pct) else "N/A",
                         "보유 주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
-                        "비중(%)": f"{float(weight)*100:.2f}%" if pd.notna(weight) and weight < 10 else (f"{float(weight):.2f}%" if pd.notna(weight) else "N/A"),
-                        "변동": f"{int(change):+,}" if pd.notna(change) and change != 0 else "-",
                     })
                 if rows:
                     return pd.DataFrame(rows)
     except Exception:
         pass
+
+    # fallback: symbol-positions-summary (요약 통계)
+    try:
+        r2 = requests.get(
+            f"{_FMP_BASE}/institutional-ownership/symbol-positions-summary"
+            f"?symbol={ticker_upper}&year={year}&quarter={quarter}&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r2.status_code == 200:
+            data2 = r2.json()
+            item = data2[0] if isinstance(data2, list) and data2 else {}
+            if item:
+                rows = [{
+                    "항목": "기관 투자자 수",
+                    "값": f"{int(item.get('investorsHolding', 0)):,}",
+                    "전분기 대비": f"{int(item.get('investorsHoldingChange', 0)):+,}",
+                }, {
+                    "항목": "13F 보유 주식 수",
+                    "값": f"{int(item.get('numberOfOf13Fshares', 0)):,}",
+                    "전분기 대비": f"{int(item.get('numberOfOf13FsharesChange', 0)):+,}",
+                }, {
+                    "항목": "기관 보유 비율",
+                    "값": f"{float(item.get('ownershipPercent', 0)):.2f}%",
+                    "전분기 대비": f"{float(item.get('ownershipPercentChange', 0)):+.2f}%",
+                }]
+                return pd.DataFrame(rows)
+    except Exception:
+        pass
+
     return pd.DataFrame()
 
 
@@ -2580,42 +2619,59 @@ def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
     return results
 
 def fetch_short_interest(ticker_upper: str) -> dict:
-    """공매도 비율 — FMP stable/short-interest 사용."""
+    """공매도 비율 — FMP stable/shares-float + quote 사용."""
     k = _fmp_key()
     empty = {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
     if not k:
         return empty
 
-    short_pct = None
-    days_to_cover = None
-    shares_short = None
+    float_shares = None
+    outstanding_shares = None
+    free_float_pct = None
 
-    # stable/short-interest
+    # shares-float 엔드포인트 (이미지 17에서 확인)
     try:
         r = requests.get(
-            f"{_FMP_BASE}/short-interest?symbol={ticker_upper}&apikey={k}",
+            f"{_FMP_BASE}/shares-float?symbol={ticker_upper}&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         if r.status_code == 200:
             data = r.json()
             item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
             if item:
-                short_pct = to_float(
-                    item.get("shortPercent") or item.get("shortPercentFloat") or
-                    item.get("shortFloatPercent") or item.get("shortInterestPercent") or
-                    item.get("shortPercentOfFloat")
-                )
-                if short_pct is not None and pd.notna(short_pct) and float(short_pct) <= 1.0:
-                    short_pct = round(float(short_pct) * 100, 2)
-                days_to_cover = to_float(
-                    item.get("daysToCover") or item.get("shortRatio") or item.get("daysTocover")
-                )
-                shares_short = to_float(
-                    item.get("shortInterest") or item.get("sharesShort") or item.get("shortVolume")
-                )
+                free_float_pct = to_float(item.get("freeFloat"))  # % 형태 (0~100)
+                float_shares = to_float(item.get("floatShares"))
+                outstanding_shares = to_float(item.get("outstandingShares"))
     except Exception:
         pass
 
+    # freeFloat는 유통 가능 비율 (Short %와 다름)
+    # Short Interest는 별도 데이터 소스 필요 — FMP Starter에서 직접 제공 안 됨
+    # quote에서 shortRatio 시도
+    short_pct = None
+    days_to_cover = None
+    try:
+        r2 = requests.get(
+            f"{_FMP_BASE}/quote/{ticker_upper}?apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r2.status_code == 200:
+            data2 = r2.json()
+            item2 = data2[0] if isinstance(data2, list) and data2 else {}
+            if item2:
+                # quote에 shortRatio, sharesShort 있을 수 있음
+                sr = to_float(item2.get("shortRatio") or item2.get("shortPercent"))
+                if pd.notna(sr):
+                    days_to_cover = sr if sr > 1 else None
+                ss = to_float(item2.get("sharesShort") or item2.get("shortInterest"))
+                if pd.notna(ss) and float_shares and float_shares > 0:
+                    short_pct = round(float(ss / float_shares * 100), 2)
+                elif pd.notna(ss) and outstanding_shares and outstanding_shares > 0:
+                    short_pct = round(float(ss / outstanding_shares * 100), 2)
+    except Exception:
+        pass
+
+    # freeFloat를 보조 정보로 활용 (유통주식 비율)
     squeeze_risk = "N/A"
     if short_pct is not None and pd.notna(short_pct):
         v = float(short_pct)
@@ -2624,8 +2680,10 @@ def fetch_short_interest(ticker_upper: str) -> dict:
     return {
         "short_pct": round(float(short_pct), 2) if short_pct is not None and pd.notna(short_pct) else None,
         "days_to_cover": round(float(days_to_cover), 1) if days_to_cover is not None and pd.notna(days_to_cover) else None,
-        "shares_short": int(shares_short) if shares_short is not None and pd.notna(shares_short) else None,
+        "shares_short": None,
         "squeeze_risk": squeeze_risk,
+        "free_float_pct": round(float(free_float_pct), 2) if free_float_pct is not None and pd.notna(free_float_pct) else None,
+        "float_shares": int(float_shares) if float_shares is not None and pd.notna(float_shares) else None,
     }
 
 
@@ -11419,10 +11477,23 @@ if st.session_state.get("logged_in"):
                 with si_c3:
                     st.metric("Short Squeeze 위험", short_data.get('squeeze_risk', 'N/A'))
 
+                # 유통주식 정보 추가
+                _ff = short_data.get('free_float_pct')
+                _fs = short_data.get('float_shares')
+                if _ff is not None or _fs is not None:
+                    ff_c1, ff_c2 = st.columns(2)
+                    with ff_c1:
+                        st.metric("유통주식 비율 (Free Float)",
+                                  f"{float(_ff):.2f}%" if _ff is not None else "N/A",
+                                  help="전체 발행주식 중 실제 시장에서 거래 가능한 비율")
+                    with ff_c2:
+                        st.metric("유통주식 수 (Float Shares)",
+                                  f"{int(_fs):,}" if _fs is not None else "N/A")
+
                 _sp_val = short_data.get('short_pct')
                 if _sp_val is not None and pd.notna(_sp_val) and float(_sp_val) >= 15:
                     st.warning(f"⚠️ 공매도 비율 {float(_sp_val):.1f}% — 높은 수준.")
-                if _sp is None:
+                if _sp is None and _ff is None:
                     st.caption("※ FMP Starter 플랜에서 Short Interest 미제공 (Premium 이상 필요)")
             except Exception as _si_e:
                 st.warning(f"공매도 데이터 로드 오류: {_si_e}")
