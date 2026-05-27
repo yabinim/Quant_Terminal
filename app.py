@@ -2976,8 +2976,8 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                 v = to_float(p.get("dcf"))
                 if pd.notna(v) and v > 0: info["_fmp_dcf"] = v
 
-    # ── key-metrics-ttm: EV/Sales, EV/FCF, ROE (실제 확인 필드) ────────
-    if not info.get("_fmp_ev_to_sales") or not info.get("_fmp_ev_to_fcf"):
+    # ── key-metrics-ttm: EV/Sales, EV/FCF, EV/EBITDA, ROE (실제 확인 필드) ──
+    if not info.get("_fmp_ev_to_sales") or not info.get("_fmp_ev_to_fcf") or not info.get("enterpriseToEbitda"):
         km = _fmp_key_metrics(ticker)
         if km:
             if not info.get("_fmp_ev_to_sales"):
@@ -2986,6 +2986,10 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
             if not info.get("_fmp_ev_to_fcf"):
                 v = to_float(km.get("evToFreeCashFlowTTM"))
                 if pd.notna(v) and v > 0: info["_fmp_ev_to_fcf"] = v
+            # EV/EBITDA — 실제 필드명은 대문자 EBITDA
+            if not info.get("enterpriseToEbitda"):
+                v = to_float(km.get("evToEBITDATTM") or km.get("evToEbitdaTTM"))
+                if pd.notna(v) and v > 0: info["enterpriseToEbitda"] = v
             if not info.get("marketCap"):
                 v = to_float(km.get("marketCapTTM"))
                 if pd.notna(v) and v > 0: info["marketCap"] = v
@@ -2994,17 +2998,21 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                 if pd.notna(v): info["returnOnEquity"] = v
 
     # ── ratios-ttm: 실제 API 응답에서 확인된 정확한 필드명 ────────────
-    _need_ratios = not all([info.get("trailingPE"), info.get("priceToBook"),
-                            info.get("debtToEquity"), info.get("operatingMargins")])
+    # operatingMargins만 채워져도 P/E 등이 없으면 다시 조회
+    _need_ratios = not all([
+        info.get("trailingPE"),
+        info.get("priceToBook"),
+        info.get("debtToEquity"),
+        info.get("operatingMargins"),
+        info.get("enterpriseToEbitda"),
+    ])
     if _need_ratios:
         rat = _fmp_ratios(ticker)
         if rat:
             if not info.get("trailingPE"):
                 v = to_float(rat.get("priceToEarningsRatioTTM"))
                 if pd.notna(v) and v > 0: info["trailingPE"] = v
-            if not info.get("forwardPE"):
-                v = to_float(rat.get("forwardPriceToEarningsGrowthRatioTTM"))
-                if pd.notna(v) and v > 0: info["forwardPE"] = v
+            # Forward P/E는 ratios-ttm에 전용 필드 없음 → profile에서 가져옴 (아래 profile 섹션에서 처리)
             if not info.get("priceToBook"):
                 v = to_float(rat.get("priceToBookRatioTTM"))
                 if pd.notna(v) and v > 0: info["priceToBook"] = v
