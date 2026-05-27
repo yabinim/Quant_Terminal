@@ -2988,9 +2988,14 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
     """
     info = dict(info)
 
-    # ── profile: 회사명·섹터·설명 (✅ 무료 제공 확인) ─────────────────
-    _need_prof = not all([info.get("longName") or info.get("shortName"),
-                          info.get("sector"), info.get("longBusinessSummary")])
+    # ── profile: 회사명·섹터·설명·밸류에이션 기본값 ─────────────────
+    # 밸류에이션 필드(P/E, EPS 등)가 없으면 항상 profile 조회
+    _need_prof = not all([
+        info.get("longName") or info.get("shortName"),
+        info.get("sector"),
+        info.get("longBusinessSummary"),
+        info.get("trailingPE") or info.get("trailingEps"),  # 밸류에이션도 체크
+    ])
     if _need_prof:
         p = _fmp_profile(ticker)
         if p:
@@ -3028,6 +3033,31 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                 info["earningsDate"] = [str(p["earningsAnnouncement"])[:10]]
             if p.get("isEtf") and not info.get("quoteType"):
                 info["quoteType"] = "ETF"
+            # ── profile에서 직접 밸류에이션 필드 추출 ─────────────────
+            if not info.get("trailingPE"):
+                v = to_float(p.get("pe") or p.get("peRatio"))
+                if pd.notna(v) and v > 0: info["trailingPE"] = v
+            if not info.get("forwardPE"):
+                v = to_float(p.get("forwardPE") or p.get("forwardPe"))
+                if pd.notna(v) and v > 0: info["forwardPE"] = v
+            if not info.get("trailingEps"):
+                v = to_float(p.get("eps") or p.get("epsActual"))
+                if pd.notna(v): info["trailingEps"] = v
+            if not info.get("priceToBook"):
+                v = to_float(p.get("priceToBook") or p.get("pbRatio"))
+                if pd.notna(v) and v > 0: info["priceToBook"] = v
+            if not info.get("beta"):
+                v = to_float(p.get("beta"))
+                if pd.notna(v): info["beta"] = v
+            if not info.get("dividendYield"):
+                v = to_float(p.get("lastDiv"))
+                price_v = to_float(p.get("price"))
+                if pd.notna(v) and pd.notna(price_v) and price_v > 0:
+                    info["dividendYield"] = v / price_v
+            # DCF 내재가치
+            if not info.get("_fmp_dcf"):
+                v = to_float(p.get("dcf"))
+                if pd.notna(v) and v > 0: info["_fmp_dcf"] = v
 
     # ── key-metrics-ttm: EV/Sales, EV/FCF (항상 시도) ───────────────
     # yfinance가 제공하지 않는 지표 → FMP에서 항상 가져옴
@@ -10664,6 +10694,7 @@ if st.session_state.get("logged_in"):
                         days_to_earn = (datetime.strptime(ne[:10], "%Y-%m-%d") - datetime.now()).days
                         earn_label = f"D-{days_to_earn}일" if days_to_earn >= 0 else f"{abs(days_to_earn)}일 전"
                         st.metric("다음 실적 발표", ne[:10], delta=earn_label)
+                        st.caption("※ FMP 제공 예정일. 미확인 상태일 수 있습니다.")
                     except Exception:
                         st.metric("다음 실적 발표", ne[:10])
                 else:
@@ -11249,7 +11280,7 @@ if st.session_state.get("logged_in"):
                     inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
 
                 if inst_df.empty:
-                    st.info("기관 보유 데이터를 가져오지 못했습니다.")
+                    st.info("기관 보유 데이터를 가져오지 못했습니다. (FMP Starter 플랜 데이터 제공 범위 확인 필요)")
                 else:
                     inst_df.columns = [str(c).strip() for c in inst_df.columns]
                     pct_col = next((c for c in inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
@@ -11287,6 +11318,20 @@ if st.session_state.get("logged_in"):
                 _sp_val = short_data.get('short_pct')
                 if _sp_val is not None and pd.notna(_sp_val) and float(_sp_val) >= 15:
                     st.warning(f"⚠️ 공매도 비율 {float(_sp_val):.1f}% — 높은 수준. 급등 시 Short Squeeze로 추가 상승 가능. 단, 하락 베팅이 많다는 의미이기도 해요.")
+                # 디버그: API 응답 원문 확인 (임시)
+                if _sp is None:
+                    with st.expander("🔧 데이터 확인 (임시)", expanded=False):
+                        k_debug = _fmp_key()
+                        if k_debug:
+                            try:
+                                r1 = requests.get(f"https://financialmodelingprep.com/api/v4/short-float?symbol={str(selected_ticker).strip().upper()}&apikey={k_debug}", timeout=5)
+                                st.write(f"v4/short-float 상태: {r1.status_code}")
+                                st.write(r1.json() if r1.status_code == 200 else r1.text[:200])
+                                r2 = requests.get(f"https://financialmodelingprep.com/api/v3/institutional-holder/{str(selected_ticker).strip().upper()}?apikey={k_debug}", timeout=5)
+                                st.write(f"v3/institutional-holder 상태: {r2.status_code}")
+                                st.write(r2.json() if r2.status_code == 200 else r2.text[:200])
+                            except Exception as _de:
+                                st.write(f"디버그 오류: {_de}")
             except Exception as _si_e:
                 st.warning(f"공매도 데이터 로드 오류: {_si_e}")
 
