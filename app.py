@@ -1377,38 +1377,35 @@ def fetch_dxy_latest_and_mean_deviation():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
-    """보유 종목의 다음 실적 발표일 — FMP earnings-calendar (날짜 범위 파라미터 사용)."""
+    """보유 종목의 다음 실적 발표일 — FMP earnings-calendar (symbol만 사용)."""
     k = _fmp_key()
     results = []
     today = datetime.now(timezone.utc).date()
-    # 오늘부터 6개월 후까지 범위로 요청
-    from_str = today.strftime("%Y-%m-%d")
-    to_str = (today + timedelta(days=180)).strftime("%Y-%m-%d")
     for tk in tickers:
         try:
             if not k:
                 continue
             r = requests.get(
-                f"{_FMP_BASE}/earnings-calendar?symbol={tk}&from={from_str}&to={to_str}&apikey={k}",
+                f"{_FMP_BASE}/earnings-calendar?symbol={tk}&apikey={k}",
                 timeout=_FMP_TIMEOUT
             )
             data = r.json() if r.status_code == 200 else []
             if isinstance(data, list) and data:
-                # 날짜 오름차순 정렬 후 첫 번째
-                dated = []
+                future_items = []
                 for item in data:
                     date_str = str(item.get("date") or "")[:10]
                     if not date_str or len(date_str) < 10:
                         continue
                     try:
                         dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-                        dated.append((dt, date_str, item))
+                        days_until = (dt - today).days
+                        if days_until >= 0:
+                            future_items.append((days_until, date_str, item))
                     except Exception:
                         continue
-                if dated:
-                    dated.sort(key=lambda x: x[0])
-                    dt, date_str, item = dated[0]
-                    days_until = (dt - today).days
+                if future_items:
+                    future_items.sort(key=lambda x: x[0])
+                    days_until, date_str, item = future_items[0]
                     results.append({
                         "ticker": tk,
                         "earnings_date": date_str,
@@ -2640,53 +2637,74 @@ def fetch_options_flow_summary(ticker_upper: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_insider_trading(ticker_upper: str) -> pd.DataFrame:
-    """인사이더 트레이딩 — FMP stable 여러 엔드포인트 시도."""
+    """인사이더 트레이딩 — FMP stable/insider-trading/search + statistics 사용."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
 
-    data = []
-    for endpoint in ["insider-trading", "insider-trading-rss-feed"]:
-        try:
-            r = requests.get(
-                f"{_FMP_BASE}/{endpoint}?symbol={ticker_upper}&limit=20&apikey={k}",
-                timeout=_FMP_TIMEOUT
-            )
-            if r.status_code == 200:
-                d = r.json()
-                if isinstance(d, list) and d:
-                    data = d
-                    break
-        except Exception:
-            continue
-
-    if not data:
-        return pd.DataFrame()
-
     rows = []
-    for item in data[:15]:
-        name = str(item.get("reportingName") or item.get("name") or item.get("filerName") or item.get("reporter") or "")
-        title = str(item.get("typeOfOwner") or item.get("title") or item.get("officerTitle") or item.get("relationship") or "")
-        tx_type = str(item.get("transactionType") or item.get("acquistionOrDisposition") or item.get("type") or "")
-        shares = to_float(item.get("securitiesTransacted") or item.get("shares") or item.get("sharesTransacted") or item.get("numberOfShares"))
-        price = to_float(item.get("price") or item.get("transactionPrice") or item.get("sharePrice"))
-        date_str = str(item.get("transactionDate") or item.get("filingDate") or item.get("date") or "")[:10]
-        if not name or not date_str:
-            continue
-        is_buy = any(w in tx_type.upper() for w in ["P-", "PURCHASE", "BUY", "ACQUI", "A-"])
-        is_sell = any(w in tx_type.upper() for w in ["S-", "SALE", "SELL", "DISPO", "D-"])
-        direction = "🟢 매수" if is_buy else ("🔴 매도" if is_sell else tx_type[:10])
-        value = shares * price if pd.notna(shares) and pd.notna(price) else None
-        rows.append({
-            "날짜": date_str,
-            "이름": name[:25],
-            "직책": title[:20],
-            "거래": direction,
-            "주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
-            "거래가": f"${price:.2f}" if pd.notna(price) else "N/A",
-            "거래금액": f"${value/1e6:.2f}M" if value and value >= 1e6 else (f"${value:,.0f}" if value else "N/A"),
-        })
+    # 정확한 엔드포인트: /stable/insider-trading/search?symbol=TSLA
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/insider-trading/search?symbol={ticker_upper}&limit=15&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and data:
+                for item in data[:15]:
+                    name = str(item.get("reportingName") or item.get("name") or "")
+                    title = str(item.get("typeOfOwner") or item.get("officerTitle") or "")
+                    tx_type = str(item.get("transactionType") or item.get("acquistionOrDisposition") or "")
+                    shares = to_float(item.get("securitiesTransacted") or item.get("shares"))
+                    price = to_float(item.get("price") or item.get("transactionPrice"))
+                    date_str = str(item.get("transactionDate") or item.get("filingDate") or "")[:10]
+                    if not name or not date_str:
+                        continue
+                    is_buy = any(w in tx_type.upper() for w in ["P-", "PURCHASE", "BUY", "A-AWARD", "A-"])
+                    is_sell = any(w in tx_type.upper() for w in ["S-", "SALE", "SELL", "D-", "DISPO"])
+                    direction = "🟢 매수" if is_buy else ("🔴 매도" if is_sell else tx_type[:12])
+                    value = shares * price if pd.notna(shares) and pd.notna(price) and price > 0 else None
+                    rows.append({
+                        "날짜": date_str,
+                        "이름": name[:25],
+                        "직책": title[:20],
+                        "거래유형": direction,
+                        "주식수": f"{int(shares):,}" if pd.notna(shares) else "N/A",
+                        "거래가": f"${price:.2f}" if pd.notna(price) and price > 0 else "N/A",
+                        "거래금액": f"${value/1e6:.2f}M" if value and value >= 1e6 else (f"${value:,.0f}" if value else "N/A"),
+                    })
+    except Exception:
+        pass
+
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_insider_statistics(ticker_upper: str) -> dict:
+    """인사이더 트레이딩 통계 요약 — FMP stable/insider-trading/statistics 사용."""
+    k = _fmp_key()
+    if not k:
+        return {}
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/insider-trading/statistics?symbol={ticker_upper}&apikey={k}",
+            timeout=_FMP_TIMEOUT
+        )
+        if r.status_code == 200:
+            data = r.json()
+            item = data[0] if isinstance(data, list) and data else {}
+            if item:
+                return {
+                    "acquired": to_float(item.get("acquiredTransactions") or item.get("totalAcquired")),
+                    "disposed": to_float(item.get("disposedTransactions") or item.get("totalDisposed")),
+                    "total_purchases": to_float(item.get("totalPurchases")),
+                    "total_sales": to_float(item.get("totalSales")),
+                    "ratio": to_float(item.get("acquiredDisposedRatio")),
+                }
+    except Exception:
+        pass
+    return {}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2743,21 +2761,17 @@ def fetch_analyst_price_targets(ticker_upper: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_senate_house_trading(ticker_upper: str) -> pd.DataFrame:
-    """상원/하원 의원 거래 — FMP stable 여러 엔드포인트 시도."""
+    """상원/하원 의원 거래 — FMP stable/senate-trading/search + house-disclosure/search 사용."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
     rows = []
+    # FMP 문서 기준 정확한 엔드포인트
     sources = [
-        ("senate-trading", "상원"),
-        ("senate-disclosure", "상원"),
-        ("house-disclosure", "하원"),
-        ("house-trading", "하원"),
+        ("senate-trading/search", "상원"),
+        ("house-disclosure/search", "하원"),
     ]
-    tried = set()
     for endpoint, source in sources:
-        if source in tried:
-            continue
         try:
             r = requests.get(
                 f"{_FMP_BASE}/{endpoint}?symbol={ticker_upper}&apikey={k}",
@@ -2766,12 +2780,12 @@ def fetch_senate_house_trading(ticker_upper: str) -> pd.DataFrame:
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, list) and data:
-                    tried.add(source)
                     for item in data[:8]:
-                        name = str(item.get("senator") or item.get("representative") or item.get("name") or item.get("member") or "")
-                        tx_type = str(item.get("type") or item.get("transactionType") or item.get("assetType") or "")
-                        amount = str(item.get("amount") or item.get("transactionAmount") or item.get("range") or "")
-                        date_s = str(item.get("transactionDate") or item.get("disclosureDate") or item.get("date") or item.get("dateRecieved") or "")[:10]
+                        name = str(item.get("senator") or item.get("representative") or item.get("name") or item.get("firstName", "") + " " + item.get("lastName", "") or "").strip()
+                        tx_type = str(item.get("type") or item.get("transactionType") or "")
+                        amount = str(item.get("amount") or item.get("transactionAmount") or "")
+                        date_s = str(item.get("transactionDate") or item.get("disclosureDate") or item.get("date") or "")[:10]
+                        asset = str(item.get("assetName") or item.get("asset") or ticker_upper)
                         if not name:
                             continue
                         rows.append({
@@ -3298,10 +3312,8 @@ def fetch_company_overview(ticker_upper: str) -> dict:
         k = _fmp_key()
         if k:
             try:
-                today_str = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
-                to_str = (datetime.now(timezone.utc).date() + timedelta(days=180)).strftime("%Y-%m-%d")
                 r = requests.get(
-                    f"{_FMP_BASE}/earnings-calendar?symbol={ticker_upper}&from={today_str}&to={to_str}&apikey={k}",
+                    f"{_FMP_BASE}/earnings-calendar?symbol={ticker_upper}&apikey={k}",
                     timeout=_FMP_TIMEOUT
                 )
                 cal = r.json() if r.status_code == 200 else []
@@ -11415,21 +11427,30 @@ if st.session_state.get("logged_in"):
             st.caption("CEO·CFO 등 내부자의 실제 매수/매도 거래. 대량 매수는 강한 내부 확신 신호입니다.")
             try:
                 with st.spinner("인사이더 거래 데이터 불러오는 중..."):
-                    insider_df = fetch_insider_trading(str(selected_ticker).strip().upper())
-                if insider_df.empty:
-                    st.info("인사이더 트레이딩 데이터를 가져오지 못했습니다.")
-                else:
-                    # 매수/매도 요약
-                    buy_rows = insider_df[insider_df["거래"].str.contains("매수", na=False)]
-                    sell_rows = insider_df[insider_df["거래"].str.contains("매도", na=False)]
+                    _tk_ins = str(selected_ticker).strip().upper()
+                    insider_df = fetch_insider_trading(_tk_ins)
+                    insider_stats = fetch_insider_statistics(_tk_ins)
+
+                # 통계 요약 먼저 표시
+                if insider_stats:
+                    purchases = insider_stats.get("total_purchases") or insider_stats.get("acquired")
+                    sales = insider_stats.get("total_sales") or insider_stats.get("disposed")
+                    ratio = insider_stats.get("ratio")
                     ins_c1, ins_c2, ins_c3 = st.columns(3)
                     with ins_c1:
-                        st.metric("최근 매수 건수", f"{len(buy_rows)}건")
+                        st.metric("내부자 매수 건수", f"{int(purchases)}건" if pd.notna(purchases) else "N/A")
                     with ins_c2:
-                        st.metric("최근 매도 건수", f"{len(sell_rows)}건")
+                        st.metric("내부자 매도 건수", f"{int(sales)}건" if pd.notna(sales) else "N/A")
                     with ins_c3:
-                        signal = "🟢 매수 우세" if len(buy_rows) > len(sell_rows) else ("🔴 매도 우세" if len(sell_rows) > len(buy_rows) else "⚪ 중립")
+                        if pd.notna(ratio) and purchases is not None and sales is not None:
+                            signal = "🟢 매수 우세" if float(purchases) > float(sales) else ("🔴 매도 우세" if float(sales) > float(purchases) else "⚪ 중립")
+                        else:
+                            signal = "N/A"
                         st.metric("내부자 방향성", signal)
+
+                if insider_df.empty:
+                    st.info("인사이더 트레이딩 상세 내역이 없습니다.")
+                else:
                     st.dataframe(insider_df, use_container_width=True, hide_index=True)
             except Exception as _ins_e:
                 st.warning(f"인사이더 트레이딩 로드 오류: {_ins_e}")
@@ -11481,7 +11502,7 @@ if st.session_state.get("logged_in"):
                 with st.spinner("의회 거래 데이터 불러오는 중..."):
                     congress_df = fetch_senate_house_trading(str(selected_ticker).strip().upper())
                 if congress_df.empty:
-                    st.info("의회 거래 데이터를 가져오지 못했습니다.")
+                    st.info("의회 거래 데이터를 가져오지 못했습니다. (FMP Starter 플랜 제공 범위 외)")
                 else:
                     buy_cnt = congress_df[congress_df["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)]
                     sell_cnt = congress_df[congress_df["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)]
