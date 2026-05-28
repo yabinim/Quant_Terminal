@@ -1215,8 +1215,47 @@ def macro_traffic_light(bad_total):
         )
 
 
+def _yield_spread_note(spread: float, t10: float, t3m: float, source: str) -> tuple:
+    """금리차 수치 → (status, note) 공통 판정 로직."""
+    detail = f"10Y {t10:.2f}% / 3M {t3m:.2f}% [{source}]"
+    if spread < 0:
+        status = MACRO_STATUS_WARN
+        note = f"수익률 곡선 역전(단기금리 > 장기): 침체·신용경색 우려 신호입니다. ({detail})"
+    elif spread < 0.3:
+        status = MACRO_STATUS_WARN
+        note = f"금리차 플러스이나 매우 좁은 구간 — 역전 전단계 모니터링 필요. ({detail})"
+    else:
+        status = MACRO_STATUS_PASS
+        note = f"장단기 금리차 플러스 구간입니다. 역전 신호 없음. ({detail})"
+    return spread, status, note
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yield_spread_latest():
-    """10Y-3M 국채 금리차 — FRED DGS10 / DTB3 사용."""
+    """10Y-3M 국채 금리차.
+    1순위: FMP Treasury Rates API (당일 실시간)
+    2순위: FRED DGS10 / DTB3 (전일 기준, 폴백)
+    """
+    k = _fmp_key()
+    # ── FMP 실시간 시도 ─────────────────────────────────────────────────
+    if k:
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/treasury-rates?apikey={k}",
+                timeout=_FMP_TIMEOUT,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    latest = data[0]
+                    t10 = to_float(latest.get("year10") or latest.get("tenYear"))
+                    t3m = to_float(latest.get("month3") or latest.get("threeMonth"))
+                    if pd.notna(t10) and pd.notna(t3m):
+                        spread = t10 - t3m
+                        return _yield_spread_note(spread, t10, t3m, "FMP 실시간")
+        except Exception:
+            pass
+    # ── FRED 폴백 ────────────────────────────────────────────────────────
     try:
         t10_s = fred.get_series("DGS10")
         t3m_s = fred.get_series("DTB3")
@@ -1225,13 +1264,7 @@ def fetch_yield_spread_latest():
         if pd.isna(t10) or pd.isna(t3m):
             return np.nan, MACRO_STATUS_NA, "데이터 부족 (N/A)"
         spread = t10 - t3m
-        if spread < 0:
-            status = MACRO_STATUS_WARN
-            note = "수익률 곡선 역전(단기금리 > 장기): 침체·신용경색 우려 신호입니다."
-        else:
-            status = MACRO_STATUS_PASS
-            note = "장단기 금리차 플러스 구간입니다. 역전 신호 없음으로 해석합니다."
-        return spread, status, note
+        return _yield_spread_note(spread, t10, t3m, "FRED 전일")
     except Exception:
         return np.nan, MACRO_STATUS_NA, "연산 또는 다운로드 오류"
 
@@ -1469,6 +1502,113 @@ def fetch_macro_history_series() -> dict:
     return out
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fmp_economic_indicator(name: str) -> tuple[float, float, str]:
+    """FMP Economic Indicators API — (latest_val, prev_val, date_str).
+    name 예: 'GDP', 'retailSales', 'unemploymentRate', 'consumerConfidence'
+    """
+    k = _fmp_key()
+    if not k:
+        return np.nan, np.nan, ""
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/economic-indicators?name={name}&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return np.nan, np.nan, ""
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return np.nan, np.nan, ""
+        latest_val = to_float(data[0].get("value"))
+        prev_val = to_float(data[1].get("value")) if len(data) > 1 else np.nan
+        date_str = str(data[0].get("date", ""))[:10]
+        return latest_val, prev_val, date_str
+    except Exception:
+        return np.nan, np.nan, ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fmp_market_risk_premium() -> tuple[float, str]:
+    """FMP Market Risk Premium API — (US ERP %, note)."""
+    k = _fmp_key()
+    if not k:
+        return np.nan, "FMP API 키 없음"
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/market-risk-premium?apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return np.nan, "데이터 없음"
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return np.nan, "데이터 없음"
+        # US 항목 우선, 없으면 첫 번째
+        us_item = next(
+            (d for d in data if str(d.get("country", "")).upper() in ("US", "UNITED STATES", "USA")),
+            data[0],
+        )
+        erp = to_float(us_item.get("totalEquityRiskPremium") or us_item.get("equityRiskPremium"))
+        country = str(us_item.get("country", "US"))
+        if pd.isna(erp):
+            return np.nan, "데이터 없음"
+        if erp >= 6.0:
+            note = f"ERP {erp:.2f}% — 주식이 채권 대비 매우 매력적. 밸류에이션 저평가 구간."
+        elif erp >= 4.0:
+            note = f"ERP {erp:.2f}% — 주식 위험 프리미엄 적정 구간."
+        else:
+            note = f"ERP {erp:.2f}% — 주식 프리미엄 낮음. 채권 대비 주식 매력 저하."
+        return erp, note
+    except Exception:
+        return np.nan, "조회 오류"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fmp_economic_calendar_risk() -> tuple[list, bool]:
+    """FMP Economic Calendar — 당일~3일 이내 고임팩트 US 이벤트 감지.
+    반환: (events_list, has_high_impact)
+    events_list: [{"date","event","impact","actual","estimate","prior"}]
+    """
+    k = _fmp_key()
+    if not k:
+        return [], False
+    try:
+        today = datetime.now(timezone.utc).date()
+        from_date = today.strftime("%Y-%m-%d")
+        to_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
+        r = requests.get(
+            f"{_FMP_BASE}/economic-calendar?from={from_date}&to={to_date}&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return [], False
+        data = r.json()
+        if not isinstance(data, list):
+            return [], False
+        events = []
+        for ev in data:
+            country = str(ev.get("country", "")).upper()
+            if country not in ("US", "USD", "UNITED STATES", ""):
+                continue
+            impact = str(ev.get("impact", "") or ev.get("importance", "") or "").capitalize()
+            event_name = str(ev.get("event", "") or ev.get("name", ""))
+            if not event_name:
+                continue
+            events.append({
+                "date":     str(ev.get("date", ""))[:10],
+                "event":    event_name,
+                "impact":   impact,
+                "actual":   ev.get("actual"),
+                "estimate": ev.get("estimate"),
+                "prior":    ev.get("previous") or ev.get("prior"),
+            })
+        has_high = any(e["impact"].lower() in ("high", "3") for e in events)
+        return events, has_high
+    except Exception:
+        return [], False
+
+
 def compute_macro_score(rows: list) -> tuple[float, str, str]:
     """
     6대 지표 + Fear&Greed + Fed Rate를 종합해 0~100 Macro Score 계산.
@@ -1644,6 +1784,72 @@ def analyze_us_macro_dashboard():
         "판정": macro_status_label(fed_status),
         "판독 요약": fed_note,
         "_status": fed_status,
+    })
+
+    # ── FMP GDP 성장률 ──────────────────────────────────────────────────
+    gdp_val, gdp_prev, gdp_date = fetch_fmp_economic_indicator("GDP")
+    gdp_chg = float(gdp_val - gdp_prev) if pd.notna(gdp_val) and pd.notna(gdp_prev) else np.nan
+    if pd.notna(gdp_val):
+        if gdp_val < 0:
+            gdp_st = MACRO_STATUS_FAIL
+            gdp_note = f"GDP 성장률 마이너스 ({gdp_val:.1f}%, {gdp_date}) — 기술적 침체 위험 구간."
+        elif gdp_val < 1.5:
+            gdp_st = MACRO_STATUS_WARN
+            gdp_note = f"GDP 성장 둔화 ({gdp_val:.1f}%, {gdp_date}) — 경기 모멘텀 약화 신호."
+        else:
+            gdp_st = MACRO_STATUS_PASS
+            gdp_note = f"GDP 성장 양호 ({gdp_val:.1f}%, {gdp_date}) — 실물 경기 안정권."
+    else:
+        gdp_st = MACRO_STATUS_NA
+        gdp_note = "GDP 데이터 없음 (FMP 조회 실패 또는 API 키 미설정)."
+    rows.append({
+        "지표": "GDP 성장률 (FMP)",
+        "현재값": f"{gdp_val:.1f}%" if pd.notna(gdp_val) else "N/A",
+        "판정": macro_status_label(gdp_st),
+        "판독 요약": gdp_note,
+        "_status": gdp_st,
+    })
+
+    # ── FMP Retail Sales (소매판매 MoM) ────────────────────────────────
+    rs_val, rs_prev, rs_date = fetch_fmp_economic_indicator("retailSales")
+    if pd.notna(rs_val):
+        if rs_val < -1.0:
+            rs_st = MACRO_STATUS_FAIL
+            rs_note = f"소매판매 급감 ({rs_val:.1f}%, {rs_date}) — 소비 위축, 경기 침체 우려."
+        elif rs_val < 0:
+            rs_st = MACRO_STATUS_WARN
+            rs_note = f"소매판매 감소 ({rs_val:.1f}%, {rs_date}) — 소비 모멘텀 둔화."
+        else:
+            rs_st = MACRO_STATUS_PASS
+            rs_note = f"소매판매 플러스 ({rs_val:.1f}%, {rs_date}) — 소비 체력 유지."
+    else:
+        rs_st = MACRO_STATUS_NA
+        rs_note = "소매판매 데이터 없음."
+    rows.append({
+        "지표": "소매판매 MoM (FMP)",
+        "현재값": f"{rs_val:.1f}%" if pd.notna(rs_val) else "N/A",
+        "판정": macro_status_label(rs_st),
+        "판독 요약": rs_note,
+        "_status": rs_st,
+    })
+
+    # ── FMP Market Risk Premium (ERP) ──────────────────────────────────
+    erp_val, erp_note = fetch_fmp_market_risk_premium()
+    if pd.notna(erp_val):
+        if erp_val >= 5.5:
+            erp_st = MACRO_STATUS_PASS
+        elif erp_val >= 3.5:
+            erp_st = MACRO_STATUS_WARN
+        else:
+            erp_st = MACRO_STATUS_FAIL
+    else:
+        erp_st = MACRO_STATUS_NA
+    rows.append({
+        "지표": "주식 위험 프리미엄 ERP (FMP)",
+        "현재값": f"{erp_val:.2f}%" if pd.notna(erp_val) else "N/A",
+        "판정": macro_status_label(erp_st),
+        "판독 요약": erp_note,
+        "_status": erp_st,
     })
 
     bad_total = sum(1 for r in rows if macro_status_bad_count(r["_status"]))
@@ -2082,7 +2288,7 @@ def cached_analyze_us_macro_dashboard():
 def get_macro_dashboard_with_validation():
     """rows가 8개 미만이면 캐시를 자동 무효화하고 재호출."""
     pack = cached_analyze_us_macro_dashboard()
-    if pack and len(pack.get("rows", [])) < 8:
+    if pack and len(pack.get("rows", [])) < 10:
         cached_analyze_us_macro_dashboard.clear()
         pack = cached_analyze_us_macro_dashboard()
     return pack
@@ -2348,12 +2554,12 @@ def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 @st.cache_data(ttl=1800, show_spinner=False)
 def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     """
-    Daily Risk Gauge — 하락장 선행 신호 5가지 종합 점수.
+    Daily Risk Gauge — 하락장 선행 신호 6가지 종합 점수.
     sector_filter: "전체" | "테크·반도체" | "에너지" | "금융" | "헬스케어" | "산업재"
+    신호 6: FMP Economic Calendar 이벤트 리스크 (당일~3일 이내 고임팩트 이벤트)
     """
     import time as _time
 
@@ -2502,6 +2708,48 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
 
+    # ── 신호 6: 이벤트 리스크 (FMP Economic Calendar) ────────────────────
+    try:
+        cal_events, has_high_impact = fetch_fmp_economic_calendar_risk()
+        if cal_events:
+            high_events = [e for e in cal_events if e["impact"].lower() in ("high", "3")]
+            med_events  = [e for e in cal_events if e["impact"].lower() in ("medium", "2")]
+            event_alert = has_high_impact
+            if high_events:
+                ev_names = ", ".join(e["event"] for e in high_events[:3])
+                ev_dates = high_events[0]["date"]
+                signals["event_risk"] = {
+                    "ok":    False,
+                    "value": f"고임팩트 {len(high_events)}건",
+                    "trend": ev_names[:60],
+                }
+                details["이벤트 리스크"] = {
+                    "고임팩트": f"{len(high_events)}건 ({ev_dates}~)",
+                    "주요 이벤트": ev_names[:80],
+                    "판정": "⚠️ 변동성 확대 주의",
+                }
+                warnings.append(
+                    f"⚠️ 고임팩트 경제 이벤트 {len(high_events)}건 예정 "
+                    f"({ev_dates}): {ev_names[:60]}"
+                )
+            elif med_events:
+                signals["event_risk"] = {
+                    "ok":    True,
+                    "value": f"중간 임팩트 {len(med_events)}건",
+                    "trend": "",
+                }
+                details["이벤트 리스크"] = {
+                    "중간임팩트": f"{len(med_events)}건",
+                    "판정": "✅ 고임팩트 없음",
+                }
+            else:
+                signals["event_risk"] = {"ok": True, "value": "고임팩트 이벤트 없음", "trend": ""}
+                details["이벤트 리스크"] = {"판정": "✅ 3일 이내 고임팩트 없음"}
+        else:
+            signals["event_risk"] = {"ok": True, "value": "캘린더 조회 불가", "trend": ""}
+    except Exception:
+        signals["event_risk"] = {"ok": True, "value": "N/A", "trend": ""}
+
     # ── 뉴스 수집 ─────────────────────────────────────────────────────────
     news_items = []
     k = _fmp_key()
@@ -2565,6 +2813,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         "details": details,
         "news_items": news_items,
         "sector_filter": sector_filter,
+        "event_calendar": cal_events if "cal_events" in dir() else [],
     }
 
 
@@ -9358,7 +9607,7 @@ if st.session_state.get("logged_in"):
         # 🚨 Daily Risk Gauge
         # ─────────────────────────────────────────────────────────────────────
         st.subheader("🚨 Daily Risk Gauge")
-        st.caption("매일 접속 시 시장 하락 선행 신호 5가지를 자동 스캔합니다. 전날 미리 경고를 포착하는 게 목표예요.")
+        st.caption("매일 접속 시 시장 하락 선행 신호 6가지를 자동 스캔합니다. 전날 미리 경고를 포착하는 게 목표예요.")
 
         drg_col1, drg_col2 = st.columns([2, 3])
         with drg_col1:
@@ -9373,7 +9622,7 @@ if st.session_state.get("logged_in"):
         if st.button("🔄 지금 스캔", key="drg_refresh_btn", use_container_width=True):
             compute_daily_risk_gauge.clear()
 
-        with st.spinner("선행 지표 5가지 분석 중..."):
+        with st.spinner("선행 지표 6가지 분석 중..."):
             drg = compute_daily_risk_gauge(sector_filter=sector_choice)
 
         risk_score = drg["risk_score"]
@@ -9395,17 +9644,18 @@ if st.session_state.get("logged_in"):
             unsafe_allow_html=True
         )
 
-        st.markdown("### 📡 선행 신호 5가지")
+        st.markdown("### 📡 선행 신호 6가지")
         sig = drg["signals"]
-        s_col1, s_col2, s_col3, s_col4, s_col5 = st.columns(5)
+        s_col1, s_col2, s_col3, s_col4, s_col5, s_col6 = st.columns(6)
         signal_defs = [
-            ("vix",     "VIX 방향",     "🌡️"),
-            ("credit",  "신용 스프레드", "💳"),
-            ("leaders", "대장주 모멘텀", "🏆"),
-            ("volume",  "거래량 패턴",   "📦"),
-            ("vix_vxn", "VIX/VXN",      "⚡"),
+            ("vix",        "VIX 방향",      "🌡️"),
+            ("credit",     "신용 스프레드",  "💳"),
+            ("leaders",    "대장주 모멘텀",  "🏆"),
+            ("volume",     "거래량 패턴",    "📦"),
+            ("vix_vxn",    "VIX/VXN",       "⚡"),
+            ("event_risk", "이벤트 리스크",  "📅"),
         ]
-        for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5], signal_defs):
+        for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5, s_col6], signal_defs):
             with col:
                 s = sig.get(key, {})
                 ok = s.get("ok", True)
@@ -9431,6 +9681,37 @@ if st.session_state.get("logged_in"):
                 st.warning(w)
         else:
             st.success("✅ 현재 감지된 선행 경고 신호 없음 — 시장 환경 정상")
+
+        # ── 이벤트 캘린더 카드 (신호 6 상세) ─────────────────────────────
+        event_cal = drg.get("event_calendar", [])
+        if event_cal:
+            st.divider()
+            st.markdown("### 📅 3일 이내 경제 이벤트 캘린더 (FMP)")
+            ev_cols_header = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
+            for hdr, txt in zip(ev_cols_header, ["날짜", "이벤트", "임팩트", "실제", "예상", "이전"]):
+                hdr.markdown(f"**{txt}**")
+            for ev in event_cal[:12]:
+                impact = ev.get("impact", "")
+                impact_color = (
+                    "#dc2626" if impact.lower() in ("high", "3")
+                    else "#f59e0b" if impact.lower() in ("medium", "2")
+                    else "#64748b"
+                )
+                impact_emoji = (
+                    "🔴 High" if impact.lower() in ("high", "3")
+                    else "🟡 Medium" if impact.lower() in ("medium", "2")
+                    else "⚪ Low"
+                )
+                def _fmt_ev_val(v):
+                    return str(v) if v is not None and str(v).strip() not in ("", "None") else "—"
+                ev_cols = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
+                ev_cols[0].markdown(f"`{ev.get('date','')}`")
+                ev_cols[1].markdown(ev.get("event", ""))
+                ev_cols[2].markdown(f"<span style='color:{impact_color};font-weight:700'>{impact_emoji}</span>", unsafe_allow_html=True)
+                ev_cols[3].markdown(_fmt_ev_val(ev.get("actual")))
+                ev_cols[4].markdown(_fmt_ev_val(ev.get("estimate")))
+                ev_cols[5].markdown(_fmt_ev_val(ev.get("prior")))
+            st.caption("📌 FMP Economic Calendar 기준. FMP API 키 미설정 시 표시되지 않습니다.")
 
         with st.expander("🔍 신호 상세 데이터", expanded=False):
             for key, data in drg.get("details", {}).items():
@@ -9466,7 +9747,7 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.markdown("### 🤖 AI 내일 시장 예측")
-        st.caption("선행 신호 5가지 + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 자기 전 또는 장 열리기 전 실행 권장.")
+        st.caption("선행 신호 6가지 + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 자기 전 또는 장 열리기 전 실행 권장.")
 
         if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
             with st.spinner("최신 데이터 수집 중..."):
@@ -9501,6 +9782,17 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     macro_summary = "데이터 없음"
 
+            # 4) 이벤트 캘린더 요약
+            fresh_events = fresh_drg.get("event_calendar", [])
+            if fresh_events:
+                event_summary = "\n".join([
+                    f"- {e['date']} [{e['impact']}] {e['event']}"
+                    + (f" (예상: {e['estimate']})" if e.get("estimate") is not None else "")
+                    for e in fresh_events[:6]
+                ])
+            else:
+                event_summary = "이벤트 없음 또는 조회 불가"
+
             signal_summary = "\n".join([
                 f"- {label}: {'정상' if fresh_sig.get(key, {}).get('ok', True) else '경고'} | {fresh_sig.get(key, {}).get('value', 'N/A')}"
                 for key, label, _ in signal_defs
@@ -9514,8 +9806,9 @@ if st.session_state.get("logged_in"):
                 "아래 실시간 데이터를 바탕으로 내일 미국 주식시장을 예측하세요.\n\n"
                 f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
                 f"[분석 섹터] {sector_choice}\n\n"
-                f"[선행 신호 5가지]\n{signal_summary}\n\n"
+                f"[선행 신호 6가지]\n{signal_summary}\n\n"
                 f"[감지된 경고]\n{warning_text}\n\n"
+                f"[3일 이내 주요 경제 이벤트]\n{event_summary}\n\n"
                 f"[거시경제 지표]\n{macro_summary}\n\n"
                 f"[오늘의 주요 뉴스 ({rss_news_count}개 소스)]\n{rss_news_text}\n\n"
                 "---\n"
@@ -9712,7 +10005,7 @@ if st.session_state.get("logged_in"):
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
         st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 미국 거시경제 대시보드")
-        st.caption("yfinance + FRED API + CNN Fear & Greed 기준. 판단은 참고용 휴리스틱입니다.")
+        st.caption("FRED API + FMP Treasury/Economics API 기준. 금리차는 FMP 실시간, 월간 지표는 FRED. 판단은 참고용 휴리스틱입니다.")
 
         try:
             with st.spinner("매크로 지표를 불러오는 중..."):
@@ -9768,8 +10061,8 @@ if st.session_state.get("logged_in"):
             with st.spinner("히스토리 데이터 로딩 중..."):
                 hist_data = fetch_macro_history_series()
 
-            chart_tab1, chart_tab2, chart_tab3, chart_tab4, chart_tab5 = st.tabs(
-                ["VIX", "CPI YoY", "실업률", "Fed Rate", "DXY"]
+            chart_tab1, chart_tab2, chart_tab3, chart_tab4, chart_tab5, chart_tab6, chart_tab7 = st.tabs(
+                ["VIX", "CPI YoY", "실업률", "Fed Rate", "DXY", "GDP", "소매판매"]
             )
             with chart_tab1:
                 vix_hist = macro_pack.get("vix_hist")
@@ -9812,6 +10105,30 @@ if st.session_state.get("logged_in"):
                 else:
                     st.warning("DXY 데이터를 불러오지 못했습니다.")
 
+            with chart_tab6:
+                try:
+                    gdp_row = next((r for r in macro_pack.get("rows", []) if "GDP" in r.get("지표", "")), None)
+                    if gdp_row and gdp_row.get("현재값", "N/A") != "N/A":
+                        st.metric("GDP 성장률 (최신)", gdp_row["현재값"])
+                        st.info(gdp_row["판독 요약"])
+                        st.caption("💡 0% 이하 2분기 연속 = 기술적 침체. 1.5% 미만이면 둔화 신호.")
+                    else:
+                        st.warning("GDP 데이터를 불러오지 못했습니다. FMP API 키를 확인하세요.")
+                except Exception:
+                    st.warning("GDP 데이터 조회 중 오류가 발생했습니다.")
+
+            with chart_tab7:
+                try:
+                    rs_row = next((r for r in macro_pack.get("rows", []) if "소매판매" in r.get("지표", "")), None)
+                    if rs_row and rs_row.get("현재값", "N/A") != "N/A":
+                        st.metric("소매판매 MoM (최신)", rs_row["현재값"])
+                        st.info(rs_row["판독 요약"])
+                        st.caption("💡 소비 체력의 핵심 선행 지표. 마이너스 전환 시 경기 둔화 신호.")
+                    else:
+                        st.warning("소매판매 데이터를 불러오지 못했습니다. FMP API 키를 확인하세요.")
+                except Exception:
+                    st.warning("소매판매 데이터 조회 중 오류가 발생했습니다.")
+
             st.divider()
 
             # ── 3. 전체 지표 카드 ─────────────────────────────────────────
@@ -9835,17 +10152,21 @@ if st.session_state.get("logged_in"):
 
             with st.expander("📖 거시경제 지표 해석 가이드", expanded=False):
                 st.markdown("""
-| 지표 | 의미 | 주식 시장 영향 |
-|---|---|---|
-| 장단기 금리차 | 경기 침체 예고 신호 | 역전 시 침체 우려, 정상화 시 폭락 가능 |
-| VIX | 투자자 공포·탐욕 수준 | 20 이하 안정, 35 이상 극단적 공포 |
-| WTI 유가 | 인플레이션·비용 압력 | 급등 시 성장주 밸류에이션 타격 |
-| 실업률 (샴) | 소비 체력·침체 진입 | 샴 발동 시 실물 위기 시작 |
-| CPI YoY | 연준 금리 결정 방향 | 3% 이상 시 고금리 유지 (성장주 악재) |
-| DXY | 글로벌 달러 위상 | 강세 시 다국적 기업 해외 실적 악화 |
-| Fear & Greed | 시장 심리 종합 | 75+ 극단적 탐욕(매도 고려), 25- 극단적 공포(매수 고려) |
-| Fed Funds Rate | 현재 기준금리 | 5% 이상 고금리 레짐, 인하 시 성장주 재평가 |
+| 지표 | 소스 | 의미 | 주식 시장 영향 |
+|---|---|---|---|
+| 장단기 금리차 | FMP 실시간 / FRED 폴백 | 경기 침체 예고 신호 | 역전 시 침체 우려, 좁아질수록 위험 |
+| VIX | FRED | 투자자 공포·탐욕 수준 | 20 이하 안정, 35 이상 극단적 공포 |
+| WTI 유가 | FRED | 인플레이션·비용 압력 | 급등 시 성장주 밸류에이션 타격 |
+| 실업률 (샴) | FRED | 소비 체력·침체 진입 | 샴 발동 시 실물 위기 시작 |
+| CPI YoY | FRED | 연준 금리 결정 방향 | 3% 이상 시 고금리 유지 (성장주 악재) |
+| DXY | FRED | 글로벌 달러 위상 | 강세 시 다국적 기업 해외 실적 악화 |
+| Fear & Greed | VIX 백분위 근사 | 시장 심리 종합 | 75+ 극단적 탐욕(매도 고려), 25- 극단적 공포(매수 고려) |
+| Fed Funds Rate | FRED | 현재 기준금리 | 5% 이상 고금리 레짐, 인하 시 성장주 재평가 |
+| GDP 성장률 | FMP Economics | 실물 경기 방향 | 마이너스 2분기 = 기술적 침체, 1.5% 미만 = 둔화 경보 |
+| 소매판매 MoM | FMP Economics | 소비 체력 선행 | 마이너스 전환 시 소비 위축·경기 둔화 선행 신호 |
+| 주식 위험 프리미엄 ERP | FMP | 주식 vs 채권 매력도 | ERP 높을수록 주식 저평가, 낮을수록 채권 선호 국면 |
 """)
+                st.caption("📌 FMP Economics API 항목은 FMP_API_KEY 설정 시에만 조회됩니다.")
 
         except Exception as e:
             st.error("거시경제 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
