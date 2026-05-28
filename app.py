@@ -1129,8 +1129,8 @@ def usd_short_str(value):
 
 def pass_fail_badge(passed, no_data=False):
     if no_data:
-        return ":gray[No Data]"
-    return ":green[Pass]" if passed else ":red[Fail]"
+        return "⚫ N/A"
+    return "✅ Pass" if passed else "❌ Fail"
 
 
 def get_latest_series_value(df, row_name):
@@ -3245,78 +3245,68 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                             if pd.notna(v): info["marketCap"] = v
         except Exception:
             pass
-
-    # ── profile 보완 필드 (quote 블록과 독립) ──────────────────────────────
-    try:
-        _p = _fmp_profile(ticker)
-        if _p:
-            if not info.get("earningsDate") and _p.get("earningsAnnouncement"):
-                info["earningsDate"] = [str(_p["earningsAnnouncement"])[:10]]
-            if _p.get("isEtf") and not info.get("quoteType"):
+            if not info.get("earningsDate") and p.get("earningsAnnouncement"):
+                info["earningsDate"] = [str(p["earningsAnnouncement"])[:10]]
+            if p.get("isEtf") and not info.get("quoteType"):
                 info["quoteType"] = "ETF"
+            # ── profile에서 직접 밸류에이션 필드 추출 ─────────────────
             if not info.get("trailingPE"):
-                v = to_float(_p.get("pe") or _p.get("peRatio"))
+                v = to_float(p.get("pe") or p.get("peRatio"))
                 if pd.notna(v) and v > 0: info["trailingPE"] = v
-            if not info.get("trailingEps"):
-                v = to_float(_p.get("eps") or _p.get("epsActual"))
-                if pd.notna(v): info["trailingEps"] = v
-            if not info.get("priceToBook"):
-                v = to_float(_p.get("priceToBook") or _p.get("pbRatio"))
-                if pd.notna(v) and v > 0: info["priceToBook"] = v
-            if not info.get("beta"):
-                v = to_float(_p.get("beta"))
-                if pd.notna(v): info["beta"] = v
-            if not info.get("dividendYield"):
-                v = to_float(_p.get("lastDiv"))
-                price_v = to_float(_p.get("price"))
-                if pd.notna(v) and pd.notna(price_v) and price_v > 0:
-                    info["dividendYield"] = v / price_v
-            if not info.get("_fmp_dcf"):
-                v = to_float(_p.get("dcf"))
-                if pd.notna(v) and v > 0: info["_fmp_dcf"] = v
-    except Exception:
-        pass
+            if not info.get("forwardPE"):
+                v = to_float(p.get("forwardPE") or p.get("forwardPe"))
+                if pd.notna(v) and v > 0: info["forwardPE"] = v
 
-    # ── analyst-estimates: Forward P/E 계산 ────────────────────────────────
-    # 실제 API 응답: epsAvg 필드 사용, period=annual&limit=4로 가장 가까운 연도 우선
+    # ── analyst-estimates: Forward P/E 계산 (profile에 없을 때) ─────
     if not info.get("forwardPE"):
         try:
             k_val = _fmp_key()
             if k_val:
                 r_ae = requests.get(
-                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k_val}",
+                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&limit=4&apikey={k_val}",
                     timeout=_FMP_TIMEOUT
                 )
                 if r_ae.status_code == 200:
                     ae_data = r_ae.json()
                     if isinstance(ae_data, list) and ae_data:
+                        # 현재 연도 이후 첫 번째 예상치 사용
                         current_year = datetime.now().year
-                        # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
-                        ae_sorted = sorted(
-                            ae_data,
-                            key=lambda x: str(x.get("date") or x.get("year") or "9999")
-                        )
-                        for ae in ae_sorted:
-                            ae_year_str = str(ae.get("date") or ae.get("year") or "")[:4]
+                        for ae in ae_data:
+                            ae_date = str(ae.get("date") or ae.get("year") or "")[:4]
                             try:
-                                ae_year = int(ae_year_str)
+                                if int(ae_date) >= current_year:
+                                    est_eps = to_float(
+                                        ae.get("estimatedEpsAvg") or ae.get("estimatedEps") or
+                                        ae.get("epsAvg") or ae.get("eps")
+                                    )
+                                    cur_price = to_float(info.get("currentPrice") or info.get("price"))
+                                    if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
+                                        fwd_pe = round(cur_price / est_eps, 2)
+                                        if 0 < fwd_pe < 2000:
+                                            info["forwardPE"] = fwd_pe
+                                        break
                             except Exception:
                                 continue
-                            if ae_year < current_year:
-                                continue
-                            # 실제 API 필드명: epsAvg (확인됨)
-                            est_eps = to_float(
-                                ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
-                                ae.get("estimatedEps") or ae.get("eps")
-                            )
-                            cur_price = to_float(info.get("currentPrice") or info.get("price"))
-                            if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
-                                fwd_pe = round(float(cur_price) / float(est_eps), 2)
-                                if 0 < fwd_pe < 2000:
-                                    info["forwardPE"] = fwd_pe
-                                    break
         except Exception:
             pass
+            if not info.get("trailingEps"):
+                v = to_float(p.get("eps") or p.get("epsActual"))
+                if pd.notna(v): info["trailingEps"] = v
+            if not info.get("priceToBook"):
+                v = to_float(p.get("priceToBook") or p.get("pbRatio"))
+                if pd.notna(v) and v > 0: info["priceToBook"] = v
+            if not info.get("beta"):
+                v = to_float(p.get("beta"))
+                if pd.notna(v): info["beta"] = v
+            if not info.get("dividendYield"):
+                v = to_float(p.get("lastDiv"))
+                price_v = to_float(p.get("price"))
+                if pd.notna(v) and pd.notna(price_v) and price_v > 0:
+                    info["dividendYield"] = v / price_v
+            # DCF 내재가치
+            if not info.get("_fmp_dcf"):
+                v = to_float(p.get("dcf"))
+                if pd.notna(v) and v > 0: info["_fmp_dcf"] = v
 
     # ── key-metrics-ttm: EV/Sales, EV/FCF, EV/EBITDA, ROE (실제 확인 필드) ──
     if not info.get("_fmp_ev_to_sales") or not info.get("_fmp_ev_to_fcf") or not info.get("enterpriseToEbitda"):
@@ -3454,90 +3444,82 @@ def fetch_company_overview(ticker_upper: str) -> dict:
         website = str(info.get("website") or p.get("website") or "")
         sector_kr = translate_ko(sector_en, _SECTOR_KR) if sector_en else "N/A"
         industry_kr = translate_ko(industry_en, _INDUSTRY_KR) if industry_en else "N/A"
-        # 다음 실적 발표일 — FMP 4단계 순차 시도 (내일 이후 날짜만)
+        # 다음 실적 발표일 — FMP earnings-calendar (내일 이후만)
         next_earnings = None
         k = _fmp_key()
         tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1))
-
-        def _first_future_date(items):
-            """리스트에서 내일 이후 가장 이른 날짜 반환."""
-            future = []
-            for it in (items if isinstance(items, list) else []):
-                ds = str(it.get("date") or "")[:10]
-                if not ds or len(ds) < 10:
-                    continue
-                try:
-                    if datetime.strptime(ds, "%Y-%m-%d").date() >= tomorrow:
-                        future.append(ds)
-                except Exception:
-                    continue
-            return sorted(future)[0] if future else None
-
         if k:
-            # 1) earnings-calendar
             try:
                 r = requests.get(
                     f"{_FMP_BASE}/earnings-calendar?symbol={ticker_upper}&apikey={k}",
                     timeout=_FMP_TIMEOUT
                 )
-                if r.status_code == 200:
-                    next_earnings = _first_future_date(r.json())
+                cal = r.json() if r.status_code == 200 else []
+                future_dates = []
+                for item in (cal if isinstance(cal, list) else []):
+                    date_str = str(item.get("date") or "")[:10]
+                    if not date_str or len(date_str) < 10:
+                        continue
+                    try:
+                        dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        if dt >= tomorrow:  # 내일 이후만
+                            future_dates.append(date_str)
+                    except Exception:
+                        continue
+                if future_dates:
+                    next_earnings = sorted(future_dates)[0]
             except Exception:
                 pass
-
-            # 2) earnings (Earnings Report API — 미래 예정 포함)
-            if not next_earnings:
-                try:
-                    r2 = requests.get(
-                        f"{_FMP_BASE}/earnings?symbol={ticker_upper}&apikey={k}",
-                        timeout=_FMP_TIMEOUT
-                    )
-                    if r2.status_code == 200:
-                        next_earnings = _first_future_date(r2.json())
-                except Exception:
-                    pass
-
-            # 3) analyst-estimates 분기별
-            if not next_earnings:
-                try:
-                    r3 = requests.get(
-                        f"{_FMP_BASE}/analyst-estimates?symbol={ticker_upper}&period=quarter&limit=4&apikey={k}",
-                        timeout=_FMP_TIMEOUT
-                    )
-                    if r3.status_code == 200:
-                        next_earnings = _first_future_date(r3.json())
-                except Exception:
-                    pass
-
-            # 4) quote earningsAnnouncement
-            if not next_earnings:
-                try:
-                    rq = requests.get(
-                        f"{_FMP_BASE}/quote?symbol={ticker_upper}&apikey={k}",
-                        timeout=_FMP_TIMEOUT
-                    )
-                    if rq.status_code == 200:
-                        qd = rq.json()
-                        q_item = qd[0] if isinstance(qd, list) and qd else {}
-                        ann = str(q_item.get("earningsAnnouncement") or "")[:10]
-                        if ann and len(ann) == 10:
-                            try:
-                                if datetime.strptime(ann, "%Y-%m-%d").date() >= tomorrow:
-                                    next_earnings = ann
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-        # profile earningsAnnouncement fallback
+        # profile fallback도 내일 이후만
         if not next_earnings:
             ann = str(p.get("earningsAnnouncement") or "")[:10]
             if ann and len(ann) == 10:
                 try:
-                    if datetime.strptime(ann, "%Y-%m-%d").date() >= tomorrow:
+                    ann_dt = datetime.strptime(ann, "%Y-%m-%d").date()
+                    if ann_dt >= tomorrow:
                         next_earnings = ann
                 except Exception:
                     pass
+        # analyst-estimates fallback (날짜 정보 포함될 때)
+        if not next_earnings and k:
+            try:
+                r3 = requests.get(
+                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker_upper}&period=quarter&limit=4&apikey={k}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if r3.status_code == 200:
+                    ae_data = r3.json()
+                    if isinstance(ae_data, list):
+                        for ae in ae_data:
+                            ae_date = str(ae.get("date") or "")[:10]
+                            if not ae_date or len(ae_date) < 10:
+                                continue
+                            try:
+                                ae_dt = datetime.strptime(ae_date, "%Y-%m-%d").date()
+                                if ae_dt >= tomorrow:
+                                    next_earnings = ae_date
+                                    break
+                            except Exception:
+                                continue
+            except Exception:
+                pass
+        # quote의 earningsAnnouncement 필드
+        if not next_earnings and k:
+            try:
+                rq = requests.get(f"{_FMP_BASE}/quote/{ticker_upper}?apikey={k}", timeout=_FMP_TIMEOUT)
+                if rq.status_code == 200:
+                    qd = rq.json()
+                    q_item = qd[0] if isinstance(qd, list) and qd else {}
+                    ann = str(q_item.get("earningsAnnouncement") or "")[:10]
+                    if ann and len(ann) == 10:
+                        try:
+                            ann_dt = datetime.strptime(ann, "%Y-%m-%d").date()
+                            if ann_dt >= tomorrow:
+                                next_earnings = ann
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         return {
             "name": name,
             "sector": sector_kr, "sector_en": sector_en,
@@ -4080,63 +4062,83 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     qoq_eps_growth = np.nan
     if not earn_df.empty:
         try:
-            est_col = next((c for c in earn_df.columns if "estimate" in c.lower()), None)
-            act_col = next((c for c in earn_df.columns if "actual" in c.lower() or "reported" in c.lower()), None)
+            # 영문("actual","reported") 또는 한글("EPS 실제","실제") 컬럼 탐색
+            act_col = next((
+                c for c in earn_df.columns
+                if "actual" in c.lower() or "reported" in c.lower()
+                   or "eps 실제" in c.lower() or "실제" in c.lower()
+            ), None)
             if act_col and len(earn_df) >= 2:
-                acts = pd.to_numeric(earn_df[act_col], errors="coerce").dropna()
+                # "$0.150" 형태 문자열도 처리
+                acts = pd.to_numeric(
+                    earn_df[act_col].astype(str).str.replace(r"[$,]", "", regex=True),
+                    errors="coerce"
+                ).dropna()
                 if len(acts) >= 2 and acts.iloc[1] != 0:
                     qoq_eps_growth = float((acts.iloc[0] - acts.iloc[1]) / abs(acts.iloc[1]) * 100)
         except Exception:
             pass
 
-    # I: 애널리스트 매수 컨센서스 (ratings-snapshot) — FMP Starter 제공
-    # 기관 보유 API가 Starter 플랜 차단이므로 ratings-snapshot으로 대체
-    analyst_buy_pct = np.nan
-    analyst_label   = ""
-    if k_val:
+    # QoQ EPS fallback — FMP income-statement(quarter) 직접 계산
+    if pd.isna(qoq_eps_growth) and k_val:
         try:
-            r_rat = requests.get(
-                f"{_FMP_BASE}/ratings-snapshot?symbol={ticker_upper}&apikey={k_val}",
+            r_q = requests.get(
+                f"{_FMP_BASE}/income-statement?symbol={ticker_upper}&period=quarter&limit=4&apikey={k_val}",
                 timeout=_FMP_TIMEOUT
             )
-            if r_rat.status_code == 200:
-                rat_data = r_rat.json()
-                rat = rat_data[0] if isinstance(rat_data, list) and rat_data else (rat_data if isinstance(rat_data, dict) else {})
-                if rat:
-                    sb  = to_float(rat.get("strongBuy")  or 0)
-                    b   = to_float(rat.get("buy")        or 0)
-                    h   = to_float(rat.get("hold")       or 0)
-                    s   = to_float(rat.get("sell")       or 0)
-                    ss  = to_float(rat.get("strongSell") or 0)
-                    tot = (sb or 0)+(b or 0)+(h or 0)+(s or 0)+(ss or 0)
-                    if tot > 0:
-                        bc = (sb or 0)+(b or 0)
-                        analyst_buy_pct = round(float(bc / tot * 100), 1)
-                        analyst_label = f"매수의견 {analyst_buy_pct:.0f}% ({int(bc)}/{int(tot)}명)"
+            if r_q.status_code == 200:
+                q_data = r_q.json()
+                if isinstance(q_data, list) and len(q_data) >= 2:
+                    eps_now  = to_float(q_data[0].get("epsdiluted") or q_data[0].get("eps"))
+                    eps_prev = to_float(q_data[1].get("epsdiluted") or q_data[1].get("eps"))
+                    if pd.notna(eps_now) and pd.notna(eps_prev) and eps_prev != 0:
+                        qoq_eps_growth = float((eps_now - eps_prev) / abs(eps_prev) * 100)
         except Exception:
             pass
 
-    # grades-consensus fallback
-    if pd.isna(analyst_buy_pct) and k_val:
+    # 기관 보유율 — positions-summary의 ownershipPercent 우선 사용
+    inst_pct = np.nan
+    try:
+        # inst_df가 "항목/값/전분기대비" 형식이면 ownershipPercent 행에서 추출
+        if not inst_df.empty:
+            if "항목" in inst_df.columns and "값" in inst_df.columns:
+                own_row = inst_df[inst_df["항목"].str.contains("보유 비율|ownershipPercent", na=False)]
+                if not own_row.empty:
+                    val_str = str(own_row["값"].iloc[0]).replace("%", "").strip()
+                    inst_pct = to_float(val_str)
+            else:
+                # 기관명/비중 형식
+                pct_col = next((c for c in inst_df.columns if "비중" in c or "%" in c), None)
+                if pct_col:
+                    vals = pd.to_numeric(
+                        inst_df[pct_col].astype(str).str.replace("%", "").str.strip(),
+                        errors="coerce"
+                    ).dropna()
+                    if not vals.empty:
+                        total = float(vals.sum())
+                        inst_pct = total * 100 if total <= 1 else total
+    except Exception:
+        pass
+
+    # inst_pct가 여전히 nan이면 FMP positions-summary 직접 호출
+    if pd.isna(inst_pct) and k_val:
         try:
-            r_gc = requests.get(
-                f"{_FMP_BASE}/grades-consensus?symbol={ticker_upper}&apikey={k_val}",
-                timeout=_FMP_TIMEOUT
-            )
-            if r_gc.status_code == 200:
-                gc_data = r_gc.json()
-                gc = gc_data[0] if isinstance(gc_data, list) and gc_data else (gc_data if isinstance(gc_data, dict) else {})
-                if gc:
-                    sb  = to_float(gc.get("strongBuy")  or 0)
-                    b   = to_float(gc.get("buy")        or 0)
-                    h   = to_float(gc.get("hold")       or 0)
-                    s   = to_float(gc.get("sell")       or 0)
-                    ss  = to_float(gc.get("strongSell") or 0)
-                    tot = (sb or 0)+(b or 0)+(h or 0)+(s or 0)+(ss or 0)
-                    if tot > 0:
-                        bc = (sb or 0)+(b or 0)
-                        analyst_buy_pct = round(float(bc / tot * 100), 1)
-                        analyst_label = f"매수의견 {analyst_buy_pct:.0f}% ({int(bc)}/{int(tot)}명)"
+            now_q = datetime.now()
+            q_n = (now_q.month - 1) // 3
+            y_n = now_q.year
+            if q_n == 0: q_n = 4; y_n -= 1
+            for y_try, q_try in [(y_n, q_n), (y_n if q_n > 1 else y_n-1, q_n-1 if q_n > 1 else 4)]:
+                r_pos = requests.get(
+                    f"{_FMP_BASE}/institutional-ownership/symbol-positions-summary"
+                    f"?symbol={ticker_upper}&year={y_try}&quarter={q_try}&apikey={k_val}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if r_pos.status_code == 200:
+                    pos_data = r_pos.json()
+                    pos_item = pos_data[0] if isinstance(pos_data, list) and pos_data else {}
+                    if pos_item:
+                        inst_pct = to_float(pos_item.get("ownershipPercent"))
+                        break
         except Exception:
             pass
 
@@ -4217,14 +4219,14 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     cs_score += momentum_pts
     cs_detail["L+N_모멘텀"] = f"MA정배열+고점근접 → {momentum_pts}점"
 
-    # I: 애널리스트 매수 컨센서스 (15점) — 기관보유 대체
-    if pd.notna(analyst_buy_pct):
-        if analyst_buy_pct >= 70:   pts = 15
-        elif analyst_buy_pct >= 55: pts = 10
-        elif analyst_buy_pct >= 40: pts = 5
-        else:                       pts = 2
+    # I: 기관 보유 (15점)
+    if pd.notna(inst_pct):
+        if inst_pct >= 60:   pts = 15
+        elif inst_pct >= 40: pts = 10
+        elif inst_pct >= 20: pts = 5
+        else:                pts = 2
         cs_score += pts
-        cs_detail["I_기관보유"] = f"{analyst_label} → {pts}점"
+        cs_detail["I_기관보유"] = f"{inst_pct:.1f}% → {pts}점"
     else:
         cs_detail["I_기관보유"] = "데이터 없음"
 
@@ -11474,19 +11476,7 @@ if st.session_state.get("logged_in"):
                         _mos  = margin_context.get("margin_of_safety")
                         _cp   = margin_context.get("current_price")
 
-                        # 1행: yfinance 기반 (있을 때만 의미있음)
-                        _vc1, _vc2, _vc3, _vc4 = st.columns(4)
-                        with _vc1: st.metric("Forward P/E",  num_str(_fpe) if pd.notna(_fpe) else "N/A")
-                        with _vc2: st.metric("Trailing P/E", num_str(_tpe) if pd.notna(_tpe) else "N/A")
-                        with _vc3: st.metric("P/B",          num_str(_pb)  if pd.notna(_pb)  else "N/A")
-                        with _vc4: st.metric("EV/EBITDA",    num_str(_ev)  if pd.notna(_ev)  else "N/A")
-
-                        # 2행: FMP 무료 플랜 제공 지표 (항상 표시)
-                        _vc5, _vc6, _, _ = st.columns(4)
-                        with _vc5: st.metric("EV/Sales", num_str(_evs) if pd.notna(_evs) else "N/A",
-                                             help="기업가치/매출액. 10 이하 합리적. FMP 제공.")
-                        with _vc6: st.metric("EV/FCF",   num_str(_evf) if pd.notna(_evf) else "N/A",
-                                             help="기업가치/잉여현금흐름. 40 이하 합리적. FMP 제공.")
+                        # Valuation 지표는 위 카드(st.metric + 판정)에서 이미 표시됨 — 중복 제거
 
                         # Graham 적정주가 — 가치주 조건 만족 시에만 표시
                         # 조건: EPS > 0, 성장률 0~20%, P/E < 25 (성장주·적자기업 제외)
@@ -11689,8 +11679,8 @@ if st.session_state.get("logged_in"):
         # ── Earnings Surprise 히스토리 ────────────────────────────────────
         if not is_etf_mode:
             st.divider()
-            st.markdown("### 📅 Earnings 히스토리")
-            st.caption("최근 분기별 실적 데이터입니다.")
+            st.markdown("### 📅 Earnings Surprise 히스토리")
+            st.caption("최근 분기별 EPS 예상 대비 실제 Beat/Miss 현황입니다.")
             try:
                 with st.spinner("어닝 데이터 불러오는 중..."):
                     earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
@@ -11698,37 +11688,45 @@ if st.session_state.get("logged_in"):
                 if earn_df.empty:
                     st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
                 else:
-                    # 컬럼 정규화
                     earn_df.columns = [str(c).strip() for c in earn_df.columns]
-                    # Estimate, Actual, Surprise 컬럼 찾기
-                    est_col = next((c for c in earn_df.columns if "estimate" in c.lower()), None)
-                    act_col = next((c for c in earn_df.columns if "actual" in c.lower() or "reported" in c.lower()), None)
+                    # 영문/한글 컬럼명 모두 탐색
+                    est_col = next((c for c in earn_df.columns
+                        if "estimate" in c.lower() or "eps 예상" in c.lower() or "예상" in c.lower()), None)
+                    act_col = next((c for c in earn_df.columns
+                        if "actual" in c.lower() or "reported" in c.lower()
+                           or "eps 실제" in c.lower() or "실제" in c.lower()), None)
 
                     if est_col and act_col:
-                        earn_df[est_col] = pd.to_numeric(earn_df[est_col], errors="coerce")
-                        earn_df[act_col] = pd.to_numeric(earn_df[act_col], errors="coerce")
-                        earn_df["Surprise(%)"] = ((earn_df[act_col] - earn_df[est_col]) / earn_df[est_col].abs() * 100).round(1)
+                        # "$0.150" 형태 파싱
+                        earn_df["_est_num"] = pd.to_numeric(
+                            earn_df[est_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
+                        earn_df["_act_num"] = pd.to_numeric(
+                            earn_df[act_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
+                        earn_df["Surprise(%)"] = (
+                            (earn_df["_act_num"] - earn_df["_est_num"]) / earn_df["_est_num"].abs() * 100
+                        ).round(1)
                         earn_df["판정"] = earn_df["Surprise(%)"].apply(
-                            lambda x: "✅ Beat" if pd.notna(x) and x > 0 else ("❌ Miss" if pd.notna(x) and x < 0 else "N/A")
+                            lambda x: "✅ Beat" if pd.notna(x) and x > 0 else ("❌ Miss" if pd.notna(x) and x < 0 else "—")
                         )
+                        earn_df = earn_df.drop(columns=["_est_num","_act_num"], errors="ignore")
 
-                        beat_count = (earn_df["판정"] == "✅ Beat").sum()
-                        total_count = len(earn_df[earn_df["판정"] != "N/A"])
+                        beat_count  = (earn_df["판정"] == "✅ Beat").sum()
+                        total_count = len(earn_df[earn_df["판정"] != "—"])
                         if total_count > 0:
                             beat_rate = beat_count / total_count * 100
+                            msg = f"어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}분기)"
                             if beat_rate >= 75:
-                                st.success(f"🏆 어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}) — 실적 퀄리티 우수")
+                                st.success(f"🏆 {msg} — 실적 퀄리티 우수")
                             elif beat_rate >= 50:
-                                st.warning(f"🟡 어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}) — 보통")
+                                st.warning(f"🟡 {msg} — 보통")
                             else:
-                                st.error(f"🔴 어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}) — 실적 부진")
+                                st.error(f"🔴 {msg} — 실적 부진")
 
                     def _style_surprise(val):
                         v = pd.to_numeric(str(val).replace("%",""), errors="coerce")
                         if pd.isna(v): return ""
                         return "color:#16a34a;font-weight:600" if v > 0 else "color:#dc2626;font-weight:600"
 
-                    display_cols = [c for c in earn_df.columns if c not in ["판정"]]
                     if "Surprise(%)" in earn_df.columns:
                         styled_earn = earn_df.style.map(_style_surprise, subset=["Surprise(%)"])
                         st.dataframe(styled_earn, use_container_width=True, hide_index=True)
@@ -11737,19 +11735,16 @@ if st.session_state.get("logged_in"):
             except Exception as _ee:
                 st.warning(f"어닝 히스토리 로드 오류: {_ee}")
 
-            # ── 기관 보유 비중 ────────────────────────────────────────────
+            # ── 기관 투자자 보유 현황 (FMP Starter → ratings-snapshot 대체) ──
             st.divider()
             st.markdown("### 🏦 기관 투자자 보유 현황")
-            st.caption("상위 기관의 보유 비중. 기관 보유 비중이 높고 증가 추세이면 스마트머니 유입 신호입니다.")
+            st.caption("FMP Starter 플랜에서 기관 보유 상세 데이터 미제공 → 애널리스트 컨센서스(ratings-snapshot)로 대체합니다.")
             try:
-                with st.spinner("기관 보유 데이터 불러오는 중..."):
-                    inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
-
-                if inst_df.empty:
-                    st.caption("※ FMP Starter 플랜에서 기관 보유 상세 미제공 → 애널리스트 컨센서스로 대체")
-                    _tk_inst = str(selected_ticker).strip().upper()
-                    _k_inst = _fmp_key()
-                    if _k_inst:
+                _tk_inst = str(selected_ticker).strip().upper()
+                _k_inst  = _fmp_key()
+                _shown   = False
+                if _k_inst:
+                    with st.spinner("애널리스트 데이터 불러오는 중..."):
                         try:
                             _r_inst = requests.get(
                                 f"{_FMP_BASE}/ratings-snapshot?symbol={_tk_inst}&apikey={_k_inst}",
@@ -11757,83 +11752,45 @@ if st.session_state.get("logged_in"):
                             )
                             if _r_inst.status_code == 200:
                                 _rd = _r_inst.json()
-                                _ri = _rd[0] if isinstance(_rd, list) and _rd else {}
+                                _ri = _rd[0] if isinstance(_rd, list) and _rd else (
+                                      _rd  if isinstance(_rd, dict) else {})
                                 if _ri:
                                     _sb  = int(_ri.get("strongBuy")  or 0)
                                     _b   = int(_ri.get("buy")        or 0)
                                     _h   = int(_ri.get("hold")       or 0)
                                     _s   = int(_ri.get("sell")       or 0)
                                     _ss  = int(_ri.get("strongSell") or 0)
-                                    _tot = _sb+_b+_h+_s+_ss
+                                    _tot = _sb + _b + _h + _s + _ss
                                     if _tot > 0:
-                                        _buy_pct = round((_sb+_b)/_tot*100, 1)
+                                        _buy_pct = round((_sb + _b) / _tot * 100, 1)
                                         ic1, ic2, ic3 = st.columns(3)
-                                        ic1.metric("애널리스트 매수 의견", f"{_buy_pct:.0f}%", f"{_sb+_b}/{_tot}명")
-                                        ic2.metric("Strong Buy / Buy", f"{_sb} / {_b}명")
-                                        ic3.metric("Hold / Sell", f"{_h} / {_s+_ss}명")
-                                        _rlabel = _ri.get("ratingRecommendation") or _ri.get("rating") or ""
+                                        ic1.metric("매수 의견 비율", f"{_buy_pct:.0f}%",
+                                                   f"Strong Buy {_sb} + Buy {_b}명")
+                                        ic2.metric("Hold", f"{_h}명")
+                                        ic3.metric("Sell / Strong Sell", f"{_s + _ss}명",
+                                                   f"총 {_tot}명 애널리스트")
+                                        _rlabel = (_ri.get("ratingRecommendation") or
+                                                   _ri.get("rating") or "")
                                         if _rlabel:
-                                            st.info(f"📊 종합 의견: **{_rlabel}**")
-                                    else:
-                                        st.info("애널리스트 데이터가 없습니다.")
-                                else:
-                                    st.info("애널리스트 데이터를 가져오지 못했습니다.")
+                                            _buy_color = "#16a34a" if _buy_pct >= 60 else (
+                                                          "#f59e0b" if _buy_pct >= 40 else "#dc2626")
+                                            st.markdown(
+                                                f"<div style='background:#1e293b;border-radius:8px;"
+                                                f"padding:10px 16px;border-left:4px solid {_buy_color};"
+                                                f"margin-top:8px;'>"
+                                                f"<span style='color:{_buy_color};font-weight:700;'>"
+                                                f"📊 종합 의견: {_rlabel}</span></div>",
+                                                unsafe_allow_html=True
+                                            )
+                                        _shown = True
                         except Exception:
-                            st.info("애널리스트 데이터 로드 실패.")
-                else:
-                    inst_df.columns = [str(c).strip() for c in inst_df.columns]
-                    pct_col = next((c for c in inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
-                    if pct_col:
-                        inst_df[pct_col] = pd.to_numeric(inst_df[pct_col], errors="coerce")
-                        total_inst = inst_df[pct_col].sum() * 100 if inst_df[pct_col].max() <= 1 else inst_df[pct_col].sum()
-                        st.metric("상위 10개 기관 합산 보유 비중", f"{total_inst:.1f}%")
-                    st.dataframe(inst_df, use_container_width=True, hide_index=True)
+                            pass
+                if not _shown:
+                    st.info("애널리스트 컨센서스 데이터를 가져오지 못했습니다.")
             except Exception as _ie:
-                st.warning(f"기관 보유 데이터 로드 오류: {_ie}")
+                st.warning(f"데이터 로드 오류: {_ie}")
 
-            # ── 공매도 비율 ───────────────────────────────────────────────
-            st.divider()
-            st.markdown("### 🩳 공매도 비율 (Short Interest)")
-            st.caption("공매도 비율이 높을수록 기관이 하락에 베팅 중. 20% 이상이면 Short Squeeze 가능성도 있어요.")
-            try:
-                with st.spinner("공매도 데이터 불러오는 중..."):
-                    short_data = fetch_short_interest(str(selected_ticker).strip().upper())
-                    if short_data is None:
-                        short_data = {"short_pct": None, "days_to_cover": None, "shares_short": None, "squeeze_risk": "N/A"}
-
-                si_c1, si_c2, si_c3 = st.columns(3)
-                with si_c1:
-                    _sp = short_data.get('short_pct')
-                    st.metric("공매도 비율 (Float)",
-                              f"{float(_sp):.1f}%" if _sp is not None and pd.notna(_sp) else "N/A")
-                with si_c2:
-                    _dc = short_data.get('days_to_cover')
-                    st.metric("Days to Cover",
-                              f"{float(_dc):.1f}일" if _dc is not None and pd.notna(_dc) else "N/A",
-                              help="현재 공매도 포지션을 청산하는 데 걸리는 평균 거래일")
-                with si_c3:
-                    st.metric("Short Squeeze 위험", short_data.get('squeeze_risk', 'N/A'))
-
-                # 유통주식 정보 추가
-                _ff = short_data.get('free_float_pct')
-                _fs = short_data.get('float_shares')
-                if _ff is not None or _fs is not None:
-                    ff_c1, ff_c2 = st.columns(2)
-                    with ff_c1:
-                        st.metric("유통주식 비율 (Free Float)",
-                                  f"{float(_ff):.2f}%" if _ff is not None else "N/A",
-                                  help="전체 발행주식 중 실제 시장에서 거래 가능한 비율")
-                    with ff_c2:
-                        st.metric("유통주식 수 (Float Shares)",
-                                  f"{int(_fs):,}" if _fs is not None else "N/A")
-
-                _sp_val = short_data.get('short_pct')
-                if _sp_val is not None and pd.notna(_sp_val) and float(_sp_val) >= 15:
-                    st.warning(f"⚠️ 공매도 비율 {float(_sp_val):.1f}% — 높은 수준.")
-                if _sp is None and _ff is None:
-                    st.caption("※ FMP Starter 플랜에서 Short Interest 미제공 (Premium 이상 필요)")
-            except Exception as _si_e:
-                st.warning(f"공매도 데이터 로드 오류: {_si_e}")
+            # 공매도 비율 섹션 제거 — FMP Starter 미제공, yfinance rate limit으로 대안 없음
 
             # ── 인사이더 트레이딩 ─────────────────────────────────────────
             st.divider()
@@ -11846,20 +11803,27 @@ if st.session_state.get("logged_in"):
                     insider_stats = fetch_insider_statistics(_tk_ins)
 
                 # 통계 요약 먼저 표시
-                if insider_stats:
-                    purchases = insider_stats.get("total_purchases") or insider_stats.get("acquired")
-                    sales = insider_stats.get("total_sales") or insider_stats.get("disposed")
-                    ratio = insider_stats.get("ratio")
+                if insider_stats or not insider_df.empty:
+                    purchases = to_float(insider_stats.get("total_purchases") or insider_stats.get("acquired")) if insider_stats else None
+                    sales     = to_float(insider_stats.get("total_sales")     or insider_stats.get("disposed"))  if insider_stats else None
                     ins_c1, ins_c2, ins_c3 = st.columns(3)
                     with ins_c1:
-                        st.metric("내부자 매수 건수", f"{int(purchases)}건" if pd.notna(purchases) else "N/A")
+                        p_n = int(purchases) if purchases is not None and pd.notna(purchases) else 0
+                        st.metric("내부자 매수 건수", f"{p_n}건")
                     with ins_c2:
-                        st.metric("내부자 매도 건수", f"{int(sales)}건" if pd.notna(sales) else "N/A")
+                        s_n = int(sales) if sales is not None and pd.notna(sales) else 0
+                        st.metric("내부자 매도 건수", f"{s_n}건")
                     with ins_c3:
-                        if pd.notna(ratio) and purchases is not None and sales is not None:
-                            signal = "🟢 매수 우세" if float(purchases) > float(sales) else ("🔴 매도 우세" if float(sales) > float(purchases) else "⚪ 중립")
+                        p_v = float(purchases) if purchases is not None and pd.notna(purchases) else 0.0
+                        s_v = float(sales)     if sales     is not None and pd.notna(sales)     else 0.0
+                        if p_v > 0 or s_v > 0:
+                            signal = "🟢 매수 우세" if p_v > s_v else ("🔴 매도 우세" if s_v > p_v else "⚪ 중립")
+                        elif not insider_df.empty and "거래유형" in insider_df.columns:
+                            buy_cnt  = insider_df["거래유형"].str.contains("매수", na=False).sum()
+                            sell_cnt = insider_df["거래유형"].str.contains("매도", na=False).sum()
+                            signal   = "🟢 매수 우세" if buy_cnt > sell_cnt else ("🔴 매도 우세" if sell_cnt > buy_cnt else "⚪ 중립")
                         else:
-                            signal = "N/A"
+                            signal = "집계 중"
                         st.metric("내부자 방향성", signal)
 
                 if insider_df.empty:
