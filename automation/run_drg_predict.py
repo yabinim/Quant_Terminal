@@ -360,7 +360,9 @@ def generate_drg_prediction(rss_news_text: str, macro_summary: str,
     _RETRY_WAITS = [10, 30, 60, 120]
     for attempt in range(5):
         try:
-            cfg = genai_types.GenerateContentConfig(temperature=0.7, max_output_tokens=4096)
+            # max_output_tokens=2048: Gmail 102KB 클리핑 방지
+            # (4096은 HTML 변환 후 102KB 초과 → Gmail이 본문 잘라냄)
+            cfg = genai_types.GenerateContentConfig(temperature=0.7, max_output_tokens=2048)
             response = client.models.generate_content(
                 model="gemini-2.5-flash", contents=prompt, config=cfg
             )
@@ -437,6 +439,11 @@ def build_drg_email_html(full_text: str, direction: str, spy_close: float,
         </div>"""
 
     spy_str = f"${spy_close:.2f}" if not np.isnan(spy_close) else "N/A"
+
+    # Gmail 102KB 클리핑 방지: full_text를 2500자로 제한
+    if len(full_text) > 2500:
+        full_text = full_text[:2500] + "\n\n*[전체 내용은 Quant Terminal에서 확인하세요]*"
+        print(f"[INFO] full_text 길이 초과 → 2500자로 truncate")
 
     # full_text 마크다운 → HTML 간단 변환
     text_html = full_text.replace("\n", "<br>")
