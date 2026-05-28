@@ -1199,19 +1199,35 @@ def macro_status_bad_count(status):
     return status in (MACRO_STATUS_WARN, MACRO_STATUS_FAIL)
 
 
-def macro_traffic_light(bad_total):
-    if bad_total >= 5:
+def macro_traffic_light(bad_total, total_indicators: int = 11):
+    """
+    11개 지표 기준 신호등.
+    - 빨간불: 전체의 60% 이상(7/11) 경고·실패  → 거시 리스크 전방위 확산
+    - 노란불: 전체의 36% 이상(4/11) 경고·실패  → 경고 누적, 비중 축소
+    - 초록불: 그 미만                           → 환경 안정적
+    """
+    red_threshold    = max(7, round(total_indicators * 0.60))   # ≥60% → 빨간불
+    yellow_threshold = max(4, round(total_indicators * 0.36))   # ≥36% → 노란불
+
+    if bad_total >= red_threshold:
         st.error(
-            "🔴 [빨간불] 폭풍우 경보 (Full Alignment). 시스템 붕괴 위험. "
-            "제3원칙에 따라 시장에서 도망치세요."
+            f"🔴 **[빨간불] 폭풍우 경보** — {total_indicators}개 지표 중 {bad_total}개 경고·실패 "
+            f"({bad_total/total_indicators*100:.0f}%). "
+            "복수의 거시 지표가 동시에 악화된 상태입니다. "
+            "**현금 비중을 최우선으로 확대하고, 신규 매수를 전면 중단하세요.** "
+            "개별 종목 분석(3단계)을 진행하기 전에 매크로 리스크가 해소되는지 먼저 확인하세요."
         )
-    elif bad_total >= 3:
+    elif bad_total >= yellow_threshold:
         st.warning(
-            "🟡 [노란불] 거시경제 경고 누적. 개별 종목이 좋아도 비중을 줄이고 현금을 확보하세요."
+            f"🟡 **[노란불] 거시경제 경고 누적** — {total_indicators}개 지표 중 {bad_total}개 경고·실패 "
+            f"({bad_total/total_indicators*100:.0f}%). "
+            "개별 종목이 좋아 보여도 매크로 역풍이 있을 수 있습니다. "
+            "포지션 비중을 줄이고 현금을 확보하며 분할 접근을 권장합니다."
         )
     else:
         st.success(
-            f"🟢 [초록불] 매크로 환경 안정적. 「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털과 매수 타점을 확인한 뒤 투자를 진행하세요."
+            f"🟢 **[초록불] 매크로 환경 안정적** — {total_indicators}개 지표 중 경고 {bad_total}개. "
+            f"「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털과 매수 타점을 확인한 뒤 투자를 진행하세요."
         )
 
 
@@ -1786,48 +1802,82 @@ def analyze_us_macro_dashboard():
         "_status": fed_status,
     })
 
-    # ── FMP GDP 성장률 ──────────────────────────────────────────────────
-    gdp_val, gdp_prev, gdp_date = fetch_fmp_economic_indicator("GDP")
-    gdp_chg = float(gdp_val - gdp_prev) if pd.notna(gdp_val) and pd.notna(gdp_prev) else np.nan
-    if pd.notna(gdp_val):
-        if gdp_val < 0:
+    # ── FMP GDP 성장률 (QoQ %) ──────────────────────────────────────────
+    # FMP 'GDP' API는 절대값(십억 달러 단위 연율)을 반환하므로
+    # 전분기 대비 변화율(%)을 직접 계산해야 한다.
+    gdp_abs, gdp_abs_prev, gdp_date = fetch_fmp_economic_indicator("GDP")
+    if pd.notna(gdp_abs) and pd.notna(gdp_abs_prev) and gdp_abs_prev != 0:
+        gdp_qoq = float((gdp_abs / gdp_abs_prev - 1.0) * 100)
+    else:
+        gdp_qoq = np.nan
+
+    if pd.notna(gdp_qoq):
+        if gdp_qoq < 0:
             gdp_st = MACRO_STATUS_FAIL
-            gdp_note = f"GDP 성장률 마이너스 ({gdp_val:.1f}%, {gdp_date}) — 기술적 침체 위험 구간."
-        elif gdp_val < 1.5:
+            gdp_note = f"GDP QoQ {gdp_qoq:+.2f}% ({gdp_date}) — 마이너스 성장, 기술적 침체 위험 구간."
+        elif gdp_qoq < 0.5:
             gdp_st = MACRO_STATUS_WARN
-            gdp_note = f"GDP 성장 둔화 ({gdp_val:.1f}%, {gdp_date}) — 경기 모멘텀 약화 신호."
+            gdp_note = f"GDP QoQ {gdp_qoq:+.2f}% ({gdp_date}) — 성장 정체 구간. 경기 모멘텀 약화 신호."
+        elif gdp_qoq < 1.0:
+            gdp_st = MACRO_STATUS_WARN
+            gdp_note = f"GDP QoQ {gdp_qoq:+.2f}% ({gdp_date}) — 저성장 구간. 선별적 접근 필요."
         else:
             gdp_st = MACRO_STATUS_PASS
-            gdp_note = f"GDP 성장 양호 ({gdp_val:.1f}%, {gdp_date}) — 실물 경기 안정권."
+            gdp_note = f"GDP QoQ {gdp_qoq:+.2f}% ({gdp_date}) — 실물 경기 안정권."
+        gdp_display = f"{gdp_qoq:+.2f}% (QoQ)"
+    elif pd.notna(gdp_abs):
+        # prev 없이 절대값만 있을 때 — 표시만 하고 NA 판정
+        gdp_st = MACRO_STATUS_NA
+        gdp_note = f"GDP 절대값 ${gdp_abs:,.0f}B ({gdp_date}). 전분기 데이터 없어 성장률 계산 불가."
+        gdp_display = f"${gdp_abs:,.0f}B"
     else:
         gdp_st = MACRO_STATUS_NA
         gdp_note = "GDP 데이터 없음 (FMP 조회 실패 또는 API 키 미설정)."
+        gdp_display = "N/A"
+
     rows.append({
-        "지표": "GDP 성장률 (FMP)",
-        "현재값": f"{gdp_val:.1f}%" if pd.notna(gdp_val) else "N/A",
+        "지표": "GDP 성장률 QoQ (FMP)",
+        "현재값": gdp_display,
         "판정": macro_status_label(gdp_st),
         "판독 요약": gdp_note,
         "_status": gdp_st,
     })
 
-    # ── FMP Retail Sales (소매판매 MoM) ────────────────────────────────
-    rs_val, rs_prev, rs_date = fetch_fmp_economic_indicator("retailSales")
-    if pd.notna(rs_val):
-        if rs_val < -1.0:
+    # ── FMP Retail Sales (소매판매 MoM %) ──────────────────────────────
+    # FMP 'retailSales' API는 절대값(백만 달러)을 반환하므로
+    # 전월 대비 변화율(%)을 직접 계산해야 한다.
+    rs_abs, rs_abs_prev, rs_date = fetch_fmp_economic_indicator("retailSales")
+    if pd.notna(rs_abs) and pd.notna(rs_abs_prev) and rs_abs_prev != 0:
+        rs_mom = float((rs_abs / rs_abs_prev - 1.0) * 100)
+    else:
+        rs_mom = np.nan
+
+    if pd.notna(rs_mom):
+        if rs_mom < -1.0:
             rs_st = MACRO_STATUS_FAIL
-            rs_note = f"소매판매 급감 ({rs_val:.1f}%, {rs_date}) — 소비 위축, 경기 침체 우려."
-        elif rs_val < 0:
+            rs_note = f"소매판매 MoM {rs_mom:+.2f}% ({rs_date}) — 소비 급감, 경기 침체 우려."
+        elif rs_mom < 0:
             rs_st = MACRO_STATUS_WARN
-            rs_note = f"소매판매 감소 ({rs_val:.1f}%, {rs_date}) — 소비 모멘텀 둔화."
+            rs_note = f"소매판매 MoM {rs_mom:+.2f}% ({rs_date}) — 소비 모멘텀 둔화."
+        elif rs_mom < 0.3:
+            rs_st = MACRO_STATUS_WARN
+            rs_note = f"소매판매 MoM {rs_mom:+.2f}% ({rs_date}) — 소비 정체 구간. 모니터링 필요."
         else:
             rs_st = MACRO_STATUS_PASS
-            rs_note = f"소매판매 플러스 ({rs_val:.1f}%, {rs_date}) — 소비 체력 유지."
+            rs_note = f"소매판매 MoM {rs_mom:+.2f}% ({rs_date}) — 소비 체력 유지."
+        rs_display = f"{rs_mom:+.2f}% (MoM)"
+    elif pd.notna(rs_abs):
+        rs_st = MACRO_STATUS_NA
+        rs_note = f"소매판매 절대값 ${rs_abs:,.0f}M ({rs_date}). 전월 데이터 없어 변화율 계산 불가."
+        rs_display = f"${rs_abs:,.0f}M"
     else:
         rs_st = MACRO_STATUS_NA
         rs_note = "소매판매 데이터 없음."
+        rs_display = "N/A"
+
     rows.append({
         "지표": "소매판매 MoM (FMP)",
-        "현재값": f"{rs_val:.1f}%" if pd.notna(rs_val) else "N/A",
+        "현재값": rs_display,
         "판정": macro_status_label(rs_st),
         "판독 요약": rs_note,
         "_status": rs_st,
@@ -10272,7 +10322,7 @@ if st.session_state.get("logged_in"):
                 unsafe_allow_html=True,
             )
             st.caption(macro_desc)
-            macro_traffic_light(macro_pack["bad_total"])
+            macro_traffic_light(macro_pack["bad_total"], total_indicators=len(macro_pack["rows"]))
 
             st.divider()
 
@@ -10329,9 +10379,9 @@ if st.session_state.get("logged_in"):
                 try:
                     gdp_row = next((r for r in macro_pack.get("rows", []) if "GDP" in r.get("지표", "")), None)
                     if gdp_row and gdp_row.get("현재값", "N/A") != "N/A":
-                        st.metric("GDP 성장률 (최신)", gdp_row["현재값"])
+                        st.metric("GDP 성장률 QoQ (최신)", gdp_row["현재값"])
                         st.info(gdp_row["판독 요약"])
-                        st.caption("💡 0% 이하 2분기 연속 = 기술적 침체. 1.5% 미만이면 둔화 신호.")
+                        st.caption("💡 전분기 대비 성장률(%). 마이너스 2분기 연속 = 기술적 침체. 0.5% 미만이면 정체 신호.")
                     else:
                         st.warning("GDP 데이터를 불러오지 못했습니다. FMP API 키를 확인하세요.")
                 except Exception:
@@ -10343,7 +10393,7 @@ if st.session_state.get("logged_in"):
                     if rs_row and rs_row.get("현재값", "N/A") != "N/A":
                         st.metric("소매판매 MoM (최신)", rs_row["현재값"])
                         st.info(rs_row["판독 요약"])
-                        st.caption("💡 소비 체력의 핵심 선행 지표. 마이너스 전환 시 경기 둔화 신호.")
+                        st.caption("💡 전월 대비 변화율(%). 마이너스 전환 시 소비 위축·경기 둔화 선행 신호.")
                     else:
                         st.warning("소매판매 데이터를 불러오지 못했습니다. FMP API 키를 확인하세요.")
                 except Exception:
@@ -10382,8 +10432,8 @@ if st.session_state.get("logged_in"):
 | DXY | FRED | 글로벌 달러 위상 | 강세 시 다국적 기업 해외 실적 악화 |
 | Fear & Greed | VIX 백분위 근사 | 시장 심리 종합 | 75+ 극단적 탐욕(매도 고려), 25- 극단적 공포(매수 고려) |
 | Fed Funds Rate | FRED | 현재 기준금리 | 5% 이상 고금리 레짐, 인하 시 성장주 재평가 |
-| GDP 성장률 | FMP Economics | 실물 경기 방향 | 마이너스 2분기 = 기술적 침체, 1.5% 미만 = 둔화 경보 |
-| 소매판매 MoM | FMP Economics | 소비 체력 선행 | 마이너스 전환 시 소비 위축·경기 둔화 선행 신호 |
+| GDP 성장률 QoQ | FMP Economics | 전분기 대비 실질 성장률 | 마이너스 2분기 연속 = 기술적 침체, 0.5% 미만 = 정체 경보 |
+| 소매판매 MoM | FMP Economics | 전월 대비 소비 변화율 | 마이너스 전환 시 소비 위축·경기 둔화 선행 신호 |
 | 주식 위험 프리미엄 ERP | FMP | 주식 vs 채권 매력도 | ERP 높을수록 주식 저평가, 낮을수록 채권 선호 국면 |
 """)
                 st.caption("📌 FMP Economics API 항목은 FMP_API_KEY 설정 시에만 조회됩니다.")
