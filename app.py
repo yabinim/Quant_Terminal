@@ -7077,7 +7077,7 @@ def hydrate_narrative_from_disk_once():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
-    """현재가 조회 — FMP stock-quote 사용."""
+    """현재가 조회 — FMP /quote/ 우선, 실패·누락 시 /historical-price-eod/ 마지막 종가로 fallback."""
     clean_tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
     clean_tickers = list(dict.fromkeys(clean_tickers))
     if not clean_tickers:
@@ -7085,6 +7085,10 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
     k = _fmp_key()
     if not k:
         return {}
+
+    price_map = {}
+
+    # ── 1차: FMP /quote/ (실시간 호가) ──────────────────────────────────────
     try:
         symbols = ",".join(clean_tickers)
         r = requests.get(
@@ -7092,21 +7096,30 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
             timeout=_FMP_TIMEOUT
         )
         data = r.json() if r.status_code == 200 else []
-        if not isinstance(data, list):
-            return {}
-        price_map = {}
-        for item in data:
-            sym = str(item.get("symbol") or "").strip().upper()
-            price = to_float(item.get("price") or item.get("previousClose"))
-            if sym:
-                price_map[sym] = price
-        # 없는 티커는 nan
-        for tk in clean_tickers:
-            if tk not in price_map:
-                price_map[tk] = np.nan
-        return price_map
+        if isinstance(data, list):
+            for item in data:
+                sym = str(item.get("symbol") or "").strip().upper()
+                price = to_float(item.get("price") or item.get("previousClose"))
+                if sym and pd.notna(price):
+                    price_map[sym] = price
     except Exception:
-        return {}
+        pass
+
+    # ── 2차 fallback: quote 실패 or 누락 티커 → historical 마지막 종가 ────
+    missing = [tk for tk in clean_tickers if tk not in price_map or pd.isna(price_map.get(tk))]
+    for tk in missing:
+        try:
+            hist = _fmp_price_history(tk, limit=5)
+            if not hist.empty and "Close" in hist.columns:
+                last_close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+                if not last_close.empty:
+                    price_map[tk] = float(last_close.iloc[-1])
+                    continue
+        except Exception:
+            pass
+        price_map[tk] = np.nan  # 최종 실패
+
+    return price_map
 
 
 # 1.5 / 1.6 공통: 마크다운·설명문에서 잘못 딴 가짜 티커(EXPANDING 등) 원천 차단
@@ -15163,6 +15176,36 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         else:
             st.markdown(f"### 📋 관심 종목 현황 ({len(wl_items)}개)")
             wl_tickers = [i["ticker"] for i in wl_items]
+
+            # ── 💰 등록가 일괄 복구 버튼 (saved_price 없는 종목 대상) ────────
+            _missing_sp = [i for i in wl_items if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce"))]
+            if _missing_sp:
+                st.warning(f"⚠️ **{len(_missing_sp)}개 종목**의 등록가(Saved Price)가 없어 '등록 시 대비'가 N/A로 표시됩니다.")
+                if st.button("💰 등록가 현재가로 일괄 복구", key="bulk_fix_saved_price", type="secondary"):
+                    with st.spinner("등록가 복구 중..."):
+                        try:
+                            fetch_latest_prices_for_tickers.clear()
+                        except Exception:
+                            pass
+                        _fix_tks = tuple(i["ticker"] for i in _missing_sp)
+                        _fix_prices = fetch_latest_prices_for_tickers(_fix_tks)
+                        _fix_count = 0
+                        for i in wl_items:
+                            if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce")):
+                                _fp = _fix_prices.get(i["ticker"], np.nan)
+                                if pd.notna(_fp):
+                                    i["saved_price"] = float(_fp)
+                                    _fix_count += 1
+                        if _fix_count > 0:
+                            _ok_fix, _err_fix = save_watchlist_sheet(uid_wl, wl_items)
+                            if _ok_fix:
+                                load_watchlist_sheet.clear()
+                                st.success(f"✅ {_fix_count}개 종목 등록가 복구 완료!")
+                                st.rerun()
+                            else:
+                                st.error(f"저장 실패: {_err_fix}")
+                        else:
+                            st.warning("복구할 가격 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
 
             with st.spinner("실시간 가격 및 지표 계산 중..."):
                 price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
