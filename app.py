@@ -2183,7 +2183,7 @@ def cached_timing_price_history(ticker_upper: str):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)  # 10분 TTL — 지표 변화 빠른 반영
 def cached_evaluate_kpis_snapshot(ticker_upper: str):
     return evaluate_kpis(str(ticker_upper).strip().upper())
 
@@ -3776,6 +3776,38 @@ def evaluate_kpis(ticker_symbol):
     forward_pe    = to_float(info.get("forwardPE"))
     trailing_pe   = to_float(info.get("trailingPE"))
     price_to_book = to_float(info.get("priceToBook"))
+
+    # Forward P/E fallback — evaluate_kpis에서 직접 계산 (캐시 미스 대비)
+    if pd.isna(forward_pe):
+        try:
+            _k_fp = _fmp_key()
+            if _k_fp:
+                _r_fp = requests.get(
+                    f"{_FMP_BASE}/analyst-estimates?symbol={tk_upper}&period=annual&limit=4&apikey={_k_fp}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if _r_fp.status_code == 200:
+                    _fp_data = _r_fp.json()
+                    if isinstance(_fp_data, list) and _fp_data:
+                        _cur_year = datetime.now().year
+                        _fp_sorted = sorted(_fp_data, key=lambda x: str(x.get("date") or "9999"))
+                        for _ae in _fp_sorted:
+                            _ae_y = str(_ae.get("date") or "")[:4]
+                            try:
+                                if int(_ae_y) < _cur_year:
+                                    continue
+                            except Exception:
+                                continue
+                            _eps = to_float(_ae.get("epsAvg") or _ae.get("estimatedEpsAvg") or _ae.get("estimatedEps"))
+                            _cp  = to_float(info.get("currentPrice") or info.get("price"))
+                            if pd.notna(_eps) and _eps > 0 and pd.notna(_cp) and _cp > 0:
+                                _fwd = round(float(_cp) / float(_eps), 2)
+                                if 0 < _fwd < 2000:
+                                    forward_pe = _fwd
+                                    info["forwardPE"] = _fwd
+                                    break
+        except Exception:
+            pass
     ev_to_ebitda  = to_float(info.get("enterpriseToEbitda"))
     # FMP 무료 대체 지표
     ev_to_sales   = to_float(info.get("_fmp_ev_to_sales"))
@@ -11375,16 +11407,21 @@ if st.session_state.get("logged_in"):
                     st.dataframe(styled_top10, use_container_width=True, hide_index=True)
             else:
                 with st.spinner(f"{selected_ticker} 데이터 불러오는 중..."):
-                    kpi_df, pass_count, fail_count, nodata_count, margin_context = cached_evaluate_kpis_snapshot(
+                    kpi_df, _c_pass, _c_fail, _c_nodata, margin_context = cached_evaluate_kpis_snapshot(
                         selected_ticker
                     )
-    
+                # 캐시된 카운트 무시 — kpi_df에서 직접 계산 (캐시 형식 불일치 방지)
+                _pp = kpi_df["Pass"].astype(str)
+                pass_count   = int((_pp.str.contains("Pass",  case=False) & ~_pp.str.contains("Fail", case=False)).sum())
+                fail_count   = int(_pp.str.contains("Fail",   case=False).sum())
+                nodata_count = int((_pp.str.contains("N/A|No Data", case=False) & ~_pp.str.contains("Fail|Pass", case=False)).sum())
+
                 c1, c2, c3, c4 = st.columns(4)
                 total_kpis = len(kpi_df)
                 c1.metric("총 KPI", total_kpis)
-                c2.metric("Pass", int(pass_count))
-                c3.metric("Fail", int(fail_count))
-                c4.metric("No Data", int(nodata_count))
+                c2.metric("Pass", pass_count)
+                c3.metric("Fail", fail_count)
+                c4.metric("No Data", nodata_count)
     
                 with st.container():
                     final_core_pass = bool(margin_context.get("core_fcf_pass"))
@@ -11716,8 +11753,8 @@ if st.session_state.get("logged_in"):
         # ── Earnings Surprise 히스토리 ────────────────────────────────────
         if not is_etf_mode:
             st.divider()
-            st.markdown("### 📅 Earnings 히스토리")
-            st.caption("최근 분기별 실적 데이터입니다.")
+            st.markdown("### 📅 Earnings Surprise 히스토리")
+            st.caption("최근 분기별 EPS 예상 대비 실제 Beat/Miss 현황입니다.")
             try:
                 with st.spinner("어닝 데이터 불러오는 중..."):
                     earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
@@ -11725,29 +11762,40 @@ if st.session_state.get("logged_in"):
                 if earn_df.empty:
                     st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
                 else:
-                    # 컬럼 정규화
                     earn_df.columns = [str(c).strip() for c in earn_df.columns]
-                    # Estimate, Actual, Surprise 컬럼 찾기
-                    # 영문/한글 컬럼 모두 탐색
-                    est_col = next((c for c in earn_df.columns
-                        if "estimate" in c.lower() or "eps 예상" in c.lower() or "예상" in c.lower()), None)
-                    act_col = next((c for c in earn_df.columns
-                        if "actual" in c.lower() or "reported" in c.lower()
-                           or "eps 실제" in c.lower() or "실제" in c.lower()), None)
 
-                    if est_col and act_col:
-                        earn_df["_est_n"] = pd.to_numeric(
-                            earn_df[est_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
-                        earn_df["_act_n"] = pd.to_numeric(
-                            earn_df[act_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
-                        earn_df["Surprise(%)"] = (
-                            (earn_df["_act_n"] - earn_df["_est_n"]) / earn_df["_est_n"].abs() * 100
-                        ).round(1)
-                        earn_df["판정"] = earn_df["Surprise(%)"].apply(
+                    # ── Beat/Miss 판정 ──────────────────────────────────────
+                    # 방법 1: "어닝 서프라이즈" 컬럼이 이미 있으면 바로 사용
+                    _surp_col = next((c for c in earn_df.columns if "서프라이즈" in c or "surprise" in c.lower()), None)
+                    if _surp_col:
+                        # "+1.2%" 형태 → 수치 파싱
+                        _sv = pd.to_numeric(
+                            earn_df[_surp_col].astype(str).str.replace(r"[%+]","",regex=True),
+                            errors="coerce"
+                        )
+                        earn_df["판정"] = _sv.apply(
                             lambda x: "✅ Beat" if pd.notna(x) and x > 0 else ("❌ Miss" if pd.notna(x) and x < 0 else "—")
                         )
-                        earn_df = earn_df.drop(columns=["_est_n","_act_n"], errors="ignore")
+                    else:
+                        # 방법 2: EPS 예상/실제 컬럼에서 직접 계산
+                        est_col = next((c for c in earn_df.columns
+                            if "estimate" in c.lower() or "eps 예상" in c.lower() or "예상" in c.lower()), None)
+                        act_col = next((c for c in earn_df.columns
+                            if "actual" in c.lower() or "reported" in c.lower()
+                               or "eps 실제" in c.lower() or "실제" in c.lower()), None)
+                        if est_col and act_col:
+                            _en = pd.to_numeric(earn_df[est_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
+                            _an = pd.to_numeric(earn_df[act_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
+                            _diff = ((_an - _en) / _en.abs() * 100).round(1)
+                            earn_df["어닝 서프라이즈"] = _diff.apply(
+                                lambda x: f"{x:+.1f}%" if pd.notna(x) else "N/A"
+                            )
+                            earn_df["판정"] = _diff.apply(
+                                lambda x: "✅ Beat" if pd.notna(x) and x > 0 else ("❌ Miss" if pd.notna(x) and x < 0 else "—")
+                            )
 
+                    # ── Beat 비율 요약 ──────────────────────────────────────
+                    if "판정" in earn_df.columns:
                         beat_count  = (earn_df["판정"] == "✅ Beat").sum()
                         total_count = len(earn_df[earn_df["판정"] != "—"])
                         if total_count > 0:
@@ -11757,14 +11805,15 @@ if st.session_state.get("logged_in"):
                             elif beat_rate >= 50: st.warning(f"🟡 {msg} — 보통")
                             else:                 st.error(f"🔴 {msg} — 실적 부진")
 
-                    def _style_surprise(val):
-                        v = pd.to_numeric(str(val).replace("%",""), errors="coerce")
+                    # ── 색상 스타일 적용 ────────────────────────────────────
+                    def _style_surp(val):
+                        v = pd.to_numeric(str(val).replace("%","").replace("+",""), errors="coerce")
                         if pd.isna(v): return ""
                         return "color:#16a34a;font-weight:600" if v > 0 else "color:#dc2626;font-weight:600"
 
-                    if "Surprise(%)" in earn_df.columns:
-                        styled_earn = earn_df.style.map(_style_surprise, subset=["Surprise(%)"])
-                        st.dataframe(styled_earn, use_container_width=True, hide_index=True)
+                    _style_cols = [c for c in earn_df.columns if "서프라이즈" in c or "surprise" in c.lower()]
+                    if _style_cols:
+                        st.dataframe(earn_df.style.map(_style_surp, subset=_style_cols), use_container_width=True, hide_index=True)
                     else:
                         st.dataframe(earn_df, use_container_width=True, hide_index=True)
             except Exception as _ee:
