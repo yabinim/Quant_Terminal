@@ -2218,6 +2218,7 @@ def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "")
                 "vol_surge": round(vol_surge, 2) if pd.notna(vol_surge) else None,
                 "verdict": verdict,
                 "detail": detail,
+                "current_price": round(float(s.iloc[-1]), 4) if not s.empty and pd.notna(s.iloc[-1]) else None,  # ✅ Watchlist saved_price용
             })
 
         results.sort(key=lambda x: (
@@ -8300,6 +8301,8 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
 
         close_series = close_df[ticker] if ticker in close_df.columns else pd.Series(dtype=float)
         vol_series = volume_df[ticker] if ticker in volume_df.columns else pd.Series(dtype=float)
+        _close_num_l = pd.to_numeric(close_series, errors="coerce").dropna()
+        last_px_l = to_float(_close_num_l.iloc[-1]) if not _close_num_l.empty else np.nan  # ✅ 현재가
 
         m1_ret = calculate_period_return(close_series, 21)
         m3_ret = calculate_period_return(close_series, 63)
@@ -8348,6 +8351,7 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             {
                 "Ticker": ticker,
                 "Name": long_name,
+                "Price": round(float(last_px_l), 4) if pd.notna(last_px_l) else np.nan,  # ✅ Watchlist saved_price용
                 "Narrative Raw": narrative_score,
                 "Narrative Why": narrative_why,
                 "Narrative Available": bool(narrative_available),
@@ -8528,6 +8532,7 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
             {
                 "Ticker": ticker,
                 "Name": long_name,
+                "Price": round(float(last_px), 4) if pd.notna(last_px) else np.nan,  # ✅ Watchlist saved_price용
                 "Narrative Raw": narrative_score,
                 "Narrative Why": narrative_why,
                 "Narrative Available": bool(narrative_available),
@@ -9816,11 +9821,18 @@ if st.session_state.get("logged_in"):
     if st.sidebar.button("현재 티커 저장", use_container_width=True, type="primary"):
         _uid_memo = str(st.session_state.get("user_id") or "").strip()
         _tk_save = str(selected_ticker).strip().upper()
+        # ✅ 저장 시점 현재가를 캐시 우회하여 신선하게 조회
+        try:
+            fetch_latest_prices_for_tickers.clear()
+        except Exception:
+            pass
+        _saved_p = fetch_latest_prices_for_tickers((_tk_save,)).get(_tk_save, np.nan)
         _ok_wl_save, _err_wl_save = add_to_watchlist(
             _uid_memo, _tk_save,
             memo=watch_note.strip(),
             alert_rsi=float(_alert_rsi_val) if _alert_rsi_val > 0 else None,
             alert_ma200=bool(_alert_ma200_val),
+            saved_price=float(_saved_p) if pd.notna(_saved_p) else None,  # ✅ 명시적 전달
         )
         if _ok_wl_save:
             _alert_desc = []
@@ -10748,7 +10760,16 @@ if st.session_state.get("logged_in"):
                             )
                             def _add_to_wl_em(tk=v["ticker"], vdict=v):
                                 _uid_em = str(st.session_state.get("user_id") or "").strip()
-                                _cur_p = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+                                # ✅ verify_emerging_with_quant 결과의 current_price 우선 사용
+                                _preset = vdict.get("current_price")
+                                if _preset and pd.notna(_preset):
+                                    _cur_p = float(_preset)
+                                else:
+                                    try:
+                                        fetch_latest_prices_for_tickers.clear()
+                                    except Exception:
+                                        pass
+                                    _cur_p = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
                                 _em_item = {
                                     "ticker": tk,
                                     "memo": f"Emerging 검증 - {vdict['verdict']}",
@@ -10782,7 +10803,16 @@ if st.session_state.get("logged_in"):
                             st.markdown(f"**{v['ticker']}** — {v['detail']}")
                             def _add_early_wl(tk=v["ticker"], vd=v):
                                 _uid_el = str(st.session_state.get("user_id") or "").strip()
-                                _cur_p2 = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+                                # ✅ verify_emerging_with_quant 결과의 current_price 우선 사용
+                                _preset2 = vd.get("current_price")
+                                if _preset2 and pd.notna(_preset2):
+                                    _cur_p2 = float(_preset2)
+                                else:
+                                    try:
+                                        fetch_latest_prices_for_tickers.clear()
+                                    except Exception:
+                                        pass
+                                    _cur_p2 = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
                                 _el_item = {
                                     "ticker": tk, "memo": f"Emerging 얼리버드 - {vd['detail']}",
                                     "alert_price": np.nan, "alert_rsi": 35.0, "alert_ma200": True,
@@ -14816,12 +14846,19 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.warning("티커를 입력해주세요.")
                 else:
                     with st.spinner(f"{wl_ticker} 저장 중..."):
+                        # ✅ 저장 시점 현재가를 캐시 우회하여 신선하게 조회
+                        try:
+                            fetch_latest_prices_for_tickers.clear()
+                        except Exception:
+                            pass
+                        _wl_form_price = fetch_latest_prices_for_tickers((wl_ticker,)).get(wl_ticker, np.nan)
                         ok_wl, err_wl = add_to_watchlist(
                             uid_wl, wl_ticker,
                             memo=wl_memo.strip(),
                             alert_price=float(wl_alert_price) if wl_alert_price > 0 else None,
                             alert_rsi=float(wl_alert_rsi) if wl_alert_rsi > 0 else None,
                             alert_ma200=wl_alert_ma200,
+                            saved_price=float(_wl_form_price) if pd.notna(_wl_form_price) else None,  # ✅ 명시적 전달
                         )
                     if ok_wl:
                         st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!")
