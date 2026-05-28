@@ -8528,18 +8528,45 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
 
 
 def fetch_market_news():
+    """
+    FMP Stock News API 기반 뉴스 수집 (레거시 호환용 단순 텍스트 반환).
+    fetch_global_market_news()의 경량 버전으로, 일부 서브 프롬프트에서 사용.
+    FMP 키 없을 시 Yahoo Finance RSS fallback.
+    """
+    k = _fmp_key()
+    chunks = []
+
+    if k:
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/news/stock-latest?page=0&limit=20&apikey={k}",
+                timeout=_FMP_TIMEOUT,
+            )
+            if r.status_code == 200:
+                items = r.json() if isinstance(r.json(), list) else []
+                for idx, item in enumerate(items[:20], start=1):
+                    title = _clean_news_text(item.get("title", ""))
+                    text = _clean_news_text(item.get("text", "") or item.get("summary", ""))[:200]
+                    tickers = str(item.get("tickers", "") or "").strip()
+                    if title:
+                        line = f"[{idx}] Title: {title}"
+                        if tickers:
+                            line += f" | Tickers: {tickers}"
+                        if text:
+                            line += f"\nSummary: {text}"
+                        chunks.append(line)
+                if chunks:
+                    return "\n\n".join(chunks).strip()
+        except Exception:
+            pass
+
+    # Fallback: Yahoo Finance RSS
     try:
         feed = feedparser.parse("https://finance.yahoo.com/news/rssindex")
         entries = getattr(feed, "entries", [])[:20]
-        if not entries:
-            return ""
-
-        chunks = []
         for idx, entry in enumerate(entries, start=1):
-            title = str(getattr(entry, "title", "") or "").strip()
-            summary = str(getattr(entry, "summary", "") or "").strip()
-            summary = re.sub(r"<[^>]+>", " ", summary)
-            summary = re.sub(r"\s+", " ", summary).strip()
+            title = _clean_news_text(getattr(entry, "title", ""))
+            summary = _clean_news_text(getattr(entry, "summary", "") or "")
             if title or summary:
                 chunks.append(f"[{idx}] Title: {title}\nSummary: {summary}")
         return "\n\n".join(chunks).strip()
@@ -8556,22 +8583,82 @@ def _to_utc_datetime(struct_time_obj):
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _clean_news_text(raw_text):
+def _clean_news_text(raw_text, max_len: int = 0):
+    """HTML 태그 제거 + 공백 정규화. max_len > 0 이면 해당 길이로 truncate."""
     text = str(raw_text or "").strip()
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
+    if max_len > 0:
+        text = text[:max_len]
     return text
 
 
-def fetch_global_market_news():
+# ---------------------------------------------------------------------------
+# FMP 뉴스 파이프라인 헬퍼
+# ---------------------------------------------------------------------------
+
+def _fmp_news_fetch(endpoint: str, params: dict, timeout: int = 8) -> list:
     """
-    Multi-source RSS ingestion + title similarity dedup + weighted ranking.
-    Returns:
-      top_news: List[dict] (Top 50)
-      context_text: str (LLM 입력 텍스트)
-      raw_count: int (중복 제거 전 원본 수집 건수)
+    FMP 뉴스 API 단일 호출 래퍼.
+    성공 시 list[dict] 반환, 실패 시 [] 반환.
+    """
+    k = _fmp_key()
+    if not k:
+        return []
+    try:
+        p = {**params, "apikey": k}
+        r = requests.get(f"{_FMP_BASE}/{endpoint}", params=p, timeout=timeout)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _fmp_news_to_unified(items: list, source_label: str, weight: float,
+                         body_key: str = "text", max_body: int = 300) -> list:
+    """
+    FMP 뉴스 응답 → 통합 dict 포맷 변환.
+    통합 포맷: {title, summary, tickers, published, published_dt, source, weight}
+    """
+    result = []
+    for item in items:
+        title = _clean_news_text(item.get("title", ""))
+        body  = _clean_news_text(item.get(body_key, "") or item.get("text", "") or item.get("content", ""), max_len=max_body)
+        pub_raw = str(item.get("publishedDate", "") or item.get("date", "") or "").strip()
+        tickers = _clean_news_text(item.get("tickers", "") or item.get("symbol", ""))
+
+        # publishedDate → datetime (FMP: "2025-05-28 14:30:00" 형식)
+        pub_dt = datetime.min.replace(tzinfo=timezone.utc)
+        if pub_raw:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+                try:
+                    pub_dt = datetime.strptime(pub_raw[:19], fmt).replace(tzinfo=timezone.utc)
+                    break
+                except ValueError:
+                    continue
+
+        if not title:
+            continue
+        result.append({
+            "title":        title,
+            "summary":      body,
+            "tickers":      tickers,
+            "published":    pub_raw if pub_raw else "N/A",
+            "published_dt": pub_dt,
+            "source":       source_label,
+            "weight":       weight,
+        })
+    return result
+
+
+def _rss_news_fallback() -> list:
+    """
+    FMP API 키 없거나 모든 레이어 실패 시 RSS fallback.
+    기존 4개 소스 유지.
     """
     browser_headers = {
         "User-Agent": (
@@ -8580,104 +8667,152 @@ def fetch_global_market_news():
             "Chrome/120.0.0.0 Safari/537.36"
         )
     }
-
     rss_sources = {
-        "Yahoo Finance": {
-            "url": "https://finance.yahoo.com/news/rssindex",
-            "weight": 1.0,
-        },
-        "CNBC": {
-            "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?profile=120000000",
-            "weight": 0.9,
-        },
-        "Google News Finance": {
-            "url": "https://news.google.com/rss/search?q=finance+market+economy&hl=en-US&gl=US&ceid=US:en",
-            "weight": 0.8,
-        },
-        "MarketWatch": {
-            "url": "http://feeds.marketwatch.com/marketwatch/marketpulse/",
-            "weight": 0.7,
-        },
+        "Yahoo Finance":      ("https://finance.yahoo.com/news/rssindex", 1.0),
+        "CNBC":               ("https://search.cnbc.com/rs/search/combinedcms/view.xml?profile=120000000", 0.9),
+        "Google News Finance":("https://news.google.com/rss/search?q=finance+market+economy&hl=en-US&gl=US&ceid=US:en", 0.8),
+        "MarketWatch":        ("http://feeds.marketwatch.com/marketwatch/marketpulse/", 0.7),
     }
-
     all_news = []
-    for source_name, cfg in rss_sources.items():
-        feed_url = cfg.get("url", "")
-        weight = float(cfg.get("weight", 0.0))
+    for source_name, (feed_url, weight) in rss_sources.items():
         try:
             response = requests.get(feed_url, headers=browser_headers, timeout=8)
             if response.status_code != 200:
                 continue
-
             feed = feedparser.parse(response.content)
-            entries = getattr(feed, "entries", []) or []
-            for entry in entries:
-                title = _clean_news_text(getattr(entry, "title", ""))
-                summary = _clean_news_text(getattr(entry, "summary", "") or getattr(entry, "description", ""))
-                published_raw = str(getattr(entry, "published", "") or getattr(entry, "updated", "") or "").strip()
-                published_dt = _to_utc_datetime(
+            for entry in getattr(feed, "entries", []) or []:
+                title   = _clean_news_text(getattr(entry, "title", ""))
+                summary = _clean_news_text(getattr(entry, "summary", "") or getattr(entry, "description", ""), max_len=300)
+                pub_raw = str(getattr(entry, "published", "") or getattr(entry, "updated", "") or "").strip()
+                pub_dt  = _to_utc_datetime(
                     getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
                 )
                 if not (title or summary):
                     continue
-                all_news.append(
-                    {
-                        "title": title,
-                        "summary": summary,
-                        "published": published_raw if published_raw else "N/A",
-                        "published_dt": published_dt,
-                        "source": source_name,
-                        "weight": weight,
-                    }
-                )
+                all_news.append({
+                    "title": title, "summary": summary, "tickers": "",
+                    "published": pub_raw or "N/A", "published_dt": pub_dt,
+                    "source": f"RSS/{source_name}", "weight": weight,
+                })
         except Exception:
-            # 개별 피드 실패는 전체 파이프라인을 중단시키지 않음
             continue
+    return all_news
 
-    deduped_news = []
+
+def _dedup_and_rank(all_news: list, top_n: int = 60) -> list:
+    """제목 유사도 기반 중복 제거 → (weight DESC, published_dt DESC) 정렬 → top_n 반환."""
     similarity_threshold = 0.7
+    deduped = []
     for news in all_news:
-        duplicate_idx = None
-        for idx, kept in enumerate(deduped_news):
-            title_sim = SequenceMatcher(None, news["title"].lower(), kept["title"].lower()).ratio()
-            if title_sim >= similarity_threshold:
-                duplicate_idx = idx
+        dup_idx = None
+        for idx, kept in enumerate(deduped):
+            if SequenceMatcher(None, news["title"].lower(), kept["title"].lower()).ratio() >= similarity_threshold:
+                dup_idx = idx
                 break
+        if dup_idx is None:
+            deduped.append(news)
+        else:
+            kept = deduped[dup_idx]
+            if news["weight"] > kept["weight"]:
+                deduped[dup_idx] = news
+            elif news["weight"] == kept["weight"] and news["published_dt"] > kept["published_dt"]:
+                deduped[dup_idx] = news
 
-        if duplicate_idx is None:
-            deduped_news.append(news)
-            continue
-
-        kept_news = deduped_news[duplicate_idx]
-        if news["weight"] > kept_news["weight"]:
-            deduped_news[duplicate_idx] = news
-        elif news["weight"] == kept_news["weight"] and news["published_dt"] > kept_news["published_dt"]:
-            deduped_news[duplicate_idx] = news
-
-    ranked_news = sorted(
-        deduped_news,
+    ranked = sorted(
+        deduped,
         key=lambda x: (x.get("weight", 0.0), x.get("published_dt", datetime.min.replace(tzinfo=timezone.utc))),
         reverse=True,
     )
-    top_news = ranked_news[:50]
+    return ranked[:top_n]
 
+
+def _build_news_context_text(top_news: list) -> str:
+    """
+    LLM 프롬프트용 뉴스 컨텍스트 문자열 생성.
+    티커 정보가 있는 경우 Tickers 행을 포함시켜 LLM winners 선정 정확도를 높임.
+    """
     chunks = []
     for idx, item in enumerate(top_news, start=1):
-        chunks.append(
-            "\n".join(
-                [
-                    f"[{idx}] Source: {item.get('source', 'Unknown')} (Weight: {item.get('weight', 0.0):.1f})",
-                    f"Published: {item.get('published', 'N/A')}",
-                    f"Title: {item.get('title', '')}",
-                    f"Summary: {item.get('summary', '')}",
-                ]
-            )
-        )
-    context_text = "\n\n".join(chunks).strip()
+        lines = [
+            f"[{idx}] Source: {item.get('source', 'Unknown')} (Weight: {item.get('weight', 0.0):.1f})",
+            f"Published: {item.get('published', 'N/A')}",
+        ]
+        tickers = str(item.get("tickers", "") or "").strip()
+        if tickers:
+            lines.append(f"Tickers: {tickers}")
+        lines.append(f"Title: {item.get('title', '')}")
+        summary = str(item.get("summary", "") or "").strip()
+        if summary:
+            lines.append(f"Content: {summary}")
+        chunks.append("\n".join(lines))
+    return "\n\n".join(chunks).strip()
 
+
+def fetch_global_market_news():
+    """
+    FMP 4-레이어 뉴스 파이프라인 (RSS fallback 포함).
+
+    레이어 구조 및 가중치:
+      Layer A  Stock News       weight=1.2  티커 태그 포함 → winners 직결
+      Layer B  Press Releases   weight=1.3  어닝/M&A/가이던스 등 고임팩트
+      Layer C  FMP Articles     weight=1.0  FMP 에디터 분석 기사
+      Layer D  General News     weight=0.8  매크로/경제 맥락
+
+    FMP 키 없거나 전체 레이어 수집 0건 → RSS fallback 자동 전환.
+
+    Returns:
+      top_news:     List[dict]  (Top 60, published_dt 제거됨)
+      context_text: str         (LLM 프롬프트용 텍스트)
+      raw_count:    int         (중복 제거 전 수집 건수)
+    """
+    k = _fmp_key()
+    all_news: list = []
+    source_log: list[str] = []
+
+    if k:
+        # ── Layer A: Stock News (티커 태그 포함, 가장 중요) ──────────────────
+        stock_items = _fmp_news_fetch("news/stock-latest", {"page": 0, "limit": 50})
+        layer_a = _fmp_news_to_unified(stock_items, "FMP Stock News", weight=1.2, body_key="text", max_body=300)
+        all_news.extend(layer_a)
+        source_log.append(f"Stock News {len(layer_a)}건")
+
+        # ── Layer B: Press Releases (고임팩트 기업 이벤트) ───────────────────
+        press_items = _fmp_news_fetch("press-releases-latest", {"page": 0, "limit": 30})
+        layer_b = _fmp_news_to_unified(press_items, "FMP Press Release", weight=1.3, body_key="text", max_body=300)
+        all_news.extend(layer_b)
+        source_log.append(f"Press Releases {len(layer_b)}건")
+
+        # ── Layer C: FMP Articles (분석 깊이) ────────────────────────────────
+        article_items = _fmp_news_fetch("fmp-articles", {"page": 0, "limit": 20})
+        layer_c = _fmp_news_to_unified(article_items, "FMP Article", weight=1.0, body_key="content", max_body=300)
+        all_news.extend(layer_c)
+        source_log.append(f"FMP Articles {len(layer_c)}건")
+
+        # ── Layer D: General News (매크로 맥락) ──────────────────────────────
+        general_items = _fmp_news_fetch("news/general-latest", {"page": 0, "limit": 20})
+        layer_d = _fmp_news_to_unified(general_items, "FMP General News", weight=0.8, body_key="text", max_body=200)
+        all_news.extend(layer_d)
+        source_log.append(f"General News {len(layer_d)}건")
+
+    raw_count = len(all_news)
+
+    # FMP 키 없거나 전체 수집 0건 → RSS fallback
+    if raw_count == 0:
+        all_news = _rss_news_fallback()
+        raw_count = len(all_news)
+        source_log = [f"RSS Fallback {raw_count}건"]
+
+    top_news = _dedup_and_rank(all_news, top_n=60)
+    context_text = _build_news_context_text(top_news)
+
+    # session_state에 소스 수집 현황 기록 (UI 디버그용)
+    st.session_state["_news_source_log"] = " | ".join(source_log)
+
+    # published_dt는 내부용이므로 최종 반환 전 제거
     for item in top_news:
         item.pop("published_dt", None)
-    return top_news, context_text, len(all_news)
+
+    return top_news, context_text, raw_count
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -9757,14 +9892,16 @@ if st.session_state.get("logged_in"):
                 fresh_sig = fresh_drg.get("signals", sig)
                 fresh_warnings = fresh_drg.get("warnings", [])
 
-                # 2) RSS 멀티소스 뉴스 수집 (Yahoo/CNBC/Google/MarketWatch, 최대 30개)
+                # 2) FMP 멀티레이어 뉴스 수집 (Stock News·Press Releases·Articles·General, 최대 30개)
                 try:
-                    rss_news_list, _, _ = fetch_global_market_news()
+                    fmp_news_list, _, _ = fetch_global_market_news()
                     rss_news_text = "\n".join([
-                        f"- [{item.get('source','?')}] {item.get('title','')} | {item.get('summary','')[:80]}"
-                        for item in rss_news_list[:30]
-                    ]) if rss_news_list else "RSS 뉴스 없음"
-                    rss_news_count = len(rss_news_list)
+                        f"- [{item.get('source','?')}] {item.get('title','')}"
+                        + (f" | Tickers: {item.get('tickers','')}" if item.get('tickers') else "")
+                        + (f" | {item.get('summary','')[:80]}" if item.get('summary') else "")
+                        for item in fmp_news_list[:30]
+                    ]) if fmp_news_list else "뉴스 없음"
+                    rss_news_count = len(fmp_news_list)
                 except Exception:
                     rss_news_text = "\n".join([
                         f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
@@ -10204,17 +10341,18 @@ if st.session_state.get("logged_in"):
         if st.button("🚀 AI 내러티브 엔진 가동 (실시간 뉴스 분석)"):
             try:
                 with st.status("🚀 AI 내러티브 엔진 가동 프로세스 시작...", expanded=True) as status:
-                    st.write("📥 1단계: 글로벌 RSS 뉴스 피드 접속 및 데이터 수집 중...")
+                    st.write("📥 1단계: FMP 멀티레이어 뉴스 파이프라인 수집 중... (Stock News · Press Releases · FMP Articles · General News)")
                     top_news, news_text, raw_news_count = cached_fetch_global_market_news_pack()
+                    _source_log = st.session_state.get("_news_source_log", "")
                     if raw_news_count == 0:
-                        st.write(":red[RSS 수집 에러 발생: 유효한 뉴스 데이터를 확보하지 못했습니다.]")
+                        st.write(":red[뉴스 수집 에러: 유효한 뉴스 데이터를 확보하지 못했습니다. (FMP API 키 확인 또는 RSS Fallback도 실패)]")
                         status.update(label="❌ 분석 중단 (에러 발생)", state="error", expanded=True)
                         st.error("❌ 실시간 뉴스 수집에 실패했습니다.")
                     else:
-                        st.write(f"✔️ 수집 완료: 총 {raw_news_count}개 뉴스 확보")
+                        st.write(f"✔️ 수집 완료: 총 {raw_news_count}개 원본 뉴스 확보 ({_source_log})")
     
-                        st.write("⚙️ 2단계: 뉴스 중복 제거(Deduplication) 및 중요도 랭킹 산출 중...")
-                        st.write(f"✔️ 중복 제거/랭킹 완료: Top {len(top_news)}개 핵심 뉴스 선별")
+                        st.write("⚙️ 2단계: 뉴스 중복 제거(Deduplication) 및 가중치 기반 랭킹 산출 중...")
+                        st.write(f"✔️ 중복 제거/랭킹 완료: Top {len(top_news)}개 핵심 뉴스 선별 (티커 태그 포함)")
                         st.session_state["latest_top_news"] = top_news
     
                         st.write("📊 3단계: ETF Universe 정량 스크리닝 (RS·모멘텀·거래량 분석) 중...")
@@ -10224,7 +10362,7 @@ if st.session_state.get("logged_in"):
                         else:
                             st.write("⚠️ 정량 스크리닝 데이터 없음 — 뉴스 분석만으로 진행")
 
-                        st.write("🧠 4단계: 뉴스 + 정량 데이터를 Gemini 2.5 Flash 엔진으로 전송하여 내러티브 분석 중...")
+                        st.write("🧠 4단계: 뉴스(티커 태그 포함) + 정량 데이터를 Gemini 2.5 Flash 엔진으로 전송하여 내러티브 분석 중...")
                         narrative_data = generate_market_narrative(news_text, selected_language, quant_data=quant_result)
                         st.write("🔍 5단계: AI 응답 수신 완료. JSON 데이터 파싱 및 필터링 중...")
     
@@ -10237,7 +10375,7 @@ if st.session_state.get("logged_in"):
                             status.update(label="✅ 분석 완료! (성공)", state="complete", expanded=False)
                             st.success(
                                 "분석 결과를 Google 스프레드시트 `Quant_DB`의 **`Narratives`** 탭에 한 행 추가했습니다. "
-                                f"(수집 {raw_news_count}건 / LLM 투입 Top {len(top_news)})"
+                                f"(수집 {raw_news_count}건 / LLM 투입 Top {len(top_news)} | {_source_log})"
                             )
                         else:
                             st.write(":red[AI 파싱 에러 발생: Gemini 응답에서 유효한 JSON을 추출하지 못했습니다.]")
