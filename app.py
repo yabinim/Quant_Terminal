@@ -3245,68 +3245,78 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                             if pd.notna(v): info["marketCap"] = v
         except Exception:
             pass
-            if not info.get("earningsDate") and p.get("earningsAnnouncement"):
-                info["earningsDate"] = [str(p["earningsAnnouncement"])[:10]]
-            if p.get("isEtf") and not info.get("quoteType"):
-                info["quoteType"] = "ETF"
-            # ── profile에서 직접 밸류에이션 필드 추출 ─────────────────
-            if not info.get("trailingPE"):
-                v = to_float(p.get("pe") or p.get("peRatio"))
-                if pd.notna(v) and v > 0: info["trailingPE"] = v
-            if not info.get("forwardPE"):
-                v = to_float(p.get("forwardPE") or p.get("forwardPe"))
-                if pd.notna(v) and v > 0: info["forwardPE"] = v
 
-    # ── analyst-estimates: Forward P/E 계산 (profile에 없을 때) ─────
+    # ── profile 보완 필드 (quote 블록과 독립) ──────────────────────────────
+    try:
+        _p = _fmp_profile(ticker)
+        if _p:
+            if not info.get("earningsDate") and _p.get("earningsAnnouncement"):
+                info["earningsDate"] = [str(_p["earningsAnnouncement"])[:10]]
+            if _p.get("isEtf") and not info.get("quoteType"):
+                info["quoteType"] = "ETF"
+            if not info.get("trailingPE"):
+                v = to_float(_p.get("pe") or _p.get("peRatio"))
+                if pd.notna(v) and v > 0: info["trailingPE"] = v
+            if not info.get("trailingEps"):
+                v = to_float(_p.get("eps") or _p.get("epsActual"))
+                if pd.notna(v): info["trailingEps"] = v
+            if not info.get("priceToBook"):
+                v = to_float(_p.get("priceToBook") or _p.get("pbRatio"))
+                if pd.notna(v) and v > 0: info["priceToBook"] = v
+            if not info.get("beta"):
+                v = to_float(_p.get("beta"))
+                if pd.notna(v): info["beta"] = v
+            if not info.get("dividendYield"):
+                v = to_float(_p.get("lastDiv"))
+                price_v = to_float(_p.get("price"))
+                if pd.notna(v) and pd.notna(price_v) and price_v > 0:
+                    info["dividendYield"] = v / price_v
+            if not info.get("_fmp_dcf"):
+                v = to_float(_p.get("dcf"))
+                if pd.notna(v) and v > 0: info["_fmp_dcf"] = v
+    except Exception:
+        pass
+
+    # ── analyst-estimates: Forward P/E 계산 ────────────────────────────────
+    # 실제 API 응답: epsAvg 필드 사용, period=annual&limit=4로 가장 가까운 연도 우선
     if not info.get("forwardPE"):
         try:
             k_val = _fmp_key()
             if k_val:
                 r_ae = requests.get(
-                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&limit=4&apikey={k_val}",
+                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k_val}",
                     timeout=_FMP_TIMEOUT
                 )
                 if r_ae.status_code == 200:
                     ae_data = r_ae.json()
                     if isinstance(ae_data, list) and ae_data:
-                        # 현재 연도 이후 첫 번째 예상치 사용
                         current_year = datetime.now().year
-                        for ae in ae_data:
-                            ae_date = str(ae.get("date") or ae.get("year") or "")[:4]
+                        # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
+                        ae_sorted = sorted(
+                            ae_data,
+                            key=lambda x: str(x.get("date") or x.get("year") or "9999")
+                        )
+                        for ae in ae_sorted:
+                            ae_year_str = str(ae.get("date") or ae.get("year") or "")[:4]
                             try:
-                                if int(ae_date) >= current_year:
-                                    est_eps = to_float(
-                                        ae.get("estimatedEpsAvg") or ae.get("estimatedEps") or
-                                        ae.get("epsAvg") or ae.get("eps")
-                                    )
-                                    cur_price = to_float(info.get("currentPrice") or info.get("price"))
-                                    if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
-                                        fwd_pe = round(cur_price / est_eps, 2)
-                                        if 0 < fwd_pe < 2000:
-                                            info["forwardPE"] = fwd_pe
-                                        break
+                                ae_year = int(ae_year_str)
                             except Exception:
                                 continue
+                            if ae_year < current_year:
+                                continue
+                            # 실제 API 필드명: epsAvg (확인됨)
+                            est_eps = to_float(
+                                ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
+                                ae.get("estimatedEps") or ae.get("eps")
+                            )
+                            cur_price = to_float(info.get("currentPrice") or info.get("price"))
+                            if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
+                                fwd_pe = round(float(cur_price) / float(est_eps), 2)
+                                if 0 < fwd_pe < 2000:
+                                    info["forwardPE"] = fwd_pe
+                                    break
         except Exception:
             pass
-            if not info.get("trailingEps"):
-                v = to_float(p.get("eps") or p.get("epsActual"))
-                if pd.notna(v): info["trailingEps"] = v
-            if not info.get("priceToBook"):
-                v = to_float(p.get("priceToBook") or p.get("pbRatio"))
-                if pd.notna(v) and v > 0: info["priceToBook"] = v
-            if not info.get("beta"):
-                v = to_float(p.get("beta"))
-                if pd.notna(v): info["beta"] = v
-            if not info.get("dividendYield"):
-                v = to_float(p.get("lastDiv"))
-                price_v = to_float(p.get("price"))
-                if pd.notna(v) and pd.notna(price_v) and price_v > 0:
-                    info["dividendYield"] = v / price_v
-            # DCF 내재가치
-            if not info.get("_fmp_dcf"):
-                v = to_float(p.get("dcf"))
-                if pd.notna(v) and v > 0: info["_fmp_dcf"] = v
 
     # ── key-metrics-ttm: EV/Sales, EV/FCF, EV/EBITDA, ROE (실제 확인 필드) ──
     if not info.get("_fmp_ev_to_sales") or not info.get("_fmp_ev_to_fcf") or not info.get("enterpriseToEbitda"):
@@ -3449,11 +3459,11 @@ def fetch_company_overview(ticker_upper: str) -> dict:
         k = _fmp_key()
         tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1))
 
-        def _first_future_date(items, date_key="date"):
+        def _first_future_date(items):
             """리스트에서 내일 이후 가장 이른 날짜 반환."""
             future = []
             for it in (items if isinstance(items, list) else []):
-                ds = str(it.get(date_key) or "")[:10]
+                ds = str(it.get("date") or "")[:10]
                 if not ds or len(ds) < 10:
                     continue
                 try:
@@ -3487,7 +3497,7 @@ def fetch_company_overview(ticker_upper: str) -> dict:
                 except Exception:
                     pass
 
-            # 3) analyst-estimates (분기 예상 날짜)
+            # 3) analyst-estimates 분기별
             if not next_earnings:
                 try:
                     r3 = requests.get(
@@ -4079,10 +4089,10 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
         except Exception:
             pass
 
-    # I: 애널리스트 컨센서스 — ratings-snapshot (FMP Starter 제공)
-    # 기관 보유율 대신 "기관 애널리스트들의 매수 의견 비율"로 CAN SLIM I 근사
-    analyst_buy_pct = np.nan   # 매수 의견 비율 (0~100)
-    analyst_label   = ""       # 표시용 레이블
+    # I: 애널리스트 매수 컨센서스 (ratings-snapshot) — FMP Starter 제공
+    # 기관 보유 API가 Starter 플랜 차단이므로 ratings-snapshot으로 대체
+    analyst_buy_pct = np.nan
+    analyst_label   = ""
     if k_val:
         try:
             r_rat = requests.get(
@@ -4093,20 +4103,20 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
                 rat_data = r_rat.json()
                 rat = rat_data[0] if isinstance(rat_data, list) and rat_data else (rat_data if isinstance(rat_data, dict) else {})
                 if rat:
-                    strong_buy = to_float(rat.get("strongBuy") or rat.get("ratingRecommendationStrongBuy") or 0)
-                    buy        = to_float(rat.get("buy")       or rat.get("ratingRecommendationBuy")       or 0)
-                    hold       = to_float(rat.get("hold")      or rat.get("ratingRecommendationHold")      or 0)
-                    sell       = to_float(rat.get("sell")      or rat.get("ratingRecommendationSell")      or 0)
-                    strong_sell= to_float(rat.get("strongSell")or rat.get("ratingRecommendationStrongSell")or 0)
-                    total_cnt  = (strong_buy or 0) + (buy or 0) + (hold or 0) + (sell or 0) + (strong_sell or 0)
-                    if total_cnt and total_cnt > 0:
-                        buy_cnt = (strong_buy or 0) + (buy or 0)
-                        analyst_buy_pct = round(float(buy_cnt / total_cnt * 100), 1)
-                        analyst_label = f"매수의견 {analyst_buy_pct:.0f}% ({int(buy_cnt)}/{int(total_cnt)}명)"
+                    sb  = to_float(rat.get("strongBuy")  or 0)
+                    b   = to_float(rat.get("buy")        or 0)
+                    h   = to_float(rat.get("hold")       or 0)
+                    s   = to_float(rat.get("sell")       or 0)
+                    ss  = to_float(rat.get("strongSell") or 0)
+                    tot = (sb or 0)+(b or 0)+(h or 0)+(s or 0)+(ss or 0)
+                    if tot > 0:
+                        bc = (sb or 0)+(b or 0)
+                        analyst_buy_pct = round(float(bc / tot * 100), 1)
+                        analyst_label = f"매수의견 {analyst_buy_pct:.0f}% ({int(bc)}/{int(tot)}명)"
         except Exception:
             pass
 
-    # ratings-snapshot 실패시 grades-consensus fallback
+    # grades-consensus fallback
     if pd.isna(analyst_buy_pct) and k_val:
         try:
             r_gc = requests.get(
@@ -4124,7 +4134,7 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
                     ss  = to_float(gc.get("strongSell") or 0)
                     tot = (sb or 0)+(b or 0)+(h or 0)+(s or 0)+(ss or 0)
                     if tot > 0:
-                        bc = (sb or 0) + (b or 0)
+                        bc = (sb or 0)+(b or 0)
                         analyst_buy_pct = round(float(bc / tot * 100), 1)
                         analyst_label = f"매수의견 {analyst_buy_pct:.0f}% ({int(bc)}/{int(tot)}명)"
         except Exception:
@@ -4207,8 +4217,7 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     cs_score += momentum_pts
     cs_detail["L+N_모멘텀"] = f"MA정배열+고점근접 → {momentum_pts}점"
 
-    # I: 애널리스트 매수 컨센서스 (15점) — 기관 보유 대체 지표
-    # FMP Starter에서 기관 보유 API 차단 → ratings-snapshot 매수의견 비율로 대체
+    # I: 애널리스트 매수 컨센서스 (15점) — 기관보유 대체
     if pd.notna(analyst_buy_pct):
         if analyst_buy_pct >= 70:   pts = 15
         elif analyst_buy_pct >= 55: pts = 10
@@ -11737,8 +11746,7 @@ if st.session_state.get("logged_in"):
                     inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
 
                 if inst_df.empty:
-                    # FMP Starter 차단 → ratings-snapshot으로 대체 표시
-                    st.caption("※ FMP Starter 플랜에서 기관 보유 상세 데이터 미제공. 애널리스트 컨센서스로 대체합니다.")
+                    st.caption("※ FMP Starter 플랜에서 기관 보유 상세 미제공 → 애널리스트 컨센서스로 대체")
                     _tk_inst = str(selected_ticker).strip().upper()
                     _k_inst = _fmp_key()
                     if _k_inst:
@@ -11756,24 +11764,22 @@ if st.session_state.get("logged_in"):
                                     _h   = int(_ri.get("hold")       or 0)
                                     _s   = int(_ri.get("sell")       or 0)
                                     _ss  = int(_ri.get("strongSell") or 0)
-                                    _tot = _sb + _b + _h + _s + _ss
+                                    _tot = _sb+_b+_h+_s+_ss
                                     if _tot > 0:
-                                        _buy_pct = round((_sb + _b) / _tot * 100, 1)
+                                        _buy_pct = round((_sb+_b)/_tot*100, 1)
                                         ic1, ic2, ic3 = st.columns(3)
                                         ic1.metric("애널리스트 매수 의견", f"{_buy_pct:.0f}%", f"{_sb+_b}/{_tot}명")
                                         ic2.metric("Strong Buy / Buy", f"{_sb} / {_b}명")
                                         ic3.metric("Hold / Sell", f"{_h} / {_s+_ss}명")
-                                        _rating_label = _ri.get("ratingRecommendation") or _ri.get("rating") or ""
-                                        if _rating_label:
-                                            st.info(f"📊 종합 의견: **{_rating_label}**")
+                                        _rlabel = _ri.get("ratingRecommendation") or _ri.get("rating") or ""
+                                        if _rlabel:
+                                            st.info(f"📊 종합 의견: **{_rlabel}**")
                                     else:
-                                        st.info("애널리스트 데이터도 없습니다.")
+                                        st.info("애널리스트 데이터가 없습니다.")
                                 else:
                                     st.info("애널리스트 데이터를 가져오지 못했습니다.")
-                        except Exception as _ie2:
-                            st.info(f"데이터 로드 실패: {_ie2}")
-                    else:
-                        st.info("FMP API 키가 설정되지 않았습니다.")
+                        except Exception:
+                            st.info("애널리스트 데이터 로드 실패.")
                 else:
                     inst_df.columns = [str(c).strip() for c in inst_df.columns]
                     pct_col = next((c for c in inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
