@@ -12328,125 +12328,248 @@ if st.session_state.get("logged_in"):
         # ── AI 종합 진단 ─────────────────────────────────────────────────
         st.divider()
         st.markdown("### 🤖 AI 종합 진단")
-        st.caption("펀더멘털 + 기술적 지표를 Gemini AI가 종합 분석해서 투자 판단을 제공합니다.")
+        st.caption("이 탭의 모든 데이터(펀더멘털·기술적 지표·투자스타일·어닝·인사이더·애널리스트·의회거래)를 Gemini AI가 종합 분석합니다.")
 
-        if st.button("🤖 AI 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
+        # session_state 키: 종목별로 분리
+        _diag_key        = f"ai_diag_result_{str(selected_ticker).strip().upper()}"
+        _diag_ticker_key = "ai_diag_last_ticker"
+
+        # 종목이 바뀌면 이전 진단 결과 초기화
+        if st.session_state.get(_diag_ticker_key) != str(selected_ticker).strip().upper():
+            st.session_state[_diag_ticker_key] = str(selected_ticker).strip().upper()
+            if _diag_key in st.session_state:
+                del st.session_state[_diag_key]
+
+        if st.button("🤖 AI 종합 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
             try:
-                # 이미 위에서 계산된 값들을 최대한 재사용
+                _tk = str(selected_ticker).strip().upper()
+
+                # 1) 기술적 지표
                 _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
-                _diag_close = pd.to_numeric(_diag_timing["Close"], errors="coerce").dropna() if not _diag_timing.empty else pd.Series(dtype=float)
-                _diag_rsi = float(calculate_rsi(_diag_close).dropna().iloc[-1]) if len(_diag_close) > 14 else np.nan
-                _diag_ma200 = float(_diag_close.rolling(200, min_periods=150).mean().iloc[-1]) if len(_diag_close) >= 150 else np.nan
-                _diag_ma50 = float(_diag_close.rolling(50, min_periods=50).mean().iloc[-1]) if len(_diag_close) >= 50 else np.nan
-                _diag_price = float(_diag_close.iloc[-1]) if not _diag_close.empty else np.nan
-                _diag_52w_high = float(_diag_close.max()) if not _diag_close.empty else np.nan
-                _diag_pct_from_high = ((_diag_price / _diag_52w_high) - 1) * 100 if pd.notna(_diag_price) and pd.notna(_diag_52w_high) and _diag_52w_high > 0 else np.nan
+                _dc = pd.to_numeric(_diag_timing["Close"], errors="coerce").dropna() if not _diag_timing.empty else pd.Series(dtype=float)
+                _d_price    = float(_dc.iloc[-1]) if not _dc.empty else np.nan
+                _d_rsi      = float(calculate_rsi(_dc).dropna().iloc[-1]) if len(_dc) > 14 else np.nan
+                _d_ma50     = float(_dc.rolling(50,  min_periods=50 ).mean().iloc[-1]) if len(_dc) >= 50  else np.nan
+                _d_ma200    = float(_dc.rolling(200, min_periods=150).mean().iloc[-1]) if len(_dc) >= 150 else np.nan
+                _d_52h      = float(_dc.rolling(252).max().iloc[-1]) if len(_dc) >= 20 else float(_dc.max())
+                _d_52l      = float(_dc.rolling(252).min().iloc[-1]) if len(_dc) >= 20 else float(_dc.min())
+                _d_fromhigh = ((_d_price / _d_52h) - 1) * 100 if pd.notna(_d_price) and pd.notna(_d_52h) and _d_52h > 0 else np.nan
+                _d_vol      = pd.to_numeric(_diag_timing.get("Volume", pd.Series(dtype=float)), errors="coerce")
+                _d_vr       = float(_d_vol.iloc[-1] / _d_vol.rolling(20).mean().iloc[-1]) if len(_d_vol) >= 20 and _d_vol.rolling(20).mean().iloc[-1] > 0 else np.nan
+                _d_ml, _d_sl, _d_hs = calculate_macd(_dc)
+                _d_hist     = float(_d_hs.iloc[-1]) if not _d_hs.empty else np.nan
+                _d_mval     = float(_d_ml.iloc[-1]) if not _d_ml.empty else np.nan
+                _d_sval     = float(_d_sl.iloc[-1]) if not _d_sl.empty else np.nan
+                _d_bbu, _d_bbm, _d_bbl = calculate_bollinger_bands(_dc)
+                _d_bbuv = float(_d_bbu.dropna().iloc[-1]) if not _d_bbu.dropna().empty else np.nan
+                _d_bblv = float(_d_bbl.dropna().iloc[-1]) if not _d_bbl.dropna().empty else np.nan
 
-                # MACD - 명시적으로 양수/음수 체크
-                _diag_macd_line, _diag_sig_line, _diag_hist_series = calculate_macd(_diag_close)
-                _diag_hist_val = float(_diag_hist_series.iloc[-1]) if not _diag_hist_series.empty else np.nan
-                _macd_direction = "상승모멘텀 (양수)" if (pd.notna(_diag_hist_val) and _diag_hist_val > 0) else "하락모멘텀 (음수)" if (pd.notna(_diag_hist_val) and _diag_hist_val < 0) else "중립"
+                def _nf(v, fmt=".2f", pre="", suf=""):
+                    return f"{pre}{v:{fmt}}{suf}" if pd.notna(v) else "N/A"
 
-                # 볼린저밴드
-                _bb_upper, _bb_mid, _bb_lower = calculate_bollinger_bands(_diag_close)
-                _bb_upper_val = float(_bb_upper.dropna().iloc[-1]) if not _bb_upper.dropna().empty else np.nan
-                _bb_lower_val = float(_bb_lower.dropna().iloc[-1]) if not _bb_lower.dropna().empty else np.nan
-                _bb_position = "하단 터치 (반등 가능)" if pd.notna(_diag_price) and pd.notna(_bb_lower_val) and _diag_price <= _bb_lower_val * 1.01 else \
-                               "상단 터치 (과열)" if pd.notna(_diag_price) and pd.notna(_bb_upper_val) and _diag_price >= _bb_upper_val * 0.99 else "밴드 내부"
-
-                # KPI 요약
-                _kpi_summary = ""
-                _kpi_details = ""
+                # 2) 투자 스타일 점수
+                _d_style_text = "N/A"
                 try:
-                    _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
-                    _kpi_summary = f"KPI: {_pass_n}개 통과 / {_fail_n}개 실패"
-                    _safety = _margin.get('margin_of_safety')
-                    _intrinsic = _margin.get('intrinsic_value')
-                    _kpi_details = (
-                        f"안전마진: {_safety:.1f}% / 적정주가: ${_intrinsic:.2f}"
-                        if pd.notna(_safety) and pd.notna(_intrinsic) else "밸류에이션 데이터 없음"
+                    _d_kpi_df2, _, _, _, _d_margin2 = cached_evaluate_kpis_snapshot(_tk)
+                    _d_sty = calculate_style_scores(_tk, _d_margin2, _d_kpi_df2)
+                    _cs = _d_sty["canslim"]["score"]; _vs = _d_sty["value"]["score"]; _qs = _d_sty["quality"]["score"]
+                    _dom = _d_sty["dominant"]
+                    _cs_det = " / ".join(f"{k}: {v}" for k,v in _d_sty["canslim"]["detail"].items())
+                    _vs_det = " / ".join(f"{k}: {v}" for k,v in _d_sty["value"]["detail"].items())
+                    _qs_det = " / ".join(f"{k}: {v}" for k,v in _d_sty["quality"]["detail"].items())
+                    _d_style_text = (
+                        f"CAN SLIM {_cs}점 / 가치투자 {_vs}점 / 장기우량주 {_qs}점 → 주도스타일: {_dom}\n"
+                        f"  CAN SLIM 세부: {_cs_det}\n"
+                        f"  가치투자 세부: {_vs_det}\n"
+                        f"  장기우량주 세부: {_qs_det}"
                     )
-                    # 실패한 KPI 목록
-                    _fail_items = _kpi_df[_kpi_df["Pass"].str.contains("Fail", na=False)]["KPI"].tolist() if not _kpi_df.empty else []
-                    if _fail_items:
-                        _kpi_details += f" / 실패 항목: {', '.join(_fail_items[:3])}"
-                except Exception:
-                    _kpi_summary = "KPI 데이터 없음"
-                    _kpi_details = ""
-
-                # 기관 보유
-                _inst_pct = "데이터 없음"
-                try:
-                    _inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
-                    if not _inst_df.empty:
-                        _pct_col = next((c for c in _inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
-                        if _pct_col:
-                            _total = _inst_df[_pct_col].sum()
-                            _total_pct = _total * 100 if _total <= 1 else _total
-                            _inst_pct = f"{_total_pct:.1f}%"
                 except Exception:
                     pass
 
+                # 3) 체력검사 KPI
+                _d_kpi_text = "N/A"
+                try:
+                    _d_kpi_df3, _, _, _, _d_mg = cached_evaluate_kpis_snapshot(_tk)
+                    _pp3 = _d_kpi_df3["Pass"].astype(str)
+                    _pc3 = int((_pp3.str.contains("Pass", case=False) & ~_pp3.str.contains("Fail", case=False)).sum())
+                    _fc3 = int(_pp3.str.contains("Fail", case=False).sum())
+                    _pi  = _d_kpi_df3[_pp3.str.contains("Pass", case=False) & ~_pp3.str.contains("Fail", case=False)]["KPI"].tolist()
+                    _fi  = _d_kpi_df3[_pp3.str.contains("Fail", case=False)]["KPI"].tolist()
+                    _fpe2 = _d_mg.get("forward_pe");  _tpe2 = _d_mg.get("trailing_pe")
+                    _pb2  = _d_mg.get("price_to_book"); _ev2 = _d_mg.get("ev_to_ebitda")
+                    _evs2 = _d_mg.get("ev_to_sales");  _evf2 = _d_mg.get("ev_to_fcf")
+                    _mos2 = _d_mg.get("margin_of_safety"); _iv2 = _d_mg.get("intrinsic_value")
+                    _d_kpi_text = (
+                        f"통과 {_pc3}개: {', '.join(_pi)} / 실패 {_fc3}개: {', '.join(_fi)}\n"
+                        f"  밸류에이션: Forward P/E={_nf(_fpe2)}, Trailing P/E={_nf(_tpe2)}, P/B={_nf(_pb2)}, EV/EBITDA={_nf(_ev2)}, EV/Sales={_nf(_evs2)}, EV/FCF={_nf(_evf2)}\n"
+                        f"  Graham 안전마진={_nf(_mos2, '.1f', '', '%')}, 적정주가={_nf(_iv2, '.2f', '$')}"
+                    )
+                except Exception:
+                    pass
+
+                # 4) Earnings Surprise
+                _d_earn_text = "N/A"
+                try:
+                    _d_earn = cached_earnings_history(_tk)
+                    if not _d_earn.empty:
+                        _sc4 = next((c for c in _d_earn.columns if "서프라이즈" in c), None)
+                        _ac4 = next((c for c in _d_earn.columns if "eps 실제" in c.lower() or "실제" in c.lower()), None)
+                        _rows4 = []
+                        for _, _er in _d_earn.head(4).iterrows():
+                            _rs = f"{_er.get('분기','')}"
+                            if _ac4:  _rs += f" EPS={_er.get(_ac4,'')}"
+                            if _sc4:  _rs += f" 서프라이즈={_er.get(_sc4,'')}"
+                            _rows4.append(_rs)
+                        if "판정" in _d_earn.columns:
+                            _bt4 = int((_d_earn["판정"] == "✅ Beat").sum())
+                            _tt4 = len(_d_earn[_d_earn["판정"] != "—"])
+                            _d_earn_text = (f"최근 {_tt4}분기 Beat {_bt4}회 ({int(_bt4/_tt4*100) if _tt4 else 0}%)\n  "
+                                             + "\n  ".join(_rows4))
+                        else:
+                            _d_earn_text = "\n  ".join(_rows4)
+                except Exception:
+                    pass
+
+                # 5) 인사이더 트레이딩
+                _d_ins_text = "N/A"
+                try:
+                    _d_ist = fetch_insider_statistics(_tk)
+                    _d_iby = int(to_float(_d_ist.get("total_purchases") or _d_ist.get("acquired") or 0) or 0)
+                    _d_isl = int(to_float(_d_ist.get("total_sales")     or _d_ist.get("disposed")  or 0) or 0)
+                    _d_idr = "매수 우세" if _d_iby > _d_isl else ("매도 우세" if _d_isl > _d_iby else "중립")
+                    _d_ins_text = f"매수 {_d_iby}건 / 매도 {_d_isl}건 → {_d_idr}"
+                except Exception:
+                    pass
+
+                # 6) 애널리스트 컨센서스
+                _d_anal_text = "N/A"
+                try:
+                    _d_an = fetch_analyst_price_targets(_tk)
+                    if _d_an:
+                        _d_acp = to_float(selected_ticker_info.get("price") or selected_ticker_info.get("currentPrice"))
+                        _d_atm = _d_an.get("target_mean"); _d_ath = _d_an.get("target_high"); _d_atl = _d_an.get("target_low")
+                        _d_ups = f"{((_d_atm/_d_acp-1)*100):+.1f}%" if _d_atm and _d_acp else "N/A"
+                        _d_rec = " / ".join(f"{r.get('기관','')}: {r.get('등급','')}" for r in _d_an.get("recent",[])[:3])
+                        _d_anal_text = f"평균목표가 {_nf(_d_atm, '.2f', '$')} (상승여력 {_d_ups}) / 최고 {_nf(_d_ath, '.2f', '$')} / 최저 {_nf(_d_atl, '.2f', '$')}"
+                        if _d_rec: _d_anal_text += f"\n  최근 추천: {_d_rec}"
+                    _k6 = _fmp_key()
+                    if _k6:
+                        _r6 = requests.get(f"{_FMP_BASE}/ratings-snapshot?symbol={_tk}&apikey={_k6}", timeout=_FMP_TIMEOUT)
+                        if _r6.status_code == 200:
+                            _rd6 = _r6.json()
+                            _ri6 = _rd6[0] if isinstance(_rd6, list) and _rd6 else {}
+                            if _ri6:
+                                _rsb6=int(to_float(_ri6.get("strongBuy") or 0) or 0); _rb6=int(to_float(_ri6.get("buy") or 0) or 0)
+                                _rh6=int(to_float(_ri6.get("hold") or 0) or 0); _rs6=int(to_float(_ri6.get("sell") or 0) or 0); _rss6=int(to_float(_ri6.get("strongSell") or 0) or 0)
+                                _rt6=_rsb6+_rb6+_rh6+_rs6+_rss6
+                                if _rt6>0:
+                                    _rbp6=round((_rsb6+_rb6)/_rt6*100,1)
+                                    _rl6=_ri6.get("ratingRecommendation") or _ri6.get("rating") or ""
+                                    _d_anal_text += f"\n  애널리스트 매수의견 {_rbp6:.0f}% ({_rsb6+_rb6}/{_rt6}명) / 종합의견: {_rl6}"
+                except Exception:
+                    pass
+
+                # 7) 의회 거래
+                _d_cg_text = "N/A"
+                try:
+                    _d_cg = fetch_senate_house_trading(_tk)
+                    if not _d_cg.empty:
+                        _cgb = len(_d_cg[_d_cg["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)])
+                        _cgs = len(_d_cg[_d_cg["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)])
+                        _d_cg_text = f"의원 매수 {_cgb}건 / 매도 {_cgs}건"
+                except Exception:
+                    pass
+
+                # 8) 다음 실적 발표
+                _d_nxt = "N/A"
+                try:
+                    _d_nxt = str(selected_ticker_info.get("earningsDate") or selected_ticker_info.get("_next_earnings") or "N/A")
+                    if isinstance(_d_nxt, list): _d_nxt = _d_nxt[0] if _d_nxt else "N/A"
+                except Exception:
+                    pass
+
+                # 프롬프트 조립
                 _diag_prompt = f"""당신은 월가 수석 퀀트 애널리스트입니다.
-아래 실제 데이터를 바탕으로 **{selected_ticker}** 종목에 대한 투자 진단을 한국어로 작성하세요.
-데이터에 없는 내용은 추측하지 마세요.
+아래 **{_tk}** 종목의 실제 데이터를 바탕으로 투자 종합진단을 한국어로 작성하세요.
+N/A 항목은 분석에서 제외하세요.
 
-[기술적 지표 — 실제 계산값]
-- 현재가: ${f'{_diag_price:.2f}' if pd.notna(_diag_price) else 'N/A'}
-- RSI(14): {f'{_diag_rsi:.1f}' if pd.notna(_diag_rsi) else 'N/A'} ({'과매수' if pd.notna(_diag_rsi) and _diag_rsi >= 70 else '조정구간' if pd.notna(_diag_rsi) and _diag_rsi < 50 else '중립'})
-- MACD 히스토그램: {f'{_diag_hist_val:+.4f}' if pd.notna(_diag_hist_val) else 'N/A'} → {_macd_direction}
-- 200일선: ${f'{_diag_ma200:.2f}' if pd.notna(_diag_ma200) else 'N/A'} → 현재가 {'위 (장기 우상향)' if pd.notna(_diag_price) and pd.notna(_diag_ma200) and _diag_price > _diag_ma200 else '아래 (장기 하락추세)'}
-- 50일선: ${f'{_diag_ma50:.2f}' if pd.notna(_diag_ma50) else 'N/A'} → 현재가 {'위' if pd.notna(_diag_price) and pd.notna(_diag_ma50) and _diag_price > _diag_ma50 else '아래'}
-- 52주 고점 대비: {f'{_diag_pct_from_high:+.1f}%' if pd.notna(_diag_pct_from_high) else 'N/A'}
-- 볼린저밴드: {_bb_position}
+━━━ 기술적 분석 ━━━
+현재가: {_nf(_d_price, ".2f", "$")} / 52주 고점: {_nf(_d_52h, ".2f", "$")} / 저점: {_nf(_d_52l, ".2f", "$")} / 고점대비: {_nf(_d_fromhigh, "+.1f", "", "%")}
+RSI(14): {_nf(_d_rsi, ".1f")} → {"과매수⚠️" if pd.notna(_d_rsi) and _d_rsi>=70 else "과매도✅" if pd.notna(_d_rsi) and _d_rsi<=30 else "중립"}
+MACD: {_nf(_d_mval, "+.4f")} / Signal: {_nf(_d_sval, "+.4f")} / Histogram: {_nf(_d_hist, "+.4f")} → {"상승모멘텀" if pd.notna(_d_hist) and _d_hist>0 else "하락모멘텀"}
+MA50: {_nf(_d_ma50, ".2f", "$")} / MA200: {_nf(_d_ma200, ".2f", "$")} → {"MA정배열" if pd.notna(_d_price) and pd.notna(_d_ma50) and pd.notna(_d_ma200) and _d_price>_d_ma50>_d_ma200 else "역배열" if pd.notna(_d_price) and pd.notna(_d_ma200) and _d_price<_d_ma200 else "부분배열"}
+볼린저밴드 상단: {_nf(_d_bbuv, ".2f", "$")} / 하단: {_nf(_d_bblv, ".2f", "$")} → {"상단돌파(과열)" if pd.notna(_d_price) and pd.notna(_d_bbuv) and _d_price>_d_bbuv else "하단이탈(과매도)" if pd.notna(_d_price) and pd.notna(_d_bblv) and _d_price<_d_bblv else "밴드내부"}
+거래량 비율: {_nf(_d_vr, ".2f", "", "x")}
 
-[펀더멘털]
-- {_kpi_summary}
-- {_kpi_details}
-- 기관 보유 비중 (상위 10개): {_inst_pct}
+━━━ 투자 스타일 적합도 ━━━
+{_d_style_text}
 
-[출력 규칙]
-1. 반드시 아래 형식 그대로 작성 (마크다운 사용)
-2. 각 항목을 구체적 수치와 함께 설명 (데이터 기반)
-3. "관망" 판단 시에도 구체적인 매수 진입 조건을 명시
-4. 전체 200~300자 이상 작성
+━━━ 체력검사 KPI ━━━
+{_d_kpi_text}
 
-## 종합 판단: [매수 고려 / 관망 / 매도 고려]
+━━━ Earnings Surprise (최근 4분기) ━━━
+{_d_earn_text}
 
-**📊 기술적 분석:**
-(RSI, MACD, 이동평균, 볼린저밴드 각각 언급)
+━━━ 인사이더 트레이딩 ━━━
+{_d_ins_text}
 
-**💼 펀더멘털 분석:**
-(KPI 통과/실패, 안전마진, 기관 보유 언급)
+━━━ 애널리스트 컨센서스 & 목표주가 ━━━
+{_d_anal_text}
 
-**⚠️ 주요 리스크:**
-(구체적으로 2가지)
+━━━ 의회(상·하원) 거래 ━━━
+{_d_cg_text}
+
+━━━ 다음 실적 발표 ━━━
+{_d_nxt}
+
+━━━ 출력 형식 (반드시 준수) ━━━
+## 🎯 종합 판단: [매수 고려 / 관망 / 매도 고려]
+
+**📊 기술적 분석 요약:**
+(RSI·MACD·이동평균·볼린저밴드·거래량 각각 수치 포함)
+
+**💼 펀더멘털 & 투자 스타일:**
+(투자스타일 점수·KPI 통과/실패·밸류에이션 수치)
+
+**📈 Earnings & 수급 신호:**
+(어닝 Beat/Miss·인사이더 방향·애널리스트 컨센서스·의회 거래)
+
+**⚠️ 주요 리스크 (2가지):**
+(구체적 수치 기반)
 
 **🎯 액션 플랜:**
-(관망이면 구체적 진입 조건 명시. 예: RSI XX 이하 또는 MACD 양전환 시)
+(진입 조건 또는 매도 조건 구체적으로 명시)
 
 *본 분석은 참고용이며 투자 권유가 아닙니다.*"""
 
-                with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
+                with st.spinner("Gemini AI 종합 진단 중... (약 20초 소요)"):
                     _diag_model = _GenAIModel(
                         "gemini-2.5-flash",
-                        generation_config={"temperature": 0.3, "max_output_tokens": 4096}  # 종목 진단 — 볼 때마다 다른 인사이트
+                        generation_config={"temperature": 0.3, "max_output_tokens": 6000}
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
                     _diag_text = _gemini_response_text_utf8_safe(_diag_response)
 
                 if _diag_text:
-                    if "매수 고려" in _diag_text:
-                        st.success(_diag_text)
-                    elif "매도 고려" in _diag_text:
-                        st.error(_diag_text)
-                    else:
-                        st.warning(_diag_text)
+                    st.session_state[_diag_key] = _diag_text
                 else:
                     st.warning("AI 진단 결과를 받지 못했습니다.")
+
             except Exception as _ae:
                 st.error(f"AI 진단 오류: {_ae}")
-    
+
+        # 저장된 진단 결과 표시 (버튼 클릭 후에도 유지)
+        if st.session_state.get(_diag_key):
+            _saved = st.session_state[_diag_key]
+            if "매수 고려" in _saved:
+                st.success(_saved)
+            elif "매도 고려" in _saved:
+                st.error(_saved)
+            else:
+                st.warning(_saved)
+            if st.button("🗑️ 진단 결과 초기화", key="ai_diag_clear_btn"):
+                del st.session_state[_diag_key]
+                st.rerun()
     elif main_nav == _MAIN_NAV_OPTIONS[6]:
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
