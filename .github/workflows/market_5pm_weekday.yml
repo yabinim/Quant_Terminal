@@ -10,7 +10,7 @@ on:
 jobs:
   run-5pm-weekday:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: 📥 코드 체크아웃
