@@ -1,13 +1,11 @@
 name: 📰 8AM Pre-Market (내러티브 + DRG 예측)
 
 on:
-  schedule:
-    # 평일 8AM ET = UTC 12:00 (서머타임: UTC 11:00)
-    # 서머타임(3월~11월): 0 11 * * 1-5
-    # 표준시(11월~3월):   0 12 * * 1-5
-    # → 보수적으로 12:00 UTC 사용 (서머타임 기간엔 8AM ET보다 1시간 늦지만 허용 범위)
-    - cron: '0 12 * * 1-5'
-  workflow_dispatch:   # 수동 실행 허용 (테스트용)
+  repository_dispatch:
+    types: [trigger-9am]   # Cloud Scheduler가 보내는 event_type과 일치시킴
+  workflow_dispatch:        # 수동 실행 허용 (테스트용)
+  # schedule 제거: GitHub Actions 자체 스케줄 비활성화
+  # → Cloud Scheduler (Google)가 단독으로 트리거 관리
 
 jobs:
   run-8am:

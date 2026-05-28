@@ -1,10 +1,10 @@
 name: 📅 5PM 주말·휴일 (내러티브만)
 
 on:
-  schedule:
-    # 주말(토·일) 5PM ET = UTC 21:00
-    - cron: '0 21 * * 0,6'
+  repository_dispatch:
+    types: [trigger-5pm-weekend]   # Cloud Scheduler → GitHub API로 트리거
   workflow_dispatch:
+  # schedule 제거: GitHub Actions 자체 스케줄 비활성화
 
 jobs:
   run-5pm-weekend:
