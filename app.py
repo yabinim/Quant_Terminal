@@ -7705,7 +7705,17 @@ def render_opportunity_scanner_snapshot(snap):
     st.divider()
     st.markdown("##### 📌 저장된 스캔 결과")
     if completed_at:
-        st.caption(f"완료 시각 (UTC): `{completed_at}`")
+        try:
+            _ca_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+            _now_utc = datetime.now(timezone.utc)
+            _elapsed_min = int((_now_utc - _ca_dt).total_seconds() / 60)
+            _elapsed_str = f"{_elapsed_min}분 전" if _elapsed_min < 60 else f"{_elapsed_min // 60}시간 {_elapsed_min % 60}분 전"
+            _ca_kst = _ca_dt.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M KST")
+            st.caption(f"⏱️ 완료 시각: `{_ca_kst}` ({_elapsed_str})")
+            if _elapsed_min > 360:  # 6시간 이상 경과
+                st.warning("⚠️ 스캔 결과가 6시간 이상 지났습니다. 최신 시장 상황 반영을 위해 재스캔을 권장합니다.")
+        except Exception:
+            st.caption(f"완료 시각 (UTC): `{completed_at}`")
     st.info(f"[{mode_note}] 유니버스 **{len(universe)}**개 티커 · 리런·메뉴 이동 후에도 세션에 유지됩니다.")
     with st.expander("스캔 당시 유니버스 보기", expanded=False):
         st.code(", ".join(universe) if universe else "(기록 없음)")
@@ -7745,7 +7755,7 @@ def render_opportunity_scanner_snapshot(snap):
             )
             if _ok_s:
                 st.session_state[f"_sc_wl_added_{tk}"] = True
-        btn_col1, btn_col2 = st.columns([1, 3])
+        btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
         with btn_col1:
             if st.session_state.get(f"_sc_wl_added_{tk_scan}"):
                 st.success(f"✅ {tk_scan} 추가됨!")
@@ -7754,6 +7764,16 @@ def render_opportunity_scanner_snapshot(snap):
                     key=f"scanner_wl_add_{rank_idx}_{tk_scan}",
                     on_click=_add_sc_top3_wl,
                     use_container_width=True)
+        with btn_col2:
+            # 아이디어A: 1클릭으로 3단계 정밀검사 탭으로 이동
+            def _goto_micro(tk=tk_scan):
+                st.session_state["selected_ticker"] = tk
+                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+            st.button(f"🔬 {tk_scan} 정밀검사",
+                key=f"scanner_goto_micro_{rank_idx}_{tk_scan}",
+                on_click=_goto_micro,
+                use_container_width=True,
+                help="3단계 개별 종목 정밀 검사 탭으로 이동합니다.")
         st.divider()
 
     remain_df = score_df.iloc[3:].copy()
@@ -7789,8 +7809,48 @@ def render_opportunity_scanner_snapshot(snap):
                     st.success(f"✅ {_rtk}")
                 else:
                     st.button(f"🔔 {_rtk}", key=f"rem_wl_{_ri}_{_rtk}", on_click=_add_rem_wl, use_container_width=True)
+                def _goto_micro_rem(tk=_rtk):
+                    st.session_state["selected_ticker"] = tk
+                    st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                st.button(f"🔬 {_rtk}", key=f"rem_micro_{_ri}_{_rtk}", on_click=_goto_micro_rem, use_container_width=True, help="3단계 정밀검사로 이동")
     else:
         st.caption("유니버스 종목 수가 3개 이하라 추가 표시는 없습니다.")
+
+    # ── 아이디어D: 팩터 레이더 차트 ──────────────────────────────────────
+    with st.expander("📊 팩터 레이더 차트 (상위 종목 팩터 프로파일 비교)", expanded=False):
+        _radar_df = score_df.head(5).copy()
+        _factor_cols = ["Narrative Score", "Momentum Score", "RS Score", "Fundamentals Score", "Institutional Score", "Valuation Score"]
+        _factor_short = ["Narrative", "Momentum", "RS", "Fundamen.", "Inst.", "Valuation"]
+        _available_cols = [c for c in _factor_cols if c in _radar_df.columns]
+        if not _radar_df.empty and len(_available_cols) >= 3:
+            _rows = []
+            for _, _rdr in _radar_df.iterrows():
+                _tk = str(_rdr["Ticker"])
+                for _col, _short in zip(_factor_cols, _factor_short):
+                    if _col in _rdr.index:
+                        _val = pd.to_numeric(_rdr[_col], errors="coerce")
+                        _rows.append({"Ticker": _tk, "Factor": _short, "Score": float(_val) if pd.notna(_val) else 0.0})
+            _chart_df = pd.DataFrame(_rows)
+            if not _chart_df.empty:
+                try:
+                    _radar_chart = (
+                        alt.Chart(_chart_df)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("Factor:N", sort=_factor_short, title=None),
+                            y=alt.Y("Score:Q", scale=alt.Scale(domain=[0, 100]), title="Score"),
+                            color=alt.Color("Ticker:N", legend=alt.Legend(title="종목")),
+                            xOffset="Ticker:N",
+                            tooltip=["Ticker", "Factor", alt.Tooltip("Score:Q", format=".1f")],
+                        )
+                        .properties(height=300, title="Top 5 종목 팩터 점수 비교")
+                    )
+                    st.altair_chart(_radar_chart, use_container_width=True)
+                    st.caption("막대가 길수록 해당 팩터에서 강세. 같은 Factor 내 색깔별로 종목 비교 가능.")
+                except Exception as _chart_err:
+                    st.caption(f"차트 렌더링 실패: {_chart_err}")
+        else:
+            st.caption("레이더 차트를 표시할 점수 데이터가 부족합니다.")
 
     with st.expander("📐 알파 스캐너 점수 계산 공식 (가중치·의미·계산 방법)", expanded=False):
         st.markdown(
@@ -7818,10 +7878,10 @@ def render_opportunity_scanner_snapshot(snap):
    종목의 약 63거래일(3개월) 수익률에서 SPY의 동일 기간 수익률을 뺀 값(초과수익)을 쓰고, 역시 이번 스캔 풀 안에서 0~100으로 정규화합니다.
 
 4. **Fundamentals**  
-   Yahoo Finance `info`에서 `revenueGrowth` 또는 `trailingEps`가 양수면 가점(원시 100), 아니면 0으로 두고 풀 전체에서 정규화합니다. **두 지표가 모두 없으면** 이 항목은 “데이터 없음”으로 보아 가중치에서 빼고, 나머지 항목만으로 **100점 만점에 맞게 다시 환산**합니다.
+   `revenueGrowth`를 0~100 연속 점수로 정규화합니다 (성장률 -100%=0점, +200%=100점 선형 맵핑). `trailingEps > 0`이면 최대 30점 추가 보너스, 음수이면 15점 패널티. 단순 이진 판단 대신 연속 점수로 종목 구별력을 높였습니다. **두 지표가 모두 없으면** 이 항목은 가중치에서 빼고 나머지 항목만으로 100점 환산합니다.
 
 5. **Inst. Interest**  
-   최근 3거래일 평균 거래량 ÷ 최근 63거래일 평균 거래량이 **1.2 이상**이면 가점(원시 100), 미만이면 0 후 정규화합니다.
+   `거래량 급증(3일/63일 ≥ 1.2)` OR `기관보유비율(institutionPercentHeld) ≥ 50%` 중 하나라도 충족하면 신호로 인정합니다. **두 조건 모두 충족 시 100점, 하나만 충족 시 65점**으로 신호 강도를 구분합니다.
 
 6. **Valuation**  
    `forwardPE`가 양수이고 **50 이하**이면 가점(원시 100), 그렇지 않으면 0 후 정규화합니다. **P/E가 없거나 0 이하**(적자 등으로 해석 어려움)면 역시 가중치에서 제외하고 재환산합니다.
@@ -7855,7 +7915,17 @@ def render_opportunity_emerging_snapshot(snap):
     st.divider()
     st.markdown("##### 🚀 저장된 Emerging 스캔 결과")
     if completed_at:
-        st.caption(f"완료 시각 (UTC): `{completed_at}`")
+        try:
+            _ca_dt_em = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+            _now_utc_em = datetime.now(timezone.utc)
+            _elapsed_min_em = int((_now_utc_em - _ca_dt_em).total_seconds() / 60)
+            _elapsed_str_em = f"{_elapsed_min_em}분 전" if _elapsed_min_em < 60 else f"{_elapsed_min_em // 60}시간 {_elapsed_min_em % 60}분 전"
+            _ca_kst_em = _ca_dt_em.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M KST")
+            st.caption(f"⏱️ 완료 시각: `{_ca_kst_em}` ({_elapsed_str_em})")
+            if _elapsed_min_em > 360:
+                st.warning("⚠️ 스캔 결과가 6시간 이상 지났습니다. 최신 시장 상황 반영을 위해 재스캔을 권장합니다.")
+        except Exception:
+            st.caption(f"완료 시각 (UTC): `{completed_at}`")
     st.info(f"[{mode_note}] 유니버스 **{len(universe)}**개 · 후발·2차 수혜 관점 브리핑")
     with st.expander("스캔 당시 유니버스", expanded=False):
         st.code(", ".join(universe) if universe else "(기록 없음)")
@@ -7899,14 +7969,27 @@ def render_opportunity_emerging_snapshot(snap):
             )
             if _ok:
                 st.session_state[f"_em_snap_wl_{tk}"] = True
-        if st.session_state.get(_em_wl_key):
-            st.success(f"✅ {tk_em} Watchlist 추가됨!")
-        else:
+        _em_btn_c1, _em_btn_c2, _em_btn_c3 = st.columns([1, 1, 2])
+        with _em_btn_c1:
+            if st.session_state.get(_em_wl_key):
+                st.success(f"✅ {tk_em} Watchlist 추가됨!")
+            else:
+                st.button(
+                    f"🔔 {tk_em} Watchlist 추가",
+                    key=f"em_snap_wl_{rank_idx}_{tk_em}",
+                    on_click=_do_add_em,
+                    use_container_width=True,
+                )
+        with _em_btn_c2:
+            def _goto_micro_em(tk=tk_em):
+                st.session_state["selected_ticker"] = tk
+                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
             st.button(
-                f"🔔 {tk_em} Watchlist 추가",
-                key=f"em_snap_wl_{rank_idx}_{tk_em}",
-                on_click=_do_add_em,
-                use_container_width=False,
+                f"🔬 {tk_em} 정밀검사",
+                key=f"em_snap_micro_{rank_idx}_{tk_em}",
+                on_click=_goto_micro_em,
+                use_container_width=True,
+                help="3단계 개별 종목 정밀 검사 탭으로 이동합니다.",
             )
         st.divider()
 
@@ -7944,6 +8027,40 @@ def render_opportunity_emerging_snapshot(snap):
         )
     else:
         st.caption("유니버스가 3개 이하입니다.")
+
+    # ── Emerging 팩터 비교 차트 ────────────────────────────────────────
+    with st.expander("📊 Emerging 팩터 비교 차트 (Top 5)", expanded=False):
+        _em_radar_df = score_df.head(5).copy()
+        _em_factor_cols = ["Narrative Score", "Early RS Score", "Vol Accel Score", "Fundamentals Score", "Overextension Score"]
+        _em_factor_short = ["Narrative", "Early RS", "Vol Accel", "Fundamen.", "Overext."]
+        _em_avail_cols = [c for c in _em_factor_cols if c in _em_radar_df.columns]
+        if not _em_radar_df.empty and len(_em_avail_cols) >= 3:
+            _em_rows = []
+            for _, _edr in _em_radar_df.iterrows():
+                _etk = str(_edr["Ticker"])
+                for _ec, _es in zip(_em_factor_cols, _em_factor_short):
+                    if _ec in _edr.index:
+                        _ev = pd.to_numeric(_edr[_ec], errors="coerce")
+                        _em_rows.append({"Ticker": _etk, "Factor": _es, "Score": float(_ev) if pd.notna(_ev) else 0.0})
+            _em_chart_df = pd.DataFrame(_em_rows)
+            if not _em_chart_df.empty:
+                try:
+                    _em_chart = (
+                        alt.Chart(_em_chart_df)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("Factor:N", sort=_em_factor_short, title=None),
+                            y=alt.Y("Score:Q", scale=alt.Scale(domain=[0, 100]), title="Score"),
+                            color=alt.Color("Ticker:N", legend=alt.Legend(title="종목")),
+                            xOffset="Ticker:N",
+                            tooltip=["Ticker", "Factor", alt.Tooltip("Score:Q", format=".1f")],
+                        )
+                        .properties(height=300, title="Emerging Top 5 팩터 비교")
+                    )
+                    st.altair_chart(_em_chart, use_container_width=True)
+                    st.caption("Overextension은 낮을수록(과열 없음) 좋은 신호입니다.")
+                except Exception as _ec_err:
+                    st.caption(f"차트 렌더링 실패: {_ec_err}")
 
     with st.expander("📐 Emerging 엔진 공식 (가중치·의미)", expanded=False):
         st.markdown(
@@ -8285,9 +8402,6 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             volume_df = pd.DataFrame()
             spy_hist = pd.DataFrame()
 
-    if len(tickers) == 1 and close_df.columns.tolist() == list(batch.keys())[:1]:
-        pass  # FMP batch already uses ticker as column name
-
     spy_3m = calculate_period_return(spy_hist["Close"], 63) if "Close" in spy_hist.columns else np.nan
     spy_3m = to_float(spy_3m)
     if pd.isna(spy_3m):
@@ -8322,17 +8436,39 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             vol_ratio = float(vol_3d_avg / vol_3m_avg)
 
         fundamentals_data_available = pd.notna(revenue_growth) or pd.notna(trailing_eps)
-        fundamentals_pass = (
-            (pd.notna(revenue_growth) and revenue_growth > 0)
-            or (pd.notna(trailing_eps) and trailing_eps > 0)
-        )
-        inst_pass = pd.notna(vol_ratio) and vol_ratio >= 1.2
+        # 이진(0/100) 대신 연속 점수화: revenue_growth·trailing_eps를 각각 0~100으로 정규화 후 합산
+        # revenue_growth: clip(-1, 2) → 0~100 선형 맵핑 (200% 성장 = 100점)
+        # trailing_eps > 0 이면 최대 30점 보너스 (펀더멘털 안정성 가점)
+        _fund_raw = 0.0
+        if pd.notna(revenue_growth):
+            _rev_score = float(np.clip((revenue_growth + 1.0) / 3.0 * 100.0, 0.0, 100.0))
+            _fund_raw = max(_fund_raw, _rev_score)
+        if pd.notna(trailing_eps) and trailing_eps > 0:
+            _fund_raw = min(100.0, _fund_raw + 30.0)
+        elif pd.notna(trailing_eps) and trailing_eps <= 0:
+            _fund_raw = max(0.0, _fund_raw - 15.0)
+        fundamentals_pass = _fund_raw >= 30.0  # 리스크 판단용 임계값
+        # Institutional: 거래량 급증(vol_ratio>=1.2) OR 기관 보유비율 높음 (OR 조건으로 신호 품질 향상)
+        inst_ownership = to_float(info.get("institutionPercentHeld") or info.get("institutionalOwnershipPercentage"))
+        inst_via_vol = pd.notna(vol_ratio) and vol_ratio >= 1.2
+        inst_via_ownership = pd.notna(inst_ownership) and inst_ownership >= 0.5  # 50% 이상 기관 보유
+        inst_pass = inst_via_vol or inst_via_ownership
+        # Institutional Raw: 두 신호 모두 충족 시 100, 하나만 충족 시 65, 둘 다 미충족 시 0
+        if inst_via_vol and inst_via_ownership:
+            _inst_raw = 100.0
+        elif inst_via_vol or inst_via_ownership:
+            _inst_raw = 65.0
+        else:
+            _inst_raw = 0.0
         # forwardPE가 None/NaN이거나 0 이하(적자 등으로 PE 해석 불가)면 결측으로 간주
         valuation_data_available = pd.notna(forward_pe) and forward_pe > 0
         valuation_pass = valuation_data_available and forward_pe <= 50
 
         narrative_score, narrative_why = narrative_map.get(ticker, (0.0, "배치 미응답"))
+        # API 실패 사유면 narrative_available=False로 표기 → 동적 분모에서 완전 제외 (불이익 방지)
         narrative_available = narrative_why not in SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS
+        if not narrative_available:
+            narrative_score = 0.0  # 분자에서도 0으로 보장
 
         risk_bits = []
         if not valuation_data_available:
@@ -8357,9 +8493,9 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
                 "Narrative Available": bool(narrative_available),
                 "Momentum 1M Raw": to_float(m1_ret),
                 "RS Raw": to_float(rs_raw),
-                "Fundamentals Raw": 100.0 if fundamentals_pass else 0.0,
+                "Fundamentals Raw": float(_fund_raw),
                 "Fundamentals Available": bool(fundamentals_data_available),
-                "Institutional Raw": 100.0 if inst_pass else 0.0,
+                "Institutional Raw": float(_inst_raw),
                 "Valuation Raw": 100.0 if valuation_pass else 0.0,
                 "Valuation Available": bool(valuation_data_available),
                 "Risk": risk_text,
@@ -8515,7 +8651,10 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
                 fund_raw = 20.0
 
         narrative_score, narrative_why = narrative_map_em.get(ticker, (0.0, "배치 미응답"))
+        # API 실패 사유면 narrative_available=False → 동적 분모에서 완전 제외 (불이익 방지)
         narrative_available = narrative_why not in SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS
+        if not narrative_available:
+            narrative_score = 0.0
 
         risk_bits = []
         if pd.notna(rsi_last) and rsi_last > 70:
@@ -11079,9 +11218,108 @@ if st.session_state.get("logged_in"):
         tab_scan_leaders, tab_scan_emerge = st.tabs(
             ["🔥 Current Leaders (대장주 추종)", "🚀 Emerging Opportunities (후발주 선점)"]
         )
+
+        # ── 아이디어C: 두 엔진 결과가 모두 있을 때 교집합/차집합 요약 ──────────
+        _snap_l = st.session_state.get("scanner_results")
+        _snap_e = st.session_state.get("scanner_results_emerging")
+        if (
+            isinstance(_snap_l, dict) and isinstance(_snap_l.get("score_df"), pd.DataFrame) and not _snap_l["score_df"].empty
+            and isinstance(_snap_e, dict) and isinstance(_snap_e.get("score_df"), pd.DataFrame) and not _snap_e["score_df"].empty
+        ):
+            _l_df = _snap_l["score_df"]
+            _e_df = _snap_e["score_df"]
+            _top_n = 10
+            _l_top = set(_l_df.head(_top_n)["Ticker"].str.upper().tolist())
+            _e_top = set(_e_df.head(_top_n)["Ticker"].str.upper().tolist())
+            _both = sorted(_l_top & _e_top)
+            _only_l = sorted(_l_top - _e_top)
+            _only_e = sorted(_e_top - _l_top)
+            with st.expander("🔀 듀얼 엔진 크로스 분석 (두 결과가 모두 있을 때 자동 표시)", expanded=True):
+                st.caption(f"양쪽 엔진 TOP{_top_n} 기준 비교")
+                _cx1, _cx2, _cx3 = st.columns(3)
+                with _cx1:
+                    st.markdown("**✅ 양쪽 모두 상위권** (핵심 신호)")
+                    if _both:
+                        for _bt in _both:
+                            _l_sc = _l_df[_l_df["Ticker"] == _bt]["Final Score"].values
+                            _e_sc = _e_df[_e_df["Ticker"] == _bt]["Final Score"].values
+                            _l_s = f"{float(_l_sc[0]):.1f}" if len(_l_sc) else "—"
+                            _e_s = f"{float(_e_sc[0]):.1f}" if len(_e_sc) else "—"
+                            st.markdown(f"- **{_bt}** (L:{_l_s} / E:{_e_s})")
+                    else:
+                        st.caption("교집합 없음")
+                with _cx2:
+                    st.markdown("**🔥 Leaders만 상위권** (현재 대장주)")
+                    if _only_l:
+                        for _lt in _only_l:
+                            _l_sc = _l_df[_l_df["Ticker"] == _lt]["Final Score"].values
+                            _l_s = f"{float(_l_sc[0]):.1f}" if len(_l_sc) else "—"
+                            st.markdown(f"- **{_lt}** (L:{_l_s})")
+                    else:
+                        st.caption("Leaders 전용 종목 없음")
+                with _cx3:
+                    st.markdown("**🚀 Emerging만 상위권** (후발주 선점 후보)")
+                    if _only_e:
+                        for _et in _only_e:
+                            _e_sc = _e_df[_e_df["Ticker"] == _et]["Final Score"].values
+                            _e_s = f"{float(_e_sc[0]):.1f}" if len(_e_sc) else "—"
+                            st.markdown(f"- **{_et}** (E:{_e_s})")
+                    else:
+                        st.caption("Emerging 전용 종목 없음")
     
         with tab_scan_leaders:
             st.markdown("##### 🔥 Current Leaders")
+
+            # ── 아이디어E: 내러티브 미등장 상위 종목 피드백 분석 ──────────────
+            _snap_fb = st.session_state.get("scanner_results")
+            if isinstance(_snap_fb, dict) and isinstance(_snap_fb.get("score_df"), pd.DataFrame) and not _snap_fb["score_df"].empty:
+                _fb_df = _snap_fb["score_df"].head(10)
+                # 내러티브 정렬에 없었던(점수 낮은) 종목 중 Final Score 상위권
+                _fb_exclude = frozenset(SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS)
+                _blind_spots = _fb_df[
+                    (_fb_df["Narrative Why"].isin(_fb_exclude) | (_fb_df.get("Narrative Score", pd.Series(dtype=float)) < 30))
+                    & (_fb_df["Final Score"] >= 55)
+                ]["Ticker"].tolist() if "Narrative Score" in _fb_df.columns else []
+                if _blind_spots:
+                    with st.expander(f"🧠 내러티브 피드백 루프 — 스캐너가 발견한 내러티브 사각지대 {len(_blind_spots)}종목", expanded=False):
+                        st.caption(
+                            "스캐너 Final Score 55↑이지만 내러티브 정렬 점수가 낮은 종목입니다. "
+                            "다음 내러티브 생성 시 이 섹터/테마를 추가로 점검하세요."
+                        )
+                        st.code(", ".join(_blind_spots))
+                        if st.button("🤖 Gemini로 사각지대 분석 요청", key="blind_spot_gemini_btn"):
+                            _genai_client = _get_genai_client()
+                            if _genai_client is None:
+                                st.error("Gemini API 키가 설정되지 않았습니다.")
+                            else:
+                                _narrative_ctx = json.dumps(_snap_fb.get("scanner_data_source", ""), ensure_ascii=False)
+                                _bs_prompt = f"""
+당신은 월가 탑다운 스트래티지스트입니다.
+아래 종목들은 퀀트 스캐너(모멘텀·RS·펀더멘털)에서 상위 점수를 받았지만,
+최신 시장 내러티브 분석에서는 낮은 Narrative Alignment를 받은 종목들입니다.
+
+종목: {', '.join(_blind_spots)}
+
+다음을 간결하게 분석해주세요:
+1) 이 종목들이 공유하는 테마/섹터/공급망 관계는 무엇인가?
+2) 내러티브에서 놓친 이유(데이터 지연, 2차 수혜 구간, 섹터 rotation 초기 등)는?
+3) 다음 내러티브 분석 시 추가로 점검해야 할 키워드 2~3개
+
+한국어로, 간결하게 (총 200자 이내)."""
+                                try:
+                                    with st.spinner("Gemini 사각지대 분석 중..."):
+                                        _bs_model = _genai_client.models
+                                        _bs_resp = _bs_model.generate_content(
+                                            model=_SCANNER_NARRATIVE_BATCH_MODEL_ID,
+                                            contents=_bs_prompt,
+                                        )
+                                        _bs_text = str(getattr(_bs_resp, "text", "") or "").strip()
+                                    if _bs_text:
+                                        st.info(_bs_text)
+                                    else:
+                                        st.warning("분석 결과를 받지 못했습니다.")
+                                except Exception as _bs_err:
+                                    st.error(f"Gemini 분석 실패: {_bs_err}")
     
             selected_sector_labels = []
             manual_tickers_input = ""
@@ -11204,6 +11442,33 @@ if st.session_state.get("logged_in"):
                     st.markdown("**🏆 자주 등장한 종목 (신뢰도 높은 신호)**")
                     st.dataframe(ticker_freq.head(15), use_container_width=True, hide_index=True)
 
+                    # ── 아이디어B: 연속 상위권 자동 Watchlist 추가 제안 ──────
+                    _total_scans = sc_hist["Date"].nunique()
+                    if _total_scans >= 3:
+                        _strong = ticker_freq[
+                            (ticker_freq["등장횟수"] >= max(3, int(_total_scans * 0.5))) &
+                            (ticker_freq["평균점수"] >= 60.0)
+                        ].head(5)
+                        if not _strong.empty:
+                            st.markdown("**🎯 반복 상위권 종목 — Watchlist 추가 추천**")
+                            st.caption(f"전체 스캔 {_total_scans}회 중 50% 이상 등장 + 평균점수 60↑ 조건")
+                            _strong_cols = st.columns(min(len(_strong), 5))
+                            for _si, (_, _sr) in enumerate(_strong.iterrows()):
+                                _stk = str(_sr["Ticker"]).strip().upper()
+                                with _strong_cols[_si]:
+                                    def _add_strong_wl(tk=_stk, avg_sc=_sr["평균점수"], cnt=_sr["등장횟수"]):
+                                        _uid_st = str(st.session_state.get("user_id") or "").strip()
+                                        add_to_watchlist(
+                                            _uid_st, tk,
+                                            memo=f"반복 상위권({cnt}회 등장, 평균{avg_sc:.1f}점)",
+                                        )
+                                        st.session_state[f"_hist_wl_{tk}"] = True
+                                    if st.session_state.get(f"_hist_wl_{_stk}"):
+                                        st.success(f"✅ {_stk}")
+                                    else:
+                                        st.button(f"🔔 {_stk} 추가", key=f"hist_wl_{_si}_{_stk}",
+                                            on_click=_add_strong_wl, use_container_width=True)
+
                     # 최근 스캔 결과
                     st.markdown("**📅 최근 스캔 기록**")
                     recent_sc = sc_hist.sort_values("Date", ascending=False).head(20)
@@ -11217,7 +11482,7 @@ if st.session_state.get("logged_in"):
             if scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[2]:
                 st.caption(
                     "Data Source가 수동일 때만 아래에서 유니버스를 구성합니다. "
-                    "(Current Leaders 서브탭과 동일한 옵션 구조이며, 선택 값은 서브탭별로 독립입니다.)"
+                    "섹터 선택값은 Leaders 탭과 **독립**으로 저장됩니다 — 여기서 따로 선택해주세요."
                 )
                 selected_sector_labels_em = st.multiselect(
                     "주요 섹터 (복수 선택)",
@@ -11292,12 +11557,8 @@ if st.session_state.get("logged_in"):
                             "universe": list(target_u_em),
                             "completed_at": datetime.now(timezone.utc).isoformat(),
                         }
-                        # Emerging 히스토리 저장
-                        _em_uid_sc = str(st.session_state.get("user_id") or "").strip()
-                        _ok_em_hist, _ = save_scanner_result_history(_em_uid_sc, em_df, engine="emerging")
-                        if _ok_em_hist:
-                            load_scanner_history.clear()
-                        st.success("Emerging Opportunities 스캔 완료 — 결과가 세션 및 히스토리에 저장되었습니다.")
+                        # 히스토리 저장은 아래 자동저장 로직(_em_sc_last != _em_sc_today)에서 일괄 처리
+                        st.success("Emerging Opportunities 스캔 완료 — 결과가 세션에 저장되었습니다.")
     
             snap_em = st.session_state.get("scanner_results_emerging")
             if isinstance(snap_em, dict) and isinstance(snap_em.get("score_df"), pd.DataFrame) and not snap_em["score_df"].empty:
@@ -11334,6 +11595,34 @@ if st.session_state.get("logged_in"):
 
                     st.markdown("**🌱 자주 등장한 Emerging 종목 (신뢰도 높은 신호)**")
                     st.dataframe(em_freq.head(15), use_container_width=True, hide_index=True)
+
+                    # ── 아이디어B: 연속 상위권 자동 Watchlist 추가 제안 ──────
+                    _em_total_scans = em_sc_hist["Date"].nunique()
+                    if _em_total_scans >= 3:
+                        _em_strong = em_freq[
+                            (em_freq["등장횟수"] >= max(3, int(_em_total_scans * 0.5))) &
+                            (em_freq["평균점수"] >= 55.0)
+                        ].head(5)
+                        if not _em_strong.empty:
+                            st.markdown("**🎯 반복 상위권 Emerging 종목 — Watchlist 추가 추천**")
+                            st.caption(f"전체 스캔 {_em_total_scans}회 중 50% 이상 등장 + 평균점수 55↑ 조건")
+                            _em_strong_cols = st.columns(min(len(_em_strong), 5))
+                            for _esi, (_, _esr) in enumerate(_em_strong.iterrows()):
+                                _estk = str(_esr["Ticker"]).strip().upper()
+                                with _em_strong_cols[_esi]:
+                                    def _add_em_strong_wl(tk=_estk, avg_sc=_esr["평균점수"], cnt=_esr["등장횟수"]):
+                                        _uid_est = str(st.session_state.get("user_id") or "").strip()
+                                        add_to_watchlist(
+                                            _uid_est, tk,
+                                            memo=f"Emerging 반복({cnt}회, 평균{avg_sc:.1f}점)",
+                                            alert_rsi=35.0,
+                                        )
+                                        st.session_state[f"_em_hist_wl_{tk}"] = True
+                                    if st.session_state.get(f"_em_hist_wl_{_estk}"):
+                                        st.success(f"✅ {_estk}")
+                                    else:
+                                        st.button(f"🔔 {_estk}", key=f"em_hist_wl_{_esi}_{_estk}",
+                                            on_click=_add_em_strong_wl, use_container_width=True)
 
                     # 최근 스캔 기록
                     st.markdown("**📅 최근 Emerging 스캔 기록**")
