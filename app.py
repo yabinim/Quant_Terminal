@@ -3220,7 +3220,7 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
         try:
             k_q = _fmp_key()
             if k_q:
-                rq = requests.get(f"{_FMP_BASE}/quote/{ticker}?apikey={k_q}", timeout=_FMP_TIMEOUT)
+                rq = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k_q}", timeout=_FMP_TIMEOUT)
                 if rq.status_code == 200:
                     qd = rq.json()
                     q_item = qd[0] if isinstance(qd, list) and qd else {}
@@ -3309,7 +3309,22 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
                                 ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
                                 ae.get("estimatedEps") or ae.get("eps")
                             )
-                            cur_price = to_float(info.get("currentPrice") or info.get("price"))
+                            cur_price = to_float(
+                                info.get("currentPrice") or info.get("price") or
+                                info.get("regularMarketPrice") or info.get("_fmp_price")
+                            )
+                            # currentPrice 없으면 profile에서 직접 가져오기
+                            if (cur_price is None or pd.isna(cur_price)) and k_val:
+                                try:
+                                    _rp = requests.get(f"{_FMP_BASE}/profile?symbol={ticker}&apikey={k_val}", timeout=_FMP_TIMEOUT)
+                                    if _rp.status_code == 200:
+                                        _pd2 = _rp.json()
+                                        _pi2 = _pd2[0] if isinstance(_pd2, list) and _pd2 else {}
+                                        cur_price = to_float(_pi2.get("price"))
+                                        if pd.notna(cur_price):
+                                            info["currentPrice"] = cur_price
+                                except Exception:
+                                    pass
                             if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
                                 fwd_pe = round(float(cur_price) / float(est_eps), 2)
                                 if 0 < fwd_pe < 2000:
@@ -3932,7 +3947,7 @@ def evaluate_kpis(ticker_symbol):
             "Pass": pass_fail_badge(pd.notna(ev_to_fcf) and 0 < ev_to_fcf <= ev_fcf_max, pd.isna(ev_to_fcf)),
         },
         {
-            "Category": "밸류에이션 (Valuation) — 상대평가",
+            "Category": "밸류에이션 (Valuation)",
             "KPI": "PEG Ratio (성장 대비)",
             "Value": num_str(peg_ratio),
             "Rule": f"{peg_pass_threshold} 미만 = 성장 대비 합리적",
@@ -3965,9 +3980,10 @@ def evaluate_kpis(ticker_symbol):
     })
 
     kpi_df = pd.DataFrame(rows)
-    pass_count   = kpi_df["Pass"].str.startswith("✅").sum()
-    fail_count   = kpi_df["Pass"].str.startswith("❌").sum()
-    nodata_count = kpi_df["Pass"].str.startswith("⚫").sum()
+    _p = kpi_df["Pass"].astype(str)
+    pass_count   = (_p.str.contains("Pass",  case=False) & ~_p.str.contains("Fail", case=False)).sum()
+    fail_count   = _p.str.contains("Fail",   case=False).sum()
+    nodata_count = (_p.str.contains("N/A|No Data", case=False) & ~_p.str.contains("Fail|Pass", case=False)).sum()
 
     margin_context = {
         "intrinsic_value": intrinsic_value,
@@ -11759,55 +11775,82 @@ if st.session_state.get("logged_in"):
             st.markdown("### 🏦 기관 투자자 보유 현황")
             st.caption("상위 기관의 보유 비중. 기관 보유 비중이 높고 증가 추세이면 스마트머니 유입 신호입니다.")
             try:
-                with st.spinner("기관 보유 데이터 불러오는 중..."):
-                    inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
+                _tk_inst = str(selected_ticker).strip().upper()
+                _k_inst  = _fmp_key()
+                _shown   = False
 
-                if inst_df.empty:
-                    st.caption("※ FMP Starter 플랜에서 기관 보유 상세 미제공 → 애널리스트 컨센서스로 대체")
-                    _tk_inst = str(selected_ticker).strip().upper()
-                    _k_inst = _fmp_key()
+                with st.spinner("애널리스트 데이터 불러오는 중..."):
                     if _k_inst:
+                        # 1) ratings-snapshot 시도
                         try:
-                            _r_inst = requests.get(
+                            _r1 = requests.get(
                                 f"{_FMP_BASE}/ratings-snapshot?symbol={_tk_inst}&apikey={_k_inst}",
                                 timeout=_FMP_TIMEOUT
                             )
-                            if _r_inst.status_code == 200:
-                                _rd = _r_inst.json()
-                                _ri = _rd[0] if isinstance(_rd, list) and _rd else (
-                                      _rd if isinstance(_rd, dict) else {})
+                            if _r1.status_code == 200:
+                                _rd1 = _r1.json()
+                                _ri  = _rd1[0] if isinstance(_rd1, list) and _rd1 else (
+                                       _rd1 if isinstance(_rd1, dict) else {})
                                 if _ri:
-                                    _sb  = int(_ri.get("strongBuy")  or 0)
-                                    _b   = int(_ri.get("buy")        or 0)
-                                    _h   = int(_ri.get("hold")       or 0)
-                                    _s   = int(_ri.get("sell")       or 0)
-                                    _ss  = int(_ri.get("strongSell") or 0)
-                                    _tot = _sb+_b+_h+_s+_ss
+                                    # FMP ratings-snapshot 실제 필드명 모두 시도
+                                    _sb  = int(to_float(_ri.get("strongBuy")  or _ri.get("ratingDetailsStrongBuyCount") or _ri.get("ratingStrongBuy")  or 0) or 0)
+                                    _b   = int(to_float(_ri.get("buy")        or _ri.get("ratingDetailsBuyCount")       or _ri.get("ratingBuy")        or 0) or 0)
+                                    _h   = int(to_float(_ri.get("hold")       or _ri.get("ratingDetailsHoldCount")      or _ri.get("ratingHold")       or 0) or 0)
+                                    _s   = int(to_float(_ri.get("sell")       or _ri.get("ratingDetailsSellCount")      or _ri.get("ratingSell")       or 0) or 0)
+                                    _ss  = int(to_float(_ri.get("strongSell") or _ri.get("ratingDetailsStrongSellCount")or _ri.get("ratingStrongSell") or 0) or 0)
+                                    _tot = _sb + _b + _h + _s + _ss
                                     if _tot > 0:
-                                        _buy_pct = round((_sb+_b)/_tot*100, 1)
+                                        _buy_pct = round((_sb + _b) / _tot * 100, 1)
                                         ic1, ic2, ic3 = st.columns(3)
-                                        ic1.metric("애널리스트 매수 의견", f"{_buy_pct:.0f}%", f"{_sb+_b}/{_tot}명")
-                                        ic2.metric("Strong Buy / Buy", f"{_sb} / {_b}명")
-                                        ic3.metric("Hold / Sell", f"{_h} / {_s+_ss}명")
-                                        _rlabel = _ri.get("ratingRecommendation") or _ri.get("rating") or ""
+                                        ic1.metric("매수 의견 비율", f"{_buy_pct:.0f}%", f"Strong Buy {_sb} + Buy {_b}명")
+                                        ic2.metric("Hold", f"{_h}명")
+                                        ic3.metric("Sell / Strong Sell", f"{_s+_ss}명", f"총 {_tot}명")
+                                        _rlabel = (_ri.get("ratingRecommendation") or _ri.get("rating") or
+                                                   _ri.get("ratingScore") or "")
                                         if _rlabel:
-                                            st.info(f"📊 종합 의견: **{_rlabel}**")
-                                    else:
-                                        st.info("애널리스트 데이터가 없습니다.")
-                                else:
-                                    st.info("애널리스트 데이터를 가져오지 못했습니다.")
+                                            _col = "#16a34a" if _buy_pct >= 60 else ("#f59e0b" if _buy_pct >= 40 else "#dc2626")
+                                            st.markdown(
+                                                f"<div style='background:#1e293b;border-radius:8px;padding:10px 16px;"
+                                                f"border-left:4px solid {_col};margin-top:8px;'>"
+                                                f"<span style='color:{_col};font-weight:700;'>📊 종합 의견: {_rlabel}</span></div>",
+                                                unsafe_allow_html=True)
+                                        _shown = True
                         except Exception:
-                            st.info("애널리스트 데이터 로드 실패.")
-                else:
-                    inst_df.columns = [str(c).strip() for c in inst_df.columns]
-                    pct_col = next((c for c in inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
-                    if pct_col:
-                        inst_df[pct_col] = pd.to_numeric(inst_df[pct_col], errors="coerce")
-                        total_inst = inst_df[pct_col].sum() * 100 if inst_df[pct_col].max() <= 1 else inst_df[pct_col].sum()
-                        st.metric("상위 10개 기관 합산 보유 비중", f"{total_inst:.1f}%")
-                    st.dataframe(inst_df, use_container_width=True, hide_index=True)
+                            pass
+
+                        # 2) grades-consensus fallback
+                        if not _shown:
+                            try:
+                                _r2 = requests.get(
+                                    f"{_FMP_BASE}/grades-consensus?symbol={_tk_inst}&apikey={_k_inst}",
+                                    timeout=_FMP_TIMEOUT
+                                )
+                                if _r2.status_code == 200:
+                                    _rd2 = _r2.json()
+                                    _gc  = _rd2[0] if isinstance(_rd2, list) and _rd2 else (
+                                           _rd2 if isinstance(_rd2, dict) else {})
+                                    if _gc:
+                                        _sb2 = int(to_float(_gc.get("strongBuy")  or 0) or 0)
+                                        _b2  = int(to_float(_gc.get("buy")        or 0) or 0)
+                                        _h2  = int(to_float(_gc.get("hold")       or 0) or 0)
+                                        _s2  = int(to_float(_gc.get("sell")       or 0) or 0)
+                                        _ss2 = int(to_float(_gc.get("strongSell") or 0) or 0)
+                                        _tot2 = _sb2+_b2+_h2+_s2+_ss2
+                                        if _tot2 > 0:
+                                            _bp2 = round((_sb2+_b2)/_tot2*100, 1)
+                                            ic1, ic2, ic3 = st.columns(3)
+                                            ic1.metric("매수 의견 비율", f"{_bp2:.0f}%", f"Strong Buy {_sb2} + Buy {_b2}명")
+                                            ic2.metric("Hold", f"{_h2}명")
+                                            ic3.metric("Sell / Strong Sell", f"{_s2+_ss2}명", f"총 {_tot2}명")
+                                            _shown = True
+                            except Exception:
+                                pass
+
+                if not _shown:
+                    # FMP API에서 데이터 없음 — 직접 응답 내용 디버그
+                    st.info("애널리스트 컨센서스 데이터를 가져오지 못했습니다. (FMP API 응답 없음)")
             except Exception as _ie:
-                st.warning(f"기관 보유 데이터 로드 오류: {_ie}")
+                st.warning(f"데이터 로드 오류: {_ie}")
 
 
 
