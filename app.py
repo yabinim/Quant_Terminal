@@ -8729,23 +8729,95 @@ def _dedup_and_rank(all_news: list, top_n: int = 60) -> list:
 def _build_news_context_text(top_news: list) -> str:
     """
     LLM 프롬프트용 뉴스 컨텍스트 문자열 생성.
-    티커 정보가 있는 경우 Tickers 행을 포함시켜 LLM winners 선정 정확도를 높임.
+    소스 유형별로 섹션을 분리해서 Gemini가 Press Release / Stock News / General을
+    다른 가중치로 처리할 수 있도록 구조화.
     """
-    chunks = []
-    for idx, item in enumerate(top_news, start=1):
-        lines = [
-            f"[{idx}] Source: {item.get('source', 'Unknown')} (Weight: {item.get('weight', 0.0):.1f})",
-            f"Published: {item.get('published', 'N/A')}",
-        ]
-        tickers = str(item.get("tickers", "") or "").strip()
-        if tickers:
-            lines.append(f"Tickers: {tickers}")
-        lines.append(f"Title: {item.get('title', '')}")
-        summary = str(item.get("summary", "") or "").strip()
-        if summary:
-            lines.append(f"Content: {summary}")
-        chunks.append("\n".join(lines))
-    return "\n\n".join(chunks).strip()
+
+    # 소스 유형 분류 기준 및 섹션 정의
+    # (매칭 키워드, 섹션 헤더, 설명)
+    section_defs = [
+        (
+            "FMP Press Release",
+            "━━━ [SECTION A] Press Releases — 고임팩트 기업 공시 (최우선 참고) ━━━",
+            "어닝 발표·M&A·가이던스 등 주가에 직접 영향을 주는 공식 기업 공시입니다.\n"
+            "이 섹션의 Tickers 종목은 즉각적인 가격 반응이 확인된 최우선 winners 후보입니다.",
+        ),
+        (
+            "FMP Stock News",
+            "━━━ [SECTION B] Stock News — 종목 티커 태그 포함 뉴스 ━━━",
+            "각 기사에 관련 종목 티커가 태그되어 있습니다.\n"
+            "Tickers 필드에 명시된 종목을 해당 테마의 직접 수혜주 후보로 간주하세요.",
+        ),
+        (
+            "FMP Article",
+            "━━━ [SECTION C] FMP Articles — 전문 애널리스트 분석 기사 ━━━",
+            "FMP 에디터의 심층 분석 기사입니다. 테마의 구조적 배경과 expanding_to 단계 설정에 활용하세요.",
+        ),
+        (
+            "FMP General News",
+            "━━━ [SECTION D] General / Macro News — 거시경제 맥락 ━━━",
+            "금리·환율·정책 등 매크로 뉴스입니다. regime(Risk On/Off, liquidity) 판단에 활용하세요.",
+        ),
+        (
+            "RSS",
+            "━━━ [SECTION E] RSS Fallback News ━━━",
+            "RSS 수집 뉴스입니다. FMP 데이터가 없을 때 사용됩니다.",
+        ),
+    ]
+
+    # 소스별 분류
+    buckets: dict[str, list] = {key: [] for key, _, _ in section_defs}
+    buckets["__etc__"] = []
+
+    for item in top_news:
+        src = str(item.get("source", "") or "")
+        matched = False
+        for key, _, _ in section_defs:
+            if key in src:
+                buckets[key].append(item)
+                matched = True
+                break
+        if not matched:
+            buckets["__etc__"].append(item)
+
+    sections = []
+    global_idx = 1
+
+    for key, header, desc in section_defs:
+        items = buckets.get(key, [])
+        if not items:
+            continue
+        chunks = []
+        for item in items:
+            lines = [f"[{global_idx}] Published: {item.get('published', 'N/A')}"]
+            tickers = str(item.get("tickers", "") or "").strip()
+            if tickers:
+                lines.append(f"  Tickers: {tickers}")
+            lines.append(f"  Title: {item.get('title', '')}")
+            content = str(item.get("summary", "") or "").strip()
+            if content:
+                lines.append(f"  Content: {content}")
+            chunks.append("\n".join(lines))
+            global_idx += 1
+        sections.append(f"{header}\n{desc}\n\n" + "\n\n".join(chunks))
+
+    # 분류 안 된 기타 항목
+    if buckets["__etc__"]:
+        chunks = []
+        for item in buckets["__etc__"]:
+            lines = [f"[{global_idx}] Source: {item.get('source','Unknown')} | Published: {item.get('published','N/A')}"]
+            tickers = str(item.get("tickers", "") or "").strip()
+            if tickers:
+                lines.append(f"  Tickers: {tickers}")
+            lines.append(f"  Title: {item.get('title', '')}")
+            content = str(item.get("summary", "") or "").strip()
+            if content:
+                lines.append(f"  Content: {content}")
+            chunks.append("\n".join(lines))
+            global_idx += 1
+        sections.append("━━━ [SECTION F] Other News ━━━\n\n" + "\n\n".join(chunks))
+
+    return "\n\n\n".join(sections).strip()
 
 
 def fetch_global_market_news():
@@ -9083,6 +9155,15 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
 - 뉴스만 좋고 가격이 안 받쳐주는 종목은 emerging으로만 분류
 - 각 theme의 winners는 반드시 3~6개 티커
 
+뉴스 소스 유형별 활용 지침 (매우 중요):
+- [SECTION A] Press Releases: 기업이 직접 발표한 공식 공시입니다.
+  해당 섹션의 "Tickers:" 필드에 태그된 종목은 실적·M&A·가이던스 등 고임팩트 이벤트가 확인된 종목이므로,
+  정량 데이터와 방향이 일치하면 반드시 winners의 최우선 후보로 선정하세요.
+- [SECTION B] Stock News: 각 기사의 "Tickers:" 필드는 해당 뉴스와 직접 연관된 종목입니다.
+  동일 티커가 여러 기사에 반복 등장할수록 모멘텀이 강한 종목으로 간주하세요.
+- [SECTION C] FMP Articles: 테마의 구조적 맥락과 expanding_to 단계 설정에 활용하세요.
+- [SECTION D] General/Macro News: regime(Risk On/Off, liquidity 방향) 판단에 주로 활용하세요.
+
 중요 규칙:
 1) 반드시 순수 JSON 텍스트만 출력 (```json 같은 마크다운 금지)
 2) 모든 키를 빠짐없이 포함
@@ -9093,8 +9174,10 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
 7) expected_tickers는 각 stage마다 반드시 2~4개 티커를 쉼표 구분 문자열로 작성
 8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력 (설명 금지, 큰따옴표 사용 금지)
 9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
+10) winners/emerging 선정 근거: 뉴스의 Tickers 태그 + 반복 등장 횟수 + 정량 RS Score를 종합해 판단하세요.
+    근거 없이 유명 대형주를 임의로 채워 넣는 것을 금지합니다.
 {quant_section}
-[뉴스 데이터]
+[뉴스 데이터 — 소스 유형별 섹션 구분]
 {news_text}
 
 [출력 JSON 스키마]
@@ -9107,9 +9190,9 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
   "themes": [
     {{
       "title": "테마명 (예: AI Capex Expansion)",
-      "driver": "무엇이 이 테마를 촉발했는가?",
+      "driver": "무엇이 이 테마를 촉발했는가? Press Release·Stock News 기반 구체적 근거 포함",
       "winners": "정량+정성 모두 확인된 수혜주 (예: NVDA, MSFT, SOXX)",
-      "emerging": "뉴스 모멘텀은 있으나 가격 확인 필요 종목 (예: ARM, MRVL)",
+      "emerging": "뉴스 Tickers 태그는 있으나 정량 가격 확인 필요 종목 (예: ARM, MRVL)",
       "momentum_note": "강함/보통/약함 중 하나만 선택 (예: 강함)",
       "expanding_to": [
         {{"stage": "기업용 AI 솔루션", "expected_tickers": "CRM, NOW, WDAY"}},
