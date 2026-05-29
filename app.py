@@ -740,6 +740,8 @@ def try_sheet_login():
         st.session_state["user_id"] = uid
         st.session_state["login_error"] = False
         st.session_state["login_feedback"] = ""
+        # 로그인 직후 DRG·VIX·거시지표 백그라운드 워밍업
+        _trigger_background_warmup()
         return
     ws, err = open_users_worksheet()
     if err:
@@ -777,12 +779,49 @@ def try_sheet_login():
             st.session_state["user_id"] = lid
             st.session_state["login_error"] = False
             st.session_state["login_feedback"] = ""
+            # 로그인 직후 DRG·VIX·거시지표 백그라운드 워밍업
+            _trigger_background_warmup()
         else:
             st.session_state["login_error"] = True
             st.session_state["login_feedback"] = "비밀번호가 올바르지 않습니다."
         return
     st.session_state["login_error"] = True
     st.session_state["login_feedback"] = f"알 수 없는 계정 상태입니다: {row.get('Status', '')}"
+
+
+def _trigger_background_warmup():
+    """로그인 직후 한 번만 실행: DRG·거시지표·VIX 캐시를 백그라운드 스레드에서 미리 워밍업.
+    이미 캐시가 있으면 즉시 반환, 없으면 논블로킹으로 채워 둠.
+    """
+    import threading as _threading
+    if st.session_state.get("_warmup_done"):
+        return
+    st.session_state["_warmup_done"] = True
+
+    def _warmup():
+        try:
+            # VIX 캐시 (DRG·거시지표 공통)
+            fetch_vix_latest_and_history()
+        except Exception:
+            pass
+        try:
+            # 거시지표 히스토리 캐시
+            fetch_macro_history_series()
+        except Exception:
+            pass
+        try:
+            # DRG (전체 섹터 기본값으로 프리워밍)
+            compute_daily_risk_gauge(sector_filter="전체")
+        except Exception:
+            pass
+        try:
+            # 거시경제 대시보드
+            cached_analyze_us_macro_dashboard()
+        except Exception:
+            pass
+
+    t = _threading.Thread(target=_warmup, daemon=True)
+    t.start()
 
 
 def _render_login_screen():
@@ -2897,18 +2936,135 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     signals = {}
     warnings = []
     details = {}
+    import concurrent.futures as _cf_drg
 
-    # ── 신호 1: VIX 방향 전환 — 캐시된 fetch_vix_latest_and_history() 재사용
-    # (FRED/FMP 이중 소스 + @st.cache_data(ttl=3600) → 중복 API 호출 없음)
+    k_drg = _fmp_key()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 모든 외부 API 데이터를 병렬로 미리 fetch
+    # ══════════════════════════════════════════════════════════════════════════
+    def _fetch_vix_data():
+        try:
+            v, h, e = fetch_vix_latest_and_history()
+            return ("vix", (v, h, e))
+        except Exception:
+            return ("vix", (np.nan, None, "오류"))
+
+    def _fetch_credit_data():
+        try:
+            tickers = ["HYG", "LQD"]
+            df = _fmp_batch_to_close_df(tickers, limit=30)
+            return ("credit", df)
+        except Exception:
+            return ("credit", pd.DataFrame())
+
+    def _fetch_leaders_data():
+        try:
+            tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
+            df = _fmp_batch_to_close_df(tickers_dl, limit=30)
+            return ("leaders", df)
+        except Exception:
+            return ("leaders", pd.DataFrame())
+
+    def _fetch_futures_data():
+        results = {}
+        if not k_drg:
+            return ("futures", results)
+        for sym in ["ES=F", "NQ=F"]:
+            try:
+                r = requests.get(
+                    f"{_FMP_BASE}/quote/{sym}?apikey={k_drg}",
+                    timeout=_FMP_TIMEOUT,
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    item = d[0] if isinstance(d, list) and d else d
+                    price = to_float(item.get("price") or item.get("lastPrice"))
+                    prev  = to_float(item.get("previousClose") or item.get("prevClose"))
+                    chg = ((price / prev - 1) * 100) if (pd.notna(price) and pd.notna(prev) and prev > 0) else np.nan
+                    results[sym] = {"price": price, "prev": prev, "chg_pct": chg}
+            except Exception:
+                pass
+        return ("futures", results)
+
+    def _fetch_riskoff_data():
+        results = {}
+        if not k_drg:
+            return ("riskoff", results)
+        # UUP, GLD, IEF를 배치로 한 번에
+        try:
+            df = _fmp_batch_to_close_df(["UUP", "GLD", "IEF"], limit=10)
+            name_map = {"UUP": "달러", "GLD": "금", "IEF": "국채(7-10Y)"}
+            for sym, name in name_map.items():
+                if sym in df.columns:
+                    s = pd.to_numeric(df[sym], errors="coerce").dropna()
+                    chg = float((s.iloc[-1] / s.iloc[-6] - 1) * 100) if len(s) >= 6 else np.nan
+                    results[sym] = {"name": name, "chg_pct": chg}
+        except Exception:
+            pass
+        return ("riskoff", results)
+
+    def _fetch_calendar_data():
+        try:
+            return ("calendar", fetch_fmp_economic_calendar_risk())
+        except Exception:
+            return ("calendar", ([], False))
+
+    def _fetch_news_data():
+        news = []
+        if not k_drg:
+            return ("news", news)
+        try:
+            risk_tickers = ["SPY", sector_etf] + leaders[:2]
+            for tk in list(dict.fromkeys(risk_tickers))[:3]:
+                try:
+                    r = requests.get(
+                        f"{_FMP_BASE}/stock-news?symbols={tk}&limit=3&apikey={k_drg}",
+                        timeout=_FMP_TIMEOUT
+                    )
+                    if r.status_code == 200:
+                        tk_news = r.json()
+                        if isinstance(tk_news, list):
+                            for n in tk_news[:3]:
+                                title = str(n.get("title") or "")
+                                if title:
+                                    news.append({
+                                        "ticker": tk,
+                                        "title": title,
+                                        "publisher": str(n.get("site") or n.get("publisher") or ""),
+                                        "link": str(n.get("url") or n.get("link") or ""),
+                                        "pub_time": n.get("publishedDate") or n.get("date"),
+                                    })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return ("news", news)
+
+    # 7개 fetch 함수를 동시 실행
+    _prefetch_tasks = [
+        _fetch_vix_data, _fetch_credit_data, _fetch_leaders_data,
+        _fetch_futures_data, _fetch_riskoff_data, _fetch_calendar_data,
+        _fetch_news_data,
+    ]
+    _prefetch = {}
+    with _cf_drg.ThreadPoolExecutor(max_workers=7) as _exe_drg:
+        _futs_drg = {_exe_drg.submit(fn): fn.__name__ for fn in _prefetch_tasks}
+        for fut in _cf_drg.as_completed(_futs_drg, timeout=20):
+            try:
+                key, val = fut.result()
+                _prefetch[key] = val
+            except Exception:
+                pass
+
+    # ── 신호 1: VIX 방향 전환 ────────────────────────────────────────────
     vix_close = pd.Series(dtype=float)
-    _vix_source = ""
     try:
-        _vix_val, _vix_hist, _vix_err = fetch_vix_latest_and_history()
+        _vix_val, _vix_hist, _vix_err = _prefetch.get("vix", (np.nan, None, "N/A"))
         if _vix_hist is not None and not _vix_hist.empty and "Close" in _vix_hist.columns:
             _s30 = pd.to_numeric(_vix_hist["Close"], errors="coerce").dropna().tail(30)
             if len(_s30) >= 10:
                 vix_close = _s30
-                _vix_source = "캐시" if _vix_err in (None, "FMP폴백") else "FRED"
     except Exception:
         pass
     try:
@@ -2926,12 +3082,11 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["vix"] = {"ok": True, "value": "N/A", "trend": "N/A"}
 
-    # ── 신호 2: Put/Call Ratio (HYG/LQD 스프레드로 근사) ─────────────────
+    # ── 신호 2: 신용 스프레드 (HYG/LQD) ─────────────────────────────────
     try:
-        hyg_df = _fmp_price_history("HYG", limit=30)
-        lqd_df = _fmp_price_history("LQD", limit=30)
-        hyg = pd.to_numeric(hyg_df["Close"], errors="coerce").dropna() if not hyg_df.empty else pd.Series(dtype=float)
-        lqd = pd.to_numeric(lqd_df["Close"], errors="coerce").dropna() if not lqd_df.empty else pd.Series(dtype=float)
+        _credit_df = _prefetch.get("credit", pd.DataFrame())
+        hyg = pd.to_numeric(_credit_df.get("HYG", pd.Series(dtype=float)), errors="coerce").dropna()
+        lqd = pd.to_numeric(_credit_df.get("LQD", pd.Series(dtype=float)), errors="coerce").dropna()
         if len(hyg) >= 10 and len(lqd) >= 10:
             spread_now = float(hyg.iloc[-1] / lqd.iloc[-1])
             spread_5d = float(hyg.iloc[-6] / lqd.iloc[-6]) if len(hyg) >= 6 else spread_now
@@ -2941,15 +3096,16 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             details["HYG/LQD 스프레드"] = {"5일 변화": f"{spread_chg:+.2f}%", "판정": "⚠️ 축소(위험)" if spread_alert else "✅ 정상"}
             if spread_alert:
                 warnings.append(f"⚠️ 신용 스프레드 축소 ({spread_chg:+.2f}%/5일) — 리스크오프 신호")
+        else:
+            signals["credit"] = {"ok": True, "value": "N/A", "trend": ""}
     except Exception:
         signals["credit"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 3: 대장주 모멘텀 약화 ─────────────────────────────────────
+    # ── 신호 3: 대장주 모멘텀 약화 ───────────────────────────────────────
     try:
+        close_df = _prefetch.get("leaders", pd.DataFrame())
         leader_alerts = []
         leader_details = {}
-        tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
-        close_df = _fmp_batch_to_close_df(tickers_dl, limit=30)
 
         spy_s = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
         spy_5d = float((spy_s.iloc[-1]/spy_s.iloc[-6] - 1)*100) if len(spy_s) >= 6 else 0
@@ -2981,32 +3137,11 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["leaders"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 4: 선물 프리마켓 방향 (ES=F S&P500 / NQ=F 나스닥) ─────────────
-    # FMP quote API로 선물 현재가 + 전일 종가 비교 → 프리마켓 방향 판정
-    # 장 시작 전(Pre-Market) 가장 직접적인 당일 방향 선행 신호
+    # ── 신호 4: 선물 프리마켓 방향 (ES=F / NQ=F) — prefetch 결과 사용 ────
     try:
-        k4 = _fmp_key()
-        _futures_symbols = ["ES=F", "NQ=F"]   # S&P500 선물, 나스닥100 선물
-        _fut_results = {}
-        if k4:
-            for sym in _futures_symbols:
-                try:
-                    r4 = requests.get(
-                        f"{_FMP_BASE}/quote/{sym}?apikey={k4}",
-                        timeout=_FMP_TIMEOUT,
-                    )
-                    if r4.status_code == 200:
-                        d4 = r4.json()
-                        item = d4[0] if isinstance(d4, list) and d4 else d4
-                        price  = to_float(item.get("price") or item.get("lastPrice"))
-                        prev   = to_float(item.get("previousClose") or item.get("prevClose"))
-                        chg_pct = ((price / prev - 1) * 100) if (pd.notna(price) and pd.notna(prev) and prev > 0) else np.nan
-                        _fut_results[sym] = {"price": price, "prev": prev, "chg_pct": chg_pct}
-                except Exception:
-                    pass
-
+        _fut_results = _prefetch.get("futures", {})
         if _fut_results:
-            _fut_chgs = [v["chg_pct"] for v in _fut_results.values() if pd.notna(v["chg_pct"])]
+            _fut_chgs = [v["chg_pct"] for v in _fut_results.values() if pd.notna(v.get("chg_pct", np.nan))]
             _avg_chg = float(np.mean(_fut_chgs)) if _fut_chgs else np.nan
             if pd.notna(_avg_chg):
                 fut_alert = _avg_chg <= -0.5      # 0.5% 이상 하락이면 경고
@@ -3034,33 +3169,9 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 5: 달러·금·국채 리스크오프 신호 ───────────────────────────
-    # UUP(달러ETF)·GLD(금ETF)·IEF(중기국채ETF) 동반 강세 = 안전자산 쏠림
-    # → 3개 중 2개 이상 5일 상승 + SPY 하락이면 리스크오프 경고
+    # ── 신호 5: 달러·금·국채 리스크오프 신호 — prefetch 결과 사용 ────────
     try:
-        k5 = _fmp_key()
-        _safety_symbols = {"UUP": "달러", "GLD": "금", "IEF": "국채(7-10Y)"}
-        _safety_results = {}
-        if k5:
-            for sym5, name5 in _safety_symbols.items():
-                try:
-                    r5 = requests.get(
-                        f"{_FMP_BASE}/historical-price-eod/full?symbol={sym5}&limit=10&apikey={k5}",
-                        timeout=_FMP_TIMEOUT,
-                    )
-                    if r5.status_code == 200:
-                        d5 = r5.json()
-                        rows5 = d5.get("historical", d5) if isinstance(d5, dict) else d5
-                        if isinstance(rows5, list) and len(rows5) >= 6:
-                            df5 = pd.DataFrame(rows5)
-                            df5["date"] = pd.to_datetime(df5["date"])
-                            df5 = df5.set_index("date").sort_index()
-                            s5 = pd.to_numeric(df5["close"], errors="coerce").dropna()
-                            chg5 = float((s5.iloc[-1] / s5.iloc[-6] - 1) * 100) if len(s5) >= 6 else np.nan
-                            _safety_results[sym5] = {"name": name5, "chg_pct": chg5}
-                except Exception:
-                    pass
-
+        _safety_results = _prefetch.get("riskoff", {})
         if _safety_results:
             _rising = [sym for sym, v in _safety_results.items()
                        if pd.notna(v["chg_pct"]) and v["chg_pct"] > 0.3]
@@ -3097,9 +3208,10 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["riskoff"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 6: 이벤트 리스크 (FMP Economic Calendar) ────────────────────
+    # ── 신호 6: 이벤트 리스크 — prefetch 결과 사용 ──────────────────────
+    cal_events = []
     try:
-        cal_events, has_high_impact = fetch_fmp_economic_calendar_risk()
+        cal_events, has_high_impact = _prefetch.get("calendar", ([], False))
         if cal_events:
             high_events = [e for e in cal_events if e["impact"].lower() in ("high", "3")]
             med_events  = [e for e in cal_events if e["impact"].lower() in ("medium", "2")]
@@ -3139,36 +3251,8 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["event_risk"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 뉴스 수집 ─────────────────────────────────────────────────────────
-    news_items = []
-    k = _fmp_key()
-    try:
-        risk_tickers = ["SPY", sector_etf] + leaders[:2]
-        for tk in risk_tickers[:3]:
-            try:
-                if k:
-                    r = requests.get(
-                        f"{_FMP_BASE}/stock-news?symbols={tk}&limit=3&apikey={k}",
-                        timeout=_FMP_TIMEOUT
-                    )
-                    tk_news = r.json() if r.status_code == 200 else []
-                    if isinstance(tk_news, list):
-                        for n in tk_news[:3]:
-                            title = str(n.get("title") or "")
-                            publisher = str(n.get("site") or n.get("publisher") or "")
-                            link = str(n.get("url") or n.get("link") or "")
-                            pub_time = n.get("publishedDate") or n.get("date")
-                            if title:
-                                news_items.append({
-                                    "ticker": tk, "title": title,
-                                    "publisher": publisher, "link": link,
-                                    "pub_time": pub_time,
-                                })
-                _time.sleep(0.3)
-            except Exception:
-                continue
-    except Exception:
-        pass
+    # ── 뉴스 — prefetch 결과 사용 ────────────────────────────────────────
+    news_items = _prefetch.get("news", [])
 
     # ── 종합 점수 계산 ─────────────────────────────────────────────────────
     ok_count = sum(1 for v in signals.values() if v["ok"])
@@ -3202,7 +3286,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         "details": details,
         "news_items": news_items,
         "sector_filter": sector_filter,
-        "event_calendar": cal_events if "cal_events" in dir() else [],
+        "event_calendar": cal_events,
     }
 
 
@@ -10572,8 +10656,10 @@ if st.session_state.get("logged_in"):
 
         if st.button("🔄 지금 스캔", key="drg_refresh_btn", use_container_width=True):
             compute_daily_risk_gauge.clear()
+            fetch_vix_latest_and_history.clear()
+            fetch_fmp_economic_calendar_risk.clear()
 
-        with st.spinner("선행 지표 6가지 분석 중..."):
+        with st.spinner("📡 선행 신호 6가지 동시 분석 중... (약 5~10초)"):
             drg = compute_daily_risk_gauge(sector_filter=sector_choice)
 
         risk_score = drg["risk_score"]
