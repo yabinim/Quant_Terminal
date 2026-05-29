@@ -2967,24 +2967,53 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             return ("leaders", pd.DataFrame())
 
     def _fetch_futures_data():
+        """프리마켓 방향 — SPY/QQQ stock-price-change API (1일 변화율).
+        FMP는 ES=F/NQ=F 선물 심볼 미지원. stock-price-change가 가장 정확한 대체.
+        프리마켓 시간대에는 quote의 price가 프리마켓 가격을 반영함.
+        """
         results = {}
         if not k_drg:
             return ("futures", results)
-        for sym in ["ES=F", "NQ=F"]:
+
+        # 1차: stock-price-change API (1D 변화율 — 가장 신뢰도 높음)
+        try:
+            r_chg = requests.get(
+                f"{_FMP_BASE}/stock-price-change?symbol=SPY,QQQ&apikey={k_drg}",
+                timeout=_FMP_TIMEOUT,
+            )
+            if r_chg.status_code == 200:
+                data_chg = r_chg.json()
+                items = data_chg if isinstance(data_chg, list) else [data_chg]
+                for item in items:
+                    sym = str(item.get("symbol", "")).upper()
+                    chg1d = to_float(item.get("1D") or item.get("1d") or item.get("day"))
+                    if sym in ("SPY", "QQQ") and pd.notna(chg1d):
+                        results[sym] = {"chg_pct": chg1d, "source": "price-change"}
+        except Exception:
+            pass
+
+        # 2차: quote API 폴백 (price vs previousClose)
+        for sym in ["SPY", "QQQ"]:
+            if sym in results:
+                continue
             try:
-                r = requests.get(
-                    f"{_FMP_BASE}/quote/{sym}?apikey={k_drg}",
+                r_q = requests.get(
+                    f"{_FMP_BASE}/quote?symbol={sym}&apikey={k_drg}",
                     timeout=_FMP_TIMEOUT,
                 )
-                if r.status_code == 200:
-                    d = r.json()
-                    item = d[0] if isinstance(d, list) and d else d
-                    price = to_float(item.get("price") or item.get("lastPrice"))
+                if r_q.status_code == 200:
+                    d_q = r_q.json()
+                    item = d_q[0] if isinstance(d_q, list) and d_q else d_q
+                    price = to_float(item.get("price"))
                     prev  = to_float(item.get("previousClose") or item.get("prevClose"))
-                    chg = ((price / prev - 1) * 100) if (pd.notna(price) and pd.notna(prev) and prev > 0) else np.nan
-                    results[sym] = {"price": price, "prev": prev, "chg_pct": chg}
+                    chg_pct = to_float(item.get("changesPercentage") or item.get("changePercent"))
+                    if pd.notna(chg_pct):
+                        results[sym] = {"chg_pct": chg_pct, "source": "quote"}
+                    elif pd.notna(price) and pd.notna(prev) and prev > 0:
+                        results[sym] = {"chg_pct": (price / prev - 1) * 100, "source": "quote"}
             except Exception:
                 pass
+
         return ("futures", results)
 
     def _fetch_riskoff_data():
@@ -3137,35 +3166,46 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["leaders"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 4: 선물 프리마켓 방향 (ES=F / NQ=F) — prefetch 결과 사용 ────
+    # ── 신호 4: 프리마켓 방향 (SPY/QQQ 1일 변화율) — prefetch 결과 사용 ─
+    # FMP는 ES=F/NQ=F 미지원 → stock-price-change + quote API로 SPY/QQQ 사용
     try:
         _fut_results = _prefetch.get("futures", {})
         if _fut_results:
-            _fut_chgs = [v["chg_pct"] for v in _fut_results.values() if pd.notna(v.get("chg_pct", np.nan))]
+            _fut_chgs = [v["chg_pct"] for v in _fut_results.values()
+                         if pd.notna(v.get("chg_pct", np.nan))]
             _avg_chg = float(np.mean(_fut_chgs)) if _fut_chgs else np.nan
             if pd.notna(_avg_chg):
-                fut_alert = _avg_chg <= -0.5      # 0.5% 이상 하락이면 경고
+                fut_alert = _avg_chg <= -0.5
                 if _avg_chg >= 0.3:
                     fut_label = f"📈 +{_avg_chg:.2f}%"
                 elif _avg_chg <= -0.3:
                     fut_label = f"📉 {_avg_chg:.2f}%"
                 else:
                     fut_label = f"➡️ {_avg_chg:+.2f}%"
-                es_str = f"ES {_fut_results.get('ES=F',{}).get('chg_pct', np.nan):+.2f}%" if 'ES=F' in _fut_results and pd.notna(_fut_results['ES=F']['chg_pct']) else "N/A"
-                nq_str = f"NQ {_fut_results.get('NQ=F',{}).get('chg_pct', np.nan):+.2f}%" if 'NQ=F' in _fut_results and pd.notna(_fut_results['NQ=F']['chg_pct']) else "N/A"
-                signals["futures"] = {"ok": not fut_alert, "value": fut_label, "trend": f"{es_str} / {nq_str}"}
-                details["선물 프리마켓"] = {
-                    "S&P500 선물(ES)": es_str,
-                    "나스닥 선물(NQ)": nq_str,
+                spy_chg = _fut_results.get("SPY", {}).get("chg_pct", np.nan)
+                qqq_chg = _fut_results.get("QQQ", {}).get("chg_pct", np.nan)
+                spy_str = f"SPY {spy_chg:+.2f}%" if pd.notna(spy_chg) else "N/A"
+                qqq_str = f"QQQ {qqq_chg:+.2f}%" if pd.notna(qqq_chg) else "N/A"
+                signals["futures"] = {
+                    "ok": not fut_alert,
+                    "value": fut_label,
+                    "trend": f"{spy_str} / {qqq_str}",
+                }
+                details["프리마켓 방향"] = {
+                    "SPY (S&P500)": spy_str,
+                    "QQQ (나스닥100)": qqq_str,
                     "평균 변화율": f"{_avg_chg:+.2f}%",
                     "판정": "⚠️ 갭다운 우려" if fut_alert else "✅ 정상",
+                    "데이터 소스": "FMP stock-price-change / quote",
                 }
                 if fut_alert:
-                    warnings.append(f"⚠️ 선물 프리마켓 하락 ({es_str} / {nq_str}) — 갭다운 개장 가능성")
+                    warnings.append(
+                        f"⚠️ 프리마켓 하락 ({spy_str} / {qqq_str}) — 갭다운 개장 가능성"
+                    )
             else:
                 signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
         else:
-            signals["futures"] = {"ok": True, "value": "N/A (FMP키 없음)", "trend": ""}
+            signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
     except Exception:
         signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
 
@@ -10688,7 +10728,7 @@ if st.session_state.get("logged_in"):
             ("vix",        "VIX 방향",        "🌡️"),
             ("credit",     "신용 스프레드",    "💳"),
             ("leaders",    "대장주 모멘텀",    "🏆"),
-            ("futures",    "선물 프리마켓",    "📈"),
+            ("futures",    "프리마켓 방향",    "📈"),
             ("riskoff",    "달러·금·국채",     "🛡️"),
             ("event_risk", "이벤트 리스크",    "📅"),
         ]
