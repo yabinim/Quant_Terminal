@@ -2766,7 +2766,7 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
         data = r.json() if r.status_code == 200 else []
         if isinstance(data, list) and len(data) >= 2:
             rows = []
-            today_str = str(datetime.now().date())
+            today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
             for item in data[:8]:
                 date_str = str(item.get("date") or item.get("fiscalDateEnding") or "")[:10]
                 if not date_str or date_str >= today_str:
@@ -2830,7 +2830,7 @@ def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     # 최근 3개 분기 순서로 시도 (데이터가 있는 분기까지)
-    now = datetime.now()
+    now = datetime.now(_MARKET_ET_TZ)
     q_now = (now.month - 1) // 3
     year_now = now.year
     if q_now == 0:
@@ -4253,7 +4253,7 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
         try:
             ae_data = _fmp_analyst_estimates(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
             if isinstance(ae_data, list) and ae_data:
-                current_year = datetime.now().year
+                current_year = datetime.now(_MARKET_ET_TZ).year
                 # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
                 ae_sorted = sorted(
                     ae_data,
@@ -4705,7 +4705,7 @@ def evaluate_kpis(ticker_symbol):
         try:
             _fp_data = _fmp_analyst_estimates(tk_upper)
             if isinstance(_fp_data, list) and _fp_data:
-                _cur_year = datetime.now().year
+                _cur_year = datetime.now(_MARKET_ET_TZ).year
                 _fp_sorted = sorted(_fp_data, key=lambda x: str(x.get("date") or "9999"))
                 for _ae in _fp_sorted:
                     _ae_y = str(_ae.get("date") or "")[:4]
@@ -6514,7 +6514,7 @@ def save_new_etfs_to_sheet(new_etfs: list[dict]) -> tuple[int, str]:
             if r and r[0].strip()
         )
         rows_to_add = []
-        added_date = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+        added_date = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
         for etf in new_etfs:
             tk = str(etf.get("ticker", "")).strip().upper()
             if not tk or tk in existing_tickers:
@@ -6555,7 +6555,7 @@ def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) ->
         if not isinstance(all_etfs, list):
             return []
 
-        cutoff_date = datetime.now(_KST_TZ) - timedelta(days=days_lookback)
+        cutoff_date = datetime.now(_MARKET_ET_TZ) - timedelta(days=days_lookback)
         new_etfs = []
 
         for etf in all_etfs:
@@ -6623,7 +6623,7 @@ def cleanup_low_quality_etfs_from_sheet(min_avg_volume_m: float = 1.0, min_aum_m
 
         # etf_universe.txt 티커는 보호 (삭제 대상에서 제외)
         protected = set(load_etf_universe_tickers())
-        cutoff_date = datetime.now(_KST_TZ) - timedelta(days=180)
+        cutoff_date = datetime.now(_MARKET_ET_TZ) - timedelta(days=180)
 
         rows_to_delete = []
         for i, r in enumerate(vals[1:], start=2):
@@ -6751,7 +6751,7 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: st
                         migrated.append([old_row[0], old_row[1], "Leaders"] + old_row[2:])
                     ws.append_rows(migrated, value_input_option="USER_ENTERED")
 
-        today_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+        today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
         uid_u = str(user_id).strip().upper()
         engine_label = "Emerging" if engine == "emerging" else "Leaders"
         rows = []
@@ -6861,7 +6861,7 @@ def save_portfolio_snapshot(user_id: str, sell_radar_df: pd.DataFrame) -> tuple[
     if sell_radar_df is None or sell_radar_df.empty:
         return False, "포트폴리오 데이터 없음"
     try:
-        today_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+        today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
         uid_u = str(user_id).strip().upper()
 
         # 총 평가금액, 총 매수금액, 수익률 계산
@@ -6999,7 +6999,7 @@ def upsert_emerging_tracker(user_id: str, ticker: str, theme: str, verdict: str,
         vals = ws.get_all_values()
         uid_u = str(user_id).strip().upper()
         tk_u = str(ticker).strip().upper()
-        now_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d %H:%M")
+        now_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M")
         rs_str = f"{float(rs_score):.2f}" if rs_score is not None and rs_score == rs_score else ""
 
         # 기존 행 찾기
@@ -10901,7 +10901,14 @@ if st.session_state.get("logged_in"):
             ])
             warning_text = "\n".join(fresh_warnings) if fresh_warnings else "없음"
             now_kst = datetime.now(_KST_TZ)
-            market_session = "장 전" if now_kst.hour < 9 else ("장 중" if now_kst.hour < 16 else "장 후")
+            now_et_for_session = datetime.now(_MARKET_ET_TZ)
+            # 장 세션 판단은 ET 기준 (9:30~16:00 ET)
+            et_hour = now_et_for_session.hour
+            et_minute = now_et_for_session.minute
+            market_session = (
+                "장 전" if (et_hour < 9 or (et_hour == 9 and et_minute < 30))
+                else ("장 중" if et_hour < 16 else "장 후")
+            )
 
             # 선물·리스크오프 신호 별도 강조
             _futures_sig = fresh_sig.get("futures", {})
@@ -10963,8 +10970,8 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     _spy_close = np.nan
 
-                # DRG_Predictions 시트에 저장
-                _pred_date_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+                # DRG_Predictions 시트에 저장 (ET 기준 — 자동화 스크립트와 동일)
+                _pred_date_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
                 _puid_drg = str(st.session_state.get("user_id") or "").strip()
                 save_drg_prediction(
                     _puid_drg, _pred_date_str, _pred_dir,
@@ -12348,7 +12355,7 @@ if st.session_state.get("logged_in"):
                 # 스캐너 결과 자동 저장
                 _sc_uid = str(st.session_state.get("user_id") or "").strip()
                 _sc_last = st.session_state.get("_scanner_saved_date")
-                _sc_today = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+                _sc_today = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
                 if _sc_last != _sc_today:
                     _ok_sc, _ = save_scanner_result_history(_sc_uid, snap["score_df"], engine="leaders")
                     if _ok_sc:
@@ -12503,7 +12510,7 @@ if st.session_state.get("logged_in"):
                 # Emerging 자동 저장 (스캔 직후 session에 있을 때)
                 _em_sc_uid = str(st.session_state.get("user_id") or "").strip()
                 _em_sc_last = st.session_state.get("_em_scanner_saved_date")
-                _em_sc_today = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+                _em_sc_today = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
                 if _em_sc_last != _em_sc_today:
                     _ok_em_sc, _ = save_scanner_result_history(_em_sc_uid, snap_em["score_df"], engine="emerging")
                     if _ok_em_sc:
@@ -13103,7 +13110,7 @@ if st.session_state.get("logged_in"):
                 ne = co.get("next_earnings")
                 if ne:
                     try:
-                        days_to_earn = (datetime.strptime(ne[:10], "%Y-%m-%d") - datetime.now()).days
+                        days_to_earn = (datetime.strptime(ne[:10], "%Y-%m-%d") - datetime.now(_MARKET_ET_TZ).replace(tzinfo=None)).days
                         earn_label = f"D-{days_to_earn}일" if days_to_earn >= 0 else f"{abs(days_to_earn)}일 전"
                         st.metric("다음 실적 발표", ne[:10], delta=earn_label)
                         st.caption("※ FMP 제공 예정일. 미확인 상태일 수 있습니다.")
@@ -14679,7 +14686,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 # 포트폴리오 스냅샷 자동 저장 (일 1회)
                 _ph_uid = str(st.session_state.get("user_id") or "").strip()
                 _ph_last = st.session_state.get("_portfolio_snapshot_saved_date")
-                _today_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
+                _today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
                 if _ph_last != _today_str and not sell_radar_df.empty:
                     _ok_snap, _ = save_portfolio_snapshot(_ph_uid, sell_radar_df)
                     if _ok_snap:
