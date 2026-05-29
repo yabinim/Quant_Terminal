@@ -1592,44 +1592,142 @@ def fetch_dxy_latest_and_mean_deviation():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
-    """보유 종목의 다음 실적 발표일 — FMP earnings-calendar (symbol만 사용)."""
+    """보유 종목의 다음 실적 발표일.
+
+    4-layer fallback 전략:
+      1) FMP earnings-calendar  (from=오늘, to=오늘+90일, symbol=X)
+      2) FMP earnings           (/stable/earnings?symbol=X)
+      3) FMP quote              (earningsAnnouncement 필드)
+      4) yfinance               (.calendar 속성)
+    """
     k = _fmp_key()
-    results = []
     today = datetime.now(timezone.utc).date()
-    for tk in tickers:
-        try:
-            if not k:
+    tomorrow_dt = today + timedelta(days=1)
+    from_str = today.strftime("%Y-%m-%d")
+    to_str   = (today + timedelta(days=90)).strftime("%Y-%m-%d")
+    results  = []
+
+    def _parse_future(items: list, date_key: str = "date") -> tuple:
+        """items 리스트에서 내일 이후 가장 이른 (days_until, date_str, item) 반환."""
+        future = []
+        for it in (items if isinstance(items, list) else []):
+            ds = str(it.get(date_key) or "")[:10]
+            if not ds or len(ds) < 10:
                 continue
-            r = requests.get(
-                f"{_FMP_BASE}/earnings-calendar?symbol={tk}&apikey={k}",
-                timeout=_FMP_TIMEOUT
-            )
-            data = r.json() if r.status_code == 200 else []
-            if isinstance(data, list) and data:
-                future_items = []
-                tomorrow_dt = today + timedelta(days=1)
-                for item in data:
-                    date_str = str(item.get("date") or "")[:10]
-                    if not date_str or len(date_str) < 10:
-                        continue
-                    try:
-                        dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-                        days_until = (dt - today).days
-                        if dt >= tomorrow_dt:  # 내일 이후만
-                            future_items.append((days_until, date_str, item))
-                    except Exception:
-                        continue
-                if future_items:
-                    future_items.sort(key=lambda x: x[0])
-                    days_until, date_str, item = future_items[0]
-                    results.append({
-                        "ticker": tk,
-                        "earnings_date": date_str,
-                        "days_until": days_until,
-                        "eps_estimate": to_float(item.get("epsEstimated")),
-                    })
+            try:
+                dt = datetime.strptime(ds, "%Y-%m-%d").date()
+                if dt >= tomorrow_dt:
+                    future.append(((dt - today).days, ds, it))
+            except Exception:
+                continue
+        return sorted(future)[0] if future else None
+
+    def _parse_ann_field(ann_str: str) -> tuple | None:
+        """단순 날짜 문자열(earningsAnnouncement)을 (days, date_str, {}) 형태로 변환."""
+        ds = str(ann_str or "")[:10]
+        if not ds or len(ds) < 10:
+            return None
+        try:
+            dt = datetime.strptime(ds, "%Y-%m-%d").date()
+            if dt >= tomorrow_dt:
+                return (dt - today).days, ds, {}
+        except Exception:
+            pass
+        return None
+
+    for tk in tickers:
+        best: tuple | None = None
+        eps_estimate = None
+        try:
+            # ── Layer 1: earnings-calendar with date range ────────────────
+            if k and best is None:
+                try:
+                    r = requests.get(
+                        f"{_FMP_BASE}/earnings-calendar"
+                        f"?symbol={tk}&from={from_str}&to={to_str}&apikey={k}",
+                        timeout=_FMP_TIMEOUT,
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        found = _parse_future(data if isinstance(data, list) else [])
+                        if found:
+                            best = found
+                            eps_estimate = to_float(found[2].get("epsEstimated"))
+                except Exception:
+                    pass
+
+            # ── Layer 2: /stable/earnings (includes upcoming) ─────────────
+            if k and best is None:
+                try:
+                    r2 = requests.get(
+                        f"{_FMP_BASE}/earnings?symbol={tk}&apikey={k}",
+                        timeout=_FMP_TIMEOUT,
+                    )
+                    if r2.status_code == 200:
+                        data2 = r2.json()
+                        found2 = _parse_future(data2 if isinstance(data2, list) else [])
+                        if found2:
+                            best = found2
+                            eps_estimate = to_float(found2[2].get("epsEstimated"))
+                except Exception:
+                    pass
+
+            # ── Layer 3: quote earningsAnnouncement field ─────────────────
+            if k and best is None:
+                try:
+                    rq = requests.get(
+                        f"{_FMP_BASE}/quote?symbol={tk}&apikey={k}",
+                        timeout=_FMP_TIMEOUT,
+                    )
+                    if rq.status_code == 200:
+                        qd = rq.json()
+                        q_item = qd[0] if isinstance(qd, list) and qd else {}
+                        ann = str(q_item.get("earningsAnnouncement") or "")[:10]
+                        parsed = _parse_ann_field(ann)
+                        if parsed:
+                            best = parsed
+                except Exception:
+                    pass
+
+            # ── Layer 4: yfinance .calendar fallback ──────────────────────
+            if best is None:
+                try:
+                    import yfinance as yf
+                    yf_ticker = yf.Ticker(tk)
+                    cal = yf_ticker.calendar
+                    # cal 은 dict 또는 DataFrame 형태
+                    if isinstance(cal, dict):
+                        earn_date = cal.get("Earnings Date")
+                        if earn_date:
+                            # 리스트일 수 있음
+                            if isinstance(earn_date, list):
+                                earn_date = earn_date[0]
+                            ds = str(earn_date)[:10]
+                            parsed = _parse_ann_field(ds)
+                            if parsed:
+                                best = parsed
+                    elif hasattr(cal, "empty") and not cal.empty:
+                        # DataFrame 형태: index에 날짜가 있을 수 있음
+                        if "Earnings Date" in cal.index:
+                            earn_date = cal.loc["Earnings Date"].iloc[0]
+                            ds = str(earn_date)[:10]
+                            parsed = _parse_ann_field(ds)
+                            if parsed:
+                                best = parsed
+                except Exception:
+                    pass
+
+            if best:
+                days_until, date_str, _ = best
+                results.append({
+                    "ticker":        tk,
+                    "earnings_date": date_str,
+                    "days_until":    days_until,
+                    "eps_estimate":  eps_estimate,
+                })
         except Exception:
             continue
+
     results.sort(key=lambda x: x["days_until"])
     return results
 
@@ -16603,6 +16701,527 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.rerun()
                 else:
                     st.error(f"삭제 실패: {err_del}")
+
+    elif main_nav == _MAIN_NAV_OPTIONS[12]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 📖 사용 가이드
+        # ─────────────────────────────────────────────────────────────────────
+        st.title("📖 사용 가이드")
+        st.caption("Quant Investment Terminal — 전체 기능 및 워크플로우 안내")
+
+        _uid_guide = str(st.session_state.get("user_id") or "").strip()
+        _role_guide = st.session_state.get("user_role", "guest")
+
+        # ── 빠른 링크 버튼 ────────────────────────────────────────────────────
+        st.markdown("### 🔗 빠른 이동")
+        _qc1, _qc2, _qc3, _qc4 = st.columns(4)
+        with _qc1:
+            if st.button("🚨 Daily Risk Gauge", key="guide_goto_risk", use_container_width=True):
+                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[0]
+                st.rerun()
+        with _qc2:
+            if st.button("🌐 거시경제 지표", key="guide_goto_macro", use_container_width=True):
+                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[1]
+                st.rerun()
+        with _qc3:
+            if st.button("🔬 개별 종목 검사", key="guide_goto_micro", use_container_width=True):
+                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                st.rerun()
+        with _qc4:
+            if st.button("🛡️ 포트폴리오", key="guide_goto_port", use_container_width=True):
+                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[6]
+                st.rerun()
+
+        st.divider()
+
+        # ── 전체 워크플로우 개요 ──────────────────────────────────────────────
+        st.markdown("## 🗺️ 투자 의사결정 워크플로우 (Top-Down)")
+        st.info(
+            "**권장 순서:** 🚨 Daily Risk → 🌐 거시경제 → 📰 내러티브 → 🎯 섹터 → "
+            "🚀 종목 스캐너 → 🔬 정밀 검사 → 🛡️ 포트폴리오 관리\n\n"
+            "매일 아침 ① Daily Risk Gauge 먼저 확인 → 위험이 낮으면 ② 내러티브 분석 실행 "
+            "→ AI가 추천한 섹터·종목을 ③ 스캐너로 검증 → ④ 정밀 검사 후 투자 결정"
+        )
+
+        # ── 섹션별 탭 구성 ────────────────────────────────────────────────────
+        _g_tab0, _g_tab1, _g_tab2, _g_tab3, _g_tab4, _g_tab5 = st.tabs([
+            "🚀 시작하기",
+            "📊 분석 도구",
+            "💼 포트폴리오",
+            "🤖 AI 인사이트",
+            "⚙️ 설정 & DB",
+            "❓ FAQ",
+        ])
+
+        # ════════════════════════════════════════════════════════════════════
+        with _g_tab0:
+            st.markdown("### 🚀 처음 시작하는 분들을 위한 3단계 셋업")
+
+            with st.expander("**STEP 1 — Google Sheets DB 연결 확인**", expanded=True):
+                st.markdown("""
+앱은 **Google Sheets(`Quant_DB`)** 를 데이터베이스로 사용합니다.  
+Streamlit Cloud `Secrets`에 아래 키가 설정되어 있어야 합니다.
+
+| 시크릿 키 | 용도 |
+|---|---|
+| `GOOGLE_CREDENTIALS` | GCP 서비스 계정 JSON (gspread 인증) |
+| `SPREADSHEET_ID` | Quant_DB 스프레드시트 ID |
+| `FMP_API_KEY` | Financial Modeling Prep API 키 |
+| `ANTHROPIC_API_KEY` | Claude AI (AI 분석용) |
+| `FRED_API_KEY` | FRED 거시경제 지표 |
+
+> ⚠️ `FMP_API_KEY` 없이는 실적 캘린더·거시지표 일부가 작동하지 않습니다.
+""")
+
+            with st.expander("**STEP 2 — 포트폴리오 종목 등록**", expanded=True):
+                st.markdown("""
+**[4단계] 포트폴리오 매도 레이더** 탭에서:
+1. `계좌명(Account)` 입력 (예: Robinhood, Fidelity, ISA)
+2. `티커(Ticker)` 입력 (예: AAPL, TSLA, 005930.KS)
+3. `매수가`, `수량` 입력 후 **"종목 추가"** 클릭
+4. Google Sheets `Portfolio` 탭에 자동 저장 — 모든 기기에서 실시간 동기화
+
+> 💡 국내 주식도 `.KS` 접미사로 지원합니다 (예: `005930.KS` = 삼성전자)
+""")
+
+            with st.expander("**STEP 3 — 첫 AI 내러티브 분석 실행**", expanded=True):
+                st.markdown("""
+**[1단계] 시장 내러티브** 탭에서:
+1. 분석 타입 선택: `오늘의 최신 내러티브` 또는 `주간 메가 트렌드`
+2. **"🤖 AI 내러티브 분석 실행"** 버튼 클릭
+3. AI가 Winners(주도주)·Emerging(급부상 종목)·Sector Rotation을 자동 분석
+4. 결과가 `Narratives` 시트에 자동 저장 → 이후 모든 AI 탭에서 활용
+
+> ⏱️ 최초 분석 소요 시간: 약 30~60초
+""")
+
+            st.divider()
+            st.markdown("### 📅 일일 루틴 추천")
+            st.markdown("""
+| 시간 | 탭 | 행동 |
+|---|---|---|
+| 장 열기 전 (오전 9시 이전) | 🚨 Daily Risk Gauge | 선행 신호 6개 + 시장 위험도 확인 |
+| 장 중 | 📰 [1단계] 시장 내러티브 | AI 내러티브 분석 → Winners/Emerging 파악 |
+| 장 중 | 🎯 [2단계] 섹터 & 자금 흐름 | 자금이 몰리는 섹터 확인 |
+| 관심 종목 발생 시 | 🔬 [3단계] 정밀 검사 | 개별 종목 펀더멘털 + 기술적 분석 |
+| 주 1회 | 📋 [AI] 주간 포트폴리오 요약 | 전체 포트폴리오 AI 리뷰 |
+""")
+
+        # ════════════════════════════════════════════════════════════════════
+        with _g_tab1:
+            st.markdown("### 📊 분석 도구 탭 상세 가이드")
+
+            with st.expander("🚨 **Daily Risk Gauge** — 매일 첫 확인", expanded=False):
+                st.markdown("""
+**목적:** 당일 시장 진입 가능 여부를 빠르게 판단
+
+**선행 신호 6가지:**
+- 🌙 **VIX 공포지수** — 20 이하: 안전 / 30 이상: 위험
+- 📈 **선물 프리마켓** (S&P500·나스닥) — 장 열기 전 방향성 확인
+- 💵 **달러 인덱스(DXY)** — 강달러 = 신흥국·원자재 압박
+- 📉 **국채 수익률** — 10Y·2Y 스프레드로 경기침체 선행 신호 포착
+- 🌐 **글로벌 시장** — 전일 아시아·유럽 마감 분위기
+- 📅 **경제 이벤트 캘린더** — FOMC·CPI 등 고임팩트 발표 감지
+
+**오늘 투자해도 될까?** 버튼으로 AI가 6가지 신호를 종합해 매매 가능 여부 판단
+
+> ⚡ 데이터는 1시간 캐시. 강제 새로고침은 화면 상단 **🔄 데이터 새로고침** 버튼
+""")
+
+            with st.expander("🌐 **[1단계] 거시경제 지표**", expanded=False):
+                st.markdown("""
+**미국 거시경제 8대 지표 자동 수집·판독**
+
+| 지표 | 데이터 소스 | 판독 기준 |
+|---|---|---|
+| 기준금리 (Fed Funds) | FRED / FMP | 5% 이상 = 고금리 레짐 |
+| 국채 수익률 (10Y, 2Y) | FRED / FMP | 역전 = 침체 선행 신호 |
+| CPI 인플레이션 | FRED / FMP | 3% 이상 = 위험 |
+| 실업률 | FRED / FMP | 4.5% 이상 = 경기 둔화 |
+| GDP 성장률 | FMP | 2% 이하 = 경기 둔화 |
+| 소매판매 | FMP | 전월 대비 감소 = 소비 위축 |
+| VIX 공포지수 | FRED / yfinance | 25 이상 = 위험 선호 저하 |
+| 달러 인덱스 | FRED / FMP(UUP) | 52주 평균 대비 +5.5% 이상 = 달러 과강세 |
+
+**📊 Macro Score:** 8개 지표 합산 점수 (Pass/Warning/Fail)  
+**📈 2년 히스토리 차트:** 지표 추이를 시각화해 트렌드 파악
+""")
+
+            with st.expander("📰 **[1단계] 시장 내러티브**", expanded=False):
+                st.markdown("""
+**AI가 뉴스·시장 데이터를 분석해 투자 테마를 추출**
+
+**분석 타입:**
+- `오늘의 최신 내러티브` — 당일 뉴스 기반 단기 모멘텀 분석
+- `주간 메가 트렌드` — 최근 7일 흐름 기반 스윙/중기 투자용
+
+**분석 결과 구성:**
+1. **Market Regime** — 현재 시장 국면 (Risk-On / Risk-Off / Neutral)
+2. **테마별 내러티브** — AI가 추출한 핵심 투자 테마 (2~5개)
+3. **Winners** — 각 테마에서 주목할 선도 종목
+4. **Emerging** — 급부상 중인 초기 단계 종목
+5. **Sector Rotation Map** — 자금이 이동하는 섹터 시각화
+6. **내러티브 일관성 점수** — 이전 분석과의 연속성 평가
+
+**Emerging 종목 정량 교차 검증:** Winners/Emerging 종목을 RSI·RS·거래량으로 자동 검증  
+**시계열 분석 엔진:** 특정 내러티브가 얼마나 지속됐는지 추적  
+
+> 💾 분석 결과는 `Narratives` 시트에 자동 저장 (최근 40개 보관)
+""")
+
+            with st.expander("🎯 **[2단계] 섹터 & 자금 흐름**", expanded=False):
+                st.markdown("""
+**11개 GICS 섹터 ETF 상대 강도 분석**
+
+- **섹터 ETF 강도 순위** — XLK·XLV·XLE 등 섹터별 1개월 수익률 비교
+- **섹터별 P/E Snapshot** — 고평가/저평가 섹터 한눈에 파악
+- **Alpha Leaders** — 선택 섹터 내 실제 주도주 발굴
+- **Laggards** — 낙폭과대 반등 후보
+
+**추가 레이더:**
+- 🚀 **Hidden Alpha Radar** — 새로운 주도 테마 발굴 (섹터 이탈 강세주)
+- 🌱 **Early Signal Radar** — 막 강해지기 시작한 섹터 선제 감지
+- 🛡️ **섹터 꺾임 감지** — 고점 이탈 섹터 → 매도 타이밍 포착
+""")
+
+            with st.expander("🚀 **[2단계] AI 종목 스캐너**", expanded=False):
+                st.markdown("""
+**내러티브 DB의 Winners·Emerging 종목을 자동 스캔**
+
+**데이터 소스 선택:**
+- `오늘의 최신 내러티브` — 당일 분석 결과의 Winners/Emerging
+- `주간 메가 트렌드` — 7일 누적 상위 종목
+- `수동 섹터/티커 입력` — 직접 종목 지정
+
+**듀얼 엔진 스캔 결과:**
+- **Current Leaders** — RSI·모멘텀·거래량 기반 현재 주도주
+- **Emerging Opportunities** — 초기 부상 중인 기회 종목
+
+**🔬 종목/테마 X-Ray:** 특정 종목·섹터에 대한 심층 AI 분석  
+**📊 내러티브 팩트 체크:** 과거 AI 추천 종목의 실제 수익률 검증
+""")
+
+            with st.expander("🔬 **[3단계] 개별 종목 정밀 검사**", expanded=False):
+                st.markdown("""
+**사이드바에서 티커 입력 후 분석 실행**
+
+**펀더멘털 분석:**
+- 시가총액·P/E·P/B·PEG·ROE·부채비율 등 핵심 KPI
+- **투자 스타일 적합도** — 성장주/가치주/배당주/모멘텀 중 어디에 해당하는지
+- **DCF 내재가치 계산** — 현재가 대비 안전마진 산출
+- **어닝 서프라이즈 히스토리** — 최근 8분기 EPS 실제 vs 예상
+
+**기술적 분석:**
+- RSI(14), MACD, 볼린저밴드, 52주 고점/저점 대비
+- 200일선·50일선 위치 확인
+- 거래량 이상 감지
+
+**추가 데이터:**
+- 📞 어닝콜 트랜스크립트 AI 요약 (FMP)
+- 🏦 기관 투자자 보유 현황 변화
+- 🕵️ 인사이더 트레이딩 내역
+- 🎯 애널리스트 목표주가 컨센서스
+- 🏛️ 상원/하원 의원 거래 내역
+
+**🤖 AI 종합 진단:** 펀더멘털+기술적 신호를 종합한 매수/관망/매도 의견
+""")
+
+        # ════════════════════════════════════════════════════════════════════
+        with _g_tab2:
+            st.markdown("### 💼 포트폴리오 관리 탭 상세 가이드")
+
+            with st.expander("🛡️ **[4단계] 포트폴리오 매도 레이더**", expanded=True):
+                st.markdown("""
+**포트폴리오 전체 현황 + 매도 신호 자동 감지**
+
+#### 📋 포트폴리오 관리
+- **계좌별 등록** — Robinhood·Fidelity 등 여러 계좌를 분리 관리
+- **종목 추가/삭제** — 티커·매수가·수량 입력
+- **실시간 손익** — 현재가 자동 조회 → 투자 손익($) 및 수익률(%) 계산
+- **매도 기록** — 매도한 종목의 실현 손익 추적
+
+#### 📊 포트폴리오 분석 (고급)
+- **Correlation Matrix** — 보유 종목 간 상관관계 (분산투자 체크)
+- **수익률 히스토리** — 매수가 기준 누적 수익 추이
+- **Personal Benchmark 비교** — 내 포트폴리오 vs SPY·QQQ 성과 비교 (100 normalized)
+
+#### 📅 보유 종목 실적 발표 캘린더
+보유 종목의 다음 실적 발표일 자동 조회:
+- **빨간 🔴**: D-30일 이내 임박 → 변동성 대비 필요
+- **노란 🟡**: 예정 (30일 이후)
+- **초록 ✅**: 발표 완료
+- EPS 예상치 표시 (FMP 제공 시)
+
+#### 🎯 매도 타이밍 레이더
+RSI·MACD·52주 고점·200일선 4가지 기술적 신호로 **위험점수** 산출:
+
+| 신호 등급 | 기준 | 의미 |
+|---|---|---|
+| 🔴 매도 검토 | 위험점수 3점+ | RSI 과매수 + 복수 기술적 경고 |
+| 🟡 주의 | 위험점수 1~2점 | 일부 신호 경고 |
+| 🟢 유지 | 위험점수 0점 | 이상 신호 없음 |
+
+**🤖 AI 매도 우선순위:** 기술적 신호 + 펀더멘털을 AI가 종합해 매도 우선순위 제시
+""")
+
+            with st.expander("🔔 **Buy Watchlist & Alert**", expanded=False):
+                st.markdown("""
+**관심 종목 등록 + 매수 조건 자동 체크**
+
+#### 등록 방법
+1. 사이드바 티커 입력창에 종목 입력
+2. 투자 메모 작성 (선택)
+3. Alert 조건 설정:
+   - **목표 RSI** — RSI가 지정값 이하로 하락 시 알림 (예: 30 이하 → 과매도 매수 기회)
+   - **200일선 하향 돌파** — 200일선 아래로 내려갈 때 알림
+4. **"현재 티커 저장"** 클릭
+
+#### Watchlist 탭에서
+- **Alert 조건 충족 시** — 🔴 자동 하이라이트
+- 각 종목 클릭 → 바로 [3단계] 정밀 검사로 이동
+- 목표가·메모 직접 편집 가능
+
+> 💡 정기적으로 Watchlist를 관리해 관심 종목이 매수 조건에 들어올 때 빠르게 대응하세요.
+""")
+
+        # ════════════════════════════════════════════════════════════════════
+        with _g_tab3:
+            st.markdown("### 🤖 AI 인사이트 탭 상세 가이드")
+
+            with st.expander("📊 **[AI] 내러티브 적중률 트래커**", expanded=False):
+                st.markdown("""
+**AI 내러티브 분석의 실제 성과를 검증하는 팩트체크 시스템**
+
+#### 작동 방식
+1. 과거 내러티브 분석 시 기록된 Winners·Emerging 종목 불러오기
+2. 분석 시점으로부터 현재까지 실제 수익률 계산
+3. 종목별·테마별·월별 적중률 통계 제공
+
+#### 주요 지표
+- **평균 수익률** — AI가 추천한 종목들의 평균 성과
+- **적중률(%)** — 플러스 수익률을 기록한 비율
+- **Best 5 / Worst 5** — 가장 성공한/실패한 AI 추천 종목
+
+> 이 탭을 통해 어떤 내러티브 타입이 더 신뢰할 만한지, 어떤 섹터에서 AI가 강한지 파악할 수 있습니다.
+""")
+
+            with st.expander("💡 **[AI] Idea-to-Portfolio 추적**", expanded=False):
+                st.markdown("""
+**내러티브 분석에서 발굴한 아이디어가 실제 포트폴리오에 편입됐는지 추적**
+
+AI가 추천한 Winners·Emerging 종목 중:
+- 포트폴리오에 **이미 보유 중**인 종목 → ✅ 표시
+- 아직 **미편입** 종목 → 빠른 검사 버튼으로 바로 분석
+- **실현 손익**과 AI 추천 이후 수익률 비교
+
+> 💡 AI의 인사이트를 실제 투자로 연결하는 파이프라인을 관리합니다.
+""")
+
+            with st.expander("📋 **[AI] 주간 포트폴리오 요약**", expanded=False):
+                st.markdown("""
+**주 1회 실행 — 포트폴리오 전체에 대한 AI 주간 리뷰 리포트 자동 생성**
+
+#### 리포트 포함 내용
+- 현재 포트폴리오 전체 손익 현황
+- 최근 AI 내러티브와 보유 종목의 연관성 분석
+- 현재 거시경제 환경에서의 포트폴리오 리스크 평가
+- 주간 투자 전략 제언 (매도 검토 / 추가 매수 관심 / 유지)
+
+#### 사용 방법
+1. **[4단계] 포트폴리오 매도 레이더**를 먼저 열어 수익률 데이터 동기화
+2. **"🤖 주간 AI 리포트 생성"** 버튼 클릭
+3. 리포트가 `Narratives` 시트에 자동 저장 (이전 기록도 보관)
+
+> ⏱️ 생성 소요 시간: 약 20~30초
+""")
+
+            with st.expander("📡 **[AI] Emerging 종목 추적기**", expanded=False):
+                st.markdown("""
+**Emerging 종목이 반복 등장할수록 신뢰도 높은 매수 신호**
+
+#### 작동 방식
+- [1단계] 시장 내러티브 분석 후 **"Emerging 종목 검증 실행"** 클릭 시 자동 기록
+- 같은 종목이 여러 분석에서 반복 등장할 때 추적
+
+#### 신호 등급
+| 등장 횟수 | 의미 | 색상 |
+|---|---|---|
+| 1회 | 관심 후보 | 초록 |
+| 2~4회 | 반복 등장 — 관심 집중 | 주황 |
+| 5회+ | 강한 모멘텀 신호 | 빨강 |
+
+#### Best Verdict 분류
+- **최적 매수 타이밍** — RSI·RS 지표가 매수 구간에 있는 종목
+- **얼리버드 기회** — 아직 초기 단계지만 선취매 가능한 종목
+
+> 💡 [3단계] 개별 종목 정밀 검사 버튼으로 바로 심층 분석 진행 가능
+""")
+
+        # ════════════════════════════════════════════════════════════════════
+        with _g_tab4:
+            st.markdown("### ⚙️ 설정 & 데이터베이스 구조")
+
+            with st.expander("🗄️ **Google Sheets DB 구조 (`Quant_DB`)**", expanded=True):
+                st.markdown("""
+| 시트(탭) 이름 | 저장 데이터 | 관련 기능 |
+|---|---|---|
+| `Users` | user_id, 비밀번호(해시), role, status | 로그인·승인 관리 |
+| `Narratives` | AI 분석 결과 전체 (date, category, title, content, winners, emerging 등) | 내러티브 기록·AI 인사이트 |
+| `Portfolio` | user_id, Account, Ticker, 매수가, 수량, 메모 | 포트폴리오 관리 |
+| `Watchlist` | user_id, ticker, 목표가, RSI 알림, 메모 | Watchlist & Alert |
+| `SellHistory` | user_id, ticker, 매도가, 매도일, 실현손익 | 매도 기록·실현손익 |
+| `Portfolio_Snapshot` | 날짜별 포트폴리오 가치 스냅샷 | 수익률 히스토리 차트 |
+| `ETF_Universe` | ETF 티커·이름·섹터 | AI 종목 스캐너 |
+| `Emerging_Tracker` | user_id, ticker, 등장횟수, 검증결과 | Emerging 추적기 |
+
+> 🔒 모든 데이터는 `user_id`로 철저히 분리 — 다른 유저의 데이터는 조회 불가
+""")
+
+            with st.expander("🔑 **API 키 관리**", expanded=False):
+                st.markdown("""
+**Streamlit Community Cloud → App Settings → Secrets 에서 설정**
+
+```toml
+# .streamlit/secrets.toml 예시
+FMP_API_KEY        = "your_fmp_key"
+ANTHROPIC_API_KEY  = "your_anthropic_key"
+FRED_API_KEY       = "your_fred_key"
+SPREADSHEET_ID     = "your_sheet_id"
+
+[GOOGLE_CREDENTIALS]
+type                        = "service_account"
+project_id                  = "..."
+private_key_id              = "..."
+private_key                 = "-----BEGIN RSA PRIVATE KEY-----\\n..."
+client_email                = "...@....iam.gserviceaccount.com"
+```
+
+**FMP 플랜별 기능:**
+| 기능 | Free | Starter+ |
+|---|---|---|
+| 실적 캘린더 | ✅ | ✅ |
+| 기관 투자자 데이터 | ❌ | ✅ |
+| 인사이더 트레이딩 | ❌ | ✅ |
+| 어닝콜 트랜스크립트 | ❌ | ✅ |
+| 실시간 데이터 | ❌ | ✅ |
+""")
+
+            with st.expander("⚡ **캐시 & 성능**", expanded=False):
+                st.markdown("""
+**Streamlit `@st.cache_data` 캐시 정책:**
+
+| 데이터 종류 | 캐시 TTL | 강제 갱신 방법 |
+|---|---|---|
+| 거시경제 지표 | 1시간 | 🔄 데이터 새로고침 버튼 |
+| 종목 가격 데이터 | 1시간 | 🔄 데이터 새로고침 버튼 |
+| FMP 프로필 | 1시간 | 앱 재시작 |
+| Narratives DB | 즉시 (cache 없음) | 자동 |
+| Portfolio DB | 즉시 (cache 없음) | 자동 |
+
+**느릴 때 체크리스트:**
+1. yfinance 과부하 — 종목 수를 줄이거나 잠시 후 재시도
+2. FMP API 응답 지연 — Free 플랜은 Rate Limit 존재
+3. Google Sheets 연결 오류 — 서비스 계정 권한 확인
+""")
+
+            if _role_guide == "admin":
+                st.divider()
+                st.markdown("### 🔑 관리자 전용")
+                with st.expander("👥 **사용자 승인 관리**", expanded=False):
+                    st.markdown("""
+사이드바 최하단 **"👤 사용자 승인 관리"** 탭에서:
+- 신규 가입 요청 확인 (`pending` 상태)
+- `Status` 변경: `approved` ← 승인 / `rejected` ← 거절
+- **"변경사항 DB에 저장"** 클릭으로 즉시 적용
+
+> 승인된 사용자만 앱의 전체 기능에 접근할 수 있습니다.
+""")
+
+        # ════════════════════════════════════════════════════════════════════
+        with _g_tab5:
+            st.markdown("### ❓ 자주 묻는 질문 (FAQ)")
+
+            _faqs = [
+                (
+                    "Q. 실적 발표 캘린더에 데이터가 안 나와요",
+                    """**원인:** FMP API 키가 없거나 해당 종목의 다음 실적 발표일이 아직 확정되지 않은 경우입니다.
+
+**해결:**
+1. `FMP_API_KEY`가 Secrets에 설정되어 있는지 확인
+2. 실적 발표일이 확정된 종목만 표시됩니다 (보통 발표 3~4주 전부터 데이터 생성)
+3. 🔄 새로고침 후 재시도""",
+                ),
+                (
+                    "Q. AI 분석이 '생성 실패'로 뜹니다",
+                    """**원인:** Anthropic API 키 오류 또는 일시적 서버 부하
+
+**해결:**
+1. `ANTHROPIC_API_KEY`가 유효한지 확인
+2. 잠시 후(30초~1분) 재시도
+3. 분석 소요 시간은 최대 60초 — 네트워크 상태 확인""",
+                ),
+                (
+                    "Q. 포트폴리오에 추가했는데 다음에 들어오면 사라져요",
+                    """**원인:** Google Sheets 연결 오류로 저장 실패
+
+**해결:**
+1. 종목 추가 시 "✅ 저장 완료" 메시지가 나오는지 확인
+2. `SPREADSHEET_ID`와 서비스 계정 권한 확인
+3. Google Sheet에서 `Portfolio` 탭을 직접 열어 데이터 존재 여부 확인""",
+                ),
+                (
+                    "Q. Daily Risk Gauge의 선물 가격이 안 나와요",
+                    """**원인:** yfinance Rate Limit 또는 장외 시간(데이터 없음)
+
+**해결:**
+1. 🔄 데이터 새로고침 버튼 클릭
+2. 미국 프리마켓 시간(오후 4시~오전 4시 ET) 이외에는 선물 데이터가 제한될 수 있습니다
+3. FMP_API_KEY 설정 시 FMP 선물 데이터로 자동 대체""",
+                ),
+                (
+                    "Q. 한국 주식도 분석 가능한가요?",
+                    """**가능합니다.** 티커 형식: `종목코드.KS`
+
+예시:
+- 삼성전자: `005930.KS`
+- SK하이닉스: `000660.KS`
+- NAVER: `035420.KS`
+
+단, FMP 기반 데이터(기관 투자자·인사이더·어닝콜)는 한국 주식을 지원하지 않습니다.  
+yfinance 기반 기술적 분석·차트는 정상 작동합니다.""",
+                ),
+                (
+                    "Q. ETF 분석도 되나요?",
+                    """**됩니다.** ETF 티커를 [3단계] 정밀 검사에서 직접 입력하면:
+- 섹터 배분·보유 종목 Top 10 자동 표시 (FMP `etf-holder` API)
+- 기술적 분석 (RSI·MACD·차트) 정상 작동
+- 펀더멘털(P/E 등)은 ETF 특성상 N/A로 표시될 수 있음
+
+[2단계] AI 종목 스캐너에서도 ETF 유니버스를 기반으로 스캔합니다.""",
+                ),
+                (
+                    "Q. 데이터는 얼마나 자주 업데이트되나요?",
+                    """**실시간 데이터가 아닙니다.** 캐시 기반 운영:
+- 주가 데이터: 1시간마다 갱신 (🔄 버튼으로 강제 갱신 가능)
+- AI 내러티브: 버튼 클릭 시마다 새로 생성
+- Google Sheets (포트폴리오·Watchlist): 즉시 동기화
+
+Streamlit Community Cloud 환경의 특성상 동시 접속자가 많으면 응답이 느려질 수 있습니다.""",
+                ),
+            ]
+
+            for _q, _a in _faqs:
+                with st.expander(_q, expanded=False):
+                    st.markdown(_a)
+
+            st.divider()
+            st.markdown("### 📬 피드백 & 버그 리포트")
+            st.info(
+                "기능 요청이나 버그는 포트폴리오 탭 하단 메모 기능 또는 "
+                "관리자에게 직접 문의해 주세요.\n\n"
+                "**앱 버전:** v2.0 (2025) | "
+                "**Tech Stack:** Streamlit · Google Sheets · yfinance · FMP · Claude AI"
+            )
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
