@@ -2981,82 +2981,121 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["leaders"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
+    # ── 신호 4: 선물 프리마켓 방향 (ES=F S&P500 / NQ=F 나스닥) ─────────────
+    # FMP quote API로 선물 현재가 + 전일 종가 비교 → 프리마켓 방향 판정
+    # 장 시작 전(Pre-Market) 가장 직접적인 당일 방향 선행 신호
     try:
-        raw_full = _fmp_price_history(sector_etf, limit=30)
-        if raw_full is not None and not raw_full.empty and len(raw_full) >= 10:
-            etf_close = pd.to_numeric(raw_full["Close"], errors="coerce").dropna()
-            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
+        k4 = _fmp_key()
+        _futures_symbols = ["ES=F", "NQ=F"]   # S&P500 선물, 나스닥100 선물
+        _fut_results = {}
+        if k4:
+            for sym in _futures_symbols:
+                try:
+                    r4 = requests.get(
+                        f"{_FMP_BASE}/quote/{sym}?apikey={k4}",
+                        timeout=_FMP_TIMEOUT,
+                    )
+                    if r4.status_code == 200:
+                        d4 = r4.json()
+                        item = d4[0] if isinstance(d4, list) and d4 else d4
+                        price  = to_float(item.get("price") or item.get("lastPrice"))
+                        prev   = to_float(item.get("previousClose") or item.get("prevClose"))
+                        chg_pct = ((price / prev - 1) * 100) if (pd.notna(price) and pd.notna(prev) and prev > 0) else np.nan
+                        _fut_results[sym] = {"price": price, "prev": prev, "chg_pct": chg_pct}
+                except Exception:
+                    pass
 
-            if len(etf_close) >= 6 and len(vol) >= 10:
-                price_5d  = float((etf_close.iloc[-1] / etf_close.iloc[-6] - 1) * 100)
-                vol_5d    = float(vol.tail(5).mean())
-                vol_20d   = float(vol.tail(20).mean())
-                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1.0
-                dist_selling = price_5d > 0 and vol_ratio < 0.8
-                vol_alert    = dist_selling or vol_ratio < 0.7
-                signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
-                details["거래량"] = {
-                    "5일 평균 비율": f"{vol_ratio:.2f}x",
-                    "가격 5일": f"{price_5d:+.1f}%",
-                    "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상"),
+        if _fut_results:
+            _fut_chgs = [v["chg_pct"] for v in _fut_results.values() if pd.notna(v["chg_pct"])]
+            _avg_chg = float(np.mean(_fut_chgs)) if _fut_chgs else np.nan
+            if pd.notna(_avg_chg):
+                fut_alert = _avg_chg <= -0.5      # 0.5% 이상 하락이면 경고
+                if _avg_chg >= 0.3:
+                    fut_label = f"📈 +{_avg_chg:.2f}%"
+                elif _avg_chg <= -0.3:
+                    fut_label = f"📉 {_avg_chg:.2f}%"
+                else:
+                    fut_label = f"➡️ {_avg_chg:+.2f}%"
+                es_str = f"ES {_fut_results.get('ES=F',{}).get('chg_pct', np.nan):+.2f}%" if 'ES=F' in _fut_results and pd.notna(_fut_results['ES=F']['chg_pct']) else "N/A"
+                nq_str = f"NQ {_fut_results.get('NQ=F',{}).get('chg_pct', np.nan):+.2f}%" if 'NQ=F' in _fut_results and pd.notna(_fut_results['NQ=F']['chg_pct']) else "N/A"
+                signals["futures"] = {"ok": not fut_alert, "value": fut_label, "trend": f"{es_str} / {nq_str}"}
+                details["선물 프리마켓"] = {
+                    "S&P500 선물(ES)": es_str,
+                    "나스닥 선물(NQ)": nq_str,
+                    "평균 변화율": f"{_avg_chg:+.2f}%",
+                    "판정": "⚠️ 갭다운 우려" if fut_alert else "✅ 정상",
                 }
-                if vol_alert:
-                    warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
+                if fut_alert:
+                    warnings.append(f"⚠️ 선물 프리마켓 하락 ({es_str} / {nq_str}) — 갭다운 개장 가능성")
             else:
-                signals["volume"] = {"ok": True, "value": "N/A", "trend": "데이터 부족"}
+                signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
         else:
-            signals["volume"] = {"ok": True, "value": "N/A", "trend": "데이터 없음"}
+            signals["futures"] = {"ok": True, "value": "N/A (FMP키 없음)", "trend": ""}
     except Exception:
-        signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+        signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 5: VIX 레짐 (공포 구조 판정) ──────────────────────────────
-    # VXN은 가져오기 어려운 경우가 많고, VIX 단독으로도 충분한 신호.
-    # LOW(<15)·NORMAL(15~20)·ELEVATED(20~30)·HIGH(>30) 4단계 레짐으로 판정.
+    # ── 신호 5: 달러·금·국채 리스크오프 신호 ───────────────────────────
+    # UUP(달러ETF)·GLD(금ETF)·IEF(중기국채ETF) 동반 강세 = 안전자산 쏠림
+    # → 3개 중 2개 이상 5일 상승 + SPY 하락이면 리스크오프 경고
     try:
-        if len(vix_close) >= 10:
-            vix_now5 = float(vix_close.iloc[-1])
-            vix_5d_chg = vix_now5 - float(vix_close.iloc[-6]) if len(vix_close) >= 6 else 0.0
-            vix_20d = float(vix_close.tail(20).mean()) if len(vix_close) >= 20 else vix_now5
-            # 레짐 판정
-            if vix_now5 > 30:
-                regime = "HIGH"
-                regime_ok = False
-                regime_emoji = "🔴"
-            elif vix_now5 > 20:
-                regime = "ELEVATED"
-                regime_ok = False
-                regime_emoji = "🟡"
-            elif vix_now5 > 15:
-                regime = "NORMAL"
-                regime_ok = True
-                regime_emoji = "🟢"
-            else:
-                regime = "LOW"
-                regime_ok = True
-                regime_emoji = "🟢"
-            # 추가: 단기 급등(5일 +4pt 이상)이면 경고
-            surge = vix_5d_chg >= 4.0
-            ok5 = regime_ok and not surge
-            val5 = f"VIX {vix_now5:.1f} [{regime}]"
-            if surge:
-                val5 += f" +{vix_5d_chg:.1f}/5일"
-            signals["vix_vxn"] = {"ok": ok5, "value": val5, "trend": ""}
-            details["VIX 레짐"] = {
-                "현재값": f"{vix_now5:.1f}",
-                "레짐": regime,
-                "5일 변화": f"{vix_5d_chg:+.1f}pt",
-                "20일 평균": f"{vix_20d:.1f}",
-                "판정": "✅ 안정" if ok5 else f"⚠️ {regime_emoji} {regime}",
+        k5 = _fmp_key()
+        _safety_symbols = {"UUP": "달러", "GLD": "금", "IEF": "국채(7-10Y)"}
+        _safety_results = {}
+        if k5:
+            for sym5, name5 in _safety_symbols.items():
+                try:
+                    r5 = requests.get(
+                        f"{_FMP_BASE}/historical-price-eod/full?symbol={sym5}&limit=10&apikey={k5}",
+                        timeout=_FMP_TIMEOUT,
+                    )
+                    if r5.status_code == 200:
+                        d5 = r5.json()
+                        rows5 = d5.get("historical", d5) if isinstance(d5, dict) else d5
+                        if isinstance(rows5, list) and len(rows5) >= 6:
+                            df5 = pd.DataFrame(rows5)
+                            df5["date"] = pd.to_datetime(df5["date"])
+                            df5 = df5.set_index("date").sort_index()
+                            s5 = pd.to_numeric(df5["close"], errors="coerce").dropna()
+                            chg5 = float((s5.iloc[-1] / s5.iloc[-6] - 1) * 100) if len(s5) >= 6 else np.nan
+                            _safety_results[sym5] = {"name": name5, "chg_pct": chg5}
+                except Exception:
+                    pass
+
+        if _safety_results:
+            _rising = [sym for sym, v in _safety_results.items()
+                       if pd.notna(v["chg_pct"]) and v["chg_pct"] > 0.3]
+            _risk_off = len(_rising) >= 2
+            # SPY도 하락 중이면 리스크오프 확증
+            _spy_also_down = False
+            if "leaders" in signals and len(leaders) > 0:
+                try:
+                    _spy_row = close_dict.get("SPY") if "close_dict" in dir() else None
+                    if _spy_row is not None and len(_spy_row) >= 6:
+                        _spy_5d = float((_spy_row.iloc[-1] / _spy_row.iloc[-6] - 1) * 100)
+                        _spy_also_down = _spy_5d < -0.5
+                except Exception:
+                    pass
+            riskoff_alert = _risk_off and _spy_also_down
+
+            _parts = [f"{v['name']} {v['chg_pct']:+.1f}%" for v in _safety_results.values()
+                      if pd.notna(v.get("chg_pct"))]
+            val5 = " / ".join(_parts) if _parts else "N/A"
+            signals["riskoff"] = {"ok": not riskoff_alert, "value": val5, "trend": ""}
+            details["달러·금·국채"] = {
+                k: f"{v['chg_pct']:+.1f}% (5일)" if pd.notna(v.get("chg_pct")) else "N/A"
+                for k, v in _safety_results.items()
             }
-            if not regime_ok:
-                warnings.append(f"⚠️ VIX {regime} 레짐 ({vix_now5:.1f}) — 시장 공포 확대 구간")
-            elif surge:
-                warnings.append(f"⚠️ VIX 단기 급등 +{vix_5d_chg:.1f}pt/5일 — 변동성 확대 주의")
+            details["달러·금·국채"]["판정"] = "⚠️ 리스크오프 확증" if riskoff_alert else (
+                "🟡 안전자산 강세 (SPY 확인 필요)" if _risk_off else "✅ 정상"
+            )
+            if riskoff_alert:
+                warnings.append(f"⚠️ 달러·금·국채 동반 강세 + SPY 약세 — 리스크오프 본격화 신호")
+            elif _risk_off:
+                warnings.append(f"🟡 안전자산 {len(_rising)}개 동반 강세 — 리스크오프 경향 모니터링")
         else:
-            signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
+            signals["riskoff"] = {"ok": True, "value": "N/A (FMP키 없음)", "trend": ""}
     except Exception:
-        signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
+        signals["riskoff"] = {"ok": True, "value": "N/A", "trend": ""}
 
     # ── 신호 6: 이벤트 리스크 (FMP Economic Calendar) ────────────────────
     try:
@@ -10519,7 +10558,7 @@ if st.session_state.get("logged_in"):
         # 🚨 Daily Risk Gauge
         # ─────────────────────────────────────────────────────────────────────
         st.subheader("🚨 Daily Risk Gauge")
-        st.caption("매일 접속 시 시장 하락 선행 신호 6가지를 자동 스캔합니다. 전날 미리 경고를 포착하는 게 목표예요.")
+        st.caption("매일 접속 시 시장 선행 신호 6가지를 자동 스캔합니다. 선물 프리마켓·이벤트 캘린더로 당일 장 방향을 장 열기 전에 파악하세요.")
 
         drg_col1, drg_col2 = st.columns([2, 3])
         with drg_col1:
@@ -10560,18 +10599,19 @@ if st.session_state.get("logged_in"):
         sig = drg["signals"]
         s_col1, s_col2, s_col3, s_col4, s_col5, s_col6 = st.columns(6)
         signal_defs = [
-            ("vix",        "VIX 방향",      "🌡️"),
-            ("credit",     "신용 스프레드",  "💳"),
-            ("leaders",    "대장주 모멘텀",  "🏆"),
-            ("volume",     "거래량 패턴",    "📦"),
-            ("vix_vxn",    "VIX 레짐",      "⚡"),
-            ("event_risk", "이벤트 리스크",  "📅"),
+            ("vix",        "VIX 방향",        "🌡️"),
+            ("credit",     "신용 스프레드",    "💳"),
+            ("leaders",    "대장주 모멘텀",    "🏆"),
+            ("futures",    "선물 프리마켓",    "📈"),
+            ("riskoff",    "달러·금·국채",     "🛡️"),
+            ("event_risk", "이벤트 리스크",    "📅"),
         ]
         for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5, s_col6], signal_defs):
             with col:
                 s = sig.get(key, {})
                 ok = s.get("ok", True)
                 val = s.get("value", "N/A")
+                trend = s.get("trend", "")
                 status = "✅ 정상" if ok else "⚠️ 경고"
                 color = "#16a34a" if ok else "#dc2626"
                 st.markdown(
@@ -10581,7 +10621,8 @@ if st.session_state.get("logged_in"):
                     f"<div style='font-size:11px;color:#94a3b8'>{label}</div>"
                     f"<div style='font-weight:700;color:{color}'>{status}</div>"
                     f"<div style='font-size:11px;color:#cbd5e1'>{val}</div>"
-                    f"</div>",
+                    + (f"<div style='font-size:10px;color:#64748b;margin-top:2px'>{trend}</div>" if trend else "")
+                    + f"</div>",
                     unsafe_allow_html=True
                 )
 
@@ -10594,36 +10635,81 @@ if st.session_state.get("logged_in"):
         else:
             st.success("✅ 현재 감지된 선행 경고 신호 없음 — 시장 환경 정상")
 
-        # ── 이벤트 캘린더 카드 (신호 6 상세) ─────────────────────────────
+        # ── 이벤트 캘린더 — 행동 지침 포함 ──────────────────────────────
         event_cal = drg.get("event_calendar", [])
         if event_cal:
             st.divider()
             st.markdown("### 📅 3일 이내 경제 이벤트 캘린더 (FMP)")
-            ev_cols_header = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
-            for hdr, txt in zip(ev_cols_header, ["날짜", "이벤트", "임팩트", "실제", "예상", "이전"]):
-                hdr.markdown(f"**{txt}**")
-            for ev in event_cal[:12]:
-                impact = ev.get("impact", "")
-                impact_color = (
-                    "#dc2626" if impact.lower() in ("high", "3")
-                    else "#f59e0b" if impact.lower() in ("medium", "2")
-                    else "#64748b"
-                )
-                impact_emoji = (
-                    "🔴 High" if impact.lower() in ("high", "3")
-                    else "🟡 Medium" if impact.lower() in ("medium", "2")
-                    else "⚪ Low"
-                )
-                def _fmt_ev_val(v):
-                    return str(v) if v is not None and str(v).strip() not in ("", "None") else "—"
-                ev_cols = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
-                ev_cols[0].markdown(f"`{ev.get('date','')}`")
-                ev_cols[1].markdown(ev.get("event", ""))
-                ev_cols[2].markdown(f"<span style='color:{impact_color};font-weight:700'>{impact_emoji}</span>", unsafe_allow_html=True)
-                ev_cols[3].markdown(_fmt_ev_val(ev.get("actual")))
-                ev_cols[4].markdown(_fmt_ev_val(ev.get("estimate")))
-                ev_cols[5].markdown(_fmt_ev_val(ev.get("prior")))
-            st.caption("📌 FMP Economic Calendar 기준. FMP API 키 미설정 시 표시되지 않습니다.")
+
+            # 이벤트별 행동 지침 자동 생성
+            _ACTION_GUIDE = {
+                "fomc": ("🏦 FOMC", "발표 전후 변동성 2배 구간. 신규 매수 자제, 기존 포지션 절반 이하 유지 권장."),
+                "federal reserve": ("🏦 연준 발언", "예상치 못한 매파 발언 시 기술주 급락 가능. 포지션 축소 준비."),
+                "cpi": ("📊 CPI", "예상치 상회 시 금리 인상 우려 → 성장주 매도 압력. 예상치 하회 시 랠리 가능."),
+                "nonfarm": ("👷 NFP", "고용 호조 = 금리 인상 우려(기술주 악재). 고용 부진 = 경기 침체 우려."),
+                "payroll": ("👷 NFP", "고용 호조 = 금리 인상 우려(기술주 악재). 고용 부진 = 경기 침체 우려."),
+                "pce": ("💰 PCE", "연준 선호 인플레 지표. 예상 상회 시 금리 인하 지연 → 성장주 부담."),
+                "ppi": ("🏭 PPI", "생산자물가. CPI 선행지표. 상승 시 향후 CPI 상승 압력 예고."),
+                "gdp": ("📈 GDP", "예상 하회 시 경기 침체 우려. 예상 상회 시 과열 인플레 우려 공존."),
+                "retail sales": ("🛒 소매판매", "소비 강도 지표. 급감 시 경기 둔화 신호."),
+                "ism": ("🏗️ ISM PMI", "50 이하 = 경기 수축. 제조업 PMI 하회 시 산업재·소재 섹터 주의."),
+                "initial claims": ("📋 실업수당", "급증 시 고용 악화 신호. 연속 급증이면 경기 침체 선행 지표."),
+                "pmi": ("📉 PMI", "50 이하 수축 신호. 예상 하회 시 경기 우려 확대."),
+            }
+
+            def _get_action(event_name: str) -> tuple:
+                name_lower = event_name.lower()
+                for kw, guide in _ACTION_GUIDE.items():
+                    if kw in name_lower:
+                        return guide
+                return ("", "")
+
+            def _fmt_ev_val(v):
+                return str(v) if v is not None and str(v).strip() not in ("", "None") else "—"
+
+            # 고임팩트 이벤트 행동 지침 먼저 표시
+            high_ev = [e for e in event_cal if e.get("impact","").lower() in ("high","3")]
+            if high_ev:
+                for ev in high_ev[:3]:
+                    ev_icon, ev_action = _get_action(ev.get("event",""))
+                    if ev_action:
+                        est = ev.get("estimate")
+                        prior = ev.get("prior")
+                        context = ""
+                        if est is not None and str(est).strip() not in ("", "None"):
+                            context += f" 예상: **{est}**"
+                        if prior is not None and str(prior).strip() not in ("", "None"):
+                            context += f" / 이전: **{prior}**"
+                        st.warning(
+                            f"**{ev_icon} {ev.get('date','')} · {ev.get('event','')}**{context}  \n"
+                            f"→ {ev_action}"
+                        )
+
+            # 전체 캘린더 테이블
+            with st.expander("📋 전체 이벤트 목록 보기", expanded=False):
+                ev_cols_header = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
+                for hdr, txt in zip(ev_cols_header, ["날짜", "이벤트", "임팩트", "실제", "예상", "이전"]):
+                    hdr.markdown(f"**{txt}**")
+                for ev in event_cal[:15]:
+                    impact = ev.get("impact", "")
+                    impact_color = (
+                        "#dc2626" if impact.lower() in ("high", "3")
+                        else "#f59e0b" if impact.lower() in ("medium", "2")
+                        else "#64748b"
+                    )
+                    impact_emoji = (
+                        "🔴 High" if impact.lower() in ("high", "3")
+                        else "🟡 Medium" if impact.lower() in ("medium", "2")
+                        else "⚪ Low"
+                    )
+                    ev_cols = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
+                    ev_cols[0].markdown(f"`{ev.get('date','')}`")
+                    ev_cols[1].markdown(ev.get("event", ""))
+                    ev_cols[2].markdown(f"<span style='color:{impact_color};font-weight:700'>{impact_emoji}</span>", unsafe_allow_html=True)
+                    ev_cols[3].markdown(_fmt_ev_val(ev.get("actual")))
+                    ev_cols[4].markdown(_fmt_ev_val(ev.get("estimate")))
+                    ev_cols[5].markdown(_fmt_ev_val(ev.get("prior")))
+            st.caption("📌 FMP Economic Calendar 기준.")
 
         with st.expander("🔍 신호 상세 데이터", expanded=False):
             for key, data in drg.get("details", {}).items():
@@ -10659,7 +10745,7 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.markdown("### 🤖 AI 내일 시장 예측")
-        st.caption("선행 신호 6가지 + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 자기 전 또는 장 열리기 전 실행 권장.")
+        st.caption("선행 신호 6가지(선물·달러·금 포함) + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 장 열리기 전(8AM ET / 한국 밤 10시) 실행 권장.")
 
         if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
             with st.spinner("최신 데이터 수집 중..."):
@@ -10709,11 +10795,18 @@ if st.session_state.get("logged_in"):
 
             signal_summary = "\n".join([
                 f"- {label}: {'정상' if fresh_sig.get(key, {}).get('ok', True) else '경고'} | {fresh_sig.get(key, {}).get('value', 'N/A')}"
+                + (f" ({fresh_sig.get(key, {}).get('trend','')})" if fresh_sig.get(key, {}).get('trend','') else "")
                 for key, label, _ in signal_defs
             ])
             warning_text = "\n".join(fresh_warnings) if fresh_warnings else "없음"
             now_kst = datetime.now(_KST_TZ)
             market_session = "장 전" if now_kst.hour < 9 else ("장 중" if now_kst.hour < 16 else "장 후")
+
+            # 선물·리스크오프 신호 별도 강조
+            _futures_sig = fresh_sig.get("futures", {})
+            _riskoff_sig = fresh_sig.get("riskoff", {})
+            _futures_line = f"선물 프리마켓: {_futures_sig.get('value','N/A')} ({_futures_sig.get('trend','')})"
+            _riskoff_line = f"달러·금·국채: {_riskoff_sig.get('value','N/A')}"
 
             drg_prompt = (
                 "당신은 월가 수석 퀀트 전략가입니다. "
@@ -10721,17 +10814,20 @@ if st.session_state.get("logged_in"):
                 f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
                 f"[분석 섹터] {sector_choice}\n\n"
                 f"[선행 신호 6가지]\n{signal_summary}\n\n"
+                f"[선물·안전자산 핵심 데이터]\n"
+                f"- {_futures_line}\n"
+                f"- {_riskoff_line}\n\n"
                 f"[감지된 경고]\n{warning_text}\n\n"
                 f"[3일 이내 주요 경제 이벤트]\n{event_summary}\n\n"
                 f"[거시경제 지표]\n{macro_summary}\n\n"
                 f"[오늘의 주요 뉴스 ({rss_news_count}개 소스)]\n{rss_news_text}\n\n"
                 "---\n"
                 "아래 4개 항목을 각각 작성하세요. "
-                "반드시 위 데이터의 실제 수치(VIX 값, 신호 상태, 뉴스 종목명/이슈)를 직접 인용해 근거를 만드세요. "
-                "일반론이나 '시장을 주시해야 한다'류의 빈말은 금지입니다.\n\n"
+                "반드시 위 수치(선물 %, VIX 값, 이벤트명/예상치, 뉴스 종목명)를 직접 인용해 근거를 만드세요. "
+                "일반론·빈말 금지. 선물과 이벤트 데이터를 반드시 활용하세요.\n\n"
                 "## 내일 시장 방향 판단: [상승 우세 / 중립 / 하락 우세]\n\n"
-                "**📊 핵심 근거** (위 수치를 직접 인용해 2~3문장):\n\n"
-                "**📰 뉴스 영향** (오늘 뉴스 중 내일 시장에 영향줄 종목/이슈 구체적으로 언급, 2문장):\n\n"
+                "**📊 핵심 근거** (선물 방향·VIX·이벤트 수치 직접 인용, 2~3문장):\n\n"
+                "**📰 뉴스 영향** (오버나잇 뉴스 중 내일 시장에 영향줄 종목/이슈, 2문장):\n\n"
                 "**⚠️ 내일 주목할 리스크** (구체적 수치/종목/이벤트 기반, 2가지):\n"
                 "1. \n"
                 "2. \n\n"
