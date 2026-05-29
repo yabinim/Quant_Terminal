@@ -1275,39 +1275,41 @@ def evaluate_vix_status(vix_value):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_vix_latest_and_history():
     """VIX 현재값 + 1년 히스토리.
-    1순위: FRED VIXCLS  2순위: FMP ^VIX
+    1순위: FRED VIXCLS  2순위: FMP ^VIX (full 엔드포인트)
     """
-    # ── FRED 시도 ─────────────────────────────────────────────────────
+    # ── FRED ─────────────────────────────────────────────────────────
     try:
         s = fred.get_series("VIXCLS")
         s = pd.to_numeric(s, errors="coerce").dropna()
-        if not s.empty:
+        if len(s) >= 10:
             s = s.tail(252)
             hist = pd.DataFrame({"Close": s})
             hist.index = pd.to_datetime(hist.index)
             return float(s.iloc[-1]), hist, None
     except Exception:
         pass
-    # ── FMP 폴백 ──────────────────────────────────────────────────────
+    # ── FMP 폴백 ─────────────────────────────────────────────────────
     try:
         k = _fmp_key()
         if k:
             r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/^VIX?limit=252&apikey={k}",
+                f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX&limit=252&apikey={k}",
                 timeout=_FMP_TIMEOUT,
             )
             if r.status_code == 200:
                 data = r.json()
-                prices = data if isinstance(data, list) else data.get("historical", [])
-                if prices:
-                    df = pd.DataFrame(prices)
-                    close_col = "close" if "close" in df.columns else "Close"
-                    df = df[["date", close_col]].rename(columns={close_col: "Close"})
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date").sort_index()
-                    df["Close"] = pd.to_numeric(df["Close"], errors="coerce").dropna()
-                    if not df.empty:
-                        return float(df["Close"].iloc[-1]), df, "FMP폴백"
+                rows = data.get("historical", data) if isinstance(data, dict) else data
+                if isinstance(rows, list) and rows:
+                    df = pd.DataFrame(rows)
+                    if "date" in df.columns:
+                        cc = "close" if "close" in df.columns else "Close"
+                        df = df[["date", cc]].rename(columns={cc: "Close"})
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+                        df = df.dropna()
+                        if not df.empty:
+                            return float(df["Close"].iloc[-1]), df, "FMP폴백"
     except Exception:
         pass
     return np.nan, None, "VIX 데이터 조회 실패 (FRED·FMP 모두 실패)"
@@ -1337,21 +1339,23 @@ def fetch_wti_latest():
             return float(s.iloc[-1])
     except Exception:
         pass
-    # FMP 폴백: USO (WTI ETF) 또는 CL=F 시도
+    # FMP 폴백: USO (WTI ETF) — full 엔드포인트
     try:
         k = _fmp_key()
         if k:
-            for ticker in ("USO", "CL=F"):
+            for sym in ("USO", "OIL"):
                 try:
                     r = requests.get(
-                        f"{_FMP_BASE}/historical-price-eod/{ticker}?limit=5&apikey={k}",
+                        f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=5&apikey={k}",
                         timeout=_FMP_TIMEOUT,
                     )
                     if r.status_code == 200:
                         d = r.json()
-                        prices = d if isinstance(d, list) else d.get("historical", [])
-                        if prices:
-                            return float(prices[0].get("close") or prices[0].get("Close", np.nan))
+                        rows = d.get("historical", d) if isinstance(d, dict) else d
+                        if isinstance(rows, list) and rows:
+                            v = rows[0].get("close") or rows[0].get("Close")
+                            if v is not None:
+                                return float(v)
                 except Exception:
                     continue
     except Exception:
@@ -1359,8 +1363,10 @@ def fetch_wti_latest():
     return np.nan
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_unrate_series() -> pd.Series:
     """UNRATE — FRED 1순위, FMP unemploymentRate 2순위."""
+    # FRED
     try:
         s = fred.get_series("UNRATE")
         s = pd.to_numeric(s, errors="coerce").dropna()
@@ -1368,6 +1374,7 @@ def _fetch_unrate_series() -> pd.Series:
             return s
     except Exception:
         pass
+    # FMP economic-indicators
     try:
         k = _fmp_key()
         if k:
@@ -1377,13 +1384,15 @@ def _fetch_unrate_series() -> pd.Series:
             )
             if r.status_code == 200:
                 data = r.json()
-                if isinstance(data, list) and len(data) >= 15:
-                    df = pd.DataFrame(data)[["date", "value"]].copy()
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date").sort_index()
-                    s = pd.to_numeric(df["value"], errors="coerce").dropna()
-                    if len(s) >= 15:
-                        return s
+                if isinstance(data, list) and data:
+                    df = pd.DataFrame(data)
+                    if "date" in df.columns and "value" in df.columns:
+                        df = df[["date", "value"]].copy()
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                        s = pd.to_numeric(df["value"], errors="coerce").dropna()
+                        if len(s) >= 5:
+                            return s
     except Exception:
         pass
     return pd.Series(dtype=float)
@@ -1423,8 +1432,10 @@ def evaluate_unemployment_sahm_series():
         return MACRO_STATUS_NA, np.nan, np.nan, np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_cpi_series() -> pd.Series:
     """CPIAUCSL — FRED 1순위, FMP CPI 2순위."""
+    # FRED
     try:
         s = fred.get_series("CPIAUCSL")
         s = pd.to_numeric(s, errors="coerce").dropna()
@@ -1432,6 +1443,7 @@ def _fetch_cpi_series() -> pd.Series:
             return s
     except Exception:
         pass
+    # FMP economic-indicators (name=CPI)
     try:
         k = _fmp_key()
         if k:
@@ -1441,13 +1453,15 @@ def _fetch_cpi_series() -> pd.Series:
             )
             if r.status_code == 200:
                 data = r.json()
-                if isinstance(data, list) and len(data) >= 14:
-                    df = pd.DataFrame(data)[["date", "value"]].copy()
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date").sort_index()
-                    s = pd.to_numeric(df["value"], errors="coerce").dropna()
-                    if len(s) >= 14:
-                        return s
+                if isinstance(data, list) and data:
+                    df = pd.DataFrame(data)
+                    if "date" in df.columns and "value" in df.columns:
+                        df = df[["date", "value"]].copy()
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                        s = pd.to_numeric(df["value"], errors="coerce").dropna()
+                        if len(s) >= 5:
+                            return s
     except Exception:
         pass
     return pd.Series(dtype=float)
@@ -1512,24 +1526,26 @@ def fetch_dxy_latest_and_mean_deviation():
             return _calc(s.tail(400))
     except Exception:
         pass
-    # FMP UUP (DXY ETF)
+    # FMP UUP (DXY ETF) — full 엔드포인트
     try:
         k = _fmp_key()
         if k:
             r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/UUP?limit=400&apikey={k}",
+                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=400&apikey={k}",
                 timeout=_FMP_TIMEOUT,
             )
             if r.status_code == 200:
                 d = r.json()
-                prices = d if isinstance(d, list) else d.get("historical", [])
-                if prices:
-                    df = pd.DataFrame(prices)
-                    cc = "close" if "close" in df.columns else "Close"
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date").sort_index()
-                    s = pd.to_numeric(df[cc], errors="coerce").dropna()
-                    return _calc(s)
+                rows = d.get("historical", d) if isinstance(d, dict) else d
+                if isinstance(rows, list) and rows:
+                    df = pd.DataFrame(rows)
+                    if "date" in df.columns:
+                        cc = "close" if "close" in df.columns else "Close"
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                        s = pd.to_numeric(df[cc], errors="coerce").dropna()
+                        if not s.empty:
+                            return _calc(s)
     except Exception:
         pass
     return np.nan, np.nan, MACRO_STATUS_NA
@@ -1669,23 +1685,24 @@ def fetch_macro_history_series() -> dict:
         if dxy_s is not None and not dxy_s.empty:
             out["dxy"] = pd.to_numeric(dxy_s, errors="coerce").dropna().tail(500)
     except Exception:
-        # FMP UUP 폴백
+        # FMP UUP 폴백 — full 엔드포인트
         try:
             k = _fmp_key()
             if k:
                 r = requests.get(
-                    f"{_FMP_BASE}/historical-price-eod/UUP?limit=500&apikey={k}",
+                    f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=500&apikey={k}",
                     timeout=_FMP_TIMEOUT,
                 )
                 if r.status_code == 200:
                     d = r.json()
-                    prices = d if isinstance(d, list) else d.get("historical", [])
-                    if prices:
-                        df = pd.DataFrame(prices)
-                        cc = "close" if "close" in df.columns else "Close"
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        out["dxy"] = pd.to_numeric(df[cc], errors="coerce").dropna().tail(500)
+                    rows = d.get("historical", d) if isinstance(d, dict) else d
+                    if isinstance(rows, list) and rows:
+                        df = pd.DataFrame(rows)
+                        if "date" in df.columns:
+                            cc = "close" if "close" in df.columns else "Close"
+                            df["date"] = pd.to_datetime(df["date"])
+                            df = df.set_index("date").sort_index()
+                            out["dxy"] = pd.to_numeric(df[cc], errors="coerce").dropna().tail(500)
         except Exception:
             pass
     return out
@@ -1852,7 +1869,7 @@ def analyze_us_macro_dashboard():
             "지표": "VIX (공포 지수)",
             "현재값": num_str(vix_val),
             "판정": macro_status_label(vix_st),
-            "판독 요약": vix_note + ("" if not vix_err else f" (데이터 참고: {vix_err})"),
+            "판독 요약": vix_note + ("" if (not vix_err or vix_err in ("FMP폴백", "None", None)) else f" [{vix_err}]"),
             "_status": vix_st,
         }
     )
@@ -2821,20 +2838,21 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             _k = _fmp_key()
             if _k:
                 _r = requests.get(
-                    f"{_FMP_BASE}/historical-price-eod/^VIX?limit=30&apikey={_k}",
+                    f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX&limit=30&apikey={_k}",
                     timeout=_FMP_TIMEOUT,
                 )
                 if _r.status_code == 200:
                     _d = _r.json()
-                    _prices = _d if isinstance(_d, list) else _d.get("historical", [])
-                    if _prices:
-                        _df = pd.DataFrame(_prices)
-                        _cc = "close" if "close" in _df.columns else "Close"
-                        _df = _df[["date", _cc]].rename(columns={_cc: "Close"})
-                        _df["date"] = pd.to_datetime(_df["date"])
-                        _df = _df.set_index("date").sort_index()
-                        vix_close = pd.to_numeric(_df["Close"], errors="coerce").dropna()
-                        _vix_source = "FMP"
+                    _rows = _d.get("historical", _d) if isinstance(_d, dict) else _d
+                    if isinstance(_rows, list) and _rows:
+                        _df = pd.DataFrame(_rows)
+                        if "date" in _df.columns:
+                            _cc = "close" if "close" in _df.columns else "Close"
+                            _df = _df[["date", _cc]].rename(columns={_cc: "Close"})
+                            _df["date"] = pd.to_datetime(_df["date"])
+                            _df = _df.set_index("date").sort_index()
+                            vix_close = pd.to_numeric(_df["Close"], errors="coerce").dropna()
+                            _vix_source = "FMP"
         except Exception:
             pass
     try:
