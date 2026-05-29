@@ -44,17 +44,6 @@ if "login_user_id" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state["user_id"] = ""
 
-if "_yf_cloud_limit_warn_shown" not in st.session_state:
-    st.session_state["_yf_cloud_limit_warn_shown"] = False
-
-
-def _notify_yfinance_fetch_failed() -> None:
-    """클라우드 등에서 Yahoo 제한 시 한 세션당 한 번만 안내."""
-    if st.session_state.get("_yf_cloud_limit_warn_shown"):
-        return
-    st.session_state["_yf_cloud_limit_warn_shown"] = True
-    st.warning("야후 파이낸스 접속 제한으로 일부 데이터를 불러오지 못했습니다.")
-
 
 _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
@@ -869,22 +858,6 @@ _MAIN_NAV_OPTIONS = (
     "📖 사용 가이드",
 )
 
-# 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
-_LEGACY_NAV_STR_TO_INDEX = {
-    "📊 거시경제 지표": 0,
-    "🧠 1.5 시장 내러티브": 1,
-    "🚀 1.6 AI Opportunity Scanner": 3,
-    "📈 2. 섹터 분석": 2,
-    "🔬 3. 체력 검사": 4,
-    "⏱️ 4. 매수 타점": 4,
-    "🛡️ 5.0 포트폴리오 매도 레이더": 5,
-    "1. 거시경제 지표 (Macro)": 0,
-    "2. 시장 내러티브 (Narrative)": 1,
-    "3. 섹터 & 자금 흐름 (Sector Flow)": 2,
-    "4. AI 종목 스캐너 (Scanner)": 3,
-    "5. 개별 종목 정밀 검사 (Fundamentals & Timing)": 4,
-    "6. 포트폴리오 매도 레이더 (Portfolio)": 5,
-}
 
 _NARRATIVE_RECORD_SOURCE_WEEKLY_7D = "weekly_trend_7d"
 
@@ -3552,6 +3525,166 @@ def _fmp_balance_sheet(ticker: str) -> dict:
     return {}
 
 
+# ── 신규 기능용 FMP 캐싱 래퍼 ────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_financial_scores(ticker: str) -> dict:
+    """FMP /financial-scores — Altman Z-Score + Piotroski F-Score.
+    반환 키: altmanZScore, piotroskiScore, workingCapital, retainedEarnings 등.
+    """
+    k = _fmp_key()
+    if not k:
+        return {}
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/financial-scores?symbol={ticker}&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+    except Exception:
+        pass
+    return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_sector_pe_snapshot() -> list:
+    """FMP /sector-pe-snapshot — 전 섹터 현재 PER 스냅샷.
+    반환: [{"sector": "Technology", "pe": 32.1, "date": "2024-02-01"}, ...]
+    """
+    k = _fmp_key()
+    if not k:
+        return []
+    try:
+        from datetime import date
+        today = date.today().isoformat()
+        r = requests.get(
+            f"{_FMP_BASE}/sector-pe-snapshot?date={today}&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d if isinstance(d, list) else []
+    except Exception:
+        pass
+    return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fmp_biggest_gainers_losers() -> dict:
+    """FMP /biggest-gainers + /biggest-losers — 장중 상위 급등/급락 종목.
+    반환: {"gainers": [...], "losers": [...]}  각 항목: symbol, name, change, changesPercentage, price
+    TTL=300(5분): 장중 실시간성 반영.
+    """
+    k = _fmp_key()
+    if not k:
+        return {"gainers": [], "losers": []}
+    result = {"gainers": [], "losers": []}
+    try:
+        rg = requests.get(f"{_FMP_BASE}/biggest-gainers?apikey={k}", timeout=_FMP_TIMEOUT)
+        if rg.status_code == 200:
+            result["gainers"] = (rg.json() or [])[:10]
+    except Exception:
+        pass
+    try:
+        rl = requests.get(f"{_FMP_BASE}/biggest-losers?apikey={k}", timeout=_FMP_TIMEOUT)
+        if rl.status_code == 200:
+            result["losers"] = (rl.json() or [])[:10]
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_earnings_transcript(ticker: str) -> dict:
+    """FMP /earning-call-transcript — 직전 분기 어닝콜 원문.
+    반환: {"symbol": ..., "quarter": ..., "year": ..., "content": ...}
+    """
+    k = _fmp_key()
+    if not k:
+        return {}
+    try:
+        # 날짜 목록 먼저 조회 → 가장 최근 분기/연도 파악
+        rd = requests.get(
+            f"{_FMP_BASE}/earning-call-transcript-dates?symbol={ticker}&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if rd.status_code != 200:
+            return {}
+        dates = rd.json()
+        if not isinstance(dates, list) or not dates:
+            return {}
+        # 첫 번째 항목이 가장 최근 (FMP 응답 내림차순)
+        latest = dates[0]
+        year = latest.get("year") or latest[0] if isinstance(latest, list) else latest.get("year")
+        quarter = latest.get("quarter") or latest[1] if isinstance(latest, list) else latest.get("quarter")
+        if not year or not quarter:
+            return {}
+        rt = requests.get(
+            f"{_FMP_BASE}/earning-call-transcript?symbol={ticker}&year={year}&quarter={quarter}&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if rt.status_code == 200:
+            d = rt.json()
+            item = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+            return item
+    except Exception:
+        pass
+    return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_historical_ratings(ticker: str) -> list:
+    """FMP /grades-historical — 애널리스트 등급 변경 히스토리 (최근 15건).
+    반환: [{"date": ..., "company": ..., "analyst": ..., "previousGrade": ..., "newGrade": ..., "action": ...}, ...]
+    """
+    k = _fmp_key()
+    if not k:
+        return []
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/grades-historical?symbol={ticker}&limit=15&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d if isinstance(d, list) else []
+    except Exception:
+        pass
+    return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_company_screener(
+    sector: str = "",
+    market_cap_min: int = 1_000_000_000,
+    volume_min: int = 500_000,
+    limit: int = 50,
+) -> list:
+    """FMP /company-screener — 조건 기반 종목 자동 탐색.
+    sector: 'Technology', 'Healthcare' 등 빈 문자열이면 전체.
+    반환: [{"symbol": ..., "companyName": ..., "marketCap": ..., "sector": ..., "volume": ...}, ...]
+    """
+    k = _fmp_key()
+    if not k:
+        return []
+    try:
+        params = f"marketCapMoreThan={market_cap_min}&volumeMoreThan={volume_min}&limit={limit}&apikey={k}"
+        if sector:
+            params += f"&sector={sector.replace(' ', '%20')}"
+        r = requests.get(
+            f"{_FMP_BASE}/company-screener?{params}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d if isinstance(d, list) else []
+    except Exception:
+        pass
+    return []
+
+
 def _fmp_fill(info: dict, ticker: str) -> dict:
     """yfinance info dict의 빈 필드를 FMP로 채워 반환.
     ※ FMP Starter 플랜 실제 제공 필드만 사용.
@@ -4088,49 +4221,21 @@ def evaluate_kpis(ticker_symbol):
                 _fcf_val = float(_ocf + _capex)
         if pd.notna(_fcf_val):
             info["_fmp_fcf"] = _fcf_val
-        # income_stmt / balance_sheet은 None으로 처리 (FMP fill로 대체)
-        income_stmt = None
-        balance_sheet = None
     except Exception:
         tk_upper = str(ticker_symbol).strip().upper()
         info = _fmp_fill({}, tk_upper)
         history = pd.DataFrame()
-        income_stmt, balance_sheet = None, None
         latest_inc, prev_inc = {}, {}
 
     # ── 지표 추출 ──────────────────────────────────────────────────────
-    # ROE
+    # ROE — FMP fill로 제공 (income_stmt/balance_sheet yfinance 분기 제거됨)
     roe = to_float(info.get("returnOnEquity"))
-    if pd.isna(roe) and income_stmt is not None and balance_sheet is not None:
-        try:
-            net_income = income_stmt.loc["Net Income"].iloc[0] if "Net Income" in income_stmt.index else np.nan
-            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
-            if pd.notna(net_income) and pd.notna(equity) and equity != 0:
-                roe = float(net_income / equity)
-        except Exception:
-            pass
 
-    # Operating Margin
+    # Operating Margin — FMP fill로 제공
     operating_margin = to_float(info.get("operatingMargins"))
-    if pd.isna(operating_margin) and income_stmt is not None:
-        try:
-            op_income = income_stmt.loc["Operating Income"].iloc[0] if "Operating Income" in income_stmt.index else np.nan
-            total_rev = income_stmt.loc["Total Revenue"].iloc[0] if "Total Revenue" in income_stmt.index else np.nan
-            if pd.notna(op_income) and pd.notna(total_rev) and total_rev != 0:
-                operating_margin = float(op_income / total_rev)
-        except Exception:
-            pass
 
-    # Debt to Equity
+    # Debt to Equity — FMP fill로 제공
     debt_to_equity = to_float(info.get("debtToEquity"))
-    if pd.isna(debt_to_equity) and balance_sheet is not None:
-        try:
-            total_debt = balance_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in balance_sheet.index else np.nan
-            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
-            if pd.notna(total_debt) and pd.notna(equity) and equity != 0:
-                debt_to_equity = float(total_debt / equity * 100)
-        except Exception:
-            pass
 
     # PEG Ratio
     peg_ratio = to_float(info.get("pegRatio") or info.get("trailingPegRatio"))
@@ -4140,35 +4245,28 @@ def evaluate_kpis(ticker_symbol):
     trailing_pe   = to_float(info.get("trailingPE"))
     price_to_book = to_float(info.get("priceToBook"))
 
-    # Forward P/E fallback — evaluate_kpis에서 직접 계산 (캐시 미스 대비)
+    # Forward P/E fallback — 캐싱 래퍼 사용 (_fmp_fill 캐시 미스 대비)
     if pd.isna(forward_pe):
         try:
-            _k_fp = _fmp_key()
-            if _k_fp:
-                _r_fp = requests.get(
-                    f"{_FMP_BASE}/analyst-estimates?symbol={tk_upper}&period=annual&limit=4&apikey={_k_fp}",
-                    timeout=_FMP_TIMEOUT
-                )
-                if _r_fp.status_code == 200:
-                    _fp_data = _r_fp.json()
-                    if isinstance(_fp_data, list) and _fp_data:
-                        _cur_year = datetime.now().year
-                        _fp_sorted = sorted(_fp_data, key=lambda x: str(x.get("date") or "9999"))
-                        for _ae in _fp_sorted:
-                            _ae_y = str(_ae.get("date") or "")[:4]
-                            try:
-                                if int(_ae_y) < _cur_year:
-                                    continue
-                            except Exception:
-                                continue
-                            _eps = to_float(_ae.get("epsAvg") or _ae.get("estimatedEpsAvg") or _ae.get("estimatedEps"))
-                            _cp  = to_float(info.get("currentPrice") or info.get("price"))
-                            if pd.notna(_eps) and _eps > 0 and pd.notna(_cp) and _cp > 0:
-                                _fwd = round(float(_cp) / float(_eps), 2)
-                                if 0 < _fwd < 2000:
-                                    forward_pe = _fwd
-                                    info["forwardPE"] = _fwd
-                                    break
+            _fp_data = _fmp_analyst_estimates(tk_upper)
+            if isinstance(_fp_data, list) and _fp_data:
+                _cur_year = datetime.now().year
+                _fp_sorted = sorted(_fp_data, key=lambda x: str(x.get("date") or "9999"))
+                for _ae in _fp_sorted:
+                    _ae_y = str(_ae.get("date") or "")[:4]
+                    try:
+                        if int(_ae_y) < _cur_year:
+                            continue
+                    except Exception:
+                        continue
+                    _eps = to_float(_ae.get("epsAvg") or _ae.get("estimatedEpsAvg") or _ae.get("estimatedEps"))
+                    _cp  = to_float(info.get("currentPrice") or info.get("price"))
+                    if pd.notna(_eps) and _eps > 0 and pd.notna(_cp) and _cp > 0:
+                        _fwd = round(float(_cp) / float(_eps), 2)
+                        if 0 < _fwd < 2000:
+                            forward_pe = _fwd
+                            info["forwardPE"] = _fwd
+                            break
         except Exception:
             pass
     ev_to_ebitda  = to_float(info.get("enterpriseToEbitda"))
@@ -9990,10 +10088,7 @@ if st.session_state.get("logged_in"):
             st.session_state.pop("main_nav_idx", None)
     _cur_nav = st.session_state.get(_nav_key)
     if _cur_nav not in _nav_opts:
-        if isinstance(_cur_nav, str) and _cur_nav in _LEGACY_NAV_STR_TO_INDEX:
-            st.session_state[_nav_key] = _MAIN_NAV_OPTIONS[_LEGACY_NAV_STR_TO_INDEX[_cur_nav]]
-        else:
-            st.session_state[_nav_key] = _nav_opts[0]
+        st.session_state[_nav_key] = _nav_opts[0]
     
     main_nav = st.sidebar.radio(
         "탑다운 단계",
@@ -10504,6 +10599,46 @@ if st.session_state.get("logged_in"):
                         st.markdown("**🤖 AI 리뷰:**")
                         st.markdown(str(_r.get("review_comment", "")))
 
+        # ── 오늘의 급등/급락 Top 10 ──────────────────────────────────────
+        st.divider()
+        st.markdown("### 📈 오늘의 급등/급락 Top 10")
+        st.caption("FMP biggest-gainers/losers 기준. 5분 캐시. 어떤 섹터가 장을 주도하는지 빠르게 파악하세요.")
+        with st.spinner("급등/급락 데이터 조회 중..."):
+            _gl_data = _fmp_biggest_gainers_losers()
+        _gl_c1, _gl_c2 = st.columns(2)
+        with _gl_c1:
+            st.markdown("#### 🚀 급등 Top 10")
+            _gainers = _gl_data.get("gainers", [])
+            if _gainers:
+                _g_rows = []
+                for _g in _gainers[:10]:
+                    _pct = to_float(_g.get("changesPercentage") or _g.get("change_percentage"))
+                    _g_rows.append({
+                        "티커": str(_g.get("symbol") or ""),
+                        "종목명": str(_g.get("name") or "")[:20],
+                        "현재가": f"${to_float(_g.get('price')):.2f}" if pd.notna(to_float(_g.get('price'))) else "N/A",
+                        "등락률": f"+{_pct:.2f}%" if pd.notna(_pct) else "N/A",
+                    })
+                st.dataframe(pd.DataFrame(_g_rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("급등 데이터를 가져올 수 없습니다.")
+        with _gl_c2:
+            st.markdown("#### 📉 급락 Top 10")
+            _losers = _gl_data.get("losers", [])
+            if _losers:
+                _l_rows = []
+                for _l in _losers[:10]:
+                    _pct = to_float(_l.get("changesPercentage") or _l.get("change_percentage"))
+                    _l_rows.append({
+                        "티커": str(_l.get("symbol") or ""),
+                        "종목명": str(_l.get("name") or "")[:20],
+                        "현재가": f"${to_float(_l.get('price')):.2f}" if pd.notna(to_float(_l.get('price'))) else "N/A",
+                        "등락률": f"{_pct:.2f}%" if pd.notna(_pct) else "N/A",
+                    })
+                st.dataframe(pd.DataFrame(_l_rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("급락 데이터를 가져올 수 없습니다.")
+
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
         st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 미국 거시경제 대시보드")
@@ -10514,7 +10649,7 @@ if st.session_state.get("logged_in"):
                 macro_pack = get_macro_dashboard_with_validation()
 
             if macro_pack.get("na_total", 0) >= 4:
-                _notify_yfinance_fetch_failed()
+                st.warning("일부 거시경제 데이터를 불러오지 못했습니다. FRED 또는 FMP API 상태를 확인해주세요.")
 
             # ── 1. Macro Score 게이지 ──────────────────────────────────────
             macro_score = macro_pack.get("macro_score", 50.0)
@@ -11421,6 +11556,53 @@ if st.session_state.get("logged_in"):
                     placeholder="예: NVDA, MSFT, SMCI",
                     key="opportunity_scanner_manual_tickers",
                 )
+
+                # ── FMP Screener 자동 탐색 ───────────────────────────────
+                with st.expander("🔍 FMP Screener 자동 탐색 (유니버스 보완)", expanded=False):
+                    st.caption("시총 $10B↑ · 거래량 100만↑ 조건으로 FMP가 자동 필터링한 종목을 유니버스에 추가합니다.")
+                    _scr_sector_map = {
+                        "전체 (섹터 무관)": "",
+                        "Technology": "Technology",
+                        "Healthcare": "Healthcare",
+                        "Financials": "Financials",
+                        "Energy": "Energy",
+                        "Consumer Cyclical": "Consumer Cyclical",
+                        "Industrials": "Industrials",
+                        "Communication Services": "Communication Services",
+                        "Utilities": "Utilities",
+                        "Real Estate": "Real Estate",
+                        "Materials": "Materials",
+                    }
+                    _scr_sel = st.selectbox(
+                        "스크리너 섹터 필터",
+                        options=list(_scr_sector_map.keys()),
+                        key="screener_sector_select",
+                    )
+                    _scr_cap_min = st.number_input(
+                        "최소 시가총액 ($B)",
+                        min_value=1, max_value=500, value=10, step=5,
+                        key="screener_cap_min",
+                    )
+                    if st.button("🔍 Screener 탐색 실행", key="run_screener_btn", use_container_width=True):
+                        with st.spinner("FMP Screener 조회 중..."):
+                            _scr_results = _fmp_company_screener(
+                                sector=_scr_sector_map[_scr_sel],
+                                market_cap_min=int(_scr_cap_min * 1_000_000_000),
+                                volume_min=1_000_000,
+                                limit=50,
+                            )
+                        if _scr_results:
+                            _scr_tickers = [str(r.get("symbol") or "").strip().upper() for r in _scr_results if r.get("symbol")]
+                            _scr_tickers = filter_scanner_ticker_list(_scr_tickers)
+                            st.session_state["_screener_extra_tickers"] = _scr_tickers
+                            st.success(f"✅ {len(_scr_tickers)}개 종목 탐색 완료 — 스캔 실행 시 유니버스에 자동 포함됩니다.")
+                            st.code(", ".join(_scr_tickers[:30]) + ("..." if len(_scr_tickers) > 30 else ""))
+                        else:
+                            st.warning("스크리너 결과를 가져올 수 없습니다.")
+                    _scr_extra = st.session_state.get("_screener_extra_tickers", [])
+                    if _scr_extra:
+                        st.caption(f"📌 현재 탐색된 추가 종목: {len(_scr_extra)}개 (스캔 실행 시 자동 병합)")
+
             elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
                 st.caption(
                     "「Current Leaders 스캔」은 `Narratives` 시트 **Winners** 열(또는 JSON의 winners)만 사용합니다. "
@@ -11443,6 +11625,10 @@ if st.session_state.get("logged_in"):
                     target_universe = build_opportunity_scanner_universe_from_direct_selection(
                         selected_sector_labels, manual_tickers_input
                     )
+                    # FMP Screener 자동 탐색 결과 병합
+                    _scr_extra_l = st.session_state.get("_screener_extra_tickers", [])
+                    if _scr_extra_l:
+                        target_universe = list(dict.fromkeys(target_universe + _scr_extra_l))
                     latest_analysis = resolve_opportunity_scanner_narrative_for_direct_mode()
                     src_note = "수동 섹터/티커"
                     scanner_mode_saved = "섹터/티커 직접 스캔"
@@ -11876,7 +12062,35 @@ if st.session_state.get("logged_in"):
                 missing_cells = int(sector_returns_df[perf_cols].isna().sum().sum())
                 if missing_cells > 0:
                     st.info("일부 ETF는 거래일 부족 또는 데이터 누락으로 일부 기간 수익률이 N/A로 표시됩니다.")
-    
+
+                # ── 섹터 PER 스냅샷 ──────────────────────────────────────────
+                st.divider()
+                st.markdown("### 💰 섹터별 현재 PER (Sector P/E Snapshot)")
+                st.caption("FMP sector-pe-snapshot 기준. RS 강한 섹터라도 PER이 지나치게 높으면 신중하게 접근하세요.")
+                with st.spinner("섹터 PER 데이터 조회 중..."):
+                    _spe_data = _fmp_sector_pe_snapshot()
+                if _spe_data:
+                    _spe_rows = []
+                    for _sp in _spe_data:
+                        _sp_pe = to_float(_sp.get("pe") or _sp.get("pe_ratio") or _sp.get("peRatio"))
+                        _sp_sec = str(_sp.get("sector") or "")
+                        if _sp_sec and pd.notna(_sp_pe) and _sp_pe > 0:
+                            _spe_rows.append({"섹터": _sp_sec, "현재 PER": round(_sp_pe, 1)})
+                    if _spe_rows:
+                        _spe_df = pd.DataFrame(_spe_rows).sort_values("현재 PER", ascending=True).reset_index(drop=True)
+                        _spe_styled = (
+                            _spe_df.style
+                            .format({"현재 PER": "{:.1f}x"})
+                            .background_gradient(cmap="RdYlGn_r", subset=["현재 PER"], vmin=10, vmax=50)
+                        )
+                        st.dataframe(_spe_styled, use_container_width=True, hide_index=True)
+                        _median_pe = _spe_df["현재 PER"].median()
+                        st.caption(f"📊 섹터 중간 PER: {_median_pe:.1f}x  |  낮을수록 밸류에이션 매력 높음 (초록), 높을수록 부담 (빨강)")
+                    else:
+                        st.caption("PER 데이터를 파싱할 수 없습니다.")
+                else:
+                    st.caption("섹터 PER 데이터를 조회할 수 없습니다.")
+
                 st.divider()
                 selected_sector_etf = st.selectbox(
                     "세부 종목을 확인하고 싶은 섹터를 선택하세요",
@@ -12588,6 +12802,67 @@ if st.session_state.get("logged_in"):
                     st.divider()
 
     
+                # ── Altman Z-Score + Piotroski F-Score ──────────────────────
+                with st.expander("🏦 재무 건전성 점수 (Altman Z / Piotroski F)", expanded=True):
+                    st.caption("FMP `/financial-scores` 기반. Altman Z는 파산 위험, Piotroski F는 재무 종합 점수(0~9).")
+                    with st.spinner(f"{selected_ticker} 재무 건전성 점수 조회 중..."):
+                        _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
+                    if _fs:
+                        _az = to_float(_fs.get("altmanZScore"))
+                        _ps = to_float(_fs.get("piotroskiScore"))
+                        _az_col, _ps_col = st.columns(2)
+                        with _az_col:
+                            if pd.notna(_az):
+                                if _az >= 3.0:
+                                    _az_label = "✅ 안전 구간 (≥3.0)"
+                                    _az_color = "#16a34a"
+                                elif _az >= 1.81:
+                                    _az_label = "⚠️ 회색 구간 (1.81~3.0)"
+                                    _az_color = "#d97706"
+                                else:
+                                    _az_label = "🚨 위험 구간 (<1.81)"
+                                    _az_color = "#dc2626"
+                                st.markdown(
+                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
+                                    f"border-left:4px solid {_az_color};'>"
+                                    f"<div style='color:#94a3b8;font-size:12px;'>Altman Z-Score</div>"
+                                    f"<div style='color:{_az_color};font-size:26px;font-weight:900;'>{_az:.2f}</div>"
+                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_az_label}</div>"
+                                    f"<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
+                                    f"≥3.0 안전 · 1.81~3.0 주의 · &lt;1.81 파산위험</div>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.metric("Altman Z-Score", "N/A")
+                        with _ps_col:
+                            if pd.notna(_ps):
+                                _ps_int = int(_ps)
+                                if _ps_int >= 7:
+                                    _ps_label = "✅ 강한 재무 (7~9)"
+                                    _ps_color = "#16a34a"
+                                elif _ps_int >= 4:
+                                    _ps_label = "🟡 중립 (4~6)"
+                                    _ps_color = "#d97706"
+                                else:
+                                    _ps_label = "🚨 약한 재무 (0~3)"
+                                    _ps_color = "#dc2626"
+                                _ps_bar = "█" * _ps_int + "░" * (9 - _ps_int)
+                                st.markdown(
+                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
+                                    f"border-left:4px solid {_ps_color};'>"
+                                    f"<div style='color:#94a3b8;font-size:12px;'>Piotroski F-Score</div>"
+                                    f"<div style='color:{_ps_color};font-size:26px;font-weight:900;'>{_ps_int} / 9</div>"
+                                    f"<div style='color:{_ps_color};font-size:14px;font-family:monospace;'>{_ps_bar}</div>"
+                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_ps_label}</div>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.metric("Piotroski F-Score", "N/A")
+                    else:
+                        st.caption("재무 건전성 데이터를 조회할 수 없습니다.")
+
                 with st.expander("원본 KPI 테이블 보기"):
                     st.dataframe(
                         kpi_df[["Category", "KPI", "Value", "Rule", "Pass"]],
@@ -12598,7 +12873,60 @@ if st.session_state.get("logged_in"):
         except Exception as e:
             st.error("펀더멘털(체력 검사) 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
-    
+
+        # ── 어닝콜 트랜스크립트 AI 요약 ───────────────────────────────────
+        st.divider()
+        st.markdown("### 📞 어닝콜 트랜스크립트 AI 요약")
+        st.caption("직전 분기 실적발표 원문 → Gemini 3줄 요약 (가이던스·경영진 톤·주요 리스크)")
+        _tc_key = f"_transcript_summary_{selected_ticker}"
+        _tc_raw_key = f"_transcript_raw_{selected_ticker}"
+        _tc_col1, _tc_col2 = st.columns([1, 1])
+        with _tc_col1:
+            if st.button("🤖 트랜스크립트 AI 요약 실행", key=f"tc_btn_{selected_ticker}", use_container_width=True):
+                with st.spinner("어닝콜 원문 조회 중..."):
+                    _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
+                st.session_state[_tc_raw_key] = _tc_data
+                if _tc_data and _tc_data.get("content"):
+                    _tc_text = str(_tc_data["content"])[:6000]
+                    _tc_q = _tc_data.get("quarter", "")
+                    _tc_y = _tc_data.get("year", "")
+                    _tc_prompt = (
+                        f"{selected_ticker} {_tc_y}년 Q{_tc_q} 어닝콜 트랜스크립트를 분석하세요.\n\n"
+                        "다음 3가지를 각각 2~3문장으로 요약하세요:\n"
+                        "1) 📈 가이던스 (상향/하향/유지 여부, 구체 수치)\n"
+                        "2) 🎙️ 경영진 톤 (자신감/우려/방어적 등 분위기)\n"
+                        "3) ⚠️ 주요 리스크 (경영진이 언급한 위험 요인)\n\n"
+                        "한국어로 답변하세요.\n\n"
+                        f"[트랜스크립트 원문]\n{_tc_text}"
+                    )
+                    with st.spinner("Gemini 요약 중..."):
+                        try:
+                            _tc_model = _GenAIModel(
+                                "gemini-2.5-flash",
+                                generation_config={"temperature": 0.1, "max_output_tokens": 1024},
+                            )
+                            _tc_resp = _tc_model.generate_content(_tc_prompt)
+                            _tc_summary = (_gemini_response_text_utf8_safe(_tc_resp) or "").strip()
+                            st.session_state[_tc_key] = {
+                                "summary": _tc_summary,
+                                "quarter": _tc_q,
+                                "year": _tc_y,
+                            }
+                        except Exception as _tc_err:
+                            st.error(f"Gemini 요약 실패: {_tc_err}")
+                else:
+                    st.warning("어닝콜 트랜스크립트 데이터를 찾을 수 없습니다.")
+        with _tc_col2:
+            if st.session_state.get(_tc_key):
+                _tc_sum = st.session_state[_tc_key]
+                st.caption(f"📅 {_tc_sum.get('year')}년 Q{_tc_sum.get('quarter')} 어닝콜")
+        if st.session_state.get(_tc_key) and st.session_state[_tc_key].get("summary"):
+            st.markdown(st.session_state[_tc_key]["summary"])
+            _tc_raw = st.session_state.get(_tc_raw_key, {})
+            if _tc_raw and _tc_raw.get("content"):
+                with st.expander("📄 원문 보기 (영문)", expanded=False):
+                    st.text(str(_tc_raw["content"])[:3000] + ("..." if len(str(_tc_raw.get("content",""))) > 3000 else ""))
+
         st.divider()
         st.markdown("### 📊 기술적 분석 (Technical Analysis)")
         st.caption("RSI · MACD · 볼린저밴드 · 거래량으로 진입 구간 점검")
@@ -13247,7 +13575,34 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             if st.button("🗑️ 진단 초기화", key="ai_diag_reset"):
                 st.session_state.pop(_diag_sk, None)
                 st.rerun()
-    
+
+        # ── 애널리스트 등급 변경 히스토리 ────────────────────────────────
+        st.divider()
+        st.markdown("### 📊 애널리스트 등급 변경 히스토리")
+        st.caption("주요 기관의 상향/하향/유지 이력 (FMP grades-historical, 최근 15건)")
+        with st.spinner(f"{selected_ticker} 등급 히스토리 조회 중..."):
+            _rating_hist = _fmp_historical_ratings(str(selected_ticker).strip().upper())
+        if _rating_hist:
+            _rh_rows = []
+            for _rh in _rating_hist:
+                _action = str(_rh.get("action") or _rh.get("ratingChange") or "").strip()
+                _action_emoji = (
+                    "🟢 상향" if any(w in _action.lower() for w in ["upgrade", "initiated", "initiated at"]) else
+                    "🔴 하향" if "downgrade" in _action.lower() else
+                    "⚪ 유지"
+                )
+                _rh_rows.append({
+                    "날짜": str(_rh.get("date") or "")[:10],
+                    "기관": str(_rh.get("gradingCompany") or _rh.get("company") or ""),
+                    "변경": _action_emoji,
+                    "이전": str(_rh.get("previousGrade") or ""),
+                    "현재": str(_rh.get("newGrade") or ""),
+                })
+            _rh_df = pd.DataFrame(_rh_rows)
+            st.dataframe(_rh_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("등급 변경 히스토리 데이터를 찾을 수 없습니다.")
+
     elif main_nav == _MAIN_NAV_OPTIONS[6]:
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
