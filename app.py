@@ -4051,31 +4051,6 @@ def _fmp_sector_pe_snapshot() -> list:
     return []
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _fmp_biggest_gainers_losers() -> dict:
-    """FMP /biggest-gainers + /biggest-losers — 장중 상위 급등/급락 종목.
-    반환: {"gainers": [...], "losers": [...]}  각 항목: symbol, name, change, changesPercentage, price
-    TTL=300(5분): 장중 실시간성 반영.
-    """
-    k = _fmp_key()
-    if not k:
-        return {"gainers": [], "losers": []}
-    result = {"gainers": [], "losers": []}
-    try:
-        rg = requests.get(f"{_FMP_BASE}/biggest-gainers?apikey={k}", timeout=_FMP_TIMEOUT)
-        if rg.status_code == 200:
-            result["gainers"] = (rg.json() or [])[:10]
-    except Exception:
-        pass
-    try:
-        rl = requests.get(f"{_FMP_BASE}/biggest-losers?apikey={k}", timeout=_FMP_TIMEOUT)
-        if rl.status_code == 200:
-            result["losers"] = (rl.json() or [])[:10]
-    except Exception:
-        pass
-    return result
-
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fmp_earnings_transcript(ticker: str) -> dict:
     """FMP /earning-call-transcript — 직전 분기 어닝콜 원문.
@@ -11138,45 +11113,200 @@ if st.session_state.get("logged_in"):
                         st.markdown("**🤖 AI 리뷰:**")
                         st.markdown(str(_r.get("review_comment", "")))
 
-        # ── 오늘의 급등/급락 Top 10 ──────────────────────────────────────
+        # ── 🎯 오늘 투자해도 될까? — 실시간 투자 판단 브리핑 ────────────────
         st.divider()
-        st.markdown("### 📈 오늘의 급등/급락 Top 10")
-        st.caption("FMP biggest-gainers/losers 기준. 5분 캐시. 어떤 섹터가 장을 주도하는지 빠르게 파악하세요.")
-        with st.spinner("급등/급락 데이터 조회 중..."):
-            _gl_data = _fmp_biggest_gainers_losers()
-        _gl_c1, _gl_c2 = st.columns(2)
-        with _gl_c1:
-            st.markdown("#### 🚀 급등 Top 10")
-            _gainers = _gl_data.get("gainers", [])
-            if _gainers:
-                _g_rows = []
-                for _g in _gainers[:10]:
-                    _pct = to_float(_g.get("changesPercentage") or _g.get("change_percentage"))
-                    _g_rows.append({
-                        "티커": str(_g.get("symbol") or ""),
-                        "종목명": str(_g.get("name") or "")[:20],
-                        "현재가": f"${to_float(_g.get('price')):.2f}" if pd.notna(to_float(_g.get('price'))) else "N/A",
-                        "등락률": f"+{_pct:.2f}%" if pd.notna(_pct) else "N/A",
-                    })
-                st.dataframe(pd.DataFrame(_g_rows), use_container_width=True, hide_index=True)
+        st.markdown("### 🎯 오늘 투자해도 될까?")
+        st.caption(
+            "아침 시장 예측 + 현재 거시경제 지표 + DRG 선행 신호를 종합해 "
+            "Gemini가 지금 이 순간 투자 판단을 내립니다."
+        )
+
+        _itb_session_key = "invest_today_briefing"
+        _itb_ts_key = "invest_today_briefing_ts"
+        _itb_uid = str(st.session_state.get("user_id") or "").strip()
+
+        # ── 입력 데이터 수집 ────────────────────────────────────────────────
+        # 1) 오늘 아침 예측
+        _itb_today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+        _itb_pred_df = load_drg_predictions(_itb_uid)
+        _itb_today_pred = None
+        if not _itb_pred_df.empty:
+            _itb_match = _itb_pred_df[
+                _itb_pred_df["pred_date"].astype(str).str[:10] == _itb_today_str
+            ]
+            if not _itb_match.empty:
+                _itb_today_pred = _itb_match.iloc[-1]
+
+        # 2) DRG 현재 점수/신호 (이미 위에서 계산된 drg 재사용)
+        # drg 변수는 이 페이지 상단에서 이미 compute_daily_risk_gauge()로 계산됨
+
+        # ── 상태 표시 ────────────────────────────────────────────────────────
+        _itb_info_c1, _itb_info_c2, _itb_info_c3 = st.columns(3)
+        with _itb_info_c1:
+            if _itb_today_pred is not None:
+                st.success(f"✅ 오늘 예측 있음\n\n**{_itb_today_pred.get('direction', '')}**")
             else:
-                st.caption("급등 데이터를 가져올 수 없습니다.")
-        with _gl_c2:
-            st.markdown("#### 📉 급락 Top 10")
-            _losers = _gl_data.get("losers", [])
-            if _losers:
-                _l_rows = []
-                for _l in _losers[:10]:
-                    _pct = to_float(_l.get("changesPercentage") or _l.get("change_percentage"))
-                    _l_rows.append({
-                        "티커": str(_l.get("symbol") or ""),
-                        "종목명": str(_l.get("name") or "")[:20],
-                        "현재가": f"${to_float(_l.get('price')):.2f}" if pd.notna(to_float(_l.get('price'))) else "N/A",
-                        "등락률": f"{_pct:.2f}%" if pd.notna(_pct) else "N/A",
-                    })
-                st.dataframe(pd.DataFrame(_l_rows), use_container_width=True, hide_index=True)
+                st.warning("⚠️ 오늘 아침 예측 없음\n\n(예측 없이도 분석 가능)")
+        with _itb_info_c2:
+            st.info(
+                f"**DRG:** {drg.get('risk_level', 'N/A')}\n\n"
+                f"Risk Score: {drg.get('risk_score', 'N/A')}/10"
+            )
+        with _itb_info_c3:
+            if st.session_state.get(_itb_ts_key):
+                st.info(f"⏱️ 마지막 분석\n\n{st.session_state[_itb_ts_key]}")
             else:
-                st.caption("급락 데이터를 가져올 수 없습니다.")
+                st.info("📊 거시 지표 자동 로드됨\n\n버튼을 눌러 분석 시작")
+
+        # ── 실행 버튼 ────────────────────────────────────────────────────────
+        _itb_btn_col, _itb_reset_col = st.columns([3, 1])
+        with _itb_btn_col:
+            _run_itb = st.button(
+                "🎯 지금 투자해도 될지 분석",
+                key="invest_today_briefing_btn",
+                use_container_width=True,
+                type="primary",
+            )
+        with _itb_reset_col:
+            if st.button("🗑️ 초기화", key="invest_today_briefing_reset", use_container_width=True):
+                st.session_state.pop(_itb_session_key, None)
+                st.session_state.pop(_itb_ts_key, None)
+                st.rerun()
+
+        if _run_itb:
+            # ── 거시 지표 로드 ────────────────────────────────────────────
+            with st.spinner("거시경제 지표 로드 중..."):
+                _itb_macro = get_macro_dashboard_with_validation()
+
+            # ── 프롬프트 구성 ─────────────────────────────────────────────
+            # 1) 아침 예측 섹션
+            if _itb_today_pred is not None:
+                _pred_section = (
+                    f"[오늘 아침 시장 예측 — {_itb_today_pred.get('pred_date', '')}]\n"
+                    f"예측 방향: {_itb_today_pred.get('direction', '')}\n"
+                    f"섹터 필터: {_itb_today_pred.get('sector_filter', '전체')}\n"
+                    f"벤치마크: {_itb_today_pred.get('benchmark_etf', 'SPY')}\n"
+                    f"예측 전문 (앞 800자):\n{str(_itb_today_pred.get('full_text', ''))[:800]}\n"
+                )
+            else:
+                _pred_section = "[오늘 아침 시장 예측]\n예측 기록 없음 (아직 실행 전이거나 휴장일)\n"
+
+            # 2) DRG 신호 섹션
+            _sig = drg.get("signals", {})
+            _sig_lines = []
+            _sig_label_map = {
+                "vix": "VIX 방향",
+                "credit": "신용 스프레드",
+                "leaders": "대장주 모멘텀",
+                "volume": "거래량 패턴",
+                "vix_vxn": "VIX/VXN 비율",
+                "event_risk": "이벤트 리스크",
+                "futures": "선물 방향",
+                "riskoff": "리스크오프 신호",
+            }
+            for _sk, _sl in _sig_label_map.items():
+                _sv = _sig.get(_sk)
+                if _sv:
+                    _ok_str = "✅ 정상" if _sv.get("ok") else "❌ 경고"
+                    _sig_lines.append(f"  - {_sl}: {_ok_str} | {_sv.get('value', 'N/A')}")
+            _drg_section = (
+                f"[DRG (Daily Risk Gauge) 현재 상태]\n"
+                f"종합 Risk Score: {drg.get('risk_score', 'N/A')}/10 — {drg.get('risk_level', '')}\n"
+                f"요약: {drg.get('risk_msg', '')}\n"
+                f"선행 신호 상세:\n" + "\n".join(_sig_lines) + "\n"
+            )
+
+            # 3) 거시 지표 섹션
+            _macro_lines = []
+            for _mr in (_itb_macro.get("rows") or [])[:12]:
+                _macro_lines.append(
+                    f"  - {_mr.get('지표', '')}: {_mr.get('현재값', 'N/A')} → {_mr.get('판정', '')} | {_mr.get('판독 요약', '')[:60]}"
+                )
+            _macro_score = _itb_macro.get("macro_score", "N/A")
+            _macro_grade = _itb_macro.get("macro_grade", "N/A")
+            _fg_rating = _itb_macro.get("fg_rating", "N/A")
+            _macro_section = (
+                f"[거시경제 지표 현황]\n"
+                f"종합 Macro Score: {_macro_score}/100 — {_macro_grade}\n"
+                f"Fear & Greed: {_fg_rating}\n"
+                f"주요 지표:\n" + "\n".join(_macro_lines) + "\n"
+            )
+
+            # 4) 최종 프롬프트
+            _itb_prompt = f"""당신은 월가 퀀트 스트래티지스트입니다.
+아래 세 가지 데이터를 종합해서 **지금 이 순간** 투자 판단을 내려주세요.
+
+{_pred_section}
+{_drg_section}
+{_macro_section}
+
+---
+다음 형식으로 한국어로 답변하세요:
+
+## 📊 신호 일치도 분석
+아침 예측 방향과 현재 DRG·거시 지표가 일치하는지 불일치하는지 2~3문장으로 설명.
+
+## 🎯 투자 판단 (세 가지)
+- 🟢 **신규 진입**: [가능 / 자제 / 불가] — 이유 1문장
+- 🟡 **기존 포지션 유지**: [유지 / 일부 축소 / 전량 축소] — 이유 1문장
+- 🔴 **헷지·현금 비중**: [현수준 유지 / 확대 권장 / 긴급 확대] — 이유 1문장
+
+## 💡 확신도
+[0~100 숫자]% — 이유 1문장 (신호들이 일관되면 높음, 혼조세면 낮음)
+
+## ⚠️ 오늘 가장 주목할 리스크 1가지
+한 문장으로.
+
+## ✅ 오늘 가장 긍정적인 신호 1가지
+한 문장으로.
+"""
+
+            with st.spinner("Gemini 투자 판단 분석 중... (10~20초)"):
+                try:
+                    _itb_model = _GenAIModel(
+                        "gemini-2.5-flash",
+                        generation_config={"temperature": 0.2, "max_output_tokens": 1024},
+                    )
+                    _itb_resp = _itb_model.generate_content(_itb_prompt)
+                    _itb_text = (_gemini_response_text_utf8_safe(_itb_resp) or "").strip()
+                    if _itb_text:
+                        _now_et = datetime.now(_MARKET_ET_TZ)
+                        _ts_str = _now_et.strftime("%m/%d %H:%M ET")
+                        # 장 마감까지 남은 시간
+                        _market_close = _now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+                        _mins_left = int((_market_close - _now_et).total_seconds() / 60)
+                        _validity = (
+                            f"장 마감까지 약 {_mins_left}분" if 0 < _mins_left < 480
+                            else ("장 마감 후" if _mins_left <= 0 else "프리마켓")
+                        )
+                        st.session_state[_itb_session_key] = {
+                            "text": _itb_text,
+                            "timestamp": _ts_str,
+                            "validity": _validity,
+                            "pred_direction": _itb_today_pred.get("direction", "없음") if _itb_today_pred is not None else "없음",
+                            "drg_score": drg.get("risk_score", "N/A"),
+                            "macro_score": _macro_score,
+                        }
+                        st.session_state[_itb_ts_key] = _ts_str
+                    else:
+                        st.warning("분석 결과를 받지 못했습니다. 다시 시도해주세요.")
+                except Exception as _itb_err:
+                    st.error(f"Gemini 분석 실패: {_itb_err}")
+
+        # ── 저장된 결과 표시 ────────────────────────────────────────────────
+        _itb_saved = st.session_state.get(_itb_session_key)
+        if _itb_saved and _itb_saved.get("text"):
+            _itb_meta_c1, _itb_meta_c2, _itb_meta_c3, _itb_meta_c4 = st.columns(4)
+            _itb_meta_c1.metric("분석 시각", _itb_saved.get("timestamp", "N/A"))
+            _itb_meta_c2.metric("유효 시간", _itb_saved.get("validity", "N/A"))
+            _itb_meta_c3.metric("DRG 점수", f"{_itb_saved.get('drg_score', 'N/A')}/10")
+            _itb_meta_c4.metric("Macro Score", f"{_itb_saved.get('macro_score', 'N/A')}/100")
+            st.markdown("---")
+            st.markdown(_itb_saved["text"])
+            st.caption(
+                "⚠️ 이 분석은 투자 참고용입니다. 최종 투자 결정은 본인의 판단으로 하세요. "
+                "새로운 뉴스·이벤트 발생 시 '🗑️ 초기화' 후 재분석을 권장합니다."
+            )
 
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
