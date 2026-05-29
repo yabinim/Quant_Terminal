@@ -88,8 +88,12 @@ _WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Al
 _THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
 
+@st.cache_resource
 def get_gspread_client():
-    """`st.secrets['gcp_service_account']` 서비스 계정으로 gspread 클라이언트 생성. 미설정 시 None."""
+    """`st.secrets['gcp_service_account']` 서비스 계정으로 gspread 클라이언트 생성. 미설정 시 None.
+    @st.cache_resource: 앱 전체 세션에서 OAuth 인증을 1회만 수행하고 클라이언트를 재사용.
+    (기존: open_*_worksheet 10개가 각각 독립 인증 → 매 호출마다 새 auth 요청)
+    """
     try:
         info = dict(st.secrets["gcp_service_account"])
     except (KeyError, FileNotFoundError, TypeError):
@@ -1295,6 +1299,7 @@ def evaluate_vix_status(vix_value):
     return MACRO_STATUS_PASS, "상대적으로 낮은 불안 구간입니다. 단, 역사적 평균 대비 고점 돌파 시 추세를 확인하세요."
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_vix_latest_and_history():
     """VIX 현재값 + 1년 히스토리 — FRED VIXCLS 사용."""
     try:
@@ -1323,6 +1328,7 @@ def evaluate_wti_status(wti):
     return MACRO_STATUS_PASS, "유가가 과도하게 붐비거나 붕괴한 구간은 아닙니다."
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_wti_latest():
     """WTI 유가 최신값 — FRED DCOILWTICO 사용."""
     try:
@@ -1402,6 +1408,7 @@ def evaluate_cpi_yoy():
         return MACRO_STATUS_NA, np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_dxy_latest_and_mean_deviation():
     """DXY 달러 인덱스 — FRED DTWEXBGS 사용."""
     try:
@@ -1468,6 +1475,7 @@ def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
     return results
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fed_funds_rate() -> tuple[float, str]:
     """FRED FEDFUNDS 시리즈에서 현재 기준금리 반환. (rate, note)"""
     try:
@@ -1486,6 +1494,7 @@ def fetch_fed_funds_rate() -> tuple[float, str]:
         return np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_macro_history_series() -> dict:
     """CPI·실업률·DXY·Fed Rate 1~2년 히스토리 시리즈 반환."""
     out = {}
@@ -3484,6 +3493,65 @@ def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
     return pd.DataFrame(close_dict).sort_index()
 
 
+# ── _fmp_fill 내부 uncached requests.get 3개를 캐싱 래퍼로 분리 ──────────
+# 기존: _fmp_fill() 호출마다 /quote, /analyst-estimates, /balance-sheet를
+#        직접 requests.get → 스캐너 30~50 티커 루프에서 최대 150회 raw HTTP.
+# 개선: 각각 @st.cache_data(ttl=3600) 래퍼로 감싸 첫 호출 이후 캐시 히트.
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_quote(ticker: str) -> dict:
+    """FMP /quote — MA50/MA200/52w고저/현재가/시총. _fmp_fill 전용 캐싱 래퍼."""
+    k = _fmp_key()
+    if not k:
+        return {}
+    try:
+        r = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
+        if r.status_code == 200:
+            d = r.json()
+            return d[0] if isinstance(d, list) and d else {}
+    except Exception:
+        pass
+    return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_analyst_estimates(ticker: str) -> list:
+    """FMP /analyst-estimates (annual, limit=4) — Forward P/E 계산용. _fmp_fill 전용 캐싱 래퍼."""
+    k = _fmp_key()
+    if not k:
+        return []
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d if isinstance(d, list) else []
+    except Exception:
+        pass
+    return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_balance_sheet(ticker: str) -> dict:
+    """FMP /balance-sheet-statement (limit=2) — ROE·D/E 직접 계산용. _fmp_fill 전용 캐싱 래퍼."""
+    k = _fmp_key()
+    if not k:
+        return {}
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit=2&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d[0] if isinstance(d, list) and d else {}
+    except Exception:
+        pass
+    return {}
+
+
 def _fmp_fill(info: dict, ticker: str) -> dict:
     """yfinance info dict의 빈 필드를 FMP로 채워 반환.
     ※ FMP Starter 플랜 실제 제공 필드만 사용.
@@ -3537,31 +3605,26 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
     _need_quote = not all([info.get("fiftyDayAverage"), info.get("twoHundredDayAverage")])
     if _need_quote:
         try:
-            k_q = _fmp_key()
-            if k_q:
-                rq = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k_q}", timeout=_FMP_TIMEOUT)
-                if rq.status_code == 200:
-                    qd = rq.json()
-                    q_item = qd[0] if isinstance(qd, list) and qd else {}
-                    if q_item:
-                        if not info.get("fiftyDayAverage"):
-                            v = to_float(q_item.get("priceAvg50"))
-                            if pd.notna(v): info["fiftyDayAverage"] = v
-                        if not info.get("twoHundredDayAverage"):
-                            v = to_float(q_item.get("priceAvg200"))
-                            if pd.notna(v): info["twoHundredDayAverage"] = v
-                        if not info.get("fiftyTwoWeekHigh"):
-                            v = to_float(q_item.get("yearHigh"))
-                            if pd.notna(v): info["fiftyTwoWeekHigh"] = v
-                        if not info.get("fiftyTwoWeekLow"):
-                            v = to_float(q_item.get("yearLow"))
-                            if pd.notna(v): info["fiftyTwoWeekLow"] = v
-                        if not info.get("currentPrice"):
-                            v = to_float(q_item.get("price"))
-                            if pd.notna(v): info["currentPrice"] = v
-                        if not info.get("marketCap"):
-                            v = to_float(q_item.get("marketCap"))
-                            if pd.notna(v): info["marketCap"] = v
+            q_item = _fmp_quote(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
+            if q_item:
+                if not info.get("fiftyDayAverage"):
+                    v = to_float(q_item.get("priceAvg50"))
+                    if pd.notna(v): info["fiftyDayAverage"] = v
+                if not info.get("twoHundredDayAverage"):
+                    v = to_float(q_item.get("priceAvg200"))
+                    if pd.notna(v): info["twoHundredDayAverage"] = v
+                if not info.get("fiftyTwoWeekHigh"):
+                    v = to_float(q_item.get("yearHigh"))
+                    if pd.notna(v): info["fiftyTwoWeekHigh"] = v
+                if not info.get("fiftyTwoWeekLow"):
+                    v = to_float(q_item.get("yearLow"))
+                    if pd.notna(v): info["fiftyTwoWeekLow"] = v
+                if not info.get("currentPrice"):
+                    v = to_float(q_item.get("price"))
+                    if pd.notna(v): info["currentPrice"] = v
+                if not info.get("marketCap"):
+                    v = to_float(q_item.get("marketCap"))
+                    if pd.notna(v): info["marketCap"] = v
         except Exception:
             pass
 
@@ -3600,55 +3663,42 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
     # 실제 API 응답: epsAvg 필드 사용, period=annual&limit=4로 가장 가까운 연도 우선
     if not info.get("forwardPE"):
         try:
-            k_val = _fmp_key()
-            if k_val:
-                r_ae = requests.get(
-                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k_val}",
-                    timeout=_FMP_TIMEOUT
+            ae_data = _fmp_analyst_estimates(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
+            if isinstance(ae_data, list) and ae_data:
+                current_year = datetime.now().year
+                # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
+                ae_sorted = sorted(
+                    ae_data,
+                    key=lambda x: str(x.get("date") or x.get("year") or "9999")
                 )
-                if r_ae.status_code == 200:
-                    ae_data = r_ae.json()
-                    if isinstance(ae_data, list) and ae_data:
-                        current_year = datetime.now().year
-                        # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
-                        ae_sorted = sorted(
-                            ae_data,
-                            key=lambda x: str(x.get("date") or x.get("year") or "9999")
-                        )
-                        for ae in ae_sorted:
-                            ae_year_str = str(ae.get("date") or ae.get("year") or "")[:4]
-                            try:
-                                ae_year = int(ae_year_str)
-                            except Exception:
-                                continue
-                            if ae_year < current_year:
-                                continue
-                            # 실제 API 필드명: epsAvg (확인됨)
-                            est_eps = to_float(
-                                ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
-                                ae.get("estimatedEps") or ae.get("eps")
-                            )
-                            cur_price = to_float(
-                                info.get("currentPrice") or info.get("price") or
-                                info.get("regularMarketPrice") or info.get("_fmp_price")
-                            )
-                            # currentPrice 없으면 profile에서 직접 가져오기
-                            if (cur_price is None or pd.isna(cur_price)) and k_val:
-                                try:
-                                    _rp = requests.get(f"{_FMP_BASE}/profile?symbol={ticker}&apikey={k_val}", timeout=_FMP_TIMEOUT)
-                                    if _rp.status_code == 200:
-                                        _pd2 = _rp.json()
-                                        _pi2 = _pd2[0] if isinstance(_pd2, list) and _pd2 else {}
-                                        cur_price = to_float(_pi2.get("price"))
-                                        if pd.notna(cur_price):
-                                            info["currentPrice"] = cur_price
-                                except Exception:
-                                    pass
-                            if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
-                                fwd_pe = round(float(cur_price) / float(est_eps), 2)
-                                if 0 < fwd_pe < 2000:
-                                    info["forwardPE"] = fwd_pe
-                                    break
+                for ae in ae_sorted:
+                    ae_year_str = str(ae.get("date") or ae.get("year") or "")[:4]
+                    try:
+                        ae_year = int(ae_year_str)
+                    except Exception:
+                        continue
+                    if ae_year < current_year:
+                        continue
+                    # 실제 API 필드명: epsAvg (확인됨)
+                    est_eps = to_float(
+                        ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
+                        ae.get("estimatedEps") or ae.get("eps")
+                    )
+                    cur_price = to_float(
+                        info.get("currentPrice") or info.get("price") or
+                        info.get("regularMarketPrice") or info.get("_fmp_price")
+                    )
+                    # currentPrice 없으면 캐싱된 profile에서 가져오기 (기존: 별도 requests.get)
+                    if (cur_price is None or pd.isna(cur_price)):
+                        _p_cur = _fmp_profile(ticker)
+                        cur_price = to_float(_p_cur.get("price")) if _p_cur else np.nan
+                        if pd.notna(cur_price):
+                            info["currentPrice"] = cur_price
+                    if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
+                        fwd_pe = round(float(cur_price) / float(est_eps), 2)
+                        if 0 < fwd_pe < 2000:
+                            info["forwardPE"] = fwd_pe
+                            break
         except Exception:
             pass
 
@@ -3745,15 +3795,9 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
 
         # balance-sheet에서 직접 ROE, D/E 계산
         try:
-            k_val = _fmp_key()
-            if k_val and (not info.get("returnOnEquity") or not info.get("debtToEquity")):
-                rb = requests.get(
-                    f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit=2&apikey={k_val}",
-                    timeout=_FMP_TIMEOUT
-                )
-                bs_data = rb.json() if rb.status_code == 200 else []
-                if isinstance(bs_data, list) and bs_data:
-                    bs = bs_data[0]
+            if not info.get("returnOnEquity") or not info.get("debtToEquity"):
+                bs = _fmp_balance_sheet(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
+                if bs:
                     equity = to_float(bs.get("totalStockholdersEquity") or bs.get("stockholdersEquity"))
                     total_debt = to_float(bs.get("totalDebt") or bs.get("longTermDebt"))
                     net_income = to_float(latest.get("netIncome")) if latest else np.nan
