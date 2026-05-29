@@ -1634,77 +1634,106 @@ def fetch_fed_funds_rate() -> tuple[float, str]:
     return np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
+def _hist_fetch_fedfunds() -> pd.Series:
+    """FEDFUNDS 히스토리 — FRED 1순위, FMP 폴백."""
+    try:
+        s = fred.get_series("FEDFUNDS")
+        if s is not None and not s.empty:
+            return pd.to_numeric(s, errors="coerce").dropna().tail(24)
+    except Exception:
+        pass
+    try:
+        k = _fmp_key()
+        if k:
+            r = requests.get(
+                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}",
+                timeout=_FMP_TIMEOUT,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    df = pd.DataFrame(data)[["date", "value"]].copy()
+                    df["date"] = pd.to_datetime(df["date"])
+                    df = df.set_index("date").sort_index()
+                    return pd.to_numeric(df["value"], errors="coerce").dropna().tail(24)
+    except Exception:
+        pass
+    return pd.Series(dtype=float)
+
+
+def _hist_fetch_dxy() -> pd.Series:
+    """DXY 히스토리 — FRED 1순위, FMP UUP 폴백."""
+    try:
+        s = fred.get_series("DTWEXBGS")
+        if s is not None and not s.empty:
+            return pd.to_numeric(s, errors="coerce").dropna().tail(500)
+    except Exception:
+        pass
+    try:
+        k = _fmp_key()
+        if k:
+            r = requests.get(
+                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=500&apikey={k}",
+                timeout=_FMP_TIMEOUT,
+            )
+            if r.status_code == 200:
+                d = r.json()
+                rows = d.get("historical", d) if isinstance(d, dict) else d
+                if isinstance(rows, list) and rows:
+                    df = pd.DataFrame(rows)
+                    if "date" in df.columns:
+                        cc = "close" if "close" in df.columns else "Close"
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                        return pd.to_numeric(df[cc], errors="coerce").dropna().tail(500)
+    except Exception:
+        pass
+    return pd.Series(dtype=float)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_macro_history_series() -> dict:
     """CPI·실업률·DXY·Fed Rate 1~2년 히스토리 시리즈.
-    각 지표마다 FRED 1순위 → FMP 폴백.
+    4개 소스를 ThreadPoolExecutor로 병렬 조회.
     """
+    import concurrent.futures as _cf
+
+    def _safe_cpi():
+        try:
+            s = _fetch_cpi_series()
+            if not s.empty:
+                df = pd.DataFrame({"CPI": s}).dropna()
+                df["v"] = df["CPI"].pct_change(12) * 100
+                return ("cpi", df["v"].dropna().tail(24))
+        except Exception:
+            pass
+        return ("cpi", pd.Series(dtype=float))
+
+    def _safe_un():
+        try:
+            s = _fetch_unrate_series()
+            if not s.empty:
+                return ("unrate", s.tail(24))
+        except Exception:
+            pass
+        return ("unrate", pd.Series(dtype=float))
+
+    def _safe_fed():
+        return ("fedfunds", _hist_fetch_fedfunds())
+
+    def _safe_dxy():
+        return ("dxy", _hist_fetch_dxy())
+
     out = {}
-    # ── CPI ──────────────────────────────────────────────────────────
-    try:
-        cpi_s = _fetch_cpi_series()
-        if not cpi_s.empty:
-            cpi_df = pd.DataFrame({"CPI": cpi_s}).dropna()
-            cpi_df["CPI YoY(%)"] = cpi_df["CPI"].pct_change(12) * 100
-            out["cpi"] = cpi_df["CPI YoY(%)"].dropna().tail(24)
-    except Exception:
-        pass
-    # ── UNRATE ───────────────────────────────────────────────────────
-    try:
-        un_s = _fetch_unrate_series()
-        if not un_s.empty:
-            out["unrate"] = un_s.tail(24)
-    except Exception:
-        pass
-    # ── Fed Rate ─────────────────────────────────────────────────────
-    try:
-        fed_s = fred.get_series("FEDFUNDS")
-        if fed_s is not None and not fed_s.empty:
-            out["fedfunds"] = pd.to_numeric(fed_s, errors="coerce").dropna().tail(24)
-    except Exception:
-        # FMP federalFundsRate 폴백
-        try:
-            k = _fmp_key()
-            if k:
-                r = requests.get(
-                    f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}",
-                    timeout=_FMP_TIMEOUT,
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, list) and data:
-                        df = pd.DataFrame(data)[["date", "value"]].copy()
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        out["fedfunds"] = pd.to_numeric(df["value"], errors="coerce").dropna().tail(24)
-        except Exception:
-            pass
-    # ── DXY ──────────────────────────────────────────────────────────
-    try:
-        dxy_s = fred.get_series("DTWEXBGS")
-        if dxy_s is not None and not dxy_s.empty:
-            out["dxy"] = pd.to_numeric(dxy_s, errors="coerce").dropna().tail(500)
-    except Exception:
-        # FMP UUP 폴백 — full 엔드포인트
-        try:
-            k = _fmp_key()
-            if k:
-                r = requests.get(
-                    f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=500&apikey={k}",
-                    timeout=_FMP_TIMEOUT,
-                )
-                if r.status_code == 200:
-                    d = r.json()
-                    rows = d.get("historical", d) if isinstance(d, dict) else d
-                    if isinstance(rows, list) and rows:
-                        df = pd.DataFrame(rows)
-                        if "date" in df.columns:
-                            cc = "close" if "close" in df.columns else "Close"
-                            df["date"] = pd.to_datetime(df["date"])
-                            df = df.set_index("date").sort_index()
-                            out["dxy"] = pd.to_numeric(df[cc], errors="coerce").dropna().tail(500)
-        except Exception:
-            pass
+    with _cf.ThreadPoolExecutor(max_workers=4) as exe:
+        futs = [exe.submit(fn) for fn in (_safe_cpi, _safe_un, _safe_fed, _safe_dxy)]
+        for fut in _cf.as_completed(futs, timeout=20):
+            try:
+                key, val = fut.result()
+                if not val.empty:
+                    out[key] = val
+            except Exception:
+                pass
     return out
 
 
@@ -1838,19 +1867,62 @@ def compute_macro_score(rows: list) -> tuple[float, str, str]:
 
 
 def analyze_us_macro_dashboard():
-    spread_val, spread_st, spread_note = fetch_yield_spread_latest()
+    import concurrent.futures as _cf
 
-    vix_val, vix_hist, vix_err = fetch_vix_latest_and_history()
+    # ── 모든 외부 API를 병렬로 동시 호출 (순차 3분 → 병렬 ~20초) ─────────
+    def _safe(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+
+    _tasks = {
+        "spread":   (fetch_yield_spread_latest,          []),
+        "vix":      (fetch_vix_latest_and_history,       []),
+        "wti":      (fetch_wti_latest,                   []),
+        "un":       (evaluate_unemployment_sahm_series,  []),
+        "cpi":      (evaluate_cpi_yoy,                   []),
+        "dxy":      (fetch_dxy_latest_and_mean_deviation,[]),
+        "fed":      (fetch_fed_funds_rate,               []),
+        "fg":       (fetch_macro_history_series,         []),
+        "gdp":      (fetch_fmp_economic_indicator,       ["GDP"]),
+        "rs":       (fetch_fmp_economic_indicator,       ["retailSales"]),
+        "erp":      (fetch_fmp_market_risk_premium,      []),
+    }
+
+    _results = {}
+    with _cf.ThreadPoolExecutor(max_workers=11) as _exe:
+        _futures = {
+            name: _exe.submit(_safe, fn, *args)
+            for name, (fn, args) in _tasks.items()
+        }
+        for name, fut in _futures.items():
+            try:
+                _results[name] = fut.result(timeout=25)
+            except Exception:
+                _results[name] = None
+
+    # ── 결과 언팩 ─────────────────────────────────────────────────────
+    _s = _results.get("spread") or (np.nan, MACRO_STATUS_NA, "조회 실패")
+    spread_val, spread_st, spread_note = _s
+
+    _v = _results.get("vix") or (np.nan, None, "조회 실패")
+    vix_val, vix_hist, vix_err = _v
     vix_st, vix_note = evaluate_vix_status(vix_val)
 
-    wti = fetch_wti_latest()
+    wti = _results.get("wti") or np.nan
+    if wti is None:
+        wti = np.nan
     wti_st, wti_note = evaluate_wti_status(wti)
 
-    un_st, un_avg3, un_yr_low, un_margin, un_note = evaluate_unemployment_sahm_series()
+    _u = _results.get("un") or (MACRO_STATUS_NA, np.nan, np.nan, np.nan, _FRED_TRANSIENT_ERROR_NOTE)
+    un_st, un_avg3, un_yr_low, un_margin, un_note = _u
 
-    cpi_st, cpi_yoy, cpi_note = evaluate_cpi_yoy()
+    _c = _results.get("cpi") or (MACRO_STATUS_NA, np.nan, _FRED_TRANSIENT_ERROR_NOTE)
+    cpi_st, cpi_yoy, cpi_note = _c
 
-    dxy, dxy_dev, dxy_st_base = fetch_dxy_latest_and_mean_deviation()
+    _d = _results.get("dxy") or (np.nan, np.nan, MACRO_STATUS_NA)
+    dxy, dxy_dev, dxy_st_base = _d
 
     rows = []
 
@@ -1977,7 +2049,8 @@ def analyze_us_macro_dashboard():
     })
 
     # Fed Funds Rate
-    fed_rate, fed_note = fetch_fed_funds_rate()
+    _fr = _results.get("fed") or (np.nan, _FRED_TRANSIENT_ERROR_NOTE)
+    fed_rate, fed_note = _fr
     fed_status = (
         MACRO_STATUS_FAIL if pd.notna(fed_rate) and fed_rate >= 5.0
         else MACRO_STATUS_WARN if pd.notna(fed_rate) and fed_rate >= 3.0
@@ -1995,7 +2068,8 @@ def analyze_us_macro_dashboard():
     # ── FMP GDP 성장률 (QoQ %) ──────────────────────────────────────────
     # FMP 'GDP' API는 절대값(십억 달러 단위 연율)을 반환하므로
     # 전분기 대비 변화율(%)을 직접 계산해야 한다.
-    gdp_abs, gdp_abs_prev, gdp_date = fetch_fmp_economic_indicator("GDP")
+    _gdp = _results.get("gdp") or (np.nan, np.nan, "")
+    gdp_abs, gdp_abs_prev, gdp_date = _gdp
     if pd.notna(gdp_abs) and pd.notna(gdp_abs_prev) and gdp_abs_prev != 0:
         gdp_qoq = float((gdp_abs / gdp_abs_prev - 1.0) * 100)
     else:
@@ -2036,7 +2110,8 @@ def analyze_us_macro_dashboard():
     # ── FMP Retail Sales (소매판매 MoM %) ──────────────────────────────
     # FMP 'retailSales' API는 절대값(백만 달러)을 반환하므로
     # 전월 대비 변화율(%)을 직접 계산해야 한다.
-    rs_abs, rs_abs_prev, rs_date = fetch_fmp_economic_indicator("retailSales")
+    _rs = _results.get("rs") or (np.nan, np.nan, "")
+    rs_abs, rs_abs_prev, rs_date = _rs
     if pd.notna(rs_abs) and pd.notna(rs_abs_prev) and rs_abs_prev != 0:
         rs_mom = float((rs_abs / rs_abs_prev - 1.0) * 100)
     else:
@@ -2074,7 +2149,8 @@ def analyze_us_macro_dashboard():
     })
 
     # ── FMP Market Risk Premium (ERP) ──────────────────────────────────
-    erp_val, erp_note = fetch_fmp_market_risk_premium()
+    _erp = _results.get("erp") or (np.nan, "조회 실패")
+    erp_val, erp_note = _erp
     if pd.notna(erp_val):
         if erp_val >= 5.5:
             erp_st = MACRO_STATUS_PASS
@@ -2822,47 +2898,27 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     warnings = []
     details = {}
 
-    # ── 신호 1: VIX 방향 전환 (FRED 1순위 → FMP 폴백) ─────────────────
+    # ── 신호 1: VIX 방향 전환 — 캐시된 fetch_vix_latest_and_history() 재사용
+    # (FRED/FMP 이중 소스 + @st.cache_data(ttl=3600) → 중복 API 호출 없음)
     vix_close = pd.Series(dtype=float)
     _vix_source = ""
     try:
-        _s = fred.get_series("VIXCLS")
-        _s = pd.to_numeric(_s, errors="coerce").dropna().tail(30)
-        if len(_s) >= 10:
-            vix_close = _s
-            _vix_source = "FRED"
+        _vix_val, _vix_hist, _vix_err = fetch_vix_latest_and_history()
+        if _vix_hist is not None and not _vix_hist.empty and "Close" in _vix_hist.columns:
+            _s30 = pd.to_numeric(_vix_hist["Close"], errors="coerce").dropna().tail(30)
+            if len(_s30) >= 10:
+                vix_close = _s30
+                _vix_source = "캐시" if _vix_err in (None, "FMP폴백") else "FRED"
     except Exception:
         pass
-    if vix_close.empty:
-        try:
-            _k = _fmp_key()
-            if _k:
-                _r = requests.get(
-                    f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX&limit=30&apikey={_k}",
-                    timeout=_FMP_TIMEOUT,
-                )
-                if _r.status_code == 200:
-                    _d = _r.json()
-                    _rows = _d.get("historical", _d) if isinstance(_d, dict) else _d
-                    if isinstance(_rows, list) and _rows:
-                        _df = pd.DataFrame(_rows)
-                        if "date" in _df.columns:
-                            _cc = "close" if "close" in _df.columns else "Close"
-                            _df = _df[["date", _cc]].rename(columns={_cc: "Close"})
-                            _df["date"] = pd.to_datetime(_df["date"])
-                            _df = _df.set_index("date").sort_index()
-                            vix_close = pd.to_numeric(_df["Close"], errors="coerce").dropna()
-                            _vix_source = "FMP"
-        except Exception:
-            pass
     try:
         if len(vix_close) >= 10:
             vix_now = float(vix_close.iloc[-1])
             vix_20d_avg = float(vix_close.tail(20).mean())
             vix_trend = vix_now - float(vix_close.iloc[-6]) if len(vix_close) >= 6 else 0
             vix_alert = vix_trend > 2 or vix_now > vix_20d_avg * 1.15
-            signals["vix"] = {"ok": not vix_alert, "value": f"{vix_now:.1f} [{_vix_source}]", "trend": f"{vix_trend:+.1f}/5일"}
-            details["VIX"] = {"현재값": f"{vix_now:.1f}", "5일 변화": f"{vix_trend:+.1f}", "20일 평균": f"{vix_20d_avg:.1f}", "소스": _vix_source}
+            signals["vix"] = {"ok": not vix_alert, "value": f"{vix_now:.1f}", "trend": f"{vix_trend:+.1f}/5일"}
+            details["VIX"] = {"현재값": f"{vix_now:.1f}", "5일 변화": f"{vix_trend:+.1f}", "20일 평균": f"{vix_20d_avg:.1f}"}
             if vix_alert:
                 warnings.append(f"⚠️ VIX 상승 전환 감지 ({vix_now:.1f}, +{vix_trend:.1f}/5일)")
         else:
@@ -2954,49 +3010,51 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 5: VIX/VXN 비율 (공포 급등 탐지) ─────────────────────────
-    # 데이터 소스 우선순위: FMP ^VXN → FRED VXNCLS → VIX 단독 판정(폴백)
-    _vxn = pd.Series(dtype=float)
-    # 소스 1: FMP ^VXN
+    # ── 신호 5: VIX 레짐 (공포 구조 판정) ──────────────────────────────
+    # VXN은 가져오기 어려운 경우가 많고, VIX 단독으로도 충분한 신호.
+    # LOW(<15)·NORMAL(15~20)·ELEVATED(20~30)·HIGH(>30) 4단계 레짐으로 판정.
     try:
-        _vxn_df = _fmp_price_history("^VXN", limit=10)
-        if not _vxn_df.empty:
-            _vxn = pd.to_numeric(_vxn_df["Close"], errors="coerce").dropna()
-    except Exception:
-        pass
-    # 소스 2: FRED VXNCLS
-    if _vxn.empty:
-        try:
-            _vxn_s = fred.get_series("VXNCLS")
-            _vxn = pd.to_numeric(_vxn_s, errors="coerce").dropna().tail(5)
-        except Exception:
-            pass
-    try:
-        _vix_ok = "vix" in signals and signals["vix"].get("value", "N/A") != "N/A"
-        if not _vxn.empty and _vix_ok and len(vix_close) >= 1:
-            vix_now2 = float(vix_close.iloc[-1])
-            vxn_now = float(_vxn.iloc[-1])
-            ratio = vix_now2 / vxn_now if vxn_now > 0 else 1.0
-            fear_spike = ratio > 0.95
-            signals["vix_vxn"] = {"ok": not fear_spike, "value": f"VIX/VXN {ratio:.3f}", "trend": ""}
-            details["VIX/VXN 비율"] = {"VIX": f"{vix_now2:.1f}", "VXN": f"{vxn_now:.1f}", "비율": f"{ratio:.3f}", "판정": "⚠️ 공포 급등" if fear_spike else "✅ 정상"}
-            if fear_spike:
-                warnings.append(f"⚠️ VIX/VXN 비율 {ratio:.3f} — 주식·나스닥 공포 동조화 신호")
-        elif _vix_ok and len(vix_close) >= 10:
-            # VXN 없을 때: VIX 절대값으로 단독 판정
-            vix_now2 = float(vix_close.iloc[-1])
-            vix_20d = float(vix_close.tail(20).mean()) if len(vix_close) >= 20 else vix_now2
-            fear_spike = vix_now2 > 30 or vix_now2 > vix_20d * 1.25
-            signals["vix_vxn"] = {
-                "ok": not fear_spike,
-                "value": f"VIX {vix_now2:.1f} (VXN조회불가)",
-                "trend": "",
+        if len(vix_close) >= 10:
+            vix_now5 = float(vix_close.iloc[-1])
+            vix_5d_chg = vix_now5 - float(vix_close.iloc[-6]) if len(vix_close) >= 6 else 0.0
+            vix_20d = float(vix_close.tail(20).mean()) if len(vix_close) >= 20 else vix_now5
+            # 레짐 판정
+            if vix_now5 > 30:
+                regime = "HIGH"
+                regime_ok = False
+                regime_emoji = "🔴"
+            elif vix_now5 > 20:
+                regime = "ELEVATED"
+                regime_ok = False
+                regime_emoji = "🟡"
+            elif vix_now5 > 15:
+                regime = "NORMAL"
+                regime_ok = True
+                regime_emoji = "🟢"
+            else:
+                regime = "LOW"
+                regime_ok = True
+                regime_emoji = "🟢"
+            # 추가: 단기 급등(5일 +4pt 이상)이면 경고
+            surge = vix_5d_chg >= 4.0
+            ok5 = regime_ok and not surge
+            val5 = f"VIX {vix_now5:.1f} [{regime}]"
+            if surge:
+                val5 += f" +{vix_5d_chg:.1f}/5일"
+            signals["vix_vxn"] = {"ok": ok5, "value": val5, "trend": ""}
+            details["VIX 레짐"] = {
+                "현재값": f"{vix_now5:.1f}",
+                "레짐": regime,
+                "5일 변화": f"{vix_5d_chg:+.1f}pt",
+                "20일 평균": f"{vix_20d:.1f}",
+                "판정": "✅ 안정" if ok5 else f"⚠️ {regime_emoji} {regime}",
             }
-            details["VIX/VXN 비율"] = {"비고": "VXN 조회 실패 — VIX 단독 판정", "VIX": f"{vix_now2:.1f}", "판정": "⚠️ VIX 과열" if fear_spike else "✅ 정상"}
-            if fear_spike:
-                warnings.append(f"⚠️ VIX {vix_now2:.1f} 과열 — 공포 급등 신호 (VXN 데이터 없음)")
+            if not regime_ok:
+                warnings.append(f"⚠️ VIX {regime} 레짐 ({vix_now5:.1f}) — 시장 공포 확대 구간")
+            elif surge:
+                warnings.append(f"⚠️ VIX 단기 급등 +{vix_5d_chg:.1f}pt/5일 — 변동성 확대 주의")
         else:
-            signals["vix_vxn"] = {"ok": True, "value": "N/A (소스 없음)", "trend": ""}
+            signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
     except Exception:
         signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
 
@@ -10506,7 +10564,7 @@ if st.session_state.get("logged_in"):
             ("credit",     "신용 스프레드",  "💳"),
             ("leaders",    "대장주 모멘텀",  "🏆"),
             ("volume",     "거래량 패턴",    "📦"),
-            ("vix_vxn",    "VIX/VXN",       "⚡"),
+            ("vix_vxn",    "VIX 레짐",      "⚡"),
             ("event_risk", "이벤트 리스크",  "📅"),
         ]
         for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5, s_col6], signal_defs):
