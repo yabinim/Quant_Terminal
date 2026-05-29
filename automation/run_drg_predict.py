@@ -101,23 +101,53 @@ _MAJOR_RELEASE_KEYWORDS = [
     "initial claims","jobless",
 ]
 
-def get_todays_major_releases(fred: Fred) -> list[str]:
-    """오늘 날짜의 주요 경제지표 발표 목록 반환.
-    1차: 하드코딩된 공식 캘린더 (정확)
-    2차: FRED API 보조 (긴급/추가 발표 감지)
+def get_todays_major_releases(fred: Fred = None) -> tuple:
+    """오늘~3일 이내 주요 경제지표 발표. (release_names, full_events)
+    1차: FMP Economic Calendar API  2차: 하드코딩 폴백
     """
     today_str = datetime.now(_ET).strftime("%Y-%m-%d")
-    releases = []
+    to_str    = (datetime.now(_ET) + timedelta(days=3)).strftime("%Y-%m-%d")
+    FMP_KEY_C = os.environ.get("FMP_API_KEY", "")
+    FMP_BASE_C = "https://financialmodelingprep.com/stable"
+    releases, full_events = [], []
 
-    # 1차: 하드코딩 캘린더
+    if FMP_KEY_C:
+        try:
+            r = requests.get(
+                f"{FMP_BASE_C}/economic-calendar?from={today_str}&to={to_str}&apikey={FMP_KEY_C}",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    for ev in data:
+                        country = str(ev.get("country","") or "").upper()
+                        if country not in ("US","USD","UNITED STATES",""):
+                            continue
+                        impact  = str(ev.get("impact","") or ev.get("importance","") or "").capitalize()
+                        ev_name = str(ev.get("event","") or ev.get("name",""))
+                        ev_date = str(ev.get("date",""))[:10]
+                        if not ev_name:
+                            continue
+                        full_events.append({"date":ev_date,"event":ev_name,"impact":impact,
+                                            "actual":ev.get("actual"),
+                                            "estimate":ev.get("estimate"),
+                                            "prior":ev.get("previous") or ev.get("prior")})
+                        if impact.lower() in ("high","3") and ev_date == today_str:
+                            releases.append(ev_name)
+                    print(f"[INFO] FMP 캘린더: {len(full_events)}개, 오늘 고임팩트 {len(releases)}개")
+                    if full_events:
+                        return releases, full_events
+        except Exception as e:
+            print(f"[WARN] FMP 캘린더 실패: {e}")
+
     for event_name, dates in _HARDCODED_CALENDAR_2026.items():
         if today_str in dates:
             releases.append(event_name)
-            print(f"[INFO] 하드코딩 캘린더 발표: {event_name}")
-
-    # FRED API 보조 제거 (오탐 방지) — 하드코딩 캘린더만 사용
-
-    return releases
+            full_events.append({"date":today_str,"event":event_name,"impact":"High",
+                                 "actual":None,"estimate":None,"prior":None})
+            print(f"[INFO] 하드코딩 캘린더: {event_name}")
+    return releases, full_events
 
 
 # ── 뉴스 수집 ─────────────────────────────────────────────────────────────────
@@ -258,41 +288,91 @@ def fetch_macro_context(fred: Fred) -> str:
     except Exception:
         lines.append("- 대장주 모멘텀: 조회 실패")
 
-    # ── 신호 4: 거래량 패턴 (SPY 기준) ─────────────────────────────────────
+    # ── 신호 4: 선물 프리마켓 방향 (ES=F / NQ=F) ───────────────────────────
     try:
-        spy_df_raw = requests.get(f"{FMP_BASE}/historical-price-eod/full?symbol=SPY&limit=30&apikey={FMP_KEY}", timeout=8).json()
-        spy_rows = spy_df_raw.get("historical", spy_df_raw) if isinstance(spy_df_raw, dict) else spy_df_raw
-        spy_df = pd.DataFrame(spy_rows) if isinstance(spy_rows, list) and spy_rows else pd.DataFrame()
-        if not spy_df.empty:
-            spy_df["date"] = pd.to_datetime(spy_df["date"])
-            spy_df = spy_df.set_index("date").sort_index()
-            etf_close = pd.to_numeric(spy_df["close"], errors="coerce").dropna()
-            vol = pd.to_numeric(spy_df.get("volume", pd.Series(dtype=float)), errors="coerce").dropna()
-            if len(etf_close) >= 6 and len(vol) >= 10:
-                price_5d = float((etf_close.iloc[-1] / etf_close.iloc[-6] - 1) * 100)
-                vol_ratio = float(vol.tail(5).mean()) / float(vol.tail(20).mean())
-                dist_selling = price_5d > 0 and vol_ratio < 0.8
-                vol_alert = dist_selling or vol_ratio < 0.7
-                status = "⚠️ 분산매도" if dist_selling else ("⚠️ 거래량급감" if vol_ratio < 0.7 else "✅ 정상")
-                lines.append(f"- 거래량 패턴: {vol_ratio:.2f}x (가격 {price_5d:+.1f}%) [{status}]")
-                signals_summary.append(f"거래량 {'경고' if vol_alert else '정상'}")
+        _fut_syms = ["ES=F", "NQ=F"]
+        _fut_chgs = []
+        _fut_lines = []
+        for sym in _fut_syms:
+            try:
+                r_fut = requests.get(
+                    f"{FMP_BASE}/quote/{sym}?apikey={FMP_KEY}", timeout=8
+                )
+                if r_fut.status_code == 200:
+                    d_fut = r_fut.json()
+                    item = d_fut[0] if isinstance(d_fut, list) and d_fut else d_fut
+                    price = float(item.get("price") or item.get("lastPrice") or 0)
+                    prev  = float(item.get("previousClose") or item.get("prevClose") or 0)
+                    if prev > 0 and price > 0:
+                        chg = (price / prev - 1) * 100
+                        _fut_chgs.append(chg)
+                        _fut_lines.append(f"{sym} {chg:+.2f}%")
+            except Exception:
+                pass
+        if _fut_chgs:
+            avg_chg = float(np.mean(_fut_chgs))
+            fut_alert = avg_chg <= -0.5
+            status = "⚠️ 갭다운우려" if fut_alert else "✅ 정상"
+            lines.append(f"- 선물 프리마켓: {' / '.join(_fut_lines)} (평균 {avg_chg:+.2f}%) [{status}]")
+            signals_summary.append(f"선물 {'경고' if fut_alert else '정상'}")
+        else:
+            lines.append("- 선물 프리마켓: 조회 실패")
     except Exception:
-        lines.append("- 거래량 패턴: 조회 실패")
+        lines.append("- 선물 프리마켓: 조회 실패")
 
-    # ── 신호 5: VIX/VXN 비율 ────────────────────────────────────────────────
+    # ── 신호 5: 달러·금·국채 리스크오프 신호 ────────────────────────────────
     try:
-        vxn_s_raw = fred.get_series("VXNCLS")
-        vxn_s = pd.to_numeric(vxn_s_raw, errors="coerce").dropna().tail(5)
-        if not vxn_s.empty and vix_close is not None and len(vix_close) > 0:
-            vix_now2 = float(vix_close.iloc[-1])
-            vxn_now = float(vxn_s.iloc[-1])
-            ratio = vix_now2 / vxn_now if vxn_now > 0 else 1
-            fear_spike = ratio > 0.95
-            status = "⚠️ 공포급등" if fear_spike else "✅ 정상"
-            lines.append(f"- VIX/VXN 비율: {ratio:.3f} [{status}]")
-            signals_summary.append(f"VIX/VXN {'경고' if fear_spike else '정상'}")
+        _safety = {"UUP": "달러", "GLD": "금", "IEF": "국채"}
+        _safety_chgs = []
+        _safety_lines = []
+        for sym5, name5 in _safety.items():
+            try:
+                r5 = requests.get(
+                    f"{FMP_BASE}/historical-price-eod/full?symbol={sym5}&limit=10&apikey={FMP_KEY}",
+                    timeout=8
+                )
+                if r5.status_code == 200:
+                    d5 = r5.json()
+                    rows5 = d5.get("historical", d5) if isinstance(d5, dict) else d5
+                    if isinstance(rows5, list) and len(rows5) >= 6:
+                        df5 = pd.DataFrame(rows5)
+                        df5["date"] = pd.to_datetime(df5["date"])
+                        df5 = df5.set_index("date").sort_index()
+                        s5 = pd.to_numeric(df5["close"], errors="coerce").dropna()
+                        chg5 = float((s5.iloc[-1] / s5.iloc[-6] - 1) * 100) if len(s5) >= 6 else np.nan
+                        if not np.isnan(chg5):
+                            _safety_chgs.append((sym5, chg5))
+                            _safety_lines.append(f"{name5} {chg5:+.1f}%")
+            except Exception:
+                pass
+        if _safety_chgs:
+            _rising = [s for s, c in _safety_chgs if c > 0.3]
+            spy_5d_chg = 0.0
+            try:
+                r_spy2 = requests.get(
+                    f"{FMP_BASE}/historical-price-eod/full?symbol=SPY&limit=10&apikey={FMP_KEY}",
+                    timeout=8
+                )
+                if r_spy2.status_code == 200:
+                    d_spy2 = r_spy2.json()
+                    rows_spy2 = d_spy2.get("historical", d_spy2) if isinstance(d_spy2, dict) else d_spy2
+                    if isinstance(rows_spy2, list) and len(rows_spy2) >= 6:
+                        df_spy2 = pd.DataFrame(rows_spy2)
+                        df_spy2["date"] = pd.to_datetime(df_spy2["date"])
+                        df_spy2 = df_spy2.set_index("date").sort_index()
+                        s_spy2 = pd.to_numeric(df_spy2["close"], errors="coerce").dropna()
+                        spy_5d_chg = float((s_spy2.iloc[-1] / s_spy2.iloc[-6] - 1) * 100) if len(s_spy2) >= 6 else 0.0
+            except Exception:
+                pass
+            riskoff_alert = len(_rising) >= 2 and spy_5d_chg < -0.5
+            status_ro = "⚠️ 리스크오프" if riskoff_alert else ("🟡 안전자산강세" if len(_rising) >= 2 else "✅ 정상")
+            lines.append(f"- 달러·금·국채: {' / '.join(_safety_lines)} [{status_ro}]")
+            signals_summary.append(f"리스크오프 {'경고' if riskoff_alert else '정상'}")
+        else:
+            lines.append("- 달러·금·국채: 조회 실패")
     except Exception:
-        lines.append("- VIX/VXN 비율: 조회 실패")
+        lines.append("- 달러·금·국채: 조회 실패")
+
 
     # ── FRED 기준금리 + CPI (추가 컨텍스트) ────────────────────────────────
     try:
@@ -311,46 +391,66 @@ def fetch_macro_context(fred: Fred) -> str:
     # ── 종합 신호 요약 ───────────────────────────────────────────────────────
     warning_count = sum(1 for s in signals_summary if "경고" in s)
     risk_level = "🔴 HIGH RISK" if warning_count >= 3 else ("🟡 MEDIUM RISK" if warning_count >= 1 else "🟢 LOW RISK")
-    lines.insert(0, f"[선행 신호 종합: {risk_level} | 경고 {warning_count}/5개]")
+    lines.insert(0, f"[선행 신호 종합: {risk_level} | 경고 {warning_count}/5개 (VIX·신용·대장주·선물·리스크오프)]")
 
     return "\n".join(lines) if lines else "데이터 없음"
 
 
 # ── Gemini DRG 예측 생성 ──────────────────────────────────────────────────────
 def generate_drg_prediction(rss_news_text: str, macro_summary: str,
-                             fred_releases: list[str], sector: str = "전체 시장") -> str:
+                             fred_releases: list[str], sector: str = "전체 시장",
+                             full_events: list = None) -> str:
     client = genai.Client(api_key=GOOGLE_API_KEY)
     now_kst = datetime.now(_KST)
     now_et  = datetime.now(_ET)
 
     fred_section = ""
-    if fred_releases:
+    _today_et = datetime.now(_ET).strftime("%Y-%m-%d")
+    if full_events:
+        high_today = [e for e in full_events
+                      if e.get("impact","").lower() in ("high","3")
+                      and e.get("date","") == _today_et]
+        if high_today:
+            ev_lines = []
+            for ev in high_today[:4]:
+                line = f"  - {ev['event']}"
+                if ev.get("estimate") is not None:
+                    line += f" (예상: {ev['estimate']}"
+                    if ev.get("prior") is not None:
+                        line += f" / 이전: {ev['prior']}"
+                    line += ")"
+                ev_lines.append(line)
+            fred_section = (
+                "\n⚠️ [오늘의 고임팩트 경제지표 (FMP Calendar)]\n"
+                + "\n".join(ev_lines) + "\n"
+                "→ 예상치 대비 실제값 방향으로 급변동 가능. 각 지표 예상치를 반드시 활용해 예측하세요.\n"
+            )
+    elif fred_releases:
         items = "\n".join(f"  - {r}" for r in fred_releases)
         fred_section = (
-            f"\n⚠️ [오늘의 주요 경제지표 발표 — FRED 캘린더]\n{items}\n"
-            f"→ 위 지표 발표(8:30 ET) 전후로 시장 변동성이 크게 높아질 수 있습니다. "
-            f"예측의 불확실성이 평소보다 높음을 반드시 언급하세요.\n"
+            f"\n⚠️ [오늘의 주요 경제지표]\n{items}\n"
+            "→ 발표 전후 변동성 증가 예상.\n"
         )
 
     prompt = (
         "당신은 월가 수석 퀀트 전략가입니다. "
-        "아래 실시간 데이터를 바탕으로 오늘 미국 주식시장을 예측하세요.\n\n"
+        "아래 Pre-Market 실시간 데이터를 바탕으로 오늘 미국 주식시장을 예측하세요.\n\n"
         f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} KST / {now_et.strftime('%H:%M')} ET (Pre-Market)\n"
         f"[분석 섹터] {sector}\n\n"
-        f"[거시경제 지표]\n{macro_summary}\n\n"
+        f"[선행 신호 종합 + 선물·안전자산]\n{macro_summary}\n\n"
         f"[오늘의 주요 뉴스 (오버나잇 포함)]\n{rss_news_text}\n"
         f"{fred_section}\n"
         "---\n"
         "아래 4개 항목을 각각 작성하세요. "
-        "반드시 위 데이터의 실제 수치(VIX 값, SPY 가격, 뉴스 종목명/이슈)를 직접 인용해 근거를 만드세요. "
-        "일반론이나 '시장을 주시해야 한다'류의 빈말은 금지입니다.\n\n"
+        "반드시 위 수치(선물 %, VIX 값, 이벤트 예상치, 뉴스 종목명)를 직접 인용해 근거를 만드세요. "
+        "일반론·빈말 금지.\n\n"
         "## 오늘 시장 방향 판단: [상승 우세 / 중립 / 하락 우세]\n\n"
-        "**📊 핵심 근거** (위 수치를 직접 인용해 2~3문장):\n\n"
-        "**📰 뉴스 영향** (오버나잇 뉴스 중 오늘 시장에 영향줄 종목/이슈 구체적으로 언급, 2문장):\n\n"
+        "**📊 핵심 근거** (선물 방향·VIX·이벤트 예상치 직접 인용, 2~3문장):\n\n"
+        "**📰 뉴스 영향** (오버나잇 뉴스 중 오늘 시장 영향 종목/이슈, 2문장):\n\n"
         "**⚠️ 오늘 주목할 리스크** (구체적 수치/종목/이벤트 기반, 2가지):\n"
         "1. \n"
         "2. \n\n"
-        "**🎯 실전 대응** (지금 상황에 맞는 구체적 행동, 보유/매수/현금 각 1문장):\n"
+        "**🎯 실전 대응** (보유/매수/현금 각 1문장):\n"
         "- 보유 중: \n"
         "- 매수 타이밍 보는 중: \n"
         "- 현금 대기 중: \n\n"
@@ -419,22 +519,72 @@ def save_drg_to_sheet(pred_date: str, direction: str, sector: str,
 
 # ── HTML 이메일 ───────────────────────────────────────────────────────────────
 def build_drg_email_html(full_text: str, direction: str, spy_close: float,
-                          fred_releases: list[str], macro_summary: str) -> str:
+                          fred_releases: list[str], macro_summary: str,
+                          full_events: list = None) -> str:
     now_et  = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
     now_kst = datetime.now(_KST).strftime("%Y-%m-%d %H:%M KST")
 
     dir_color = {"상승 우세": "#16a34a", "중립": "#d97706", "하락 우세": "#dc2626"}.get(direction, "#6b7280")
     dir_emoji = {"상승 우세": "📈", "중립": "➡️", "하락 우세": "📉"}.get(direction, "❓")
 
+    _ACTION_MAP_EMAIL = {
+        "fomc":"신규 매수 자제. 발표 전후 변동성 2배 구간.",
+        "federal reserve":"연준 발언 매파 시 기술주 급락 가능.",
+        "cpi":"예상 상회→금리 우려·성장주 압박. 예상 하회→랠리 가능.",
+        "nonfarm":"고용 호조=금리 우려. 고용 부진=침체 우려.",
+        "payroll":"고용 호조=금리 우려. 고용 부진=침체 우려.",
+        "pce":"예상 상회→금리 인하 지연, 성장주 부담.",
+        "gdp":"예상 하회→침체 우려. 예상 상회→과열 우려.",
+        "ism":"50 이하=수축. 하회 시 산업재 주의.",
+        "pmi":"50 이하 수축. 예상 하회 시 경기 우려.",
+        "retail sales":"급감 시 소비 위축·경기 둔화 신호.",
+        "initial claims":"급증 시 고용 악화 선행 신호.",
+    }
+    def _get_act(n):
+        nl = n.lower()
+        for k,v in _ACTION_MAP_EMAIL.items():
+            if k in nl: return v
+        return "발표 전후 변동성 주의."
+
+    _today_et_email = datetime.now(_ET).strftime("%Y-%m-%d")
     fred_html = ""
-    if fred_releases:
+    if full_events:
+        high_today_e = [e for e in full_events
+                        if e.get("impact","").lower() in ("high","3")
+                        and e.get("date","") == _today_et_email]
+        if high_today_e:
+            ev_cards = ""
+            for ev in high_today_e[:4]:
+                ev_ctx = ""
+                if ev.get("estimate") is not None:
+                    ev_ctx += f" | 예상: <b>{ev['estimate']}</b>"
+                if ev.get("prior") is not None:
+                    ev_ctx += f" / 이전: <b>{ev['prior']}</b>"
+                ev_cards += (
+                    f'<div style="border-left:3px solid #ea580c;padding:6px 10px;'
+                    f'margin:6px 0;background:#451a03;border-radius:4px;">'
+                    f'<div style="color:#fed7aa;font-weight:700;font-size:13px;">'
+                    f'{ev["event"]} ({ev["date"]}){ev_ctx}</div>'
+                    f'<div style="color:#fb923c;font-size:12px;margin-top:3px;">'
+                    f'→ {_get_act(ev["event"])}</div></div>'
+                )
+            fred_html = (
+                '<div style="background:#3b1414;border-radius:8px;padding:14px 16px;'
+                'margin-bottom:16px;border:1px solid #ea580c;">'
+                '<div style="font-weight:700;color:#fed7aa;margin-bottom:8px;">'
+                '⚠️ 오늘의 고임팩트 경제지표 · 행동 지침</div>'
+                + ev_cards + '</div>'
+            )
+    if not fred_html and fred_releases:
         items = "".join(f"<li>{r}</li>" for r in fred_releases)
-        fred_html = f"""
-        <div style="background:#7c2d12;border-radius:8px;padding:12px 16px;margin-bottom:16px;border:1px solid #ea580c;">
-          <div style="font-weight:700;color:#fed7aa;">⚠️ 오늘의 주요 경제지표 발표 (8:30 ET)</div>
-          <ul style="color:#fdba74;margin:8px 0 0 0;padding-left:18px;font-size:13px;">{items}</ul>
-          <div style="color:#fb923c;font-size:12px;margin-top:6px;">→ 발표 전후 변동성 증가 예상. 예측 불확실성 높음.</div>
-        </div>"""
+        fred_html = (
+            '<div style="background:#7c2d12;border-radius:8px;padding:12px 16px;'
+            'margin-bottom:16px;border:1px solid #ea580c;">'
+            '<div style="font-weight:700;color:#fed7aa;">⚠️ 오늘의 주요 경제지표 발표</div>'
+            f'<ul style="color:#fdba74;margin:8px 0 0 0;padding-left:18px;font-size:13px;">{items}</ul>'
+            '<div style="color:#fb923c;font-size:12px;margin-top:6px;">→ 발표 전후 변동성 증가 예상.</div>'
+            '</div>'
+        )
 
     spy_str = f"${spy_close:.2f}" if not np.isnan(spy_close) else "N/A"
 
@@ -518,9 +668,11 @@ def main():
         sys.exit(0)
 
     fred = Fred(api_key=FRED_API_KEY)
-    fred_releases = get_todays_major_releases(fred)
+    fred_releases, full_events = get_todays_major_releases(fred)
     if fred_releases:
         print(f"[INFO] 오늘의 주요 경제지표: {fred_releases}")
+    if full_events:
+        print(f"[INFO] FMP 이벤트 캘린더: {len(full_events)}개")
 
     print("[STEP 1] 뉴스 수집 중...")
     _, rss_news_text, raw_count = fetch_global_market_news()
@@ -531,7 +683,7 @@ def main():
     print(f"[INFO] 거시지표:\n{macro_summary}")
 
     print("[STEP 3] Gemini DRG 예측 생성 중...")
-    full_text = generate_drg_prediction(rss_news_text, macro_summary, fred_releases)
+    full_text = generate_drg_prediction(rss_news_text, macro_summary, fred_releases, full_events=full_events)
     if not full_text:
         print("[ERROR] DRG 예측 생성 실패.")
         sys.exit(1)
@@ -556,7 +708,7 @@ def main():
     print("[STEP 5] 이메일 발송 중...")
     fred_tag = " ⚠️FRED발표" if fred_releases else ""
     subject = f"🚨 [DRG 예측] {direction} · {datetime.now(_ET).strftime('%m/%d')}{fred_tag}"
-    html_body = build_drg_email_html(full_text, direction, spy_close, fred_releases, macro_summary)
+    html_body = build_drg_email_html(full_text, direction, spy_close, fred_releases, macro_summary, full_events=full_events)
     send_email(subject, html_body)
 
     print(f"[DONE] 완료: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
