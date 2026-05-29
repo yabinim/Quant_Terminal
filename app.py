@@ -44,6 +44,17 @@ if "login_user_id" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state["user_id"] = ""
 
+if "_yf_cloud_limit_warn_shown" not in st.session_state:
+    st.session_state["_yf_cloud_limit_warn_shown"] = False
+
+
+def _notify_yfinance_fetch_failed() -> None:
+    """클라우드 등에서 Yahoo 제한 시 한 세션당 한 번만 안내."""
+    if st.session_state.get("_yf_cloud_limit_warn_shown"):
+        return
+    st.session_state["_yf_cloud_limit_warn_shown"] = True
+    st.warning("야후 파이낸스 접속 제한으로 일부 데이터를 불러오지 못했습니다.")
+
 
 _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
@@ -77,12 +88,8 @@ _WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Al
 _THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
 
-@st.cache_resource
 def get_gspread_client():
-    """`st.secrets['gcp_service_account']` 서비스 계정으로 gspread 클라이언트 생성. 미설정 시 None.
-    @st.cache_resource: 앱 전체 세션에서 OAuth 인증을 1회만 수행하고 클라이언트를 재사용.
-    (기존: open_*_worksheet 10개가 각각 독립 인증 → 매 호출마다 새 auth 요청)
-    """
+    """`st.secrets['gcp_service_account']` 서비스 계정으로 gspread 클라이언트 생성. 미설정 시 None."""
     try:
         info = dict(st.secrets["gcp_service_account"])
     except (KeyError, FileNotFoundError, TypeError):
@@ -858,6 +865,22 @@ _MAIN_NAV_OPTIONS = (
     "📖 사용 가이드",
 )
 
+# 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
+_LEGACY_NAV_STR_TO_INDEX = {
+    "📊 거시경제 지표": 0,
+    "🧠 1.5 시장 내러티브": 1,
+    "🚀 1.6 AI Opportunity Scanner": 3,
+    "📈 2. 섹터 분석": 2,
+    "🔬 3. 체력 검사": 4,
+    "⏱️ 4. 매수 타점": 4,
+    "🛡️ 5.0 포트폴리오 매도 레이더": 5,
+    "1. 거시경제 지표 (Macro)": 0,
+    "2. 시장 내러티브 (Narrative)": 1,
+    "3. 섹터 & 자금 흐름 (Sector Flow)": 2,
+    "4. AI 종목 스캐너 (Scanner)": 3,
+    "5. 개별 종목 정밀 검사 (Fundamentals & Timing)": 4,
+    "6. 포트폴리오 매도 레이더 (Portfolio)": 5,
+}
 
 _NARRATIVE_RECORD_SOURCE_WEEKLY_7D = "weekly_trend_7d"
 
@@ -1272,47 +1295,20 @@ def evaluate_vix_status(vix_value):
     return MACRO_STATUS_PASS, "상대적으로 낮은 불안 구간입니다. 단, 역사적 평균 대비 고점 돌파 시 추세를 확인하세요."
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_vix_latest_and_history():
-    """VIX 현재값 + 1년 히스토리.
-    1순위: FRED VIXCLS  2순위: FMP ^VIX (full 엔드포인트)
-    """
-    # ── FRED ─────────────────────────────────────────────────────────
+    """VIX 현재값 + 1년 히스토리 — FRED VIXCLS 사용."""
     try:
         s = fred.get_series("VIXCLS")
         s = pd.to_numeric(s, errors="coerce").dropna()
-        if len(s) >= 10:
-            s = s.tail(252)
-            hist = pd.DataFrame({"Close": s})
-            hist.index = pd.to_datetime(hist.index)
-            return float(s.iloc[-1]), hist, None
-    except Exception:
-        pass
-    # ── FMP 폴백 ─────────────────────────────────────────────────────
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX&limit=252&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                rows = data.get("historical", data) if isinstance(data, dict) else data
-                if isinstance(rows, list) and rows:
-                    df = pd.DataFrame(rows)
-                    if "date" in df.columns:
-                        cc = "close" if "close" in df.columns else "Close"
-                        df = df[["date", cc]].rename(columns={cc: "Close"})
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-                        df = df.dropna()
-                        if not df.empty:
-                            return float(df["Close"].iloc[-1]), df, "FMP폴백"
-    except Exception:
-        pass
-    return np.nan, None, "VIX 데이터 조회 실패 (FRED·FMP 모두 실패)"
+        if s.empty:
+            return np.nan, None, "FRED VIXCLS 데이터 없음"
+        s = s.tail(252)
+        hist = pd.DataFrame({"Close": s})
+        hist.index = pd.to_datetime(hist.index)
+        cur = float(s.iloc[-1])
+        return cur, hist, None
+    except Exception as exc:
+        return np.nan, None, str(exc)
 
 
 def evaluate_wti_status(wti):
@@ -1327,81 +1323,21 @@ def evaluate_wti_status(wti):
     return MACRO_STATUS_PASS, "유가가 과도하게 붐비거나 붕괴한 구간은 아닙니다."
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_wti_latest():
-    """WTI 유가 최신값.
-    1순위: FRED DCOILWTICO  2순위: FMP USO ETF 근사
-    """
+    """WTI 유가 최신값 — FRED DCOILWTICO 사용."""
     try:
         s = fred.get_series("DCOILWTICO")
         s = pd.to_numeric(s, errors="coerce").dropna()
-        if not s.empty:
-            return float(s.iloc[-1])
+        return float(s.iloc[-1]) if not s.empty else np.nan
     except Exception:
-        pass
-    # FMP 폴백: USO (WTI ETF) — full 엔드포인트
-    try:
-        k = _fmp_key()
-        if k:
-            for sym in ("USO", "OIL"):
-                try:
-                    r = requests.get(
-                        f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=5&apikey={k}",
-                        timeout=_FMP_TIMEOUT,
-                    )
-                    if r.status_code == 200:
-                        d = r.json()
-                        rows = d.get("historical", d) if isinstance(d, dict) else d
-                        if isinstance(rows, list) and rows:
-                            v = rows[0].get("close") or rows[0].get("Close")
-                            if v is not None:
-                                return float(v)
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return np.nan
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_unrate_series() -> pd.Series:
-    """UNRATE — FRED 1순위, FMP unemploymentRate 2순위."""
-    # FRED
-    try:
-        s = fred.get_series("UNRATE")
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if len(s) >= 15:
-            return s
-    except Exception:
-        pass
-    # FMP economic-indicators
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=unemploymentRate&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    df = pd.DataFrame(data)
-                    if "date" in df.columns and "value" in df.columns:
-                        df = df[["date", "value"]].copy()
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        s = pd.to_numeric(df["value"], errors="coerce").dropna()
-                        if len(s) >= 5:
-                            return s
-    except Exception:
-        pass
-    return pd.Series(dtype=float)
+        return np.nan
 
 
 def evaluate_unemployment_sahm_series():
     try:
-        unrate_series = _fetch_unrate_series()
-        if unrate_series.empty:
+        try:
+            unrate_series = fred.get_series("UNRATE")
+        except Exception:
             return MACRO_STATUS_NA, np.nan, np.nan, np.nan, _FRED_TRANSIENT_ERROR_NOTE
         df_unrate = pd.DataFrame({"UNRATE": unrate_series})
         df_unrate["UNRATE"] = pd.to_numeric(df_unrate["UNRATE"], errors="coerce")
@@ -1432,45 +1368,11 @@ def evaluate_unemployment_sahm_series():
         return MACRO_STATUS_NA, np.nan, np.nan, np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_cpi_series() -> pd.Series:
-    """CPIAUCSL — FRED 1순위, FMP CPI 2순위."""
-    # FRED
-    try:
-        s = fred.get_series("CPIAUCSL")
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if len(s) >= 14:
-            return s
-    except Exception:
-        pass
-    # FMP economic-indicators (name=CPI)
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=CPI&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    df = pd.DataFrame(data)
-                    if "date" in df.columns and "value" in df.columns:
-                        df = df[["date", "value"]].copy()
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        s = pd.to_numeric(df["value"], errors="coerce").dropna()
-                        if len(s) >= 5:
-                            return s
-    except Exception:
-        pass
-    return pd.Series(dtype=float)
-
-
 def evaluate_cpi_yoy():
     try:
-        cpi_series = _fetch_cpi_series()
-        if cpi_series.empty:
+        try:
+            cpi_series = fred.get_series("CPIAUCSL")
+        except Exception:
             return MACRO_STATUS_NA, np.nan, _FRED_TRANSIENT_ERROR_NOTE
         df_cpi = pd.DataFrame({"CPIAUCSL": cpi_series})
         df_cpi["CPIAUCSL"] = pd.to_numeric(df_cpi["CPIAUCSL"], errors="coerce")
@@ -1500,55 +1402,26 @@ def evaluate_cpi_yoy():
         return MACRO_STATUS_NA, np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_dxy_latest_and_mean_deviation():
-    """DXY 달러 인덱스.
-    1순위: FRED DTWEXBGS  2순위: FMP UUP ETF (DXY 추적)
-    """
-    def _calc(closes_s: pd.Series):
-        if closes_s.empty:
+    """DXY 달러 인덱스 — FRED DTWEXBGS 사용."""
+    try:
+        s = fred.get_series("DTWEXBGS")
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
             return np.nan, np.nan, MACRO_STATUS_NA
-        cur = float(closes_s.iloc[-1])
-        ma252 = float(closes_s.rolling(window=252, min_periods=63).mean().iloc[-1])
-        if pd.isna(cur) or pd.isna(ma252) or ma252 == 0:
+        closes = s.tail(400)
+        cur = float(closes.iloc[-1])
+        ma252 = float(closes.rolling(window=252, min_periods=126).mean().iloc[-1])
+        dev_pct = np.nan if pd.isna(cur) or pd.isna(ma252) or ma252 == 0 else (cur / ma252 - 1.0) * 100
+        if pd.isna(cur) or pd.isna(ma252):
             return cur, np.nan, MACRO_STATUS_NA
-        dev_pct = (cur / ma252 - 1.0) * 100
         if dev_pct >= 5.5:
             return cur, dev_pct, MACRO_STATUS_FAIL
         if dev_pct >= 2.5:
             return cur, dev_pct, MACRO_STATUS_WARN
         return cur, dev_pct, MACRO_STATUS_PASS
-    # FRED
-    try:
-        s = fred.get_series("DTWEXBGS")
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if not s.empty:
-            return _calc(s.tail(400))
     except Exception:
-        pass
-    # FMP UUP (DXY ETF) — full 엔드포인트
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=400&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                d = r.json()
-                rows = d.get("historical", d) if isinstance(d, dict) else d
-                if isinstance(rows, list) and rows:
-                    df = pd.DataFrame(rows)
-                    if "date" in df.columns:
-                        cc = "close" if "close" in df.columns else "Close"
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        s = pd.to_numeric(df[cc], errors="coerce").dropna()
-                        if not s.empty:
-                            return _calc(s)
-    except Exception:
-        pass
-    return np.nan, np.nan, MACRO_STATUS_NA
+        return np.nan, np.nan, MACRO_STATUS_NA
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1595,116 +1468,53 @@ def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
     return results
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fed_funds_rate() -> tuple[float, str]:
-    """현재 기준금리.
-    1순위: FRED FEDFUNDS  2순위: FMP federalFundsRate
-    """
-    def _fed_note(rate: float) -> str:
-        if rate >= 5.0:
-            return "고금리 레짐. 성장주 밸류에이션 압박 지속."
-        if rate >= 3.0:
-            return "중립 이상 금리. 연준 기조 모니터링 필요."
-        return "완화적 금리 환경. 유동성 우호적."
-    # FRED
+    """FRED FEDFUNDS 시리즈에서 현재 기준금리 반환. (rate, note)"""
     try:
         series = fred.get_series("FEDFUNDS")
-        if series is not None and not series.empty:
-            rate = float(pd.to_numeric(series, errors="coerce").dropna().iloc[-1])
-            if pd.notna(rate):
-                return rate, _fed_note(rate)
+        if series is None or series.empty:
+            return np.nan, "FRED 데이터 없음"
+        rate = float(pd.to_numeric(series, errors="coerce").dropna().iloc[-1])
+        if rate >= 5.0:
+            note = "고금리 레짐. 성장주 밸류에이션 압박 지속."
+        elif rate >= 3.0:
+            note = "중립 이상 금리. 연준 기조 모니터링 필요."
+        else:
+            note = "완화적 금리 환경. 유동성 우호적."
+        return rate, note
     except Exception:
-        pass
-    # FMP federalFundsRate
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    rate = to_float(data[0].get("value"))
-                    if pd.notna(rate):
-                        return rate, _fed_note(rate) + " [FMP]"
-    except Exception:
-        pass
-    return np.nan, _FRED_TRANSIENT_ERROR_NOTE
+        return np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_macro_history_series() -> dict:
-    """CPI·실업률·DXY·Fed Rate 1~2년 히스토리 시리즈.
-    각 지표마다 FRED 1순위 → FMP 폴백.
-    """
+    """CPI·실업률·DXY·Fed Rate 1~2년 히스토리 시리즈 반환."""
     out = {}
-    # ── CPI ──────────────────────────────────────────────────────────
     try:
-        cpi_s = _fetch_cpi_series()
-        if not cpi_s.empty:
-            cpi_df = pd.DataFrame({"CPI": cpi_s}).dropna()
+        cpi_s = fred.get_series("CPIAUCSL")
+        if cpi_s is not None and not cpi_s.empty:
+            cpi_df = pd.DataFrame({"CPI": pd.to_numeric(cpi_s, errors="coerce")}).dropna()
             cpi_df["CPI YoY(%)"] = cpi_df["CPI"].pct_change(12) * 100
             out["cpi"] = cpi_df["CPI YoY(%)"].dropna().tail(24)
     except Exception:
         pass
-    # ── UNRATE ───────────────────────────────────────────────────────
     try:
-        un_s = _fetch_unrate_series()
-        if not un_s.empty:
-            out["unrate"] = un_s.tail(24)
+        un_s = fred.get_series("UNRATE")
+        if un_s is not None and not un_s.empty:
+            out["unrate"] = pd.to_numeric(un_s, errors="coerce").dropna().tail(24)
     except Exception:
         pass
-    # ── Fed Rate ─────────────────────────────────────────────────────
     try:
         fed_s = fred.get_series("FEDFUNDS")
         if fed_s is not None and not fed_s.empty:
             out["fedfunds"] = pd.to_numeric(fed_s, errors="coerce").dropna().tail(24)
     except Exception:
-        # FMP federalFundsRate 폴백
-        try:
-            k = _fmp_key()
-            if k:
-                r = requests.get(
-                    f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}",
-                    timeout=_FMP_TIMEOUT,
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, list) and data:
-                        df = pd.DataFrame(data)[["date", "value"]].copy()
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        out["fedfunds"] = pd.to_numeric(df["value"], errors="coerce").dropna().tail(24)
-        except Exception:
-            pass
-    # ── DXY ──────────────────────────────────────────────────────────
+        pass
     try:
         dxy_s = fred.get_series("DTWEXBGS")
         if dxy_s is not None and not dxy_s.empty:
             out["dxy"] = pd.to_numeric(dxy_s, errors="coerce").dropna().tail(500)
     except Exception:
-        # FMP UUP 폴백 — full 엔드포인트
-        try:
-            k = _fmp_key()
-            if k:
-                r = requests.get(
-                    f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=500&apikey={k}",
-                    timeout=_FMP_TIMEOUT,
-                )
-                if r.status_code == 200:
-                    d = r.json()
-                    rows = d.get("historical", d) if isinstance(d, dict) else d
-                    if isinstance(rows, list) and rows:
-                        df = pd.DataFrame(rows)
-                        if "date" in df.columns:
-                            cc = "close" if "close" in df.columns else "Close"
-                            df["date"] = pd.to_datetime(df["date"])
-                            df = df.set_index("date").sort_index()
-                            out["dxy"] = pd.to_numeric(df[cc], errors="coerce").dropna().tail(500)
-        except Exception:
-            pass
+        pass
     return out
 
 
@@ -1869,7 +1679,7 @@ def analyze_us_macro_dashboard():
             "지표": "VIX (공포 지수)",
             "현재값": num_str(vix_val),
             "판정": macro_status_label(vix_st),
-            "판독 요약": vix_note + ("" if (not vix_err or vix_err in ("FMP폴백", "None", None)) else f" [{vix_err}]"),
+            "판독 요약": vix_note + ("" if not vix_err else f" (데이터 참고: {vix_err})"),
             "_status": vix_st,
         }
     )
@@ -2822,51 +2632,20 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     warnings = []
     details = {}
 
-    # ── 신호 1: VIX 방향 전환 (FRED 1순위 → FMP 폴백) ─────────────────
-    vix_close = pd.Series(dtype=float)
-    _vix_source = ""
+    # ── 신호 1: VIX 방향 전환 ───────────────────────────────────────────
     try:
-        _s = fred.get_series("VIXCLS")
-        _s = pd.to_numeric(_s, errors="coerce").dropna().tail(30)
-        if len(_s) >= 10:
-            vix_close = _s
-            _vix_source = "FRED"
-    except Exception:
-        pass
-    if vix_close.empty:
-        try:
-            _k = _fmp_key()
-            if _k:
-                _r = requests.get(
-                    f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX&limit=30&apikey={_k}",
-                    timeout=_FMP_TIMEOUT,
-                )
-                if _r.status_code == 200:
-                    _d = _r.json()
-                    _rows = _d.get("historical", _d) if isinstance(_d, dict) else _d
-                    if isinstance(_rows, list) and _rows:
-                        _df = pd.DataFrame(_rows)
-                        if "date" in _df.columns:
-                            _cc = "close" if "close" in _df.columns else "Close"
-                            _df = _df[["date", _cc]].rename(columns={_cc: "Close"})
-                            _df["date"] = pd.to_datetime(_df["date"])
-                            _df = _df.set_index("date").sort_index()
-                            vix_close = pd.to_numeric(_df["Close"], errors="coerce").dropna()
-                            _vix_source = "FMP"
-        except Exception:
-            pass
-    try:
+        vix_s = fred.get_series("VIXCLS")
+        vix_close = pd.to_numeric(vix_s, errors="coerce").dropna().tail(30)
         if len(vix_close) >= 10:
             vix_now = float(vix_close.iloc[-1])
+            vix_5d_avg = float(vix_close.tail(5).mean())
             vix_20d_avg = float(vix_close.tail(20).mean())
             vix_trend = vix_now - float(vix_close.iloc[-6]) if len(vix_close) >= 6 else 0
             vix_alert = vix_trend > 2 or vix_now > vix_20d_avg * 1.15
-            signals["vix"] = {"ok": not vix_alert, "value": f"{vix_now:.1f} [{_vix_source}]", "trend": f"{vix_trend:+.1f}/5일"}
-            details["VIX"] = {"현재값": f"{vix_now:.1f}", "5일 변화": f"{vix_trend:+.1f}", "20일 평균": f"{vix_20d_avg:.1f}", "소스": _vix_source}
+            signals["vix"] = {"ok": not vix_alert, "value": f"{vix_now:.1f}", "trend": f"{vix_trend:+.1f}/5일"}
+            details["VIX"] = {"현재값": f"{vix_now:.1f}", "5일 변화": f"{vix_trend:+.1f}", "20일 평균": f"{vix_20d_avg:.1f}"}
             if vix_alert:
                 warnings.append(f"⚠️ VIX 상승 전환 감지 ({vix_now:.1f}, +{vix_trend:.1f}/5일)")
-        else:
-            signals["vix"] = {"ok": True, "value": "N/A", "trend": "N/A"}
     except Exception:
         signals["vix"] = {"ok": True, "value": "N/A", "trend": "N/A"}
 
@@ -2954,49 +2733,29 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 5: VIX/VXN 비율 (공포 급등 탐지) ─────────────────────────
-    # 데이터 소스 우선순위: FMP ^VXN → FRED VXNCLS → VIX 단독 판정(폴백)
-    _vxn = pd.Series(dtype=float)
-    # 소스 1: FMP ^VXN
+    # ── 신호 5: VIX 선물 구조 (VIX > VXN 비율) ────────────────────────────
     try:
-        _vxn_df = _fmp_price_history("^VXN", limit=10)
-        if not _vxn_df.empty:
-            _vxn = pd.to_numeric(_vxn_df["Close"], errors="coerce").dropna()
-    except Exception:
-        pass
-    # 소스 2: FRED VXNCLS
-    if _vxn.empty:
-        try:
-            _vxn_s = fred.get_series("VXNCLS")
-            _vxn = pd.to_numeric(_vxn_s, errors="coerce").dropna().tail(5)
-        except Exception:
-            pass
-    try:
-        _vix_ok = "vix" in signals and signals["vix"].get("value", "N/A") != "N/A"
-        if not _vxn.empty and _vix_ok and len(vix_close) >= 1:
+        vxn_df = _fmp_price_history("^VXN", limit=10)
+        if vxn_df.empty:
+            # FMP에서 ^VXN 안되면 FRED VXN 시도
+            try:
+                vxn_s = fred.get_series("VXNCLS")
+                vxn = pd.to_numeric(vxn_s, errors="coerce").dropna().tail(5)
+            except Exception:
+                vxn = pd.Series(dtype=float)
+        else:
+            vxn = pd.to_numeric(vxn_df["Close"], errors="coerce").dropna()
+        if not vxn.empty and "vix" in signals and signals["vix"]["value"] != "N/A":
             vix_now2 = float(vix_close.iloc[-1])
-            vxn_now = float(_vxn.iloc[-1])
-            ratio = vix_now2 / vxn_now if vxn_now > 0 else 1.0
+            vxn_now = float(vxn.iloc[-1])
+            ratio = vix_now2 / vxn_now if vxn_now > 0 else 1
             fear_spike = ratio > 0.95
             signals["vix_vxn"] = {"ok": not fear_spike, "value": f"VIX/VXN {ratio:.3f}", "trend": ""}
-            details["VIX/VXN 비율"] = {"VIX": f"{vix_now2:.1f}", "VXN": f"{vxn_now:.1f}", "비율": f"{ratio:.3f}", "판정": "⚠️ 공포 급등" if fear_spike else "✅ 정상"}
+            details["VIX/VXN 비율"] = {"현재": f"{ratio:.3f}", "판정": "⚠️ 공포 급등" if fear_spike else "✅ 정상"}
             if fear_spike:
-                warnings.append(f"⚠️ VIX/VXN 비율 {ratio:.3f} — 주식·나스닥 공포 동조화 신호")
-        elif _vix_ok and len(vix_close) >= 10:
-            # VXN 없을 때: VIX 절대값으로 단독 판정
-            vix_now2 = float(vix_close.iloc[-1])
-            vix_20d = float(vix_close.tail(20).mean()) if len(vix_close) >= 20 else vix_now2
-            fear_spike = vix_now2 > 30 or vix_now2 > vix_20d * 1.25
-            signals["vix_vxn"] = {
-                "ok": not fear_spike,
-                "value": f"VIX {vix_now2:.1f} (VXN조회불가)",
-                "trend": "",
-            }
-            details["VIX/VXN 비율"] = {"비고": "VXN 조회 실패 — VIX 단독 판정", "VIX": f"{vix_now2:.1f}", "판정": "⚠️ VIX 과열" if fear_spike else "✅ 정상"}
-            if fear_spike:
-                warnings.append(f"⚠️ VIX {vix_now2:.1f} 과열 — 공포 급등 신호 (VXN 데이터 없음)")
+                warnings.append(f"⚠️ VIX/VXN 비율 {ratio:.3f} — 공포 급등 신호")
         else:
-            signals["vix_vxn"] = {"ok": True, "value": "N/A (소스 없음)", "trend": ""}
+            signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
     except Exception:
         signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
 
@@ -3683,31 +3442,12 @@ def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fmp_batch_price_history(tickers: list, limit: int = 130) -> dict:
-    """여러 티커를 ThreadPoolExecutor로 병렬 FMP 호출 → {ticker: DataFrame} 반환.
-    순차 루프 대비 섹터 스캔(30~50종목) 기준 약 5~8배 속도 향상.
-    max_workers=8: FMP Starter 레이트 리밋(300 req/min) 여유 있게 유지.
-    """
-    if not tickers:
-        return {}
-
-    import concurrent.futures
-
-    _MAX_WORKERS = 8  # FMP 레이트 리밋 감안한 동시 요청 수
-
-    def _fetch_one(tk):
-        df = _fmp_price_history(tk, limit=limit)
-        return tk, df
-
+    """여러 티커를 개별 FMP 호출로 수집 → {ticker: DataFrame} 반환."""
     result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        futures = {executor.submit(_fetch_one, tk): tk for tk in tickers}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                tk, df = future.result()
-                if not df.empty:
-                    result[tk] = df
-            except Exception:
-                pass  # 개별 티커 실패가 전체 배치를 중단시키지 않음
+    for tk in tickers:
+        df = _fmp_price_history(tk, limit=limit)
+        if not df.empty:
+            result[tk] = df
     return result
 
 
@@ -3723,225 +3463,6 @@ def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
     if not close_dict:
         return pd.DataFrame()
     return pd.DataFrame(close_dict).sort_index()
-
-
-# ── _fmp_fill 내부 uncached requests.get 3개를 캐싱 래퍼로 분리 ──────────
-# 기존: _fmp_fill() 호출마다 /quote, /analyst-estimates, /balance-sheet를
-#        직접 requests.get → 스캐너 30~50 티커 루프에서 최대 150회 raw HTTP.
-# 개선: 각각 @st.cache_data(ttl=3600) 래퍼로 감싸 첫 호출 이후 캐시 히트.
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_quote(ticker: str) -> dict:
-    """FMP /quote — MA50/MA200/52w고저/현재가/시총. _fmp_fill 전용 캐싱 래퍼."""
-    k = _fmp_key()
-    if not k:
-        return {}
-    try:
-        r = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
-        if r.status_code == 200:
-            d = r.json()
-            return d[0] if isinstance(d, list) and d else {}
-    except Exception:
-        pass
-    return {}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_analyst_estimates(ticker: str) -> list:
-    """FMP /analyst-estimates (annual, limit=4) — Forward P/E 계산용. _fmp_fill 전용 캐싱 래퍼."""
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_balance_sheet(ticker: str) -> dict:
-    """FMP /balance-sheet-statement (limit=2) — ROE·D/E 직접 계산용. _fmp_fill 전용 캐싱 래퍼."""
-    k = _fmp_key()
-    if not k:
-        return {}
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit=2&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d[0] if isinstance(d, list) and d else {}
-    except Exception:
-        pass
-    return {}
-
-
-# ── 신규 기능용 FMP 캐싱 래퍼 ────────────────────────────────────────────────
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_financial_scores(ticker: str) -> dict:
-    """FMP /financial-scores — Altman Z-Score + Piotroski F-Score.
-    반환 키: altmanZScore, piotroskiScore, workingCapital, retainedEarnings 등.
-    """
-    k = _fmp_key()
-    if not k:
-        return {}
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/financial-scores?symbol={ticker}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
-    except Exception:
-        pass
-    return {}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_sector_pe_snapshot() -> list:
-    """FMP /sector-pe-snapshot — 전 섹터 현재 PER 스냅샷.
-    반환: [{"sector": "Technology", "pe": 32.1, "date": "2024-02-01"}, ...]
-    """
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        from datetime import date
-        today = date.today().isoformat()
-        r = requests.get(
-            f"{_FMP_BASE}/sector-pe-snapshot?date={today}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _fmp_biggest_gainers_losers() -> dict:
-    """FMP /biggest-gainers + /biggest-losers — 장중 상위 급등/급락 종목.
-    반환: {"gainers": [...], "losers": [...]}  각 항목: symbol, name, change, changesPercentage, price
-    TTL=300(5분): 장중 실시간성 반영.
-    """
-    k = _fmp_key()
-    if not k:
-        return {"gainers": [], "losers": []}
-    result = {"gainers": [], "losers": []}
-    try:
-        rg = requests.get(f"{_FMP_BASE}/biggest-gainers?apikey={k}", timeout=_FMP_TIMEOUT)
-        if rg.status_code == 200:
-            result["gainers"] = (rg.json() or [])[:10]
-    except Exception:
-        pass
-    try:
-        rl = requests.get(f"{_FMP_BASE}/biggest-losers?apikey={k}", timeout=_FMP_TIMEOUT)
-        if rl.status_code == 200:
-            result["losers"] = (rl.json() or [])[:10]
-    except Exception:
-        pass
-    return result
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_earnings_transcript(ticker: str) -> dict:
-    """FMP /earning-call-transcript — 직전 분기 어닝콜 원문.
-    반환: {"symbol": ..., "quarter": ..., "year": ..., "content": ...}
-    """
-    k = _fmp_key()
-    if not k:
-        return {}
-    try:
-        # 날짜 목록 먼저 조회 → 가장 최근 분기/연도 파악
-        rd = requests.get(
-            f"{_FMP_BASE}/earning-call-transcript-dates?symbol={ticker}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if rd.status_code != 200:
-            return {}
-        dates = rd.json()
-        if not isinstance(dates, list) or not dates:
-            return {}
-        # 첫 번째 항목이 가장 최근 (FMP 응답 내림차순)
-        latest = dates[0]
-        year = latest.get("year") or latest[0] if isinstance(latest, list) else latest.get("year")
-        quarter = latest.get("quarter") or latest[1] if isinstance(latest, list) else latest.get("quarter")
-        if not year or not quarter:
-            return {}
-        rt = requests.get(
-            f"{_FMP_BASE}/earning-call-transcript?symbol={ticker}&year={year}&quarter={quarter}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if rt.status_code == 200:
-            d = rt.json()
-            item = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
-            return item
-    except Exception:
-        pass
-    return {}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_historical_ratings(ticker: str) -> list:
-    """FMP /grades-historical — 애널리스트 등급 변경 히스토리 (최근 15건).
-    반환: [{"date": ..., "company": ..., "analyst": ..., "previousGrade": ..., "newGrade": ..., "action": ...}, ...]
-    """
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/grades-historical?symbol={ticker}&limit=15&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_company_screener(
-    sector: str = "",
-    market_cap_min: int = 1_000_000_000,
-    volume_min: int = 500_000,
-    limit: int = 50,
-) -> list:
-    """FMP /company-screener — 조건 기반 종목 자동 탐색.
-    sector: 'Technology', 'Healthcare' 등 빈 문자열이면 전체.
-    반환: [{"symbol": ..., "companyName": ..., "marketCap": ..., "sector": ..., "volume": ...}, ...]
-    """
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        params = f"marketCapMoreThan={market_cap_min}&volumeMoreThan={volume_min}&limit={limit}&apikey={k}"
-        if sector:
-            params += f"&sector={sector.replace(' ', '%20')}"
-        r = requests.get(
-            f"{_FMP_BASE}/company-screener?{params}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
 
 
 def _fmp_fill(info: dict, ticker: str) -> dict:
@@ -3997,26 +3518,31 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
     _need_quote = not all([info.get("fiftyDayAverage"), info.get("twoHundredDayAverage")])
     if _need_quote:
         try:
-            q_item = _fmp_quote(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
-            if q_item:
-                if not info.get("fiftyDayAverage"):
-                    v = to_float(q_item.get("priceAvg50"))
-                    if pd.notna(v): info["fiftyDayAverage"] = v
-                if not info.get("twoHundredDayAverage"):
-                    v = to_float(q_item.get("priceAvg200"))
-                    if pd.notna(v): info["twoHundredDayAverage"] = v
-                if not info.get("fiftyTwoWeekHigh"):
-                    v = to_float(q_item.get("yearHigh"))
-                    if pd.notna(v): info["fiftyTwoWeekHigh"] = v
-                if not info.get("fiftyTwoWeekLow"):
-                    v = to_float(q_item.get("yearLow"))
-                    if pd.notna(v): info["fiftyTwoWeekLow"] = v
-                if not info.get("currentPrice"):
-                    v = to_float(q_item.get("price"))
-                    if pd.notna(v): info["currentPrice"] = v
-                if not info.get("marketCap"):
-                    v = to_float(q_item.get("marketCap"))
-                    if pd.notna(v): info["marketCap"] = v
+            k_q = _fmp_key()
+            if k_q:
+                rq = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k_q}", timeout=_FMP_TIMEOUT)
+                if rq.status_code == 200:
+                    qd = rq.json()
+                    q_item = qd[0] if isinstance(qd, list) and qd else {}
+                    if q_item:
+                        if not info.get("fiftyDayAverage"):
+                            v = to_float(q_item.get("priceAvg50"))
+                            if pd.notna(v): info["fiftyDayAverage"] = v
+                        if not info.get("twoHundredDayAverage"):
+                            v = to_float(q_item.get("priceAvg200"))
+                            if pd.notna(v): info["twoHundredDayAverage"] = v
+                        if not info.get("fiftyTwoWeekHigh"):
+                            v = to_float(q_item.get("yearHigh"))
+                            if pd.notna(v): info["fiftyTwoWeekHigh"] = v
+                        if not info.get("fiftyTwoWeekLow"):
+                            v = to_float(q_item.get("yearLow"))
+                            if pd.notna(v): info["fiftyTwoWeekLow"] = v
+                        if not info.get("currentPrice"):
+                            v = to_float(q_item.get("price"))
+                            if pd.notna(v): info["currentPrice"] = v
+                        if not info.get("marketCap"):
+                            v = to_float(q_item.get("marketCap"))
+                            if pd.notna(v): info["marketCap"] = v
         except Exception:
             pass
 
@@ -4055,42 +3581,55 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
     # 실제 API 응답: epsAvg 필드 사용, period=annual&limit=4로 가장 가까운 연도 우선
     if not info.get("forwardPE"):
         try:
-            ae_data = _fmp_analyst_estimates(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
-            if isinstance(ae_data, list) and ae_data:
-                current_year = datetime.now().year
-                # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
-                ae_sorted = sorted(
-                    ae_data,
-                    key=lambda x: str(x.get("date") or x.get("year") or "9999")
+            k_val = _fmp_key()
+            if k_val:
+                r_ae = requests.get(
+                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k_val}",
+                    timeout=_FMP_TIMEOUT
                 )
-                for ae in ae_sorted:
-                    ae_year_str = str(ae.get("date") or ae.get("year") or "")[:4]
-                    try:
-                        ae_year = int(ae_year_str)
-                    except Exception:
-                        continue
-                    if ae_year < current_year:
-                        continue
-                    # 실제 API 필드명: epsAvg (확인됨)
-                    est_eps = to_float(
-                        ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
-                        ae.get("estimatedEps") or ae.get("eps")
-                    )
-                    cur_price = to_float(
-                        info.get("currentPrice") or info.get("price") or
-                        info.get("regularMarketPrice") or info.get("_fmp_price")
-                    )
-                    # currentPrice 없으면 캐싱된 profile에서 가져오기 (기존: 별도 requests.get)
-                    if (cur_price is None or pd.isna(cur_price)):
-                        _p_cur = _fmp_profile(ticker)
-                        cur_price = to_float(_p_cur.get("price")) if _p_cur else np.nan
-                        if pd.notna(cur_price):
-                            info["currentPrice"] = cur_price
-                    if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
-                        fwd_pe = round(float(cur_price) / float(est_eps), 2)
-                        if 0 < fwd_pe < 2000:
-                            info["forwardPE"] = fwd_pe
-                            break
+                if r_ae.status_code == 200:
+                    ae_data = r_ae.json()
+                    if isinstance(ae_data, list) and ae_data:
+                        current_year = datetime.now().year
+                        # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
+                        ae_sorted = sorted(
+                            ae_data,
+                            key=lambda x: str(x.get("date") or x.get("year") or "9999")
+                        )
+                        for ae in ae_sorted:
+                            ae_year_str = str(ae.get("date") or ae.get("year") or "")[:4]
+                            try:
+                                ae_year = int(ae_year_str)
+                            except Exception:
+                                continue
+                            if ae_year < current_year:
+                                continue
+                            # 실제 API 필드명: epsAvg (확인됨)
+                            est_eps = to_float(
+                                ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
+                                ae.get("estimatedEps") or ae.get("eps")
+                            )
+                            cur_price = to_float(
+                                info.get("currentPrice") or info.get("price") or
+                                info.get("regularMarketPrice") or info.get("_fmp_price")
+                            )
+                            # currentPrice 없으면 profile에서 직접 가져오기
+                            if (cur_price is None or pd.isna(cur_price)) and k_val:
+                                try:
+                                    _rp = requests.get(f"{_FMP_BASE}/profile?symbol={ticker}&apikey={k_val}", timeout=_FMP_TIMEOUT)
+                                    if _rp.status_code == 200:
+                                        _pd2 = _rp.json()
+                                        _pi2 = _pd2[0] if isinstance(_pd2, list) and _pd2 else {}
+                                        cur_price = to_float(_pi2.get("price"))
+                                        if pd.notna(cur_price):
+                                            info["currentPrice"] = cur_price
+                                except Exception:
+                                    pass
+                            if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
+                                fwd_pe = round(float(cur_price) / float(est_eps), 2)
+                                if 0 < fwd_pe < 2000:
+                                    info["forwardPE"] = fwd_pe
+                                    break
         except Exception:
             pass
 
@@ -4187,9 +3726,15 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
 
         # balance-sheet에서 직접 ROE, D/E 계산
         try:
-            if not info.get("returnOnEquity") or not info.get("debtToEquity"):
-                bs = _fmp_balance_sheet(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
-                if bs:
+            k_val = _fmp_key()
+            if k_val and (not info.get("returnOnEquity") or not info.get("debtToEquity")):
+                rb = requests.get(
+                    f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit=2&apikey={k_val}",
+                    timeout=_FMP_TIMEOUT
+                )
+                bs_data = rb.json() if rb.status_code == 200 else []
+                if isinstance(bs_data, list) and bs_data:
+                    bs = bs_data[0]
                     equity = to_float(bs.get("totalStockholdersEquity") or bs.get("stockholdersEquity"))
                     total_debt = to_float(bs.get("totalDebt") or bs.get("longTermDebt"))
                     net_income = to_float(latest.get("netIncome")) if latest else np.nan
@@ -4480,21 +4025,49 @@ def evaluate_kpis(ticker_symbol):
                 _fcf_val = float(_ocf + _capex)
         if pd.notna(_fcf_val):
             info["_fmp_fcf"] = _fcf_val
+        # income_stmt / balance_sheet은 None으로 처리 (FMP fill로 대체)
+        income_stmt = None
+        balance_sheet = None
     except Exception:
         tk_upper = str(ticker_symbol).strip().upper()
         info = _fmp_fill({}, tk_upper)
         history = pd.DataFrame()
+        income_stmt, balance_sheet = None, None
         latest_inc, prev_inc = {}, {}
 
     # ── 지표 추출 ──────────────────────────────────────────────────────
-    # ROE — FMP fill로 제공 (income_stmt/balance_sheet yfinance 분기 제거됨)
+    # ROE
     roe = to_float(info.get("returnOnEquity"))
+    if pd.isna(roe) and income_stmt is not None and balance_sheet is not None:
+        try:
+            net_income = income_stmt.loc["Net Income"].iloc[0] if "Net Income" in income_stmt.index else np.nan
+            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
+            if pd.notna(net_income) and pd.notna(equity) and equity != 0:
+                roe = float(net_income / equity)
+        except Exception:
+            pass
 
-    # Operating Margin — FMP fill로 제공
+    # Operating Margin
     operating_margin = to_float(info.get("operatingMargins"))
+    if pd.isna(operating_margin) and income_stmt is not None:
+        try:
+            op_income = income_stmt.loc["Operating Income"].iloc[0] if "Operating Income" in income_stmt.index else np.nan
+            total_rev = income_stmt.loc["Total Revenue"].iloc[0] if "Total Revenue" in income_stmt.index else np.nan
+            if pd.notna(op_income) and pd.notna(total_rev) and total_rev != 0:
+                operating_margin = float(op_income / total_rev)
+        except Exception:
+            pass
 
-    # Debt to Equity — FMP fill로 제공
+    # Debt to Equity
     debt_to_equity = to_float(info.get("debtToEquity"))
+    if pd.isna(debt_to_equity) and balance_sheet is not None:
+        try:
+            total_debt = balance_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in balance_sheet.index else np.nan
+            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
+            if pd.notna(total_debt) and pd.notna(equity) and equity != 0:
+                debt_to_equity = float(total_debt / equity * 100)
+        except Exception:
+            pass
 
     # PEG Ratio
     peg_ratio = to_float(info.get("pegRatio") or info.get("trailingPegRatio"))
@@ -4504,28 +4077,35 @@ def evaluate_kpis(ticker_symbol):
     trailing_pe   = to_float(info.get("trailingPE"))
     price_to_book = to_float(info.get("priceToBook"))
 
-    # Forward P/E fallback — 캐싱 래퍼 사용 (_fmp_fill 캐시 미스 대비)
+    # Forward P/E fallback — evaluate_kpis에서 직접 계산 (캐시 미스 대비)
     if pd.isna(forward_pe):
         try:
-            _fp_data = _fmp_analyst_estimates(tk_upper)
-            if isinstance(_fp_data, list) and _fp_data:
-                _cur_year = datetime.now().year
-                _fp_sorted = sorted(_fp_data, key=lambda x: str(x.get("date") or "9999"))
-                for _ae in _fp_sorted:
-                    _ae_y = str(_ae.get("date") or "")[:4]
-                    try:
-                        if int(_ae_y) < _cur_year:
-                            continue
-                    except Exception:
-                        continue
-                    _eps = to_float(_ae.get("epsAvg") or _ae.get("estimatedEpsAvg") or _ae.get("estimatedEps"))
-                    _cp  = to_float(info.get("currentPrice") or info.get("price"))
-                    if pd.notna(_eps) and _eps > 0 and pd.notna(_cp) and _cp > 0:
-                        _fwd = round(float(_cp) / float(_eps), 2)
-                        if 0 < _fwd < 2000:
-                            forward_pe = _fwd
-                            info["forwardPE"] = _fwd
-                            break
+            _k_fp = _fmp_key()
+            if _k_fp:
+                _r_fp = requests.get(
+                    f"{_FMP_BASE}/analyst-estimates?symbol={tk_upper}&period=annual&limit=4&apikey={_k_fp}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if _r_fp.status_code == 200:
+                    _fp_data = _r_fp.json()
+                    if isinstance(_fp_data, list) and _fp_data:
+                        _cur_year = datetime.now().year
+                        _fp_sorted = sorted(_fp_data, key=lambda x: str(x.get("date") or "9999"))
+                        for _ae in _fp_sorted:
+                            _ae_y = str(_ae.get("date") or "")[:4]
+                            try:
+                                if int(_ae_y) < _cur_year:
+                                    continue
+                            except Exception:
+                                continue
+                            _eps = to_float(_ae.get("epsAvg") or _ae.get("estimatedEpsAvg") or _ae.get("estimatedEps"))
+                            _cp  = to_float(info.get("currentPrice") or info.get("price"))
+                            if pd.notna(_eps) and _eps > 0 and pd.notna(_cp) and _cp > 0:
+                                _fwd = round(float(_cp) / float(_eps), 2)
+                                if 0 < _fwd < 2000:
+                                    forward_pe = _fwd
+                                    info["forwardPE"] = _fwd
+                                    break
         except Exception:
             pass
     ev_to_ebitda  = to_float(info.get("enterpriseToEbitda"))
@@ -5720,15 +5300,10 @@ def update_drg_prediction_result(user_id: str, pred_date: str,
         for i, row in enumerate(rows[1:], start=2):
             if (len(row) > uid_idx and str(row[uid_idx]).strip() == str(user_id).strip() and
                     len(row) > date_idx and str(row[date_idx]).strip() == str(pred_date).strip()):
-                # 4번 개별 호출 → batch_update 1회로 합산 (API 호출 4→1)
-                def _col(idx):
-                    return chr(64 + idx + 1)
-                ws.batch_update([
-                    {"range": f"{_col(actual_dir_idx)}{i}",  "values": [[actual_direction]]},
-                    {"range": f"{_col(actual_ret_idx)}{i}",  "values": [[str(round(actual_return_pct, 4))]]},
-                    {"range": f"{_col(correct_idx)}{i}",     "values": [[is_correct]]},
-                    {"range": f"{_col(comment_idx)}{i}",     "values": [[review_comment]]},
-                ], value_input_option="USER_ENTERED")
+                ws.update_cell(i, actual_dir_idx + 1, actual_direction)
+                ws.update_cell(i, actual_ret_idx + 1, str(round(actual_return_pct, 4)))
+                ws.update_cell(i, correct_idx + 1, is_correct)
+                ws.update_cell(i, comment_idx + 1, review_comment)
                 _invalidate_drg_predictions_cache()
                 return True, ""
         return False, f"{pred_date} 예측 행을 찾을 수 없습니다."
@@ -10347,7 +9922,10 @@ if st.session_state.get("logged_in"):
             st.session_state.pop("main_nav_idx", None)
     _cur_nav = st.session_state.get(_nav_key)
     if _cur_nav not in _nav_opts:
-        st.session_state[_nav_key] = _nav_opts[0]
+        if isinstance(_cur_nav, str) and _cur_nav in _LEGACY_NAV_STR_TO_INDEX:
+            st.session_state[_nav_key] = _MAIN_NAV_OPTIONS[_LEGACY_NAV_STR_TO_INDEX[_cur_nav]]
+        else:
+            st.session_state[_nav_key] = _nav_opts[0]
     
     main_nav = st.sidebar.radio(
         "탑다운 단계",
@@ -10858,46 +10436,6 @@ if st.session_state.get("logged_in"):
                         st.markdown("**🤖 AI 리뷰:**")
                         st.markdown(str(_r.get("review_comment", "")))
 
-        # ── 오늘의 급등/급락 Top 10 ──────────────────────────────────────
-        st.divider()
-        st.markdown("### 📈 오늘의 급등/급락 Top 10")
-        st.caption("FMP biggest-gainers/losers 기준. 5분 캐시. 어떤 섹터가 장을 주도하는지 빠르게 파악하세요.")
-        with st.spinner("급등/급락 데이터 조회 중..."):
-            _gl_data = _fmp_biggest_gainers_losers()
-        _gl_c1, _gl_c2 = st.columns(2)
-        with _gl_c1:
-            st.markdown("#### 🚀 급등 Top 10")
-            _gainers = _gl_data.get("gainers", [])
-            if _gainers:
-                _g_rows = []
-                for _g in _gainers[:10]:
-                    _pct = to_float(_g.get("changesPercentage") or _g.get("change_percentage"))
-                    _g_rows.append({
-                        "티커": str(_g.get("symbol") or ""),
-                        "종목명": str(_g.get("name") or "")[:20],
-                        "현재가": f"${to_float(_g.get('price')):.2f}" if pd.notna(to_float(_g.get('price'))) else "N/A",
-                        "등락률": f"+{_pct:.2f}%" if pd.notna(_pct) else "N/A",
-                    })
-                st.dataframe(pd.DataFrame(_g_rows), use_container_width=True, hide_index=True)
-            else:
-                st.caption("급등 데이터를 가져올 수 없습니다.")
-        with _gl_c2:
-            st.markdown("#### 📉 급락 Top 10")
-            _losers = _gl_data.get("losers", [])
-            if _losers:
-                _l_rows = []
-                for _l in _losers[:10]:
-                    _pct = to_float(_l.get("changesPercentage") or _l.get("change_percentage"))
-                    _l_rows.append({
-                        "티커": str(_l.get("symbol") or ""),
-                        "종목명": str(_l.get("name") or "")[:20],
-                        "현재가": f"${to_float(_l.get('price')):.2f}" if pd.notna(to_float(_l.get('price'))) else "N/A",
-                        "등락률": f"{_pct:.2f}%" if pd.notna(_pct) else "N/A",
-                    })
-                st.dataframe(pd.DataFrame(_l_rows), use_container_width=True, hide_index=True)
-            else:
-                st.caption("급락 데이터를 가져올 수 없습니다.")
-
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
         st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 미국 거시경제 대시보드")
@@ -10908,7 +10446,7 @@ if st.session_state.get("logged_in"):
                 macro_pack = get_macro_dashboard_with_validation()
 
             if macro_pack.get("na_total", 0) >= 4:
-                st.warning("일부 거시경제 데이터를 불러오지 못했습니다. FRED 또는 FMP API 상태를 확인해주세요.")
+                _notify_yfinance_fetch_failed()
 
             # ── 1. Macro Score 게이지 ──────────────────────────────────────
             macro_score = macro_pack.get("macro_score", 50.0)
@@ -11815,53 +11353,6 @@ if st.session_state.get("logged_in"):
                     placeholder="예: NVDA, MSFT, SMCI",
                     key="opportunity_scanner_manual_tickers",
                 )
-
-                # ── FMP Screener 자동 탐색 ───────────────────────────────
-                with st.expander("🔍 FMP Screener 자동 탐색 (유니버스 보완)", expanded=False):
-                    st.caption("시총 $10B↑ · 거래량 100만↑ 조건으로 FMP가 자동 필터링한 종목을 유니버스에 추가합니다.")
-                    _scr_sector_map = {
-                        "전체 (섹터 무관)": "",
-                        "Technology": "Technology",
-                        "Healthcare": "Healthcare",
-                        "Financials": "Financials",
-                        "Energy": "Energy",
-                        "Consumer Cyclical": "Consumer Cyclical",
-                        "Industrials": "Industrials",
-                        "Communication Services": "Communication Services",
-                        "Utilities": "Utilities",
-                        "Real Estate": "Real Estate",
-                        "Materials": "Materials",
-                    }
-                    _scr_sel = st.selectbox(
-                        "스크리너 섹터 필터",
-                        options=list(_scr_sector_map.keys()),
-                        key="screener_sector_select",
-                    )
-                    _scr_cap_min = st.number_input(
-                        "최소 시가총액 ($B)",
-                        min_value=1, max_value=500, value=10, step=5,
-                        key="screener_cap_min",
-                    )
-                    if st.button("🔍 Screener 탐색 실행", key="run_screener_btn", use_container_width=True):
-                        with st.spinner("FMP Screener 조회 중..."):
-                            _scr_results = _fmp_company_screener(
-                                sector=_scr_sector_map[_scr_sel],
-                                market_cap_min=int(_scr_cap_min * 1_000_000_000),
-                                volume_min=1_000_000,
-                                limit=50,
-                            )
-                        if _scr_results:
-                            _scr_tickers = [str(r.get("symbol") or "").strip().upper() for r in _scr_results if r.get("symbol")]
-                            _scr_tickers = filter_scanner_ticker_list(_scr_tickers)
-                            st.session_state["_screener_extra_tickers"] = _scr_tickers
-                            st.success(f"✅ {len(_scr_tickers)}개 종목 탐색 완료 — 스캔 실행 시 유니버스에 자동 포함됩니다.")
-                            st.code(", ".join(_scr_tickers[:30]) + ("..." if len(_scr_tickers) > 30 else ""))
-                        else:
-                            st.warning("스크리너 결과를 가져올 수 없습니다.")
-                    _scr_extra = st.session_state.get("_screener_extra_tickers", [])
-                    if _scr_extra:
-                        st.caption(f"📌 현재 탐색된 추가 종목: {len(_scr_extra)}개 (스캔 실행 시 자동 병합)")
-
             elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
                 st.caption(
                     "「Current Leaders 스캔」은 `Narratives` 시트 **Winners** 열(또는 JSON의 winners)만 사용합니다. "
@@ -11884,10 +11375,6 @@ if st.session_state.get("logged_in"):
                     target_universe = build_opportunity_scanner_universe_from_direct_selection(
                         selected_sector_labels, manual_tickers_input
                     )
-                    # FMP Screener 자동 탐색 결과 병합
-                    _scr_extra_l = st.session_state.get("_screener_extra_tickers", [])
-                    if _scr_extra_l:
-                        target_universe = list(dict.fromkeys(target_universe + _scr_extra_l))
                     latest_analysis = resolve_opportunity_scanner_narrative_for_direct_mode()
                     src_note = "수동 섹터/티커"
                     scanner_mode_saved = "섹터/티커 직접 스캔"
@@ -12321,35 +11808,7 @@ if st.session_state.get("logged_in"):
                 missing_cells = int(sector_returns_df[perf_cols].isna().sum().sum())
                 if missing_cells > 0:
                     st.info("일부 ETF는 거래일 부족 또는 데이터 누락으로 일부 기간 수익률이 N/A로 표시됩니다.")
-
-                # ── 섹터 PER 스냅샷 ──────────────────────────────────────────
-                st.divider()
-                st.markdown("### 💰 섹터별 현재 PER (Sector P/E Snapshot)")
-                st.caption("FMP sector-pe-snapshot 기준. RS 강한 섹터라도 PER이 지나치게 높으면 신중하게 접근하세요.")
-                with st.spinner("섹터 PER 데이터 조회 중..."):
-                    _spe_data = _fmp_sector_pe_snapshot()
-                if _spe_data:
-                    _spe_rows = []
-                    for _sp in _spe_data:
-                        _sp_pe = to_float(_sp.get("pe") or _sp.get("pe_ratio") or _sp.get("peRatio"))
-                        _sp_sec = str(_sp.get("sector") or "")
-                        if _sp_sec and pd.notna(_sp_pe) and _sp_pe > 0:
-                            _spe_rows.append({"섹터": _sp_sec, "현재 PER": round(_sp_pe, 1)})
-                    if _spe_rows:
-                        _spe_df = pd.DataFrame(_spe_rows).sort_values("현재 PER", ascending=True).reset_index(drop=True)
-                        _spe_styled = (
-                            _spe_df.style
-                            .format({"현재 PER": "{:.1f}x"})
-                            .background_gradient(cmap="RdYlGn_r", subset=["현재 PER"], vmin=10, vmax=50)
-                        )
-                        st.dataframe(_spe_styled, use_container_width=True, hide_index=True)
-                        _median_pe = _spe_df["현재 PER"].median()
-                        st.caption(f"📊 섹터 중간 PER: {_median_pe:.1f}x  |  낮을수록 밸류에이션 매력 높음 (초록), 높을수록 부담 (빨강)")
-                    else:
-                        st.caption("PER 데이터를 파싱할 수 없습니다.")
-                else:
-                    st.caption("섹터 PER 데이터를 조회할 수 없습니다.")
-
+    
                 st.divider()
                 selected_sector_etf = st.selectbox(
                     "세부 종목을 확인하고 싶은 섹터를 선택하세요",
@@ -13061,67 +12520,6 @@ if st.session_state.get("logged_in"):
                     st.divider()
 
     
-                # ── Altman Z-Score + Piotroski F-Score ──────────────────────
-                with st.expander("🏦 재무 건전성 점수 (Altman Z / Piotroski F)", expanded=True):
-                    st.caption("FMP `/financial-scores` 기반. Altman Z는 파산 위험, Piotroski F는 재무 종합 점수(0~9).")
-                    with st.spinner(f"{selected_ticker} 재무 건전성 점수 조회 중..."):
-                        _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
-                    if _fs:
-                        _az = to_float(_fs.get("altmanZScore"))
-                        _ps = to_float(_fs.get("piotroskiScore"))
-                        _az_col, _ps_col = st.columns(2)
-                        with _az_col:
-                            if pd.notna(_az):
-                                if _az >= 3.0:
-                                    _az_label = "✅ 안전 구간 (≥3.0)"
-                                    _az_color = "#16a34a"
-                                elif _az >= 1.81:
-                                    _az_label = "⚠️ 회색 구간 (1.81~3.0)"
-                                    _az_color = "#d97706"
-                                else:
-                                    _az_label = "🚨 위험 구간 (<1.81)"
-                                    _az_color = "#dc2626"
-                                st.markdown(
-                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
-                                    f"border-left:4px solid {_az_color};'>"
-                                    f"<div style='color:#94a3b8;font-size:12px;'>Altman Z-Score</div>"
-                                    f"<div style='color:{_az_color};font-size:26px;font-weight:900;'>{_az:.2f}</div>"
-                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_az_label}</div>"
-                                    f"<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
-                                    f"≥3.0 안전 · 1.81~3.0 주의 · &lt;1.81 파산위험</div>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.metric("Altman Z-Score", "N/A")
-                        with _ps_col:
-                            if pd.notna(_ps):
-                                _ps_int = int(_ps)
-                                if _ps_int >= 7:
-                                    _ps_label = "✅ 강한 재무 (7~9)"
-                                    _ps_color = "#16a34a"
-                                elif _ps_int >= 4:
-                                    _ps_label = "🟡 중립 (4~6)"
-                                    _ps_color = "#d97706"
-                                else:
-                                    _ps_label = "🚨 약한 재무 (0~3)"
-                                    _ps_color = "#dc2626"
-                                _ps_bar = "█" * _ps_int + "░" * (9 - _ps_int)
-                                st.markdown(
-                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
-                                    f"border-left:4px solid {_ps_color};'>"
-                                    f"<div style='color:#94a3b8;font-size:12px;'>Piotroski F-Score</div>"
-                                    f"<div style='color:{_ps_color};font-size:26px;font-weight:900;'>{_ps_int} / 9</div>"
-                                    f"<div style='color:{_ps_color};font-size:14px;font-family:monospace;'>{_ps_bar}</div>"
-                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_ps_label}</div>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.metric("Piotroski F-Score", "N/A")
-                    else:
-                        st.caption("재무 건전성 데이터를 조회할 수 없습니다.")
-
                 with st.expander("원본 KPI 테이블 보기"):
                     st.dataframe(
                         kpi_df[["Category", "KPI", "Value", "Rule", "Pass"]],
@@ -13132,60 +12530,7 @@ if st.session_state.get("logged_in"):
         except Exception as e:
             st.error("펀더멘털(체력 검사) 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
-
-        # ── 어닝콜 트랜스크립트 AI 요약 ───────────────────────────────────
-        st.divider()
-        st.markdown("### 📞 어닝콜 트랜스크립트 AI 요약")
-        st.caption("직전 분기 실적발표 원문 → Gemini 3줄 요약 (가이던스·경영진 톤·주요 리스크)")
-        _tc_key = f"_transcript_summary_{selected_ticker}"
-        _tc_raw_key = f"_transcript_raw_{selected_ticker}"
-        _tc_col1, _tc_col2 = st.columns([1, 1])
-        with _tc_col1:
-            if st.button("🤖 트랜스크립트 AI 요약 실행", key=f"tc_btn_{selected_ticker}", use_container_width=True):
-                with st.spinner("어닝콜 원문 조회 중..."):
-                    _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
-                st.session_state[_tc_raw_key] = _tc_data
-                if _tc_data and _tc_data.get("content"):
-                    _tc_text = str(_tc_data["content"])[:6000]
-                    _tc_q = _tc_data.get("quarter", "")
-                    _tc_y = _tc_data.get("year", "")
-                    _tc_prompt = (
-                        f"{selected_ticker} {_tc_y}년 Q{_tc_q} 어닝콜 트랜스크립트를 분석하세요.\n\n"
-                        "다음 3가지를 각각 2~3문장으로 요약하세요:\n"
-                        "1) 📈 가이던스 (상향/하향/유지 여부, 구체 수치)\n"
-                        "2) 🎙️ 경영진 톤 (자신감/우려/방어적 등 분위기)\n"
-                        "3) ⚠️ 주요 리스크 (경영진이 언급한 위험 요인)\n\n"
-                        "한국어로 답변하세요.\n\n"
-                        f"[트랜스크립트 원문]\n{_tc_text}"
-                    )
-                    with st.spinner("Gemini 요약 중..."):
-                        try:
-                            _tc_model = _GenAIModel(
-                                "gemini-2.5-flash",
-                                generation_config={"temperature": 0.1, "max_output_tokens": 1024},
-                            )
-                            _tc_resp = _tc_model.generate_content(_tc_prompt)
-                            _tc_summary = (_gemini_response_text_utf8_safe(_tc_resp) or "").strip()
-                            st.session_state[_tc_key] = {
-                                "summary": _tc_summary,
-                                "quarter": _tc_q,
-                                "year": _tc_y,
-                            }
-                        except Exception as _tc_err:
-                            st.error(f"Gemini 요약 실패: {_tc_err}")
-                else:
-                    st.warning("어닝콜 트랜스크립트 데이터를 찾을 수 없습니다.")
-        with _tc_col2:
-            if st.session_state.get(_tc_key):
-                _tc_sum = st.session_state[_tc_key]
-                st.caption(f"📅 {_tc_sum.get('year')}년 Q{_tc_sum.get('quarter')} 어닝콜")
-        if st.session_state.get(_tc_key) and st.session_state[_tc_key].get("summary"):
-            st.markdown(st.session_state[_tc_key]["summary"])
-            _tc_raw = st.session_state.get(_tc_raw_key, {})
-            if _tc_raw and _tc_raw.get("content"):
-                with st.expander("📄 원문 보기 (영문)", expanded=False):
-                    st.text(str(_tc_raw["content"])[:3000] + ("..." if len(str(_tc_raw.get("content",""))) > 3000 else ""))
-
+    
         st.divider()
         st.markdown("### 📊 기술적 분석 (Technical Analysis)")
         st.caption("RSI · MACD · 볼린저밴드 · 거래량으로 진입 구간 점검")
@@ -13834,34 +13179,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             if st.button("🗑️ 진단 초기화", key="ai_diag_reset"):
                 st.session_state.pop(_diag_sk, None)
                 st.rerun()
-
-        # ── 애널리스트 등급 변경 히스토리 ────────────────────────────────
-        st.divider()
-        st.markdown("### 📊 애널리스트 등급 변경 히스토리")
-        st.caption("주요 기관의 상향/하향/유지 이력 (FMP grades-historical, 최근 15건)")
-        with st.spinner(f"{selected_ticker} 등급 히스토리 조회 중..."):
-            _rating_hist = _fmp_historical_ratings(str(selected_ticker).strip().upper())
-        if _rating_hist:
-            _rh_rows = []
-            for _rh in _rating_hist:
-                _action = str(_rh.get("action") or _rh.get("ratingChange") or "").strip()
-                _action_emoji = (
-                    "🟢 상향" if any(w in _action.lower() for w in ["upgrade", "initiated", "initiated at"]) else
-                    "🔴 하향" if "downgrade" in _action.lower() else
-                    "⚪ 유지"
-                )
-                _rh_rows.append({
-                    "날짜": str(_rh.get("date") or "")[:10],
-                    "기관": str(_rh.get("gradingCompany") or _rh.get("company") or ""),
-                    "변경": _action_emoji,
-                    "이전": str(_rh.get("previousGrade") or ""),
-                    "현재": str(_rh.get("newGrade") or ""),
-                })
-            _rh_df = pd.DataFrame(_rh_rows)
-            st.dataframe(_rh_df, use_container_width=True, hide_index=True)
-        else:
-            st.caption("등급 변경 히스토리 데이터를 찾을 수 없습니다.")
-
+    
     elif main_nav == _MAIN_NAV_OPTIONS[6]:
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
