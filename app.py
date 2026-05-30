@@ -7643,8 +7643,19 @@ def narrative_history_expander_title(rec):
     elif not session_lbl:
         session_lbl = "⏱️ Unknown session"
     analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
-    if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+    src = str(analysis.get("source") or "").strip()
+
+    if src == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
         return f"[{date_part}] 📊 주간트렌드(7일) | 브리핑 | 티커 {len(analysis.get('precomputed_universe') or [])}개"
+    if src == "wow_trend_7d":
+        # 브리핑 첫 줄(제목)을 미리보기로 추출
+        md = str(analysis.get("weekly_briefing_markdown") or "").strip()
+        preview = ""
+        if md:
+            first_line = md.lstrip("#").split("\n")[0].strip()
+            preview = first_line[:50] + ("…" if len(first_line) > 50 else "")
+        return f"[{date_part}] ⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)" + (f" | {preview}" if preview else "")
+
     regime_part = _narrative_regime_risk_display(analysis)
     theme_part = _narrative_core_theme_display(analysis)
     return f"[{date_part}] {session_lbl} | {regime_part} | {theme_part}"
@@ -7860,7 +7871,11 @@ def render_narrative_history_compact(analysis: dict):
     if not isinstance(analysis, dict):
         st.write("_데이터 형식 오류_")
         return
-    if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+
+    src = str(analysis.get("source") or "").strip()
+
+    # ── 주간 트렌드 (weekly_trend_7d) ────────────────────────────────────
+    if src == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
         st.markdown("**유형:** 주간 트렌드 브리핑 (최근 7일 교집합)")
         uni = analysis.get("precomputed_universe")
         if isinstance(uni, list) and uni:
@@ -7871,6 +7886,18 @@ def render_narrative_history_compact(analysis: dict):
                 st.markdown(md[:12000])
         return
 
+    # ── 트렌드 변곡점 (wow_trend_7d) ─────────────────────────────────────
+    if src == "wow_trend_7d":
+        st.markdown("**유형:** ⚖️ 트렌드 변곡점 분석 (이번 주 vs 저번 주)")
+        md = str(analysis.get("weekly_briefing_markdown") or analysis.get("summary") or "").strip()
+        if md:
+            with st.expander("변곡점 브리핑 본문 보기", expanded=False):
+                st.markdown(md[:12000])
+        else:
+            st.caption("저장된 브리핑 본문이 없습니다.")
+        return
+
+    # ── 일반 시장 내러티브 (market_narrative) ────────────────────────────
     regime = analysis.get("regime") if isinstance(analysis.get("regime"), dict) else {}
     summary = analysis.get("summary") or ""
     themes = analysis.get("themes") if isinstance(analysis.get("themes"), list) else []
@@ -7945,11 +7972,23 @@ def hydrate_narrative_from_disk_once():
                     )
                     existing_ts = st.session_state.get("narrative_timeseries_briefing")
                     if not (isinstance(existing_ts, dict) and existing_ts.get("markdown")):
+                        fc_kind = "wow" if src == "wow_trend_7d" else "weekly"
+                        # 복원 시 팩트체크 재계산
+                        factcheck_df = pd.DataFrame()
+                        try:
+                            tickers_by_cat = extract_factcheck_tickers_from_briefing(briefing_md, kind=fc_kind)
+                            if tickers_by_cat.get("all"):
+                                if fc_kind == "wow":
+                                    factcheck_df = compute_narrative_factcheck_wow_returns(tickers_by_cat)
+                                else:
+                                    factcheck_df = compute_narrative_factcheck_weekly_returns(tickers_by_cat)
+                        except Exception:
+                            factcheck_df = pd.DataFrame()
                         st.session_state["narrative_timeseries_briefing"] = {
                             "title": title,
                             "markdown": briefing_md,
-                            "factcheck_kind": "wow" if src == "wow_trend_7d" else "weekly",
-                            "factcheck_df": pd.DataFrame(),
+                            "factcheck_kind": fc_kind,
+                            "factcheck_df": factcheck_df,
                         }
         st.session_state["_narrative_persist_loaded_v2"] = True
 
