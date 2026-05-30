@@ -7649,7 +7649,7 @@ def narrative_history_expander_title(rec):
         return f"[{date_part}] 📊 주간트렌드(7일) | 브리핑 | 티커 {len(analysis.get('precomputed_universe') or [])}개"
     if src == "wow_trend_7d":
         # 브리핑 첫 줄(제목)을 미리보기로 추출
-        md = str(analysis.get("weekly_briefing_markdown") or "").strip()
+        md = str(analysis.get("weekly_briefing_markdown") or analysis.get("wow_briefing_markdown") or "").strip()
         preview = ""
         if md:
             first_line = md.lstrip("#").split("\n")[0].strip()
@@ -7831,7 +7831,7 @@ def append_wow_trend_narrative_record(briefing_markdown: str, language: str,
             f"vs 저번 주 {len(last_week_recs or [])}건 기반"
         ),
         "summary": md,
-        "wow_briefing_markdown": md,
+        "weekly_briefing_markdown": md,
         "precomputed_universe": filter_scanner_ticker_list(ordered),
     }
     record = {
@@ -7889,7 +7889,12 @@ def render_narrative_history_compact(analysis: dict):
     # ── 트렌드 변곡점 (wow_trend_7d) ─────────────────────────────────────
     if src == "wow_trend_7d":
         st.markdown("**유형:** ⚖️ 트렌드 변곡점 분석 (이번 주 vs 저번 주)")
-        md = str(analysis.get("weekly_briefing_markdown") or analysis.get("summary") or "").strip()
+        md = str(
+            analysis.get("weekly_briefing_markdown")
+            or analysis.get("wow_briefing_markdown")
+            or analysis.get("summary")
+            or ""
+        ).strip()
         if md:
             with st.expander("변곡점 브리핑 본문 보기", expanded=False):
                 st.markdown(md[:12000])
@@ -7964,7 +7969,12 @@ def hydrate_narrative_from_disk_once():
             st.session_state["current_view_source"] = src
             # wow/weekly 는 narrative_timeseries_briefing 도 복원
             if src in ("weekly_trend_7d", "wow_trend_7d"):
-                briefing_md = str(picked_analysis.get("weekly_briefing_markdown") or "").strip()
+                briefing_md = str(
+                    picked_analysis.get("weekly_briefing_markdown")
+                    or picked_analysis.get("wow_briefing_markdown")
+                    or picked_analysis.get("summary")
+                    or ""
+                ).strip()
                 if briefing_md:
                     title = (
                         "📊 주간 트렌드 추출 (최근 7일)" if src == "weekly_trend_7d"
@@ -11955,7 +11965,12 @@ if st.session_state.get("logged_in"):
         # CASE A: weekly_trend_7d / wow_trend_7d → 마크다운 브리핑 렌더
         # ════════════════════════════════════════════════════════════════════
         if _cv_source in ("weekly_trend_7d", "wow_trend_7d") and isinstance(narrative_data, dict):
-            briefing_md = str(narrative_data.get("weekly_briefing_markdown") or "").strip()
+            briefing_md = str(
+                narrative_data.get("weekly_briefing_markdown")
+                or narrative_data.get("wow_briefing_markdown")
+                or narrative_data.get("summary")
+                or ""
+            ).strip()
             nb_ts = st.session_state.get("narrative_timeseries_briefing")
             # session_state의 briefing이 더 최신이면 그쪽 우선
             if isinstance(nb_ts, dict) and nb_ts.get("markdown"):
