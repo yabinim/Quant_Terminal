@@ -1030,6 +1030,7 @@ model = _GenAIModel(
         "top_p": 1,
         "top_k": 1,
         "max_output_tokens": 8192,
+        "thinking_budget": 0,
         "response_mime_type": "application/json",
     },
 )
@@ -1058,6 +1059,7 @@ _scanner_narrative_batch_model = _GenAIModel(
         "top_p": 1,
         "top_k": 1,
         "max_output_tokens": 8192,
+        "thinking_budget": 0,
         "response_mime_type": "application/json",
     },
 )
@@ -10188,7 +10190,8 @@ def analyze_deep_dive(query, news_data, language):
             "temperature": 0.0,
             "top_p": 1,
             "top_k": 1,
-            "max_output_tokens": 4096,
+            "max_output_tokens": 8192,
+            "thinking_budget": 0,
             "response_mime_type": "application/json",
         },
     )
@@ -10648,7 +10651,9 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
                 "temperature": 0.3,  # 주간 요약 — 매주 다른 인사이트를 위해 약간의 다양성 허용
                 "top_p": 1,
                 "top_k": 1,
-                "max_output_tokens": 4096,
+                # 5개 섹션 마크다운 리포트 — 4096 으로는 잘릴 수 있어 확대 + 사고 비활성화
+                "max_output_tokens": 16384,
+                "thinking_budget": 0,
             },
         )
         response = summary_model.generate_content(prompt)
@@ -11387,7 +11392,7 @@ if st.session_state.get("logged_in"):
             with st.spinner("Gemini AI 분석 중... (약 15~20초)"):
                 _drg_model = _GenAIModel(
                     "gemini-2.5-flash",
-                    generation_config={"temperature": 0.7, "max_output_tokens": 4096}
+                    generation_config={"temperature": 0.7, "max_output_tokens": 8192, "thinking_budget": 0}
                 )
                 _drg_response = _drg_model.generate_content(drg_prompt)
                 _drg_text = _gemini_response_text_utf8_safe(_drg_response)
@@ -11497,7 +11502,7 @@ if st.session_state.get("logged_in"):
                                             "3~4문장 한국어 리뷰: 맞았다면 어떤 근거가 적중했는지, 틀렸다면 무엇을 놓쳤는지, 다음 예측 시 참고할 인사이트."
                                         )
                                         _rm = _GenAIModel("gemini-2.5-flash",
-                                            generation_config={"temperature": 0.3, "max_output_tokens": 512})
+                                            generation_config={"temperature": 0.3, "max_output_tokens": 1024, "thinking_budget": 0})
                                         _rv = _gemini_response_text_utf8_safe(_rm.generate_content(_rp)) or ""
                                     except Exception:
                                         _rv = ""
@@ -11711,7 +11716,7 @@ if st.session_state.get("logged_in"):
                 try:
                     _itb_model = _GenAIModel(
                         "gemini-2.5-flash",
-                        generation_config={"temperature": 0.2, "max_output_tokens": 1024},
+                        generation_config={"temperature": 0.2, "max_output_tokens": 4096, "thinking_budget": 0},
                     )
                     _itb_resp = _itb_model.generate_content(_itb_prompt)
                     _itb_text = (_gemini_response_text_utf8_safe(_itb_resp) or "").strip()
@@ -13670,7 +13675,7 @@ if st.session_state.get("logged_in"):
                                 _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
                                 _tr_model = _GenAIModel(
                                     "gemini-2.5-flash",
-                                    generation_config={"temperature": 0.0, "max_output_tokens": 4096}
+                                    generation_config={"temperature": 0.0, "max_output_tokens": 8192, "thinking_budget": 0}
                                 )
                                 _tr_resp = _tr_model.generate_content(
                                     "다음 영문 회사 소개를 한국어로 번역하세요. "
@@ -14112,7 +14117,7 @@ if st.session_state.get("logged_in"):
                         try:
                             _tc_model = _GenAIModel(
                                 "gemini-2.5-flash",
-                                generation_config={"temperature": 0.1, "max_output_tokens": 1024},
+                                generation_config={"temperature": 0.1, "max_output_tokens": 4096, "thinking_budget": 0},
                             )
                             _tc_resp = _tc_model.generate_content(_tc_prompt)
                             _tc_summary = (_gemini_response_text_utf8_safe(_tc_resp) or "").strip()
@@ -14760,7 +14765,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
                     _diag_model = _GenAIModel(
                         "gemini-2.5-flash",
-                        generation_config={"temperature": 0.4, "max_output_tokens": 6000}
+                        generation_config={"temperature": 0.4, "max_output_tokens": 16384, "thinking_budget": 0}
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
                     _diag_text = _gemini_response_text_utf8_safe(_diag_response)
@@ -15838,6 +15843,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={
                                 "temperature": 0.0,
                                 "max_output_tokens": 8192,
+                                "thinking_budget": 0,
                                 "response_mime_type": "application/json",
                             })
                             _resp = _ai_m.generate_content(ai_prompt)
