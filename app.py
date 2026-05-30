@@ -485,7 +485,27 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
     title = _narrative_sheet_title_for_record(rec_out)
     if len(title) > 500:
         title = title[:497] + "..."
-    content = json.dumps(rec_out, ensure_ascii=False)
+
+    # Google Sheets 셀 한도 50,000자 — weekly/wow 브리핑은 마크다운이 길어 초과할 수 있음
+    # weekly_briefing_markdown 을 먼저 20,000자로 트리밍한 rec_out 을 직렬화
+    _SHEET_CELL_LIMIT = 49000
+    rec_for_json = rec_out
+    md_key = "weekly_briefing_markdown"
+    analysis_for_json = dict(analysis)
+    if md_key in analysis_for_json and len(str(analysis_for_json.get(md_key) or "")) > 20000:
+        analysis_for_json[md_key] = str(analysis_for_json[md_key])[:20000] + "\n\n…(truncated)"
+        rec_for_json = dict(rec_out)
+        rec_for_json["analysis"] = analysis_for_json
+    content = json.dumps(rec_for_json, ensure_ascii=False)
+    if len(content) > _SHEET_CELL_LIMIT:
+        # 그래도 넘으면 summary 도 트리밍
+        analysis_for_json["summary"] = str(analysis_for_json.get("summary") or "")[:5000]
+        rec_for_json = dict(rec_for_json)
+        rec_for_json["analysis"] = analysis_for_json
+        content = json.dumps(rec_for_json, ensure_ascii=False)
+    if len(content) > _SHEET_CELL_LIMIT:
+        content = content[:_SHEET_CELL_LIMIT]
+
     w_list: list = []
     e_list: list = []
     try:
@@ -11981,11 +12001,28 @@ if st.session_state.get("logged_in"):
                 # 팩트 체크 테이블
                 fc_kind = "wow" if _cv_source == "wow_trend_7d" else "weekly"
                 fc_df = nb_ts.get("factcheck_df") if isinstance(nb_ts, dict) else None
+
+                # nb_ts 없거나 factcheck_df 비어있으면 briefing_md 로 즉석 재계산
+                if not isinstance(fc_df, pd.DataFrame) or fc_df.empty:
+                    try:
+                        tickers_by_cat = extract_factcheck_tickers_from_briefing(briefing_md, kind=fc_kind)
+                        if tickers_by_cat.get("all"):
+                            if fc_kind == "wow":
+                                fc_df = compute_narrative_factcheck_wow_returns(tickers_by_cat)
+                            else:
+                                fc_df = compute_narrative_factcheck_weekly_returns(tickers_by_cat)
+                            # nb_ts 에 캐싱
+                            if isinstance(nb_ts, dict):
+                                nb_ts["factcheck_df"] = fc_df
+                                st.session_state["narrative_timeseries_briefing"] = nb_ts
+                    except Exception:
+                        fc_df = pd.DataFrame()
+
                 if isinstance(fc_df, pd.DataFrame) and not fc_df.empty:
                     st.subheader("📊 내러티브 팩트 체크 (실제 수익률)")
                     render_narrative_factcheck_table(fc_df, kind=fc_kind)
                 else:
-                    st.caption("팩트 체크 수익률 데이터가 없습니다.")
+                    st.caption("팩트 체크 대상 티커가 추출되지 않았습니다.")
             else:
                 st.warning("저장된 브리핑 마크다운이 없습니다. 다시 실행해주세요.")
 
