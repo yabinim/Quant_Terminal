@@ -870,6 +870,9 @@ if "current_view" not in st.session_state:
     st.session_state["current_view"] = {}
 if "current_view_language" not in st.session_state:
     st.session_state["current_view_language"] = "ko"
+if "current_view_source" not in st.session_state:
+    # 분석 유형 추적: "market_narrative" | "weekly_trend_7d" | "wow_trend_7d"
+    st.session_state["current_view_source"] = "market_narrative"
 if "scanner_results" not in st.session_state:
     st.session_state["scanner_results"] = None
 if "scanner_results_emerging" not in st.session_state:
@@ -7921,19 +7924,33 @@ def hydrate_narrative_from_disk_once():
 
     if not st.session_state.get("_narrative_persist_loaded_v2"):
         cv = st.session_state.get("current_view")
-        last_non_weekly = None
-        for r in reversed(records):
-            if not isinstance(r, dict):
-                continue
-            a = r.get("analysis") if isinstance(r.get("analysis"), dict) else {}
-            if a.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
-                continue
-            last_non_weekly = r
-            break
-        pick = last_non_weekly or (records[-1] if records else None)
+        # 가장 최근 저장 레코드를 source 종류 무관하게 선택
+        pick = records[-1] if records else None
         if (not isinstance(cv, dict) or not cv) and pick:
-            st.session_state["current_view"] = pick.get("analysis", {})
+            picked_analysis = pick.get("analysis", {})
+            st.session_state["current_view"] = picked_analysis
             st.session_state["current_view_language"] = pick.get("language", "ko")
+            # source 타입 복원
+            src = str(picked_analysis.get("source") or "market_narrative")
+            if src not in ("weekly_trend_7d", "wow_trend_7d"):
+                src = "market_narrative"
+            st.session_state["current_view_source"] = src
+            # wow/weekly 는 narrative_timeseries_briefing 도 복원
+            if src in ("weekly_trend_7d", "wow_trend_7d"):
+                briefing_md = str(picked_analysis.get("weekly_briefing_markdown") or "").strip()
+                if briefing_md:
+                    title = (
+                        "📊 주간 트렌드 추출 (최근 7일)" if src == "weekly_trend_7d"
+                        else "⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)"
+                    )
+                    existing_ts = st.session_state.get("narrative_timeseries_briefing")
+                    if not (isinstance(existing_ts, dict) and existing_ts.get("markdown")):
+                        st.session_state["narrative_timeseries_briefing"] = {
+                            "title": title,
+                            "markdown": briefing_md,
+                            "factcheck_kind": "wow" if src == "wow_trend_7d" else "weekly",
+                            "factcheck_df": pd.DataFrame(),
+                        }
         st.session_state["_narrative_persist_loaded_v2"] = True
 
 
@@ -11802,6 +11819,7 @@ if st.session_state.get("logged_in"):
                             st.session_state["narrative_history"].append(narrative_data)
                             st.session_state["current_view"] = narrative_data
                             st.session_state["current_view_language"] = selected_language
+                            st.session_state["current_view_source"] = "market_narrative"
                             append_narrative_history_record(narrative_data, selected_language)
                             st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
                             status.update(label="✅ 분석 완료! (성공)", state="complete", expanded=False)
@@ -11839,7 +11857,13 @@ if st.session_state.get("logged_in"):
         history_len = len(st.session_state.get("narrative_history", []))
         st.caption(f"📊 현재 누적된 분석 횟수: {history_len} 회")
     
-        if st.session_state.get("current_view") and st.session_state.get("current_view_language") != selected_language:
+        # ── 언어 전환 번역 (market_narrative 전용) ──────────────────────────
+        _cv_source = st.session_state.get("current_view_source", "market_narrative")
+        if (
+            _cv_source == "market_narrative"
+            and st.session_state.get("current_view")
+            and st.session_state.get("current_view_language") != selected_language
+        ):
             with st.spinner("선택한 언어로 결과를 자연스럽게 번역 중입니다..."):
                 translated = translate_narrative_json(st.session_state["current_view"], selected_language)
                 if translated:
@@ -11847,107 +11871,132 @@ if st.session_state.get("logged_in"):
                     st.session_state["current_view_language"] = selected_language
                 else:
                     st.warning("언어 전환 번역에 실패하여 기존 결과를 유지합니다.")
-    
+
         narrative_data = st.session_state.get("current_view", {})
-        regime_data = narrative_data.get("regime", {}) if isinstance(narrative_data, dict) else {}
-        themes_data = narrative_data.get("themes", []) if isinstance(narrative_data, dict) else []
-        rotation_data = narrative_data.get("rotation", "") if isinstance(narrative_data, dict) else ""
-        summary_data = narrative_data.get("summary", "") if isinstance(narrative_data, dict) else ""
-        top_quant_picks = narrative_data.get("top_quant_picks", "") if isinstance(narrative_data, dict) else ""
-    
-        if not narrative_data:
-            st.warning("아직 AI 분석 결과가 없습니다. 상단 버튼을 눌러 실시간 내러티브를 생성하세요.")
+        _cv_source = st.session_state.get("current_view_source", "market_narrative")
+
+        # ── 최근 분석 유형 배지 ────────────────────────────────────────────
+        if narrative_data:
+            _badge_map = {
+                "market_narrative": ("🚀 AI 시장 내러티브", "info"),
+                "weekly_trend_7d":  ("📊 주간 트렌드 추출 (최근 7일)", "success"),
+                "wow_trend_7d":     ("⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)", "success"),
+            }
+            _badge_label, _badge_type = _badge_map.get(_cv_source, ("최근 분석 결과", "info"))
+            if _badge_type == "success":
+                st.success(f"📌 현재 표시: **{_badge_label}** — 가장 최근 실행 결과입니다.")
+            else:
+                st.info(f"📌 현재 표시: **{_badge_label}** — 가장 최근 실행 결과입니다.")
+
+        # ════════════════════════════════════════════════════════════════════
+        # CASE A: weekly_trend_7d / wow_trend_7d → 마크다운 브리핑 렌더
+        # ════════════════════════════════════════════════════════════════════
+        if _cv_source in ("weekly_trend_7d", "wow_trend_7d") and isinstance(narrative_data, dict):
+            briefing_md = str(narrative_data.get("weekly_briefing_markdown") or "").strip()
+            nb_ts = st.session_state.get("narrative_timeseries_briefing")
+            # session_state의 briefing이 더 최신이면 그쪽 우선
+            if isinstance(nb_ts, dict) and nb_ts.get("markdown"):
+                briefing_md = str(nb_ts.get("markdown") or briefing_md).strip()
+
+            if briefing_md:
+                st.markdown(briefing_md)
+                # 팩트 체크 테이블
+                fc_kind = "wow" if _cv_source == "wow_trend_7d" else "weekly"
+                fc_df = nb_ts.get("factcheck_df") if isinstance(nb_ts, dict) else None
+                if isinstance(fc_df, pd.DataFrame) and not fc_df.empty:
+                    st.subheader("📊 내러티브 팩트 체크 (실제 수익률)")
+                    render_narrative_factcheck_table(fc_df, kind=fc_kind)
+                else:
+                    st.caption("팩트 체크 수익률 데이터가 없습니다.")
+            else:
+                st.warning("저장된 브리핑 마크다운이 없습니다. 다시 실행해주세요.")
+
+        # ════════════════════════════════════════════════════════════════════
+        # CASE B: market_narrative (기본) → JSON 기반 풀 렌더
+        # ════════════════════════════════════════════════════════════════════
         else:
-            st.info(
-                "현재 화면에 표시되는 것은 **가장 최근 내러티브 스냅샷**입니다. "
-                "저장된 기록을 날짜별로 묶어 보려면 하단 **시계열 분석 엔진**을 사용하세요."
-            )
-    
-        st.markdown("### 🧭 Market Regime Indicator")
-        regime_col_1, regime_col_2, regime_col_3 = st.columns(3)
-        with regime_col_1:
-            st.metric(
-                "Risk On / Risk Off",
-                regime_data.get("risk", "N/A"),
-            )
-        with regime_col_2:
-            st.metric(
-                "Growth vs Value",
-                regime_data.get("growth_value", "N/A"),
-            )
-        with regime_col_3:
-            st.metric(
-                "Liquidity",
-                regime_data.get("liquidity", "N/A"),
-            )
-    
-        # ── Top Quant Picks 배너 ─────────────────────────────────────────
-        if top_quant_picks:
+            regime_data     = narrative_data.get("regime", {}) if isinstance(narrative_data, dict) else {}
+            themes_data     = narrative_data.get("themes", []) if isinstance(narrative_data, dict) else []
+            rotation_data   = narrative_data.get("rotation", "") if isinstance(narrative_data, dict) else ""
+            summary_data    = narrative_data.get("summary", "") if isinstance(narrative_data, dict) else ""
+            top_quant_picks = narrative_data.get("top_quant_picks", "") if isinstance(narrative_data, dict) else ""
+
+            if not narrative_data:
+                st.warning("아직 AI 분석 결과가 없습니다. 상단 버튼을 눌러 실시간 내러티브를 생성하세요.")
+
+            st.markdown("### 🧭 Market Regime Indicator")
+            regime_col_1, regime_col_2, regime_col_3 = st.columns(3)
+            with regime_col_1:
+                st.metric("Risk On / Risk Off", regime_data.get("risk", "N/A"))
+            with regime_col_2:
+                st.metric("Growth vs Value", regime_data.get("growth_value", "N/A"))
+            with regime_col_3:
+                st.metric("Liquidity", regime_data.get("liquidity", "N/A"))
+
+            # ── Top Quant Picks 배너 ─────────────────────────────────────────
+            if top_quant_picks:
+                st.divider()
+                st.markdown("### 🏆 Top Quant Picks (정량+정성 동시 확인)")
+                st.success(
+                    f"**정량 모멘텀 + 뉴스 내러티브가 동시에 확인된 최우선 종목:** `{top_quant_picks}`  "
+                    "RS Score 양수 + 200일선 위 + 내러티브 테마 일치 종목입니다."
+                )
+
             st.divider()
-            st.markdown("### 🏆 Top Quant Picks (정량+정성 동시 확인)")
-            st.success(
-                f"**정량 모멘텀 + 뉴스 내러티브가 동시에 확인된 최우선 종목:** `{top_quant_picks}`  "
-                "RS Score 양수 + 200일선 위 + 내러티브 테마 일치 종목입니다."
-            )
+            st.markdown("### 🔥 Current Market Themes & 📊 Narrative Breakdown")
+            if isinstance(themes_data, list) and themes_data:
+                for idx, theme in enumerate(themes_data, start=1):
+                    theme = theme if isinstance(theme, dict) else {}
+                    title = theme.get("title", f"Theme {idx}")
+                    expanding_to_data = theme.get("expanding_to", [])
+                    if isinstance(expanding_to_data, list):
+                        expanding_lines = []
+                        for flow in expanding_to_data:
+                            flow = flow if isinstance(flow, dict) else {}
+                            stage = str(flow.get("stage", "") or "").strip()
+                            expected_tickers = str(flow.get("expected_tickers", "") or "").strip()
+                            if stage or expected_tickers:
+                                expanding_lines.append(f"- ➔ **{stage if stage else 'N/A'}**: `{expected_tickers if expected_tickers else 'N/A'}`")
+                        expanding_to_display = "\n".join(expanding_lines) if expanding_lines else "- ➔ **N/A**: `N/A`"
+                    else:
+                        fallback_text = str(expanding_to_data or "N/A").strip()
+                        expanding_to_display = f"- ➔ **Legacy Flow**: `{fallback_text}`"
 
-        st.divider()
-        st.markdown("### 🔥 Current Market Themes & 📊 Narrative Breakdown")
-        if isinstance(themes_data, list) and themes_data:
-            for idx, theme in enumerate(themes_data, start=1):
-                theme = theme if isinstance(theme, dict) else {}
-                title = theme.get("title", f"Theme {idx}")
-                expanding_to_data = theme.get("expanding_to", [])
-                if isinstance(expanding_to_data, list):
-                    expanding_lines = []
-                    for flow in expanding_to_data:
-                        flow = flow if isinstance(flow, dict) else {}
-                        stage = str(flow.get("stage", "") or "").strip()
-                        expected_tickers = str(flow.get("expected_tickers", "") or "").strip()
-                        if stage or expected_tickers:
-                            expanding_lines.append(f"- ➔ **{stage if stage else 'N/A'}**: `{expected_tickers if expected_tickers else 'N/A'}`")
-                    expanding_to_display = "\n".join(expanding_lines) if expanding_lines else "- ➔ **N/A**: `N/A`"
-                else:
-                    # 과거 누적 데이터(문자열 포맷)와의 하위 호환
-                    fallback_text = str(expanding_to_data or "N/A").strip()
-                    expanding_to_display = f"- ➔ **Legacy Flow**: `{fallback_text}`"
-    
-                momentum_note = str(theme.get("momentum_note", "") or "").strip()
-                emerging_tickers = str(theme.get("emerging", "") or "").strip()
-                winners_str = str(theme.get("winners", "") or "N/A").strip()
+                    momentum_note   = str(theme.get("momentum_note", "") or "").strip()
+                    emerging_tickers = str(theme.get("emerging", "") or "").strip()
+                    winners_str     = str(theme.get("winners", "") or "N/A").strip()
 
-                # 모멘텀 강도 이모지
-                if "강함" in momentum_note or "strong" in momentum_note.lower():
-                    mom_emoji = "🔥"
-                elif "약함" in momentum_note or "weak" in momentum_note.lower():
-                    mom_emoji = "❄️"
-                else:
-                    mom_emoji = "📊"
+                    if "강함" in momentum_note or "strong" in momentum_note.lower():
+                        mom_emoji = "🔥"
+                    elif "약함" in momentum_note or "weak" in momentum_note.lower():
+                        mom_emoji = "❄️"
+                    else:
+                        mom_emoji = "📊"
 
-                with st.expander(f"Theme {idx}: {title} {mom_emoji}", expanded=(idx == 1)):
-                    # Winners + 모멘텀 점수 강조
-                    st.markdown(f"**🎯 Winners (정량+정성 확인):** `{winners_str}`")
-                    if emerging_tickers:
-                        st.markdown(f"**🌱 Emerging (추적 필요):** `{emerging_tickers}`")
-                    if momentum_note:
-                        st.caption(f"📈 모멘텀: {momentum_note}")
-                    st.markdown(
-                        f"""
+                    with st.expander(f"Theme {idx}: {title} {mom_emoji}", expanded=(idx == 1)):
+                        st.markdown(f"**🎯 Winners (정량+정성 확인):** `{winners_str}`")
+                        if emerging_tickers:
+                            st.markdown(f"**🌱 Emerging (추적 필요):** `{emerging_tickers}`")
+                        if momentum_note:
+                            st.caption(f"📈 모멘텀: {momentum_note}")
+                        st.markdown(
+                            f"""
 - **Driver (원인):** {theme.get("driver", "N/A")}
 - **Expanding to (확장 흐름):**
 {expanding_to_display}
 - **Risk (위험 요인):** {theme.get("risk", "N/A")}
 """
-                    )
-        else:
-            st.info("AI가 추출한 테마 데이터가 아직 없습니다.")
-    
-        st.divider()
-        st.markdown("### 📈 Sector Rotation Map (자금 이동 지도)")
-        st.markdown(rotation_data if rotation_data else "N/A")
-    
-        st.divider()
-        st.markdown("### 🧠 Smart AI Summary")
-        st.info(summary_data if summary_data else "N/A")
+                        )
+            else:
+                st.info("AI가 추출한 테마 데이터가 아직 없습니다.")
+
+            st.divider()
+            st.markdown("### 📈 Sector Rotation Map (자금 이동 지도)")
+            st.markdown(rotation_data if rotation_data else "N/A")
+
+            st.divider()
+            st.markdown("### 🧠 Smart AI Summary")
+            st.info(summary_data if summary_data else "N/A")
 
         # ── 내러티브 일관성 점수 ─────────────────────────────────────────
         st.divider()
@@ -12202,6 +12251,11 @@ if st.session_state.get("logged_in"):
                             "factcheck_kind": "weekly",
                             "factcheck_df": factcheck_df,
                         }
+                        # current_view 갱신 — 분석 유형: weekly_trend_7d
+                        weekly_analysis = {"source": "weekly_trend_7d", "weekly_briefing_markdown": text}
+                        st.session_state["current_view"] = weekly_analysis
+                        st.session_state["current_view_language"] = selected_language
+                        st.session_state["current_view_source"] = "weekly_trend_7d"
                         append_weekly_trend_narrative_record(text, selected_language, week_recs)
                         st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
                         st.session_state["narrative_history"] = [
@@ -12240,6 +12294,11 @@ if st.session_state.get("logged_in"):
                             "factcheck_kind": "wow",
                             "factcheck_df": factcheck_df,
                         }
+                        # current_view 갱신 — 분석 유형: wow_trend_7d
+                        wow_analysis = {"source": "wow_trend_7d", "weekly_briefing_markdown": text}
+                        st.session_state["current_view"] = wow_analysis
+                        st.session_state["current_view_language"] = selected_language
+                        st.session_state["current_view_source"] = "wow_trend_7d"
                         # ── Sheets 자동 저장 (주간 트렌드와 동일 방식) ──
                         append_wow_trend_narrative_record(text, selected_language, this_w, last_w)
                         st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
