@@ -8113,12 +8113,12 @@ _FACTCHECK_WINNERS_HEADER_RE = re.compile(
 _FACTCHECK_EXPANDING_HEADER_RE = re.compile(
     r"^\s*#{1,6}\s*🚀\s*Weekly\s+Expanding\s+To.*$", re.MULTILINE | re.IGNORECASE
 )
-# WoW(트렌드 변곡점) 응답에서 자주 등장하는 Fading/Emerging 헤더(영문·한국어 혼용 모두 허용)
+# WoW 고정 헤더 (🌱/🥀 이모지 포함) + 기존 한국어 키워드 fallback
 _FACTCHECK_EMERGING_HEADER_RE = re.compile(
-    r"^\s*#{1,6}.*(emerging|부상|새로\s*나).*$", re.MULTILINE | re.IGNORECASE
+    r"^\s*#{1,6}\s*(?:🌱\s*Emerging|.*(?:emerging|부상|새로\s*나)).*$", re.MULTILINE | re.IGNORECASE
 )
 _FACTCHECK_FADING_HEADER_RE = re.compile(
-    r"^\s*#{1,6}.*(fading|사그|약화|소멸).*$", re.MULTILINE | re.IGNORECASE
+    r"^\s*#{1,6}\s*(?:🥀\s*Fading|.*(?:fading|사그|약화|소멸)).*$", re.MULTILINE | re.IGNORECASE
 )
 _FACTCHECK_INTERSECTION_HEADER_RE = re.compile(
     r"^\s*#{1,6}.*(교집합|intersection|살아남은).*$", re.MULTILINE | re.IGNORECASE
@@ -10760,6 +10760,30 @@ D) 🚀 Weekly Expanding To (주간 후발/확장 수혜주):
 4) 한 문단 **Executive Summary** (투자 회의 브리핑 톤)
 
 데이터 밖 환각 금지. 출력은 반드시 {lang}입니다.
+
+[필수 — 자동 파싱 섹션: 아래 4개 헤더는 번역·수정 금지, 이모지 포함, ## 레벨 그대로 유지]
+리포트 **하단**에 반드시 다음 4개 섹션을 추가하라. 시스템이 정규식으로 파싱하므로 헤더 문자열을 단 한 글자도 바꾸지 마라.
+
+## 🏆 Weekly Winners (주간 대장주)
+- 이번 주와 저번 주 **모두에서 강했던** 핵심 티커 (교집합 + 지속 모멘텀)
+- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 5~10개)
+
+## 🚀 Weekly Expanding To (주간 후발/확장 수혜주)
+- 이번 주 새로 부상하거나 다음 주 초반 순환매 수혜 예상 티커
+- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 5~10개)
+
+## 🌱 Emerging (이번 주 새로 부상)
+- 저번 주에는 없었고 이번 주에 새로 등장한 티커·테마
+- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 3~7개)
+
+## 🥀 Fading (저번 주 대비 약화)
+- 저번 주에는 강했지만 이번 주에 사그라든 티커·테마
+- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 3~7개)
+
+[티커 표기 규칙 — 절대 준수]
+- 모든 티커는 반드시 영문 대문자(UPPERCASE). 예) NVDA, MSFT, AVGO
+- 각 불릿 라인에 티커 1개만. 잘못된 예: `- **NVDA, AMD** — ...`
+- 일반 약어(AI, ETF, FED, GDP 등)는 티커로 표기 금지.
 """.format(
             lang=language_label
         )
