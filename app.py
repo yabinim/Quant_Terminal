@@ -980,6 +980,18 @@ class _GenAIModel:
     def __init__(self, model_id, generation_config=None):
         self._model_id = model_id
         cfg = dict(generation_config or {})
+        # Gemini 2.5 계열은 'thinking' 토큰이 max_output_tokens 예산을 함께 소비한다.
+        # generation_config 에 thinking_budget(정수)이 있으면 ThinkingConfig 로 변환한다.
+        #   0   → 사고 비활성화(전체 토큰 예산을 보이는 출력에 사용)
+        #   -1  → 동적(모델이 알아서)
+        #   N>0 → 사고에 최대 N 토큰만 허용
+        if "thinking_budget" in cfg:
+            _tb = cfg.pop("thinking_budget")
+            try:
+                cfg["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=int(_tb))
+            except Exception:
+                # 구버전 SDK 등에서 ThinkingConfig 미지원이면 조용히 무시
+                pass
         self._config = genai_types.GenerateContentConfig(**cfg) if cfg else None
 
     def generate_content(self, prompt, max_retries: int = 3):
@@ -10573,12 +10585,13 @@ def _narrative_timeseries_briefing_model():
             "temperature": 0.0,
             "top_p": 0.95,
             "top_k": 40,
-            # 4096은 WoW(변곡점) 리포트에 부족하다.
-            # 교집합 + 차집합/Drift + Fading/Emerging + Executive Summary +
-            # 하단 자동 파싱 섹션 4개(Winners/Expanding/Emerging/Fading)까지 요구하므로
-            # 한국어 출력 기준 4096 토큰에서 잘려나간다. 8192로 상향.
-            # (gemini-2.5-flash는 최대 65536까지 가능 — 더 길면 추가 상향 가능)
-            "max_output_tokens": 8192,
+            # 변곡점/주간 리포트: 본문 + 자동파싱 4개 섹션 + 티커 리스트가 길어
+            # 4096 으로는 잘린다. 넉넉히 확보한다.
+            "max_output_tokens": 16384,
+            # Gemini 2.5 Flash 는 thinking 이 기본 ON 이고 사고 토큰이
+            # max_output_tokens 예산을 함께 깎는다. 사고를 비활성화(0)하여
+            # 전체 토큰 예산을 '보이는 출력'에 사용하도록 한다.
+            "thinking_budget": 0,
         },
     )
 
@@ -10866,31 +10879,28 @@ D) 🚀 Weekly Expanding To (주간 후발/확장 수혜주):
         briefing_model = _narrative_timeseries_briefing_model()
         response = briefing_model.generate_content(prompt)
         raw = str(getattr(response, "text", "") or "").strip()
-
-        # ── 출력 토큰 한도(max_output_tokens)에서 잘렸는지 확인 ──
-        # finish_reason == MAX_TOKENS 이면 응답이 문장 중간에서 끊긴 것이다.
-        # 이 잘린 텍스트를 그대로 저장하면 DB·화면 모두에서 내용이 짤려 보이고,
-        # 하단 자동 파싱 섹션(Weekly Winners 등)이 통째로 누락돼 2단계 스캐너 연동이 깨진다.
-        # → 잘린 결과는 저장/표시하지 않고 사용자에게 안내한 뒤 재시도를 유도한다.
-        truncated = False
+        # text 가 비어도 candidates.parts 에 본문이 들어오는 경우가 있어 회수한다.
+        if not raw and hasattr(response, "candidates"):
+            try:
+                for _c in (response.candidates or []):
+                    for _p in getattr(getattr(_c, "content", None), "parts", []) or []:
+                        raw += getattr(_p, "text", "") or ""
+                raw = raw.strip()
+            except Exception:
+                pass
+        # 토큰 한도로 잘렸는지(finish_reason == MAX_TOKENS) 확인하여 경고한다.
         try:
-            for _cand in (getattr(response, "candidates", None) or []):
-                _fr = getattr(_cand, "finish_reason", None)
-                _fr_name = (getattr(_fr, "name", None) or str(_fr or "")).upper()
-                if "MAX_TOKENS" in _fr_name:
-                    truncated = True
-                    break
+            _fr = ""
+            for _c in (getattr(response, "candidates", None) or []):
+                _fr = str(getattr(_c, "finish_reason", "") or "")
+                break
+            if "MAX_TOKENS" in _fr.upper():
+                st.warning(
+                    "⚠️ 분석 본문이 모델 출력 한도에 도달해 일부가 잘렸을 수 있습니다. "
+                    "다시 시도하면 더 완전한 결과를 받을 수 있습니다."
+                )
         except Exception:
-            truncated = False
-
-        if truncated:
-            st.warning(
-                "⚠️ 분석 결과가 출력 토큰 한도에 도달해 문장 중간에서 잘렸습니다. "
-                "잘린 결과는 저장하지 않았습니다. 잠시 후 다시 시도해 주세요. "
-                "(계속 반복되면 비교 스냅샷 수를 줄이거나 max_output_tokens 를 더 높여주세요.)"
-            )
-            return ""
-
+            pass
         return raw
     except Exception as exc:
         err = str(exc).lower()
