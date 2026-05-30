@@ -8009,19 +8009,27 @@ def hydrate_narrative_from_disk_once():
 
     if not st.session_state.get("_narrative_persist_loaded_v2"):
         cv = st.session_state.get("current_view")
-        # 가장 최근 저장 레코드를 source 종류 무관하게 선택
-        pick = records[-1] if records else None
+        # market_narrative 타입만 current_view에 복원 (wow/weekly는 nb_ts로 별도 관리)
+        last_narrative = None
+        for r in reversed(records):
+            if not isinstance(r, dict):
+                continue
+            a = r.get("analysis") if isinstance(r.get("analysis"), dict) else {}
+            src = str(a.get("source") or "").strip()
+            if src in ("weekly_trend_7d", "wow_trend_7d", _NARRATIVE_RECORD_SOURCE_WEEKLY_7D):
+                continue
+            last_narrative = r
+            break
+        pick = last_narrative or (records[-1] if records else None)
         if (not isinstance(cv, dict) or not cv) and pick:
             picked_analysis = pick.get("analysis", {})
-            st.session_state["current_view"] = picked_analysis
-            st.session_state["current_view_language"] = pick.get("language", "ko")
-            # source 타입 복원
-            src = str(picked_analysis.get("source") or "market_narrative")
-            if src not in ("weekly_trend_7d", "wow_trend_7d"):
-                src = "market_narrative"
-            st.session_state["current_view_source"] = src
-            # wow/weekly 는 narrative_timeseries_briefing 도 복원
-            if src in ("weekly_trend_7d", "wow_trend_7d"):
+            # wow/weekly가 최신이어도 current_view에 넣지 않음 — nb_ts가 없으면 복원
+            picked_src = str(picked_analysis.get("source") or "").strip()
+            if picked_src not in ("weekly_trend_7d", "wow_trend_7d"):
+                st.session_state["current_view"] = picked_analysis
+                st.session_state["current_view_language"] = pick.get("language", "ko")
+            # wow/weekly 최신 레코드면 nb_ts 복원
+            if picked_src in ("weekly_trend_7d", "wow_trend_7d"):
                 briefing_md = str(
                     picked_analysis.get("weekly_briefing_markdown")
                     or picked_analysis.get("wow_briefing_markdown")
@@ -8029,14 +8037,9 @@ def hydrate_narrative_from_disk_once():
                     or ""
                 ).strip()
                 if briefing_md:
-                    title = (
-                        "📊 주간 트렌드 추출 (최근 7일)" if src == "weekly_trend_7d"
-                        else "⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)"
-                    )
                     existing_ts = st.session_state.get("narrative_timeseries_briefing")
                     if not (isinstance(existing_ts, dict) and existing_ts.get("markdown")):
-                        fc_kind = "wow" if src == "wow_trend_7d" else "weekly"
-                        # 복원 시 팩트체크 재계산
+                        fc_kind = "wow" if picked_src == "wow_trend_7d" else "weekly"
                         factcheck_df = pd.DataFrame()
                         try:
                             tickers_by_cat = extract_factcheck_tickers_from_briefing(briefing_md, kind=fc_kind)
@@ -8047,6 +8050,10 @@ def hydrate_narrative_from_disk_once():
                                     factcheck_df = compute_narrative_factcheck_weekly_returns(tickers_by_cat)
                         except Exception:
                             factcheck_df = pd.DataFrame()
+                        title = (
+                            "📊 주간 트렌드 추출 (최근 7일)" if picked_src == "weekly_trend_7d"
+                            else "⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)"
+                        )
                         st.session_state["narrative_timeseries_briefing"] = {
                             "title": title,
                             "markdown": briefing_md,
@@ -12015,96 +12022,43 @@ if st.session_state.get("logged_in"):
     
         history_len = len(st.session_state.get("narrative_history", []))
         st.caption(f"📊 현재 누적된 분석 횟수: {history_len} 회")
-    
-        # ── 언어 전환 번역 (market_narrative 전용) ──────────────────────────
-        _cv_source = st.session_state.get("current_view_source", "market_narrative")
+
+        # 언어 전환 번역 (market_narrative 전용)
         if (
-            _cv_source == "market_narrative"
-            and st.session_state.get("current_view")
+            st.session_state.get("current_view")
             and st.session_state.get("current_view_language") != selected_language
         ):
-            with st.spinner("선택한 언어로 결과를 자연스럽게 번역 중입니다..."):
-                translated = translate_narrative_json(st.session_state["current_view"], selected_language)
-                if translated:
-                    st.session_state["current_view"] = translated
-                    st.session_state["current_view_language"] = selected_language
-                else:
-                    st.warning("언어 전환 번역에 실패하여 기존 결과를 유지합니다.")
+            _cv_src_check = str(st.session_state.get("current_view", {}).get("source") or "market_narrative")
+            if _cv_src_check not in ("weekly_trend_7d", "wow_trend_7d"):
+                with st.spinner("선택한 언어로 결과를 자연스럽게 번역 중입니다..."):
+                    translated = translate_narrative_json(st.session_state["current_view"], selected_language)
+                    if translated:
+                        st.session_state["current_view"] = translated
+                        st.session_state["current_view_language"] = selected_language
+                    else:
+                        st.warning("언어 전환 번역에 실패하여 기존 결과를 유지합니다.")
 
         narrative_data = st.session_state.get("current_view", {})
-        _cv_source = st.session_state.get("current_view_source", "market_narrative")
+        regime_data     = narrative_data.get("regime", {}) if isinstance(narrative_data, dict) else {}
+        themes_data     = narrative_data.get("themes", []) if isinstance(narrative_data, dict) else []
+        rotation_data   = narrative_data.get("rotation", "") if isinstance(narrative_data, dict) else ""
+        summary_data    = narrative_data.get("summary", "") if isinstance(narrative_data, dict) else ""
+        top_quant_picks = narrative_data.get("top_quant_picks", "") if isinstance(narrative_data, dict) else ""
 
-        # ── 최근 분석 유형 배지 ────────────────────────────────────────────
-        if narrative_data:
-            _badge_map = {
-                "market_narrative": ("🚀 AI 시장 내러티브", "info"),
-                "weekly_trend_7d":  ("📊 주간 트렌드 추출 (최근 7일)", "success"),
-                "wow_trend_7d":     ("⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)", "success"),
-            }
-            _badge_label, _badge_type = _badge_map.get(_cv_source, ("최근 분석 결과", "info"))
-            if _badge_type == "success":
-                st.success(f"📌 현재 표시: **{_badge_label}** — 가장 최근 실행 결과입니다.")
-            else:
-                st.info(f"📌 현재 표시: **{_badge_label}** — 가장 최근 실행 결과입니다.")
+        # wow/weekly source가 current_view에 들어온 경우 상단은 비움 (하단 nb_ts에서 렌더)
+        _cv_src = str(narrative_data.get("source") or "") if isinstance(narrative_data, dict) else ""
+        _is_briefing_type = _cv_src in ("weekly_trend_7d", "wow_trend_7d")
 
-        # ════════════════════════════════════════════════════════════════════
-        # CASE A: weekly_trend_7d / wow_trend_7d → 마크다운 브리핑 렌더
-        # ════════════════════════════════════════════════════════════════════
-        if _cv_source in ("weekly_trend_7d", "wow_trend_7d") and isinstance(narrative_data, dict):
-            briefing_md = str(
-                narrative_data.get("weekly_briefing_markdown")
-                or narrative_data.get("wow_briefing_markdown")
-                or narrative_data.get("summary")
-                or ""
-            ).strip()
-            nb_ts = st.session_state.get("narrative_timeseries_briefing")
-            # session_state의 briefing이 더 최신이면 그쪽 우선
-            if isinstance(nb_ts, dict) and nb_ts.get("markdown"):
-                briefing_md = str(nb_ts.get("markdown") or briefing_md).strip()
-
-            if briefing_md:
-                st.markdown(briefing_md)
-                # 팩트 체크 테이블
-                fc_kind = "wow" if _cv_source == "wow_trend_7d" else "weekly"
-                fc_df = nb_ts.get("factcheck_df") if isinstance(nb_ts, dict) else None
-
-                # nb_ts 없거나 factcheck_df 비어있으면 briefing_md 로 즉석 재계산
-                if not isinstance(fc_df, pd.DataFrame) or fc_df.empty:
-                    try:
-                        tickers_by_cat = extract_factcheck_tickers_from_briefing(briefing_md, kind=fc_kind)
-                        if tickers_by_cat.get("all"):
-                            if fc_kind == "wow":
-                                fc_df = compute_narrative_factcheck_wow_returns(tickers_by_cat)
-                            else:
-                                fc_df = compute_narrative_factcheck_weekly_returns(tickers_by_cat)
-                            # nb_ts 에 캐싱
-                            if isinstance(nb_ts, dict):
-                                nb_ts["factcheck_df"] = fc_df
-                                st.session_state["narrative_timeseries_briefing"] = nb_ts
-                    except Exception:
-                        fc_df = pd.DataFrame()
-
-                if isinstance(fc_df, pd.DataFrame) and not fc_df.empty:
-                    st.subheader("📊 내러티브 팩트 체크 (실제 수익률)")
-                    render_narrative_factcheck_table(fc_df, kind=fc_kind)
-                else:
-                    st.caption("팩트 체크 대상 티커가 추출되지 않았습니다.")
-            else:
-                st.warning("저장된 브리핑 마크다운이 없습니다. 다시 실행해주세요.")
-
-        # ════════════════════════════════════════════════════════════════════
-        # CASE B: market_narrative (기본) → JSON 기반 풀 렌더
-        # ════════════════════════════════════════════════════════════════════
-        else:
-            regime_data     = narrative_data.get("regime", {}) if isinstance(narrative_data, dict) else {}
-            themes_data     = narrative_data.get("themes", []) if isinstance(narrative_data, dict) else []
-            rotation_data   = narrative_data.get("rotation", "") if isinstance(narrative_data, dict) else ""
-            summary_data    = narrative_data.get("summary", "") if isinstance(narrative_data, dict) else ""
-            top_quant_picks = narrative_data.get("top_quant_picks", "") if isinstance(narrative_data, dict) else ""
-
-            if not narrative_data:
+        if not narrative_data or _is_briefing_type:
+            if not _is_briefing_type:
                 st.warning("아직 AI 분석 결과가 없습니다. 상단 버튼을 눌러 실시간 내러티브를 생성하세요.")
+        else:
+            st.info(
+                "현재 화면에 표시되는 것은 **가장 최근 내러티브 스냅샷**입니다. "
+                "저장된 기록을 날짜별로 묶어 보려면 하단 **시계열 분석 엔진**을 사용하세요."
+            )
 
+        if not _is_briefing_type:
             st.markdown("### 🧭 Market Regime Indicator")
             regime_col_1, regime_col_2, regime_col_3 = st.columns(3)
             with regime_col_1:
@@ -12143,9 +12097,9 @@ if st.session_state.get("logged_in"):
                         fallback_text = str(expanding_to_data or "N/A").strip()
                         expanding_to_display = f"- ➔ **Legacy Flow**: `{fallback_text}`"
 
-                    momentum_note   = str(theme.get("momentum_note", "") or "").strip()
+                    momentum_note    = str(theme.get("momentum_note", "") or "").strip()
                     emerging_tickers = str(theme.get("emerging", "") or "").strip()
-                    winners_str     = str(theme.get("winners", "") or "N/A").strip()
+                    winners_str      = str(theme.get("winners", "") or "N/A").strip()
 
                     if "강함" in momentum_note or "strong" in momentum_note.lower():
                         mom_emoji = "🔥"
@@ -12440,11 +12394,6 @@ if st.session_state.get("logged_in"):
                             "factcheck_kind": "weekly",
                             "factcheck_df": factcheck_df,
                         }
-                        # current_view 갱신 — 분석 유형: weekly_trend_7d
-                        weekly_analysis = {"source": "weekly_trend_7d", "weekly_briefing_markdown": text}
-                        st.session_state["current_view"] = weekly_analysis
-                        st.session_state["current_view_language"] = selected_language
-                        st.session_state["current_view_source"] = "weekly_trend_7d"
                         append_weekly_trend_narrative_record(text, selected_language, week_recs)
                         st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
                         st.session_state["narrative_history"] = [
@@ -12483,12 +12432,7 @@ if st.session_state.get("logged_in"):
                             "factcheck_kind": "wow",
                             "factcheck_df": factcheck_df,
                         }
-                        # current_view 갱신 — 분석 유형: wow_trend_7d
-                        wow_analysis = {"source": "wow_trend_7d", "weekly_briefing_markdown": text}
-                        st.session_state["current_view"] = wow_analysis
-                        st.session_state["current_view_language"] = selected_language
-                        st.session_state["current_view_source"] = "wow_trend_7d"
-                        # ── Sheets 자동 저장 (주간 트렌드와 동일 방식) ──
+                        # ── Sheets 자동 저장 ──
                         append_wow_trend_narrative_record(text, selected_language, this_w, last_w)
                         st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
                         st.session_state["narrative_history"] = [
@@ -12498,18 +12442,33 @@ if st.session_state.get("logged_in"):
                             "트렌드 변곡점 분석 결과를 Google 시트 **`Narratives`**에 저장했습니다. "
                             "과거 분석 기록에서 확인할 수 있습니다."
                         )
-    
+
         nb_ts = st.session_state.get("narrative_timeseries_briefing")
-        # CASE A (weekly/wow) 에서 이미 브리핑을 렌더했으면 중복 렌더 스킵
-        _already_rendered = _cv_source in ("weekly_trend_7d", "wow_trend_7d")
-        if not _already_rendered and isinstance(nb_ts, dict) and str(nb_ts.get("markdown") or "").strip():
+        if isinstance(nb_ts, dict) and str(nb_ts.get("markdown") or "").strip():
             st.markdown("---")
             st.success(str(nb_ts.get("title") or "시계열 브리핑"))
             st.markdown(str(nb_ts.get("markdown") or "").strip())
 
             fc_kind = nb_ts.get("factcheck_kind")
             fc_df = nb_ts.get("factcheck_df")
-            if fc_kind in ("weekly", "wow") and isinstance(fc_df, pd.DataFrame):
+
+            # factcheck_df 없거나 비어있으면 즉석 재계산
+            if fc_kind in ("weekly", "wow") and (not isinstance(fc_df, pd.DataFrame) or fc_df.empty):
+                try:
+                    tickers_by_cat = extract_factcheck_tickers_from_briefing(
+                        str(nb_ts.get("markdown") or ""), kind=fc_kind
+                    )
+                    if tickers_by_cat.get("all"):
+                        if fc_kind == "wow":
+                            fc_df = compute_narrative_factcheck_wow_returns(tickers_by_cat)
+                        else:
+                            fc_df = compute_narrative_factcheck_weekly_returns(tickers_by_cat)
+                        nb_ts["factcheck_df"] = fc_df
+                        st.session_state["narrative_timeseries_briefing"] = nb_ts
+                except Exception:
+                    fc_df = pd.DataFrame()
+
+            if fc_kind in ("weekly", "wow") and isinstance(fc_df, pd.DataFrame) and not fc_df.empty:
                 st.subheader("📊 내러티브 팩트 체크 (실제 수익률)")
                 render_narrative_factcheck_table(fc_df, kind=fc_kind)
     
