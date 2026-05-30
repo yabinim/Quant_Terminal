@@ -10573,7 +10573,12 @@ def _narrative_timeseries_briefing_model():
             "temperature": 0.0,
             "top_p": 0.95,
             "top_k": 40,
-            "max_output_tokens": 4096,
+            # 4096은 WoW(변곡점) 리포트에 부족하다.
+            # 교집합 + 차집합/Drift + Fading/Emerging + Executive Summary +
+            # 하단 자동 파싱 섹션 4개(Winners/Expanding/Emerging/Fading)까지 요구하므로
+            # 한국어 출력 기준 4096 토큰에서 잘려나간다. 8192로 상향.
+            # (gemini-2.5-flash는 최대 65536까지 가능 — 더 길면 추가 상향 가능)
+            "max_output_tokens": 8192,
         },
     )
 
@@ -10861,6 +10866,31 @@ D) 🚀 Weekly Expanding To (주간 후발/확장 수혜주):
         briefing_model = _narrative_timeseries_briefing_model()
         response = briefing_model.generate_content(prompt)
         raw = str(getattr(response, "text", "") or "").strip()
+
+        # ── 출력 토큰 한도(max_output_tokens)에서 잘렸는지 확인 ──
+        # finish_reason == MAX_TOKENS 이면 응답이 문장 중간에서 끊긴 것이다.
+        # 이 잘린 텍스트를 그대로 저장하면 DB·화면 모두에서 내용이 짤려 보이고,
+        # 하단 자동 파싱 섹션(Weekly Winners 등)이 통째로 누락돼 2단계 스캐너 연동이 깨진다.
+        # → 잘린 결과는 저장/표시하지 않고 사용자에게 안내한 뒤 재시도를 유도한다.
+        truncated = False
+        try:
+            for _cand in (getattr(response, "candidates", None) or []):
+                _fr = getattr(_cand, "finish_reason", None)
+                _fr_name = (getattr(_fr, "name", None) or str(_fr or "")).upper()
+                if "MAX_TOKENS" in _fr_name:
+                    truncated = True
+                    break
+        except Exception:
+            truncated = False
+
+        if truncated:
+            st.warning(
+                "⚠️ 분석 결과가 출력 토큰 한도에 도달해 문장 중간에서 잘렸습니다. "
+                "잘린 결과는 저장하지 않았습니다. 잠시 후 다시 시도해 주세요. "
+                "(계속 반복되면 비교 스냅샷 수를 줄이거나 max_output_tokens 를 더 높여주세요.)"
+            )
+            return ""
+
         return raw
     except Exception as exc:
         err = str(exc).lower()
