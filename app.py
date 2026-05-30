@@ -489,20 +489,22 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
     # Google Sheets 셀 한도 50,000자 — weekly/wow 브리핑은 마크다운이 길어 초과할 수 있음
     # weekly_briefing_markdown 을 먼저 20,000자로 트리밍한 rec_out 을 직렬화
     _SHEET_CELL_LIMIT = 49000
-    rec_for_json = rec_out
-    md_key = "weekly_briefing_markdown"
     analysis_for_json = dict(analysis)
-    if md_key in analysis_for_json and len(str(analysis_for_json.get(md_key) or "")) > 20000:
-        analysis_for_json[md_key] = str(analysis_for_json[md_key])[:20000] + "\n\n…(truncated)"
-        rec_for_json = dict(rec_out)
-        rec_for_json["analysis"] = analysis_for_json
+    md_key = "weekly_briefing_markdown"
+    briefing_full = str(analysis_for_json.get(md_key) or "").strip()
+
+    # weekly/wow 브리핑 마크다운은 JSON에서 제거하고 별도 컬럼(Winners)에 저장
+    # → 복원 시 Winners 컬럼에서 읽어서 analysis 에 재주입
+    if briefing_full and analysis_for_json.get("source") in ("weekly_trend_7d", "wow_trend_7d"):
+        analysis_for_json.pop(md_key, None)
+        # summary 도 중복이므로 제거하여 셀 한도 절약
+        analysis_for_json.pop("summary", None)
+
+    rec_for_json = dict(rec_out)
+    rec_for_json["analysis"] = analysis_for_json
     content = json.dumps(rec_for_json, ensure_ascii=False)
-    if len(content) > _SHEET_CELL_LIMIT:
-        # 그래도 넘으면 summary 도 트리밍
-        analysis_for_json["summary"] = str(analysis_for_json.get("summary") or "")[:5000]
-        rec_for_json = dict(rec_for_json)
-        rec_for_json["analysis"] = analysis_for_json
-        content = json.dumps(rec_for_json, ensure_ascii=False)
+
+    # 그래도 한도 초과 시 최후 수단으로 truncate
     if len(content) > _SHEET_CELL_LIMIT:
         content = content[:_SHEET_CELL_LIMIT]
 
@@ -520,8 +522,16 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
                 w_list = filter_scanner_ticker_list([str(x).strip().upper() for x in pre if str(x).strip()])
             except Exception:
                 w_list = []
-    w_csv = ",".join(w_list)
-    e_csv = ",".join(e_list)
+
+    # weekly/wow 브리핑 마크다운 전문은 Winners 컬럼에 저장 (복원용)
+    # 일반 내러티브는 기존대로 티커 CSV
+    if briefing_full and analysis.get("source") in ("weekly_trend_7d", "wow_trend_7d"):
+        w_csv = briefing_full  # Winners 컬럼 = 브리핑 전문
+        e_csv = ",".join(e_list)
+    else:
+        w_csv = ",".join(w_list)
+        e_csv = ",".join(e_list)
+
     return [str(owner_id).strip(), date_kst, category, title, content, w_csv, e_csv]
 
 
@@ -554,6 +564,16 @@ def _sheet_row_to_narrative_record(row: list) -> dict | None:
         envelope["_sheet_user_id"] = str(rid).strip()
         envelope["_sheet_winners_csv"] = winners_csv
         envelope["_sheet_emerging_csv"] = emerging_csv
+
+        # weekly/wow 브리핑: Winners 컬럼에 전문이 저장돼 있으면 analysis 에 재주입
+        src = str(envelope.get("analysis", {}).get("source") or category or "").strip()
+        if src in ("weekly_trend_7d", "wow_trend_7d") and winners_csv:
+            analysis_restored = dict(envelope["analysis"])
+            if not analysis_restored.get("weekly_briefing_markdown"):
+                analysis_restored["weekly_briefing_markdown"] = winners_csv
+                analysis_restored["summary"] = winners_csv
+            envelope["analysis"] = analysis_restored
+
         return envelope
     return None
 
@@ -12467,11 +12487,13 @@ if st.session_state.get("logged_in"):
                         )
     
         nb_ts = st.session_state.get("narrative_timeseries_briefing")
-        if isinstance(nb_ts, dict) and str(nb_ts.get("markdown") or "").strip():
+        # CASE A (weekly/wow) 에서 이미 브리핑을 렌더했으면 중복 렌더 스킵
+        _already_rendered = _cv_source in ("weekly_trend_7d", "wow_trend_7d")
+        if not _already_rendered and isinstance(nb_ts, dict) and str(nb_ts.get("markdown") or "").strip():
             st.markdown("---")
             st.success(str(nb_ts.get("title") or "시계열 브리핑"))
             st.markdown(str(nb_ts.get("markdown") or "").strip())
-    
+
             fc_kind = nb_ts.get("factcheck_kind")
             fc_df = nb_ts.get("factcheck_df")
             if fc_kind in ("weekly", "wow") and isinstance(fc_df, pd.DataFrame):
