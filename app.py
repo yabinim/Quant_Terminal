@@ -871,20 +871,11 @@ if "current_view" not in st.session_state:
 if "current_view_language" not in st.session_state:
     st.session_state["current_view_language"] = "ko"
 if "scanner_results" not in st.session_state:
-    # 세션 최초 초기화 시 Sheets에서 마지막 결과 복원 시도
-    _uid_init = str(st.session_state.get("user_id") or "").strip()
-    if _uid_init:
-        _restored_l = load_scanner_last_result(_uid_init, "leaders")
-        st.session_state["scanner_results"] = _restored_l  # None이면 None 그대로
-    else:
-        st.session_state["scanner_results"] = None
+    st.session_state["scanner_results"] = None
 if "scanner_results_emerging" not in st.session_state:
-    _uid_init_em = str(st.session_state.get("user_id") or "").strip()
-    if _uid_init_em:
-        _restored_e = load_scanner_last_result(_uid_init_em, "emerging")
-        st.session_state["scanner_results_emerging"] = _restored_e
-    else:
-        st.session_state["scanner_results_emerging"] = None
+    st.session_state["scanner_results_emerging"] = None
+if "_scanner_last_result_restored" not in st.session_state:
+    st.session_state["_scanner_last_result_restored"] = False
 if "narrative_timeseries_briefing" not in st.session_state:
     st.session_state["narrative_timeseries_briefing"] = None
 
@@ -12361,6 +12352,22 @@ if st.session_state.get("logged_in"):
     
     elif main_nav == _MAIN_NAV_OPTIONS[4]:
         render_sync_button("sync_tab_scanner", [], "스캐너 결과 캐시를 초기화합니다.")
+
+        # ── 세션 최초 진입 시 Sheets에서 마지막 스캔 결과 복원 ──────────────
+        # (함수 정의 이후 시점이므로 NameError 없음)
+        if not st.session_state.get("_scanner_last_result_restored"):
+            _uid_restore = str(st.session_state.get("user_id") or "").strip()
+            if _uid_restore:
+                if st.session_state.get("scanner_results") is None:
+                    _restored_l = load_scanner_last_result(_uid_restore, "leaders")
+                    if _restored_l:
+                        st.session_state["scanner_results"] = _restored_l
+                if st.session_state.get("scanner_results_emerging") is None:
+                    _restored_e = load_scanner_last_result(_uid_restore, "emerging")
+                    if _restored_e:
+                        st.session_state["scanner_results_emerging"] = _restored_e
+            st.session_state["_scanner_last_result_restored"] = True
+
         st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 듀얼 엔진")
         st.caption(
             "**Current Leaders**는 기존 6대 팩터로 대장·테마 정렬을, **Emerging**은 2차 수혜·초기 모멘텀·거래량 가속·과열 회피 관점으로 같은 유니버스를 재스코어링합니다."
