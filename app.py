@@ -486,25 +486,40 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
     if len(title) > 500:
         title = title[:497] + "..."
 
-    # Google Sheets 셀 한도 50,000자 — weekly/wow 브리핑은 마크다운이 길어 초과할 수 있음
-    # weekly_briefing_markdown 을 먼저 20,000자로 트리밍한 rec_out 을 직렬화
+    # Google Sheets 셀 한도 49,000자
+    # weekly/wow: precomputed_universe(수백 티커)를 제거해서 공간 확보 → briefing 전문 유지
     _SHEET_CELL_LIMIT = 49000
     analysis_for_json = dict(analysis)
-    md_key = "weekly_briefing_markdown"
-    briefing_full = str(analysis_for_json.get(md_key) or "").strip()
+    src = str(analysis_for_json.get("source") or "").strip()
 
-    # weekly/wow 브리핑 마크다운은 JSON에서 제거하고 별도 컬럼(Winners)에 저장
-    # → 복원 시 Winners 컬럼에서 읽어서 analysis 에 재주입
-    if briefing_full and analysis_for_json.get("source") in ("weekly_trend_7d", "wow_trend_7d"):
-        analysis_for_json.pop(md_key, None)
-        # summary 도 중복이므로 제거하여 셀 한도 절약
-        analysis_for_json.pop("summary", None)
+    if src in ("weekly_trend_7d", "wow_trend_7d"):
+        # precomputed_universe 는 크기가 크고 복원 필수 데이터가 아님 → 제거
+        analysis_for_json.pop("precomputed_universe", None)
+        # summary는 weekly_briefing_markdown의 복사본 → 중복 제거
+        if analysis_for_json.get("weekly_briefing_markdown") and analysis_for_json.get("summary"):
+            analysis_for_json.pop("summary", None)
 
     rec_for_json = dict(rec_out)
     rec_for_json["analysis"] = analysis_for_json
     content = json.dumps(rec_for_json, ensure_ascii=False)
 
-    # 그래도 한도 초과 시 최후 수단으로 truncate
+    # 그래도 한도 초과 시 weekly_briefing_markdown을 최대한 유지하며 나머지 trim
+    if len(content) > _SHEET_CELL_LIMIT:
+        md_key = "weekly_briefing_markdown"
+        md_val = str(analysis_for_json.get(md_key) or "")
+        # rotation 필드 제거
+        analysis_for_json.pop("rotation", None)
+        rec_for_json["analysis"] = analysis_for_json
+        content = json.dumps(rec_for_json, ensure_ascii=False)
+
+    if len(content) > _SHEET_CELL_LIMIT:
+        # 최후 수단: briefing 도 30,000자로 trim (잘림 표시 추가)
+        md_key = "weekly_briefing_markdown"
+        if md_key in analysis_for_json:
+            analysis_for_json[md_key] = str(analysis_for_json[md_key])[:30000] + "\n\n…(truncated)"
+        rec_for_json["analysis"] = analysis_for_json
+        content = json.dumps(rec_for_json, ensure_ascii=False)
+
     if len(content) > _SHEET_CELL_LIMIT:
         content = content[:_SHEET_CELL_LIMIT]
 
@@ -515,7 +530,7 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
         e_list = emerging_tickers_from_theme_analysis(analysis)
     except Exception:
         pass
-    if (not w_list and not e_list) and str(analysis.get("source") or "") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+    if (not w_list and not e_list) and src == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
         pre = analysis.get("precomputed_universe")
         if isinstance(pre, list):
             try:
@@ -523,15 +538,8 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
             except Exception:
                 w_list = []
 
-    # weekly/wow 브리핑 마크다운 전문은 Winners 컬럼에 저장 (복원용)
-    # 일반 내러티브는 기존대로 티커 CSV
-    if briefing_full and analysis.get("source") in ("weekly_trend_7d", "wow_trend_7d"):
-        w_csv = briefing_full  # Winners 컬럼 = 브리핑 전문
-        e_csv = ",".join(e_list)
-    else:
-        w_csv = ",".join(w_list)
-        e_csv = ",".join(e_list)
-
+    w_csv = ",".join(w_list)
+    e_csv = ",".join(e_list)
     return [str(owner_id).strip(), date_kst, category, title, content, w_csv, e_csv]
 
 
@@ -565,14 +573,19 @@ def _sheet_row_to_narrative_record(row: list) -> dict | None:
         envelope["_sheet_winners_csv"] = winners_csv
         envelope["_sheet_emerging_csv"] = emerging_csv
 
-        # weekly/wow 브리핑: Winners 컬럼에 전문이 저장돼 있으면 analysis 에 재주입
+        # weekly/wow: weekly_briefing_markdown 없으면 summary 로 fallback 세팅
         src = str(envelope.get("analysis", {}).get("source") or category or "").strip()
-        if src in ("weekly_trend_7d", "wow_trend_7d") and winners_csv:
-            analysis_restored = dict(envelope["analysis"])
-            if not analysis_restored.get("weekly_briefing_markdown"):
-                analysis_restored["weekly_briefing_markdown"] = winners_csv
-                analysis_restored["summary"] = winners_csv
-            envelope["analysis"] = analysis_restored
+        if src in ("weekly_trend_7d", "wow_trend_7d"):
+            analysis_r = dict(envelope["analysis"])
+            if not analysis_r.get("weekly_briefing_markdown"):
+                fallback_md = str(
+                    analysis_r.get("wow_briefing_markdown")
+                    or analysis_r.get("summary")
+                    or ""
+                ).strip()
+                if fallback_md:
+                    analysis_r["weekly_briefing_markdown"] = fallback_md
+                    envelope["analysis"] = analysis_r
 
         return envelope
     return None
