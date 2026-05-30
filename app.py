@@ -16712,28 +16712,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         _uid_guide = str(st.session_state.get("user_id") or "").strip()
         _role_guide = st.session_state.get("user_role", "guest")
 
-        # ── 빠른 링크 버튼 ────────────────────────────────────────────────────
-        st.markdown("### 🔗 빠른 이동")
-        _qc1, _qc2, _qc3, _qc4 = st.columns(4)
-        with _qc1:
-            if st.button("🚨 Daily Risk Gauge", key="guide_goto_risk", use_container_width=True):
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[0]
-                st.rerun()
-        with _qc2:
-            if st.button("🌐 거시경제 지표", key="guide_goto_macro", use_container_width=True):
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[1]
-                st.rerun()
-        with _qc3:
-            if st.button("🔬 개별 종목 검사", key="guide_goto_micro", use_container_width=True):
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
-                st.rerun()
-        with _qc4:
-            if st.button("🛡️ 포트폴리오", key="guide_goto_port", use_container_width=True):
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[6]
-                st.rerun()
-
-        st.divider()
-
         # ── 전체 워크플로우 개요 ──────────────────────────────────────────────
         st.markdown("## 🗺️ 투자 의사결정 워크플로우 (Top-Down)")
         st.info(
@@ -16744,36 +16722,19 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         )
 
         # ── 섹션별 탭 구성 ────────────────────────────────────────────────────
-        _g_tab0, _g_tab1, _g_tab2, _g_tab3, _g_tab4, _g_tab5 = st.tabs([
+        _g_tab0, _g_tab1, _g_tab2, _g_tab3, _g_tab4 = st.tabs([
             "🚀 시작하기",
             "📊 분석 도구",
             "💼 포트폴리오",
             "🤖 AI 인사이트",
-            "⚙️ 설정 & DB",
             "❓ FAQ",
         ])
 
         # ════════════════════════════════════════════════════════════════════
         with _g_tab0:
-            st.markdown("### 🚀 처음 시작하는 분들을 위한 3단계 셋업")
+            st.markdown("### 🚀 처음 시작하는 분들을 위한 2단계 셋업")
 
-            with st.expander("**STEP 1 — Google Sheets DB 연결 확인**", expanded=True):
-                st.markdown("""
-앱은 **Google Sheets(`Quant_DB`)** 를 데이터베이스로 사용합니다.  
-Streamlit Cloud `Secrets`에 아래 키가 설정되어 있어야 합니다.
-
-| 시크릿 키 | 용도 |
-|---|---|
-| `GOOGLE_CREDENTIALS` | GCP 서비스 계정 JSON (gspread 인증) |
-| `SPREADSHEET_ID` | Quant_DB 스프레드시트 ID |
-| `FMP_API_KEY` | Financial Modeling Prep API 키 |
-| `ANTHROPIC_API_KEY` | Claude AI (AI 분석용) |
-| `FRED_API_KEY` | FRED 거시경제 지표 |
-
-> ⚠️ `FMP_API_KEY` 없이는 실적 캘린더·거시지표 일부가 작동하지 않습니다.
-""")
-
-            with st.expander("**STEP 2 — 포트폴리오 종목 등록**", expanded=True):
+            with st.expander("**STEP 1 — 포트폴리오 종목 등록**", expanded=False):
                 st.markdown("""
 **[4단계] 포트폴리오 매도 레이더** 탭에서:
 1. `계좌명(Account)` 입력 (예: Robinhood, Fidelity, ISA)
@@ -16784,7 +16745,7 @@ Streamlit Cloud `Secrets`에 아래 키가 설정되어 있어야 합니다.
 > 💡 국내 주식도 `.KS` 접미사로 지원합니다 (예: `005930.KS` = 삼성전자)
 """)
 
-            with st.expander("**STEP 3 — 첫 AI 내러티브 분석 실행**", expanded=True):
+            with st.expander("**STEP 2 — 첫 AI 내러티브 분석 실행**", expanded=False):
                 st.markdown("""
 **[1단계] 시장 내러티브** 탭에서:
 1. 분석 타입 선택: `오늘의 최신 내러티브` 또는 `주간 메가 트렌드`
@@ -16796,8 +16757,8 @@ Streamlit Cloud `Secrets`에 아래 키가 설정되어 있어야 합니다.
 """)
 
             st.divider()
-            st.markdown("### 📅 일일 루틴 추천")
-            st.markdown("""
+            with st.expander("### 📅 일일 루틴 추천", expanded=False):
+                st.markdown("""
 | 시간 | 탭 | 행동 |
 |---|---|---|
 | 장 열기 전 (오전 9시 이전) | 🚨 Daily Risk Gauge | 선행 신호 6개 + 시장 위험도 확인 |
@@ -16930,7 +16891,7 @@ Streamlit Cloud `Secrets`에 아래 키가 설정되어 있어야 합니다.
         with _g_tab2:
             st.markdown("### 💼 포트폴리오 관리 탭 상세 가이드")
 
-            with st.expander("🛡️ **[4단계] 포트폴리오 매도 레이더**", expanded=True):
+            with st.expander("🛡️ **[4단계] 포트폴리오 매도 레이더**", expanded=False):
                 st.markdown("""
 **포트폴리오 전체 현황 + 매도 신호 자동 감지**
 
@@ -17059,86 +17020,6 @@ AI가 추천한 Winners·Emerging 종목 중:
 
         # ════════════════════════════════════════════════════════════════════
         with _g_tab4:
-            st.markdown("### ⚙️ 설정 & 데이터베이스 구조")
-
-            with st.expander("🗄️ **Google Sheets DB 구조 (`Quant_DB`)**", expanded=True):
-                st.markdown("""
-| 시트(탭) 이름 | 저장 데이터 | 관련 기능 |
-|---|---|---|
-| `Users` | user_id, 비밀번호(해시), role, status | 로그인·승인 관리 |
-| `Narratives` | AI 분석 결과 전체 (date, category, title, content, winners, emerging 등) | 내러티브 기록·AI 인사이트 |
-| `Portfolio` | user_id, Account, Ticker, 매수가, 수량, 메모 | 포트폴리오 관리 |
-| `Watchlist` | user_id, ticker, 목표가, RSI 알림, 메모 | Watchlist & Alert |
-| `SellHistory` | user_id, ticker, 매도가, 매도일, 실현손익 | 매도 기록·실현손익 |
-| `Portfolio_Snapshot` | 날짜별 포트폴리오 가치 스냅샷 | 수익률 히스토리 차트 |
-| `ETF_Universe` | ETF 티커·이름·섹터 | AI 종목 스캐너 |
-| `Emerging_Tracker` | user_id, ticker, 등장횟수, 검증결과 | Emerging 추적기 |
-
-> 🔒 모든 데이터는 `user_id`로 철저히 분리 — 다른 유저의 데이터는 조회 불가
-""")
-
-            with st.expander("🔑 **API 키 관리**", expanded=False):
-                st.markdown("""
-**Streamlit Community Cloud → App Settings → Secrets 에서 설정**
-
-```toml
-# .streamlit/secrets.toml 예시
-FMP_API_KEY        = "your_fmp_key"
-ANTHROPIC_API_KEY  = "your_anthropic_key"
-FRED_API_KEY       = "your_fred_key"
-SPREADSHEET_ID     = "your_sheet_id"
-
-[GOOGLE_CREDENTIALS]
-type                        = "service_account"
-project_id                  = "..."
-private_key_id              = "..."
-private_key                 = "-----BEGIN RSA PRIVATE KEY-----\\n..."
-client_email                = "...@....iam.gserviceaccount.com"
-```
-
-**FMP 플랜별 기능:**
-| 기능 | Free | Starter+ |
-|---|---|---|
-| 실적 캘린더 | ✅ | ✅ |
-| 기관 투자자 데이터 | ❌ | ✅ |
-| 인사이더 트레이딩 | ❌ | ✅ |
-| 어닝콜 트랜스크립트 | ❌ | ✅ |
-| 실시간 데이터 | ❌ | ✅ |
-""")
-
-            with st.expander("⚡ **캐시 & 성능**", expanded=False):
-                st.markdown("""
-**Streamlit `@st.cache_data` 캐시 정책:**
-
-| 데이터 종류 | 캐시 TTL | 강제 갱신 방법 |
-|---|---|---|
-| 거시경제 지표 | 1시간 | 🔄 데이터 새로고침 버튼 |
-| 종목 가격 데이터 | 1시간 | 🔄 데이터 새로고침 버튼 |
-| FMP 프로필 | 1시간 | 앱 재시작 |
-| Narratives DB | 즉시 (cache 없음) | 자동 |
-| Portfolio DB | 즉시 (cache 없음) | 자동 |
-
-**느릴 때 체크리스트:**
-1. yfinance 과부하 — 종목 수를 줄이거나 잠시 후 재시도
-2. FMP API 응답 지연 — Free 플랜은 Rate Limit 존재
-3. Google Sheets 연결 오류 — 서비스 계정 권한 확인
-""")
-
-            if _role_guide == "admin":
-                st.divider()
-                st.markdown("### 🔑 관리자 전용")
-                with st.expander("👥 **사용자 승인 관리**", expanded=False):
-                    st.markdown("""
-사이드바 최하단 **"👤 사용자 승인 관리"** 탭에서:
-- 신규 가입 요청 확인 (`pending` 상태)
-- `Status` 변경: `approved` ← 승인 / `rejected` ← 거절
-- **"변경사항 DB에 저장"** 클릭으로 즉시 적용
-
-> 승인된 사용자만 앱의 전체 기능에 접근할 수 있습니다.
-""")
-
-        # ════════════════════════════════════════════════════════════════════
-        with _g_tab5:
             st.markdown("### ❓ 자주 묻는 질문 (FAQ)")
 
             _faqs = [
