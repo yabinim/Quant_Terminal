@@ -69,6 +69,8 @@ _EMERGING_TRACKER_SHEET_TITLE = "Emerging_Tracker"
 _PORTFOLIO_HISTORY_SHEET_TITLE = "Portfolio_History"
 _SCANNER_HISTORY_SHEET_TITLE = "Scanner_History"
 _SCANNER_HISTORY_COLS = ["ID", "Date", "Engine", "Ticker", "Score", "Rank", "Verdict", "RS_Score", "Mom_1M"]
+_SCANNER_LAST_RESULT_SHEET_TITLE = "Scanner_Last_Result"
+_SCANNER_LAST_RESULT_COLS = ["ID", "Engine", "Saved_At", "Universe_Count", "Score_JSON"]
 _PORTFOLIO_HISTORY_COLS = ["ID", "Date", "Total_Value", "Total_Cost", "Return_Pct", "SPY_Pct", "Alpha_Pct", "Positions"]
 _EMERGING_TRACKER_COLS = ["ID", "Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]
 _ETF_UNIVERSE_SHEET_COLS = ["Ticker", "Name", "Category", "AUM_M", "Added_Date", "Source"]
@@ -869,9 +871,20 @@ if "current_view" not in st.session_state:
 if "current_view_language" not in st.session_state:
     st.session_state["current_view_language"] = "ko"
 if "scanner_results" not in st.session_state:
-    st.session_state["scanner_results"] = None
+    # 세션 최초 초기화 시 Sheets에서 마지막 결과 복원 시도
+    _uid_init = str(st.session_state.get("user_id") or "").strip()
+    if _uid_init:
+        _restored_l = load_scanner_last_result(_uid_init, "leaders")
+        st.session_state["scanner_results"] = _restored_l  # None이면 None 그대로
+    else:
+        st.session_state["scanner_results"] = None
 if "scanner_results_emerging" not in st.session_state:
-    st.session_state["scanner_results_emerging"] = None
+    _uid_init_em = str(st.session_state.get("user_id") or "").strip()
+    if _uid_init_em:
+        _restored_e = load_scanner_last_result(_uid_init_em, "emerging")
+        st.session_state["scanner_results_emerging"] = _restored_e
+    else:
+        st.session_state["scanner_results_emerging"] = None
 if "narrative_timeseries_briefing" not in st.session_state:
     st.session_state["narrative_timeseries_briefing"] = None
 
@@ -4043,6 +4056,41 @@ def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.DataFrame(close_dict).sort_index()
 
+def _fmp_fill_parallel_warmup(tickers: list, max_workers: int = 10) -> dict:
+    """
+    스캐너 루프 전에 _fmp_fill()을 종목별 병렬 실행해 캐시를 웜업한다.
+    반환: {ticker: info_dict} — 루프 안에서 바로 조회해 HTTP 재호출 없이 사용.
+
+    max_workers=10: FMP Starter 300 req/min 여유 감안.
+    _fmp_fill() 내부 캐시 함수(_fmp_profile 등)는 @st.cache_data 공유이므로
+    병렬 호출 시 첫 호출만 HTTP, 이후는 캐시 히트 → rate limit 안전.
+    """
+    import concurrent.futures as _cf
+
+    if not tickers:
+        return {}
+
+    results = {}
+
+    def _fill_one(tk):
+        try:
+            return tk, _fmp_fill({}, tk)
+        except Exception:
+            return tk, {}
+
+    with _cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fill_one, tk): tk for tk in tickers}
+        for future in _cf.as_completed(futures):
+            try:
+                tk, info = future.result()
+                results[tk] = info
+            except Exception:
+                results[futures[future]] = {}
+
+    return results
+
+
+
 
 # ── _fmp_fill 내부 uncached requests.get 3개를 캐싱 래퍼로 분리 ──────────
 # 기존: _fmp_fill() 호출마다 /quote, /analyst-estimates, /balance-sheet를
@@ -6881,6 +6929,110 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: st
         return False, str(exc)
 
 
+def save_scanner_last_result(user_id: str, snap: dict, engine: str) -> tuple[bool, str]:
+    """
+    마지막 스캔 결과 전체(score_df + meta)를 Scanner_Last_Result 탭에 JSON으로 저장.
+    세션이 끊겨도 다음 로그인 시 복원 가능.
+    user_id + engine 기준으로 덮어쓰기 (최신 1건만 유지).
+    """
+    gc = get_gspread_client()
+    if gc is None:
+        return False, "Google 서비스 계정 미설정"
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [w.title for w in sh.worksheets()]
+        if _SCANNER_LAST_RESULT_SHEET_TITLE not in existing:
+            ws = sh.add_worksheet(title=_SCANNER_LAST_RESULT_SHEET_TITLE, rows=100, cols=5)
+            ws.update([_SCANNER_LAST_RESULT_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
+        else:
+            ws = sh.worksheet(_SCANNER_LAST_RESULT_SHEET_TITLE)
+
+        uid_u = str(user_id).strip().upper()
+        engine_label = str(engine).strip()
+        saved_at = datetime.now(timezone.utc).isoformat()
+
+        # score_df → JSON (상위 50행만, 용량 절약)
+        score_df = snap.get("score_df")
+        if not isinstance(score_df, pd.DataFrame) or score_df.empty:
+            return False, "score_df 없음"
+        score_json = score_df.head(50).to_json(orient="records", force_ascii=False)
+        universe_count = str(len(snap.get("universe") or []))
+
+        # 메타 정보도 JSON에 포함
+        meta = {
+            "mode_note": snap.get("mode_note", ""),
+            "scanner_mode": snap.get("scanner_mode", ""),
+            "universe": snap.get("universe", []),
+            "completed_at": snap.get("completed_at", saved_at),
+        }
+        payload = json.dumps({"meta": meta, "rows": json.loads(score_json)}, ensure_ascii=False)
+
+        # 기존 행 탐색 (해당 user+engine)
+        all_vals = ws.get_all_values()
+        target_row = None
+        for ri, row in enumerate(all_vals[1:], start=2):
+            row = (row + [""] * 5)[:5]
+            if str(row[0]).strip().upper() == uid_u and str(row[1]).strip() == engine_label:
+                target_row = ri
+                break
+
+        new_row = [uid_u, engine_label, saved_at, universe_count, payload]
+        if target_row:
+            ws.update([new_row], range_name=f"A{target_row}:E{target_row}", value_input_option="USER_ENTERED")
+        else:
+            ws.append_rows([new_row], value_input_option="USER_ENTERED")
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def load_scanner_last_result(user_id: str, engine: str) -> dict | None:
+    """
+    Scanner_Last_Result 탭에서 마지막 스캔 결과를 복원.
+    반환: snap dict (score_df 포함) 또는 None.
+    """
+    gc = get_gspread_client()
+    if gc is None:
+        return None
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [w.title for w in sh.worksheets()]
+        if _SCANNER_LAST_RESULT_SHEET_TITLE not in existing:
+            return None
+        ws = sh.worksheet(_SCANNER_LAST_RESULT_SHEET_TITLE)
+        all_vals = ws.get_all_values()
+        if not all_vals or len(all_vals) < 2:
+            return None
+        uid_u = str(user_id).strip().upper()
+        engine_label = str(engine).strip()
+        for row in all_vals[1:]:
+            row = (row + [""] * 5)[:5]
+            if str(row[0]).strip().upper() == uid_u and str(row[1]).strip() == engine_label:
+                payload_str = str(row[4]).strip()
+                if not payload_str:
+                    return None
+                try:
+                    payload = json.loads(payload_str)
+                    meta = payload.get("meta", {})
+                    rows_data = payload.get("rows", [])
+                    if not rows_data:
+                        return None
+                    score_df = pd.DataFrame(rows_data)
+                    return {
+                        "score_df": score_df,
+                        "mode_note": meta.get("mode_note", engine_label),
+                        "scanner_mode": meta.get("scanner_mode", ""),
+                        "universe": meta.get("universe", []),
+                        "completed_at": meta.get("completed_at", ""),
+                        "_restored_from_sheet": True,
+                    }
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_scanner_history(user_id: str, engine: str = "all") -> pd.DataFrame:
     """스캐너 히스토리 로드. engine: 'all' | 'leaders' | 'emerging'"""
@@ -8436,6 +8588,8 @@ def render_opportunity_scanner_snapshot(snap):
 
     st.divider()
     st.markdown("##### 📌 저장된 스캔 결과")
+    if snap.get("_restored_from_sheet"):
+        st.info("🔄 이전 세션의 마지막 스캔 결과를 자동 복원했습니다. 최신 시장 데이터 반영을 위해 재스캔을 권장합니다.")
     if completed_at:
         try:
             _ca_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
@@ -8646,6 +8800,8 @@ def render_opportunity_emerging_snapshot(snap):
 
     st.divider()
     st.markdown("##### 🚀 저장된 Emerging 스캔 결과")
+    if snap.get("_restored_from_sheet"):
+        st.info("🔄 이전 세션의 마지막 Emerging 스캔 결과를 자동 복원했습니다. 최신 시장 데이터 반영을 위해 재스캔을 권장합니다.")
     if completed_at:
         try:
             _ca_dt_em = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
@@ -9134,6 +9290,11 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             volume_df = pd.DataFrame()
             spy_hist = pd.DataFrame()
 
+    # ── 병렬 웜업: _fmp_fill() HTTP 호출을 루프 전에 한꺼번에 병렬 처리 ──
+    # 캐시 콜드(첫 스캔)일 때 180종목 × 순차 7회 HTTP → 병렬화로 대폭 단축
+    with st.spinner(f"펀더멘털 데이터 병렬 수집 중... ({len(tickers)}종목)"):
+        _info_cache = _fmp_fill_parallel_warmup(tickers)
+
     spy_3m = calculate_period_return(spy_hist["Close"], 63) if "Close" in spy_hist.columns else np.nan
     spy_3m = to_float(spy_3m)
     if pd.isna(spy_3m):
@@ -9154,7 +9315,8 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
         m3_ret = calculate_period_return(close_series, 63)
         rs_raw = to_float(m3_ret) - to_float(spy_3m)
 
-        info = _fmp_fill({}, ticker)
+        # 병렬 웜업 딕셔너리에서 조회 (캐시 히트) — 없으면 fallback으로 직접 호출
+        info = _info_cache.get(ticker) or _fmp_fill({}, ticker)
 
         revenue_growth = to_float(info.get("revenueGrowth") or info.get("earningsGrowth"))
         trailing_eps = to_float(info.get("trailingEps"))
@@ -9293,6 +9455,10 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
     with st.spinner("Emerging Gemini 내러티브 배치 평가 중 (티커 청크별, gemini-2.5-flash)..."):
         narrative_map_em = batch_narrative_emerging_second_order_scores(tickers, narrative_text)
 
+    # ── 병렬 웜업: _fmp_fill() HTTP 호출을 루프 전에 한꺼번에 병렬 처리 ──
+    with st.spinner(f"Emerging: 펀더멘털 데이터 병렬 수집 중... ({len(tickers)}종목)"):
+        _em_info_cache = _fmp_fill_parallel_warmup(tickers)
+
     rows = []
     total = len(tickers)
 
@@ -9360,7 +9526,8 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
         else:
             over_raw = np.nan
 
-        info = _fmp_fill({}, ticker)
+        # 병렬 웜업 딕셔너리에서 조회 — 없으면 fallback으로 직접 호출
+        info = _em_info_cache.get(ticker) or _fmp_fill({}, ticker)
 
         eg = to_float(info.get("earningsGrowth"))
         if pd.isna(eg):
@@ -12445,6 +12612,9 @@ if st.session_state.get("logged_in"):
                             "completed_at": datetime.now(timezone.utc).isoformat(),
                         }
                         st.success("Current Leaders 스캔 완료 — 결과가 세션에 저장되었습니다.")
+                        # 세션 재시작 후 복원을 위해 Sheets에 마지막 결과 저장
+                        _lr_uid = str(st.session_state.get("user_id") or "").strip()
+                        save_scanner_last_result(_lr_uid, st.session_state["scanner_results"], engine="leaders")
     
             snap = st.session_state.get("scanner_results")
             if isinstance(snap, dict) and isinstance(snap.get("score_df"), pd.DataFrame) and not snap["score_df"].empty:
@@ -12600,6 +12770,9 @@ if st.session_state.get("logged_in"):
                         }
                         # 히스토리 저장은 아래 자동저장 로직(_em_sc_last != _em_sc_today)에서 일괄 처리
                         st.success("Emerging Opportunities 스캔 완료 — 결과가 세션에 저장되었습니다.")
+                        # 세션 재시작 후 복원을 위해 Sheets에 마지막 결과 저장
+                        _em_lr_uid = str(st.session_state.get("user_id") or "").strip()
+                        save_scanner_last_result(_em_lr_uid, st.session_state["scanner_results_emerging"], engine="emerging")
     
             snap_em = st.session_state.get("scanner_results_emerging")
             if isinstance(snap_em, dict) and isinstance(snap_em.get("score_df"), pd.DataFrame) and not snap_em["score_df"].empty:
