@@ -8138,24 +8138,43 @@ def parse_tickers_from_text(text):
 
 # 1.5 주간 트렌드 프롬프트가 강제하는 두 섹션 헤더 매처
 _FACTCHECK_WINNERS_HEADER_RE = re.compile(
-    r"^\s*#{1,6}\s*🏆\s*Weekly\s+Winners.*$", re.MULTILINE | re.IGNORECASE
+    r"^\s*(?:#{1,6}\s*🏆\s*Weekly\s+Winners"          # 고정 헤더
+    r"|#{1,6}.*(?:winners?|대장주|지속\s*티커|주간\s*대장)"  # 한국어 헤더
+    r"|지속\s*티커\s*[\(（]?[Ww]inners?[\)）]?"           # '지속 티커 (Winners):' 형식
+    r").*$",
+    re.MULTILINE | re.IGNORECASE,
 )
 _FACTCHECK_EXPANDING_HEADER_RE = re.compile(
-    r"^\s*#{1,6}\s*🚀\s*Weekly\s+Expanding\s+To.*$", re.MULTILINE | re.IGNORECASE
+    r"^\s*(?:#{1,6}\s*🚀\s*Weekly\s+Expanding\s+To"    # 고정 헤더
+    r"|#{1,6}.*(?:expanding|후발|확장\s*수혜)"           # 한국어 헤더
+    r").*$",
+    re.MULTILINE | re.IGNORECASE,
 )
-# WoW 고정 헤더 (🌱/🥀 이모지 포함) + 기존 한국어 키워드 fallback
+# WoW 고정 헤더 + 한국어 숫자형 헤더 모두 허용
 _FACTCHECK_EMERGING_HEADER_RE = re.compile(
-    r"^\s*#{1,6}\s*(?:🌱\s*Emerging|.*(?:emerging|부상|새로\s*나)).*$", re.MULTILINE | re.IGNORECASE
+    r"^\s*(?:#{1,6}\s*🌱\s*Emerging"                   # 고정 헤더
+    r"|#{1,6}.*(?:emerging|부상|새로\s*나)"
+    r"|\d+[\)）\.]\s*.*(?:emerging|부상|새로\s*나)"      # '3) Emerging' 형식
+    r").*$",
+    re.MULTILINE | re.IGNORECASE,
 )
 _FACTCHECK_FADING_HEADER_RE = re.compile(
-    r"^\s*#{1,6}\s*(?:🥀\s*Fading|.*(?:fading|사그|약화|소멸)).*$", re.MULTILINE | re.IGNORECASE
+    r"^\s*(?:#{1,6}\s*🥀\s*Fading"                     # 고정 헤더
+    r"|#{1,6}.*(?:fading|사그|약화|소멸)"
+    r"|🥀\s*Fading"                                     # 이모지만 있는 소제목
+    r"|\d+[\)）\.]\s*.*(?:fading|사그|약화|소멸)"
+    r").*$",
+    re.MULTILINE | re.IGNORECASE,
 )
 _FACTCHECK_INTERSECTION_HEADER_RE = re.compile(
-    r"^\s*#{1,6}.*(교집합|intersection|살아남은).*$", re.MULTILINE | re.IGNORECASE
+    r"^\s*(?:#{1,6}.*(?:교집합|intersection|살아남은)"
+    r"|\d+[\)）\.]\s*.*(?:교집합|intersection|살아남은)"  # '1) 교집합' 형식
+    r").*$",
+    re.MULTILINE | re.IGNORECASE,
 )
 
 _FACTCHECK_BOLD_TICKER_RE = re.compile(r"\*\*\s*([A-Z][A-Z0-9.\-]{0,9})\s*\*\*")
-_FACTCHECK_PLAIN_TICKER_RE = re.compile(r"\b([A-Z][A-Z0-9.\-]{0,9})\b")
+_FACTCHECK_PLAIN_TICKER_RE = re.compile(r"\b([A-Z][A-Z0-9.\-]{1,9})\b")
 
 # 본문에서 티커처럼 보이지만 실제로는 일반 약어인 단어들 — 잡음 제거용
 _FACTCHECK_NON_TICKER_WORDS = frozenset(
@@ -8167,28 +8186,39 @@ _FACTCHECK_NON_TICKER_WORDS = frozenset(
         "DCF", "ESG", "DRAM", "DDR", "LPDDR", "TAM", "SAM", "FY", "CY",
         "Q1", "Q2", "Q3", "Q4", "H1", "H2",
         "TO", "FROM", "AT", "ON", "OFF", "BY", "FOR", "AND", "OR", "BUT",
-        "WITH", "VS", "THE", "TBD", "TBA", "NA", "NAN", "TBA",
+        "WITH", "VS", "THE", "TBD", "TBA", "NA", "NAN",
         "WOW", "DOD", "WEEKLY", "WINNERS", "EXPANDING", "COPILOT", "GEMINI",
+        # WoW 한국어 브리핑에서 자주 잡히는 비티커 대문자
+        "RISK", "TIGHTENING", "DRIFT", "NARRATIVE", "WEEK", "SECTOR",
+        "ROTATION", "FADING", "EMERGING", "INTERSECTION", "PART", "SUMMARY",
+        "EXECUTIVE", "AR", "VR", "DX", "AR",
     }
 )
 
 
 def _factcheck_slice_section(markdown: str, header_re: "re.Pattern") -> str:
-    """주어진 헤더 정규식 매치 위치부터 다음 ## 헤더 전까지의 본문을 반환."""
+    """주어진 헤더 정규식 매치 위치부터 다음 섹션 헤더 전까지 본문 반환.
+    ## 마크다운 헤더 + 숫자형 섹션(1), 2) 등) 모두 인식.
+    """
     md = str(markdown or "")
     m = header_re.search(md)
     if not m:
         return ""
     start = m.end()
-    nxt = re.search(r"^\s*#{1,6}\s+\S+", md[start:], re.MULTILINE)
+    # 다음 섹션 구분자: ## 헤더 또는 숫자형 섹션 시작 또는 🥀/🌱 이모지 소제목
+    nxt = re.search(
+        r"(?:^\s*#{1,6}\s+\S+|^\s*\d+[\)）\.]\s+\S|^\s*[🥀🌱🚀🏆]\s+\S)",
+        md[start:],
+        re.MULTILINE,
+    )
     end = start + (nxt.start() if nxt else len(md) - start)
     return md[start:end]
 
 
 def _factcheck_pick_tickers_from_section(section_md: str) -> list:
-    """섹션 본문에서 라인 단위로 티커를 추출.
-    1순위: `**TICKER**` 볼드 매치 (프롬프트가 강제하는 형식)
-    2순위: 라인 첫 대문자 토큰 (잡음 단어 제외, 길이 2~6)
+    """섹션 본문에서 티커를 추출.
+    1순위: `**TICKER**` 볼드 매치 (신규 프롬프트 고정 형식)
+    2순위: 라인 내 모든 대문자 토큰 — 쉼표/공백 구분 나열 형식도 전부 수집
     """
     out = []
     seen = set()
@@ -8196,13 +8226,17 @@ def _factcheck_pick_tickers_from_section(section_md: str) -> list:
         line = raw_line.strip()
         if not line:
             continue
-        bold_match = _FACTCHECK_BOLD_TICKER_RE.search(line)
-        if bold_match:
-            tk = bold_match.group(1).upper().strip(".-")
+        # 1순위: 볼드 티커 — 한 라인에 여러 개 있어도 모두 수집
+        bold_tickers = []
+        for bm in _FACTCHECK_BOLD_TICKER_RE.finditer(line):
+            tk = bm.group(1).upper().strip(".-")
             if tk and tk not in _FACTCHECK_NON_TICKER_WORDS and tk not in seen:
                 seen.add(tk)
-                out.append(tk)
+                bold_tickers.append(tk)
+        if bold_tickers:
+            out.extend(bold_tickers)
             continue
+        # 2순위: 일반 대문자 토큰 — 라인 내 모든 후보 수집 (쉼표 구분 나열 대응)
         for tok in _FACTCHECK_PLAIN_TICKER_RE.findall(line):
             tk = tok.upper().strip(".-")
             if not (2 <= len(tk) <= 6):
@@ -8213,7 +8247,6 @@ def _factcheck_pick_tickers_from_section(section_md: str) -> list:
                 continue
             seen.add(tk)
             out.append(tk)
-            break  # 라인당 1개만
     return out
 
 
