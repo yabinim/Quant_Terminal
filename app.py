@@ -12047,6 +12047,14 @@ if st.session_state.get("logged_in"):
                         st.markdown(f"**{tk}** — {cnt}회  \n{bar}")
 
         # ── 기능 2: Emerging 종목 정량 교차 검증 ─────────────────────────
+        # themes_data는 CASE B(market_narrative)에서만 정의되므로
+        # wow/weekly source일 때 NameError 방지를 위해 여기서 안전하게 추출
+        _cv_data_for_emerging = st.session_state.get("current_view", {})
+        themes_data = (
+            _cv_data_for_emerging.get("themes", [])
+            if isinstance(_cv_data_for_emerging, dict)
+            else []
+        )
         if themes_data and isinstance(themes_data, list):
             all_emerging = []
             for theme in themes_data:
