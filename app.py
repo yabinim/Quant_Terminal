@@ -219,7 +219,7 @@ def save_thesis_row(user_id: str, ticker: str, account: str, thesis_title: str, 
     if err:
         return False, err
     try:
-        date_added = _narrative_now_kst_string()
+        date_added = _narrative_now_et_string()
         row = [
             str(user_id).strip(),
             str(ticker).strip().upper(),
@@ -308,7 +308,7 @@ def get_thesis_options_from_narratives(user_id: str) -> list[dict]:
         try:
             dt = _narrative_parse_saved_at_utc(saved_at)
             if dt:
-                date_str = dt.astimezone(_KST_TZ).strftime("%m/%d")
+                date_str = dt.astimezone(_MARKET_ET_TZ).strftime("%m/%d")
         except Exception:
             pass
         category = str(analysis.get("source") or "market_narrative").strip()
@@ -378,7 +378,7 @@ def _portfolio_row_to_new_six_cells(header_kind: str, row: list) -> list | None:
             tk,
             row[2],
             row[3],
-            str(row[4]).strip() if len(row) > 4 and str(row[4]).strip() else _narrative_now_kst_string(),
+            str(row[4]).strip() if len(row) > 4 and str(row[4]).strip() else _narrative_now_et_string(),
         ]
     row = row + [""] * 6
     rid = str(row[0]).strip()
@@ -386,7 +386,7 @@ def _portfolio_row_to_new_six_cells(header_kind: str, row: list) -> list | None:
     tk = str(row[2]).strip().upper()
     if not rid or not acct or not tk:
         return None
-    dt = str(row[5]).strip() if len(row) > 5 and str(row[5]).strip() else _narrative_now_kst_string()
+    dt = str(row[5]).strip() if len(row) > 5 and str(row[5]).strip() else _narrative_now_et_string()
     return [rid, acct, tk, row[3], row[4], dt]
 
 
@@ -400,7 +400,7 @@ def ensure_narratives_header_row(ws):
         ws.update([_NARRATIVES_SHEET_COLS], range_name="A1:G1", value_input_option="USER_ENTERED")
 
 
-def _looks_kst_timestamp(s: str) -> bool:
+def _looks_local_timestamp(s: str) -> bool:
     s = str(s or "").strip()
     return bool(re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:", s))
 
@@ -413,7 +413,7 @@ def _normalize_narrative_sheet_row(row: list) -> list:
     # 레거시 6열: ID, Date, Category, Title, Content, Tickers(단일)
     if len(row) == 6:
         s0 = str(row[0] or "").strip()
-        if s0 and not _looks_kst_timestamp(s0):
+        if s0 and not _looks_local_timestamp(s0):
             return [
                 str(row[0]).strip(),
                 str(row[1]).strip(),
@@ -424,7 +424,7 @@ def _normalize_narrative_sheet_row(row: list) -> list:
                 "",
             ]
     s0 = str(row[0]).strip() if row else ""
-    if len(row) >= 4 and _looks_kst_timestamp(s0):
+    if len(row) >= 4 and _looks_local_timestamp(s0):
         c = str(row[3]).strip() if len(row) > 3 else ""
         if c.startswith("{") or c.startswith("["):
             if len(row) == 5:
@@ -438,21 +438,21 @@ def _normalize_narrative_sheet_row(row: list) -> list:
     return (row + [""] * 7)[:7]
 
 
-def _narrative_now_kst_string(dt_utc=None) -> str:
-    """UTC 시각을 KST 문자열 YYYY-MM-DD HH:MM:SS 로."""
+def _narrative_now_et_string(dt_utc=None) -> str:
+    """UTC 시각을 ET(미 동부) 문자열 YYYY-MM-DD HH:MM:SS 로."""
     u = dt_utc or datetime.now(timezone.utc)
     if u.tzinfo is None:
         u = u.replace(tzinfo=timezone.utc)
-    return u.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return u.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _narrative_kst_date_string_to_utc_iso(date_kst_str: str) -> str | None:
-    """시트 Date 열(KST) → UTC ISO 문자열."""
+def _narrative_et_date_string_to_utc_iso(date_kst_str: str) -> str | None:
+    """시트 Date 열(ET, 미 동부) → UTC ISO 문자열."""
     if not date_kst_str or not str(date_kst_str).strip():
         return None
     try:
         naive = datetime.strptime(str(date_kst_str).strip(), "%Y-%m-%d %H:%M:%S")
-        loc = _KST_TZ.localize(naive)
+        loc = _MARKET_ET_TZ.localize(naive)
         return loc.astimezone(timezone.utc).isoformat()
     except Exception:
         return None
@@ -522,7 +522,7 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
     dt_utc = _narrative_parse_saved_at_utc(rec_out.get("saved_at"))
     if dt_utc is None:
         dt_utc = datetime.now(timezone.utc)
-    date_kst = _narrative_now_kst_string(dt_utc)
+    date_kst = _narrative_now_et_string(dt_utc)
     category = str(analysis.get("source") or "market_narrative").strip() or "market_narrative"
     title = _narrative_sheet_title_for_record(rec_out)
     if len(title) > 500:
@@ -588,7 +588,7 @@ def _sheet_row_to_narrative_record(row: list) -> dict | None:
         return None
     if isinstance(envelope.get("analysis"), dict):
         if not envelope.get("saved_at") and date_kst:
-            iso_guess = _narrative_kst_date_string_to_utc_iso(date_kst)
+            iso_guess = _narrative_et_date_string_to_utc_iso(date_kst)
             if iso_guess:
                 envelope = dict(envelope)
                 envelope["saved_at"] = iso_guess
@@ -981,7 +981,6 @@ _WATCHLIST_FILE = _APP_DIR / "watchlist.json"
 _PORTFOLIO_FILE = _APP_DIR / "portfolio.csv"
 _SAN_ANTONIO_TZ = pytz.timezone("America/Chicago")
 _MARKET_ET_TZ = pytz.timezone("America/New_York")
-_KST_TZ = pytz.timezone("Asia/Seoul")
 _NARRATIVE_HISTORY_MAX_RECORDS = 40
 _NARRATIVE_HISTORY_RETENTION_DAYS = 14
 _DATA_CACHE_TTL = 3600
@@ -1177,7 +1176,7 @@ def read_etf_universe_file_tickers():
 
 
 def to_float(value):
-    """Safely convert values from yfinance to float."""
+    """Safely convert numeric values (e.g. from FMP) to float."""
     if value is None:
         return np.nan
     if isinstance(value, (list, tuple, dict, pd.Series, pd.DataFrame)):
@@ -1234,7 +1233,7 @@ def pass_fail_badge(passed, no_data=False):
 
 def get_latest_series_value(df, row_name):
     """
-    yfinance financial statements are often indexed by account name and columns by dates.
+    Financial statements are often indexed by account name and columns by dates.
     Return the latest non-null value for a row.
     """
     if df is None or df.empty or row_name not in df.index:
@@ -1677,14 +1676,13 @@ def fetch_dxy_latest_and_mean_deviation():
 def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
     """보유 종목의 다음 실적 발표일.
 
-    4-layer fallback 전략:
+    3-layer fallback 전략 (전부 FMP):
       1) FMP earnings-calendar  (from=오늘, to=오늘+90일, symbol=X)
       2) FMP earnings           (/stable/earnings?symbol=X)
       3) FMP quote              (earningsAnnouncement 필드)
-      4) yfinance               (.calendar 속성)
     """
     k = _fmp_key()
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(_MARKET_ET_TZ).date()  # 시장 기준일 = 미 동부시간
     tomorrow_dt = today + timedelta(days=1)
     from_str = today.strftime("%Y-%m-%d")
     to_str   = (today + timedelta(days=90)).strftime("%Y-%m-%d")
@@ -1769,34 +1767,6 @@ def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
                         parsed = _parse_ann_field(ann)
                         if parsed:
                             best = parsed
-                except Exception:
-                    pass
-
-            # ── Layer 4: yfinance .calendar fallback ──────────────────────
-            if best is None:
-                try:
-                    import yfinance as yf
-                    yf_ticker = yf.Ticker(tk)
-                    cal = yf_ticker.calendar
-                    # cal 은 dict 또는 DataFrame 형태
-                    if isinstance(cal, dict):
-                        earn_date = cal.get("Earnings Date")
-                        if earn_date:
-                            # 리스트일 수 있음
-                            if isinstance(earn_date, list):
-                                earn_date = earn_date[0]
-                            ds = str(earn_date)[:10]
-                            parsed = _parse_ann_field(ds)
-                            if parsed:
-                                best = parsed
-                    elif hasattr(cal, "empty") and not cal.empty:
-                        # DataFrame 형태: index에 날짜가 있을 수 있음
-                        if "Earnings Date" in cal.index:
-                            earn_date = cal.loc["Earnings Date"].iloc[0]
-                            ds = str(earn_date)[:10]
-                            parsed = _parse_ann_field(ds)
-                            if parsed:
-                                best = parsed
                 except Exception:
                     pass
 
@@ -2021,16 +1991,19 @@ def fetch_fmp_market_risk_premium() -> tuple[float, str]:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fmp_economic_calendar_risk() -> tuple[list, bool]:
-    """FMP Economic Calendar — 당일~3일 이내 고임팩트 US 이벤트 감지.
+    """FMP Economic Calendar — 지난 2일~향후 3일 US 이벤트 감지.
+    조회 창은 발표 직후(actual 확인)와 사전 경고를 함께 보기 위해 today-2 ~ today+3로 둔다.
+    각 이벤트에 is_past(과거 발표 여부)를 태깅한다.
     반환: (events_list, has_high_impact)
-    events_list: [{"date","event","impact","actual","estimate","prior"}]
+      - events_list: [{"date","event","impact","actual","estimate","prior","is_past"}]
+      - has_high_impact: **향후(오늘 포함) 고임팩트 이벤트만** 카운트(지난 발표는 더 이상 리스크 아님)
     """
     k = _fmp_key()
     if not k:
         return [], False
     try:
-        today = datetime.now(timezone.utc).date()
-        from_date = today.strftime("%Y-%m-%d")
+        today = datetime.now(_MARKET_ET_TZ).date()  # 시장 기준일 = 미 동부시간
+        from_date = (today - timedelta(days=2)).strftime("%Y-%m-%d")
         to_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
         r = requests.get(
             f"{_FMP_BASE}/economic-calendar?from={from_date}&to={to_date}&apikey={k}",
@@ -2050,15 +2023,30 @@ def fetch_fmp_economic_calendar_risk() -> tuple[list, bool]:
             event_name = str(ev.get("event", "") or ev.get("name", ""))
             if not event_name:
                 continue
+            date_str = str(ev.get("date", ""))[:10]
+            # 날짜 < 오늘이면 이미 발표된 과거 이벤트
+            is_past = False
+            try:
+                if date_str and datetime.strptime(date_str, "%Y-%m-%d").date() < today:
+                    is_past = True
+            except Exception:
+                is_past = False
             events.append({
-                "date":     str(ev.get("date", ""))[:10],
+                "date":     date_str,
                 "event":    event_name,
                 "impact":   impact,
                 "actual":   ev.get("actual"),
                 "estimate": ev.get("estimate"),
                 "prior":    ev.get("previous") or ev.get("prior"),
+                "is_past":  is_past,
             })
-        has_high = any(e["impact"].lower() in ("high", "3") for e in events)
+        # 정렬: 날짜 오름차순(과거 → 오늘 → 미래)
+        events.sort(key=lambda e: e.get("date", ""))
+        # 리스크 플래그는 '아직 발표되지 않은(오늘 포함)' 고임팩트만 카운트
+        has_high = any(
+            (not e["is_past"]) and e["impact"].lower() in ("high", "3")
+            for e in events
+        )
         return events, has_high
     except Exception:
         return [], False
@@ -2451,7 +2439,7 @@ def calculate_period_return(close_series, lookback_days):
 
 def hidden_alpha_horizon_returns(close_series):
     """
-    Trading-day horizons for Hidden Alpha: 5 / 10 / 21 / 63 vs yfinance-style daily closes.
+    Trading-day horizons for Hidden Alpha: 5 / 10 / 21 / 63 over daily closes.
     """
     return {
         "1주(%)": calculate_period_return(close_series, 5),
@@ -2463,7 +2451,7 @@ def hidden_alpha_horizon_returns(close_series):
 
 def get_close_prices_from_download(download_df):
     """
-    Normalize yfinance download output to a close-price DataFrame with ticker columns.
+    Normalize price-download output to a close-price DataFrame with ticker columns.
     """
     if download_df is None or download_df.empty:
         return pd.DataFrame()
@@ -2877,7 +2865,7 @@ def cached_etf_universe_momentum_rankings(universe_tickers_tuple: tuple[str, ...
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
-def cached_yfinance_quote_type(ticker_upper: str):
+def cached_quote_type(ticker_upper: str):
     """종목 타입 (EQUITY/ETF 등) — FMP profile 사용."""
     try:
         p = _fmp_profile(ticker_upper)
@@ -3434,8 +3422,10 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     try:
         cal_events, has_high_impact = _prefetch.get("calendar", ([], False))
         if cal_events:
-            high_events = [e for e in cal_events if e["impact"].lower() in ("high", "3")]
-            med_events  = [e for e in cal_events if e["impact"].lower() in ("medium", "2")]
+            # 리스크 신호는 '아직 발표 전(오늘 포함)' 이벤트만 사용 (지난 발표는 리스크 아님)
+            upcoming = [e for e in cal_events if not e.get("is_past")]
+            high_events = [e for e in upcoming if e["impact"].lower() in ("high", "3")]
+            med_events  = [e for e in upcoming if e["impact"].lower() in ("medium", "2")]
             event_alert = has_high_impact
             if high_events:
                 ev_names = ", ".join(e["event"] for e in high_events[:3])
@@ -4357,7 +4347,7 @@ def _fmp_company_screener(
 
 
 def _fmp_fill(info: dict, ticker: str) -> dict:
-    """yfinance info dict의 빈 필드를 FMP로 채워 반환.
+    """info dict의 빈 필드를 FMP로 채워 반환.
     ※ FMP Starter 플랜 실제 제공 필드만 사용.
     기존 값은 절대 덮어쓰지 않음.
     """
@@ -4639,7 +4629,7 @@ def fetch_company_overview(ticker_upper: str) -> dict:
         # 다음 실적 발표일 — FMP 4단계 순차 시도 (내일 이후 날짜만)
         next_earnings = None
         k = _fmp_key()
-        tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1))
+        tomorrow = (datetime.now(_MARKET_ET_TZ).date() + timedelta(days=1))  # 시장 기준 = 미 동부시간
 
         def _first_future_date(items):
             """리스트에서 내일 이후 가장 이른 날짜 반환."""
@@ -4899,7 +4889,7 @@ def evaluate_kpis(ticker_symbol):
         latest_inc, prev_inc = {}, {}
 
     # ── 지표 추출 ──────────────────────────────────────────────────────
-    # ROE — FMP fill로 제공 (income_stmt/balance_sheet yfinance 분기 제거됨)
+    # ROE — FMP fill로 제공 (income_stmt/balance_sheet 분기 제거됨)
     roe = to_float(info.get("returnOnEquity"))
 
     # Operating Margin — FMP fill로 제공
@@ -5708,7 +5698,7 @@ def _extract_holdings_table(top_holdings_df):
     weights_raw = df[weight_col] if weight_col is not None else pd.Series(np.nan, index=df.index)
     weights = pd.to_numeric(weights_raw.astype(str).str.replace("%", "", regex=False), errors="coerce")
 
-    # yfinance source may be ratio(0~1) or already percent(0~100)
+    # source may be ratio(0~1) or already percent(0~100)
     if weights.notna().any() and weights.dropna().max() <= 1.5:
         weights = weights * 100.0
 
@@ -5880,7 +5870,7 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
                 continue
             others.append(cells)
         rows = [header] + others
-        now_s = _narrative_now_kst_string()
+        now_s = _narrative_now_et_string()
         for _, row in df.iterrows():
             acct = str(row.get("Account", "") or "").strip()
             tk = str(row.get("Ticker", "")).strip().upper()
@@ -6563,7 +6553,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
                 ticker_to_rank[tk] = int(rk)
 
     unique_holdings = sorted(dict.fromkeys(clean_tickers))
-    quote_by_ticker = {t: cached_yfinance_quote_type(t) for t in unique_holdings}
+    quote_by_ticker = {t: cached_quote_type(t) for t in unique_holdings}
 
     symbol_stats = {}
     for ticker in clean_tickers:
@@ -6788,7 +6778,7 @@ def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) ->
             ipo_date_str = str(etf.get("ipoDate", "") or "")
             if ipo_date_str:
                 try:
-                    ipo_dt = datetime.strptime(ipo_date_str[:10], "%Y-%m-%d").replace(tzinfo=_KST_TZ)
+                    ipo_dt = datetime.strptime(ipo_date_str[:10], "%Y-%m-%d").replace(tzinfo=_MARKET_ET_TZ)
                     if ipo_dt < cutoff_date:
                         continue
                 except Exception:
@@ -6854,7 +6844,7 @@ def cleanup_low_quality_etfs_from_sheet(min_avg_volume_m: float = 1.0, min_aum_m
 
             # 상장 6개월 미만이면 스킵 (아직 AUM 성장 중)
             try:
-                added_dt = datetime.strptime(added_date_str[:10], "%Y-%m-%d").replace(tzinfo=_KST_TZ)
+                added_dt = datetime.strptime(added_date_str[:10], "%Y-%m-%d").replace(tzinfo=_MARKET_ET_TZ)
                 if added_dt > cutoff_date:
                     continue
             except Exception:
@@ -7536,7 +7526,7 @@ def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
                 alert_rsi_str,
                 alert_ma200_str,
                 saved_price_str,
-                str(item.get("date_added", _narrative_now_kst_string())).strip(),
+                str(item.get("date_added", _narrative_now_et_string())).strip(),
             ])
         all_rows = [_WATCHLIST_SHEET_COLS] + other_rows + new_rows
         ws.clear()
@@ -7579,7 +7569,7 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
                      alert_price: float = None,
                      saved_price: float = None) -> tuple[bool, str]:
     """Watchlist에 단일 종목 추가. append_row 방식.
-    saved_price를 직접 넘기면 yfinance 조회 생략 (빠름).
+    saved_price를 직접 넘기면 가격 재조회 생략 (빠름).
     없으면 @st.cache_data 캐시 활용 조회.
     """
     uid = str(user_id).strip()
@@ -7618,7 +7608,7 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
             str(round(float(alert_rsi), 1)) if alert_rsi is not None else "",
             "true" if alert_ma200 else "false",
             str(round(float(cur_price), 4)) if pd.notna(cur_price) else "",
-            _narrative_now_kst_string(),
+            _narrative_now_et_string(),
         ], value_input_option="USER_ENTERED")
         # 캐시 초기화
         load_watchlist_sheet.clear()
@@ -8287,7 +8277,7 @@ def parse_tickers_from_text(text):
 
 # =============================================================================
 # 내러티브 팩트 체크 (Price Action Check)
-# 1.5 주간 트렌드 / 변곡점 분석 결과에 실제 yfinance 수익률을 덧붙여 검증.
+# 1.5 주간 트렌드 / 변곡점 분석 결과에 실제 FMP 수익률을 덧붙여 검증.
 # =============================================================================
 
 # 1.5 주간 트렌드 프롬프트가 강제하는 두 섹션 헤더 매처
@@ -8860,7 +8850,7 @@ def render_opportunity_scanner_snapshot(snap):
             _now_utc = datetime.now(timezone.utc)
             _elapsed_min = int((_now_utc - _ca_dt).total_seconds() / 60)
             _elapsed_str = f"{_elapsed_min}분 전" if _elapsed_min < 60 else f"{_elapsed_min // 60}시간 {_elapsed_min % 60}분 전"
-            _ca_kst = _ca_dt.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M KST")
+            _ca_kst = _ca_dt.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M ET")
             st.caption(f"⏱️ 완료 시각: `{_ca_kst}` ({_elapsed_str})")
             if _elapsed_min > 360:  # 6시간 이상 경과
                 st.warning("⚠️ 스캔 결과가 6시간 이상 지났습니다. 최신 시장 상황 반영을 위해 재스캔을 권장합니다.")
@@ -8896,7 +8886,7 @@ def render_opportunity_scanner_snapshot(snap):
         # Watchlist 추가 버튼 (on_click 방식)
         def _add_sc_top3_wl(tk=tk_scan, r=rank, _row=row):
             _uid_s = str(st.session_state.get("user_id") or "").strip()
-            # 스캐너 결과에서 현재가 추출 (있으면 yfinance 재조회 불필요)
+            # 스캐너 결과에서 현재가 추출 (있으면 가격 재조회 불필요)
             _sp = pd.to_numeric(_row.get("Price", _row.get("Close", np.nan)), errors="coerce")
             _ok_s, _err_s = add_to_watchlist(
                 _uid_s, tk,
@@ -9072,7 +9062,7 @@ def render_opportunity_emerging_snapshot(snap):
             _now_utc_em = datetime.now(timezone.utc)
             _elapsed_min_em = int((_now_utc_em - _ca_dt_em).total_seconds() / 60)
             _elapsed_str_em = f"{_elapsed_min_em}분 전" if _elapsed_min_em < 60 else f"{_elapsed_min_em // 60}시간 {_elapsed_min_em % 60}분 전"
-            _ca_kst_em = _ca_dt_em.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M KST")
+            _ca_kst_em = _ca_dt_em.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M ET")
             st.caption(f"⏱️ 완료 시각: `{_ca_kst_em}` ({_elapsed_str_em})")
             if _elapsed_min_em > 360:
                 st.warning("⚠️ 스캔 결과가 6시간 이상 지났습니다. 최신 시장 상황 반영을 위해 재스캔을 권장합니다.")
@@ -9222,7 +9212,7 @@ def render_opportunity_emerging_snapshot(snap):
 | Narrative Expansion | **35%** | 대장주 제외, 2차 수혜·인프라·공급망 관점 Gemini 점수 |
 | Early Relative Strength | **20%** | 1개월 수익률 기반 원시점수(0~100)를 가중합에 직접 반영 |
 | Volume Acceleration | **20%** | 최근 5일 / 30일 평균 거래량 비율(≥1.5 고득점) |
-| Fundamental Readiness | **15%** | EPS·매출 성장 등 `yfinance` info 기반 |
+| Fundamental Readiness | **15%** | EPS·매출 성장 등 `FMP` 펀더멘털 기반 |
 | Overextension Penalty | **10%** | RSI(14)>70·50일선 대비 과도 이격 시 감점 반영(높을수록 덜 과열) |
 
 결측 팩터는 가중치 분모에서 제외하고 `(가중합 ÷ 유효 가중치 합)`으로 **100점 만점** 환산합니다.
@@ -9665,7 +9655,7 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
         progress.empty()
         return score_df
 
-    # yfinance 가격 시계열이 없거나 핵심 모멘텀/RS가 NaN인 종목은 랭킹에서 제외 (내러티브만으로 상위 노출 방지)
+    # 가격 시계열이 없거나 핵심 모멘텀/RS가 NaN인 종목은 랭킹에서 제외 (내러티브만으로 상위 노출 방지)
     score_df = score_df.dropna(subset=["Momentum 1M Raw", "RS Raw"])
     if score_df.empty:
         progress.empty()
@@ -11324,7 +11314,7 @@ if st.session_state.get("logged_in"):
         event_cal = drg.get("event_calendar", [])
         if event_cal:
             st.divider()
-            st.markdown("### 📅 3일 이내 경제 이벤트 캘린더 (FMP)")
+            st.markdown("### 📅 경제 이벤트 캘린더 · 지난 2일~향후 3일 (FMP)")
 
             # 이벤트별 행동 지침 자동 생성
             _ACTION_GUIDE = {
@@ -11352,10 +11342,45 @@ if st.session_state.get("logged_in"):
             def _fmt_ev_val(v):
                 return str(v) if v is not None and str(v).strip() not in ("", "None") else "—"
 
-            # 고임팩트 이벤트 행동 지침 먼저 표시
+            def _ev_num(v):
+                try:
+                    return float(str(v).replace(",", "").replace("%", "").strip())
+                except Exception:
+                    return None
+
+            def _surprise_text(actual, estimate):
+                """발표된 이벤트의 '실제 vs 예상' 서프라이즈 한 줄."""
+                a, e = _ev_num(actual), _ev_num(estimate)
+                if a is None:
+                    return ""
+                if e is None:
+                    return f"실제 **{actual}** (예상치 없음)"
+                if a > e:
+                    return f"실제 **{actual}** / 예상 {estimate} → 📈 예상 상회"
+                if a < e:
+                    return f"실제 **{actual}** / 예상 {estimate} → 📉 예상 하회"
+                return f"실제 **{actual}** / 예상 {estimate} → ➖ 예상 부합"
+
+            # 고임팩트 이벤트: 과거(발표완료 결과) / 향후(사전 행동 지침) 분리
             high_ev = [e for e in event_cal if e.get("impact","").lower() in ("high","3")]
-            if high_ev:
-                for ev in high_ev[:3]:
+            past_high = [e for e in high_ev if e.get("is_past")]
+            upcoming_high = [e for e in high_ev if not e.get("is_past")]
+
+            # ① 발표 완료된 고임팩트 — 결과(실제 vs 예상) 표시
+            if past_high:
+                for ev in past_high[-3:]:
+                    ev_icon, _ = _get_action(ev.get("event",""))
+                    surprise = _surprise_text(ev.get("actual"), ev.get("estimate"))
+                    body = (
+                        f"**{ev_icon or '📅'} {ev.get('date','')} · {ev.get('event','')}** (발표 완료)  \n"
+                        f"{surprise}" if surprise
+                        else f"**{ev_icon or '📅'} {ev.get('date','')} · {ev.get('event','')}** (발표 완료)"
+                    )
+                    st.info(body)
+
+            # ② 향후 고임팩트 — 사전 행동 지침 표시
+            if upcoming_high:
+                for ev in upcoming_high[:3]:
                     ev_icon, ev_action = _get_action(ev.get("event",""))
                     if ev_action:
                         est = ev.get("estimate")
@@ -11372,11 +11397,12 @@ if st.session_state.get("logged_in"):
 
             # 전체 캘린더 테이블
             with st.expander("📋 전체 이벤트 목록 보기", expanded=False):
-                ev_cols_header = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
-                for hdr, txt in zip(ev_cols_header, ["날짜", "이벤트", "임팩트", "실제", "예상", "이전"]):
+                ev_cols_header = st.columns([1.2, 3.3, 1.2, 1.0, 1.2, 1.2, 1.2])
+                for hdr, txt in zip(ev_cols_header, ["날짜", "이벤트", "임팩트", "상태", "실제", "예상", "이전"]):
                     hdr.markdown(f"**{txt}**")
-                for ev in event_cal[:15]:
+                for ev in event_cal[:20]:
                     impact = ev.get("impact", "")
+                    is_past = bool(ev.get("is_past"))
                     impact_color = (
                         "#dc2626" if impact.lower() in ("high", "3")
                         else "#f59e0b" if impact.lower() in ("medium", "2")
@@ -11387,14 +11413,25 @@ if st.session_state.get("logged_in"):
                         else "🟡 Medium" if impact.lower() in ("medium", "2")
                         else "⚪ Low"
                     )
-                    ev_cols = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
-                    ev_cols[0].markdown(f"`{ev.get('date','')}`")
-                    ev_cols[1].markdown(ev.get("event", ""))
+                    status_txt = "✅ 발표완료" if is_past else "⏳ 예정"
+                    # 과거 행은 흐리게
+                    date_md = (
+                        f"<span style='color:#64748b'>`{ev.get('date','')}`</span>" if is_past
+                        else f"`{ev.get('date','')}`"
+                    )
+                    name_md = (
+                        f"<span style='color:#94a3b8'>{ev.get('event','')}</span>" if is_past
+                        else ev.get("event", "")
+                    )
+                    ev_cols = st.columns([1.2, 3.3, 1.2, 1.0, 1.2, 1.2, 1.2])
+                    ev_cols[0].markdown(date_md, unsafe_allow_html=True)
+                    ev_cols[1].markdown(name_md, unsafe_allow_html=True)
                     ev_cols[2].markdown(f"<span style='color:{impact_color};font-weight:700'>{impact_emoji}</span>", unsafe_allow_html=True)
-                    ev_cols[3].markdown(_fmt_ev_val(ev.get("actual")))
-                    ev_cols[4].markdown(_fmt_ev_val(ev.get("estimate")))
-                    ev_cols[5].markdown(_fmt_ev_val(ev.get("prior")))
-            st.caption("📌 FMP Economic Calendar 기준.")
+                    ev_cols[3].markdown(status_txt)
+                    ev_cols[4].markdown(_fmt_ev_val(ev.get("actual")))
+                    ev_cols[5].markdown(_fmt_ev_val(ev.get("estimate")))
+                    ev_cols[6].markdown(_fmt_ev_val(ev.get("prior")))
+            st.caption("📌 FMP Economic Calendar 기준. 발표 완료 이벤트는 2일간 결과(실제값) 확인용으로 표시됩니다.")
 
         with st.expander("🔍 신호 상세 데이터", expanded=False):
             for key, data in drg.get("details", {}).items():
@@ -11415,7 +11452,7 @@ if st.session_state.get("logged_in"):
                 if n.get("time"):
                     try:
                         import datetime as _dt
-                        dt = _dt.datetime.fromtimestamp(n["time"], tz=_dt.timezone.utc).astimezone(_KST_TZ)
+                        dt = _dt.datetime.fromtimestamp(n["time"], tz=_dt.timezone.utc).astimezone(_MARKET_ET_TZ)
                         time_str = dt.strftime("%m/%d %H:%M")
                     except Exception:
                         pass
@@ -11470,11 +11507,23 @@ if st.session_state.get("logged_in"):
             # 4) 이벤트 캘린더 요약
             fresh_events = fresh_drg.get("event_calendar", [])
             if fresh_events:
-                event_summary = "\n".join([
-                    f"- {e['date']} [{e['impact']}] {e['event']}"
-                    + (f" (예상: {e['estimate']})" if e.get("estimate") is not None else "")
-                    for e in fresh_events[:6]
-                ])
+                # 예측은 '향후' 이벤트만 사용. 발표 완료분은 결과(실제값)로 별도 표기.
+                up_ev = [e for e in fresh_events if not e.get("is_past")]
+                done_ev = [e for e in fresh_events if e.get("is_past") and e.get("actual") is not None]
+                lines = []
+                for e in up_ev[:6]:
+                    lines.append(
+                        f"- (예정) {e['date']} [{e['impact']}] {e['event']}"
+                        + (f" (예상: {e['estimate']})" if e.get("estimate") is not None else "")
+                    )
+                for e in done_ev[-3:]:
+                    lines.append(
+                        f"- (발표완료) {e['date']} [{e['impact']}] {e['event']}"
+                        f" (실제: {e['actual']}"
+                        + (f" / 예상: {e['estimate']}" if e.get("estimate") is not None else "")
+                        + ")"
+                    )
+                event_summary = "\n".join(lines) if lines else "이벤트 없음 또는 조회 불가"
             else:
                 event_summary = "이벤트 없음 또는 조회 불가"
 
@@ -11484,7 +11533,7 @@ if st.session_state.get("logged_in"):
                 for key, label, _ in signal_defs
             ])
             warning_text = "\n".join(fresh_warnings) if fresh_warnings else "없음"
-            now_kst = datetime.now(_KST_TZ)
+            now_kst = datetime.now(_MARKET_ET_TZ)
             now_et_for_session = datetime.now(_MARKET_ET_TZ)
             # 장 세션 판단은 ET 기준 (9:30~16:00 ET)
             et_hour = now_et_for_session.hour
@@ -11503,7 +11552,7 @@ if st.session_state.get("logged_in"):
             drg_prompt = (
                 "당신은 월가 수석 퀀트 전략가입니다. "
                 "아래 실시간 데이터를 바탕으로 내일 미국 주식시장을 예측하세요.\n\n"
-                f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
+                f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} ET ({market_session})\n"
                 f"[분석 섹터] {sector_choice}\n\n"
                 f"[선행 신호 6가지]\n{signal_summary}\n\n"
                 f"[선물·안전자산 핵심 데이터]\n"
@@ -11563,7 +11612,7 @@ if st.session_state.get("logged_in"):
                 )
 
                 st.session_state["_drg_ai_result"] = _drg_text
-                st.session_state["_drg_ai_time"] = datetime.now(_KST_TZ).strftime("%m/%d %H:%M")
+                st.session_state["_drg_ai_time"] = datetime.now(_MARKET_ET_TZ).strftime("%m/%d %H:%M")
                 st.session_state["_drg_ai_news_count"] = rss_news_count
                 st.session_state["_drg_pred_dir"] = _pred_dir
                 st.session_state["_drg_bench_etf"] = _bench_etf
@@ -11571,8 +11620,8 @@ if st.session_state.get("logged_in"):
 
         if st.session_state.get("_drg_ai_result"):
             _news_cnt = st.session_state.get("_drg_ai_news_count", 0)
-            _src_str = f"RSS {_news_cnt}개 뉴스 반영" if _news_cnt > 0 else "yfinance 뉴스 반영"
-            st.info(f"🕐 분석 시각: {st.session_state.get('_drg_ai_time', '')} KST · {_src_str}")
+            _src_str = f"RSS {_news_cnt}개 뉴스 반영" if _news_cnt > 0 else "FMP 뉴스 반영"
+            st.info(f"🕐 분석 시각: {st.session_state.get('_drg_ai_time', '')} ET · {_src_str}")
             _txt = st.session_state["_drg_ai_result"]
             if "하락 우세" in _txt:
                 st.error(_txt)
@@ -12454,7 +12503,7 @@ if st.session_state.get("logged_in"):
                                     "alert_rsi": 30.0,
                                     "alert_ma200": True,
                                     "saved_price": float(_cur_p) if pd.notna(_cur_p) else np.nan,
-                                    "date_added": _narrative_now_kst_string(),
+                                    "date_added": _narrative_now_et_string(),
                                 }
                                 _em_wl = load_watchlist_sheet(_uid_em)
                                 _em_wl = [x for x in _em_wl if x["ticker"] != tk]
@@ -12494,7 +12543,7 @@ if st.session_state.get("logged_in"):
                                     "ticker": tk, "memo": f"Emerging 얼리버드 - {vd['detail']}",
                                     "alert_price": np.nan, "alert_rsi": 35.0, "alert_ma200": True,
                                     "saved_price": float(_cur_p2) if pd.notna(_cur_p2) else np.nan,
-                                    "date_added": _narrative_now_kst_string(),
+                                    "date_added": _narrative_now_et_string(),
                                 }
                                 _el_wl = load_watchlist_sheet(_uid_el)
                                 _el_wl = [x for x in _el_wl if x["ticker"] != tk]
@@ -13282,7 +13331,7 @@ if st.session_state.get("logged_in"):
 
             with eu_col2:
                 last_run = st.session_state.get("_etf_auto_update_last_run")
-                last_run_str = last_run.astimezone(_KST_TZ).strftime("%m/%d %H:%M") if last_run else "이번 세션 미실행"
+                last_run_str = last_run.astimezone(_MARKET_ET_TZ).strftime("%m/%d %H:%M") if last_run else "이번 세션 미실행"
                 st.metric("마지막 자동 업데이트", last_run_str)
 
             manual_col1, manual_col2 = st.columns(2)
@@ -13900,7 +13949,7 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.markdown("### 체력 검사 (Fundamentals)")
-        st.caption("yfinance 기반 KPI 점검 (Pass/Fail)")
+        st.caption("FMP 기반 KPI 점검 (Pass/Fail)")
     
         try:
             if is_etf_mode:
@@ -14965,7 +15014,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     [
                         cached_portfolio_yf_close_1y.clear,
                         cached_etf_universe_rankings_full.clear,
-                        cached_yfinance_quote_type.clear,
+                        cached_quote_type.clear,
                         _portfolio_sheet_all_values_cached.clear,
                         _trade_history_all_values_cached.clear,
                     ],
@@ -15114,7 +15163,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                         updated_df.loc[idx, "Purchase_Price"] = new_avg
                                         save_portfolio(updated_df)
                                         # Trade_History에 BUY 기록
-                                        _buy_date = _narrative_now_kst_string()[:10]
+                                        _buy_date = _narrative_now_et_string()[:10]
                                         append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "추가 매수")
                                         st.success(
                                             f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
@@ -15140,7 +15189,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     )
                                     save_portfolio(updated_df)
                                     # Trade_History에 BUY 기록
-                                    _buy_date = _narrative_now_kst_string()[:10]
+                                    _buy_date = _narrative_now_et_string()[:10]
                                     append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "신규 매수")
                                     # Thesis 선택 시 Thesis 시트에도 저장
                                     if selected_thesis_label != "(Thesis 없음 - 일반 매수)":
@@ -16278,7 +16327,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             saved_at_utc = _narrative_parse_saved_at_utc(rec.get("saved_at"))
                             if saved_at_utc is None:
                                 continue
-                            saved_at_kst = saved_at_utc.astimezone(_KST_TZ)
+                            saved_at_kst = saved_at_utc.astimezone(_MARKET_ET_TZ)
                             date_label = saved_at_kst.strftime("%m/%d %H:%M")
                             session_label = rec.get("session_label") or ""
 
@@ -16318,7 +16367,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             )
 
                             # ── 가격 데이터 다운로드 ───────────────────────────
-                            with st.spinner(f"yfinance에서 {len(unique_tickers)}개 티커 가격 데이터를 받는 중..."):
+                            with st.spinner(f"FMP에서 {len(unique_tickers)}개 티커 가격 데이터를 받는 중..."):
                                 dl_period = "3mo" if horizon_td <= 21 else "6mo"
                                 closes = _factcheck_download_closes(unique_tickers, period=dl_period)
 
@@ -16333,7 +16382,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 else:
                                     series = closes[tk].dropna()
                                     # 내러티브 생성 날짜 이후 데이터만 슬라이싱
-                                    # yfinance auto_adjust=True 시 index에 tz(America/New_York)가 붙으므로
+                                    # FMP 종가 인덱스가 tz-aware일 수 있으므로(방어적 처리)
                                     # tz_convert(None)로 naive로 변환 후 비교
                                     try:
                                         naive_cutoff = pd.Timestamp(saved_at_utc.replace(tzinfo=None))
@@ -16421,7 +16470,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 st.metric(
                                     "데이터 없음",
                                     f"{na_count}건",
-                                    delta="yfinance 미수신 티커",
+                                    delta="데이터 미수신 티커",
                                 )
 
                             # 적중률 수준별 평가 메시지
@@ -16752,9 +16801,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 )
                 for prev in prev_summaries_sorted[:5]:
                     dt = _narrative_parse_saved_at_utc(prev.get("saved_at"))
-                    dt_str = dt.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M") if dt else "날짜 불명"
+                    dt_str = dt.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M") if dt else "날짜 불명"
                     summary_text = prev["analysis"].get("summary", "")
-                    with st.expander(f"📋 {dt_str} (KST)", expanded=False):
+                    with st.expander(f"📋 {dt_str} (ET)", expanded=False):
                         st.markdown(summary_text)
 
         st.divider()
@@ -17382,7 +17431,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 | 실업률 | FRED / FMP | 4.5% 이상 = 경기 둔화 |
 | GDP 성장률 | FMP | 2% 이하 = 경기 둔화 |
 | 소매판매 | FMP | 전월 대비 감소 = 소비 위축 |
-| VIX 공포지수 | FRED / yfinance | 25 이상 = 위험 선호 저하 |
+| VIX 공포지수 | FRED / FMP | 25 이상 = 위험 선호 저하 |
 | 달러 인덱스 | FRED / FMP(UUP) | 52주 평균 대비 +5.5% 이상 = 달러 과강세 |
 
 **📊 Macro Score:** 8개 지표 합산 점수 (Pass/Warning/Fail)  
@@ -17633,7 +17682,7 @@ AI가 추천한 Winners·Emerging 종목 중:
                 ),
                 (
                     "Q. Daily Risk Gauge의 선물 가격이 안 나와요",
-                    """**원인:** yfinance Rate Limit 또는 장외 시간(데이터 없음)
+                    """**원인:** 데이터 소스 Rate Limit 또는 장외 시간(데이터 없음)
 
 **해결:**
 1. 🔄 데이터 새로고침 버튼 클릭
@@ -17650,7 +17699,7 @@ AI가 추천한 Winners·Emerging 종목 중:
 - NAVER: `035420.KS`
 
 단, FMP 기반 데이터(기관 투자자·인사이더·어닝콜)는 한국 주식을 지원하지 않습니다.  
-yfinance 기반 기술적 분석·차트는 정상 작동합니다.""",
+FMP 기반 기술적 분석·차트는 정상 작동합니다.""",
                 ),
                 (
                     "Q. ETF 분석도 되나요?",
@@ -17682,7 +17731,7 @@ Streamlit Community Cloud 환경의 특성상 동시 접속자가 많으면 응�
                 "기능 요청이나 버그는 포트폴리오 탭 하단 메모 기능 또는 "
                 "관리자에게 직접 문의해 주세요.\n\n"
                 "**앱 버전:** v2.0 (2025) | "
-                "**Tech Stack:** Streamlit · Google Sheets · yfinance · FMP · Claude AI"
+                "**Tech Stack:** Streamlit · Google Sheets · FMP · Claude AI"
             )
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
