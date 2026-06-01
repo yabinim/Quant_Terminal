@@ -2736,7 +2736,7 @@ def fetch_short_interest(ticker_upper: str) -> dict:
     days_to_cover = None
     try:
         r2 = requests.get(
-            f"{_FMP_BASE}/quote/{ticker_upper}?apikey={k}",
+            f"{_FMP_BASE}/quote?symbol={ticker_upper}&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         if r2.status_code == 200:
@@ -6894,7 +6894,12 @@ def hydrate_narrative_from_disk_once():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
-    """현재가 조회 — FMP stock-quote 사용."""
+    """현재가 조회 — FMP stable API의 batch-quote 사용.
+
+    stable API는 여러 종목을 /batch-quote?symbols=A,B,C 형식으로 받는다.
+    (구형 v3의 /quote/A,B,C 경로 형식은 /stable 에서 동작하지 않아 빈 값이 온다.)
+    배치 호출이 비면 단일 /quote?symbol= 으로 종목별 폴백 조회한다.
+    """
     clean_tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
     clean_tickers = list(dict.fromkeys(clean_tickers))
     if not clean_tickers:
@@ -6902,28 +6907,51 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
     k = _fmp_key()
     if not k:
         return {}
+
+    price_map = {}
+
+    def _extract(item) -> None:
+        sym = str(item.get("symbol") or "").strip().upper()
+        price = to_float(item.get("price") or item.get("previousClose"))
+        if sym and pd.notna(price):
+            price_map[sym] = price
+
+    # 1) 배치 조회 (stable: batch-quote?symbols=A,B,C)
     try:
         symbols = ",".join(clean_tickers)
         r = requests.get(
-            f"{_FMP_BASE}/quote/{symbols}?apikey={k}",
-            timeout=_FMP_TIMEOUT
+            f"{_FMP_BASE}/batch-quote?symbols={symbols}&apikey={k}",
+            timeout=_FMP_TIMEOUT,
         )
-        data = r.json() if r.status_code == 200 else []
-        if not isinstance(data, list):
-            return {}
-        price_map = {}
-        for item in data:
-            sym = str(item.get("symbol") or "").strip().upper()
-            price = to_float(item.get("price") or item.get("previousClose"))
-            if sym:
-                price_map[sym] = price
-        # 없는 티커는 nan
-        for tk in clean_tickers:
-            if tk not in price_map:
-                price_map[tk] = np.nan
-        return price_map
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        _extract(item)
     except Exception:
-        return {}
+        pass
+
+    # 2) 누락 종목은 단일 quote 로 폴백 (stable: quote?symbol=AAPL)
+    missing = [tk for tk in clean_tickers if tk not in price_map]
+    for tk in missing:
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/quote?symbol={tk}&apikey={k}",
+                timeout=_FMP_TIMEOUT,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    _extract(data[0])
+        except Exception:
+            pass
+
+    # 끝까지 없는 티커는 nan
+    for tk in clean_tickers:
+        if tk not in price_map:
+            price_map[tk] = np.nan
+    return price_map
 
 
 # 1.5 / 1.6 공통: 마크다운·설명문에서 잘못 딴 가짜 티커(EXPANDING 등) 원천 차단
