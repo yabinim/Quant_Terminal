@@ -75,7 +75,8 @@ _PORTFOLIO_HISTORY_COLS = ["ID", "Date", "Total_Value", "Total_Cost", "Return_Pc
 _EMERGING_TRACKER_COLS = ["ID", "Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]
 _ETF_UNIVERSE_SHEET_COLS = ["Ticker", "Name", "Category", "AUM_M", "Added_Date", "Source"]
 _ETF_AUTO_UPDATE_INTERVAL_DAYS = 7  # 자동 업데이트 주기
-_WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added"]
+_WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added", "Stop_Loss", "Target_Price"]
+_WL_NCOL = len(_WATCHLIST_SHEET_COLS)  # =10. 과거 8열 시트는 읽을 때 빈 칸으로 패딩되어 호환됨.
 _THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
 
@@ -6405,6 +6406,137 @@ def compute_realized_pnl(trade_df: pd.DataFrame) -> pd.DataFrame:
 # 매도 타이밍 기술적 신호 계산
 # ──────────────────────────────────────────────────────────────────────────────
 
+# 트레일링 스톱 기본값: 보유 기간 고점 대비 이 % 이상 하락 시 경보
+_DEFAULT_TRAILING_STOP_PCT = 15.0
+
+
+def integrated_sell_verdict(
+    *,
+    above_ma200,
+    one_month_return,
+    rsi,
+    macd_signal,
+    pct_from_52w_high,
+    drawdown_from_high_pct,
+    trailing_stop_pct: float = _DEFAULT_TRAILING_STOP_PCT,
+) -> tuple[str, str]:
+    """200일선 + 선행신호(RSI·MACD·52주 이격) + 트레일링 스톱을 종합한 매도 판정.
+
+    기존 매도 레이더는 '현재가 < 200일선'만 봐서 신호가 늦었다.
+    여기서는 추세 붕괴(후행)와 과열·꺾임(선행), 그리고 고점 대비 하락(트레일링)을
+    한 점수로 합쳐 🟢보유 / 🟡일부 익절 검토 / 🔴매도 3단계로 반환한다.
+    반환: (status_label, reason_text)
+    """
+    reasons = []
+    score = 0
+
+    # ── 후행: 추세 붕괴 (가장 무거움) ───────────────────────────────
+    if above_ma200 is False:
+        score += 4
+        reasons.append("200일선 이탈(추세 붕괴)")
+
+    # ── 트레일링 스톱: 보유 고점 대비 하락 ──────────────────────────
+    if pd.notna(drawdown_from_high_pct) and drawdown_from_high_pct <= -abs(trailing_stop_pct):
+        score += 3
+        reasons.append(f"고점 대비 {drawdown_from_high_pct:.0f}% 하락(트레일링 스톱 -{abs(trailing_stop_pct):.0f}%)")
+
+    # ── 선행: 모멘텀 꺾임 ──────────────────────────────────────────
+    if macd_signal == "DEAD_CROSS":
+        score += 2
+        reasons.append("MACD 데드크로스(추세 꺾임)")
+    elif macd_signal == "BELOW_SIGNAL":
+        score += 1
+
+    if pd.notna(one_month_return) and one_month_return < 0:
+        score += 1
+        reasons.append(f"1개월 {one_month_return:+.1f}%")
+
+    # ── 선행: 과열 (신고가 부근 + RSI 과매수) ──────────────────────
+    overheated = (
+        pd.notna(rsi) and rsi > 70
+        and pd.notna(pct_from_52w_high) and pct_from_52w_high > -3
+    )
+    if overheated:
+        score += 1
+        reasons.append(f"RSI {rsi:.0f} 과열 + 신고가 부근(단기 조정 위험)")
+
+    # ── 판정 ───────────────────────────────────────────────────────
+    if score >= 4:
+        label = "🔴 매도 (SELL)"
+    elif score >= 2:
+        label = "🟡 일부 익절 검토"
+    else:
+        label = "✅ 보유 (HOLD)"
+        if not reasons:
+            reasons.append("추세 유지 · 이상 신호 없음")
+
+    return label, " · ".join(reasons)
+
+
+def suggest_stop_and_target(ticker: str, entry_price: float = None) -> dict:
+    """진입가 기준 손절·목표가 '제안값'을 계산해 반환(확정은 사용자 몫).
+
+    두 가지 손절 기준을 함께 제시한다:
+      - ATR 기반: entry - 2×ATR(14)  (변동성 큰 종목일수록 손절을 멀리)
+      - 200일선 기반: 200일 이동평균 바로 아래 2%
+    목표가는 ATR 손절 거리의 2배(손익비 1:2)를 기본 제안.
+    계산 불가 항목은 np.nan.
+    """
+    out = {
+        "entry": np.nan, "atr": np.nan,
+        "stop_atr": np.nan, "stop_atr_pct": np.nan,
+        "stop_ma200": np.nan, "stop_ma200_pct": np.nan,
+        "target_2r": np.nan, "target_2r_pct": np.nan,
+    }
+    try:
+        hist = cached_timing_price_history(str(ticker).strip().upper())
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return out
+        close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        if close.empty:
+            return out
+        entry = float(entry_price) if (entry_price is not None and pd.notna(entry_price)) else float(close.iloc[-1])
+        out["entry"] = entry
+
+        # ATR(14): True Range의 14일 평균
+        atr = np.nan
+        if all(c in hist.columns for c in ("High", "Low", "Close")):
+            high = pd.to_numeric(hist["High"], errors="coerce")
+            low = pd.to_numeric(hist["Low"], errors="coerce")
+            prev_close = pd.to_numeric(hist["Close"], errors="coerce").shift(1)
+            tr = pd.concat([
+                (high - low),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ], axis=1).max(axis=1)
+            if tr.notna().sum() >= 10:
+                atr = float(tr.rolling(14, min_periods=10).mean().dropna().iloc[-1])
+        out["atr"] = atr
+
+        if pd.notna(atr) and atr > 0 and entry > 0:
+            stop_atr = entry - 2.0 * atr
+            out["stop_atr"] = stop_atr
+            out["stop_atr_pct"] = (stop_atr / entry - 1.0) * 100.0
+            risk = entry - stop_atr
+            target = entry + 2.0 * risk  # 손익비 1:2
+            out["target_2r"] = target
+            out["target_2r_pct"] = (target / entry - 1.0) * 100.0
+
+        # 200일선 기반 손절
+        if len(close) >= 150:
+            ma_ser = close.rolling(200, min_periods=150).mean().dropna()
+            if not ma_ser.empty:
+                ma200 = float(ma_ser.iloc[-1])
+                if pd.notna(ma200) and ma200 > 0:
+                    stop_ma = ma200 * 0.98
+                    out["stop_ma200"] = stop_ma
+                    if entry > 0:
+                        out["stop_ma200_pct"] = (stop_ma / entry - 1.0) * 100.0
+    except Exception:
+        return out
+    return out
+
+
 def _empty_sell_signal():
     return {
         "rsi": np.nan, "macd_signal": "N/A", "pct_from_52w_high": np.nan,
@@ -6506,6 +6638,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
         "자산 비중(%)",
         "유니버스 랭킹(Universe Rank)",
         "상태(Status)",
+        "판정 근거(Why)",
     ]
     if portfolio_df is None or portfolio_df.empty:
         return pd.DataFrame(columns=_sell_radar_cols)
@@ -6555,6 +6688,9 @@ def build_portfolio_sell_radar_df(portfolio_df):
     unique_holdings = sorted(dict.fromkeys(clean_tickers))
     quote_by_ticker = {t: cached_quote_type(t) for t in unique_holdings}
 
+    # 선행 신호(RSI·MACD·52주 이격)를 매도 판정에 통합하기 위해 미리 계산
+    sell_sig_map = compute_sell_signal_indicators(unique_holdings)
+
     symbol_stats = {}
     for ticker in clean_tickers:
         series = close_df[ticker] if ticker in close_df.columns else pd.Series(dtype=float)
@@ -6567,16 +6703,24 @@ def build_portfolio_sell_radar_df(portfolio_df):
         if pd.notna(current_price) and pd.notna(high_52w) and high_52w > 0:
             drawdown_pct = ((current_price - high_52w) / high_52w) * 100.0
 
+        sig = sell_sig_map.get(ticker, {}) if isinstance(sell_sig_map, dict) else {}
+        above_ma200_flag = (
+            bool(current_price > ma200) if (pd.notna(current_price) and pd.notna(ma200)) else None
+        )
+
         if pd.isna(current_price) or pd.isna(ma200) or pd.isna(one_month_return):
             status = "N/A"
-        elif current_price < ma200:
-            status = "🚨 매도 (SELL)"
-        elif current_price > ma200 and one_month_return < 0:
-            status = "⚠️ 주의 (WARNING)"
-        elif current_price > ma200 and one_month_return > 0:
-            status = "✅ 보유 (HOLD)"
+            status_reason = "데이터 부족"
         else:
-            status = "N/A"
+            # 200일선 + 선행신호 + 트레일링 스톱 통합 판정
+            status, status_reason = integrated_sell_verdict(
+                above_ma200=above_ma200_flag,
+                one_month_return=one_month_return,
+                rsi=sig.get("rsi", np.nan),
+                macd_signal=sig.get("macd_signal", "N/A"),
+                pct_from_52w_high=sig.get("pct_from_52w_high", np.nan),
+                drawdown_from_high_pct=drawdown_pct,
+            )
 
         symbol_stats[ticker] = {
             "current_price": current_price,
@@ -6584,6 +6728,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
             "one_month_return": one_month_return,
             "drawdown_pct": drawdown_pct,
             "status": status,
+            "status_reason": status_reason,
         }
 
     total_market_value = 0.0
@@ -6606,6 +6751,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
         one_month_return = pd.to_numeric(stat.get("one_month_return"), errors="coerce")
         drawdown_pct = pd.to_numeric(stat.get("drawdown_pct"), errors="coerce")
         status = stat.get("status", "N/A")
+        status_reason = stat.get("status_reason", "")
 
         return_pct = np.nan
         gain_loss = np.nan
@@ -6660,6 +6806,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
                 "자산 비중(%)": weight_pct,
                 "유니버스 랭킹(Universe Rank)": universe_rank_cell,
                 "상태(Status)": status,
+                "판정 근거(Why)": status_reason,
             }
         )
 
@@ -7385,10 +7532,11 @@ def _repair_watchlist_layout(ws) -> bool:
         return False
 
     if not vals:
-        ws.update([_WATCHLIST_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+        _hdr_end = gspread.utils.rowcol_to_a1(1, _WL_NCOL)
+        ws.update([_WATCHLIST_SHEET_COLS], range_name=f"A1:{_hdr_end}", value_input_option="USER_ENTERED")
         return True
 
-    header_ok = [str(c).strip() for c in (vals[0] + [""] * 8)[:8]] == _WATCHLIST_SHEET_COLS
+    header_ok = [str(c).strip() for c in (vals[0] + [""] * _WL_NCOL)[:_WL_NCOL]] == _WATCHLIST_SHEET_COLS
 
     # 데이터 행 중 A열이 비어(=오른쪽으로 밀려) 시작하는 행이 있으면 드리프트
     drift = False
@@ -7403,7 +7551,8 @@ def _repair_watchlist_layout(ws) -> bool:
     if header_ok and not drift:
         return False  # 정상 → 재작성 불필요
 
-    # 모든 비어있지 않은 행을 '첫 비어있지 않은 셀'부터 8칸으로 정규화
+    # 모든 비어있지 않은 행을 '첫 비어있지 않은 셀'부터 _WL_NCOL칸으로 정규화
+    # (과거 8열 레코드는 Stop_Loss/Target_Price 자리가 빈 칸으로 채워져 자동 마이그레이션됨)
     cleaned = []
     for r in vals:
         if not any(str(c).strip() for c in r):
@@ -7411,9 +7560,11 @@ def _repair_watchlist_layout(ws) -> bool:
         start = next((i for i, c in enumerate(r) if str(c).strip()), None)
         if start is None:
             continue
-        rec = (r[start:start + 8] + [""] * 8)[:8]
-        # 헤더로 보이는 행은 건너뛰고(아래에서 다시 부착)
-        if [str(c).strip() for c in rec] == _WATCHLIST_SHEET_COLS \
+        rec = (r[start:start + _WL_NCOL] + [""] * _WL_NCOL)[:_WL_NCOL]
+        # 헤더로 보이는 행은 건너뛰고(아래에서 다시 부착) — 신/구 헤더 모두 인식
+        _rec_head = [str(c).strip() for c in rec]
+        if _rec_head == _WATCHLIST_SHEET_COLS \
+                or _rec_head[:8] == _WATCHLIST_SHEET_COLS[:8] \
                 or str(rec[0]).strip().upper() in ("ID", "USER_ID", "USERID"):
             continue
         # user_id, ticker 둘 다 있어야 유효 레코드
@@ -7428,7 +7579,7 @@ def _repair_watchlist_layout(ws) -> bool:
     except Exception:
         pass
     ws.clear()
-    end_cell = gspread.utils.rowcol_to_a1(len(new_rows), 8)
+    end_cell = gspread.utils.rowcol_to_a1(len(new_rows), _WL_NCOL)
     ws.update(new_rows, range_name=f"A1:{end_cell}", value_input_option="USER_ENTERED")
     return True
 
@@ -7455,8 +7606,9 @@ def open_watchlist_worksheet():
                 st.session_state["_wl_layout_repaired"] = True
             return ws, None
         # 없으면 새로 생성
-        ws = sh.add_worksheet(title=_WATCHLIST_SHEET_TITLE, rows=1000, cols=8)
-        ws.update([_WATCHLIST_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+        ws = sh.add_worksheet(title=_WATCHLIST_SHEET_TITLE, rows=1000, cols=max(_WL_NCOL, 10))
+        _hdr_end = gspread.utils.rowcol_to_a1(1, _WL_NCOL)
+        ws.update([_WATCHLIST_SHEET_COLS], range_name=f"A1:{_hdr_end}", value_input_option="USER_ENTERED")
         st.session_state["_wl_layout_repaired"] = True
         return ws, None
     except Exception as exc:
@@ -7476,7 +7628,7 @@ def load_watchlist_sheet(user_id: str) -> list[dict]:
         uid_u = str(user_id).strip().upper()
         items = []
         for r in vals[1:]:
-            r = (r + [""] * 8)[:8]
+            r = (r + [""] * _WL_NCOL)[:_WL_NCOL]
             if str(r[0]).strip().upper() != uid_u:
                 continue
             items.append({
@@ -7487,6 +7639,8 @@ def load_watchlist_sheet(user_id: str) -> list[dict]:
                 "alert_ma200": str(r[5]).strip().lower() == "true",
                 "saved_price": pd.to_numeric(r[6], errors="coerce") if r[6] else np.nan,
                 "date_added": str(r[7]).strip(),
+                "stop_loss": pd.to_numeric(r[8], errors="coerce") if r[8] else np.nan,
+                "target_price": pd.to_numeric(r[9], errors="coerce") if r[9] else np.nan,
             })
         return items
     except Exception:
@@ -7518,6 +7672,10 @@ def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
             alert_ma200_str = "true" if item.get("alert_ma200") else "false"
             saved_price = item.get("saved_price", "")
             saved_price_str = str(round(float(saved_price), 4)) if pd.notna(saved_price) and saved_price != "" else ""
+            stop_loss = item.get("stop_loss", "")
+            stop_loss_str = str(round(float(stop_loss), 4)) if pd.notna(stop_loss) and stop_loss != "" else ""
+            target_price = item.get("target_price", "")
+            target_price_str = str(round(float(target_price), 4)) if pd.notna(target_price) and target_price != "" else ""
             new_rows.append([
                 str(user_id).strip(),
                 ticker,
@@ -7527,10 +7685,13 @@ def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
                 alert_ma200_str,
                 saved_price_str,
                 str(item.get("date_added", _narrative_now_et_string())).strip(),
+                stop_loss_str,
+                target_price_str,
             ])
         all_rows = [_WATCHLIST_SHEET_COLS] + other_rows + new_rows
         ws.clear()
-        ws.update(all_rows, range_name=f"A1:H{len(all_rows)}", value_input_option="USER_ENTERED")
+        _end_cell = gspread.utils.rowcol_to_a1(len(all_rows), _WL_NCOL)
+        ws.update(all_rows, range_name=f"A1:{_end_cell}", value_input_option="USER_ENTERED")
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -7550,7 +7711,7 @@ def delete_from_watchlist(user_id: str, ticker: str) -> tuple[bool, str]:
         # 삭제할 행 번호 찾기 (역순으로 삭제해야 인덱스 안 밀림)
         to_del = []
         for i, r in enumerate(vals[1:], start=2):
-            r = (r + [""] * 8)[:8]
+            r = (r + [""] * _WL_NCOL)[:_WL_NCOL]
             if str(r[0]).strip().upper() == uid_u and str(r[1]).strip().upper() == tk_u:
                 to_del.append(i)
         for row_idx in reversed(to_del):
@@ -7567,10 +7728,13 @@ def delete_from_watchlist(user_id: str, ticker: str) -> tuple[bool, str]:
 def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
                      alert_rsi: float = None, alert_ma200: bool = False,
                      alert_price: float = None,
-                     saved_price: float = None) -> tuple[bool, str]:
+                     saved_price: float = None,
+                     stop_loss: float = None,
+                     target_price: float = None) -> tuple[bool, str]:
     """Watchlist에 단일 종목 추가. append_row 방식.
     saved_price를 직접 넘기면 가격 재조회 생략 (빠름).
     없으면 @st.cache_data 캐시 활용 조회.
+    stop_loss/target_price는 진입 시 손절·목표가(선택).
     """
     uid = str(user_id).strip()
     tk = str(ticker).strip().upper()
@@ -7600,7 +7764,7 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
         ]
         for row_idx in reversed(to_del):
             ws.delete_rows(row_idx)
-        # 새 행 추가
+        # 새 행 추가 (10열: ... Date_Added, Stop_Loss, Target_Price)
         _safe_append_rows(ws, [
             uid, tk,
             str(memo).strip(),
@@ -7609,6 +7773,8 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
             "true" if alert_ma200 else "false",
             str(round(float(cur_price), 4)) if pd.notna(cur_price) else "",
             _narrative_now_et_string(),
+            str(round(float(stop_loss), 4)) if (stop_loss is not None and pd.notna(stop_loss)) else "",
+            str(round(float(target_price), 4)) if (target_price is not None and pd.notna(target_price)) else "",
         ], value_input_option="USER_ENTERED")
         # 캐시 초기화
         load_watchlist_sheet.clear()
@@ -14423,6 +14589,37 @@ if st.session_state.get("logged_in"):
                 if is_buy_on_dip:
                     st.warning("🎯 [눌림목 포착] 장기 우상향 중인 종목의 단기 조정 구간입니다. 매수를 검토하세요!")
 
+                # ── 매수 타이밍 게이트: "지금 사도 되나" 종합 판정 ──────────────
+                # RSI 과매수 + 신고가 부근(과열) 여부를 합쳐 추격 매수를 한 박자 늦춘다.
+                # 좋은 종목이라도 '나쁜 가격(고점)'에 사는 실수를 줄이는 장치.
+                _bg_overheated = (
+                    pd.notna(current_rsi) and current_rsi >= 70
+                    and pd.notna(pct_from_high) and pct_from_high >= -3
+                )
+                _bg_hot_rsi = pd.notna(current_rsi) and current_rsi >= 75
+                _bg_uptrend = (
+                    pd.notna(current_price) and pd.notna(current_ma200)
+                    and current_price > current_ma200
+                )
+                if _bg_overheated or _bg_hot_rsi:
+                    _reason_bits = []
+                    if pd.notna(current_rsi):
+                        _reason_bits.append(f"RSI {current_rsi:.0f}(과매수)")
+                    if pd.notna(pct_from_high) and pct_from_high >= -3:
+                        _reason_bits.append("52주 신고가 부근")
+                    if pd.notna(vol_surge) and vol_surge >= 1.5:
+                        _reason_bits.append(f"거래량 {vol_surge:.1f}x 급증")
+                    st.error(
+                        "⛔ **지금은 매수 보류 (단기 과열)** — "
+                        + ", ".join(_reason_bits)
+                        + ".\n\n추세 자체는 살아있을 수 있으나 **지금 진입하면 고점 매수 위험**이 큽니다. "
+                        "RSI가 60 아래로 식거나 20일선/50일선 눌림목까지 기다렸다가 분할 매수하는 편이 유리합니다."
+                    )
+                elif is_buy_on_dip:
+                    st.success("🟢 **매수 타이밍 양호** — 우상향 추세 + 눌림목 구간. 분할 매수 고려 가능 구간입니다.")
+                elif _bg_uptrend and pd.notna(current_rsi) and current_rsi < 60:
+                    st.info("🟢 **진입 가능 구간** — 추세 유지 + 과열 아님. 다만 분할 매수로 리스크를 나누세요.")
+
                 # 볼린저밴드 위치 알림
                 if pd.notna(current_price) and pd.notna(current_bb_lower) and pd.notna(current_bb_upper):
                     if current_price <= current_bb_lower:
@@ -15488,11 +15685,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.altair_chart(pie_chart, use_container_width=True)
     
                 def style_status(cell_value):
-                    if "SELL" in str(cell_value):
+                    s = str(cell_value)
+                    if "SELL" in s or "매도" in s:
                         return "color: #d62728; font-weight: 700;"
-                    if "WARNING" in str(cell_value):
+                    if "익절" in s or "WARNING" in s or "주의" in s:
                         return "color: #f59e0b; font-weight: 700;"
-                    if "HOLD" in str(cell_value):
+                    if "HOLD" in s or "보유" in s:
                         return "color: #16a34a; font-weight: 700;"
                     return "color: #6b7280;"
     
@@ -15519,6 +15717,27 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     if v < 0:
                         return "color: #dc2626; font-weight: 600;"
                     return ""
+
+                # ── 트레일링 스톱 경보 (고점 대비 하락폭) ───────────────────
+                try:
+                    _ts_pct = _DEFAULT_TRAILING_STOP_PCT
+                    _dd_col = pd.to_numeric(sell_radar_df.get("Drawdown(%)"), errors="coerce")
+                    _breached = sell_radar_df[_dd_col <= -_ts_pct] if _dd_col is not None else None
+                    if _breached is not None and not _breached.empty:
+                        _msg_lines = []
+                        for _, _br in _breached.iterrows():
+                            _msg_lines.append(
+                                f"- **{_br['티커']}** ({_br['계좌']}): 고점 대비 "
+                                f"**{pd.to_numeric(_br['Drawdown(%)'], errors='coerce'):.0f}%** 하락"
+                            )
+                        st.warning(
+                            f"🔔 **트레일링 스톱 경보** — 보유 고점 대비 -{_ts_pct:.0f}% 이상 하락한 종목:\n\n"
+                            + "\n".join(_msg_lines)
+                            + "\n\n번 수익을 지키려면 매도 또는 일부 익절을 검토하세요. "
+                            "(이미 오른 종목이라면 본전까지 토해내기 전에 차익을 확정하는 장치입니다.)"
+                        )
+                except Exception:
+                    pass
 
                 styled_sell_radar = (
                     sell_radar_df.style.format(
@@ -16925,6 +17144,64 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
         # ── 종목 추가 폼 ───────────────────────────────────────────────────
         with st.expander("➕ 관심 종목 추가", expanded=not wl_items):
+            # 손절/목표가 제안 미리보기 (폼 바깥 — 폼은 제출 시 초기화되므로)
+            st.caption("💡 티커를 넣고 아래 **제안값 계산**을 누르면 ATR·200일선 기준 손절/목표가가 표시됩니다. 그 값을 참고해 폼에 직접 입력하세요.")
+            _sug_c1, _sug_c2 = st.columns([2, 1])
+            with _sug_c1:
+                _sug_ticker = st.text_input(
+                    "제안 계산용 티커",
+                    placeholder="예: NVDA",
+                    key="wl_suggest_ticker",
+                ).strip().upper()
+            with _sug_c2:
+                _sug_go = st.button("📐 제안값 계산", key="wl_suggest_btn", use_container_width=True)
+            if _sug_go and _sug_ticker:
+                with st.spinner(f"{_sug_ticker} 손절/목표가 제안 계산 중..."):
+                    _sug = suggest_stop_and_target(_sug_ticker)
+                st.session_state["_wl_suggestion"] = {"ticker": _sug_ticker, **_sug}
+            _sug_state = st.session_state.get("_wl_suggestion")
+            if _sug_state and _sug_state.get("ticker"):
+                _e = _sug_state.get("entry")
+                if pd.notna(_e):
+                    st.markdown(f"**{_sug_state['ticker']}** 현재가 기준 제안 (진입가 ${_e:.2f})")
+                    _r1, _r2, _r3 = st.columns(3)
+                    with _r1:
+                        if pd.notna(_sug_state.get("stop_atr")):
+                            st.metric(
+                                "손절 (ATR 기준)",
+                                f"${_sug_state['stop_atr']:.2f}",
+                                delta=f"{_sug_state['stop_atr_pct']:+.1f}%",
+                                delta_color="off",
+                            )
+                            st.caption("변동성(ATR×2) 기반. 변동 큰 종목일수록 멀게.")
+                        else:
+                            st.metric("손절 (ATR 기준)", "N/A")
+                    with _r2:
+                        if pd.notna(_sug_state.get("stop_ma200")):
+                            st.metric(
+                                "손절 (200일선 기준)",
+                                f"${_sug_state['stop_ma200']:.2f}",
+                                delta=f"{_sug_state['stop_ma200_pct']:+.1f}%" if pd.notna(_sug_state.get("stop_ma200_pct")) else None,
+                                delta_color="off",
+                            )
+                            st.caption("추세선 바로 아래. 추세 붕괴 시 손절.")
+                        else:
+                            st.metric("손절 (200일선 기준)", "N/A")
+                    with _r3:
+                        if pd.notna(_sug_state.get("target_2r")):
+                            st.metric(
+                                "목표가 (손익비 1:2)",
+                                f"${_sug_state['target_2r']:.2f}",
+                                delta=f"{_sug_state['target_2r_pct']:+.1f}%",
+                                delta_color="off",
+                            )
+                            st.caption("ATR 손절 거리의 2배.")
+                        else:
+                            st.metric("목표가 (손익비 1:2)", "N/A")
+                    st.caption("⚠️ 제안값은 참고용입니다. 종목 특성을 보고 본인이 최종 손절/목표를 정하세요.")
+                else:
+                    st.warning(f"{_sug_state['ticker']} 가격 데이터를 불러오지 못해 제안값을 계산할 수 없습니다.")
+
             with st.form("watchlist_add_form", clear_on_submit=True):
                 wl_col1, wl_col2 = st.columns([1, 2])
                 with wl_col1:
@@ -16968,6 +17245,29 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         key="wl_form_alert_ma200",
                         help="현재가가 200일 이동평균선의 ±3% 이내에 들어오면 알림",
                     )
+
+                st.markdown("**손절 / 목표가** (진입 전 미리 정하면 감정적 보유를 막아줍니다)")
+                sl_col1, sl_col2 = st.columns(2)
+                with sl_col1:
+                    wl_stop_loss = st.number_input(
+                        "🛑 손절가 ($)",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.5,
+                        format="%.2f",
+                        key="wl_form_stop_loss",
+                        help="여기까지 내려오면 자른다. 위 제안값을 참고하세요.",
+                    )
+                with sl_col2:
+                    wl_target_price = st.number_input(
+                        "🎯 목표가 ($)",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.5,
+                        format="%.2f",
+                        key="wl_form_target_price",
+                        help="익절 목표. 손익비 1:2 이상이면 기대값이 좋습니다.",
+                    )
                 submitted_wl = st.form_submit_button("Watchlist에 추가", type="primary", use_container_width=True)
 
             if submitted_wl:
@@ -16981,6 +17281,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         except Exception:
                             pass
                         _wl_form_price = fetch_latest_prices_for_tickers((wl_ticker,)).get(wl_ticker, np.nan)
+                        _sl_val = float(wl_stop_loss) if wl_stop_loss > 0 else None
+                        _tp_val = float(wl_target_price) if wl_target_price > 0 else None
                         ok_wl, err_wl = add_to_watchlist(
                             uid_wl, wl_ticker,
                             memo=wl_memo.strip(),
@@ -16988,9 +17290,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             alert_rsi=float(wl_alert_rsi) if wl_alert_rsi > 0 else None,
                             alert_ma200=wl_alert_ma200,
                             saved_price=float(_wl_form_price) if pd.notna(_wl_form_price) else None,  # ✅ 명시적 전달
+                            stop_loss=_sl_val,
+                            target_price=_tp_val,
                         )
                     if ok_wl:
-                        st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!")
+                        # 손익비(R:R) 피드백
+                        _rr_msg = ""
+                        if _sl_val and _tp_val and pd.notna(_wl_form_price):
+                            _entry = float(_wl_form_price)
+                            _risk = _entry - _sl_val
+                            _reward = _tp_val - _entry
+                            if _risk > 0 and _reward > 0:
+                                _rr = _reward / _risk
+                                if _rr >= 2:
+                                    _rr_msg = f" · 손익비 1:{_rr:.1f} ✅ (기대값 양호)"
+                                elif _rr >= 1:
+                                    _rr_msg = f" · 손익비 1:{_rr:.1f} ⚠️ (1:2 이상 권장)"
+                                else:
+                                    _rr_msg = f" · 손익비 1:{_rr:.1f} 🔴 (위험이 보상보다 큼 — 재검토)"
+                        st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!{_rr_msg}")
+                        st.session_state.pop("_wl_suggestion", None)
                         st.rerun()
                     else:
                         st.error(f"저장 실패: {err_wl}")
@@ -17072,6 +17391,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         st.markdown(f"**메모:** {item.get('memo', '') or '없음'}")
                         st.markdown(f"**등록일:** {item.get('date_added', 'N/A')}")
                         st.markdown(f"**200일선:** {'${:.2f}'.format(float(ma200_val)) if pd.notna(ma200_val) else 'N/A'}")
+                        _sl = pd.to_numeric(item.get("stop_loss"), errors="coerce")
+                        _tp = pd.to_numeric(item.get("target_price"), errors="coerce")
+                        if pd.notna(_sl) or pd.notna(_tp):
+                            _sl_txt = f"🛑 손절 ${_sl:.2f}" if pd.notna(_sl) else "🛑 손절 미설정"
+                            _tp_txt = f"🎯 목표 ${_tp:.2f}" if pd.notna(_tp) else "🎯 목표 미설정"
+                            st.markdown(f"**{_sl_txt} · {_tp_txt}**")
+                            # 손익비 표시
+                            if pd.notna(_sl) and pd.notna(_tp) and pd.notna(saved_price) and saved_price > 0:
+                                _rk = float(saved_price) - float(_sl)
+                                _rw = float(_tp) - float(saved_price)
+                                if _rk > 0 and _rw > 0:
+                                    st.caption(f"손익비 1:{_rw/_rk:.1f} (등록가 기준)")
+                            # 실시간 도달 경보
+                            if pd.notna(current_price):
+                                if pd.notna(_sl) and float(current_price) <= float(_sl):
+                                    st.error(f"🛑 손절가 도달! 현재가 ${float(current_price):.2f} ≤ 손절 ${_sl:.2f} — 매도 검토")
+                                elif pd.notna(_tp) and float(current_price) >= float(_tp):
+                                    st.success(f"🎯 목표가 도달! 현재가 ${float(current_price):.2f} ≥ 목표 ${_tp:.2f} — 익절 검토")
+                        else:
+                            st.caption("🛑🎯 손절/목표가 미설정 — 편집에서 추가하면 도달 시 알림을 줍니다.")
 
                     with alert_col:
                         st.markdown("**설정된 Alert 조건:**")
@@ -17122,8 +17461,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 key=f"edit_memo_{idx}_{tk}",
                             )
 
+                        _sl_cur = float(_sl) if pd.notna(_sl) else 0.0
+                        _tp_cur = float(_tp) if pd.notna(_tp) else 0.0
+                        edit_sl_c1, edit_sl_c2 = st.columns(2)
+                        with edit_sl_c1:
+                            new_sl = st.number_input(
+                                "🛑 손절가 (0=미설정)",
+                                min_value=0.0, value=_sl_cur, step=0.5, format="%.2f",
+                                key=f"edit_sl_{idx}_{tk}",
+                            )
+                        with edit_sl_c2:
+                            new_tp = st.number_input(
+                                "🎯 목표가 (0=미설정)",
+                                min_value=0.0, value=_tp_cur, step=0.5, format="%.2f",
+                                key=f"edit_tp_{idx}_{tk}",
+                            )
+
                         if st.button("💾 저장", key=f"wl_edit_save_{idx}_{tk}", type="primary", use_container_width=True):
                             # 기존 항목 삭제 후 새 항목 추가 (행 단위 처리)
+                            # ⚠️ saved_price/stop/target은 재추가 시 보존해야 함
+                            _keep_saved = pd.to_numeric(item.get("saved_price"), errors="coerce")
                             _ok_del, _ = delete_from_watchlist(uid_wl, tk)
                             if _ok_del:
                                 _ok_add, _err_add = add_to_watchlist(
@@ -17132,6 +17489,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     alert_price=float(new_ap) if new_ap > 0 else None,
                                     alert_rsi=float(new_ar) if new_ar > 0 else None,
                                     alert_ma200=bool(new_am),
+                                    saved_price=float(_keep_saved) if pd.notna(_keep_saved) else None,
+                                    stop_loss=float(new_sl) if new_sl > 0 else None,
+                                    target_price=float(new_tp) if new_tp > 0 else None,
                                 )
                                 if _ok_add:
                                     st.rerun()
