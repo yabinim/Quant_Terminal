@@ -44,6 +44,17 @@ if "login_user_id" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state["user_id"] = ""
 
+if "_yf_cloud_limit_warn_shown" not in st.session_state:
+    st.session_state["_yf_cloud_limit_warn_shown"] = False
+
+
+def _notify_yfinance_fetch_failed() -> None:
+    """클라우드 등에서 Yahoo 제한 시 한 세션당 한 번만 안내."""
+    if st.session_state.get("_yf_cloud_limit_warn_shown"):
+        return
+    st.session_state["_yf_cloud_limit_warn_shown"] = True
+    st.warning("야후 파이낸스 접속 제한으로 일부 데이터를 불러오지 못했습니다.")
+
 
 _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
@@ -69,8 +80,6 @@ _EMERGING_TRACKER_SHEET_TITLE = "Emerging_Tracker"
 _PORTFOLIO_HISTORY_SHEET_TITLE = "Portfolio_History"
 _SCANNER_HISTORY_SHEET_TITLE = "Scanner_History"
 _SCANNER_HISTORY_COLS = ["ID", "Date", "Engine", "Ticker", "Score", "Rank", "Verdict", "RS_Score", "Mom_1M"]
-_SCANNER_LAST_RESULT_SHEET_TITLE = "Scanner_Last_Result"
-_SCANNER_LAST_RESULT_COLS = ["ID", "Engine", "Saved_At", "Universe_Count", "Score_JSON"]
 _PORTFOLIO_HISTORY_COLS = ["ID", "Date", "Total_Value", "Total_Cost", "Return_Pct", "SPY_Pct", "Alpha_Pct", "Positions"]
 _EMERGING_TRACKER_COLS = ["ID", "Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]
 _ETF_UNIVERSE_SHEET_COLS = ["Ticker", "Name", "Category", "AUM_M", "Added_Date", "Source"]
@@ -79,12 +88,8 @@ _WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Al
 _THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
 
-@st.cache_resource
 def get_gspread_client():
-    """`st.secrets['gcp_service_account']` 서비스 계정으로 gspread 클라이언트 생성. 미설정 시 None.
-    @st.cache_resource: 앱 전체 세션에서 OAuth 인증을 1회만 수행하고 클라이언트를 재사용.
-    (기존: open_*_worksheet 10개가 각각 독립 인증 → 매 호출마다 새 auth 요청)
-    """
+    """`st.secrets['gcp_service_account']` 서비스 계정으로 gspread 클라이언트 생성. 미설정 시 None."""
     try:
         info = dict(st.secrets["gcp_service_account"])
     except (KeyError, FileNotFoundError, TypeError):
@@ -95,6 +100,49 @@ def get_gspread_client():
     )
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
+
+
+def _safe_append_rows(ws, rows, value_input_option: str = "USER_ENTERED") -> None:
+    """gspread append_row/append_rows의 '계단식 드리프트' 버그를 회피하는 안전한 행 추가.
+
+    원인: append_row/append_rows를 table_range 없이 호출하면 Google Sheets API가
+    테이블의 시작 열을 잘못 감지해, 호출할 때마다 데이터가 오른쪽으로 밀려 기록된다
+    (예: 1행 A열 → 2행 F열 → 3행 K열). 밀린 행은 A열(user_id)이 비어 있어
+    A열 기준으로 읽는 로직에서 전부 누락된다.
+
+    이 함수는 항상 A열을 기준으로 '마지막 데이터 행 다음'에 기록하므로 드리프트가 없다.
+
+    rows: 단일 행(list) 또는 여러 행(list[list]) 모두 허용.
+    """
+    if rows is None:
+        return
+    # 단일 행을 2차원으로 정규화
+    if len(rows) > 0 and not isinstance(rows[0], (list, tuple)):
+        rows = [rows]
+    rows = [list(r) for r in rows if r is not None]
+    if not rows:
+        return
+
+    existing = ws.get_all_values() or []
+    # 값이 하나라도 있는 마지막 행 번호 (중간 빈 행은 무시)
+    last_row = 0
+    for idx, r in enumerate(existing, start=1):
+        if any(str(c).strip() != "" for c in r):
+            last_row = idx
+    start_row = last_row + 1
+    end_row = start_row + len(rows) - 1
+
+    # 그리드 용량 부족 시 행 확장 (values.update는 시트를 자동 확장하지 않음)
+    try:
+        if end_row > ws.row_count:
+            ws.add_rows(end_row - ws.row_count + 50)
+    except Exception:
+        pass
+
+    n_cols = max(len(r) for r in rows)
+    end_cell = gspread.utils.rowcol_to_a1(end_row, n_cols)  # 예: "H3"
+    ws.update(rows, range_name=f"A{start_row}:{end_cell}",
+              value_input_option=value_input_option)
 
 
 def open_users_worksheet():
@@ -187,7 +235,7 @@ def save_thesis_row(user_id: str, ticker: str, account: str, thesis_title: str, 
             str(narrative_date).strip(),
             date_added,
         ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
+        _safe_append_rows(ws, row, value_input_option="USER_ENTERED")
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -485,27 +533,7 @@ def _narrative_record_to_sheet_row(rec: dict, owner_id: str) -> list:
     title = _narrative_sheet_title_for_record(rec_out)
     if len(title) > 500:
         title = title[:497] + "..."
-
-    # Google Sheets 셀 한도 50,000자 — weekly/wow 브리핑은 마크다운이 길어 초과할 수 있음
-    # weekly_briefing_markdown 을 먼저 20,000자로 트리밍한 rec_out 을 직렬화
-    _SHEET_CELL_LIMIT = 49000
-    rec_for_json = rec_out
-    md_key = "weekly_briefing_markdown"
-    analysis_for_json = dict(analysis)
-    if md_key in analysis_for_json and len(str(analysis_for_json.get(md_key) or "")) > 20000:
-        analysis_for_json[md_key] = str(analysis_for_json[md_key])[:20000] + "\n\n…(truncated)"
-        rec_for_json = dict(rec_out)
-        rec_for_json["analysis"] = analysis_for_json
-    content = json.dumps(rec_for_json, ensure_ascii=False)
-    if len(content) > _SHEET_CELL_LIMIT:
-        # 그래도 넘으면 summary 도 트리밍
-        analysis_for_json["summary"] = str(analysis_for_json.get("summary") or "")[:5000]
-        rec_for_json = dict(rec_for_json)
-        rec_for_json["analysis"] = analysis_for_json
-        content = json.dumps(rec_for_json, ensure_ascii=False)
-    if len(content) > _SHEET_CELL_LIMIT:
-        content = content[:_SHEET_CELL_LIMIT]
-
+    content = json.dumps(rec_out, ensure_ascii=False)
     w_list: list = []
     e_list: list = []
     try:
@@ -583,7 +611,7 @@ def append_narrative_row_to_sheet(row_values: list) -> tuple[bool, str]:
         return False, err
     try:
         ensure_narratives_header_row(ws)
-        ws.append_row(list(row_values)[:7], value_input_option="USER_ENTERED")
+        _safe_append_rows(ws, list(row_values)[:7], value_input_option="USER_ENTERED")
         _invalidate_narratives_sheet_cache()
         return True, ""
     except Exception as exc:
@@ -708,7 +736,7 @@ def register_pending_user(user_id: str, password: str, reason: str, source: str)
         existing = df["ID"].astype(str).str.strip().str.upper()
         if user_id.strip().upper() in set(existing):
             return False, "이미 등록된 ID입니다."
-    ws.append_row([user_id.strip(), password, reason, source, "pending"], value_input_option="USER_ENTERED")
+    _safe_append_rows(ws, [user_id.strip(), password, reason, source, "pending"], value_input_option="USER_ENTERED")
     return True, ""
 
 
@@ -762,8 +790,6 @@ def try_sheet_login():
         st.session_state["user_id"] = uid
         st.session_state["login_error"] = False
         st.session_state["login_feedback"] = ""
-        # 로그인 직후 DRG·VIX·거시지표 백그라운드 워밍업
-        _trigger_background_warmup()
         return
     ws, err = open_users_worksheet()
     if err:
@@ -801,49 +827,12 @@ def try_sheet_login():
             st.session_state["user_id"] = lid
             st.session_state["login_error"] = False
             st.session_state["login_feedback"] = ""
-            # 로그인 직후 DRG·VIX·거시지표 백그라운드 워밍업
-            _trigger_background_warmup()
         else:
             st.session_state["login_error"] = True
             st.session_state["login_feedback"] = "비밀번호가 올바르지 않습니다."
         return
     st.session_state["login_error"] = True
     st.session_state["login_feedback"] = f"알 수 없는 계정 상태입니다: {row.get('Status', '')}"
-
-
-def _trigger_background_warmup():
-    """로그인 직후 한 번만 실행: DRG·거시지표·VIX 캐시를 백그라운드 스레드에서 미리 워밍업.
-    이미 캐시가 있으면 즉시 반환, 없으면 논블로킹으로 채워 둠.
-    """
-    import threading as _threading
-    if st.session_state.get("_warmup_done"):
-        return
-    st.session_state["_warmup_done"] = True
-
-    def _warmup():
-        try:
-            # VIX 캐시 (DRG·거시지표 공통)
-            fetch_vix_latest_and_history()
-        except Exception:
-            pass
-        try:
-            # 거시지표 히스토리 캐시
-            fetch_macro_history_series()
-        except Exception:
-            pass
-        try:
-            # DRG (전체 섹터 기본값으로 프리워밍)
-            compute_daily_risk_gauge(sector_filter="전체")
-        except Exception:
-            pass
-        try:
-            # 거시경제 대시보드
-            cached_analyze_us_macro_dashboard()
-        except Exception:
-            pass
-
-    t = _threading.Thread(target=_warmup, daemon=True)
-    t.start()
 
 
 def _render_login_screen():
@@ -890,15 +879,10 @@ if "current_view" not in st.session_state:
     st.session_state["current_view"] = {}
 if "current_view_language" not in st.session_state:
     st.session_state["current_view_language"] = "ko"
-if "current_view_source" not in st.session_state:
-    # 분석 유형 추적: "market_narrative" | "weekly_trend_7d" | "wow_trend_7d"
-    st.session_state["current_view_source"] = "market_narrative"
 if "scanner_results" not in st.session_state:
     st.session_state["scanner_results"] = None
 if "scanner_results_emerging" not in st.session_state:
     st.session_state["scanner_results_emerging"] = None
-if "_scanner_last_result_restored" not in st.session_state:
-    st.session_state["_scanner_last_result_restored"] = False
 if "narrative_timeseries_briefing" not in st.session_state:
     st.session_state["narrative_timeseries_briefing"] = None
 
@@ -924,6 +908,22 @@ _MAIN_NAV_OPTIONS = (
     "📖 사용 가이드",
 )
 
+# 구버전 라디오/버튼 라벨 → 동일 인덱스 (세션 마이그레이션용)
+_LEGACY_NAV_STR_TO_INDEX = {
+    "📊 거시경제 지표": 0,
+    "🧠 1.5 시장 내러티브": 1,
+    "🚀 1.6 AI Opportunity Scanner": 3,
+    "📈 2. 섹터 분석": 2,
+    "🔬 3. 체력 검사": 4,
+    "⏱️ 4. 매수 타점": 4,
+    "🛡️ 5.0 포트폴리오 매도 레이더": 5,
+    "1. 거시경제 지표 (Macro)": 0,
+    "2. 시장 내러티브 (Narrative)": 1,
+    "3. 섹터 & 자금 흐름 (Sector Flow)": 2,
+    "4. AI 종목 스캐너 (Scanner)": 3,
+    "5. 개별 종목 정밀 검사 (Fundamentals & Timing)": 4,
+    "6. 포트폴리오 매도 레이더 (Portfolio)": 5,
+}
 
 _NARRATIVE_RECORD_SOURCE_WEEKLY_7D = "weekly_trend_7d"
 
@@ -980,18 +980,6 @@ class _GenAIModel:
     def __init__(self, model_id, generation_config=None):
         self._model_id = model_id
         cfg = dict(generation_config or {})
-        # Gemini 2.5 계열은 'thinking' 토큰이 max_output_tokens 예산을 함께 소비한다.
-        # generation_config 에 thinking_budget(정수)이 있으면 ThinkingConfig 로 변환한다.
-        #   0   → 사고 비활성화(전체 토큰 예산을 보이는 출력에 사용)
-        #   -1  → 동적(모델이 알아서)
-        #   N>0 → 사고에 최대 N 토큰만 허용
-        if "thinking_budget" in cfg:
-            _tb = cfg.pop("thinking_budget")
-            try:
-                cfg["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=int(_tb))
-            except Exception:
-                # 구버전 SDK 등에서 ThinkingConfig 미지원이면 조용히 무시
-                pass
         self._config = genai_types.GenerateContentConfig(**cfg) if cfg else None
 
     def generate_content(self, prompt, max_retries: int = 3):
@@ -1030,7 +1018,6 @@ model = _GenAIModel(
         "top_p": 1,
         "top_k": 1,
         "max_output_tokens": 8192,
-        "thinking_budget": 0,
         "response_mime_type": "application/json",
     },
 )
@@ -1059,7 +1046,6 @@ _scanner_narrative_batch_model = _GenAIModel(
         "top_p": 1,
         "top_k": 1,
         "max_output_tokens": 8192,
-        "thinking_budget": 0,
         "response_mime_type": "application/json",
     },
 )
@@ -1256,79 +1242,24 @@ def macro_status_bad_count(status):
     return status in (MACRO_STATUS_WARN, MACRO_STATUS_FAIL)
 
 
-def macro_traffic_light(bad_total, total_indicators: int = 11):
-    """
-    11개 지표 기준 신호등.
-    - 빨간불: 전체의 60% 이상(7/11) 경고·실패  → 거시 리스크 전방위 확산
-    - 노란불: 전체의 36% 이상(4/11) 경고·실패  → 경고 누적, 비중 축소
-    - 초록불: 그 미만                           → 환경 안정적
-    """
-    red_threshold    = max(7, round(total_indicators * 0.60))   # ≥60% → 빨간불
-    yellow_threshold = max(4, round(total_indicators * 0.36))   # ≥36% → 노란불
-
-    if bad_total >= red_threshold:
+def macro_traffic_light(bad_total):
+    if bad_total >= 5:
         st.error(
-            f"🔴 **[빨간불] 폭풍우 경보** — {total_indicators}개 지표 중 {bad_total}개 경고·실패 "
-            f"({bad_total/total_indicators*100:.0f}%). "
-            "복수의 거시 지표가 동시에 악화된 상태입니다. "
-            "**현금 비중을 최우선으로 확대하고, 신규 매수를 전면 중단하세요.** "
-            "개별 종목 분석(3단계)을 진행하기 전에 매크로 리스크가 해소되는지 먼저 확인하세요."
+            "🔴 [빨간불] 폭풍우 경보 (Full Alignment). 시스템 붕괴 위험. "
+            "제3원칙에 따라 시장에서 도망치세요."
         )
-    elif bad_total >= yellow_threshold:
+    elif bad_total >= 3:
         st.warning(
-            f"🟡 **[노란불] 거시경제 경고 누적** — {total_indicators}개 지표 중 {bad_total}개 경고·실패 "
-            f"({bad_total/total_indicators*100:.0f}%). "
-            "개별 종목이 좋아 보여도 매크로 역풍이 있을 수 있습니다. "
-            "포지션 비중을 줄이고 현금을 확보하며 분할 접근을 권장합니다."
+            "🟡 [노란불] 거시경제 경고 누적. 개별 종목이 좋아도 비중을 줄이고 현금을 확보하세요."
         )
     else:
         st.success(
-            f"🟢 **[초록불] 매크로 환경 안정적** — {total_indicators}개 지표 중 경고 {bad_total}개. "
-            f"「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털과 매수 타점을 확인한 뒤 투자를 진행하세요."
+            f"🟢 [초록불] 매크로 환경 안정적. 「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털과 매수 타점을 확인한 뒤 투자를 진행하세요."
         )
 
 
-def _yield_spread_note(spread: float, t10: float, t3m: float, source: str) -> tuple:
-    """금리차 수치 → (status, note) 공통 판정 로직."""
-    detail = f"10Y {t10:.2f}% / 3M {t3m:.2f}% [{source}]"
-    if spread < 0:
-        status = MACRO_STATUS_WARN
-        note = f"수익률 곡선 역전(단기금리 > 장기): 침체·신용경색 우려 신호입니다. ({detail})"
-    elif spread < 0.3:
-        status = MACRO_STATUS_WARN
-        note = f"금리차 플러스이나 매우 좁은 구간 — 역전 전단계 모니터링 필요. ({detail})"
-    else:
-        status = MACRO_STATUS_PASS
-        note = f"장단기 금리차 플러스 구간입니다. 역전 신호 없음. ({detail})"
-    return spread, status, note
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yield_spread_latest():
-    """10Y-3M 국채 금리차.
-    1순위: FMP Treasury Rates API (당일 실시간)
-    2순위: FRED DGS10 / DTB3 (전일 기준, 폴백)
-    """
-    k = _fmp_key()
-    # ── FMP 실시간 시도 ─────────────────────────────────────────────────
-    if k:
-        try:
-            r = requests.get(
-                f"{_FMP_BASE}/treasury-rates?apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    latest = data[0]
-                    t10 = to_float(latest.get("year10") or latest.get("tenYear"))
-                    t3m = to_float(latest.get("month3") or latest.get("threeMonth"))
-                    if pd.notna(t10) and pd.notna(t3m):
-                        spread = t10 - t3m
-                        return _yield_spread_note(spread, t10, t3m, "FMP 실시간")
-        except Exception:
-            pass
-    # ── FRED 폴백 ────────────────────────────────────────────────────────
+    """10Y-3M 국채 금리차 — FRED DGS10 / DTB3 사용."""
     try:
         t10_s = fred.get_series("DGS10")
         t3m_s = fred.get_series("DTB3")
@@ -1337,7 +1268,13 @@ def fetch_yield_spread_latest():
         if pd.isna(t10) or pd.isna(t3m):
             return np.nan, MACRO_STATUS_NA, "데이터 부족 (N/A)"
         spread = t10 - t3m
-        return _yield_spread_note(spread, t10, t3m, "FRED 전일")
+        if spread < 0:
+            status = MACRO_STATUS_WARN
+            note = "수익률 곡선 역전(단기금리 > 장기): 침체·신용경색 우려 신호입니다."
+        else:
+            status = MACRO_STATUS_PASS
+            note = "장단기 금리차 플러스 구간입니다. 역전 신호 없음으로 해석합니다."
+        return spread, status, note
     except Exception:
         return np.nan, MACRO_STATUS_NA, "연산 또는 다운로드 오류"
 
@@ -1352,47 +1289,20 @@ def evaluate_vix_status(vix_value):
     return MACRO_STATUS_PASS, "상대적으로 낮은 불안 구간입니다. 단, 역사적 평균 대비 고점 돌파 시 추세를 확인하세요."
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_vix_latest_and_history():
-    """VIX 현재값 + 1년 히스토리.
-    1순위: FRED VIXCLS  2순위: FMP ^VIX (full 엔드포인트)
-    """
-    # ── FRED ─────────────────────────────────────────────────────────
+    """VIX 현재값 + 1년 히스토리 — FRED VIXCLS 사용."""
     try:
         s = fred.get_series("VIXCLS")
         s = pd.to_numeric(s, errors="coerce").dropna()
-        if len(s) >= 10:
-            s = s.tail(252)
-            hist = pd.DataFrame({"Close": s})
-            hist.index = pd.to_datetime(hist.index)
-            return float(s.iloc[-1]), hist, None
-    except Exception:
-        pass
-    # ── FMP 폴백 ─────────────────────────────────────────────────────
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX&limit=252&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                rows = data.get("historical", data) if isinstance(data, dict) else data
-                if isinstance(rows, list) and rows:
-                    df = pd.DataFrame(rows)
-                    if "date" in df.columns:
-                        cc = "close" if "close" in df.columns else "Close"
-                        df = df[["date", cc]].rename(columns={cc: "Close"})
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-                        df = df.dropna()
-                        if not df.empty:
-                            return float(df["Close"].iloc[-1]), df, "FMP폴백"
-    except Exception:
-        pass
-    return np.nan, None, "VIX 데이터 조회 실패 (FRED·FMP 모두 실패)"
+        if s.empty:
+            return np.nan, None, "FRED VIXCLS 데이터 없음"
+        s = s.tail(252)
+        hist = pd.DataFrame({"Close": s})
+        hist.index = pd.to_datetime(hist.index)
+        cur = float(s.iloc[-1])
+        return cur, hist, None
+    except Exception as exc:
+        return np.nan, None, str(exc)
 
 
 def evaluate_wti_status(wti):
@@ -1407,81 +1317,21 @@ def evaluate_wti_status(wti):
     return MACRO_STATUS_PASS, "유가가 과도하게 붐비거나 붕괴한 구간은 아닙니다."
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_wti_latest():
-    """WTI 유가 최신값.
-    1순위: FRED DCOILWTICO  2순위: FMP USO ETF 근사
-    """
+    """WTI 유가 최신값 — FRED DCOILWTICO 사용."""
     try:
         s = fred.get_series("DCOILWTICO")
         s = pd.to_numeric(s, errors="coerce").dropna()
-        if not s.empty:
-            return float(s.iloc[-1])
+        return float(s.iloc[-1]) if not s.empty else np.nan
     except Exception:
-        pass
-    # FMP 폴백: USO (WTI ETF) — full 엔드포인트
-    try:
-        k = _fmp_key()
-        if k:
-            for sym in ("USO", "OIL"):
-                try:
-                    r = requests.get(
-                        f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=5&apikey={k}",
-                        timeout=_FMP_TIMEOUT,
-                    )
-                    if r.status_code == 200:
-                        d = r.json()
-                        rows = d.get("historical", d) if isinstance(d, dict) else d
-                        if isinstance(rows, list) and rows:
-                            v = rows[0].get("close") or rows[0].get("Close")
-                            if v is not None:
-                                return float(v)
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return np.nan
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_unrate_series() -> pd.Series:
-    """UNRATE — FRED 1순위, FMP unemploymentRate 2순위."""
-    # FRED
-    try:
-        s = fred.get_series("UNRATE")
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if len(s) >= 15:
-            return s
-    except Exception:
-        pass
-    # FMP economic-indicators
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=unemploymentRate&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    df = pd.DataFrame(data)
-                    if "date" in df.columns and "value" in df.columns:
-                        df = df[["date", "value"]].copy()
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        s = pd.to_numeric(df["value"], errors="coerce").dropna()
-                        if len(s) >= 5:
-                            return s
-    except Exception:
-        pass
-    return pd.Series(dtype=float)
+        return np.nan
 
 
 def evaluate_unemployment_sahm_series():
     try:
-        unrate_series = _fetch_unrate_series()
-        if unrate_series.empty:
+        try:
+            unrate_series = fred.get_series("UNRATE")
+        except Exception:
             return MACRO_STATUS_NA, np.nan, np.nan, np.nan, _FRED_TRANSIENT_ERROR_NOTE
         df_unrate = pd.DataFrame({"UNRATE": unrate_series})
         df_unrate["UNRATE"] = pd.to_numeric(df_unrate["UNRATE"], errors="coerce")
@@ -1512,45 +1362,11 @@ def evaluate_unemployment_sahm_series():
         return MACRO_STATUS_NA, np.nan, np.nan, np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_cpi_series() -> pd.Series:
-    """CPIAUCSL — FRED 1순위, FMP CPI 2순위."""
-    # FRED
-    try:
-        s = fred.get_series("CPIAUCSL")
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if len(s) >= 14:
-            return s
-    except Exception:
-        pass
-    # FMP economic-indicators (name=CPI)
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=CPI&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    df = pd.DataFrame(data)
-                    if "date" in df.columns and "value" in df.columns:
-                        df = df[["date", "value"]].copy()
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        s = pd.to_numeric(df["value"], errors="coerce").dropna()
-                        if len(s) >= 5:
-                            return s
-    except Exception:
-        pass
-    return pd.Series(dtype=float)
-
-
 def evaluate_cpi_yoy():
     try:
-        cpi_series = _fetch_cpi_series()
-        if cpi_series.empty:
+        try:
+            cpi_series = fred.get_series("CPIAUCSL")
+        except Exception:
             return MACRO_STATUS_NA, np.nan, _FRED_TRANSIENT_ERROR_NOTE
         df_cpi = pd.DataFrame({"CPIAUCSL": cpi_series})
         df_cpi["CPIAUCSL"] = pd.to_numeric(df_cpi["CPIAUCSL"], errors="coerce")
@@ -1580,446 +1396,120 @@ def evaluate_cpi_yoy():
         return MACRO_STATUS_NA, np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_dxy_latest_and_mean_deviation():
-    """DXY 달러 인덱스.
-    1순위: FRED DTWEXBGS  2순위: FMP UUP ETF (DXY 추적)
-    """
-    def _calc(closes_s: pd.Series):
-        if closes_s.empty:
+    """DXY 달러 인덱스 — FRED DTWEXBGS 사용."""
+    try:
+        s = fred.get_series("DTWEXBGS")
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
             return np.nan, np.nan, MACRO_STATUS_NA
-        cur = float(closes_s.iloc[-1])
-        ma252 = float(closes_s.rolling(window=252, min_periods=63).mean().iloc[-1])
-        if pd.isna(cur) or pd.isna(ma252) or ma252 == 0:
+        closes = s.tail(400)
+        cur = float(closes.iloc[-1])
+        ma252 = float(closes.rolling(window=252, min_periods=126).mean().iloc[-1])
+        dev_pct = np.nan if pd.isna(cur) or pd.isna(ma252) or ma252 == 0 else (cur / ma252 - 1.0) * 100
+        if pd.isna(cur) or pd.isna(ma252):
             return cur, np.nan, MACRO_STATUS_NA
-        dev_pct = (cur / ma252 - 1.0) * 100
         if dev_pct >= 5.5:
             return cur, dev_pct, MACRO_STATUS_FAIL
         if dev_pct >= 2.5:
             return cur, dev_pct, MACRO_STATUS_WARN
         return cur, dev_pct, MACRO_STATUS_PASS
-    # FRED
-    try:
-        s = fred.get_series("DTWEXBGS")
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        if not s.empty:
-            return _calc(s.tail(400))
     except Exception:
-        pass
-    # FMP UUP (DXY ETF) — full 엔드포인트
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=400&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                d = r.json()
-                rows = d.get("historical", d) if isinstance(d, dict) else d
-                if isinstance(rows, list) and rows:
-                    df = pd.DataFrame(rows)
-                    if "date" in df.columns:
-                        cc = "close" if "close" in df.columns else "Close"
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        s = pd.to_numeric(df[cc], errors="coerce").dropna()
-                        if not s.empty:
-                            return _calc(s)
-    except Exception:
-        pass
-    return np.nan, np.nan, MACRO_STATUS_NA
+        return np.nan, np.nan, MACRO_STATUS_NA
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
-    """보유 종목의 다음 실적 발표일.
-
-    4-layer fallback 전략:
-      1) FMP earnings-calendar  (from=오늘, to=오늘+90일, symbol=X)
-      2) FMP earnings           (/stable/earnings?symbol=X)
-      3) FMP quote              (earningsAnnouncement 필드)
-      4) yfinance               (.calendar 속성)
-    """
+    """보유 종목의 다음 실적 발표일 — FMP earnings-calendar (symbol만 사용)."""
     k = _fmp_key()
+    results = []
     today = datetime.now(timezone.utc).date()
-    tomorrow_dt = today + timedelta(days=1)
-    from_str = today.strftime("%Y-%m-%d")
-    to_str   = (today + timedelta(days=90)).strftime("%Y-%m-%d")
-    results  = []
-
-    def _parse_future(items: list, date_key: str = "date") -> tuple:
-        """items 리스트에서 내일 이후 가장 이른 (days_until, date_str, item) 반환."""
-        future = []
-        for it in (items if isinstance(items, list) else []):
-            ds = str(it.get(date_key) or "")[:10]
-            if not ds or len(ds) < 10:
-                continue
-            try:
-                dt = datetime.strptime(ds, "%Y-%m-%d").date()
-                if dt >= tomorrow_dt:
-                    future.append(((dt - today).days, ds, it))
-            except Exception:
-                continue
-        return sorted(future)[0] if future else None
-
-    def _parse_ann_field(ann_str: str) -> tuple | None:
-        """단순 날짜 문자열(earningsAnnouncement)을 (days, date_str, {}) 형태로 변환."""
-        ds = str(ann_str or "")[:10]
-        if not ds or len(ds) < 10:
-            return None
-        try:
-            dt = datetime.strptime(ds, "%Y-%m-%d").date()
-            if dt >= tomorrow_dt:
-                return (dt - today).days, ds, {}
-        except Exception:
-            pass
-        return None
-
     for tk in tickers:
-        best: tuple | None = None
-        eps_estimate = None
         try:
-            # ── Layer 1: earnings-calendar with date range ────────────────
-            if k and best is None:
-                try:
-                    r = requests.get(
-                        f"{_FMP_BASE}/earnings-calendar"
-                        f"?symbol={tk}&from={from_str}&to={to_str}&apikey={k}",
-                        timeout=_FMP_TIMEOUT,
-                    )
-                    if r.status_code == 200:
-                        data = r.json()
-                        found = _parse_future(data if isinstance(data, list) else [])
-                        if found:
-                            best = found
-                            eps_estimate = to_float(found[2].get("epsEstimated"))
-                except Exception:
-                    pass
-
-            # ── Layer 2: /stable/earnings (includes upcoming) ─────────────
-            if k and best is None:
-                try:
-                    r2 = requests.get(
-                        f"{_FMP_BASE}/earnings?symbol={tk}&apikey={k}",
-                        timeout=_FMP_TIMEOUT,
-                    )
-                    if r2.status_code == 200:
-                        data2 = r2.json()
-                        found2 = _parse_future(data2 if isinstance(data2, list) else [])
-                        if found2:
-                            best = found2
-                            eps_estimate = to_float(found2[2].get("epsEstimated"))
-                except Exception:
-                    pass
-
-            # ── Layer 3: quote earningsAnnouncement field ─────────────────
-            if k and best is None:
-                try:
-                    rq = requests.get(
-                        f"{_FMP_BASE}/quote?symbol={tk}&apikey={k}",
-                        timeout=_FMP_TIMEOUT,
-                    )
-                    if rq.status_code == 200:
-                        qd = rq.json()
-                        q_item = qd[0] if isinstance(qd, list) and qd else {}
-                        ann = str(q_item.get("earningsAnnouncement") or "")[:10]
-                        parsed = _parse_ann_field(ann)
-                        if parsed:
-                            best = parsed
-                except Exception:
-                    pass
-
-            # ── Layer 4: yfinance .calendar fallback ──────────────────────
-            if best is None:
-                try:
-                    import yfinance as yf
-                    yf_ticker = yf.Ticker(tk)
-                    cal = yf_ticker.calendar
-                    # cal 은 dict 또는 DataFrame 형태
-                    if isinstance(cal, dict):
-                        earn_date = cal.get("Earnings Date")
-                        if earn_date:
-                            # 리스트일 수 있음
-                            if isinstance(earn_date, list):
-                                earn_date = earn_date[0]
-                            ds = str(earn_date)[:10]
-                            parsed = _parse_ann_field(ds)
-                            if parsed:
-                                best = parsed
-                    elif hasattr(cal, "empty") and not cal.empty:
-                        # DataFrame 형태: index에 날짜가 있을 수 있음
-                        if "Earnings Date" in cal.index:
-                            earn_date = cal.loc["Earnings Date"].iloc[0]
-                            ds = str(earn_date)[:10]
-                            parsed = _parse_ann_field(ds)
-                            if parsed:
-                                best = parsed
-                except Exception:
-                    pass
-
-            if best:
-                days_until, date_str, _ = best
-                results.append({
-                    "ticker":        tk,
-                    "earnings_date": date_str,
-                    "days_until":    days_until,
-                    "eps_estimate":  eps_estimate,
-                })
+            if not k:
+                continue
+            r = requests.get(
+                f"{_FMP_BASE}/earnings-calendar?symbol={tk}&apikey={k}",
+                timeout=_FMP_TIMEOUT
+            )
+            data = r.json() if r.status_code == 200 else []
+            if isinstance(data, list) and data:
+                future_items = []
+                tomorrow_dt = today + timedelta(days=1)
+                for item in data:
+                    date_str = str(item.get("date") or "")[:10]
+                    if not date_str or len(date_str) < 10:
+                        continue
+                    try:
+                        dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        days_until = (dt - today).days
+                        if dt >= tomorrow_dt:  # 내일 이후만
+                            future_items.append((days_until, date_str, item))
+                    except Exception:
+                        continue
+                if future_items:
+                    future_items.sort(key=lambda x: x[0])
+                    days_until, date_str, item = future_items[0]
+                    results.append({
+                        "ticker": tk,
+                        "earnings_date": date_str,
+                        "days_until": days_until,
+                        "eps_estimate": to_float(item.get("epsEstimated")),
+                    })
         except Exception:
             continue
-
     results.sort(key=lambda x: x["days_until"])
     return results
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fed_funds_rate() -> tuple[float, str]:
-    """현재 기준금리.
-    1순위: FRED FEDFUNDS  2순위: FMP federalFundsRate
-    """
-    def _fed_note(rate: float) -> str:
-        if rate >= 5.0:
-            return "고금리 레짐. 성장주 밸류에이션 압박 지속."
-        if rate >= 3.0:
-            return "중립 이상 금리. 연준 기조 모니터링 필요."
-        return "완화적 금리 환경. 유동성 우호적."
-    # FRED
+    """FRED FEDFUNDS 시리즈에서 현재 기준금리 반환. (rate, note)"""
     try:
         series = fred.get_series("FEDFUNDS")
-        if series is not None and not series.empty:
-            rate = float(pd.to_numeric(series, errors="coerce").dropna().iloc[-1])
-            if pd.notna(rate):
-                return rate, _fed_note(rate)
-    except Exception:
-        pass
-    # FMP federalFundsRate
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    rate = to_float(data[0].get("value"))
-                    if pd.notna(rate):
-                        return rate, _fed_note(rate) + " [FMP]"
-    except Exception:
-        pass
-    return np.nan, _FRED_TRANSIENT_ERROR_NOTE
-
-
-def _hist_fetch_fedfunds() -> pd.Series:
-    """FEDFUNDS 히스토리 — FRED 1순위, FMP 폴백."""
-    try:
-        s = fred.get_series("FEDFUNDS")
-        if s is not None and not s.empty:
-            return pd.to_numeric(s, errors="coerce").dropna().tail(24)
-    except Exception:
-        pass
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    df = pd.DataFrame(data)[["date", "value"]].copy()
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date").sort_index()
-                    return pd.to_numeric(df["value"], errors="coerce").dropna().tail(24)
-    except Exception:
-        pass
-    return pd.Series(dtype=float)
-
-
-def _hist_fetch_dxy() -> pd.Series:
-    """DXY 히스토리 — FRED 1순위, FMP UUP 폴백."""
-    try:
-        s = fred.get_series("DTWEXBGS")
-        if s is not None and not s.empty:
-            return pd.to_numeric(s, errors="coerce").dropna().tail(500)
-    except Exception:
-        pass
-    try:
-        k = _fmp_key()
-        if k:
-            r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=500&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                d = r.json()
-                rows = d.get("historical", d) if isinstance(d, dict) else d
-                if isinstance(rows, list) and rows:
-                    df = pd.DataFrame(rows)
-                    if "date" in df.columns:
-                        cc = "close" if "close" in df.columns else "Close"
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        return pd.to_numeric(df[cc], errors="coerce").dropna().tail(500)
-    except Exception:
-        pass
-    return pd.Series(dtype=float)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_macro_history_series() -> dict:
-    """CPI·실업률·DXY·Fed Rate 1~2년 히스토리 시리즈.
-    4개 소스를 ThreadPoolExecutor로 병렬 조회.
-    """
-    import concurrent.futures as _cf
-
-    def _safe_cpi():
-        try:
-            s = _fetch_cpi_series()
-            if not s.empty:
-                df = pd.DataFrame({"CPI": s}).dropna()
-                df["v"] = df["CPI"].pct_change(12) * 100
-                return ("cpi", df["v"].dropna().tail(24))
-        except Exception:
-            pass
-        return ("cpi", pd.Series(dtype=float))
-
-    def _safe_un():
-        try:
-            s = _fetch_unrate_series()
-            if not s.empty:
-                return ("unrate", s.tail(24))
-        except Exception:
-            pass
-        return ("unrate", pd.Series(dtype=float))
-
-    def _safe_fed():
-        return ("fedfunds", _hist_fetch_fedfunds())
-
-    def _safe_dxy():
-        return ("dxy", _hist_fetch_dxy())
-
-    out = {}
-    with _cf.ThreadPoolExecutor(max_workers=4) as exe:
-        futs = [exe.submit(fn) for fn in (_safe_cpi, _safe_un, _safe_fed, _safe_dxy)]
-        for fut in _cf.as_completed(futs, timeout=20):
-            try:
-                key, val = fut.result()
-                if not val.empty:
-                    out[key] = val
-            except Exception:
-                pass
-    return out
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fmp_economic_indicator(name: str) -> tuple[float, float, str]:
-    """FMP Economic Indicators API — (latest_val, prev_val, date_str).
-    name 예: 'GDP', 'retailSales', 'unemploymentRate', 'consumerConfidence'
-    """
-    k = _fmp_key()
-    if not k:
-        return np.nan, np.nan, ""
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/economic-indicators?name={name}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code != 200:
-            return np.nan, np.nan, ""
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            return np.nan, np.nan, ""
-        latest_val = to_float(data[0].get("value"))
-        prev_val = to_float(data[1].get("value")) if len(data) > 1 else np.nan
-        date_str = str(data[0].get("date", ""))[:10]
-        return latest_val, prev_val, date_str
-    except Exception:
-        return np.nan, np.nan, ""
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fmp_market_risk_premium() -> tuple[float, str]:
-    """FMP Market Risk Premium API — (US ERP %, note)."""
-    k = _fmp_key()
-    if not k:
-        return np.nan, "FMP API 키 없음"
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/market-risk-premium?apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code != 200:
-            return np.nan, "데이터 없음"
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            return np.nan, "데이터 없음"
-        # US 항목 우선, 없으면 첫 번째
-        us_item = next(
-            (d for d in data if str(d.get("country", "")).upper() in ("US", "UNITED STATES", "USA")),
-            data[0],
-        )
-        erp = to_float(us_item.get("totalEquityRiskPremium") or us_item.get("equityRiskPremium"))
-        country = str(us_item.get("country", "US"))
-        if pd.isna(erp):
-            return np.nan, "데이터 없음"
-        if erp >= 6.0:
-            note = f"ERP {erp:.2f}% — 주식이 채권 대비 매우 매력적. 밸류에이션 저평가 구간."
-        elif erp >= 4.0:
-            note = f"ERP {erp:.2f}% — 주식 위험 프리미엄 적정 구간."
+        if series is None or series.empty:
+            return np.nan, "FRED 데이터 없음"
+        rate = float(pd.to_numeric(series, errors="coerce").dropna().iloc[-1])
+        if rate >= 5.0:
+            note = "고금리 레짐. 성장주 밸류에이션 압박 지속."
+        elif rate >= 3.0:
+            note = "중립 이상 금리. 연준 기조 모니터링 필요."
         else:
-            note = f"ERP {erp:.2f}% — 주식 프리미엄 낮음. 채권 대비 주식 매력 저하."
-        return erp, note
+            note = "완화적 금리 환경. 유동성 우호적."
+        return rate, note
     except Exception:
-        return np.nan, "조회 오류"
+        return np.nan, _FRED_TRANSIENT_ERROR_NOTE
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_fmp_economic_calendar_risk() -> tuple[list, bool]:
-    """FMP Economic Calendar — 당일~3일 이내 고임팩트 US 이벤트 감지.
-    반환: (events_list, has_high_impact)
-    events_list: [{"date","event","impact","actual","estimate","prior"}]
-    """
-    k = _fmp_key()
-    if not k:
-        return [], False
+def fetch_macro_history_series() -> dict:
+    """CPI·실업률·DXY·Fed Rate 1~2년 히스토리 시리즈 반환."""
+    out = {}
     try:
-        today = datetime.now(timezone.utc).date()
-        from_date = today.strftime("%Y-%m-%d")
-        to_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
-        r = requests.get(
-            f"{_FMP_BASE}/economic-calendar?from={from_date}&to={to_date}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code != 200:
-            return [], False
-        data = r.json()
-        if not isinstance(data, list):
-            return [], False
-        events = []
-        for ev in data:
-            country = str(ev.get("country", "")).upper()
-            if country not in ("US", "USD", "UNITED STATES", ""):
-                continue
-            impact = str(ev.get("impact", "") or ev.get("importance", "") or "").capitalize()
-            event_name = str(ev.get("event", "") or ev.get("name", ""))
-            if not event_name:
-                continue
-            events.append({
-                "date":     str(ev.get("date", ""))[:10],
-                "event":    event_name,
-                "impact":   impact,
-                "actual":   ev.get("actual"),
-                "estimate": ev.get("estimate"),
-                "prior":    ev.get("previous") or ev.get("prior"),
-            })
-        has_high = any(e["impact"].lower() in ("high", "3") for e in events)
-        return events, has_high
+        cpi_s = fred.get_series("CPIAUCSL")
+        if cpi_s is not None and not cpi_s.empty:
+            cpi_df = pd.DataFrame({"CPI": pd.to_numeric(cpi_s, errors="coerce")}).dropna()
+            cpi_df["CPI YoY(%)"] = cpi_df["CPI"].pct_change(12) * 100
+            out["cpi"] = cpi_df["CPI YoY(%)"].dropna().tail(24)
     except Exception:
-        return [], False
+        pass
+    try:
+        un_s = fred.get_series("UNRATE")
+        if un_s is not None and not un_s.empty:
+            out["unrate"] = pd.to_numeric(un_s, errors="coerce").dropna().tail(24)
+    except Exception:
+        pass
+    try:
+        fed_s = fred.get_series("FEDFUNDS")
+        if fed_s is not None and not fed_s.empty:
+            out["fedfunds"] = pd.to_numeric(fed_s, errors="coerce").dropna().tail(24)
+    except Exception:
+        pass
+    try:
+        dxy_s = fred.get_series("DTWEXBGS")
+        if dxy_s is not None and not dxy_s.empty:
+            out["dxy"] = pd.to_numeric(dxy_s, errors="coerce").dropna().tail(500)
+    except Exception:
+        pass
+    return out
 
 
 def compute_macro_score(rows: list) -> tuple[float, str, str]:
@@ -2045,62 +1535,19 @@ def compute_macro_score(rows: list) -> tuple[float, str, str]:
 
 
 def analyze_us_macro_dashboard():
-    import concurrent.futures as _cf
+    spread_val, spread_st, spread_note = fetch_yield_spread_latest()
 
-    # ── 모든 외부 API를 병렬로 동시 호출 (순차 3분 → 병렬 ~20초) ─────────
-    def _safe(fn, *args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except Exception:
-            return None
-
-    _tasks = {
-        "spread":   (fetch_yield_spread_latest,          []),
-        "vix":      (fetch_vix_latest_and_history,       []),
-        "wti":      (fetch_wti_latest,                   []),
-        "un":       (evaluate_unemployment_sahm_series,  []),
-        "cpi":      (evaluate_cpi_yoy,                   []),
-        "dxy":      (fetch_dxy_latest_and_mean_deviation,[]),
-        "fed":      (fetch_fed_funds_rate,               []),
-        "fg":       (fetch_macro_history_series,         []),
-        "gdp":      (fetch_fmp_economic_indicator,       ["GDP"]),
-        "rs":       (fetch_fmp_economic_indicator,       ["retailSales"]),
-        "erp":      (fetch_fmp_market_risk_premium,      []),
-    }
-
-    _results = {}
-    with _cf.ThreadPoolExecutor(max_workers=11) as _exe:
-        _futures = {
-            name: _exe.submit(_safe, fn, *args)
-            for name, (fn, args) in _tasks.items()
-        }
-        for name, fut in _futures.items():
-            try:
-                _results[name] = fut.result(timeout=25)
-            except Exception:
-                _results[name] = None
-
-    # ── 결과 언팩 ─────────────────────────────────────────────────────
-    _s = _results.get("spread") or (np.nan, MACRO_STATUS_NA, "조회 실패")
-    spread_val, spread_st, spread_note = _s
-
-    _v = _results.get("vix") or (np.nan, None, "조회 실패")
-    vix_val, vix_hist, vix_err = _v
+    vix_val, vix_hist, vix_err = fetch_vix_latest_and_history()
     vix_st, vix_note = evaluate_vix_status(vix_val)
 
-    wti = _results.get("wti") or np.nan
-    if wti is None:
-        wti = np.nan
+    wti = fetch_wti_latest()
     wti_st, wti_note = evaluate_wti_status(wti)
 
-    _u = _results.get("un") or (MACRO_STATUS_NA, np.nan, np.nan, np.nan, _FRED_TRANSIENT_ERROR_NOTE)
-    un_st, un_avg3, un_yr_low, un_margin, un_note = _u
+    un_st, un_avg3, un_yr_low, un_margin, un_note = evaluate_unemployment_sahm_series()
 
-    _c = _results.get("cpi") or (MACRO_STATUS_NA, np.nan, _FRED_TRANSIENT_ERROR_NOTE)
-    cpi_st, cpi_yoy, cpi_note = _c
+    cpi_st, cpi_yoy, cpi_note = evaluate_cpi_yoy()
 
-    _d = _results.get("dxy") or (np.nan, np.nan, MACRO_STATUS_NA)
-    dxy, dxy_dev, dxy_st_base = _d
+    dxy, dxy_dev, dxy_st_base = fetch_dxy_latest_and_mean_deviation()
 
     rows = []
 
@@ -2119,7 +1566,7 @@ def analyze_us_macro_dashboard():
             "지표": "VIX (공포 지수)",
             "현재값": num_str(vix_val),
             "판정": macro_status_label(vix_st),
-            "판독 요약": vix_note + ("" if (not vix_err or vix_err in ("FMP폴백", "None", None)) else f" [{vix_err}]"),
+            "판독 요약": vix_note + ("" if not vix_err else f" (데이터 참고: {vix_err})"),
             "_status": vix_st,
         }
     )
@@ -2227,8 +1674,7 @@ def analyze_us_macro_dashboard():
     })
 
     # Fed Funds Rate
-    _fr = _results.get("fed") or (np.nan, _FRED_TRANSIENT_ERROR_NOTE)
-    fed_rate, fed_note = _fr
+    fed_rate, fed_note = fetch_fed_funds_rate()
     fed_status = (
         MACRO_STATUS_FAIL if pd.notna(fed_rate) and fed_rate >= 5.0
         else MACRO_STATUS_WARN if pd.notna(fed_rate) and fed_rate >= 3.0
@@ -2241,109 +1687,6 @@ def analyze_us_macro_dashboard():
         "판정": macro_status_label(fed_status),
         "판독 요약": fed_note,
         "_status": fed_status,
-    })
-
-    # ── FMP GDP 성장률 (QoQ %) ──────────────────────────────────────────
-    # FMP 'GDP' API는 절대값(십억 달러 단위 연율)을 반환하므로
-    # 전분기 대비 변화율(%)을 직접 계산해야 한다.
-    _gdp = _results.get("gdp") or (np.nan, np.nan, "")
-    gdp_abs, gdp_abs_prev, gdp_date = _gdp
-    if pd.notna(gdp_abs) and pd.notna(gdp_abs_prev) and gdp_abs_prev != 0:
-        gdp_qoq = float((gdp_abs / gdp_abs_prev - 1.0) * 100)
-    else:
-        gdp_qoq = np.nan
-
-    if pd.notna(gdp_qoq):
-        if gdp_qoq < 0:
-            gdp_st = MACRO_STATUS_FAIL
-            gdp_note = f"GDP QoQ {gdp_qoq:+.2f}% ({gdp_date}) — 마이너스 성장, 기술적 침체 위험 구간."
-        elif gdp_qoq < 0.5:
-            gdp_st = MACRO_STATUS_WARN
-            gdp_note = f"GDP QoQ {gdp_qoq:+.2f}% ({gdp_date}) — 성장 정체 구간. 경기 모멘텀 약화 신호."
-        elif gdp_qoq < 1.0:
-            gdp_st = MACRO_STATUS_WARN
-            gdp_note = f"GDP QoQ {gdp_qoq:+.2f}% ({gdp_date}) — 저성장 구간. 선별적 접근 필요."
-        else:
-            gdp_st = MACRO_STATUS_PASS
-            gdp_note = f"GDP QoQ {gdp_qoq:+.2f}% ({gdp_date}) — 실물 경기 안정권."
-        gdp_display = f"{gdp_qoq:+.2f}% (QoQ)"
-    elif pd.notna(gdp_abs):
-        # prev 없이 절대값만 있을 때 — 표시만 하고 NA 판정
-        gdp_st = MACRO_STATUS_NA
-        gdp_note = f"GDP 절대값 ${gdp_abs:,.0f}B ({gdp_date}). 전분기 데이터 없어 성장률 계산 불가."
-        gdp_display = f"${gdp_abs:,.0f}B"
-    else:
-        gdp_st = MACRO_STATUS_NA
-        gdp_note = "GDP 데이터 없음 (FMP 조회 실패 또는 API 키 미설정)."
-        gdp_display = "N/A"
-
-    rows.append({
-        "지표": "GDP 성장률 QoQ (FMP)",
-        "현재값": gdp_display,
-        "판정": macro_status_label(gdp_st),
-        "판독 요약": gdp_note,
-        "_status": gdp_st,
-    })
-
-    # ── FMP Retail Sales (소매판매 MoM %) ──────────────────────────────
-    # FMP 'retailSales' API는 절대값(백만 달러)을 반환하므로
-    # 전월 대비 변화율(%)을 직접 계산해야 한다.
-    _rs = _results.get("rs") or (np.nan, np.nan, "")
-    rs_abs, rs_abs_prev, rs_date = _rs
-    if pd.notna(rs_abs) and pd.notna(rs_abs_prev) and rs_abs_prev != 0:
-        rs_mom = float((rs_abs / rs_abs_prev - 1.0) * 100)
-    else:
-        rs_mom = np.nan
-
-    if pd.notna(rs_mom):
-        if rs_mom < -1.0:
-            rs_st = MACRO_STATUS_FAIL
-            rs_note = f"소매판매 MoM {rs_mom:+.2f}% ({rs_date}) — 소비 급감, 경기 침체 우려."
-        elif rs_mom < 0:
-            rs_st = MACRO_STATUS_WARN
-            rs_note = f"소매판매 MoM {rs_mom:+.2f}% ({rs_date}) — 소비 모멘텀 둔화."
-        elif rs_mom < 0.3:
-            rs_st = MACRO_STATUS_WARN
-            rs_note = f"소매판매 MoM {rs_mom:+.2f}% ({rs_date}) — 소비 정체 구간. 모니터링 필요."
-        else:
-            rs_st = MACRO_STATUS_PASS
-            rs_note = f"소매판매 MoM {rs_mom:+.2f}% ({rs_date}) — 소비 체력 유지."
-        rs_display = f"{rs_mom:+.2f}% (MoM)"
-    elif pd.notna(rs_abs):
-        rs_st = MACRO_STATUS_NA
-        rs_note = f"소매판매 절대값 ${rs_abs:,.0f}M ({rs_date}). 전월 데이터 없어 변화율 계산 불가."
-        rs_display = f"${rs_abs:,.0f}M"
-    else:
-        rs_st = MACRO_STATUS_NA
-        rs_note = "소매판매 데이터 없음."
-        rs_display = "N/A"
-
-    rows.append({
-        "지표": "소매판매 MoM (FMP)",
-        "현재값": rs_display,
-        "판정": macro_status_label(rs_st),
-        "판독 요약": rs_note,
-        "_status": rs_st,
-    })
-
-    # ── FMP Market Risk Premium (ERP) ──────────────────────────────────
-    _erp = _results.get("erp") or (np.nan, "조회 실패")
-    erp_val, erp_note = _erp
-    if pd.notna(erp_val):
-        if erp_val >= 5.5:
-            erp_st = MACRO_STATUS_PASS
-        elif erp_val >= 3.5:
-            erp_st = MACRO_STATUS_WARN
-        else:
-            erp_st = MACRO_STATUS_FAIL
-    else:
-        erp_st = MACRO_STATUS_NA
-    rows.append({
-        "지표": "주식 위험 프리미엄 ERP (FMP)",
-        "현재값": f"{erp_val:.2f}%" if pd.notna(erp_val) else "N/A",
-        "판정": macro_status_label(erp_st),
-        "판독 요약": erp_note,
-        "_status": erp_st,
     })
 
     bad_total = sum(1 for r in rows if macro_status_bad_count(r["_status"]))
@@ -2662,7 +2005,6 @@ def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "")
                 "vol_surge": round(vol_surge, 2) if pd.notna(vol_surge) else None,
                 "verdict": verdict,
                 "detail": detail,
-                "current_price": round(float(s.iloc[-1]), 4) if not s.empty and pd.notna(s.iloc[-1]) else None,  # ✅ Watchlist saved_price용
             })
 
         results.sort(key=lambda x: (
@@ -2783,7 +2125,7 @@ def cached_analyze_us_macro_dashboard():
 def get_macro_dashboard_with_validation():
     """rows가 8개 미만이면 캐시를 자동 무효화하고 재호출."""
     pack = cached_analyze_us_macro_dashboard()
-    if pack and len(pack.get("rows", [])) < 10:
+    if pack and len(pack.get("rows", [])) < 8:
         cached_analyze_us_macro_dashboard.clear()
         pack = cached_analyze_us_macro_dashboard()
     return pack
@@ -2905,7 +2247,7 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
         data = r.json() if r.status_code == 200 else []
         if isinstance(data, list) and len(data) >= 2:
             rows = []
-            today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+            today_str = str(datetime.now().date())
             for item in data[:8]:
                 date_str = str(item.get("date") or item.get("fiscalDateEnding") or "")[:10]
                 if not date_str or date_str >= today_str:
@@ -2969,7 +2311,7 @@ def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     # 최근 3개 분기 순서로 시도 (데이터가 있는 분기까지)
-    now = datetime.now(_MARKET_ET_TZ)
+    now = datetime.now()
     q_now = (now.month - 1) // 3
     year_now = now.year
     if q_now == 0:
@@ -3049,12 +2391,12 @@ def cached_institutional_holders(ticker_upper: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 @st.cache_data(ttl=1800, show_spinner=False)
 def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     """
-    Daily Risk Gauge — 하락장 선행 신호 6가지 종합 점수.
+    Daily Risk Gauge — 하락장 선행 신호 5가지 종합 점수.
     sector_filter: "전체" | "테크·반도체" | "에너지" | "금융" | "헬스케어" | "산업재"
-    신호 6: FMP Economic Calendar 이벤트 리스크 (당일~3일 이내 고임팩트 이벤트)
     """
     import time as _time
 
@@ -3075,169 +2417,14 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     signals = {}
     warnings = []
     details = {}
-    import concurrent.futures as _cf_drg
 
-    k_drg = _fmp_key()
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # 모든 외부 API 데이터를 병렬로 미리 fetch
-    # ══════════════════════════════════════════════════════════════════════════
-    def _fetch_vix_data():
-        try:
-            v, h, e = fetch_vix_latest_and_history()
-            return ("vix", (v, h, e))
-        except Exception:
-            return ("vix", (np.nan, None, "오류"))
-
-    def _fetch_credit_data():
-        try:
-            tickers = ["HYG", "LQD"]
-            df = _fmp_batch_to_close_df(tickers, limit=30)
-            return ("credit", df)
-        except Exception:
-            return ("credit", pd.DataFrame())
-
-    def _fetch_leaders_data():
-        try:
-            tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
-            df = _fmp_batch_to_close_df(tickers_dl, limit=30)
-            return ("leaders", df)
-        except Exception:
-            return ("leaders", pd.DataFrame())
-
-    def _fetch_futures_data():
-        """프리마켓 방향 — SPY/QQQ stock-price-change API (1일 변화율).
-        FMP는 ES=F/NQ=F 선물 심볼 미지원. stock-price-change가 가장 정확한 대체.
-        프리마켓 시간대에는 quote의 price가 프리마켓 가격을 반영함.
-        """
-        results = {}
-        if not k_drg:
-            return ("futures", results)
-
-        # 1차: stock-price-change API (1D 변화율 — 가장 신뢰도 높음)
-        try:
-            r_chg = requests.get(
-                f"{_FMP_BASE}/stock-price-change?symbol=SPY,QQQ&apikey={k_drg}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r_chg.status_code == 200:
-                data_chg = r_chg.json()
-                items = data_chg if isinstance(data_chg, list) else [data_chg]
-                for item in items:
-                    sym = str(item.get("symbol", "")).upper()
-                    chg1d = to_float(item.get("1D") or item.get("1d") or item.get("day"))
-                    if sym in ("SPY", "QQQ") and pd.notna(chg1d):
-                        results[sym] = {"chg_pct": chg1d, "source": "price-change"}
-        except Exception:
-            pass
-
-        # 2차: quote API 폴백 (price vs previousClose)
-        for sym in ["SPY", "QQQ"]:
-            if sym in results:
-                continue
-            try:
-                r_q = requests.get(
-                    f"{_FMP_BASE}/quote?symbol={sym}&apikey={k_drg}",
-                    timeout=_FMP_TIMEOUT,
-                )
-                if r_q.status_code == 200:
-                    d_q = r_q.json()
-                    item = d_q[0] if isinstance(d_q, list) and d_q else d_q
-                    price = to_float(item.get("price"))
-                    prev  = to_float(item.get("previousClose") or item.get("prevClose"))
-                    chg_pct = to_float(item.get("changesPercentage") or item.get("changePercent"))
-                    if pd.notna(chg_pct):
-                        results[sym] = {"chg_pct": chg_pct, "source": "quote"}
-                    elif pd.notna(price) and pd.notna(prev) and prev > 0:
-                        results[sym] = {"chg_pct": (price / prev - 1) * 100, "source": "quote"}
-            except Exception:
-                pass
-
-        return ("futures", results)
-
-    def _fetch_riskoff_data():
-        results = {}
-        if not k_drg:
-            return ("riskoff", results)
-        # UUP, GLD, IEF를 배치로 한 번에
-        try:
-            df = _fmp_batch_to_close_df(["UUP", "GLD", "IEF"], limit=10)
-            name_map = {"UUP": "달러", "GLD": "금", "IEF": "국채(7-10Y)"}
-            for sym, name in name_map.items():
-                if sym in df.columns:
-                    s = pd.to_numeric(df[sym], errors="coerce").dropna()
-                    chg = float((s.iloc[-1] / s.iloc[-6] - 1) * 100) if len(s) >= 6 else np.nan
-                    results[sym] = {"name": name, "chg_pct": chg}
-        except Exception:
-            pass
-        return ("riskoff", results)
-
-    def _fetch_calendar_data():
-        try:
-            return ("calendar", fetch_fmp_economic_calendar_risk())
-        except Exception:
-            return ("calendar", ([], False))
-
-    def _fetch_news_data():
-        news = []
-        if not k_drg:
-            return ("news", news)
-        try:
-            risk_tickers = ["SPY", sector_etf] + leaders[:2]
-            for tk in list(dict.fromkeys(risk_tickers))[:3]:
-                try:
-                    r = requests.get(
-                        f"{_FMP_BASE}/stock-news?symbols={tk}&limit=3&apikey={k_drg}",
-                        timeout=_FMP_TIMEOUT
-                    )
-                    if r.status_code == 200:
-                        tk_news = r.json()
-                        if isinstance(tk_news, list):
-                            for n in tk_news[:3]:
-                                title = str(n.get("title") or "")
-                                if title:
-                                    news.append({
-                                        "ticker": tk,
-                                        "title": title,
-                                        "publisher": str(n.get("site") or n.get("publisher") or ""),
-                                        "link": str(n.get("url") or n.get("link") or ""),
-                                        "pub_time": n.get("publishedDate") or n.get("date"),
-                                    })
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return ("news", news)
-
-    # 7개 fetch 함수를 동시 실행
-    _prefetch_tasks = [
-        _fetch_vix_data, _fetch_credit_data, _fetch_leaders_data,
-        _fetch_futures_data, _fetch_riskoff_data, _fetch_calendar_data,
-        _fetch_news_data,
-    ]
-    _prefetch = {}
-    with _cf_drg.ThreadPoolExecutor(max_workers=7) as _exe_drg:
-        _futs_drg = {_exe_drg.submit(fn): fn.__name__ for fn in _prefetch_tasks}
-        for fut in _cf_drg.as_completed(_futs_drg, timeout=20):
-            try:
-                key, val = fut.result()
-                _prefetch[key] = val
-            except Exception:
-                pass
-
-    # ── 신호 1: VIX 방향 전환 ────────────────────────────────────────────
-    vix_close = pd.Series(dtype=float)
+    # ── 신호 1: VIX 방향 전환 ───────────────────────────────────────────
     try:
-        _vix_val, _vix_hist, _vix_err = _prefetch.get("vix", (np.nan, None, "N/A"))
-        if _vix_hist is not None and not _vix_hist.empty and "Close" in _vix_hist.columns:
-            _s30 = pd.to_numeric(_vix_hist["Close"], errors="coerce").dropna().tail(30)
-            if len(_s30) >= 10:
-                vix_close = _s30
-    except Exception:
-        pass
-    try:
+        vix_s = fred.get_series("VIXCLS")
+        vix_close = pd.to_numeric(vix_s, errors="coerce").dropna().tail(30)
         if len(vix_close) >= 10:
             vix_now = float(vix_close.iloc[-1])
+            vix_5d_avg = float(vix_close.tail(5).mean())
             vix_20d_avg = float(vix_close.tail(20).mean())
             vix_trend = vix_now - float(vix_close.iloc[-6]) if len(vix_close) >= 6 else 0
             vix_alert = vix_trend > 2 or vix_now > vix_20d_avg * 1.15
@@ -3245,16 +2432,15 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             details["VIX"] = {"현재값": f"{vix_now:.1f}", "5일 변화": f"{vix_trend:+.1f}", "20일 평균": f"{vix_20d_avg:.1f}"}
             if vix_alert:
                 warnings.append(f"⚠️ VIX 상승 전환 감지 ({vix_now:.1f}, +{vix_trend:.1f}/5일)")
-        else:
-            signals["vix"] = {"ok": True, "value": "N/A", "trend": "N/A"}
     except Exception:
         signals["vix"] = {"ok": True, "value": "N/A", "trend": "N/A"}
 
-    # ── 신호 2: 신용 스프레드 (HYG/LQD) ─────────────────────────────────
+    # ── 신호 2: Put/Call Ratio (HYG/LQD 스프레드로 근사) ─────────────────
     try:
-        _credit_df = _prefetch.get("credit", pd.DataFrame())
-        hyg = pd.to_numeric(_credit_df.get("HYG", pd.Series(dtype=float)), errors="coerce").dropna()
-        lqd = pd.to_numeric(_credit_df.get("LQD", pd.Series(dtype=float)), errors="coerce").dropna()
+        hyg_df = _fmp_price_history("HYG", limit=30)
+        lqd_df = _fmp_price_history("LQD", limit=30)
+        hyg = pd.to_numeric(hyg_df["Close"], errors="coerce").dropna() if not hyg_df.empty else pd.Series(dtype=float)
+        lqd = pd.to_numeric(lqd_df["Close"], errors="coerce").dropna() if not lqd_df.empty else pd.Series(dtype=float)
         if len(hyg) >= 10 and len(lqd) >= 10:
             spread_now = float(hyg.iloc[-1] / lqd.iloc[-1])
             spread_5d = float(hyg.iloc[-6] / lqd.iloc[-6]) if len(hyg) >= 6 else spread_now
@@ -3264,16 +2450,15 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             details["HYG/LQD 스프레드"] = {"5일 변화": f"{spread_chg:+.2f}%", "판정": "⚠️ 축소(위험)" if spread_alert else "✅ 정상"}
             if spread_alert:
                 warnings.append(f"⚠️ 신용 스프레드 축소 ({spread_chg:+.2f}%/5일) — 리스크오프 신호")
-        else:
-            signals["credit"] = {"ok": True, "value": "N/A", "trend": ""}
     except Exception:
         signals["credit"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 3: 대장주 모멘텀 약화 ───────────────────────────────────────
+    # ── 신호 3: 대장주 모멘텀 약화 ─────────────────────────────────────
     try:
-        close_df = _prefetch.get("leaders", pd.DataFrame())
         leader_alerts = []
         leader_details = {}
+        tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
+        close_df = _fmp_batch_to_close_df(tickers_dl, limit=30)
 
         spy_s = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
         spy_5d = float((spy_s.iloc[-1]/spy_s.iloc[-6] - 1)*100) if len(spy_s) >= 6 else 0
@@ -3305,133 +2490,91 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     except Exception:
         signals["leaders"] = {"ok": True, "value": "N/A", "trend": ""}
 
-    # ── 신호 4: 프리마켓 방향 (SPY/QQQ 1일 변화율) — prefetch 결과 사용 ─
-    # FMP는 ES=F/NQ=F 미지원 → stock-price-change + quote API로 SPY/QQQ 사용
+    # ── 신호 4: 거래량 패턴 (상승 + 거래량 감소 = 분산 매도) ─────────────
     try:
-        _fut_results = _prefetch.get("futures", {})
-        if _fut_results:
-            _fut_chgs = [v["chg_pct"] for v in _fut_results.values()
-                         if pd.notna(v.get("chg_pct", np.nan))]
-            _avg_chg = float(np.mean(_fut_chgs)) if _fut_chgs else np.nan
-            if pd.notna(_avg_chg):
-                fut_alert = _avg_chg <= -0.5
-                if _avg_chg >= 0.3:
-                    fut_label = f"📈 +{_avg_chg:.2f}%"
-                elif _avg_chg <= -0.3:
-                    fut_label = f"📉 {_avg_chg:.2f}%"
-                else:
-                    fut_label = f"➡️ {_avg_chg:+.2f}%"
-                spy_chg = _fut_results.get("SPY", {}).get("chg_pct", np.nan)
-                qqq_chg = _fut_results.get("QQQ", {}).get("chg_pct", np.nan)
-                spy_str = f"SPY {spy_chg:+.2f}%" if pd.notna(spy_chg) else "N/A"
-                qqq_str = f"QQQ {qqq_chg:+.2f}%" if pd.notna(qqq_chg) else "N/A"
-                signals["futures"] = {
-                    "ok": not fut_alert,
-                    "value": fut_label,
-                    "trend": f"{spy_str} / {qqq_str}",
+        raw_full = _fmp_price_history(sector_etf, limit=30)
+        if raw_full is not None and not raw_full.empty and len(raw_full) >= 10:
+            etf_close = pd.to_numeric(raw_full["Close"], errors="coerce").dropna()
+            vol = pd.to_numeric(raw_full.get("Volume", pd.Series(dtype=float)), errors="coerce").dropna()
+
+            if len(etf_close) >= 6 and len(vol) >= 10:
+                price_5d  = float((etf_close.iloc[-1] / etf_close.iloc[-6] - 1) * 100)
+                vol_5d    = float(vol.tail(5).mean())
+                vol_20d   = float(vol.tail(20).mean())
+                vol_ratio = vol_5d / vol_20d if vol_20d > 0 else 1.0
+                dist_selling = price_5d > 0 and vol_ratio < 0.8
+                vol_alert    = dist_selling or vol_ratio < 0.7
+                signals["volume"] = {"ok": not vol_alert, "value": f"{vol_ratio:.2f}x", "trend": f"가격 {price_5d:+.1f}%"}
+                details["거래량"] = {
+                    "5일 평균 비율": f"{vol_ratio:.2f}x",
+                    "가격 5일": f"{price_5d:+.1f}%",
+                    "판정": "⚠️ 분산 매도" if dist_selling else ("⚠️ 거래량 급감" if vol_ratio < 0.7 else "✅ 정상"),
                 }
-                details["프리마켓 방향"] = {
-                    "SPY (S&P500)": spy_str,
-                    "QQQ (나스닥100)": qqq_str,
-                    "평균 변화율": f"{_avg_chg:+.2f}%",
-                    "판정": "⚠️ 갭다운 우려" if fut_alert else "✅ 정상",
-                    "데이터 소스": "FMP stock-price-change / quote",
-                }
-                if fut_alert:
-                    warnings.append(
-                        f"⚠️ 프리마켓 하락 ({spy_str} / {qqq_str}) — 갭다운 개장 가능성"
+                if vol_alert:
+                    warnings.append(f"⚠️ {'분산 매도 패턴' if dist_selling else '거래량 급감'} (비율 {vol_ratio:.2f}x)")
+            else:
+                signals["volume"] = {"ok": True, "value": "N/A", "trend": "데이터 부족"}
+        else:
+            signals["volume"] = {"ok": True, "value": "N/A", "trend": "데이터 없음"}
+    except Exception:
+        signals["volume"] = {"ok": True, "value": "N/A", "trend": ""}
+
+    # ── 신호 5: VIX 선물 구조 (VIX > VXN 비율) ────────────────────────────
+    try:
+        vxn_df = _fmp_price_history("^VXN", limit=10)
+        if vxn_df.empty:
+            # FMP에서 ^VXN 안되면 FRED VXN 시도
+            try:
+                vxn_s = fred.get_series("VXNCLS")
+                vxn = pd.to_numeric(vxn_s, errors="coerce").dropna().tail(5)
+            except Exception:
+                vxn = pd.Series(dtype=float)
+        else:
+            vxn = pd.to_numeric(vxn_df["Close"], errors="coerce").dropna()
+        if not vxn.empty and "vix" in signals and signals["vix"]["value"] != "N/A":
+            vix_now2 = float(vix_close.iloc[-1])
+            vxn_now = float(vxn.iloc[-1])
+            ratio = vix_now2 / vxn_now if vxn_now > 0 else 1
+            fear_spike = ratio > 0.95
+            signals["vix_vxn"] = {"ok": not fear_spike, "value": f"VIX/VXN {ratio:.3f}", "trend": ""}
+            details["VIX/VXN 비율"] = {"현재": f"{ratio:.3f}", "판정": "⚠️ 공포 급등" if fear_spike else "✅ 정상"}
+            if fear_spike:
+                warnings.append(f"⚠️ VIX/VXN 비율 {ratio:.3f} — 공포 급등 신호")
+        else:
+            signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
+    except Exception:
+        signals["vix_vxn"] = {"ok": True, "value": "N/A", "trend": ""}
+
+    # ── 뉴스 수집 ─────────────────────────────────────────────────────────
+    news_items = []
+    k = _fmp_key()
+    try:
+        risk_tickers = ["SPY", sector_etf] + leaders[:2]
+        for tk in risk_tickers[:3]:
+            try:
+                if k:
+                    r = requests.get(
+                        f"{_FMP_BASE}/stock-news?symbols={tk}&limit=3&apikey={k}",
+                        timeout=_FMP_TIMEOUT
                     )
-            else:
-                signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
-        else:
-            signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
+                    tk_news = r.json() if r.status_code == 200 else []
+                    if isinstance(tk_news, list):
+                        for n in tk_news[:3]:
+                            title = str(n.get("title") or "")
+                            publisher = str(n.get("site") or n.get("publisher") or "")
+                            link = str(n.get("url") or n.get("link") or "")
+                            pub_time = n.get("publishedDate") or n.get("date")
+                            if title:
+                                news_items.append({
+                                    "ticker": tk, "title": title,
+                                    "publisher": publisher, "link": link,
+                                    "pub_time": pub_time,
+                                })
+                _time.sleep(0.3)
+            except Exception:
+                continue
     except Exception:
-        signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
-
-    # ── 신호 5: 달러·금·국채 리스크오프 신호 — prefetch 결과 사용 ────────
-    try:
-        _safety_results = _prefetch.get("riskoff", {})
-        if _safety_results:
-            _rising = [sym for sym, v in _safety_results.items()
-                       if pd.notna(v["chg_pct"]) and v["chg_pct"] > 0.3]
-            _risk_off = len(_rising) >= 2
-            # SPY도 하락 중이면 리스크오프 확증
-            _spy_also_down = False
-            if "leaders" in signals and len(leaders) > 0:
-                try:
-                    _spy_row = close_dict.get("SPY") if "close_dict" in dir() else None
-                    if _spy_row is not None and len(_spy_row) >= 6:
-                        _spy_5d = float((_spy_row.iloc[-1] / _spy_row.iloc[-6] - 1) * 100)
-                        _spy_also_down = _spy_5d < -0.5
-                except Exception:
-                    pass
-            riskoff_alert = _risk_off and _spy_also_down
-
-            _parts = [f"{v['name']} {v['chg_pct']:+.1f}%" for v in _safety_results.values()
-                      if pd.notna(v.get("chg_pct"))]
-            val5 = " / ".join(_parts) if _parts else "N/A"
-            signals["riskoff"] = {"ok": not riskoff_alert, "value": val5, "trend": ""}
-            details["달러·금·국채"] = {
-                k: f"{v['chg_pct']:+.1f}% (5일)" if pd.notna(v.get("chg_pct")) else "N/A"
-                for k, v in _safety_results.items()
-            }
-            details["달러·금·국채"]["판정"] = "⚠️ 리스크오프 확증" if riskoff_alert else (
-                "🟡 안전자산 강세 (SPY 확인 필요)" if _risk_off else "✅ 정상"
-            )
-            if riskoff_alert:
-                warnings.append(f"⚠️ 달러·금·국채 동반 강세 + SPY 약세 — 리스크오프 본격화 신호")
-            elif _risk_off:
-                warnings.append(f"🟡 안전자산 {len(_rising)}개 동반 강세 — 리스크오프 경향 모니터링")
-        else:
-            signals["riskoff"] = {"ok": True, "value": "N/A (FMP키 없음)", "trend": ""}
-    except Exception:
-        signals["riskoff"] = {"ok": True, "value": "N/A", "trend": ""}
-
-    # ── 신호 6: 이벤트 리스크 — prefetch 결과 사용 ──────────────────────
-    cal_events = []
-    try:
-        cal_events, has_high_impact = _prefetch.get("calendar", ([], False))
-        if cal_events:
-            high_events = [e for e in cal_events if e["impact"].lower() in ("high", "3")]
-            med_events  = [e for e in cal_events if e["impact"].lower() in ("medium", "2")]
-            event_alert = has_high_impact
-            if high_events:
-                ev_names = ", ".join(e["event"] for e in high_events[:3])
-                ev_dates = high_events[0]["date"]
-                signals["event_risk"] = {
-                    "ok":    False,
-                    "value": f"고임팩트 {len(high_events)}건",
-                    "trend": ev_names[:60],
-                }
-                details["이벤트 리스크"] = {
-                    "고임팩트": f"{len(high_events)}건 ({ev_dates}~)",
-                    "주요 이벤트": ev_names[:80],
-                    "판정": "⚠️ 변동성 확대 주의",
-                }
-                warnings.append(
-                    f"⚠️ 고임팩트 경제 이벤트 {len(high_events)}건 예정 "
-                    f"({ev_dates}): {ev_names[:60]}"
-                )
-            elif med_events:
-                signals["event_risk"] = {
-                    "ok":    True,
-                    "value": f"중간 임팩트 {len(med_events)}건",
-                    "trend": "",
-                }
-                details["이벤트 리스크"] = {
-                    "중간임팩트": f"{len(med_events)}건",
-                    "판정": "✅ 고임팩트 없음",
-                }
-            else:
-                signals["event_risk"] = {"ok": True, "value": "고임팩트 이벤트 없음", "trend": ""}
-                details["이벤트 리스크"] = {"판정": "✅ 3일 이내 고임팩트 없음"}
-        else:
-            signals["event_risk"] = {"ok": True, "value": "캘린더 조회 불가", "trend": ""}
-    except Exception:
-        signals["event_risk"] = {"ok": True, "value": "N/A", "trend": ""}
-
-    # ── 뉴스 — prefetch 결과 사용 ────────────────────────────────────────
-    news_items = _prefetch.get("news", [])
+        pass
 
     # ── 종합 점수 계산 ─────────────────────────────────────────────────────
     ok_count = sum(1 for v in signals.values() if v["ok"])
@@ -3465,7 +2608,6 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
         "details": details,
         "news_items": news_items,
         "sector_filter": sector_filter,
-        "event_calendar": cal_events,
     }
 
 
@@ -4043,31 +3185,12 @@ def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fmp_batch_price_history(tickers: list, limit: int = 130) -> dict:
-    """여러 티커를 ThreadPoolExecutor로 병렬 FMP 호출 → {ticker: DataFrame} 반환.
-    순차 루프 대비 섹터 스캔(30~50종목) 기준 약 5~8배 속도 향상.
-    max_workers=8: FMP Starter 레이트 리밋(300 req/min) 여유 있게 유지.
-    """
-    if not tickers:
-        return {}
-
-    import concurrent.futures
-
-    _MAX_WORKERS = 8  # FMP 레이트 리밋 감안한 동시 요청 수
-
-    def _fetch_one(tk):
-        df = _fmp_price_history(tk, limit=limit)
-        return tk, df
-
+    """여러 티커를 개별 FMP 호출로 수집 → {ticker: DataFrame} 반환."""
     result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        futures = {executor.submit(_fetch_one, tk): tk for tk in tickers}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                tk, df = future.result()
-                if not df.empty:
-                    result[tk] = df
-            except Exception:
-                pass  # 개별 티커 실패가 전체 배치를 중단시키지 않음
+    for tk in tickers:
+        df = _fmp_price_history(tk, limit=limit)
+        if not df.empty:
+            result[tk] = df
     return result
 
 
@@ -4083,235 +3206,6 @@ def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
     if not close_dict:
         return pd.DataFrame()
     return pd.DataFrame(close_dict).sort_index()
-
-def _fmp_fill_parallel_warmup(tickers: list, max_workers: int = 10) -> dict:
-    """
-    스캐너 루프 전에 _fmp_fill()을 종목별 병렬 실행해 캐시를 웜업한다.
-    반환: {ticker: info_dict} — 루프 안에서 바로 조회해 HTTP 재호출 없이 사용.
-
-    max_workers=10: FMP Starter 300 req/min 여유 감안.
-    _fmp_fill() 내부 캐시 함수(_fmp_profile 등)는 @st.cache_data 공유이므로
-    병렬 호출 시 첫 호출만 HTTP, 이후는 캐시 히트 → rate limit 안전.
-    """
-    import concurrent.futures as _cf
-
-    if not tickers:
-        return {}
-
-    results = {}
-
-    def _fill_one(tk):
-        try:
-            return tk, _fmp_fill({}, tk)
-        except Exception:
-            return tk, {}
-
-    with _cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fill_one, tk): tk for tk in tickers}
-        for future in _cf.as_completed(futures):
-            try:
-                tk, info = future.result()
-                results[tk] = info
-            except Exception:
-                results[futures[future]] = {}
-
-    return results
-
-
-
-
-# ── _fmp_fill 내부 uncached requests.get 3개를 캐싱 래퍼로 분리 ──────────
-# 기존: _fmp_fill() 호출마다 /quote, /analyst-estimates, /balance-sheet를
-#        직접 requests.get → 스캐너 30~50 티커 루프에서 최대 150회 raw HTTP.
-# 개선: 각각 @st.cache_data(ttl=3600) 래퍼로 감싸 첫 호출 이후 캐시 히트.
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_quote(ticker: str) -> dict:
-    """FMP /quote — MA50/MA200/52w고저/현재가/시총. _fmp_fill 전용 캐싱 래퍼."""
-    k = _fmp_key()
-    if not k:
-        return {}
-    try:
-        r = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
-        if r.status_code == 200:
-            d = r.json()
-            return d[0] if isinstance(d, list) and d else {}
-    except Exception:
-        pass
-    return {}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_analyst_estimates(ticker: str) -> list:
-    """FMP /analyst-estimates (annual, limit=4) — Forward P/E 계산용. _fmp_fill 전용 캐싱 래퍼."""
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_balance_sheet(ticker: str) -> dict:
-    """FMP /balance-sheet-statement (limit=2) — ROE·D/E 직접 계산용. _fmp_fill 전용 캐싱 래퍼."""
-    k = _fmp_key()
-    if not k:
-        return {}
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit=2&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d[0] if isinstance(d, list) and d else {}
-    except Exception:
-        pass
-    return {}
-
-
-# ── 신규 기능용 FMP 캐싱 래퍼 ────────────────────────────────────────────────
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_financial_scores(ticker: str) -> dict:
-    """FMP /financial-scores — Altman Z-Score + Piotroski F-Score.
-    반환 키: altmanZScore, piotroskiScore, workingCapital, retainedEarnings 등.
-    """
-    k = _fmp_key()
-    if not k:
-        return {}
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/financial-scores?symbol={ticker}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
-    except Exception:
-        pass
-    return {}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_sector_pe_snapshot() -> list:
-    """FMP /sector-pe-snapshot — 전 섹터 현재 PER 스냅샷.
-    반환: [{"sector": "Technology", "pe": 32.1, "date": "2024-02-01"}, ...]
-    """
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        from datetime import date
-        today = date.today().isoformat()
-        r = requests.get(
-            f"{_FMP_BASE}/sector-pe-snapshot?date={today}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_earnings_transcript(ticker: str) -> dict:
-    """FMP /earning-call-transcript — 직전 분기 어닝콜 원문.
-    반환: {"symbol": ..., "quarter": ..., "year": ..., "content": ...}
-    """
-    k = _fmp_key()
-    if not k:
-        return {}
-    try:
-        # 날짜 목록 먼저 조회 → 가장 최근 분기/연도 파악
-        rd = requests.get(
-            f"{_FMP_BASE}/earning-call-transcript-dates?symbol={ticker}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if rd.status_code != 200:
-            return {}
-        dates = rd.json()
-        if not isinstance(dates, list) or not dates:
-            return {}
-        # 첫 번째 항목이 가장 최근 (FMP 응답 내림차순)
-        latest = dates[0]
-        year = latest.get("year") or latest[0] if isinstance(latest, list) else latest.get("year")
-        quarter = latest.get("quarter") or latest[1] if isinstance(latest, list) else latest.get("quarter")
-        if not year or not quarter:
-            return {}
-        rt = requests.get(
-            f"{_FMP_BASE}/earning-call-transcript?symbol={ticker}&year={year}&quarter={quarter}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if rt.status_code == 200:
-            d = rt.json()
-            item = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
-            return item
-    except Exception:
-        pass
-    return {}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_historical_ratings(ticker: str) -> list:
-    """FMP /grades-historical — 애널리스트 등급 변경 히스토리 (최근 15건).
-    반환: [{"date": ..., "company": ..., "analyst": ..., "previousGrade": ..., "newGrade": ..., "action": ...}, ...]
-    """
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/grades-historical?symbol={ticker}&limit=15&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fmp_company_screener(
-    sector: str = "",
-    market_cap_min: int = 1_000_000_000,
-    volume_min: int = 500_000,
-    limit: int = 50,
-) -> list:
-    """FMP /company-screener — 조건 기반 종목 자동 탐색.
-    sector: 'Technology', 'Healthcare' 등 빈 문자열이면 전체.
-    반환: [{"symbol": ..., "companyName": ..., "marketCap": ..., "sector": ..., "volume": ...}, ...]
-    """
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        params = f"marketCapMoreThan={market_cap_min}&volumeMoreThan={volume_min}&limit={limit}&apikey={k}"
-        if sector:
-            params += f"&sector={sector.replace(' ', '%20')}"
-        r = requests.get(
-            f"{_FMP_BASE}/company-screener?{params}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
 
 
 def _fmp_fill(info: dict, ticker: str) -> dict:
@@ -4367,26 +3261,31 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
     _need_quote = not all([info.get("fiftyDayAverage"), info.get("twoHundredDayAverage")])
     if _need_quote:
         try:
-            q_item = _fmp_quote(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
-            if q_item:
-                if not info.get("fiftyDayAverage"):
-                    v = to_float(q_item.get("priceAvg50"))
-                    if pd.notna(v): info["fiftyDayAverage"] = v
-                if not info.get("twoHundredDayAverage"):
-                    v = to_float(q_item.get("priceAvg200"))
-                    if pd.notna(v): info["twoHundredDayAverage"] = v
-                if not info.get("fiftyTwoWeekHigh"):
-                    v = to_float(q_item.get("yearHigh"))
-                    if pd.notna(v): info["fiftyTwoWeekHigh"] = v
-                if not info.get("fiftyTwoWeekLow"):
-                    v = to_float(q_item.get("yearLow"))
-                    if pd.notna(v): info["fiftyTwoWeekLow"] = v
-                if not info.get("currentPrice"):
-                    v = to_float(q_item.get("price"))
-                    if pd.notna(v): info["currentPrice"] = v
-                if not info.get("marketCap"):
-                    v = to_float(q_item.get("marketCap"))
-                    if pd.notna(v): info["marketCap"] = v
+            k_q = _fmp_key()
+            if k_q:
+                rq = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k_q}", timeout=_FMP_TIMEOUT)
+                if rq.status_code == 200:
+                    qd = rq.json()
+                    q_item = qd[0] if isinstance(qd, list) and qd else {}
+                    if q_item:
+                        if not info.get("fiftyDayAverage"):
+                            v = to_float(q_item.get("priceAvg50"))
+                            if pd.notna(v): info["fiftyDayAverage"] = v
+                        if not info.get("twoHundredDayAverage"):
+                            v = to_float(q_item.get("priceAvg200"))
+                            if pd.notna(v): info["twoHundredDayAverage"] = v
+                        if not info.get("fiftyTwoWeekHigh"):
+                            v = to_float(q_item.get("yearHigh"))
+                            if pd.notna(v): info["fiftyTwoWeekHigh"] = v
+                        if not info.get("fiftyTwoWeekLow"):
+                            v = to_float(q_item.get("yearLow"))
+                            if pd.notna(v): info["fiftyTwoWeekLow"] = v
+                        if not info.get("currentPrice"):
+                            v = to_float(q_item.get("price"))
+                            if pd.notna(v): info["currentPrice"] = v
+                        if not info.get("marketCap"):
+                            v = to_float(q_item.get("marketCap"))
+                            if pd.notna(v): info["marketCap"] = v
         except Exception:
             pass
 
@@ -4425,42 +3324,55 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
     # 실제 API 응답: epsAvg 필드 사용, period=annual&limit=4로 가장 가까운 연도 우선
     if not info.get("forwardPE"):
         try:
-            ae_data = _fmp_analyst_estimates(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
-            if isinstance(ae_data, list) and ae_data:
-                current_year = datetime.now(_MARKET_ET_TZ).year
-                # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
-                ae_sorted = sorted(
-                    ae_data,
-                    key=lambda x: str(x.get("date") or x.get("year") or "9999")
+            k_val = _fmp_key()
+            if k_val:
+                r_ae = requests.get(
+                    f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k_val}",
+                    timeout=_FMP_TIMEOUT
                 )
-                for ae in ae_sorted:
-                    ae_year_str = str(ae.get("date") or ae.get("year") or "")[:4]
-                    try:
-                        ae_year = int(ae_year_str)
-                    except Exception:
-                        continue
-                    if ae_year < current_year:
-                        continue
-                    # 실제 API 필드명: epsAvg (확인됨)
-                    est_eps = to_float(
-                        ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
-                        ae.get("estimatedEps") or ae.get("eps")
-                    )
-                    cur_price = to_float(
-                        info.get("currentPrice") or info.get("price") or
-                        info.get("regularMarketPrice") or info.get("_fmp_price")
-                    )
-                    # currentPrice 없으면 캐싱된 profile에서 가져오기 (기존: 별도 requests.get)
-                    if (cur_price is None or pd.isna(cur_price)):
-                        _p_cur = _fmp_profile(ticker)
-                        cur_price = to_float(_p_cur.get("price")) if _p_cur else np.nan
-                        if pd.notna(cur_price):
-                            info["currentPrice"] = cur_price
-                    if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
-                        fwd_pe = round(float(cur_price) / float(est_eps), 2)
-                        if 0 < fwd_pe < 2000:
-                            info["forwardPE"] = fwd_pe
-                            break
+                if r_ae.status_code == 200:
+                    ae_data = r_ae.json()
+                    if isinstance(ae_data, list) and ae_data:
+                        current_year = datetime.now().year
+                        # 날짜 오름차순 정렬 → 가장 가까운 미래 연도 우선
+                        ae_sorted = sorted(
+                            ae_data,
+                            key=lambda x: str(x.get("date") or x.get("year") or "9999")
+                        )
+                        for ae in ae_sorted:
+                            ae_year_str = str(ae.get("date") or ae.get("year") or "")[:4]
+                            try:
+                                ae_year = int(ae_year_str)
+                            except Exception:
+                                continue
+                            if ae_year < current_year:
+                                continue
+                            # 실제 API 필드명: epsAvg (확인됨)
+                            est_eps = to_float(
+                                ae.get("epsAvg") or ae.get("estimatedEpsAvg") or
+                                ae.get("estimatedEps") or ae.get("eps")
+                            )
+                            cur_price = to_float(
+                                info.get("currentPrice") or info.get("price") or
+                                info.get("regularMarketPrice") or info.get("_fmp_price")
+                            )
+                            # currentPrice 없으면 profile에서 직접 가져오기
+                            if (cur_price is None or pd.isna(cur_price)) and k_val:
+                                try:
+                                    _rp = requests.get(f"{_FMP_BASE}/profile?symbol={ticker}&apikey={k_val}", timeout=_FMP_TIMEOUT)
+                                    if _rp.status_code == 200:
+                                        _pd2 = _rp.json()
+                                        _pi2 = _pd2[0] if isinstance(_pd2, list) and _pd2 else {}
+                                        cur_price = to_float(_pi2.get("price"))
+                                        if pd.notna(cur_price):
+                                            info["currentPrice"] = cur_price
+                                except Exception:
+                                    pass
+                            if pd.notna(est_eps) and est_eps > 0 and pd.notna(cur_price) and cur_price > 0:
+                                fwd_pe = round(float(cur_price) / float(est_eps), 2)
+                                if 0 < fwd_pe < 2000:
+                                    info["forwardPE"] = fwd_pe
+                                    break
         except Exception:
             pass
 
@@ -4557,9 +3469,15 @@ def _fmp_fill(info: dict, ticker: str) -> dict:
 
         # balance-sheet에서 직접 ROE, D/E 계산
         try:
-            if not info.get("returnOnEquity") or not info.get("debtToEquity"):
-                bs = _fmp_balance_sheet(ticker)  # ← 캐싱 래퍼 사용 (기존: 직접 requests.get)
-                if bs:
+            k_val = _fmp_key()
+            if k_val and (not info.get("returnOnEquity") or not info.get("debtToEquity")):
+                rb = requests.get(
+                    f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit=2&apikey={k_val}",
+                    timeout=_FMP_TIMEOUT
+                )
+                bs_data = rb.json() if rb.status_code == 200 else []
+                if isinstance(bs_data, list) and bs_data:
+                    bs = bs_data[0]
                     equity = to_float(bs.get("totalStockholdersEquity") or bs.get("stockholdersEquity"))
                     total_debt = to_float(bs.get("totalDebt") or bs.get("longTermDebt"))
                     net_income = to_float(latest.get("netIncome")) if latest else np.nan
@@ -4850,21 +3768,49 @@ def evaluate_kpis(ticker_symbol):
                 _fcf_val = float(_ocf + _capex)
         if pd.notna(_fcf_val):
             info["_fmp_fcf"] = _fcf_val
+        # income_stmt / balance_sheet은 None으로 처리 (FMP fill로 대체)
+        income_stmt = None
+        balance_sheet = None
     except Exception:
         tk_upper = str(ticker_symbol).strip().upper()
         info = _fmp_fill({}, tk_upper)
         history = pd.DataFrame()
+        income_stmt, balance_sheet = None, None
         latest_inc, prev_inc = {}, {}
 
     # ── 지표 추출 ──────────────────────────────────────────────────────
-    # ROE — FMP fill로 제공 (income_stmt/balance_sheet yfinance 분기 제거됨)
+    # ROE
     roe = to_float(info.get("returnOnEquity"))
+    if pd.isna(roe) and income_stmt is not None and balance_sheet is not None:
+        try:
+            net_income = income_stmt.loc["Net Income"].iloc[0] if "Net Income" in income_stmt.index else np.nan
+            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
+            if pd.notna(net_income) and pd.notna(equity) and equity != 0:
+                roe = float(net_income / equity)
+        except Exception:
+            pass
 
-    # Operating Margin — FMP fill로 제공
+    # Operating Margin
     operating_margin = to_float(info.get("operatingMargins"))
+    if pd.isna(operating_margin) and income_stmt is not None:
+        try:
+            op_income = income_stmt.loc["Operating Income"].iloc[0] if "Operating Income" in income_stmt.index else np.nan
+            total_rev = income_stmt.loc["Total Revenue"].iloc[0] if "Total Revenue" in income_stmt.index else np.nan
+            if pd.notna(op_income) and pd.notna(total_rev) and total_rev != 0:
+                operating_margin = float(op_income / total_rev)
+        except Exception:
+            pass
 
-    # Debt to Equity — FMP fill로 제공
+    # Debt to Equity
     debt_to_equity = to_float(info.get("debtToEquity"))
+    if pd.isna(debt_to_equity) and balance_sheet is not None:
+        try:
+            total_debt = balance_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in balance_sheet.index else np.nan
+            equity = balance_sheet.loc["Stockholders Equity"].iloc[0] if "Stockholders Equity" in balance_sheet.index else np.nan
+            if pd.notna(total_debt) and pd.notna(equity) and equity != 0:
+                debt_to_equity = float(total_debt / equity * 100)
+        except Exception:
+            pass
 
     # PEG Ratio
     peg_ratio = to_float(info.get("pegRatio") or info.get("trailingPegRatio"))
@@ -4874,28 +3820,35 @@ def evaluate_kpis(ticker_symbol):
     trailing_pe   = to_float(info.get("trailingPE"))
     price_to_book = to_float(info.get("priceToBook"))
 
-    # Forward P/E fallback — 캐싱 래퍼 사용 (_fmp_fill 캐시 미스 대비)
+    # Forward P/E fallback — evaluate_kpis에서 직접 계산 (캐시 미스 대비)
     if pd.isna(forward_pe):
         try:
-            _fp_data = _fmp_analyst_estimates(tk_upper)
-            if isinstance(_fp_data, list) and _fp_data:
-                _cur_year = datetime.now(_MARKET_ET_TZ).year
-                _fp_sorted = sorted(_fp_data, key=lambda x: str(x.get("date") or "9999"))
-                for _ae in _fp_sorted:
-                    _ae_y = str(_ae.get("date") or "")[:4]
-                    try:
-                        if int(_ae_y) < _cur_year:
-                            continue
-                    except Exception:
-                        continue
-                    _eps = to_float(_ae.get("epsAvg") or _ae.get("estimatedEpsAvg") or _ae.get("estimatedEps"))
-                    _cp  = to_float(info.get("currentPrice") or info.get("price"))
-                    if pd.notna(_eps) and _eps > 0 and pd.notna(_cp) and _cp > 0:
-                        _fwd = round(float(_cp) / float(_eps), 2)
-                        if 0 < _fwd < 2000:
-                            forward_pe = _fwd
-                            info["forwardPE"] = _fwd
-                            break
+            _k_fp = _fmp_key()
+            if _k_fp:
+                _r_fp = requests.get(
+                    f"{_FMP_BASE}/analyst-estimates?symbol={tk_upper}&period=annual&limit=4&apikey={_k_fp}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if _r_fp.status_code == 200:
+                    _fp_data = _r_fp.json()
+                    if isinstance(_fp_data, list) and _fp_data:
+                        _cur_year = datetime.now().year
+                        _fp_sorted = sorted(_fp_data, key=lambda x: str(x.get("date") or "9999"))
+                        for _ae in _fp_sorted:
+                            _ae_y = str(_ae.get("date") or "")[:4]
+                            try:
+                                if int(_ae_y) < _cur_year:
+                                    continue
+                            except Exception:
+                                continue
+                            _eps = to_float(_ae.get("epsAvg") or _ae.get("estimatedEpsAvg") or _ae.get("estimatedEps"))
+                            _cp  = to_float(info.get("currentPrice") or info.get("price"))
+                            if pd.notna(_eps) and _eps > 0 and pd.notna(_cp) and _cp > 0:
+                                _fwd = round(float(_cp) / float(_eps), 2)
+                                if 0 < _fwd < 2000:
+                                    forward_pe = _fwd
+                                    info["forwardPE"] = _fwd
+                                    break
         except Exception:
             pass
     ev_to_ebitda  = to_float(info.get("enterpriseToEbitda"))
@@ -6061,7 +5014,7 @@ def save_drg_prediction(user_id: str, pred_date: str, direction: str,
             "",   # is_correct
             "",   # review_comment
         ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
+        _safe_append_rows(ws, row, value_input_option="USER_ENTERED")
         _invalidate_drg_predictions_cache()
         return True, ""
     except Exception as exc:
@@ -6090,15 +5043,10 @@ def update_drg_prediction_result(user_id: str, pred_date: str,
         for i, row in enumerate(rows[1:], start=2):
             if (len(row) > uid_idx and str(row[uid_idx]).strip() == str(user_id).strip() and
                     len(row) > date_idx and str(row[date_idx]).strip() == str(pred_date).strip()):
-                # 4번 개별 호출 → batch_update 1회로 합산 (API 호출 4→1)
-                def _col(idx):
-                    return chr(64 + idx + 1)
-                ws.batch_update([
-                    {"range": f"{_col(actual_dir_idx)}{i}",  "values": [[actual_direction]]},
-                    {"range": f"{_col(actual_ret_idx)}{i}",  "values": [[str(round(actual_return_pct, 4))]]},
-                    {"range": f"{_col(correct_idx)}{i}",     "values": [[is_correct]]},
-                    {"range": f"{_col(comment_idx)}{i}",     "values": [[review_comment]]},
-                ], value_input_option="USER_ENTERED")
+                ws.update_cell(i, actual_dir_idx + 1, actual_direction)
+                ws.update_cell(i, actual_ret_idx + 1, str(round(actual_return_pct, 4)))
+                ws.update_cell(i, correct_idx + 1, is_correct)
+                ws.update_cell(i, comment_idx + 1, review_comment)
                 _invalidate_drg_predictions_cache()
                 return True, ""
         return False, f"{pred_date} 예측 행을 찾을 수 없습니다."
@@ -6282,7 +5230,7 @@ def append_trade_history_row(user_id: str, account: str, ticker: str, action: st
             str(date).strip(),
             str(memo).strip(),
         ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
+        _safe_append_rows(ws, row, value_input_option="USER_ENTERED")
         _invalidate_trade_history_cache()
         return True, ""
     except Exception as exc:
@@ -6688,7 +5636,7 @@ def save_new_etfs_to_sheet(new_etfs: list[dict]) -> tuple[int, str]:
             if r and r[0].strip()
         )
         rows_to_add = []
-        added_date = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+        added_date = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
         for etf in new_etfs:
             tk = str(etf.get("ticker", "")).strip().upper()
             if not tk or tk in existing_tickers:
@@ -6703,7 +5651,7 @@ def save_new_etfs_to_sheet(new_etfs: list[dict]) -> tuple[int, str]:
             ])
             existing_tickers.add(tk)
         if rows_to_add:
-            ws.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+            _safe_append_rows(ws, rows_to_add, value_input_option="USER_ENTERED")
         return len(rows_to_add), ""
     except Exception as exc:
         return 0, str(exc)
@@ -6729,7 +5677,7 @@ def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) ->
         if not isinstance(all_etfs, list):
             return []
 
-        cutoff_date = datetime.now(_MARKET_ET_TZ) - timedelta(days=days_lookback)
+        cutoff_date = datetime.now(_KST_TZ) - timedelta(days=days_lookback)
         new_etfs = []
 
         for etf in all_etfs:
@@ -6797,7 +5745,7 @@ def cleanup_low_quality_etfs_from_sheet(min_avg_volume_m: float = 1.0, min_aum_m
 
         # etf_universe.txt 티커는 보호 (삭제 대상에서 제외)
         protected = set(load_etf_universe_tickers())
-        cutoff_date = datetime.now(_MARKET_ET_TZ) - timedelta(days=180)
+        cutoff_date = datetime.now(_KST_TZ) - timedelta(days=180)
 
         rows_to_delete = []
         for i, r in enumerate(vals[1:], start=2):
@@ -6923,9 +5871,9 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: st
                         old_row = (old_row + [""] * 8)[:8]
                         # ID, Date, [Engine삽입], Ticker, Score, Rank, Verdict, RS_Score, Mom_1M
                         migrated.append([old_row[0], old_row[1], "Leaders"] + old_row[2:])
-                    ws.append_rows(migrated, value_input_option="USER_ENTERED")
+                    _safe_append_rows(ws, migrated, value_input_option="USER_ENTERED")
 
-        today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+        today_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
         uid_u = str(user_id).strip().upper()
         engine_label = "Emerging" if engine == "emerging" else "Leaders"
         rows = []
@@ -6951,114 +5899,10 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: st
                     break
             rows.append([uid_u, today_str, engine_label, _ticker, _score, str(rank_idx), _verdict, _rs, _mom])
         if rows:
-            ws.append_rows(rows, value_input_option="USER_ENTERED")
+            _safe_append_rows(ws, rows, value_input_option="USER_ENTERED")
         return True, ""
     except Exception as exc:
         return False, str(exc)
-
-
-def save_scanner_last_result(user_id: str, snap: dict, engine: str) -> tuple[bool, str]:
-    """
-    마지막 스캔 결과 전체(score_df + meta)를 Scanner_Last_Result 탭에 JSON으로 저장.
-    세션이 끊겨도 다음 로그인 시 복원 가능.
-    user_id + engine 기준으로 덮어쓰기 (최신 1건만 유지).
-    """
-    gc = get_gspread_client()
-    if gc is None:
-        return False, "Google 서비스 계정 미설정"
-    try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [w.title for w in sh.worksheets()]
-        if _SCANNER_LAST_RESULT_SHEET_TITLE not in existing:
-            ws = sh.add_worksheet(title=_SCANNER_LAST_RESULT_SHEET_TITLE, rows=100, cols=5)
-            ws.update([_SCANNER_LAST_RESULT_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
-        else:
-            ws = sh.worksheet(_SCANNER_LAST_RESULT_SHEET_TITLE)
-
-        uid_u = str(user_id).strip().upper()
-        engine_label = str(engine).strip()
-        saved_at = datetime.now(timezone.utc).isoformat()
-
-        # score_df → JSON (상위 50행만, 용량 절약)
-        score_df = snap.get("score_df")
-        if not isinstance(score_df, pd.DataFrame) or score_df.empty:
-            return False, "score_df 없음"
-        score_json = score_df.head(50).to_json(orient="records", force_ascii=False)
-        universe_count = str(len(snap.get("universe") or []))
-
-        # 메타 정보도 JSON에 포함
-        meta = {
-            "mode_note": snap.get("mode_note", ""),
-            "scanner_mode": snap.get("scanner_mode", ""),
-            "universe": snap.get("universe", []),
-            "completed_at": snap.get("completed_at", saved_at),
-        }
-        payload = json.dumps({"meta": meta, "rows": json.loads(score_json)}, ensure_ascii=False)
-
-        # 기존 행 탐색 (해당 user+engine)
-        all_vals = ws.get_all_values()
-        target_row = None
-        for ri, row in enumerate(all_vals[1:], start=2):
-            row = (row + [""] * 5)[:5]
-            if str(row[0]).strip().upper() == uid_u and str(row[1]).strip() == engine_label:
-                target_row = ri
-                break
-
-        new_row = [uid_u, engine_label, saved_at, universe_count, payload]
-        if target_row:
-            ws.update([new_row], range_name=f"A{target_row}:E{target_row}", value_input_option="USER_ENTERED")
-        else:
-            ws.append_rows([new_row], value_input_option="USER_ENTERED")
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
-
-
-def load_scanner_last_result(user_id: str, engine: str) -> dict | None:
-    """
-    Scanner_Last_Result 탭에서 마지막 스캔 결과를 복원.
-    반환: snap dict (score_df 포함) 또는 None.
-    """
-    gc = get_gspread_client()
-    if gc is None:
-        return None
-    try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [w.title for w in sh.worksheets()]
-        if _SCANNER_LAST_RESULT_SHEET_TITLE not in existing:
-            return None
-        ws = sh.worksheet(_SCANNER_LAST_RESULT_SHEET_TITLE)
-        all_vals = ws.get_all_values()
-        if not all_vals or len(all_vals) < 2:
-            return None
-        uid_u = str(user_id).strip().upper()
-        engine_label = str(engine).strip()
-        for row in all_vals[1:]:
-            row = (row + [""] * 5)[:5]
-            if str(row[0]).strip().upper() == uid_u and str(row[1]).strip() == engine_label:
-                payload_str = str(row[4]).strip()
-                if not payload_str:
-                    return None
-                try:
-                    payload = json.loads(payload_str)
-                    meta = payload.get("meta", {})
-                    rows_data = payload.get("rows", [])
-                    if not rows_data:
-                        return None
-                    score_df = pd.DataFrame(rows_data)
-                    return {
-                        "score_df": score_df,
-                        "mode_note": meta.get("mode_note", engine_label),
-                        "scanner_mode": meta.get("scanner_mode", ""),
-                        "universe": meta.get("universe", []),
-                        "completed_at": meta.get("completed_at", ""),
-                        "_restored_from_sheet": True,
-                    }
-                except Exception:
-                    return None
-        return None
-    except Exception:
-        return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -7139,7 +5983,7 @@ def save_portfolio_snapshot(user_id: str, sell_radar_df: pd.DataFrame) -> tuple[
     if sell_radar_df is None or sell_radar_df.empty:
         return False, "포트폴리오 데이터 없음"
     try:
-        today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+        today_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
         uid_u = str(user_id).strip().upper()
 
         # 총 평가금액, 총 매수금액, 수익률 계산
@@ -7185,7 +6029,7 @@ def save_portfolio_snapshot(user_id: str, sell_radar_df: pd.DataFrame) -> tuple[
         if today_row:
             ws.update([new_row], range_name=f"A{today_row}:H{today_row}", value_input_option="USER_ENTERED")
         else:
-            ws.append_row(new_row, value_input_option="USER_ENTERED")
+            _safe_append_rows(ws, new_row, value_input_option="USER_ENTERED")
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -7277,7 +6121,7 @@ def upsert_emerging_tracker(user_id: str, ticker: str, theme: str, verdict: str,
         vals = ws.get_all_values()
         uid_u = str(user_id).strip().upper()
         tk_u = str(ticker).strip().upper()
-        now_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M")
+        now_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d %H:%M")
         rs_str = f"{float(rs_score):.2f}" if rs_score is not None and rs_score == rs_score else ""
 
         # 기존 행 찾기
@@ -7312,7 +6156,7 @@ def upsert_emerging_tracker(user_id: str, ticker: str, theme: str, verdict: str,
                 value_input_option="USER_ENTERED"
             )
         else:
-            ws.append_row(
+            _safe_append_rows(ws, 
                 [uid_u, tk_u, str(theme)[:60], now_str, now_str, "1", verdict, rs_str, "🆕 신규"],
                 value_input_option="USER_ENTERED"
             )
@@ -7339,6 +6183,69 @@ def delete_emerging_tracker_row(user_id: str, ticker: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _repair_watchlist_layout(ws) -> bool:
+    """헤더 누락 또는 계단식 드리프트로 어긋난 Watchlist 행을 A열 기준 8칸 레코드로 재정렬.
+
+    과거에 table_range 없이 append_row가 호출되어 행이 오른쪽으로 밀려 저장됐거나
+    (1행 A열 → 2행 F열 → 3행 K열), 헤더 행이 없어 첫 데이터가 1행에 들어가 읽기에서
+    누락되던 데이터를 모두 복구한다. 이미 정상이면 아무 것도 하지 않는다(멱등).
+
+    반환: 시트를 변경했으면 True, 변경할 필요 없었으면 False.
+    """
+    try:
+        vals = ws.get_all_values() or []
+    except Exception:
+        return False
+
+    if not vals:
+        ws.update([_WATCHLIST_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+        return True
+
+    header_ok = [str(c).strip() for c in (vals[0] + [""] * 8)[:8]] == _WATCHLIST_SHEET_COLS
+
+    # 데이터 행 중 A열이 비어(=오른쪽으로 밀려) 시작하는 행이 있으면 드리프트
+    drift = False
+    for r in (vals[1:] if header_ok else vals):
+        if not any(str(c).strip() for c in r):
+            continue
+        first_nonempty = next((i for i, c in enumerate(r) if str(c).strip()), 0)
+        if first_nonempty > 0:
+            drift = True
+            break
+
+    if header_ok and not drift:
+        return False  # 정상 → 재작성 불필요
+
+    # 모든 비어있지 않은 행을 '첫 비어있지 않은 셀'부터 8칸으로 정규화
+    cleaned = []
+    for r in vals:
+        if not any(str(c).strip() for c in r):
+            continue
+        start = next((i for i, c in enumerate(r) if str(c).strip()), None)
+        if start is None:
+            continue
+        rec = (r[start:start + 8] + [""] * 8)[:8]
+        # 헤더로 보이는 행은 건너뛰고(아래에서 다시 부착)
+        if [str(c).strip() for c in rec] == _WATCHLIST_SHEET_COLS \
+                or str(rec[0]).strip().upper() in ("ID", "USER_ID", "USERID"):
+            continue
+        # user_id, ticker 둘 다 있어야 유효 레코드
+        if not str(rec[0]).strip() or not str(rec[1]).strip():
+            continue
+        cleaned.append(rec)
+
+    new_rows = [_WATCHLIST_SHEET_COLS] + cleaned
+    try:
+        if len(new_rows) > ws.row_count:
+            ws.add_rows(len(new_rows) - ws.row_count + 50)
+    except Exception:
+        pass
+    ws.clear()
+    end_cell = gspread.utils.rowcol_to_a1(len(new_rows), 8)
+    ws.update(new_rows, range_name=f"A1:{end_cell}", value_input_option="USER_ENTERED")
+    return True
+
+
 def open_watchlist_worksheet():
     """Quant_DB 스프레드시트의 Watchlist 탭. 없으면 자동 생성."""
     gc = get_gspread_client()
@@ -7349,10 +6256,21 @@ def open_watchlist_worksheet():
         # 먼저 기존 탭 목록에서 찾기
         existing_titles = [ws.title for ws in sh.worksheets()]
         if _WATCHLIST_SHEET_TITLE in existing_titles:
-            return sh.worksheet(_WATCHLIST_SHEET_TITLE), None
+            ws = sh.worksheet(_WATCHLIST_SHEET_TITLE)
+            # 과거 드리프트/헤더 누락 데이터 자동 복구 (세션당 1회)
+            if not st.session_state.get("_wl_layout_repaired"):
+                try:
+                    if _repair_watchlist_layout(ws):
+                        load_watchlist_sheet.clear()
+                        st.session_state.pop("_sidebar_wl_count", None)
+                except Exception:
+                    pass
+                st.session_state["_wl_layout_repaired"] = True
+            return ws, None
         # 없으면 새로 생성
         ws = sh.add_worksheet(title=_WATCHLIST_SHEET_TITLE, rows=1000, cols=8)
         ws.update([_WATCHLIST_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+        st.session_state["_wl_layout_repaired"] = True
         return ws, None
     except Exception as exc:
         return None, f"Watchlist 워크시트를 열거나 생성할 수 없습니다: {exc}"
@@ -7496,7 +6414,7 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
         for row_idx in reversed(to_del):
             ws.delete_rows(row_idx)
         # 새 행 추가
-        ws.append_row([
+        _safe_append_rows(ws, [
             uid, tk,
             str(memo).strip(),
             str(round(float(alert_price), 4)) if alert_price is not None else "",
@@ -7677,19 +6595,8 @@ def narrative_history_expander_title(rec):
     elif not session_lbl:
         session_lbl = "⏱️ Unknown session"
     analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
-    src = str(analysis.get("source") or "").strip()
-
-    if src == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+    if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
         return f"[{date_part}] 📊 주간트렌드(7일) | 브리핑 | 티커 {len(analysis.get('precomputed_universe') or [])}개"
-    if src == "wow_trend_7d":
-        # 브리핑 첫 줄(제목)을 미리보기로 추출
-        md = str(analysis.get("weekly_briefing_markdown") or analysis.get("wow_briefing_markdown") or "").strip()
-        preview = ""
-        if md:
-            first_line = md.lstrip("#").split("\n")[0].strip()
-            preview = first_line[:50] + ("…" if len(first_line) > 50 else "")
-        return f"[{date_part}] ⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)" + (f" | {preview}" if preview else "")
-
     regime_part = _narrative_regime_risk_display(analysis)
     theme_part = _narrative_core_theme_display(analysis)
     return f"[{date_part}] {session_lbl} | {regime_part} | {theme_part}"
@@ -7865,7 +6772,7 @@ def append_wow_trend_narrative_record(briefing_markdown: str, language: str,
             f"vs 저번 주 {len(last_week_recs or [])}건 기반"
         ),
         "summary": md,
-        "weekly_briefing_markdown": md,
+        "wow_briefing_markdown": md,
         "precomputed_universe": filter_scanner_ticker_list(ordered),
     }
     record = {
@@ -7905,11 +6812,7 @@ def render_narrative_history_compact(analysis: dict):
     if not isinstance(analysis, dict):
         st.write("_데이터 형식 오류_")
         return
-
-    src = str(analysis.get("source") or "").strip()
-
-    # ── 주간 트렌드 (weekly_trend_7d) ────────────────────────────────────
-    if src == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+    if analysis.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
         st.markdown("**유형:** 주간 트렌드 브리핑 (최근 7일 교집합)")
         uni = analysis.get("precomputed_universe")
         if isinstance(uni, list) and uni:
@@ -7920,23 +6823,6 @@ def render_narrative_history_compact(analysis: dict):
                 st.markdown(md[:12000])
         return
 
-    # ── 트렌드 변곡점 (wow_trend_7d) ─────────────────────────────────────
-    if src == "wow_trend_7d":
-        st.markdown("**유형:** ⚖️ 트렌드 변곡점 분석 (이번 주 vs 저번 주)")
-        md = str(
-            analysis.get("weekly_briefing_markdown")
-            or analysis.get("wow_briefing_markdown")
-            or analysis.get("summary")
-            or ""
-        ).strip()
-        if md:
-            with st.expander("변곡점 브리핑 본문 보기", expanded=False):
-                st.markdown(md[:12000])
-        else:
-            st.caption("저장된 브리핑 본문이 없습니다.")
-        return
-
-    # ── 일반 시장 내러티브 (market_narrative) ────────────────────────────
     regime = analysis.get("regime") if isinstance(analysis.get("regime"), dict) else {}
     summary = analysis.get("summary") or ""
     themes = analysis.get("themes") if isinstance(analysis.get("themes"), list) else []
@@ -7990,56 +6876,25 @@ def hydrate_narrative_from_disk_once():
 
     if not st.session_state.get("_narrative_persist_loaded_v2"):
         cv = st.session_state.get("current_view")
-        # 가장 최근 저장 레코드를 source 종류 무관하게 선택
-        pick = records[-1] if records else None
+        last_non_weekly = None
+        for r in reversed(records):
+            if not isinstance(r, dict):
+                continue
+            a = r.get("analysis") if isinstance(r.get("analysis"), dict) else {}
+            if a.get("source") == _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
+                continue
+            last_non_weekly = r
+            break
+        pick = last_non_weekly or (records[-1] if records else None)
         if (not isinstance(cv, dict) or not cv) and pick:
-            picked_analysis = pick.get("analysis", {})
-            st.session_state["current_view"] = picked_analysis
+            st.session_state["current_view"] = pick.get("analysis", {})
             st.session_state["current_view_language"] = pick.get("language", "ko")
-            # source 타입 복원
-            src = str(picked_analysis.get("source") or "market_narrative")
-            if src not in ("weekly_trend_7d", "wow_trend_7d"):
-                src = "market_narrative"
-            st.session_state["current_view_source"] = src
-            # wow/weekly 는 narrative_timeseries_briefing 도 복원
-            if src in ("weekly_trend_7d", "wow_trend_7d"):
-                briefing_md = str(
-                    picked_analysis.get("weekly_briefing_markdown")
-                    or picked_analysis.get("wow_briefing_markdown")
-                    or picked_analysis.get("summary")
-                    or ""
-                ).strip()
-                if briefing_md:
-                    title = (
-                        "📊 주간 트렌드 추출 (최근 7일)" if src == "weekly_trend_7d"
-                        else "⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)"
-                    )
-                    existing_ts = st.session_state.get("narrative_timeseries_briefing")
-                    if not (isinstance(existing_ts, dict) and existing_ts.get("markdown")):
-                        fc_kind = "wow" if src == "wow_trend_7d" else "weekly"
-                        # 복원 시 팩트체크 재계산
-                        factcheck_df = pd.DataFrame()
-                        try:
-                            tickers_by_cat = extract_factcheck_tickers_from_briefing(briefing_md, kind=fc_kind)
-                            if tickers_by_cat.get("all"):
-                                if fc_kind == "wow":
-                                    factcheck_df = compute_narrative_factcheck_wow_returns(tickers_by_cat)
-                                else:
-                                    factcheck_df = compute_narrative_factcheck_weekly_returns(tickers_by_cat)
-                        except Exception:
-                            factcheck_df = pd.DataFrame()
-                        st.session_state["narrative_timeseries_briefing"] = {
-                            "title": title,
-                            "markdown": briefing_md,
-                            "factcheck_kind": fc_kind,
-                            "factcheck_df": factcheck_df,
-                        }
         st.session_state["_narrative_persist_loaded_v2"] = True
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
-    """현재가 조회 — FMP /quote/ 우선, 실패·누락 시 /historical-price-eod/ 마지막 종가로 fallback."""
+    """현재가 조회 — FMP stock-quote 사용."""
     clean_tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
     clean_tickers = list(dict.fromkeys(clean_tickers))
     if not clean_tickers:
@@ -8047,10 +6902,6 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
     k = _fmp_key()
     if not k:
         return {}
-
-    price_map = {}
-
-    # ── 1차: FMP /quote/ (실시간 호가) ──────────────────────────────────────
     try:
         symbols = ",".join(clean_tickers)
         r = requests.get(
@@ -8058,30 +6909,21 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
             timeout=_FMP_TIMEOUT
         )
         data = r.json() if r.status_code == 200 else []
-        if isinstance(data, list):
-            for item in data:
-                sym = str(item.get("symbol") or "").strip().upper()
-                price = to_float(item.get("price") or item.get("previousClose"))
-                if sym and pd.notna(price):
-                    price_map[sym] = price
+        if not isinstance(data, list):
+            return {}
+        price_map = {}
+        for item in data:
+            sym = str(item.get("symbol") or "").strip().upper()
+            price = to_float(item.get("price") or item.get("previousClose"))
+            if sym:
+                price_map[sym] = price
+        # 없는 티커는 nan
+        for tk in clean_tickers:
+            if tk not in price_map:
+                price_map[tk] = np.nan
+        return price_map
     except Exception:
-        pass
-
-    # ── 2차 fallback: quote 실패 or 누락 티커 → historical 마지막 종가 ────
-    missing = [tk for tk in clean_tickers if tk not in price_map or pd.isna(price_map.get(tk))]
-    for tk in missing:
-        try:
-            hist = _fmp_price_history(tk, limit=5)
-            if not hist.empty and "Close" in hist.columns:
-                last_close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
-                if not last_close.empty:
-                    price_map[tk] = float(last_close.iloc[-1])
-                    continue
-        except Exception:
-            pass
-        price_map[tk] = np.nan  # 최종 실패
-
-    return price_map
+        return {}
 
 
 # 1.5 / 1.6 공통: 마크다운·설명문에서 잘못 딴 가짜 티커(EXPANDING 등) 원천 차단
@@ -8152,43 +6994,24 @@ def parse_tickers_from_text(text):
 
 # 1.5 주간 트렌드 프롬프트가 강제하는 두 섹션 헤더 매처
 _FACTCHECK_WINNERS_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s*🏆\s*Weekly\s+Winners"          # 고정 헤더
-    r"|#{1,6}.*(?:winners?|대장주|지속\s*티커|주간\s*대장)"  # 한국어 헤더
-    r"|지속\s*티커\s*[\(（]?[Ww]inners?[\)）]?"           # '지속 티커 (Winners):' 형식
-    r").*$",
-    re.MULTILINE | re.IGNORECASE,
+    r"^\s*#{1,6}\s*🏆\s*Weekly\s+Winners.*$", re.MULTILINE | re.IGNORECASE
 )
 _FACTCHECK_EXPANDING_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s*🚀\s*Weekly\s+Expanding\s+To"    # 고정 헤더
-    r"|#{1,6}.*(?:expanding|후발|확장\s*수혜)"           # 한국어 헤더
-    r").*$",
-    re.MULTILINE | re.IGNORECASE,
+    r"^\s*#{1,6}\s*🚀\s*Weekly\s+Expanding\s+To.*$", re.MULTILINE | re.IGNORECASE
 )
-# WoW 고정 헤더 + 한국어 숫자형 헤더 모두 허용
+# WoW(트렌드 변곡점) 응답에서 자주 등장하는 Fading/Emerging 헤더(영문·한국어 혼용 모두 허용)
 _FACTCHECK_EMERGING_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s*🌱\s*Emerging"                   # 고정 헤더
-    r"|#{1,6}.*(?:emerging|부상|새로\s*나)"
-    r"|\d+[\)）\.]\s*.*(?:emerging|부상|새로\s*나)"      # '3) Emerging' 형식
-    r").*$",
-    re.MULTILINE | re.IGNORECASE,
+    r"^\s*#{1,6}.*(emerging|부상|새로\s*나).*$", re.MULTILINE | re.IGNORECASE
 )
 _FACTCHECK_FADING_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s*🥀\s*Fading"                     # 고정 헤더
-    r"|#{1,6}.*(?:fading|사그|약화|소멸)"
-    r"|🥀\s*Fading"                                     # 이모지만 있는 소제목
-    r"|\d+[\)）\.]\s*.*(?:fading|사그|약화|소멸)"
-    r").*$",
-    re.MULTILINE | re.IGNORECASE,
+    r"^\s*#{1,6}.*(fading|사그|약화|소멸).*$", re.MULTILINE | re.IGNORECASE
 )
 _FACTCHECK_INTERSECTION_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}.*(?:교집합|intersection|살아남은)"
-    r"|\d+[\)）\.]\s*.*(?:교집합|intersection|살아남은)"  # '1) 교집합' 형식
-    r").*$",
-    re.MULTILINE | re.IGNORECASE,
+    r"^\s*#{1,6}.*(교집합|intersection|살아남은).*$", re.MULTILINE | re.IGNORECASE
 )
 
 _FACTCHECK_BOLD_TICKER_RE = re.compile(r"\*\*\s*([A-Z][A-Z0-9.\-]{0,9})\s*\*\*")
-_FACTCHECK_PLAIN_TICKER_RE = re.compile(r"\b([A-Z][A-Z0-9.\-]{1,9})\b")
+_FACTCHECK_PLAIN_TICKER_RE = re.compile(r"\b([A-Z][A-Z0-9.\-]{0,9})\b")
 
 # 본문에서 티커처럼 보이지만 실제로는 일반 약어인 단어들 — 잡음 제거용
 _FACTCHECK_NON_TICKER_WORDS = frozenset(
@@ -8200,39 +7023,28 @@ _FACTCHECK_NON_TICKER_WORDS = frozenset(
         "DCF", "ESG", "DRAM", "DDR", "LPDDR", "TAM", "SAM", "FY", "CY",
         "Q1", "Q2", "Q3", "Q4", "H1", "H2",
         "TO", "FROM", "AT", "ON", "OFF", "BY", "FOR", "AND", "OR", "BUT",
-        "WITH", "VS", "THE", "TBD", "TBA", "NA", "NAN",
+        "WITH", "VS", "THE", "TBD", "TBA", "NA", "NAN", "TBA",
         "WOW", "DOD", "WEEKLY", "WINNERS", "EXPANDING", "COPILOT", "GEMINI",
-        # WoW 한국어 브리핑에서 자주 잡히는 비티커 대문자
-        "RISK", "TIGHTENING", "DRIFT", "NARRATIVE", "WEEK", "SECTOR",
-        "ROTATION", "FADING", "EMERGING", "INTERSECTION", "PART", "SUMMARY",
-        "EXECUTIVE", "AR", "VR", "DX", "AR",
     }
 )
 
 
 def _factcheck_slice_section(markdown: str, header_re: "re.Pattern") -> str:
-    """주어진 헤더 정규식 매치 위치부터 다음 섹션 헤더 전까지 본문 반환.
-    ## 마크다운 헤더 + 숫자형 섹션(1), 2) 등) 모두 인식.
-    """
+    """주어진 헤더 정규식 매치 위치부터 다음 ## 헤더 전까지의 본문을 반환."""
     md = str(markdown or "")
     m = header_re.search(md)
     if not m:
         return ""
     start = m.end()
-    # 다음 섹션 구분자: ## 헤더 또는 숫자형 섹션 시작 또는 🥀/🌱 이모지 소제목
-    nxt = re.search(
-        r"(?:^\s*#{1,6}\s+\S+|^\s*\d+[\)）\.]\s+\S|^\s*[🥀🌱🚀🏆]\s+\S)",
-        md[start:],
-        re.MULTILINE,
-    )
+    nxt = re.search(r"^\s*#{1,6}\s+\S+", md[start:], re.MULTILINE)
     end = start + (nxt.start() if nxt else len(md) - start)
     return md[start:end]
 
 
 def _factcheck_pick_tickers_from_section(section_md: str) -> list:
-    """섹션 본문에서 티커를 추출.
-    1순위: `**TICKER**` 볼드 매치 (신규 프롬프트 고정 형식)
-    2순위: 라인 내 모든 대문자 토큰 — 쉼표/공백 구분 나열 형식도 전부 수집
+    """섹션 본문에서 라인 단위로 티커를 추출.
+    1순위: `**TICKER**` 볼드 매치 (프롬프트가 강제하는 형식)
+    2순위: 라인 첫 대문자 토큰 (잡음 단어 제외, 길이 2~6)
     """
     out = []
     seen = set()
@@ -8240,17 +7052,13 @@ def _factcheck_pick_tickers_from_section(section_md: str) -> list:
         line = raw_line.strip()
         if not line:
             continue
-        # 1순위: 볼드 티커 — 한 라인에 여러 개 있어도 모두 수집
-        bold_tickers = []
-        for bm in _FACTCHECK_BOLD_TICKER_RE.finditer(line):
-            tk = bm.group(1).upper().strip(".-")
+        bold_match = _FACTCHECK_BOLD_TICKER_RE.search(line)
+        if bold_match:
+            tk = bold_match.group(1).upper().strip(".-")
             if tk and tk not in _FACTCHECK_NON_TICKER_WORDS and tk not in seen:
                 seen.add(tk)
-                bold_tickers.append(tk)
-        if bold_tickers:
-            out.extend(bold_tickers)
+                out.append(tk)
             continue
-        # 2순위: 일반 대문자 토큰 — 라인 내 모든 후보 수집 (쉼표 구분 나열 대응)
         for tok in _FACTCHECK_PLAIN_TICKER_RE.findall(line):
             tk = tok.upper().strip(".-")
             if not (2 <= len(tk) <= 6):
@@ -8261,6 +7069,7 @@ def _factcheck_pick_tickers_from_section(section_md: str) -> list:
                 continue
             seen.add(tk)
             out.append(tk)
+            break  # 라인당 1개만
     return out
 
 
@@ -8712,20 +7521,8 @@ def render_opportunity_scanner_snapshot(snap):
 
     st.divider()
     st.markdown("##### 📌 저장된 스캔 결과")
-    if snap.get("_restored_from_sheet"):
-        st.info("🔄 이전 세션의 마지막 스캔 결과를 자동 복원했습니다. 최신 시장 데이터 반영을 위해 재스캔을 권장합니다.")
     if completed_at:
-        try:
-            _ca_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-            _now_utc = datetime.now(timezone.utc)
-            _elapsed_min = int((_now_utc - _ca_dt).total_seconds() / 60)
-            _elapsed_str = f"{_elapsed_min}분 전" if _elapsed_min < 60 else f"{_elapsed_min // 60}시간 {_elapsed_min % 60}분 전"
-            _ca_kst = _ca_dt.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M KST")
-            st.caption(f"⏱️ 완료 시각: `{_ca_kst}` ({_elapsed_str})")
-            if _elapsed_min > 360:  # 6시간 이상 경과
-                st.warning("⚠️ 스캔 결과가 6시간 이상 지났습니다. 최신 시장 상황 반영을 위해 재스캔을 권장합니다.")
-        except Exception:
-            st.caption(f"완료 시각 (UTC): `{completed_at}`")
+        st.caption(f"완료 시각 (UTC): `{completed_at}`")
     st.info(f"[{mode_note}] 유니버스 **{len(universe)}**개 티커 · 리런·메뉴 이동 후에도 세션에 유지됩니다.")
     with st.expander("스캔 당시 유니버스 보기", expanded=False):
         st.code(", ".join(universe) if universe else "(기록 없음)")
@@ -8765,7 +7562,7 @@ def render_opportunity_scanner_snapshot(snap):
             )
             if _ok_s:
                 st.session_state[f"_sc_wl_added_{tk}"] = True
-        btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+        btn_col1, btn_col2 = st.columns([1, 3])
         with btn_col1:
             if st.session_state.get(f"_sc_wl_added_{tk_scan}"):
                 st.success(f"✅ {tk_scan} 추가됨!")
@@ -8774,16 +7571,6 @@ def render_opportunity_scanner_snapshot(snap):
                     key=f"scanner_wl_add_{rank_idx}_{tk_scan}",
                     on_click=_add_sc_top3_wl,
                     use_container_width=True)
-        with btn_col2:
-            # 아이디어A: 1클릭으로 3단계 정밀검사 탭으로 이동
-            def _goto_micro(tk=tk_scan):
-                st.session_state["selected_ticker"] = tk
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
-            st.button(f"🔬 {tk_scan} 정밀검사",
-                key=f"scanner_goto_micro_{rank_idx}_{tk_scan}",
-                on_click=_goto_micro,
-                use_container_width=True,
-                help="3단계 개별 종목 정밀 검사 탭으로 이동합니다.")
         st.divider()
 
     remain_df = score_df.iloc[3:].copy()
@@ -8819,48 +7606,8 @@ def render_opportunity_scanner_snapshot(snap):
                     st.success(f"✅ {_rtk}")
                 else:
                     st.button(f"🔔 {_rtk}", key=f"rem_wl_{_ri}_{_rtk}", on_click=_add_rem_wl, use_container_width=True)
-                def _goto_micro_rem(tk=_rtk):
-                    st.session_state["selected_ticker"] = tk
-                    st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
-                st.button(f"🔬 {_rtk}", key=f"rem_micro_{_ri}_{_rtk}", on_click=_goto_micro_rem, use_container_width=True, help="3단계 정밀검사로 이동")
     else:
         st.caption("유니버스 종목 수가 3개 이하라 추가 표시는 없습니다.")
-
-    # ── 아이디어D: 팩터 레이더 차트 ──────────────────────────────────────
-    with st.expander("📊 팩터 레이더 차트 (상위 종목 팩터 프로파일 비교)", expanded=False):
-        _radar_df = score_df.head(5).copy()
-        _factor_cols = ["Narrative Score", "Momentum Score", "RS Score", "Fundamentals Score", "Institutional Score", "Valuation Score"]
-        _factor_short = ["Narrative", "Momentum", "RS", "Fundamen.", "Inst.", "Valuation"]
-        _available_cols = [c for c in _factor_cols if c in _radar_df.columns]
-        if not _radar_df.empty and len(_available_cols) >= 3:
-            _rows = []
-            for _, _rdr in _radar_df.iterrows():
-                _tk = str(_rdr["Ticker"])
-                for _col, _short in zip(_factor_cols, _factor_short):
-                    if _col in _rdr.index:
-                        _val = pd.to_numeric(_rdr[_col], errors="coerce")
-                        _rows.append({"Ticker": _tk, "Factor": _short, "Score": float(_val) if pd.notna(_val) else 0.0})
-            _chart_df = pd.DataFrame(_rows)
-            if not _chart_df.empty:
-                try:
-                    _radar_chart = (
-                        alt.Chart(_chart_df)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("Factor:N", sort=_factor_short, title=None),
-                            y=alt.Y("Score:Q", scale=alt.Scale(domain=[0, 100]), title="Score"),
-                            color=alt.Color("Ticker:N", legend=alt.Legend(title="종목")),
-                            xOffset="Ticker:N",
-                            tooltip=["Ticker", "Factor", alt.Tooltip("Score:Q", format=".1f")],
-                        )
-                        .properties(height=300, title="Top 5 종목 팩터 점수 비교")
-                    )
-                    st.altair_chart(_radar_chart, use_container_width=True)
-                    st.caption("막대가 길수록 해당 팩터에서 강세. 같은 Factor 내 색깔별로 종목 비교 가능.")
-                except Exception as _chart_err:
-                    st.caption(f"차트 렌더링 실패: {_chart_err}")
-        else:
-            st.caption("레이더 차트를 표시할 점수 데이터가 부족합니다.")
 
     with st.expander("📐 알파 스캐너 점수 계산 공식 (가중치·의미·계산 방법)", expanded=False):
         st.markdown(
@@ -8888,10 +7635,10 @@ def render_opportunity_scanner_snapshot(snap):
    종목의 약 63거래일(3개월) 수익률에서 SPY의 동일 기간 수익률을 뺀 값(초과수익)을 쓰고, 역시 이번 스캔 풀 안에서 0~100으로 정규화합니다.
 
 4. **Fundamentals**  
-   `revenueGrowth`를 0~100 연속 점수로 정규화합니다 (성장률 -100%=0점, +200%=100점 선형 맵핑). `trailingEps > 0`이면 최대 30점 추가 보너스, 음수이면 15점 패널티. 단순 이진 판단 대신 연속 점수로 종목 구별력을 높였습니다. **두 지표가 모두 없으면** 이 항목은 가중치에서 빼고 나머지 항목만으로 100점 환산합니다.
+   Yahoo Finance `info`에서 `revenueGrowth` 또는 `trailingEps`가 양수면 가점(원시 100), 아니면 0으로 두고 풀 전체에서 정규화합니다. **두 지표가 모두 없으면** 이 항목은 “데이터 없음”으로 보아 가중치에서 빼고, 나머지 항목만으로 **100점 만점에 맞게 다시 환산**합니다.
 
 5. **Inst. Interest**  
-   `거래량 급증(3일/63일 ≥ 1.2)` OR `기관보유비율(institutionPercentHeld) ≥ 50%` 중 하나라도 충족하면 신호로 인정합니다. **두 조건 모두 충족 시 100점, 하나만 충족 시 65점**으로 신호 강도를 구분합니다.
+   최근 3거래일 평균 거래량 ÷ 최근 63거래일 평균 거래량이 **1.2 이상**이면 가점(원시 100), 미만이면 0 후 정규화합니다.
 
 6. **Valuation**  
    `forwardPE`가 양수이고 **50 이하**이면 가점(원시 100), 그렇지 않으면 0 후 정규화합니다. **P/E가 없거나 0 이하**(적자 등으로 해석 어려움)면 역시 가중치에서 제외하고 재환산합니다.
@@ -8924,20 +7671,8 @@ def render_opportunity_emerging_snapshot(snap):
 
     st.divider()
     st.markdown("##### 🚀 저장된 Emerging 스캔 결과")
-    if snap.get("_restored_from_sheet"):
-        st.info("🔄 이전 세션의 마지막 Emerging 스캔 결과를 자동 복원했습니다. 최신 시장 데이터 반영을 위해 재스캔을 권장합니다.")
     if completed_at:
-        try:
-            _ca_dt_em = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-            _now_utc_em = datetime.now(timezone.utc)
-            _elapsed_min_em = int((_now_utc_em - _ca_dt_em).total_seconds() / 60)
-            _elapsed_str_em = f"{_elapsed_min_em}분 전" if _elapsed_min_em < 60 else f"{_elapsed_min_em // 60}시간 {_elapsed_min_em % 60}분 전"
-            _ca_kst_em = _ca_dt_em.astimezone(_KST_TZ).strftime("%Y-%m-%d %H:%M KST")
-            st.caption(f"⏱️ 완료 시각: `{_ca_kst_em}` ({_elapsed_str_em})")
-            if _elapsed_min_em > 360:
-                st.warning("⚠️ 스캔 결과가 6시간 이상 지났습니다. 최신 시장 상황 반영을 위해 재스캔을 권장합니다.")
-        except Exception:
-            st.caption(f"완료 시각 (UTC): `{completed_at}`")
+        st.caption(f"완료 시각 (UTC): `{completed_at}`")
     st.info(f"[{mode_note}] 유니버스 **{len(universe)}**개 · 후발·2차 수혜 관점 브리핑")
     with st.expander("스캔 당시 유니버스", expanded=False):
         st.code(", ".join(universe) if universe else "(기록 없음)")
@@ -8981,27 +7716,14 @@ def render_opportunity_emerging_snapshot(snap):
             )
             if _ok:
                 st.session_state[f"_em_snap_wl_{tk}"] = True
-        _em_btn_c1, _em_btn_c2, _em_btn_c3 = st.columns([1, 1, 2])
-        with _em_btn_c1:
-            if st.session_state.get(_em_wl_key):
-                st.success(f"✅ {tk_em} Watchlist 추가됨!")
-            else:
-                st.button(
-                    f"🔔 {tk_em} Watchlist 추가",
-                    key=f"em_snap_wl_{rank_idx}_{tk_em}",
-                    on_click=_do_add_em,
-                    use_container_width=True,
-                )
-        with _em_btn_c2:
-            def _goto_micro_em(tk=tk_em):
-                st.session_state["selected_ticker"] = tk
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+        if st.session_state.get(_em_wl_key):
+            st.success(f"✅ {tk_em} Watchlist 추가됨!")
+        else:
             st.button(
-                f"🔬 {tk_em} 정밀검사",
-                key=f"em_snap_micro_{rank_idx}_{tk_em}",
-                on_click=_goto_micro_em,
-                use_container_width=True,
-                help="3단계 개별 종목 정밀 검사 탭으로 이동합니다.",
+                f"🔔 {tk_em} Watchlist 추가",
+                key=f"em_snap_wl_{rank_idx}_{tk_em}",
+                on_click=_do_add_em,
+                use_container_width=False,
             )
         st.divider()
 
@@ -9039,40 +7761,6 @@ def render_opportunity_emerging_snapshot(snap):
         )
     else:
         st.caption("유니버스가 3개 이하입니다.")
-
-    # ── Emerging 팩터 비교 차트 ────────────────────────────────────────
-    with st.expander("📊 Emerging 팩터 비교 차트 (Top 5)", expanded=False):
-        _em_radar_df = score_df.head(5).copy()
-        _em_factor_cols = ["Narrative Score", "Early RS Score", "Vol Accel Score", "Fundamentals Score", "Overextension Score"]
-        _em_factor_short = ["Narrative", "Early RS", "Vol Accel", "Fundamen.", "Overext."]
-        _em_avail_cols = [c for c in _em_factor_cols if c in _em_radar_df.columns]
-        if not _em_radar_df.empty and len(_em_avail_cols) >= 3:
-            _em_rows = []
-            for _, _edr in _em_radar_df.iterrows():
-                _etk = str(_edr["Ticker"])
-                for _ec, _es in zip(_em_factor_cols, _em_factor_short):
-                    if _ec in _edr.index:
-                        _ev = pd.to_numeric(_edr[_ec], errors="coerce")
-                        _em_rows.append({"Ticker": _etk, "Factor": _es, "Score": float(_ev) if pd.notna(_ev) else 0.0})
-            _em_chart_df = pd.DataFrame(_em_rows)
-            if not _em_chart_df.empty:
-                try:
-                    _em_chart = (
-                        alt.Chart(_em_chart_df)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("Factor:N", sort=_em_factor_short, title=None),
-                            y=alt.Y("Score:Q", scale=alt.Scale(domain=[0, 100]), title="Score"),
-                            color=alt.Color("Ticker:N", legend=alt.Legend(title="종목")),
-                            xOffset="Ticker:N",
-                            tooltip=["Ticker", "Factor", alt.Tooltip("Score:Q", format=".1f")],
-                        )
-                        .properties(height=300, title="Emerging Top 5 팩터 비교")
-                    )
-                    st.altair_chart(_em_chart, use_container_width=True)
-                    st.caption("Overextension은 낮을수록(과열 없음) 좋은 신호입니다.")
-                except Exception as _ec_err:
-                    st.caption(f"차트 렌더링 실패: {_ec_err}")
 
     with st.expander("📐 Emerging 엔진 공식 (가중치·의미)", expanded=False):
         st.markdown(
@@ -9414,10 +8102,8 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             volume_df = pd.DataFrame()
             spy_hist = pd.DataFrame()
 
-    # ── 병렬 웜업: _fmp_fill() HTTP 호출을 루프 전에 한꺼번에 병렬 처리 ──
-    # 캐시 콜드(첫 스캔)일 때 180종목 × 순차 7회 HTTP → 병렬화로 대폭 단축
-    with st.spinner(f"펀더멘털 데이터 병렬 수집 중... ({len(tickers)}종목)"):
-        _info_cache = _fmp_fill_parallel_warmup(tickers)
+    if len(tickers) == 1 and close_df.columns.tolist() == list(batch.keys())[:1]:
+        pass  # FMP batch already uses ticker as column name
 
     spy_3m = calculate_period_return(spy_hist["Close"], 63) if "Close" in spy_hist.columns else np.nan
     spy_3m = to_float(spy_3m)
@@ -9432,15 +8118,12 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
 
         close_series = close_df[ticker] if ticker in close_df.columns else pd.Series(dtype=float)
         vol_series = volume_df[ticker] if ticker in volume_df.columns else pd.Series(dtype=float)
-        _close_num_l = pd.to_numeric(close_series, errors="coerce").dropna()
-        last_px_l = to_float(_close_num_l.iloc[-1]) if not _close_num_l.empty else np.nan  # ✅ 현재가
 
         m1_ret = calculate_period_return(close_series, 21)
         m3_ret = calculate_period_return(close_series, 63)
         rs_raw = to_float(m3_ret) - to_float(spy_3m)
 
-        # 병렬 웜업 딕셔너리에서 조회 (캐시 히트) — 없으면 fallback으로 직접 호출
-        info = _info_cache.get(ticker) or _fmp_fill({}, ticker)
+        info = _fmp_fill({}, ticker)
 
         revenue_growth = to_float(info.get("revenueGrowth") or info.get("earningsGrowth"))
         trailing_eps = to_float(info.get("trailingEps"))
@@ -9454,39 +8137,17 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             vol_ratio = float(vol_3d_avg / vol_3m_avg)
 
         fundamentals_data_available = pd.notna(revenue_growth) or pd.notna(trailing_eps)
-        # 이진(0/100) 대신 연속 점수화: revenue_growth·trailing_eps를 각각 0~100으로 정규화 후 합산
-        # revenue_growth: clip(-1, 2) → 0~100 선형 맵핑 (200% 성장 = 100점)
-        # trailing_eps > 0 이면 최대 30점 보너스 (펀더멘털 안정성 가점)
-        _fund_raw = 0.0
-        if pd.notna(revenue_growth):
-            _rev_score = float(np.clip((revenue_growth + 1.0) / 3.0 * 100.0, 0.0, 100.0))
-            _fund_raw = max(_fund_raw, _rev_score)
-        if pd.notna(trailing_eps) and trailing_eps > 0:
-            _fund_raw = min(100.0, _fund_raw + 30.0)
-        elif pd.notna(trailing_eps) and trailing_eps <= 0:
-            _fund_raw = max(0.0, _fund_raw - 15.0)
-        fundamentals_pass = _fund_raw >= 30.0  # 리스크 판단용 임계값
-        # Institutional: 거래량 급증(vol_ratio>=1.2) OR 기관 보유비율 높음 (OR 조건으로 신호 품질 향상)
-        inst_ownership = to_float(info.get("institutionPercentHeld") or info.get("institutionalOwnershipPercentage"))
-        inst_via_vol = pd.notna(vol_ratio) and vol_ratio >= 1.2
-        inst_via_ownership = pd.notna(inst_ownership) and inst_ownership >= 0.5  # 50% 이상 기관 보유
-        inst_pass = inst_via_vol or inst_via_ownership
-        # Institutional Raw: 두 신호 모두 충족 시 100, 하나만 충족 시 65, 둘 다 미충족 시 0
-        if inst_via_vol and inst_via_ownership:
-            _inst_raw = 100.0
-        elif inst_via_vol or inst_via_ownership:
-            _inst_raw = 65.0
-        else:
-            _inst_raw = 0.0
+        fundamentals_pass = (
+            (pd.notna(revenue_growth) and revenue_growth > 0)
+            or (pd.notna(trailing_eps) and trailing_eps > 0)
+        )
+        inst_pass = pd.notna(vol_ratio) and vol_ratio >= 1.2
         # forwardPE가 None/NaN이거나 0 이하(적자 등으로 PE 해석 불가)면 결측으로 간주
         valuation_data_available = pd.notna(forward_pe) and forward_pe > 0
         valuation_pass = valuation_data_available and forward_pe <= 50
 
         narrative_score, narrative_why = narrative_map.get(ticker, (0.0, "배치 미응답"))
-        # API 실패 사유면 narrative_available=False로 표기 → 동적 분모에서 완전 제외 (불이익 방지)
         narrative_available = narrative_why not in SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS
-        if not narrative_available:
-            narrative_score = 0.0  # 분자에서도 0으로 보장
 
         risk_bits = []
         if not valuation_data_available:
@@ -9505,15 +8166,14 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             {
                 "Ticker": ticker,
                 "Name": long_name,
-                "Price": round(float(last_px_l), 4) if pd.notna(last_px_l) else np.nan,  # ✅ Watchlist saved_price용
                 "Narrative Raw": narrative_score,
                 "Narrative Why": narrative_why,
                 "Narrative Available": bool(narrative_available),
                 "Momentum 1M Raw": to_float(m1_ret),
                 "RS Raw": to_float(rs_raw),
-                "Fundamentals Raw": float(_fund_raw),
+                "Fundamentals Raw": 100.0 if fundamentals_pass else 0.0,
                 "Fundamentals Available": bool(fundamentals_data_available),
-                "Institutional Raw": float(_inst_raw),
+                "Institutional Raw": 100.0 if inst_pass else 0.0,
                 "Valuation Raw": 100.0 if valuation_pass else 0.0,
                 "Valuation Available": bool(valuation_data_available),
                 "Risk": risk_text,
@@ -9578,10 +8238,6 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
 
     with st.spinner("Emerging Gemini 내러티브 배치 평가 중 (티커 청크별, gemini-2.5-flash)..."):
         narrative_map_em = batch_narrative_emerging_second_order_scores(tickers, narrative_text)
-
-    # ── 병렬 웜업: _fmp_fill() HTTP 호출을 루프 전에 한꺼번에 병렬 처리 ──
-    with st.spinner(f"Emerging: 펀더멘털 데이터 병렬 수집 중... ({len(tickers)}종목)"):
-        _em_info_cache = _fmp_fill_parallel_warmup(tickers)
 
     rows = []
     total = len(tickers)
@@ -9650,8 +8306,7 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
         else:
             over_raw = np.nan
 
-        # 병렬 웜업 딕셔너리에서 조회 — 없으면 fallback으로 직접 호출
-        info = _em_info_cache.get(ticker) or _fmp_fill({}, ticker)
+        info = _fmp_fill({}, ticker)
 
         eg = to_float(info.get("earningsGrowth"))
         if pd.isna(eg):
@@ -9674,10 +8329,7 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
                 fund_raw = 20.0
 
         narrative_score, narrative_why = narrative_map_em.get(ticker, (0.0, "배치 미응답"))
-        # API 실패 사유면 narrative_available=False → 동적 분모에서 완전 제외 (불이익 방지)
         narrative_available = narrative_why not in SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS
-        if not narrative_available:
-            narrative_score = 0.0
 
         risk_bits = []
         if pd.notna(rsi_last) and rsi_last > 70:
@@ -9694,7 +8346,6 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
             {
                 "Ticker": ticker,
                 "Name": long_name,
-                "Price": round(float(last_px), 4) if pd.notna(last_px) else np.nan,  # ✅ Watchlist saved_price용
                 "Narrative Raw": narrative_score,
                 "Narrative Why": narrative_why,
                 "Narrative Available": bool(narrative_available),
@@ -9745,45 +8396,18 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
 
 
 def fetch_market_news():
-    """
-    FMP Stock News API 기반 뉴스 수집 (레거시 호환용 단순 텍스트 반환).
-    fetch_global_market_news()의 경량 버전으로, 일부 서브 프롬프트에서 사용.
-    FMP 키 없을 시 Yahoo Finance RSS fallback.
-    """
-    k = _fmp_key()
-    chunks = []
-
-    if k:
-        try:
-            r = requests.get(
-                f"{_FMP_BASE}/news/stock-latest?page=0&limit=20&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                items = r.json() if isinstance(r.json(), list) else []
-                for idx, item in enumerate(items[:20], start=1):
-                    title = _clean_news_text(item.get("title", ""))
-                    text = _clean_news_text(item.get("text", "") or item.get("summary", ""))[:200]
-                    tickers = str(item.get("tickers", "") or "").strip()
-                    if title:
-                        line = f"[{idx}] Title: {title}"
-                        if tickers:
-                            line += f" | Tickers: {tickers}"
-                        if text:
-                            line += f"\nSummary: {text}"
-                        chunks.append(line)
-                if chunks:
-                    return "\n\n".join(chunks).strip()
-        except Exception:
-            pass
-
-    # Fallback: Yahoo Finance RSS
     try:
         feed = feedparser.parse("https://finance.yahoo.com/news/rssindex")
         entries = getattr(feed, "entries", [])[:20]
+        if not entries:
+            return ""
+
+        chunks = []
         for idx, entry in enumerate(entries, start=1):
-            title = _clean_news_text(getattr(entry, "title", ""))
-            summary = _clean_news_text(getattr(entry, "summary", "") or "")
+            title = str(getattr(entry, "title", "") or "").strip()
+            summary = str(getattr(entry, "summary", "") or "").strip()
+            summary = re.sub(r"<[^>]+>", " ", summary)
+            summary = re.sub(r"\s+", " ", summary).strip()
             if title or summary:
                 chunks.append(f"[{idx}] Title: {title}\nSummary: {summary}")
         return "\n\n".join(chunks).strip()
@@ -9800,82 +8424,22 @@ def _to_utc_datetime(struct_time_obj):
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _clean_news_text(raw_text, max_len: int = 0):
-    """HTML 태그 제거 + 공백 정규화. max_len > 0 이면 해당 길이로 truncate."""
+def _clean_news_text(raw_text):
     text = str(raw_text or "").strip()
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    if max_len > 0:
-        text = text[:max_len]
     return text
 
 
-# ---------------------------------------------------------------------------
-# FMP 뉴스 파이프라인 헬퍼
-# ---------------------------------------------------------------------------
-
-def _fmp_news_fetch(endpoint: str, params: dict, timeout: int = 8) -> list:
+def fetch_global_market_news():
     """
-    FMP 뉴스 API 단일 호출 래퍼.
-    성공 시 list[dict] 반환, 실패 시 [] 반환.
-    """
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        p = {**params, "apikey": k}
-        r = requests.get(f"{_FMP_BASE}/{endpoint}", params=p, timeout=timeout)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def _fmp_news_to_unified(items: list, source_label: str, weight: float,
-                         body_key: str = "text", max_body: int = 300) -> list:
-    """
-    FMP 뉴스 응답 → 통합 dict 포맷 변환.
-    통합 포맷: {title, summary, tickers, published, published_dt, source, weight}
-    """
-    result = []
-    for item in items:
-        title = _clean_news_text(item.get("title", ""))
-        body  = _clean_news_text(item.get(body_key, "") or item.get("text", "") or item.get("content", ""), max_len=max_body)
-        pub_raw = str(item.get("publishedDate", "") or item.get("date", "") or "").strip()
-        tickers = _clean_news_text(item.get("tickers", "") or item.get("symbol", ""))
-
-        # publishedDate → datetime (FMP: "2025-05-28 14:30:00" 형식)
-        pub_dt = datetime.min.replace(tzinfo=timezone.utc)
-        if pub_raw:
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-                try:
-                    pub_dt = datetime.strptime(pub_raw[:19], fmt).replace(tzinfo=timezone.utc)
-                    break
-                except ValueError:
-                    continue
-
-        if not title:
-            continue
-        result.append({
-            "title":        title,
-            "summary":      body,
-            "tickers":      tickers,
-            "published":    pub_raw if pub_raw else "N/A",
-            "published_dt": pub_dt,
-            "source":       source_label,
-            "weight":       weight,
-        })
-    return result
-
-
-def _rss_news_fallback() -> list:
-    """
-    FMP API 키 없거나 모든 레이어 실패 시 RSS fallback.
-    기존 4개 소스 유지.
+    Multi-source RSS ingestion + title similarity dedup + weighted ranking.
+    Returns:
+      top_news: List[dict] (Top 50)
+      context_text: str (LLM 입력 텍스트)
+      raw_count: int (중복 제거 전 원본 수집 건수)
     """
     browser_headers = {
         "User-Agent": (
@@ -9884,224 +8448,104 @@ def _rss_news_fallback() -> list:
             "Chrome/120.0.0.0 Safari/537.36"
         )
     }
+
     rss_sources = {
-        "Yahoo Finance":      ("https://finance.yahoo.com/news/rssindex", 1.0),
-        "CNBC":               ("https://search.cnbc.com/rs/search/combinedcms/view.xml?profile=120000000", 0.9),
-        "Google News Finance":("https://news.google.com/rss/search?q=finance+market+economy&hl=en-US&gl=US&ceid=US:en", 0.8),
-        "MarketWatch":        ("http://feeds.marketwatch.com/marketwatch/marketpulse/", 0.7),
+        "Yahoo Finance": {
+            "url": "https://finance.yahoo.com/news/rssindex",
+            "weight": 1.0,
+        },
+        "CNBC": {
+            "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?profile=120000000",
+            "weight": 0.9,
+        },
+        "Google News Finance": {
+            "url": "https://news.google.com/rss/search?q=finance+market+economy&hl=en-US&gl=US&ceid=US:en",
+            "weight": 0.8,
+        },
+        "MarketWatch": {
+            "url": "http://feeds.marketwatch.com/marketwatch/marketpulse/",
+            "weight": 0.7,
+        },
     }
+
     all_news = []
-    for source_name, (feed_url, weight) in rss_sources.items():
+    for source_name, cfg in rss_sources.items():
+        feed_url = cfg.get("url", "")
+        weight = float(cfg.get("weight", 0.0))
         try:
             response = requests.get(feed_url, headers=browser_headers, timeout=8)
             if response.status_code != 200:
                 continue
+
             feed = feedparser.parse(response.content)
-            for entry in getattr(feed, "entries", []) or []:
-                title   = _clean_news_text(getattr(entry, "title", ""))
-                summary = _clean_news_text(getattr(entry, "summary", "") or getattr(entry, "description", ""), max_len=300)
-                pub_raw = str(getattr(entry, "published", "") or getattr(entry, "updated", "") or "").strip()
-                pub_dt  = _to_utc_datetime(
+            entries = getattr(feed, "entries", []) or []
+            for entry in entries:
+                title = _clean_news_text(getattr(entry, "title", ""))
+                summary = _clean_news_text(getattr(entry, "summary", "") or getattr(entry, "description", ""))
+                published_raw = str(getattr(entry, "published", "") or getattr(entry, "updated", "") or "").strip()
+                published_dt = _to_utc_datetime(
                     getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
                 )
                 if not (title or summary):
                     continue
-                all_news.append({
-                    "title": title, "summary": summary, "tickers": "",
-                    "published": pub_raw or "N/A", "published_dt": pub_dt,
-                    "source": f"RSS/{source_name}", "weight": weight,
-                })
+                all_news.append(
+                    {
+                        "title": title,
+                        "summary": summary,
+                        "published": published_raw if published_raw else "N/A",
+                        "published_dt": published_dt,
+                        "source": source_name,
+                        "weight": weight,
+                    }
+                )
         except Exception:
+            # 개별 피드 실패는 전체 파이프라인을 중단시키지 않음
             continue
-    return all_news
 
-
-def _dedup_and_rank(all_news: list, top_n: int = 60) -> list:
-    """제목 유사도 기반 중복 제거 → (weight DESC, published_dt DESC) 정렬 → top_n 반환."""
+    deduped_news = []
     similarity_threshold = 0.7
-    deduped = []
     for news in all_news:
-        dup_idx = None
-        for idx, kept in enumerate(deduped):
-            if SequenceMatcher(None, news["title"].lower(), kept["title"].lower()).ratio() >= similarity_threshold:
-                dup_idx = idx
+        duplicate_idx = None
+        for idx, kept in enumerate(deduped_news):
+            title_sim = SequenceMatcher(None, news["title"].lower(), kept["title"].lower()).ratio()
+            if title_sim >= similarity_threshold:
+                duplicate_idx = idx
                 break
-        if dup_idx is None:
-            deduped.append(news)
-        else:
-            kept = deduped[dup_idx]
-            if news["weight"] > kept["weight"]:
-                deduped[dup_idx] = news
-            elif news["weight"] == kept["weight"] and news["published_dt"] > kept["published_dt"]:
-                deduped[dup_idx] = news
 
-    ranked = sorted(
-        deduped,
+        if duplicate_idx is None:
+            deduped_news.append(news)
+            continue
+
+        kept_news = deduped_news[duplicate_idx]
+        if news["weight"] > kept_news["weight"]:
+            deduped_news[duplicate_idx] = news
+        elif news["weight"] == kept_news["weight"] and news["published_dt"] > kept_news["published_dt"]:
+            deduped_news[duplicate_idx] = news
+
+    ranked_news = sorted(
+        deduped_news,
         key=lambda x: (x.get("weight", 0.0), x.get("published_dt", datetime.min.replace(tzinfo=timezone.utc))),
         reverse=True,
     )
-    return ranked[:top_n]
+    top_news = ranked_news[:50]
 
+    chunks = []
+    for idx, item in enumerate(top_news, start=1):
+        chunks.append(
+            "\n".join(
+                [
+                    f"[{idx}] Source: {item.get('source', 'Unknown')} (Weight: {item.get('weight', 0.0):.1f})",
+                    f"Published: {item.get('published', 'N/A')}",
+                    f"Title: {item.get('title', '')}",
+                    f"Summary: {item.get('summary', '')}",
+                ]
+            )
+        )
+    context_text = "\n\n".join(chunks).strip()
 
-def _build_news_context_text(top_news: list) -> str:
-    """
-    LLM 프롬프트용 뉴스 컨텍스트 문자열 생성.
-    소스 유형별로 섹션을 분리해서 Gemini가 Press Release / Stock News / General을
-    다른 가중치로 처리할 수 있도록 구조화.
-    """
-
-    # 소스 유형 분류 기준 및 섹션 정의
-    # (매칭 키워드, 섹션 헤더, 설명)
-    section_defs = [
-        (
-            "FMP Press Release",
-            "━━━ [SECTION A] Press Releases — 고임팩트 기업 공시 (최우선 참고) ━━━",
-            "어닝 발표·M&A·가이던스 등 주가에 직접 영향을 주는 공식 기업 공시입니다.\n"
-            "이 섹션의 Tickers 종목은 즉각적인 가격 반응이 확인된 최우선 winners 후보입니다.",
-        ),
-        (
-            "FMP Stock News",
-            "━━━ [SECTION B] Stock News — 종목 티커 태그 포함 뉴스 ━━━",
-            "각 기사에 관련 종목 티커가 태그되어 있습니다.\n"
-            "Tickers 필드에 명시된 종목을 해당 테마의 직접 수혜주 후보로 간주하세요.",
-        ),
-        (
-            "FMP Article",
-            "━━━ [SECTION C] FMP Articles — 전문 애널리스트 분석 기사 ━━━",
-            "FMP 에디터의 심층 분석 기사입니다. 테마의 구조적 배경과 expanding_to 단계 설정에 활용하세요.",
-        ),
-        (
-            "FMP General News",
-            "━━━ [SECTION D] General / Macro News — 거시경제 맥락 ━━━",
-            "금리·환율·정책 등 매크로 뉴스입니다. regime(Risk On/Off, liquidity) 판단에 활용하세요.",
-        ),
-        (
-            "RSS",
-            "━━━ [SECTION E] RSS Fallback News ━━━",
-            "RSS 수집 뉴스입니다. FMP 데이터가 없을 때 사용됩니다.",
-        ),
-    ]
-
-    # 소스별 분류
-    buckets: dict[str, list] = {key: [] for key, _, _ in section_defs}
-    buckets["__etc__"] = []
-
-    for item in top_news:
-        src = str(item.get("source", "") or "")
-        matched = False
-        for key, _, _ in section_defs:
-            if key in src:
-                buckets[key].append(item)
-                matched = True
-                break
-        if not matched:
-            buckets["__etc__"].append(item)
-
-    sections = []
-    global_idx = 1
-
-    for key, header, desc in section_defs:
-        items = buckets.get(key, [])
-        if not items:
-            continue
-        chunks = []
-        for item in items:
-            lines = [f"[{global_idx}] Published: {item.get('published', 'N/A')}"]
-            tickers = str(item.get("tickers", "") or "").strip()
-            if tickers:
-                lines.append(f"  Tickers: {tickers}")
-            lines.append(f"  Title: {item.get('title', '')}")
-            content = str(item.get("summary", "") or "").strip()
-            if content:
-                lines.append(f"  Content: {content}")
-            chunks.append("\n".join(lines))
-            global_idx += 1
-        sections.append(f"{header}\n{desc}\n\n" + "\n\n".join(chunks))
-
-    # 분류 안 된 기타 항목
-    if buckets["__etc__"]:
-        chunks = []
-        for item in buckets["__etc__"]:
-            lines = [f"[{global_idx}] Source: {item.get('source','Unknown')} | Published: {item.get('published','N/A')}"]
-            tickers = str(item.get("tickers", "") or "").strip()
-            if tickers:
-                lines.append(f"  Tickers: {tickers}")
-            lines.append(f"  Title: {item.get('title', '')}")
-            content = str(item.get("summary", "") or "").strip()
-            if content:
-                lines.append(f"  Content: {content}")
-            chunks.append("\n".join(lines))
-            global_idx += 1
-        sections.append("━━━ [SECTION F] Other News ━━━\n\n" + "\n\n".join(chunks))
-
-    return "\n\n\n".join(sections).strip()
-
-
-def fetch_global_market_news():
-    """
-    FMP 4-레이어 뉴스 파이프라인 (RSS fallback 포함).
-
-    레이어 구조 및 가중치:
-      Layer A  Stock News       weight=1.2  티커 태그 포함 → winners 직결
-      Layer B  Press Releases   weight=1.3  어닝/M&A/가이던스 등 고임팩트
-      Layer C  FMP Articles     weight=1.0  FMP 에디터 분석 기사
-      Layer D  General News     weight=0.8  매크로/경제 맥락
-
-    FMP 키 없거나 전체 레이어 수집 0건 → RSS fallback 자동 전환.
-
-    Returns:
-      top_news:     List[dict]  (Top 60, published_dt 제거됨)
-      context_text: str         (LLM 프롬프트용 텍스트)
-      raw_count:    int         (중복 제거 전 수집 건수)
-    """
-    k = _fmp_key()
-    all_news: list = []
-    source_log: list[str] = []
-
-    if k:
-        # ── Layer A: Stock News (티커 태그 포함, 가장 중요) ──────────────────
-        stock_items = _fmp_news_fetch("news/stock-latest", {"page": 0, "limit": 50})
-        layer_a = _fmp_news_to_unified(stock_items, "FMP Stock News", weight=1.2, body_key="text", max_body=300)
-        all_news.extend(layer_a)
-        source_log.append(f"Stock News {len(layer_a)}건")
-
-        # ── Layer B: Press Releases (고임팩트 기업 이벤트) ───────────────────
-        press_items = _fmp_news_fetch("press-releases-latest", {"page": 0, "limit": 30})
-        layer_b = _fmp_news_to_unified(press_items, "FMP Press Release", weight=1.3, body_key="text", max_body=300)
-        all_news.extend(layer_b)
-        source_log.append(f"Press Releases {len(layer_b)}건")
-
-        # ── Layer C: FMP Articles (분석 깊이) ────────────────────────────────
-        article_items = _fmp_news_fetch("fmp-articles", {"page": 0, "limit": 20})
-        layer_c = _fmp_news_to_unified(article_items, "FMP Article", weight=1.0, body_key="content", max_body=300)
-        all_news.extend(layer_c)
-        source_log.append(f"FMP Articles {len(layer_c)}건")
-
-        # ── Layer D: General News (매크로 맥락) ──────────────────────────────
-        general_items = _fmp_news_fetch("news/general-latest", {"page": 0, "limit": 20})
-        layer_d = _fmp_news_to_unified(general_items, "FMP General News", weight=0.8, body_key="text", max_body=200)
-        all_news.extend(layer_d)
-        source_log.append(f"General News {len(layer_d)}건")
-
-    raw_count = len(all_news)
-
-    # FMP 키 없거나 전체 수집 0건 → RSS fallback
-    if raw_count == 0:
-        all_news = _rss_news_fallback()
-        raw_count = len(all_news)
-        source_log = [f"RSS Fallback {raw_count}건"]
-
-    top_news = _dedup_and_rank(all_news, top_n=60)
-    context_text = _build_news_context_text(top_news)
-
-    # session_state에 소스 수집 현황 기록 (UI 디버그용)
-    st.session_state["_news_source_log"] = " | ".join(source_log)
-
-    # published_dt는 내부용이므로 최종 반환 전 제거
     for item in top_news:
         item.pop("published_dt", None)
-
-    return top_news, context_text, raw_count
+    return top_news, context_text, len(all_news)
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -10190,8 +8634,7 @@ def analyze_deep_dive(query, news_data, language):
             "temperature": 0.0,
             "top_p": 1,
             "top_k": 1,
-            "max_output_tokens": 8192,
-            "thinking_budget": 0,
+            "max_output_tokens": 4096,
             "response_mime_type": "application/json",
         },
     )
@@ -10373,15 +8816,6 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
 - 뉴스만 좋고 가격이 안 받쳐주는 종목은 emerging으로만 분류
 - 각 theme의 winners는 반드시 3~6개 티커
 
-뉴스 소스 유형별 활용 지침 (매우 중요):
-- [SECTION A] Press Releases: 기업이 직접 발표한 공식 공시입니다.
-  해당 섹션의 "Tickers:" 필드에 태그된 종목은 실적·M&A·가이던스 등 고임팩트 이벤트가 확인된 종목이므로,
-  정량 데이터와 방향이 일치하면 반드시 winners의 최우선 후보로 선정하세요.
-- [SECTION B] Stock News: 각 기사의 "Tickers:" 필드는 해당 뉴스와 직접 연관된 종목입니다.
-  동일 티커가 여러 기사에 반복 등장할수록 모멘텀이 강한 종목으로 간주하세요.
-- [SECTION C] FMP Articles: 테마의 구조적 맥락과 expanding_to 단계 설정에 활용하세요.
-- [SECTION D] General/Macro News: regime(Risk On/Off, liquidity 방향) 판단에 주로 활용하세요.
-
 중요 규칙:
 1) 반드시 순수 JSON 텍스트만 출력 (```json 같은 마크다운 금지)
 2) 모든 키를 빠짐없이 포함
@@ -10392,10 +8826,8 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
 7) expected_tickers는 각 stage마다 반드시 2~4개 티커를 쉼표 구분 문자열로 작성
 8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력 (설명 금지, 큰따옴표 사용 금지)
 9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
-10) winners/emerging 선정 근거: 뉴스의 Tickers 태그 + 반복 등장 횟수 + 정량 RS Score를 종합해 판단하세요.
-    근거 없이 유명 대형주를 임의로 채워 넣는 것을 금지합니다.
 {quant_section}
-[뉴스 데이터 — 소스 유형별 섹션 구분]
+[뉴스 데이터]
 {news_text}
 
 [출력 JSON 스키마]
@@ -10408,9 +8840,9 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
   "themes": [
     {{
       "title": "테마명 (예: AI Capex Expansion)",
-      "driver": "무엇이 이 테마를 촉발했는가? Press Release·Stock News 기반 구체적 근거 포함",
+      "driver": "무엇이 이 테마를 촉발했는가?",
       "winners": "정량+정성 모두 확인된 수혜주 (예: NVDA, MSFT, SOXX)",
-      "emerging": "뉴스 Tickers 태그는 있으나 정량 가격 확인 필요 종목 (예: ARM, MRVL)",
+      "emerging": "뉴스 모멘텀은 있으나 가격 확인 필요 종목 (예: ARM, MRVL)",
       "momentum_note": "강함/보통/약함 중 하나만 선택 (예: 강함)",
       "expanding_to": [
         {{"stage": "기업용 AI 솔루션", "expected_tickers": "CRM, NOW, WDAY"}},
@@ -10588,13 +9020,7 @@ def _narrative_timeseries_briefing_model():
             "temperature": 0.0,
             "top_p": 0.95,
             "top_k": 40,
-            # 변곡점/주간 리포트: 본문 + 자동파싱 4개 섹션 + 티커 리스트가 길어
-            # 4096 으로는 잘린다. 넉넉히 확보한다.
-            "max_output_tokens": 16384,
-            # Gemini 2.5 Flash 는 thinking 이 기본 ON 이고 사고 토큰이
-            # max_output_tokens 예산을 함께 깎는다. 사고를 비활성화(0)하여
-            # 전체 토큰 예산을 '보이는 출력'에 사용하도록 한다.
-            "thinking_budget": 0,
+            "max_output_tokens": 4096,
         },
     )
 
@@ -10651,9 +9077,7 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
                 "temperature": 0.3,  # 주간 요약 — 매주 다른 인사이트를 위해 약간의 다양성 허용
                 "top_p": 1,
                 "top_k": 1,
-                # 5개 섹션 마크다운 리포트 — 4096 으로는 잘릴 수 있어 확대 + 사고 비활성화
-                "max_output_tokens": 16384,
-                "thinking_budget": 0,
+                "max_output_tokens": 4096,
             },
         )
         response = summary_model.generate_content(prompt)
@@ -10846,30 +9270,6 @@ D) 🚀 Weekly Expanding To (주간 후발/확장 수혜주):
 4) 한 문단 **Executive Summary** (투자 회의 브리핑 톤)
 
 데이터 밖 환각 금지. 출력은 반드시 {lang}입니다.
-
-[필수 — 자동 파싱 섹션: 아래 4개 헤더는 번역·수정 금지, 이모지 포함, ## 레벨 그대로 유지]
-리포트 **하단**에 반드시 다음 4개 섹션을 추가하라. 시스템이 정규식으로 파싱하므로 헤더 문자열을 단 한 글자도 바꾸지 마라.
-
-## 🏆 Weekly Winners (주간 대장주)
-- 이번 주와 저번 주 **모두에서 강했던** 핵심 티커 (교집합 + 지속 모멘텀)
-- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 5~10개)
-
-## 🚀 Weekly Expanding To (주간 후발/확장 수혜주)
-- 이번 주 새로 부상하거나 다음 주 초반 순환매 수혜 예상 티커
-- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 5~10개)
-
-## 🌱 Emerging (이번 주 새로 부상)
-- 저번 주에는 없었고 이번 주에 새로 등장한 티커·테마
-- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 3~7개)
-
-## 🥀 Fading (저번 주 대비 약화)
-- 저번 주에는 강했지만 이번 주에 사그라든 티커·테마
-- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 3~7개)
-
-[티커 표기 규칙 — 절대 준수]
-- 모든 티커는 반드시 영문 대문자(UPPERCASE). 예) NVDA, MSFT, AVGO
-- 각 불릿 라인에 티커 1개만. 잘못된 예: `- **NVDA, AMD** — ...`
-- 일반 약어(AI, ETF, FED, GDP 등)는 티커로 표기 금지.
 """.format(
             lang=language_label
         )
@@ -10884,28 +9284,6 @@ D) 🚀 Weekly Expanding To (주간 후발/확장 수혜주):
         briefing_model = _narrative_timeseries_briefing_model()
         response = briefing_model.generate_content(prompt)
         raw = str(getattr(response, "text", "") or "").strip()
-        # text 가 비어도 candidates.parts 에 본문이 들어오는 경우가 있어 회수한다.
-        if not raw and hasattr(response, "candidates"):
-            try:
-                for _c in (response.candidates or []):
-                    for _p in getattr(getattr(_c, "content", None), "parts", []) or []:
-                        raw += getattr(_p, "text", "") or ""
-                raw = raw.strip()
-            except Exception:
-                pass
-        # 토큰 한도로 잘렸는지(finish_reason == MAX_TOKENS) 확인하여 경고한다.
-        try:
-            _fr = ""
-            for _c in (getattr(response, "candidates", None) or []):
-                _fr = str(getattr(_c, "finish_reason", "") or "")
-                break
-            if "MAX_TOKENS" in _fr.upper():
-                st.warning(
-                    "⚠️ 분석 본문이 모델 출력 한도에 도달해 일부가 잘렸을 수 있습니다. "
-                    "다시 시도하면 더 완전한 결과를 받을 수 있습니다."
-                )
-        except Exception:
-            pass
         return raw
     except Exception as exc:
         err = str(exc).lower()
@@ -10987,7 +9365,10 @@ if st.session_state.get("logged_in"):
             st.session_state.pop("main_nav_idx", None)
     _cur_nav = st.session_state.get(_nav_key)
     if _cur_nav not in _nav_opts:
-        st.session_state[_nav_key] = _nav_opts[0]
+        if isinstance(_cur_nav, str) and _cur_nav in _LEGACY_NAV_STR_TO_INDEX:
+            st.session_state[_nav_key] = _MAIN_NAV_OPTIONS[_LEGACY_NAV_STR_TO_INDEX[_cur_nav]]
+        else:
+            st.session_state[_nav_key] = _nav_opts[0]
     
     main_nav = st.sidebar.radio(
         "탑다운 단계",
@@ -11035,18 +9416,11 @@ if st.session_state.get("logged_in"):
     if st.sidebar.button("현재 티커 저장", use_container_width=True, type="primary"):
         _uid_memo = str(st.session_state.get("user_id") or "").strip()
         _tk_save = str(selected_ticker).strip().upper()
-        # ✅ 저장 시점 현재가를 캐시 우회하여 신선하게 조회
-        try:
-            fetch_latest_prices_for_tickers.clear()
-        except Exception:
-            pass
-        _saved_p = fetch_latest_prices_for_tickers((_tk_save,)).get(_tk_save, np.nan)
         _ok_wl_save, _err_wl_save = add_to_watchlist(
             _uid_memo, _tk_save,
             memo=watch_note.strip(),
             alert_rsi=float(_alert_rsi_val) if _alert_rsi_val > 0 else None,
             alert_ma200=bool(_alert_ma200_val),
-            saved_price=float(_saved_p) if pd.notna(_saved_p) else None,  # ✅ 명시적 전달
         )
         if _ok_wl_save:
             _alert_desc = []
@@ -11101,7 +9475,7 @@ if st.session_state.get("logged_in"):
         # 🚨 Daily Risk Gauge
         # ─────────────────────────────────────────────────────────────────────
         st.subheader("🚨 Daily Risk Gauge")
-        st.caption("매일 접속 시 시장 선행 신호 6가지를 자동 스캔합니다. 선물 프리마켓·이벤트 캘린더로 당일 장 방향을 장 열기 전에 파악하세요.")
+        st.caption("매일 접속 시 시장 하락 선행 신호 5가지를 자동 스캔합니다. 전날 미리 경고를 포착하는 게 목표예요.")
 
         drg_col1, drg_col2 = st.columns([2, 3])
         with drg_col1:
@@ -11115,10 +9489,8 @@ if st.session_state.get("logged_in"):
 
         if st.button("🔄 지금 스캔", key="drg_refresh_btn", use_container_width=True):
             compute_daily_risk_gauge.clear()
-            fetch_vix_latest_and_history.clear()
-            fetch_fmp_economic_calendar_risk.clear()
 
-        with st.spinner("📡 선행 신호 6가지 동시 분석 중... (약 5~10초)"):
+        with st.spinner("선행 지표 5가지 분석 중..."):
             drg = compute_daily_risk_gauge(sector_filter=sector_choice)
 
         risk_score = drg["risk_score"]
@@ -11140,23 +9512,21 @@ if st.session_state.get("logged_in"):
             unsafe_allow_html=True
         )
 
-        st.markdown("### 📡 선행 신호 6가지")
+        st.markdown("### 📡 선행 신호 5가지")
         sig = drg["signals"]
-        s_col1, s_col2, s_col3, s_col4, s_col5, s_col6 = st.columns(6)
+        s_col1, s_col2, s_col3, s_col4, s_col5 = st.columns(5)
         signal_defs = [
-            ("vix",        "VIX 방향",        "🌡️"),
-            ("credit",     "신용 스프레드",    "💳"),
-            ("leaders",    "대장주 모멘텀",    "🏆"),
-            ("futures",    "프리마켓 방향",    "📈"),
-            ("riskoff",    "달러·금·국채",     "🛡️"),
-            ("event_risk", "이벤트 리스크",    "📅"),
+            ("vix",     "VIX 방향",     "🌡️"),
+            ("credit",  "신용 스프레드", "💳"),
+            ("leaders", "대장주 모멘텀", "🏆"),
+            ("volume",  "거래량 패턴",   "📦"),
+            ("vix_vxn", "VIX/VXN",      "⚡"),
         ]
-        for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5, s_col6], signal_defs):
+        for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5], signal_defs):
             with col:
                 s = sig.get(key, {})
                 ok = s.get("ok", True)
                 val = s.get("value", "N/A")
-                trend = s.get("trend", "")
                 status = "✅ 정상" if ok else "⚠️ 경고"
                 color = "#16a34a" if ok else "#dc2626"
                 st.markdown(
@@ -11166,8 +9536,7 @@ if st.session_state.get("logged_in"):
                     f"<div style='font-size:11px;color:#94a3b8'>{label}</div>"
                     f"<div style='font-weight:700;color:{color}'>{status}</div>"
                     f"<div style='font-size:11px;color:#cbd5e1'>{val}</div>"
-                    + (f"<div style='font-size:10px;color:#64748b;margin-top:2px'>{trend}</div>" if trend else "")
-                    + f"</div>",
+                    f"</div>",
                     unsafe_allow_html=True
                 )
 
@@ -11179,82 +9548,6 @@ if st.session_state.get("logged_in"):
                 st.warning(w)
         else:
             st.success("✅ 현재 감지된 선행 경고 신호 없음 — 시장 환경 정상")
-
-        # ── 이벤트 캘린더 — 행동 지침 포함 ──────────────────────────────
-        event_cal = drg.get("event_calendar", [])
-        if event_cal:
-            st.divider()
-            st.markdown("### 📅 3일 이내 경제 이벤트 캘린더 (FMP)")
-
-            # 이벤트별 행동 지침 자동 생성
-            _ACTION_GUIDE = {
-                "fomc": ("🏦 FOMC", "발표 전후 변동성 2배 구간. 신규 매수 자제, 기존 포지션 절반 이하 유지 권장."),
-                "federal reserve": ("🏦 연준 발언", "예상치 못한 매파 발언 시 기술주 급락 가능. 포지션 축소 준비."),
-                "cpi": ("📊 CPI", "예상치 상회 시 금리 인상 우려 → 성장주 매도 압력. 예상치 하회 시 랠리 가능."),
-                "nonfarm": ("👷 NFP", "고용 호조 = 금리 인상 우려(기술주 악재). 고용 부진 = 경기 침체 우려."),
-                "payroll": ("👷 NFP", "고용 호조 = 금리 인상 우려(기술주 악재). 고용 부진 = 경기 침체 우려."),
-                "pce": ("💰 PCE", "연준 선호 인플레 지표. 예상 상회 시 금리 인하 지연 → 성장주 부담."),
-                "ppi": ("🏭 PPI", "생산자물가. CPI 선행지표. 상승 시 향후 CPI 상승 압력 예고."),
-                "gdp": ("📈 GDP", "예상 하회 시 경기 침체 우려. 예상 상회 시 과열 인플레 우려 공존."),
-                "retail sales": ("🛒 소매판매", "소비 강도 지표. 급감 시 경기 둔화 신호."),
-                "ism": ("🏗️ ISM PMI", "50 이하 = 경기 수축. 제조업 PMI 하회 시 산업재·소재 섹터 주의."),
-                "initial claims": ("📋 실업수당", "급증 시 고용 악화 신호. 연속 급증이면 경기 침체 선행 지표."),
-                "pmi": ("📉 PMI", "50 이하 수축 신호. 예상 하회 시 경기 우려 확대."),
-            }
-
-            def _get_action(event_name: str) -> tuple:
-                name_lower = event_name.lower()
-                for kw, guide in _ACTION_GUIDE.items():
-                    if kw in name_lower:
-                        return guide
-                return ("", "")
-
-            def _fmt_ev_val(v):
-                return str(v) if v is not None and str(v).strip() not in ("", "None") else "—"
-
-            # 고임팩트 이벤트 행동 지침 먼저 표시
-            high_ev = [e for e in event_cal if e.get("impact","").lower() in ("high","3")]
-            if high_ev:
-                for ev in high_ev[:3]:
-                    ev_icon, ev_action = _get_action(ev.get("event",""))
-                    if ev_action:
-                        est = ev.get("estimate")
-                        prior = ev.get("prior")
-                        context = ""
-                        if est is not None and str(est).strip() not in ("", "None"):
-                            context += f" 예상: **{est}**"
-                        if prior is not None and str(prior).strip() not in ("", "None"):
-                            context += f" / 이전: **{prior}**"
-                        st.warning(
-                            f"**{ev_icon} {ev.get('date','')} · {ev.get('event','')}**{context}  \n"
-                            f"→ {ev_action}"
-                        )
-
-            # 전체 캘린더 테이블
-            with st.expander("📋 전체 이벤트 목록 보기", expanded=False):
-                ev_cols_header = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
-                for hdr, txt in zip(ev_cols_header, ["날짜", "이벤트", "임팩트", "실제", "예상", "이전"]):
-                    hdr.markdown(f"**{txt}**")
-                for ev in event_cal[:15]:
-                    impact = ev.get("impact", "")
-                    impact_color = (
-                        "#dc2626" if impact.lower() in ("high", "3")
-                        else "#f59e0b" if impact.lower() in ("medium", "2")
-                        else "#64748b"
-                    )
-                    impact_emoji = (
-                        "🔴 High" if impact.lower() in ("high", "3")
-                        else "🟡 Medium" if impact.lower() in ("medium", "2")
-                        else "⚪ Low"
-                    )
-                    ev_cols = st.columns([1.2, 3.5, 1.2, 1.2, 1.2, 1.2])
-                    ev_cols[0].markdown(f"`{ev.get('date','')}`")
-                    ev_cols[1].markdown(ev.get("event", ""))
-                    ev_cols[2].markdown(f"<span style='color:{impact_color};font-weight:700'>{impact_emoji}</span>", unsafe_allow_html=True)
-                    ev_cols[3].markdown(_fmt_ev_val(ev.get("actual")))
-                    ev_cols[4].markdown(_fmt_ev_val(ev.get("estimate")))
-                    ev_cols[5].markdown(_fmt_ev_val(ev.get("prior")))
-            st.caption("📌 FMP Economic Calendar 기준.")
 
         with st.expander("🔍 신호 상세 데이터", expanded=False):
             for key, data in drg.get("details", {}).items():
@@ -11290,7 +9583,7 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.markdown("### 🤖 AI 내일 시장 예측")
-        st.caption("선행 신호 6가지(선물·달러·금 포함) + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 장 열리기 전(8AM ET / 한국 밤 10시) 실행 권장.")
+        st.caption("선행 신호 5가지 + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 자기 전 또는 장 열리기 전 실행 권장.")
 
         if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
             with st.spinner("최신 데이터 수집 중..."):
@@ -11300,16 +9593,14 @@ if st.session_state.get("logged_in"):
                 fresh_sig = fresh_drg.get("signals", sig)
                 fresh_warnings = fresh_drg.get("warnings", [])
 
-                # 2) FMP 멀티레이어 뉴스 수집 (Stock News·Press Releases·Articles·General, 최대 30개)
+                # 2) RSS 멀티소스 뉴스 수집 (Yahoo/CNBC/Google/MarketWatch, 최대 30개)
                 try:
-                    fmp_news_list, _, _ = fetch_global_market_news()
+                    rss_news_list, _, _ = fetch_global_market_news()
                     rss_news_text = "\n".join([
-                        f"- [{item.get('source','?')}] {item.get('title','')}"
-                        + (f" | Tickers: {item.get('tickers','')}" if item.get('tickers') else "")
-                        + (f" | {item.get('summary','')[:80]}" if item.get('summary') else "")
-                        for item in fmp_news_list[:30]
-                    ]) if fmp_news_list else "뉴스 없음"
-                    rss_news_count = len(fmp_news_list)
+                        f"- [{item.get('source','?')}] {item.get('title','')} | {item.get('summary','')[:80]}"
+                        for item in rss_news_list[:30]
+                    ]) if rss_news_list else "RSS 뉴스 없음"
+                    rss_news_count = len(rss_news_list)
                 except Exception:
                     rss_news_text = "\n".join([
                         f"- [{n['ticker']}] {n['title']} ({n['publisher']})"
@@ -11327,59 +9618,30 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     macro_summary = "데이터 없음"
 
-            # 4) 이벤트 캘린더 요약
-            fresh_events = fresh_drg.get("event_calendar", [])
-            if fresh_events:
-                event_summary = "\n".join([
-                    f"- {e['date']} [{e['impact']}] {e['event']}"
-                    + (f" (예상: {e['estimate']})" if e.get("estimate") is not None else "")
-                    for e in fresh_events[:6]
-                ])
-            else:
-                event_summary = "이벤트 없음 또는 조회 불가"
-
             signal_summary = "\n".join([
                 f"- {label}: {'정상' if fresh_sig.get(key, {}).get('ok', True) else '경고'} | {fresh_sig.get(key, {}).get('value', 'N/A')}"
-                + (f" ({fresh_sig.get(key, {}).get('trend','')})" if fresh_sig.get(key, {}).get('trend','') else "")
                 for key, label, _ in signal_defs
             ])
             warning_text = "\n".join(fresh_warnings) if fresh_warnings else "없음"
             now_kst = datetime.now(_KST_TZ)
-            now_et_for_session = datetime.now(_MARKET_ET_TZ)
-            # 장 세션 판단은 ET 기준 (9:30~16:00 ET)
-            et_hour = now_et_for_session.hour
-            et_minute = now_et_for_session.minute
-            market_session = (
-                "장 전" if (et_hour < 9 or (et_hour == 9 and et_minute < 30))
-                else ("장 중" if et_hour < 16 else "장 후")
-            )
-
-            # 선물·리스크오프 신호 별도 강조
-            _futures_sig = fresh_sig.get("futures", {})
-            _riskoff_sig = fresh_sig.get("riskoff", {})
-            _futures_line = f"선물 프리마켓: {_futures_sig.get('value','N/A')} ({_futures_sig.get('trend','')})"
-            _riskoff_line = f"달러·금·국채: {_riskoff_sig.get('value','N/A')}"
+            market_session = "장 전" if now_kst.hour < 9 else ("장 중" if now_kst.hour < 16 else "장 후")
 
             drg_prompt = (
                 "당신은 월가 수석 퀀트 전략가입니다. "
                 "아래 실시간 데이터를 바탕으로 내일 미국 주식시장을 예측하세요.\n\n"
                 f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} KST ({market_session})\n"
                 f"[분석 섹터] {sector_choice}\n\n"
-                f"[선행 신호 6가지]\n{signal_summary}\n\n"
-                f"[선물·안전자산 핵심 데이터]\n"
-                f"- {_futures_line}\n"
-                f"- {_riskoff_line}\n\n"
+                f"[선행 신호 5가지]\n{signal_summary}\n\n"
                 f"[감지된 경고]\n{warning_text}\n\n"
-                f"[3일 이내 주요 경제 이벤트]\n{event_summary}\n\n"
                 f"[거시경제 지표]\n{macro_summary}\n\n"
                 f"[오늘의 주요 뉴스 ({rss_news_count}개 소스)]\n{rss_news_text}\n\n"
                 "---\n"
                 "아래 4개 항목을 각각 작성하세요. "
-                "반드시 위 수치(선물 %, VIX 값, 이벤트명/예상치, 뉴스 종목명)를 직접 인용해 근거를 만드세요. "
-                "일반론·빈말 금지. 선물과 이벤트 데이터를 반드시 활용하세요.\n\n"
+                "반드시 위 데이터의 실제 수치(VIX 값, 신호 상태, 뉴스 종목명/이슈)를 직접 인용해 근거를 만드세요. "
+                "일반론이나 '시장을 주시해야 한다'류의 빈말은 금지입니다.\n\n"
                 "## 내일 시장 방향 판단: [상승 우세 / 중립 / 하락 우세]\n\n"
-                "**📊 핵심 근거** (선물 방향·VIX·이벤트 수치 직접 인용, 2~3문장):\n\n"
-                "**📰 뉴스 영향** (오버나잇 뉴스 중 내일 시장에 영향줄 종목/이슈, 2문장):\n\n"
+                "**📊 핵심 근거** (위 수치를 직접 인용해 2~3문장):\n\n"
+                "**📰 뉴스 영향** (오늘 뉴스 중 내일 시장에 영향줄 종목/이슈 구체적으로 언급, 2문장):\n\n"
                 "**⚠️ 내일 주목할 리스크** (구체적 수치/종목/이벤트 기반, 2가지):\n"
                 "1. \n"
                 "2. \n\n"
@@ -11392,7 +9654,7 @@ if st.session_state.get("logged_in"):
             with st.spinner("Gemini AI 분석 중... (약 15~20초)"):
                 _drg_model = _GenAIModel(
                     "gemini-2.5-flash",
-                    generation_config={"temperature": 0.7, "max_output_tokens": 8192, "thinking_budget": 0}
+                    generation_config={"temperature": 0.7, "max_output_tokens": 4096}
                 )
                 _drg_response = _drg_model.generate_content(drg_prompt)
                 _drg_text = _gemini_response_text_utf8_safe(_drg_response)
@@ -11414,8 +9676,8 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     _spy_close = np.nan
 
-                # DRG_Predictions 시트에 저장 (ET 기준 — 자동화 스크립트와 동일)
-                _pred_date_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+                # DRG_Predictions 시트에 저장
+                _pred_date_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
                 _puid_drg = str(st.session_state.get("user_id") or "").strip()
                 save_drg_prediction(
                     _puid_drg, _pred_date_str, _pred_dir,
@@ -11502,7 +9764,7 @@ if st.session_state.get("logged_in"):
                                             "3~4문장 한국어 리뷰: 맞았다면 어떤 근거가 적중했는지, 틀렸다면 무엇을 놓쳤는지, 다음 예측 시 참고할 인사이트."
                                         )
                                         _rm = _GenAIModel("gemini-2.5-flash",
-                                            generation_config={"temperature": 0.3, "max_output_tokens": 1024, "thinking_budget": 0})
+                                            generation_config={"temperature": 0.3, "max_output_tokens": 512})
                                         _rv = _gemini_response_text_utf8_safe(_rm.generate_content(_rp)) or ""
                                     except Exception:
                                         _rv = ""
@@ -11564,212 +9826,17 @@ if st.session_state.get("logged_in"):
                         st.markdown("**🤖 AI 리뷰:**")
                         st.markdown(str(_r.get("review_comment", "")))
 
-        # ── 🎯 오늘 투자해도 될까? — 실시간 투자 판단 브리핑 ────────────────
-        st.divider()
-        st.markdown("### 🎯 오늘 투자해도 될까?")
-        st.caption(
-            "아침 시장 예측 + 현재 거시경제 지표 + DRG 선행 신호를 종합해 "
-            "Gemini가 지금 이 순간 투자 판단을 내립니다."
-        )
-
-        _itb_session_key = "invest_today_briefing"
-        _itb_ts_key = "invest_today_briefing_ts"
-        _itb_uid = str(st.session_state.get("user_id") or "").strip()
-
-        # ── 입력 데이터 수집 ────────────────────────────────────────────────
-        # 1) 오늘 아침 예측
-        _itb_today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
-        _itb_pred_df = load_drg_predictions(_itb_uid)
-        _itb_today_pred = None
-        if not _itb_pred_df.empty:
-            _itb_match = _itb_pred_df[
-                _itb_pred_df["pred_date"].astype(str).str[:10] == _itb_today_str
-            ]
-            if not _itb_match.empty:
-                _itb_today_pred = _itb_match.iloc[-1]
-
-        # 2) DRG 현재 점수/신호 (이미 위에서 계산된 drg 재사용)
-        # drg 변수는 이 페이지 상단에서 이미 compute_daily_risk_gauge()로 계산됨
-
-        # ── 상태 표시 ────────────────────────────────────────────────────────
-        _itb_info_c1, _itb_info_c2, _itb_info_c3 = st.columns(3)
-        with _itb_info_c1:
-            if _itb_today_pred is not None:
-                st.success(f"✅ 오늘 예측 있음\n\n**{_itb_today_pred.get('direction', '')}**")
-            else:
-                st.warning("⚠️ 오늘 아침 예측 없음\n\n(예측 없이도 분석 가능)")
-        with _itb_info_c2:
-            st.info(
-                f"**DRG:** {drg.get('risk_level', 'N/A')}\n\n"
-                f"Risk Score: {drg.get('risk_score', 'N/A')}/10"
-            )
-        with _itb_info_c3:
-            if st.session_state.get(_itb_ts_key):
-                st.info(f"⏱️ 마지막 분석\n\n{st.session_state[_itb_ts_key]}")
-            else:
-                st.info("📊 거시 지표 자동 로드됨\n\n버튼을 눌러 분석 시작")
-
-        # ── 실행 버튼 ────────────────────────────────────────────────────────
-        _itb_btn_col, _itb_reset_col = st.columns([3, 1])
-        with _itb_btn_col:
-            _run_itb = st.button(
-                "🎯 지금 투자해도 될지 분석",
-                key="invest_today_briefing_btn",
-                use_container_width=True,
-                type="primary",
-            )
-        with _itb_reset_col:
-            if st.button("🗑️ 초기화", key="invest_today_briefing_reset", use_container_width=True):
-                st.session_state.pop(_itb_session_key, None)
-                st.session_state.pop(_itb_ts_key, None)
-                st.rerun()
-
-        if _run_itb:
-            # ── 거시 지표 로드 ────────────────────────────────────────────
-            with st.spinner("거시경제 지표 로드 중..."):
-                _itb_macro = get_macro_dashboard_with_validation()
-
-            # ── 프롬프트 구성 ─────────────────────────────────────────────
-            # 1) 아침 예측 섹션
-            if _itb_today_pred is not None:
-                _pred_section = (
-                    f"[오늘 아침 시장 예측 — {_itb_today_pred.get('pred_date', '')}]\n"
-                    f"예측 방향: {_itb_today_pred.get('direction', '')}\n"
-                    f"섹터 필터: {_itb_today_pred.get('sector_filter', '전체')}\n"
-                    f"벤치마크: {_itb_today_pred.get('benchmark_etf', 'SPY')}\n"
-                    f"예측 전문 (앞 800자):\n{str(_itb_today_pred.get('full_text', ''))[:800]}\n"
-                )
-            else:
-                _pred_section = "[오늘 아침 시장 예측]\n예측 기록 없음 (아직 실행 전이거나 휴장일)\n"
-
-            # 2) DRG 신호 섹션
-            _sig = drg.get("signals", {})
-            _sig_lines = []
-            _sig_label_map = {
-                "vix": "VIX 방향",
-                "credit": "신용 스프레드",
-                "leaders": "대장주 모멘텀",
-                "volume": "거래량 패턴",
-                "vix_vxn": "VIX/VXN 비율",
-                "event_risk": "이벤트 리스크",
-                "futures": "선물 방향",
-                "riskoff": "리스크오프 신호",
-            }
-            for _sk, _sl in _sig_label_map.items():
-                _sv = _sig.get(_sk)
-                if _sv:
-                    _ok_str = "✅ 정상" if _sv.get("ok") else "❌ 경고"
-                    _sig_lines.append(f"  - {_sl}: {_ok_str} | {_sv.get('value', 'N/A')}")
-            _drg_section = (
-                f"[DRG (Daily Risk Gauge) 현재 상태]\n"
-                f"종합 Risk Score: {drg.get('risk_score', 'N/A')}/10 — {drg.get('risk_level', '')}\n"
-                f"요약: {drg.get('risk_msg', '')}\n"
-                f"선행 신호 상세:\n" + "\n".join(_sig_lines) + "\n"
-            )
-
-            # 3) 거시 지표 섹션
-            _macro_lines = []
-            for _mr in (_itb_macro.get("rows") or [])[:12]:
-                _macro_lines.append(
-                    f"  - {_mr.get('지표', '')}: {_mr.get('현재값', 'N/A')} → {_mr.get('판정', '')} | {_mr.get('판독 요약', '')[:60]}"
-                )
-            _macro_score = _itb_macro.get("macro_score", "N/A")
-            _macro_grade = _itb_macro.get("macro_grade", "N/A")
-            _fg_rating = _itb_macro.get("fg_rating", "N/A")
-            _macro_section = (
-                f"[거시경제 지표 현황]\n"
-                f"종합 Macro Score: {_macro_score}/100 — {_macro_grade}\n"
-                f"Fear & Greed: {_fg_rating}\n"
-                f"주요 지표:\n" + "\n".join(_macro_lines) + "\n"
-            )
-
-            # 4) 최종 프롬프트
-            _itb_prompt = f"""당신은 월가 퀀트 스트래티지스트입니다.
-아래 세 가지 데이터를 종합해서 **지금 이 순간** 투자 판단을 내려주세요.
-
-{_pred_section}
-{_drg_section}
-{_macro_section}
-
----
-다음 형식으로 한국어로 답변하세요:
-
-## 📊 신호 일치도 분석
-아침 예측 방향과 현재 DRG·거시 지표가 일치하는지 불일치하는지 2~3문장으로 설명.
-
-## 🎯 투자 판단 (세 가지)
-- 🟢 **신규 진입**: [가능 / 자제 / 불가] — 이유 1문장
-- 🟡 **기존 포지션 유지**: [유지 / 일부 축소 / 전량 축소] — 이유 1문장
-- 🔴 **헷지·현금 비중**: [현수준 유지 / 확대 권장 / 긴급 확대] — 이유 1문장
-
-## 💡 확신도
-[0~100 숫자]% — 이유 1문장 (신호들이 일관되면 높음, 혼조세면 낮음)
-
-## ⚠️ 오늘 가장 주목할 리스크 1가지
-한 문장으로.
-
-## ✅ 오늘 가장 긍정적인 신호 1가지
-한 문장으로.
-"""
-
-            with st.spinner("Gemini 투자 판단 분석 중... (10~20초)"):
-                try:
-                    _itb_model = _GenAIModel(
-                        "gemini-2.5-flash",
-                        generation_config={"temperature": 0.2, "max_output_tokens": 4096, "thinking_budget": 0},
-                    )
-                    _itb_resp = _itb_model.generate_content(_itb_prompt)
-                    _itb_text = (_gemini_response_text_utf8_safe(_itb_resp) or "").strip()
-                    if _itb_text:
-                        _now_et = datetime.now(_MARKET_ET_TZ)
-                        _ts_str = _now_et.strftime("%m/%d %H:%M ET")
-                        # 장 마감까지 남은 시간
-                        _market_close = _now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-                        _mins_left = int((_market_close - _now_et).total_seconds() / 60)
-                        _validity = (
-                            f"장 마감까지 약 {_mins_left}분" if 0 < _mins_left < 480
-                            else ("장 마감 후" if _mins_left <= 0 else "프리마켓")
-                        )
-                        st.session_state[_itb_session_key] = {
-                            "text": _itb_text,
-                            "timestamp": _ts_str,
-                            "validity": _validity,
-                            "pred_direction": _itb_today_pred.get("direction", "없음") if _itb_today_pred is not None else "없음",
-                            "drg_score": drg.get("risk_score", "N/A"),
-                            "macro_score": _macro_score,
-                        }
-                        st.session_state[_itb_ts_key] = _ts_str
-                    else:
-                        st.warning("분석 결과를 받지 못했습니다. 다시 시도해주세요.")
-                except Exception as _itb_err:
-                    st.error(f"Gemini 분석 실패: {_itb_err}")
-
-        # ── 저장된 결과 표시 ────────────────────────────────────────────────
-        _itb_saved = st.session_state.get(_itb_session_key)
-        if _itb_saved and _itb_saved.get("text"):
-            _itb_meta_c1, _itb_meta_c2, _itb_meta_c3, _itb_meta_c4 = st.columns(4)
-            _itb_meta_c1.metric("분석 시각", _itb_saved.get("timestamp", "N/A"))
-            _itb_meta_c2.metric("유효 시간", _itb_saved.get("validity", "N/A"))
-            _itb_meta_c3.metric("DRG 점수", f"{_itb_saved.get('drg_score', 'N/A')}/10")
-            _itb_meta_c4.metric("Macro Score", f"{_itb_saved.get('macro_score', 'N/A')}/100")
-            st.markdown("---")
-            st.markdown(_itb_saved["text"])
-            st.caption(
-                "⚠️ 이 분석은 투자 참고용입니다. 최종 투자 결정은 본인의 판단으로 하세요. "
-                "새로운 뉴스·이벤트 발생 시 '🗑️ 초기화' 후 재분석을 권장합니다."
-            )
-
     elif main_nav == _MAIN_NAV_OPTIONS[1]:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
         st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 미국 거시경제 대시보드")
-        st.caption("FRED API + FMP Treasury/Economics API 기준. 금리차는 FMP 실시간, 월간 지표는 FRED. 판단은 참고용 휴리스틱입니다.")
+        st.caption("yfinance + FRED API + CNN Fear & Greed 기준. 판단은 참고용 휴리스틱입니다.")
 
         try:
             with st.spinner("매크로 지표를 불러오는 중..."):
                 macro_pack = get_macro_dashboard_with_validation()
 
             if macro_pack.get("na_total", 0) >= 4:
-                st.warning("일부 거시경제 데이터를 불러오지 못했습니다. FRED 또는 FMP API 상태를 확인해주세요.")
+                _notify_yfinance_fetch_failed()
 
             # ── 1. Macro Score 게이지 ──────────────────────────────────────
             macro_score = macro_pack.get("macro_score", 50.0)
@@ -11809,7 +9876,7 @@ if st.session_state.get("logged_in"):
                 unsafe_allow_html=True,
             )
             st.caption(macro_desc)
-            macro_traffic_light(macro_pack["bad_total"], total_indicators=len(macro_pack["rows"]))
+            macro_traffic_light(macro_pack["bad_total"])
 
             st.divider()
 
@@ -11818,8 +9885,8 @@ if st.session_state.get("logged_in"):
             with st.spinner("히스토리 데이터 로딩 중..."):
                 hist_data = fetch_macro_history_series()
 
-            chart_tab1, chart_tab2, chart_tab3, chart_tab4, chart_tab5, chart_tab6, chart_tab7 = st.tabs(
-                ["VIX", "CPI YoY", "실업률", "Fed Rate", "DXY", "GDP", "소매판매"]
+            chart_tab1, chart_tab2, chart_tab3, chart_tab4, chart_tab5 = st.tabs(
+                ["VIX", "CPI YoY", "실업률", "Fed Rate", "DXY"]
             )
             with chart_tab1:
                 vix_hist = macro_pack.get("vix_hist")
@@ -11862,30 +9929,6 @@ if st.session_state.get("logged_in"):
                 else:
                     st.warning("DXY 데이터를 불러오지 못했습니다.")
 
-            with chart_tab6:
-                try:
-                    gdp_row = next((r for r in macro_pack.get("rows", []) if "GDP" in r.get("지표", "")), None)
-                    if gdp_row and gdp_row.get("현재값", "N/A") != "N/A":
-                        st.metric("GDP 성장률 QoQ (최신)", gdp_row["현재값"])
-                        st.info(gdp_row["판독 요약"])
-                        st.caption("💡 전분기 대비 성장률(%). 마이너스 2분기 연속 = 기술적 침체. 0.5% 미만이면 정체 신호.")
-                    else:
-                        st.warning("GDP 데이터를 불러오지 못했습니다. FMP API 키를 확인하세요.")
-                except Exception:
-                    st.warning("GDP 데이터 조회 중 오류가 발생했습니다.")
-
-            with chart_tab7:
-                try:
-                    rs_row = next((r for r in macro_pack.get("rows", []) if "소매판매" in r.get("지표", "")), None)
-                    if rs_row and rs_row.get("현재값", "N/A") != "N/A":
-                        st.metric("소매판매 MoM (최신)", rs_row["현재값"])
-                        st.info(rs_row["판독 요약"])
-                        st.caption("💡 전월 대비 변화율(%). 마이너스 전환 시 소비 위축·경기 둔화 선행 신호.")
-                    else:
-                        st.warning("소매판매 데이터를 불러오지 못했습니다. FMP API 키를 확인하세요.")
-                except Exception:
-                    st.warning("소매판매 데이터 조회 중 오류가 발생했습니다.")
-
             st.divider()
 
             # ── 3. 전체 지표 카드 ─────────────────────────────────────────
@@ -11909,21 +9952,17 @@ if st.session_state.get("logged_in"):
 
             with st.expander("📖 거시경제 지표 해석 가이드", expanded=False):
                 st.markdown("""
-| 지표 | 소스 | 의미 | 주식 시장 영향 |
-|---|---|---|---|
-| 장단기 금리차 | FMP 실시간 / FRED 폴백 | 경기 침체 예고 신호 | 역전 시 침체 우려, 좁아질수록 위험 |
-| VIX | FRED | 투자자 공포·탐욕 수준 | 20 이하 안정, 35 이상 극단적 공포 |
-| WTI 유가 | FRED | 인플레이션·비용 압력 | 급등 시 성장주 밸류에이션 타격 |
-| 실업률 (샴) | FRED | 소비 체력·침체 진입 | 샴 발동 시 실물 위기 시작 |
-| CPI YoY | FRED | 연준 금리 결정 방향 | 3% 이상 시 고금리 유지 (성장주 악재) |
-| DXY | FRED | 글로벌 달러 위상 | 강세 시 다국적 기업 해외 실적 악화 |
-| Fear & Greed | VIX 백분위 근사 | 시장 심리 종합 | 75+ 극단적 탐욕(매도 고려), 25- 극단적 공포(매수 고려) |
-| Fed Funds Rate | FRED | 현재 기준금리 | 5% 이상 고금리 레짐, 인하 시 성장주 재평가 |
-| GDP 성장률 QoQ | FMP Economics | 전분기 대비 실질 성장률 | 마이너스 2분기 연속 = 기술적 침체, 0.5% 미만 = 정체 경보 |
-| 소매판매 MoM | FMP Economics | 전월 대비 소비 변화율 | 마이너스 전환 시 소비 위축·경기 둔화 선행 신호 |
-| 주식 위험 프리미엄 ERP | FMP | 주식 vs 채권 매력도 | ERP 높을수록 주식 저평가, 낮을수록 채권 선호 국면 |
+| 지표 | 의미 | 주식 시장 영향 |
+|---|---|---|
+| 장단기 금리차 | 경기 침체 예고 신호 | 역전 시 침체 우려, 정상화 시 폭락 가능 |
+| VIX | 투자자 공포·탐욕 수준 | 20 이하 안정, 35 이상 극단적 공포 |
+| WTI 유가 | 인플레이션·비용 압력 | 급등 시 성장주 밸류에이션 타격 |
+| 실업률 (샴) | 소비 체력·침체 진입 | 샴 발동 시 실물 위기 시작 |
+| CPI YoY | 연준 금리 결정 방향 | 3% 이상 시 고금리 유지 (성장주 악재) |
+| DXY | 글로벌 달러 위상 | 강세 시 다국적 기업 해외 실적 악화 |
+| Fear & Greed | 시장 심리 종합 | 75+ 극단적 탐욕(매도 고려), 25- 극단적 공포(매수 고려) |
+| Fed Funds Rate | 현재 기준금리 | 5% 이상 고금리 레짐, 인하 시 성장주 재평가 |
 """)
-                st.caption("📌 FMP Economics API 항목은 FMP_API_KEY 설정 시에만 조회됩니다.")
 
         except Exception as e:
             st.error("거시경제 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
@@ -11961,18 +10000,17 @@ if st.session_state.get("logged_in"):
         if st.button("🚀 AI 내러티브 엔진 가동 (실시간 뉴스 분석)"):
             try:
                 with st.status("🚀 AI 내러티브 엔진 가동 프로세스 시작...", expanded=True) as status:
-                    st.write("📥 1단계: FMP 멀티레이어 뉴스 파이프라인 수집 중... (Stock News · Press Releases · FMP Articles · General News)")
+                    st.write("📥 1단계: 글로벌 RSS 뉴스 피드 접속 및 데이터 수집 중...")
                     top_news, news_text, raw_news_count = cached_fetch_global_market_news_pack()
-                    _source_log = st.session_state.get("_news_source_log", "")
                     if raw_news_count == 0:
-                        st.write(":red[뉴스 수집 에러: 유효한 뉴스 데이터를 확보하지 못했습니다. (FMP API 키 확인 또는 RSS Fallback도 실패)]")
+                        st.write(":red[RSS 수집 에러 발생: 유효한 뉴스 데이터를 확보하지 못했습니다.]")
                         status.update(label="❌ 분석 중단 (에러 발생)", state="error", expanded=True)
                         st.error("❌ 실시간 뉴스 수집에 실패했습니다.")
                     else:
-                        st.write(f"✔️ 수집 완료: 총 {raw_news_count}개 원본 뉴스 확보 ({_source_log})")
+                        st.write(f"✔️ 수집 완료: 총 {raw_news_count}개 뉴스 확보")
     
-                        st.write("⚙️ 2단계: 뉴스 중복 제거(Deduplication) 및 가중치 기반 랭킹 산출 중...")
-                        st.write(f"✔️ 중복 제거/랭킹 완료: Top {len(top_news)}개 핵심 뉴스 선별 (티커 태그 포함)")
+                        st.write("⚙️ 2단계: 뉴스 중복 제거(Deduplication) 및 중요도 랭킹 산출 중...")
+                        st.write(f"✔️ 중복 제거/랭킹 완료: Top {len(top_news)}개 핵심 뉴스 선별")
                         st.session_state["latest_top_news"] = top_news
     
                         st.write("📊 3단계: ETF Universe 정량 스크리닝 (RS·모멘텀·거래량 분석) 중...")
@@ -11982,7 +10020,7 @@ if st.session_state.get("logged_in"):
                         else:
                             st.write("⚠️ 정량 스크리닝 데이터 없음 — 뉴스 분석만으로 진행")
 
-                        st.write("🧠 4단계: 뉴스(티커 태그 포함) + 정량 데이터를 Gemini 2.5 Flash 엔진으로 전송하여 내러티브 분석 중...")
+                        st.write("🧠 4단계: 뉴스 + 정량 데이터를 Gemini 2.5 Flash 엔진으로 전송하여 내러티브 분석 중...")
                         narrative_data = generate_market_narrative(news_text, selected_language, quant_data=quant_result)
                         st.write("🔍 5단계: AI 응답 수신 완료. JSON 데이터 파싱 및 필터링 중...")
     
@@ -11990,13 +10028,12 @@ if st.session_state.get("logged_in"):
                             st.session_state["narrative_history"].append(narrative_data)
                             st.session_state["current_view"] = narrative_data
                             st.session_state["current_view_language"] = selected_language
-                            st.session_state["current_view_source"] = "market_narrative"
                             append_narrative_history_record(narrative_data, selected_language)
                             st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
                             status.update(label="✅ 분석 완료! (성공)", state="complete", expanded=False)
                             st.success(
                                 "분석 결과를 Google 스프레드시트 `Quant_DB`의 **`Narratives`** 탭에 한 행 추가했습니다. "
-                                f"(수집 {raw_news_count}건 / LLM 투입 Top {len(top_news)} | {_source_log})"
+                                f"(수집 {raw_news_count}건 / LLM 투입 Top {len(top_news)})"
                             )
                         else:
                             st.write(":red[AI 파싱 에러 발생: Gemini 응답에서 유효한 JSON을 추출하지 못했습니다.]")
@@ -12028,13 +10065,7 @@ if st.session_state.get("logged_in"):
         history_len = len(st.session_state.get("narrative_history", []))
         st.caption(f"📊 현재 누적된 분석 횟수: {history_len} 회")
     
-        # ── 언어 전환 번역 (market_narrative 전용) ──────────────────────────
-        _cv_source = st.session_state.get("current_view_source", "market_narrative")
-        if (
-            _cv_source == "market_narrative"
-            and st.session_state.get("current_view")
-            and st.session_state.get("current_view_language") != selected_language
-        ):
+        if st.session_state.get("current_view") and st.session_state.get("current_view_language") != selected_language:
             with st.spinner("선택한 언어로 결과를 자연스럽게 번역 중입니다..."):
                 translated = translate_narrative_json(st.session_state["current_view"], selected_language)
                 if translated:
@@ -12042,154 +10073,107 @@ if st.session_state.get("logged_in"):
                     st.session_state["current_view_language"] = selected_language
                 else:
                     st.warning("언어 전환 번역에 실패하여 기존 결과를 유지합니다.")
-
+    
         narrative_data = st.session_state.get("current_view", {})
-        _cv_source = st.session_state.get("current_view_source", "market_narrative")
-
-        # ── 최근 분석 유형 배지 ────────────────────────────────────────────
-        if narrative_data:
-            _badge_map = {
-                "market_narrative": ("🚀 AI 시장 내러티브", "info"),
-                "weekly_trend_7d":  ("📊 주간 트렌드 추출 (최근 7일)", "success"),
-                "wow_trend_7d":     ("⚖️ 트렌드 변곡점 (이번 주 vs 저번 주)", "success"),
-            }
-            _badge_label, _badge_type = _badge_map.get(_cv_source, ("최근 분석 결과", "info"))
-            if _badge_type == "success":
-                st.success(f"📌 현재 표시: **{_badge_label}** — 가장 최근 실행 결과입니다.")
-            else:
-                st.info(f"📌 현재 표시: **{_badge_label}** — 가장 최근 실행 결과입니다.")
-
-        # ════════════════════════════════════════════════════════════════════
-        # CASE A: weekly_trend_7d / wow_trend_7d → 마크다운 브리핑 렌더
-        # ════════════════════════════════════════════════════════════════════
-        if _cv_source in ("weekly_trend_7d", "wow_trend_7d") and isinstance(narrative_data, dict):
-            briefing_md = str(
-                narrative_data.get("weekly_briefing_markdown")
-                or narrative_data.get("wow_briefing_markdown")
-                or narrative_data.get("summary")
-                or ""
-            ).strip()
-            nb_ts = st.session_state.get("narrative_timeseries_briefing")
-            # session_state의 briefing이 더 최신이면 그쪽 우선
-            if isinstance(nb_ts, dict) and nb_ts.get("markdown"):
-                briefing_md = str(nb_ts.get("markdown") or briefing_md).strip()
-
-            if briefing_md:
-                st.markdown(briefing_md)
-                # 팩트 체크 테이블
-                fc_kind = "wow" if _cv_source == "wow_trend_7d" else "weekly"
-                fc_df = nb_ts.get("factcheck_df") if isinstance(nb_ts, dict) else None
-
-                # nb_ts 없거나 factcheck_df 비어있으면 briefing_md 로 즉석 재계산
-                if not isinstance(fc_df, pd.DataFrame) or fc_df.empty:
-                    try:
-                        tickers_by_cat = extract_factcheck_tickers_from_briefing(briefing_md, kind=fc_kind)
-                        if tickers_by_cat.get("all"):
-                            if fc_kind == "wow":
-                                fc_df = compute_narrative_factcheck_wow_returns(tickers_by_cat)
-                            else:
-                                fc_df = compute_narrative_factcheck_weekly_returns(tickers_by_cat)
-                            # nb_ts 에 캐싱
-                            if isinstance(nb_ts, dict):
-                                nb_ts["factcheck_df"] = fc_df
-                                st.session_state["narrative_timeseries_briefing"] = nb_ts
-                    except Exception:
-                        fc_df = pd.DataFrame()
-
-                if isinstance(fc_df, pd.DataFrame) and not fc_df.empty:
-                    st.subheader("📊 내러티브 팩트 체크 (실제 수익률)")
-                    render_narrative_factcheck_table(fc_df, kind=fc_kind)
-                else:
-                    st.caption("팩트 체크 대상 티커가 추출되지 않았습니다.")
-            else:
-                st.warning("저장된 브리핑 마크다운이 없습니다. 다시 실행해주세요.")
-
-        # ════════════════════════════════════════════════════════════════════
-        # CASE B: market_narrative (기본) → JSON 기반 풀 렌더
-        # ════════════════════════════════════════════════════════════════════
+        regime_data = narrative_data.get("regime", {}) if isinstance(narrative_data, dict) else {}
+        themes_data = narrative_data.get("themes", []) if isinstance(narrative_data, dict) else []
+        rotation_data = narrative_data.get("rotation", "") if isinstance(narrative_data, dict) else ""
+        summary_data = narrative_data.get("summary", "") if isinstance(narrative_data, dict) else ""
+        top_quant_picks = narrative_data.get("top_quant_picks", "") if isinstance(narrative_data, dict) else ""
+    
+        if not narrative_data:
+            st.warning("아직 AI 분석 결과가 없습니다. 상단 버튼을 눌러 실시간 내러티브를 생성하세요.")
         else:
-            regime_data     = narrative_data.get("regime", {}) if isinstance(narrative_data, dict) else {}
-            themes_data     = narrative_data.get("themes", []) if isinstance(narrative_data, dict) else []
-            rotation_data   = narrative_data.get("rotation", "") if isinstance(narrative_data, dict) else ""
-            summary_data    = narrative_data.get("summary", "") if isinstance(narrative_data, dict) else ""
-            top_quant_picks = narrative_data.get("top_quant_picks", "") if isinstance(narrative_data, dict) else ""
-
-            if not narrative_data:
-                st.warning("아직 AI 분석 결과가 없습니다. 상단 버튼을 눌러 실시간 내러티브를 생성하세요.")
-
-            st.markdown("### 🧭 Market Regime Indicator")
-            regime_col_1, regime_col_2, regime_col_3 = st.columns(3)
-            with regime_col_1:
-                st.metric("Risk On / Risk Off", regime_data.get("risk", "N/A"))
-            with regime_col_2:
-                st.metric("Growth vs Value", regime_data.get("growth_value", "N/A"))
-            with regime_col_3:
-                st.metric("Liquidity", regime_data.get("liquidity", "N/A"))
-
-            # ── Top Quant Picks 배너 ─────────────────────────────────────────
-            if top_quant_picks:
-                st.divider()
-                st.markdown("### 🏆 Top Quant Picks (정량+정성 동시 확인)")
-                st.success(
-                    f"**정량 모멘텀 + 뉴스 내러티브가 동시에 확인된 최우선 종목:** `{top_quant_picks}`  "
-                    "RS Score 양수 + 200일선 위 + 내러티브 테마 일치 종목입니다."
-                )
-
+            st.info(
+                "현재 화면에 표시되는 것은 **가장 최근 내러티브 스냅샷**입니다. "
+                "저장된 기록을 날짜별로 묶어 보려면 하단 **시계열 분석 엔진**을 사용하세요."
+            )
+    
+        st.markdown("### 🧭 Market Regime Indicator")
+        regime_col_1, regime_col_2, regime_col_3 = st.columns(3)
+        with regime_col_1:
+            st.metric(
+                "Risk On / Risk Off",
+                regime_data.get("risk", "N/A"),
+            )
+        with regime_col_2:
+            st.metric(
+                "Growth vs Value",
+                regime_data.get("growth_value", "N/A"),
+            )
+        with regime_col_3:
+            st.metric(
+                "Liquidity",
+                regime_data.get("liquidity", "N/A"),
+            )
+    
+        # ── Top Quant Picks 배너 ─────────────────────────────────────────
+        if top_quant_picks:
             st.divider()
-            st.markdown("### 🔥 Current Market Themes & 📊 Narrative Breakdown")
-            if isinstance(themes_data, list) and themes_data:
-                for idx, theme in enumerate(themes_data, start=1):
-                    theme = theme if isinstance(theme, dict) else {}
-                    title = theme.get("title", f"Theme {idx}")
-                    expanding_to_data = theme.get("expanding_to", [])
-                    if isinstance(expanding_to_data, list):
-                        expanding_lines = []
-                        for flow in expanding_to_data:
-                            flow = flow if isinstance(flow, dict) else {}
-                            stage = str(flow.get("stage", "") or "").strip()
-                            expected_tickers = str(flow.get("expected_tickers", "") or "").strip()
-                            if stage or expected_tickers:
-                                expanding_lines.append(f"- ➔ **{stage if stage else 'N/A'}**: `{expected_tickers if expected_tickers else 'N/A'}`")
-                        expanding_to_display = "\n".join(expanding_lines) if expanding_lines else "- ➔ **N/A**: `N/A`"
-                    else:
-                        fallback_text = str(expanding_to_data or "N/A").strip()
-                        expanding_to_display = f"- ➔ **Legacy Flow**: `{fallback_text}`"
+            st.markdown("### 🏆 Top Quant Picks (정량+정성 동시 확인)")
+            st.success(
+                f"**정량 모멘텀 + 뉴스 내러티브가 동시에 확인된 최우선 종목:** `{top_quant_picks}`  "
+                "RS Score 양수 + 200일선 위 + 내러티브 테마 일치 종목입니다."
+            )
 
-                    momentum_note   = str(theme.get("momentum_note", "") or "").strip()
-                    emerging_tickers = str(theme.get("emerging", "") or "").strip()
-                    winners_str     = str(theme.get("winners", "") or "N/A").strip()
+        st.divider()
+        st.markdown("### 🔥 Current Market Themes & 📊 Narrative Breakdown")
+        if isinstance(themes_data, list) and themes_data:
+            for idx, theme in enumerate(themes_data, start=1):
+                theme = theme if isinstance(theme, dict) else {}
+                title = theme.get("title", f"Theme {idx}")
+                expanding_to_data = theme.get("expanding_to", [])
+                if isinstance(expanding_to_data, list):
+                    expanding_lines = []
+                    for flow in expanding_to_data:
+                        flow = flow if isinstance(flow, dict) else {}
+                        stage = str(flow.get("stage", "") or "").strip()
+                        expected_tickers = str(flow.get("expected_tickers", "") or "").strip()
+                        if stage or expected_tickers:
+                            expanding_lines.append(f"- ➔ **{stage if stage else 'N/A'}**: `{expected_tickers if expected_tickers else 'N/A'}`")
+                    expanding_to_display = "\n".join(expanding_lines) if expanding_lines else "- ➔ **N/A**: `N/A`"
+                else:
+                    # 과거 누적 데이터(문자열 포맷)와의 하위 호환
+                    fallback_text = str(expanding_to_data or "N/A").strip()
+                    expanding_to_display = f"- ➔ **Legacy Flow**: `{fallback_text}`"
+    
+                momentum_note = str(theme.get("momentum_note", "") or "").strip()
+                emerging_tickers = str(theme.get("emerging", "") or "").strip()
+                winners_str = str(theme.get("winners", "") or "N/A").strip()
 
-                    if "강함" in momentum_note or "strong" in momentum_note.lower():
-                        mom_emoji = "🔥"
-                    elif "약함" in momentum_note or "weak" in momentum_note.lower():
-                        mom_emoji = "❄️"
-                    else:
-                        mom_emoji = "📊"
+                # 모멘텀 강도 이모지
+                if "강함" in momentum_note or "strong" in momentum_note.lower():
+                    mom_emoji = "🔥"
+                elif "약함" in momentum_note or "weak" in momentum_note.lower():
+                    mom_emoji = "❄️"
+                else:
+                    mom_emoji = "📊"
 
-                    with st.expander(f"Theme {idx}: {title} {mom_emoji}", expanded=(idx == 1)):
-                        st.markdown(f"**🎯 Winners (정량+정성 확인):** `{winners_str}`")
-                        if emerging_tickers:
-                            st.markdown(f"**🌱 Emerging (추적 필요):** `{emerging_tickers}`")
-                        if momentum_note:
-                            st.caption(f"📈 모멘텀: {momentum_note}")
-                        st.markdown(
-                            f"""
+                with st.expander(f"Theme {idx}: {title} {mom_emoji}", expanded=(idx == 1)):
+                    # Winners + 모멘텀 점수 강조
+                    st.markdown(f"**🎯 Winners (정량+정성 확인):** `{winners_str}`")
+                    if emerging_tickers:
+                        st.markdown(f"**🌱 Emerging (추적 필요):** `{emerging_tickers}`")
+                    if momentum_note:
+                        st.caption(f"📈 모멘텀: {momentum_note}")
+                    st.markdown(
+                        f"""
 - **Driver (원인):** {theme.get("driver", "N/A")}
 - **Expanding to (확장 흐름):**
 {expanding_to_display}
 - **Risk (위험 요인):** {theme.get("risk", "N/A")}
 """
-                        )
-            else:
-                st.info("AI가 추출한 테마 데이터가 아직 없습니다.")
-
-            st.divider()
-            st.markdown("### 📈 Sector Rotation Map (자금 이동 지도)")
-            st.markdown(rotation_data if rotation_data else "N/A")
-
-            st.divider()
-            st.markdown("### 🧠 Smart AI Summary")
-            st.info(summary_data if summary_data else "N/A")
+                    )
+        else:
+            st.info("AI가 추출한 테마 데이터가 아직 없습니다.")
+    
+        st.divider()
+        st.markdown("### 📈 Sector Rotation Map (자금 이동 지도)")
+        st.markdown(rotation_data if rotation_data else "N/A")
+    
+        st.divider()
+        st.markdown("### 🧠 Smart AI Summary")
+        st.info(summary_data if summary_data else "N/A")
 
         # ── 내러티브 일관성 점수 ─────────────────────────────────────────
         st.divider()
@@ -12240,14 +10224,6 @@ if st.session_state.get("logged_in"):
                         st.markdown(f"**{tk}** — {cnt}회  \n{bar}")
 
         # ── 기능 2: Emerging 종목 정량 교차 검증 ─────────────────────────
-        # themes_data는 CASE B(market_narrative)에서만 정의되므로
-        # wow/weekly source일 때 NameError 방지를 위해 여기서 안전하게 추출
-        _cv_data_for_emerging = st.session_state.get("current_view", {})
-        themes_data = (
-            _cv_data_for_emerging.get("themes", [])
-            if isinstance(_cv_data_for_emerging, dict)
-            else []
-        )
         if themes_data and isinstance(themes_data, list):
             all_emerging = []
             for theme in themes_data:
@@ -12297,16 +10273,7 @@ if st.session_state.get("logged_in"):
                             )
                             def _add_to_wl_em(tk=v["ticker"], vdict=v):
                                 _uid_em = str(st.session_state.get("user_id") or "").strip()
-                                # ✅ verify_emerging_with_quant 결과의 current_price 우선 사용
-                                _preset = vdict.get("current_price")
-                                if _preset and pd.notna(_preset):
-                                    _cur_p = float(_preset)
-                                else:
-                                    try:
-                                        fetch_latest_prices_for_tickers.clear()
-                                    except Exception:
-                                        pass
-                                    _cur_p = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+                                _cur_p = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
                                 _em_item = {
                                     "ticker": tk,
                                     "memo": f"Emerging 검증 - {vdict['verdict']}",
@@ -12340,16 +10307,7 @@ if st.session_state.get("logged_in"):
                             st.markdown(f"**{v['ticker']}** — {v['detail']}")
                             def _add_early_wl(tk=v["ticker"], vd=v):
                                 _uid_el = str(st.session_state.get("user_id") or "").strip()
-                                # ✅ verify_emerging_with_quant 결과의 current_price 우선 사용
-                                _preset2 = vd.get("current_price")
-                                if _preset2 and pd.notna(_preset2):
-                                    _cur_p2 = float(_preset2)
-                                else:
-                                    try:
-                                        fetch_latest_prices_for_tickers.clear()
-                                    except Exception:
-                                        pass
-                                    _cur_p2 = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
+                                _cur_p2 = fetch_latest_prices_for_tickers((tk,)).get(tk, np.nan)
                                 _el_item = {
                                     "ticker": tk, "memo": f"Emerging 얼리버드 - {vd['detail']}",
                                     "alert_price": np.nan, "alert_rsi": 35.0, "alert_ma200": True,
@@ -12452,11 +10410,6 @@ if st.session_state.get("logged_in"):
                             "factcheck_kind": "weekly",
                             "factcheck_df": factcheck_df,
                         }
-                        # current_view 갱신 — 분석 유형: weekly_trend_7d
-                        weekly_analysis = {"source": "weekly_trend_7d", "weekly_briefing_markdown": text}
-                        st.session_state["current_view"] = weekly_analysis
-                        st.session_state["current_view_language"] = selected_language
-                        st.session_state["current_view_source"] = "weekly_trend_7d"
                         append_weekly_trend_narrative_record(text, selected_language, week_recs)
                         st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
                         st.session_state["narrative_history"] = [
@@ -12495,11 +10448,6 @@ if st.session_state.get("logged_in"):
                             "factcheck_kind": "wow",
                             "factcheck_df": factcheck_df,
                         }
-                        # current_view 갱신 — 분석 유형: wow_trend_7d
-                        wow_analysis = {"source": "wow_trend_7d", "weekly_briefing_markdown": text}
-                        st.session_state["current_view"] = wow_analysis
-                        st.session_state["current_view_language"] = selected_language
-                        st.session_state["current_view_source"] = "wow_trend_7d"
                         # ── Sheets 자동 저장 (주간 트렌드와 동일 방식) ──
                         append_wow_trend_narrative_record(text, selected_language, this_w, last_w)
                         st.session_state["narrative_history_disk_records"] = load_narrative_history_records()
@@ -12612,22 +10560,6 @@ if st.session_state.get("logged_in"):
     
     elif main_nav == _MAIN_NAV_OPTIONS[4]:
         render_sync_button("sync_tab_scanner", [], "스캐너 결과 캐시를 초기화합니다.")
-
-        # ── 세션 최초 진입 시 Sheets에서 마지막 스캔 결과 복원 ──────────────
-        # (함수 정의 이후 시점이므로 NameError 없음)
-        if not st.session_state.get("_scanner_last_result_restored"):
-            _uid_restore = str(st.session_state.get("user_id") or "").strip()
-            if _uid_restore:
-                if st.session_state.get("scanner_results") is None:
-                    _restored_l = load_scanner_last_result(_uid_restore, "leaders")
-                    if _restored_l:
-                        st.session_state["scanner_results"] = _restored_l
-                if st.session_state.get("scanner_results_emerging") is None:
-                    _restored_e = load_scanner_last_result(_uid_restore, "emerging")
-                    if _restored_e:
-                        st.session_state["scanner_results_emerging"] = _restored_e
-            st.session_state["_scanner_last_result_restored"] = True
-
         st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 듀얼 엔진")
         st.caption(
             "**Current Leaders**는 기존 6대 팩터로 대장·테마 정렬을, **Emerging**은 2차 수혜·초기 모멘텀·거래량 가속·과열 회피 관점으로 같은 유니버스를 재스코어링합니다."
@@ -12642,108 +10574,9 @@ if st.session_state.get("logged_in"):
         tab_scan_leaders, tab_scan_emerge = st.tabs(
             ["🔥 Current Leaders (대장주 추종)", "🚀 Emerging Opportunities (후발주 선점)"]
         )
-
-        # ── 아이디어C: 두 엔진 결과가 모두 있을 때 교집합/차집합 요약 ──────────
-        _snap_l = st.session_state.get("scanner_results")
-        _snap_e = st.session_state.get("scanner_results_emerging")
-        if (
-            isinstance(_snap_l, dict) and isinstance(_snap_l.get("score_df"), pd.DataFrame) and not _snap_l["score_df"].empty
-            and isinstance(_snap_e, dict) and isinstance(_snap_e.get("score_df"), pd.DataFrame) and not _snap_e["score_df"].empty
-        ):
-            _l_df = _snap_l["score_df"]
-            _e_df = _snap_e["score_df"]
-            _top_n = 10
-            _l_top = set(_l_df.head(_top_n)["Ticker"].str.upper().tolist())
-            _e_top = set(_e_df.head(_top_n)["Ticker"].str.upper().tolist())
-            _both = sorted(_l_top & _e_top)
-            _only_l = sorted(_l_top - _e_top)
-            _only_e = sorted(_e_top - _l_top)
-            with st.expander("🔀 듀얼 엔진 크로스 분석 (두 결과가 모두 있을 때 자동 표시)", expanded=True):
-                st.caption(f"양쪽 엔진 TOP{_top_n} 기준 비교")
-                _cx1, _cx2, _cx3 = st.columns(3)
-                with _cx1:
-                    st.markdown("**✅ 양쪽 모두 상위권** (핵심 신호)")
-                    if _both:
-                        for _bt in _both:
-                            _l_sc = _l_df[_l_df["Ticker"] == _bt]["Final Score"].values
-                            _e_sc = _e_df[_e_df["Ticker"] == _bt]["Final Score"].values
-                            _l_s = f"{float(_l_sc[0]):.1f}" if len(_l_sc) else "—"
-                            _e_s = f"{float(_e_sc[0]):.1f}" if len(_e_sc) else "—"
-                            st.markdown(f"- **{_bt}** (L:{_l_s} / E:{_e_s})")
-                    else:
-                        st.caption("교집합 없음")
-                with _cx2:
-                    st.markdown("**🔥 Leaders만 상위권** (현재 대장주)")
-                    if _only_l:
-                        for _lt in _only_l:
-                            _l_sc = _l_df[_l_df["Ticker"] == _lt]["Final Score"].values
-                            _l_s = f"{float(_l_sc[0]):.1f}" if len(_l_sc) else "—"
-                            st.markdown(f"- **{_lt}** (L:{_l_s})")
-                    else:
-                        st.caption("Leaders 전용 종목 없음")
-                with _cx3:
-                    st.markdown("**🚀 Emerging만 상위권** (후발주 선점 후보)")
-                    if _only_e:
-                        for _et in _only_e:
-                            _e_sc = _e_df[_e_df["Ticker"] == _et]["Final Score"].values
-                            _e_s = f"{float(_e_sc[0]):.1f}" if len(_e_sc) else "—"
-                            st.markdown(f"- **{_et}** (E:{_e_s})")
-                    else:
-                        st.caption("Emerging 전용 종목 없음")
     
         with tab_scan_leaders:
             st.markdown("##### 🔥 Current Leaders")
-
-            # ── 아이디어E: 내러티브 미등장 상위 종목 피드백 분석 ──────────────
-            _snap_fb = st.session_state.get("scanner_results")
-            if isinstance(_snap_fb, dict) and isinstance(_snap_fb.get("score_df"), pd.DataFrame) and not _snap_fb["score_df"].empty:
-                _fb_df = _snap_fb["score_df"].head(10)
-                # 내러티브 정렬에 없었던(점수 낮은) 종목 중 Final Score 상위권
-                _fb_exclude = frozenset(SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS)
-                _blind_spots = _fb_df[
-                    (_fb_df["Narrative Why"].isin(_fb_exclude) | (_fb_df.get("Narrative Score", pd.Series(dtype=float)) < 30))
-                    & (_fb_df["Final Score"] >= 55)
-                ]["Ticker"].tolist() if "Narrative Score" in _fb_df.columns else []
-                if _blind_spots:
-                    with st.expander(f"🧠 내러티브 피드백 루프 — 스캐너가 발견한 내러티브 사각지대 {len(_blind_spots)}종목", expanded=False):
-                        st.caption(
-                            "스캐너 Final Score 55↑이지만 내러티브 정렬 점수가 낮은 종목입니다. "
-                            "다음 내러티브 생성 시 이 섹터/테마를 추가로 점검하세요."
-                        )
-                        st.code(", ".join(_blind_spots))
-                        if st.button("🤖 Gemini로 사각지대 분석 요청", key="blind_spot_gemini_btn"):
-                            _genai_client = _get_genai_client()
-                            if _genai_client is None:
-                                st.error("Gemini API 키가 설정되지 않았습니다.")
-                            else:
-                                _narrative_ctx = json.dumps(_snap_fb.get("scanner_data_source", ""), ensure_ascii=False)
-                                _bs_prompt = f"""
-당신은 월가 탑다운 스트래티지스트입니다.
-아래 종목들은 퀀트 스캐너(모멘텀·RS·펀더멘털)에서 상위 점수를 받았지만,
-최신 시장 내러티브 분석에서는 낮은 Narrative Alignment를 받은 종목들입니다.
-
-종목: {', '.join(_blind_spots)}
-
-다음을 간결하게 분석해주세요:
-1) 이 종목들이 공유하는 테마/섹터/공급망 관계는 무엇인가?
-2) 내러티브에서 놓친 이유(데이터 지연, 2차 수혜 구간, 섹터 rotation 초기 등)는?
-3) 다음 내러티브 분석 시 추가로 점검해야 할 키워드 2~3개
-
-한국어로, 간결하게 (총 200자 이내)."""
-                                try:
-                                    with st.spinner("Gemini 사각지대 분석 중..."):
-                                        _bs_model = _genai_client.models
-                                        _bs_resp = _bs_model.generate_content(
-                                            model=_SCANNER_NARRATIVE_BATCH_MODEL_ID,
-                                            contents=_bs_prompt,
-                                        )
-                                        _bs_text = str(getattr(_bs_resp, "text", "") or "").strip()
-                                    if _bs_text:
-                                        st.info(_bs_text)
-                                    else:
-                                        st.warning("분석 결과를 받지 못했습니다.")
-                                except Exception as _bs_err:
-                                    st.error(f"Gemini 분석 실패: {_bs_err}")
     
             selected_sector_labels = []
             manual_tickers_input = ""
@@ -12764,53 +10597,6 @@ if st.session_state.get("logged_in"):
                     placeholder="예: NVDA, MSFT, SMCI",
                     key="opportunity_scanner_manual_tickers",
                 )
-
-                # ── FMP Screener 자동 탐색 ───────────────────────────────
-                with st.expander("🔍 FMP Screener 자동 탐색 (유니버스 보완)", expanded=False):
-                    st.caption("시총 $10B↑ · 거래량 100만↑ 조건으로 FMP가 자동 필터링한 종목을 유니버스에 추가합니다.")
-                    _scr_sector_map = {
-                        "전체 (섹터 무관)": "",
-                        "Technology": "Technology",
-                        "Healthcare": "Healthcare",
-                        "Financials": "Financials",
-                        "Energy": "Energy",
-                        "Consumer Cyclical": "Consumer Cyclical",
-                        "Industrials": "Industrials",
-                        "Communication Services": "Communication Services",
-                        "Utilities": "Utilities",
-                        "Real Estate": "Real Estate",
-                        "Materials": "Materials",
-                    }
-                    _scr_sel = st.selectbox(
-                        "스크리너 섹터 필터",
-                        options=list(_scr_sector_map.keys()),
-                        key="screener_sector_select",
-                    )
-                    _scr_cap_min = st.number_input(
-                        "최소 시가총액 ($B)",
-                        min_value=1, max_value=500, value=10, step=5,
-                        key="screener_cap_min",
-                    )
-                    if st.button("🔍 Screener 탐색 실행", key="run_screener_btn", use_container_width=True):
-                        with st.spinner("FMP Screener 조회 중..."):
-                            _scr_results = _fmp_company_screener(
-                                sector=_scr_sector_map[_scr_sel],
-                                market_cap_min=int(_scr_cap_min * 1_000_000_000),
-                                volume_min=1_000_000,
-                                limit=50,
-                            )
-                        if _scr_results:
-                            _scr_tickers = [str(r.get("symbol") or "").strip().upper() for r in _scr_results if r.get("symbol")]
-                            _scr_tickers = filter_scanner_ticker_list(_scr_tickers)
-                            st.session_state["_screener_extra_tickers"] = _scr_tickers
-                            st.success(f"✅ {len(_scr_tickers)}개 종목 탐색 완료 — 스캔 실행 시 유니버스에 자동 포함됩니다.")
-                            st.code(", ".join(_scr_tickers[:30]) + ("..." if len(_scr_tickers) > 30 else ""))
-                        else:
-                            st.warning("스크리너 결과를 가져올 수 없습니다.")
-                    _scr_extra = st.session_state.get("_screener_extra_tickers", [])
-                    if _scr_extra:
-                        st.caption(f"📌 현재 탐색된 추가 종목: {len(_scr_extra)}개 (스캔 실행 시 자동 병합)")
-
             elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
                 st.caption(
                     "「Current Leaders 스캔」은 `Narratives` 시트 **Winners** 열(또는 JSON의 winners)만 사용합니다. "
@@ -12833,10 +10619,6 @@ if st.session_state.get("logged_in"):
                     target_universe = build_opportunity_scanner_universe_from_direct_selection(
                         selected_sector_labels, manual_tickers_input
                     )
-                    # FMP Screener 자동 탐색 결과 병합
-                    _scr_extra_l = st.session_state.get("_screener_extra_tickers", [])
-                    if _scr_extra_l:
-                        target_universe = list(dict.fromkeys(target_universe + _scr_extra_l))
                     latest_analysis = resolve_opportunity_scanner_narrative_for_direct_mode()
                     src_note = "수동 섹터/티커"
                     scanner_mode_saved = "섹터/티커 직접 스캔"
@@ -12879,9 +10661,6 @@ if st.session_state.get("logged_in"):
                             "completed_at": datetime.now(timezone.utc).isoformat(),
                         }
                         st.success("Current Leaders 스캔 완료 — 결과가 세션에 저장되었습니다.")
-                        # 세션 재시작 후 복원을 위해 Sheets에 마지막 결과 저장
-                        _lr_uid = str(st.session_state.get("user_id") or "").strip()
-                        save_scanner_last_result(_lr_uid, st.session_state["scanner_results"], engine="leaders")
     
             snap = st.session_state.get("scanner_results")
             if isinstance(snap, dict) and isinstance(snap.get("score_df"), pd.DataFrame) and not snap["score_df"].empty:
@@ -12890,7 +10669,7 @@ if st.session_state.get("logged_in"):
                 # 스캐너 결과 자동 저장
                 _sc_uid = str(st.session_state.get("user_id") or "").strip()
                 _sc_last = st.session_state.get("_scanner_saved_date")
-                _sc_today = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+                _sc_today = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
                 if _sc_last != _sc_today:
                     _ok_sc, _ = save_scanner_result_history(_sc_uid, snap["score_df"], engine="leaders")
                     if _ok_sc:
@@ -12920,33 +10699,6 @@ if st.session_state.get("logged_in"):
                     st.markdown("**🏆 자주 등장한 종목 (신뢰도 높은 신호)**")
                     st.dataframe(ticker_freq.head(15), use_container_width=True, hide_index=True)
 
-                    # ── 아이디어B: 연속 상위권 자동 Watchlist 추가 제안 ──────
-                    _total_scans = sc_hist["Date"].nunique()
-                    if _total_scans >= 3:
-                        _strong = ticker_freq[
-                            (ticker_freq["등장횟수"] >= max(3, int(_total_scans * 0.5))) &
-                            (ticker_freq["평균점수"] >= 60.0)
-                        ].head(5)
-                        if not _strong.empty:
-                            st.markdown("**🎯 반복 상위권 종목 — Watchlist 추가 추천**")
-                            st.caption(f"전체 스캔 {_total_scans}회 중 50% 이상 등장 + 평균점수 60↑ 조건")
-                            _strong_cols = st.columns(min(len(_strong), 5))
-                            for _si, (_, _sr) in enumerate(_strong.iterrows()):
-                                _stk = str(_sr["Ticker"]).strip().upper()
-                                with _strong_cols[_si]:
-                                    def _add_strong_wl(tk=_stk, avg_sc=_sr["평균점수"], cnt=_sr["등장횟수"]):
-                                        _uid_st = str(st.session_state.get("user_id") or "").strip()
-                                        add_to_watchlist(
-                                            _uid_st, tk,
-                                            memo=f"반복 상위권({cnt}회 등장, 평균{avg_sc:.1f}점)",
-                                        )
-                                        st.session_state[f"_hist_wl_{tk}"] = True
-                                    if st.session_state.get(f"_hist_wl_{_stk}"):
-                                        st.success(f"✅ {_stk}")
-                                    else:
-                                        st.button(f"🔔 {_stk} 추가", key=f"hist_wl_{_si}_{_stk}",
-                                            on_click=_add_strong_wl, use_container_width=True)
-
                     # 최근 스캔 결과
                     st.markdown("**📅 최근 스캔 기록**")
                     recent_sc = sc_hist.sort_values("Date", ascending=False).head(20)
@@ -12960,7 +10712,7 @@ if st.session_state.get("logged_in"):
             if scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[2]:
                 st.caption(
                     "Data Source가 수동일 때만 아래에서 유니버스를 구성합니다. "
-                    "섹터 선택값은 Leaders 탭과 **독립**으로 저장됩니다 — 여기서 따로 선택해주세요."
+                    "(Current Leaders 서브탭과 동일한 옵션 구조이며, 선택 값은 서브탭별로 독립입니다.)"
                 )
                 selected_sector_labels_em = st.multiselect(
                     "주요 섹터 (복수 선택)",
@@ -13035,11 +10787,12 @@ if st.session_state.get("logged_in"):
                             "universe": list(target_u_em),
                             "completed_at": datetime.now(timezone.utc).isoformat(),
                         }
-                        # 히스토리 저장은 아래 자동저장 로직(_em_sc_last != _em_sc_today)에서 일괄 처리
-                        st.success("Emerging Opportunities 스캔 완료 — 결과가 세션에 저장되었습니다.")
-                        # 세션 재시작 후 복원을 위해 Sheets에 마지막 결과 저장
-                        _em_lr_uid = str(st.session_state.get("user_id") or "").strip()
-                        save_scanner_last_result(_em_lr_uid, st.session_state["scanner_results_emerging"], engine="emerging")
+                        # Emerging 히스토리 저장
+                        _em_uid_sc = str(st.session_state.get("user_id") or "").strip()
+                        _ok_em_hist, _ = save_scanner_result_history(_em_uid_sc, em_df, engine="emerging")
+                        if _ok_em_hist:
+                            load_scanner_history.clear()
+                        st.success("Emerging Opportunities 스캔 완료 — 결과가 세션 및 히스토리에 저장되었습니다.")
     
             snap_em = st.session_state.get("scanner_results_emerging")
             if isinstance(snap_em, dict) and isinstance(snap_em.get("score_df"), pd.DataFrame) and not snap_em["score_df"].empty:
@@ -13048,7 +10801,7 @@ if st.session_state.get("logged_in"):
                 # Emerging 자동 저장 (스캔 직후 session에 있을 때)
                 _em_sc_uid = str(st.session_state.get("user_id") or "").strip()
                 _em_sc_last = st.session_state.get("_em_scanner_saved_date")
-                _em_sc_today = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+                _em_sc_today = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
                 if _em_sc_last != _em_sc_today:
                     _ok_em_sc, _ = save_scanner_result_history(_em_sc_uid, snap_em["score_df"], engine="emerging")
                     if _ok_em_sc:
@@ -13076,34 +10829,6 @@ if st.session_state.get("logged_in"):
 
                     st.markdown("**🌱 자주 등장한 Emerging 종목 (신뢰도 높은 신호)**")
                     st.dataframe(em_freq.head(15), use_container_width=True, hide_index=True)
-
-                    # ── 아이디어B: 연속 상위권 자동 Watchlist 추가 제안 ──────
-                    _em_total_scans = em_sc_hist["Date"].nunique()
-                    if _em_total_scans >= 3:
-                        _em_strong = em_freq[
-                            (em_freq["등장횟수"] >= max(3, int(_em_total_scans * 0.5))) &
-                            (em_freq["평균점수"] >= 55.0)
-                        ].head(5)
-                        if not _em_strong.empty:
-                            st.markdown("**🎯 반복 상위권 Emerging 종목 — Watchlist 추가 추천**")
-                            st.caption(f"전체 스캔 {_em_total_scans}회 중 50% 이상 등장 + 평균점수 55↑ 조건")
-                            _em_strong_cols = st.columns(min(len(_em_strong), 5))
-                            for _esi, (_, _esr) in enumerate(_em_strong.iterrows()):
-                                _estk = str(_esr["Ticker"]).strip().upper()
-                                with _em_strong_cols[_esi]:
-                                    def _add_em_strong_wl(tk=_estk, avg_sc=_esr["평균점수"], cnt=_esr["등장횟수"]):
-                                        _uid_est = str(st.session_state.get("user_id") or "").strip()
-                                        add_to_watchlist(
-                                            _uid_est, tk,
-                                            memo=f"Emerging 반복({cnt}회, 평균{avg_sc:.1f}점)",
-                                            alert_rsi=35.0,
-                                        )
-                                        st.session_state[f"_em_hist_wl_{tk}"] = True
-                                    if st.session_state.get(f"_em_hist_wl_{_estk}"):
-                                        st.success(f"✅ {_estk}")
-                                    else:
-                                        st.button(f"🔔 {_estk}", key=f"em_hist_wl_{_esi}_{_estk}",
-                                            on_click=_add_em_strong_wl, use_container_width=True)
 
                     # 최근 스캔 기록
                     st.markdown("**📅 최근 Emerging 스캔 기록**")
@@ -13276,35 +11001,7 @@ if st.session_state.get("logged_in"):
                 missing_cells = int(sector_returns_df[perf_cols].isna().sum().sum())
                 if missing_cells > 0:
                     st.info("일부 ETF는 거래일 부족 또는 데이터 누락으로 일부 기간 수익률이 N/A로 표시됩니다.")
-
-                # ── 섹터 PER 스냅샷 ──────────────────────────────────────────
-                st.divider()
-                st.markdown("### 💰 섹터별 현재 PER (Sector P/E Snapshot)")
-                st.caption("FMP sector-pe-snapshot 기준. RS 강한 섹터라도 PER이 지나치게 높으면 신중하게 접근하세요.")
-                with st.spinner("섹터 PER 데이터 조회 중..."):
-                    _spe_data = _fmp_sector_pe_snapshot()
-                if _spe_data:
-                    _spe_rows = []
-                    for _sp in _spe_data:
-                        _sp_pe = to_float(_sp.get("pe") or _sp.get("pe_ratio") or _sp.get("peRatio"))
-                        _sp_sec = str(_sp.get("sector") or "")
-                        if _sp_sec and pd.notna(_sp_pe) and _sp_pe > 0:
-                            _spe_rows.append({"섹터": _sp_sec, "현재 PER": round(_sp_pe, 1)})
-                    if _spe_rows:
-                        _spe_df = pd.DataFrame(_spe_rows).sort_values("현재 PER", ascending=True).reset_index(drop=True)
-                        _spe_styled = (
-                            _spe_df.style
-                            .format({"현재 PER": "{:.1f}x"})
-                            .background_gradient(cmap="RdYlGn_r", subset=["현재 PER"], vmin=10, vmax=50)
-                        )
-                        st.dataframe(_spe_styled, use_container_width=True, hide_index=True)
-                        _median_pe = _spe_df["현재 PER"].median()
-                        st.caption(f"📊 섹터 중간 PER: {_median_pe:.1f}x  |  낮을수록 밸류에이션 매력 높음 (초록), 높을수록 부담 (빨강)")
-                    else:
-                        st.caption("PER 데이터를 파싱할 수 없습니다.")
-                else:
-                    st.caption("섹터 PER 데이터를 조회할 수 없습니다.")
-
+    
                 st.divider()
                 selected_sector_etf = st.selectbox(
                     "세부 종목을 확인하고 싶은 섹터를 선택하세요",
@@ -13648,7 +11345,7 @@ if st.session_state.get("logged_in"):
                 ne = co.get("next_earnings")
                 if ne:
                     try:
-                        days_to_earn = (datetime.strptime(ne[:10], "%Y-%m-%d") - datetime.now(_MARKET_ET_TZ).replace(tzinfo=None)).days
+                        days_to_earn = (datetime.strptime(ne[:10], "%Y-%m-%d") - datetime.now()).days
                         earn_label = f"D-{days_to_earn}일" if days_to_earn >= 0 else f"{abs(days_to_earn)}일 전"
                         st.metric("다음 실적 발표", ne[:10], delta=earn_label)
                         st.caption("※ FMP 제공 예정일. 미확인 상태일 수 있습니다.")
@@ -13675,7 +11372,7 @@ if st.session_state.get("logged_in"):
                                 _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
                                 _tr_model = _GenAIModel(
                                     "gemini-2.5-flash",
-                                    generation_config={"temperature": 0.0, "max_output_tokens": 8192, "thinking_budget": 0}
+                                    generation_config={"temperature": 0.0, "max_output_tokens": 4096}
                                 )
                                 _tr_resp = _tr_model.generate_content(
                                     "다음 영문 회사 소개를 한국어로 번역하세요. "
@@ -14016,67 +11713,6 @@ if st.session_state.get("logged_in"):
                     st.divider()
 
     
-                # ── Altman Z-Score + Piotroski F-Score ──────────────────────
-                with st.expander("🏦 재무 건전성 점수 (Altman Z / Piotroski F)", expanded=True):
-                    st.caption("FMP `/financial-scores` 기반. Altman Z는 파산 위험, Piotroski F는 재무 종합 점수(0~9).")
-                    with st.spinner(f"{selected_ticker} 재무 건전성 점수 조회 중..."):
-                        _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
-                    if _fs:
-                        _az = to_float(_fs.get("altmanZScore"))
-                        _ps = to_float(_fs.get("piotroskiScore"))
-                        _az_col, _ps_col = st.columns(2)
-                        with _az_col:
-                            if pd.notna(_az):
-                                if _az >= 3.0:
-                                    _az_label = "✅ 안전 구간 (≥3.0)"
-                                    _az_color = "#16a34a"
-                                elif _az >= 1.81:
-                                    _az_label = "⚠️ 회색 구간 (1.81~3.0)"
-                                    _az_color = "#d97706"
-                                else:
-                                    _az_label = "🚨 위험 구간 (<1.81)"
-                                    _az_color = "#dc2626"
-                                st.markdown(
-                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
-                                    f"border-left:4px solid {_az_color};'>"
-                                    f"<div style='color:#94a3b8;font-size:12px;'>Altman Z-Score</div>"
-                                    f"<div style='color:{_az_color};font-size:26px;font-weight:900;'>{_az:.2f}</div>"
-                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_az_label}</div>"
-                                    f"<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
-                                    f"≥3.0 안전 · 1.81~3.0 주의 · &lt;1.81 파산위험</div>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.metric("Altman Z-Score", "N/A")
-                        with _ps_col:
-                            if pd.notna(_ps):
-                                _ps_int = int(_ps)
-                                if _ps_int >= 7:
-                                    _ps_label = "✅ 강한 재무 (7~9)"
-                                    _ps_color = "#16a34a"
-                                elif _ps_int >= 4:
-                                    _ps_label = "🟡 중립 (4~6)"
-                                    _ps_color = "#d97706"
-                                else:
-                                    _ps_label = "🚨 약한 재무 (0~3)"
-                                    _ps_color = "#dc2626"
-                                _ps_bar = "█" * _ps_int + "░" * (9 - _ps_int)
-                                st.markdown(
-                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
-                                    f"border-left:4px solid {_ps_color};'>"
-                                    f"<div style='color:#94a3b8;font-size:12px;'>Piotroski F-Score</div>"
-                                    f"<div style='color:{_ps_color};font-size:26px;font-weight:900;'>{_ps_int} / 9</div>"
-                                    f"<div style='color:{_ps_color};font-size:14px;font-family:monospace;'>{_ps_bar}</div>"
-                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_ps_label}</div>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.metric("Piotroski F-Score", "N/A")
-                    else:
-                        st.caption("재무 건전성 데이터를 조회할 수 없습니다.")
-
                 with st.expander("원본 KPI 테이블 보기"):
                     st.dataframe(
                         kpi_df[["Category", "KPI", "Value", "Rule", "Pass"]],
@@ -14087,60 +11723,7 @@ if st.session_state.get("logged_in"):
         except Exception as e:
             st.error("펀더멘털(체력 검사) 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
-
-        # ── 어닝콜 트랜스크립트 AI 요약 ───────────────────────────────────
-        st.divider()
-        st.markdown("### 📞 어닝콜 트랜스크립트 AI 요약")
-        st.caption("직전 분기 실적발표 원문 → Gemini 3줄 요약 (가이던스·경영진 톤·주요 리스크)")
-        _tc_key = f"_transcript_summary_{selected_ticker}"
-        _tc_raw_key = f"_transcript_raw_{selected_ticker}"
-        _tc_col1, _tc_col2 = st.columns([1, 1])
-        with _tc_col1:
-            if st.button("🤖 트랜스크립트 AI 요약 실행", key=f"tc_btn_{selected_ticker}", use_container_width=True):
-                with st.spinner("어닝콜 원문 조회 중..."):
-                    _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
-                st.session_state[_tc_raw_key] = _tc_data
-                if _tc_data and _tc_data.get("content"):
-                    _tc_text = str(_tc_data["content"])[:6000]
-                    _tc_q = _tc_data.get("quarter", "")
-                    _tc_y = _tc_data.get("year", "")
-                    _tc_prompt = (
-                        f"{selected_ticker} {_tc_y}년 Q{_tc_q} 어닝콜 트랜스크립트를 분석하세요.\n\n"
-                        "다음 3가지를 각각 2~3문장으로 요약하세요:\n"
-                        "1) 📈 가이던스 (상향/하향/유지 여부, 구체 수치)\n"
-                        "2) 🎙️ 경영진 톤 (자신감/우려/방어적 등 분위기)\n"
-                        "3) ⚠️ 주요 리스크 (경영진이 언급한 위험 요인)\n\n"
-                        "한국어로 답변하세요.\n\n"
-                        f"[트랜스크립트 원문]\n{_tc_text}"
-                    )
-                    with st.spinner("Gemini 요약 중..."):
-                        try:
-                            _tc_model = _GenAIModel(
-                                "gemini-2.5-flash",
-                                generation_config={"temperature": 0.1, "max_output_tokens": 4096, "thinking_budget": 0},
-                            )
-                            _tc_resp = _tc_model.generate_content(_tc_prompt)
-                            _tc_summary = (_gemini_response_text_utf8_safe(_tc_resp) or "").strip()
-                            st.session_state[_tc_key] = {
-                                "summary": _tc_summary,
-                                "quarter": _tc_q,
-                                "year": _tc_y,
-                            }
-                        except Exception as _tc_err:
-                            st.error(f"Gemini 요약 실패: {_tc_err}")
-                else:
-                    st.warning("어닝콜 트랜스크립트 데이터를 찾을 수 없습니다.")
-        with _tc_col2:
-            if st.session_state.get(_tc_key):
-                _tc_sum = st.session_state[_tc_key]
-                st.caption(f"📅 {_tc_sum.get('year')}년 Q{_tc_sum.get('quarter')} 어닝콜")
-        if st.session_state.get(_tc_key) and st.session_state[_tc_key].get("summary"):
-            st.markdown(st.session_state[_tc_key]["summary"])
-            _tc_raw = st.session_state.get(_tc_raw_key, {})
-            if _tc_raw and _tc_raw.get("content"):
-                with st.expander("📄 원문 보기 (영문)", expanded=False):
-                    st.text(str(_tc_raw["content"])[:3000] + ("..." if len(str(_tc_raw.get("content",""))) > 3000 else ""))
-
+    
         st.divider()
         st.markdown("### 📊 기술적 분석 (Technical Analysis)")
         st.caption("RSI · MACD · 볼린저밴드 · 거래량으로 진입 구간 점검")
@@ -14541,16 +12124,9 @@ if st.session_state.get("logged_in"):
         # ── AI 종합 진단 ─────────────────────────────────────────────────
         st.divider()
         st.markdown("### 🤖 AI 종합 진단")
-        st.caption("단순 정리가 아닌 시그널 충돌 분석·핵심 투자포인트·구체적 액션을 제시합니다. 결과는 탭 이동 후에도 유지됩니다.")
+        st.caption("펀더멘털 + 기술적 지표를 Gemini AI가 종합 분석해서 투자 판단을 제공합니다.")
 
-        # session_state로 결과 유지 (종목 바뀌면 초기화)
-        _diag_sk = f"ai_diag_{str(selected_ticker).strip().upper()}"
-        _diag_tk = "ai_diag_last_ticker"
-        if st.session_state.get(_diag_tk) != str(selected_ticker).strip().upper():
-            st.session_state[_diag_tk] = str(selected_ticker).strip().upper()
-            st.session_state.pop(_diag_sk, None)
-
-        if st.button("🤖 AI 종합 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
+        if st.button("🤖 AI 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
             try:
                 # 이미 위에서 계산된 값들을 최대한 재사용
                 _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
@@ -14607,216 +12183,66 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     pass
 
-                # ── 기술적 지표 추가 수집 ──────────────────────────────────────
-                # KPI 데이터 재사용
-                _diag_pass_items, _diag_fail_items = [], []
-                _diag_fpe = _diag_tpe = _diag_pb = _diag_ev = _diag_evs = _diag_evf = np.nan
-                _diag_mos = _diag_iv = np.nan
-                _diag_cs = _diag_vs = _diag_qs = 0
-                _diag_cs_det = _diag_vs_det = _diag_qs_det = _diag_dom = ""
-                try:
-                    _dk, _, _, _, _dm = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
-                    _dpp = _dk["Pass"].astype(str)
-                    _diag_pass_items = _dk[_dpp.str.contains("Pass", case=False) & ~_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
-                    _diag_fail_items = _dk[_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
-                    _diag_fpe  = _dm.get("forward_pe");    _diag_tpe = _dm.get("trailing_pe")
-                    _diag_pb   = _dm.get("price_to_book"); _diag_ev  = _dm.get("ev_to_ebitda")
-                    _diag_evs  = _dm.get("ev_to_sales");   _diag_evf = _dm.get("ev_to_fcf")
-                    _diag_mos  = _dm.get("margin_of_safety"); _diag_iv = _dm.get("intrinsic_value")
-                    _diag_style = calculate_style_scores(str(selected_ticker).strip().upper(), _dm, _dk)
-                    _diag_cs  = _diag_style["canslim"]["score"]
-                    _diag_vs  = _diag_style["value"]["score"]
-                    _diag_qs  = _diag_style["quality"]["score"]
-                    _diag_dom = _diag_style["dominant"]
-                    _diag_cs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["canslim"]["detail"].items())
-                    _diag_vs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["value"]["detail"].items())
-                    _diag_qs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["quality"]["detail"].items())
-                except Exception:
-                    pass
+                _diag_prompt = f"""당신은 월가 수석 퀀트 애널리스트입니다.
+아래 실제 데이터를 바탕으로 **{selected_ticker}** 종목에 대한 투자 진단을 한국어로 작성하세요.
+데이터에 없는 내용은 추측하지 마세요.
 
-                # 인사이더 방향
-                _diag_ins_buy = _diag_ins_sell = 0
-                try:
-                    _dis = fetch_insider_statistics(str(selected_ticker).strip().upper())
-                    _diag_ins_buy  = int(to_float(_dis.get("total_purchases") or _dis.get("acquired") or 0) or 0)
-                    _diag_ins_sell = int(to_float(_dis.get("total_sales")     or _dis.get("disposed")  or 0) or 0)
-                except Exception:
-                    pass
+[기술적 지표 — 실제 계산값]
+- 현재가: ${f'{_diag_price:.2f}' if pd.notna(_diag_price) else 'N/A'}
+- RSI(14): {f'{_diag_rsi:.1f}' if pd.notna(_diag_rsi) else 'N/A'} ({'과매수' if pd.notna(_diag_rsi) and _diag_rsi >= 70 else '조정구간' if pd.notna(_diag_rsi) and _diag_rsi < 50 else '중립'})
+- MACD 히스토그램: {f'{_diag_hist_val:+.4f}' if pd.notna(_diag_hist_val) else 'N/A'} → {_macd_direction}
+- 200일선: ${f'{_diag_ma200:.2f}' if pd.notna(_diag_ma200) else 'N/A'} → 현재가 {'위 (장기 우상향)' if pd.notna(_diag_price) and pd.notna(_diag_ma200) and _diag_price > _diag_ma200 else '아래 (장기 하락추세)'}
+- 50일선: ${f'{_diag_ma50:.2f}' if pd.notna(_diag_ma50) else 'N/A'} → 현재가 {'위' if pd.notna(_diag_price) and pd.notna(_diag_ma50) and _diag_price > _diag_ma50 else '아래'}
+- 52주 고점 대비: {f'{_diag_pct_from_high:+.1f}%' if pd.notna(_diag_pct_from_high) else 'N/A'}
+- 볼린저밴드: {_bb_position}
 
-                # 어닝 Beat 비율
-                _diag_beat_rate = _diag_beat_n = _diag_earn_n = 0
-                _diag_earn_rows = []
-                try:
-                    _dea = cached_earnings_history(str(selected_ticker).strip().upper())
-                    if not _dea.empty and "판정" in _dea.columns:
-                        _diag_beat_n  = int((_dea["판정"] == "✅ Beat").sum())
-                        _diag_earn_n  = len(_dea[_dea["판정"] != "—"])
-                        _diag_beat_rate = int(_diag_beat_n / _diag_earn_n * 100) if _diag_earn_n else 0
-                    _sc_e = next((c for c in _dea.columns if "서프라이즈" in c), None)
-                    _ac_e = next((c for c in _dea.columns if "eps 실제" in c.lower() or "실제" in c.lower()), None)
-                    for _, _er in _dea.head(4).iterrows():
-                        _rs = str(_er.get("분기",""))
-                        if _ac_e: _rs += f" EPS={_er.get(_ac_e,'')}"
-                        if _sc_e: _rs += f" 서프라이즈={_er.get(_sc_e,'')}"
-                        _diag_earn_rows.append(_rs)
-                except Exception:
-                    pass
+[펀더멘털]
+- {_kpi_summary}
+- {_kpi_details}
+- 기관 보유 비중 (상위 10개): {_inst_pct}
 
-                # 애널리스트 목표가 & 매수비율
-                _diag_tgt_mean = _diag_tgt_high = _diag_tgt_low = None
-                _diag_buy_pct = _diag_rat_label = _diag_rat_tot = ""
-                _diag_rec_list = []
-                try:
-                    _dan = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
-                    if _dan:
-                        _diag_tgt_mean = _dan.get("target_mean")
-                        _diag_tgt_high = _dan.get("target_high")
-                        _diag_tgt_low  = _dan.get("target_low")
-                        _diag_rec_list = [f"{r.get('기관','')}: {r.get('등급','')}" for r in _dan.get("recent",[])[:3]]
-                    _k_r = _fmp_key()
-                    if _k_r:
-                        _r_r = requests.get(f"{_FMP_BASE}/ratings-snapshot?symbol={str(selected_ticker).strip().upper()}&apikey={_k_r}", timeout=_FMP_TIMEOUT)
-                        if _r_r.status_code == 200:
-                            _rrd = _r_r.json()
-                            _rri = _rrd[0] if isinstance(_rrd, list) and _rrd else {}
-                            if _rri:
-                                _rsb=int(to_float(_rri.get("strongBuy") or 0) or 0); _rb=int(to_float(_rri.get("buy") or 0) or 0)
-                                _rh=int(to_float(_rri.get("hold") or 0) or 0); _rs=int(to_float(_rri.get("sell") or 0) or 0); _rss=int(to_float(_rri.get("strongSell") or 0) or 0)
-                                _rt=_rsb+_rb+_rh+_rs+_rss
-                                if _rt > 0:
-                                    _diag_buy_pct   = f"{round((_rsb+_rb)/_rt*100,1):.0f}%"
-                                    _diag_rat_label = _rri.get("ratingRecommendation") or _rri.get("rating") or ""
-                                    _diag_rat_tot   = f"{_rsb+_rb}/{_rt}명"
-                except Exception:
-                    pass
+[출력 규칙]
+1. 반드시 아래 형식 그대로 작성 (마크다운 사용)
+2. 각 항목을 구체적 수치와 함께 설명 (데이터 기반)
+3. "관망" 판단 시에도 구체적인 매수 진입 조건을 명시
+4. 전체 200~300자 이상 작성
 
-                # 의회 거래
-                _diag_cg_buy = _diag_cg_sell = 0
-                try:
-                    _dcg = fetch_senate_house_trading(str(selected_ticker).strip().upper())
-                    if not _dcg.empty:
-                        _diag_cg_buy  = len(_dcg[_dcg["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)])
-                        _diag_cg_sell = len(_dcg[_dcg["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)])
-                except Exception:
-                    pass
+## 종합 판단: [매수 고려 / 관망 / 매도 고려]
 
-                def _nv(v, fmt=".2f", pre="", suf=""):
-                    return f"{pre}{v:{fmt}}{suf}" if pd.notna(v) else "N/A"
+**📊 기술적 분석:**
+(RSI, MACD, 이동평균, 볼린저밴드 각각 언급)
 
-                # ── 프롬프트: 정리 말고 판단을 요청 ──────────────────────────
-                _diag_prompt = f"""당신은 15년 경력의 헤지펀드 포트폴리오 매니저입니다.
-아래는 {selected_ticker}에 대한 실제 정량 데이터입니다.
+**💼 펀더멘털 분석:**
+(KPI 통과/실패, 안전마진, 기관 보유 언급)
 
-당신의 역할:
-- 데이터를 단순 나열하지 마세요. 이미 사용자가 알고 있습니다.
-- 시그널들이 서로 일치하는지, 충돌하는지를 분석하세요.
-- 충돌하는 시그널이 있다면 어느 쪽을 더 신뢰해야 하는지 근거를 대세요.
-- 최종적으로 지금 이 종목을 어떻게 다뤄야 하는지 명확한 의견을 내세요.
+**⚠️ 주요 리스크:**
+(구체적으로 2가지)
 
---- 데이터 ---
-[기술적]
-현재가 {_nv(_diag_price,".2f","$")} | 52주 고점 대비 {_nv(_diag_pct_from_high,"+.1f","","%")}
-RSI {_nv(_diag_rsi,".1f")} | MACD 히스토그램 {_nv(_diag_hist_val,"+.4f")} ({_macd_direction}) | 볼린저밴드 {_bb_position}
-MA50 {_nv(_diag_ma50,".2f","$")} / MA200 {_nv(_diag_ma200,".2f","$")} → {"정배열" if pd.notna(_diag_price) and pd.notna(_diag_ma50) and pd.notna(_diag_ma200) and _diag_price>_diag_ma50>_diag_ma200 else "역배열" if pd.notna(_diag_price) and pd.notna(_diag_ma200) and _diag_price<_diag_ma200 else "부분배열"}
-
-[투자 스타일 점수]
-CAN SLIM {_diag_cs}점 | 가치투자 {_diag_vs}점 | 장기우량주 {_diag_qs}점 → 주도스타일: {_diag_dom}
-CAN SLIM 세부: {_diag_cs_det}
-가치투자 세부: {_diag_vs_det}
-장기우량주 세부: {_diag_qs_det}
-
-[체력검사 KPI]
-통과: {', '.join(_diag_pass_items) if _diag_pass_items else '없음'}
-실패: {', '.join(_diag_fail_items) if _diag_fail_items else '없음'}
-밸류에이션: Forward P/E={_nv(_diag_fpe)} Trailing P/E={_nv(_diag_tpe)} P/B={_nv(_diag_pb)} EV/EBITDA={_nv(_diag_ev)} EV/Sales={_nv(_diag_evs)} EV/FCF={_nv(_diag_evf)}
-Graham 안전마진={_nv(_diag_mos,".1f","","%")} | {_kpi_details}
-
-[Earnings Surprise 최근 {_diag_earn_n}분기]
-Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
-
-[수급 시그널]
-인사이더: 매수 {_diag_ins_buy}건 vs 매도 {_diag_ins_sell}건 → {"매수 우세" if _diag_ins_buy > _diag_ins_sell else "매도 우세" if _diag_ins_sell > _diag_ins_buy else "중립"}
-애널리스트 매수의견: {_diag_buy_pct} ({_diag_rat_tot}) | 종합의견: {_diag_rat_label}
-애널리스트 목표가: 평균 {_nv(_diag_tgt_mean,".2f","$")} / 최고 {_nv(_diag_tgt_high,".2f","$")} / 최저 {_nv(_diag_tgt_low,".2f","$")}
-최근 추천: {" | ".join(_diag_rec_list) if _diag_rec_list else "N/A"}
-의회 거래: 매수 {_diag_cg_buy}건 vs 매도 {_diag_cg_sell}건
-
---- 작성 지침 ---
-아래 형식으로 작성하되, 각 섹션에서 데이터를 나열하지 말고 해석과 판단만 쓰세요.
-
-## 🎯 종합 판단: [매수 고려 / 관망 / 매도 고려]
-한 줄 핵심 근거 (가장 결정적인 이유 하나)
-
-**📡 시그널 충돌 분석:**
-기술적·펀더멘털·수급 시그널이 같은 방향을 가리키는지, 엇갈리는지 분석하세요.
-예: "기술적으로는 강하지만 인사이더가 대규모 매도 중" 같은 충돌을 짚고, 어느 쪽에 무게를 두어야 하는지 판단하세요.
-
-**💡 이 종목의 핵심 투자 포인트:**
-지금 이 종목을 매수할 만한 가장 강력한 이유 (데이터 기반). 없다면 "현재 없음"이라고 쓰세요.
-
-**💣 가장 큰 리스크:**
-지금 이 종목을 피해야 할 가장 강력한 이유 (데이터 기반). 숫자로 근거를 대세요.
-
-**🎯 구체적 액션 플랜:**
-지금 당장 어떻게 해야 하는지. 매수라면 어떤 조건이 추가로 확인되어야 하는지. 관망이라면 어떤 시그널이 나올 때 진입/회피할지. 막연한 표현 금지.
+**🎯 액션 플랜:**
+(관망이면 구체적 진입 조건 명시. 예: RSI XX 이하 또는 MACD 양전환 시)
 
 *본 분석은 참고용이며 투자 권유가 아닙니다.*"""
 
                 with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
                     _diag_model = _GenAIModel(
                         "gemini-2.5-flash",
-                        generation_config={"temperature": 0.4, "max_output_tokens": 16384, "thinking_budget": 0}
+                        generation_config={"temperature": 0.3, "max_output_tokens": 4096}  # 종목 진단 — 볼 때마다 다른 인사이트
                     )
                     _diag_response = _diag_model.generate_content(_diag_prompt)
                     _diag_text = _gemini_response_text_utf8_safe(_diag_response)
 
                 if _diag_text:
-                    st.session_state[_diag_sk] = _diag_text
+                    if "매수 고려" in _diag_text:
+                        st.success(_diag_text)
+                    elif "매도 고려" in _diag_text:
+                        st.error(_diag_text)
+                    else:
+                        st.warning(_diag_text)
                 else:
                     st.warning("AI 진단 결과를 받지 못했습니다.")
             except Exception as _ae:
                 st.error(f"AI 진단 오류: {_ae}")
-
-        # 저장된 결과 표시 (버튼 눌러도, 탭 이동해도 유지)
-        if st.session_state.get(_diag_sk):
-            _saved_diag = st.session_state[_diag_sk]
-            if "매수 고려" in _saved_diag:
-                st.success(_saved_diag)
-            elif "매도 고려" in _saved_diag:
-                st.error(_saved_diag)
-            else:
-                st.warning(_saved_diag)
-            if st.button("🗑️ 진단 초기화", key="ai_diag_reset"):
-                st.session_state.pop(_diag_sk, None)
-                st.rerun()
-
-        # ── 애널리스트 등급 변경 히스토리 ────────────────────────────────
-        st.divider()
-        st.markdown("### 📊 애널리스트 등급 변경 히스토리")
-        st.caption("주요 기관의 상향/하향/유지 이력 (FMP grades-historical, 최근 15건)")
-        with st.spinner(f"{selected_ticker} 등급 히스토리 조회 중..."):
-            _rating_hist = _fmp_historical_ratings(str(selected_ticker).strip().upper())
-        if _rating_hist:
-            _rh_rows = []
-            for _rh in _rating_hist:
-                _action = str(_rh.get("action") or _rh.get("ratingChange") or "").strip()
-                _action_emoji = (
-                    "🟢 상향" if any(w in _action.lower() for w in ["upgrade", "initiated", "initiated at"]) else
-                    "🔴 하향" if "downgrade" in _action.lower() else
-                    "⚪ 유지"
-                )
-                _rh_rows.append({
-                    "날짜": str(_rh.get("date") or "")[:10],
-                    "기관": str(_rh.get("gradingCompany") or _rh.get("company") or ""),
-                    "변경": _action_emoji,
-                    "이전": str(_rh.get("previousGrade") or ""),
-                    "현재": str(_rh.get("newGrade") or ""),
-                })
-            _rh_df = pd.DataFrame(_rh_rows)
-            st.dataframe(_rh_df, use_container_width=True, hide_index=True)
-        else:
-            st.caption("등급 변경 히스토리 데이터를 찾을 수 없습니다.")
-
+    
     elif main_nav == _MAIN_NAV_OPTIONS[6]:
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
@@ -15224,7 +12650,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 # 포트폴리오 스냅샷 자동 저장 (일 1회)
                 _ph_uid = str(st.session_state.get("user_id") or "").strip()
                 _ph_last = st.session_state.get("_portfolio_snapshot_saved_date")
-                _today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+                _today_str = datetime.now(_KST_TZ).strftime("%Y-%m-%d")
                 if _ph_last != _today_str and not sell_radar_df.empty:
                     _ok_snap, _ = save_portfolio_snapshot(_ph_uid, sell_radar_df)
                     if _ok_snap:
@@ -15843,7 +13269,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={
                                 "temperature": 0.0,
                                 "max_output_tokens": 8192,
-                                "thinking_budget": 0,
                                 "response_mime_type": "application/json",
                             })
                             _resp = _ai_m.generate_content(ai_prompt)
@@ -16786,19 +14211,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.warning("티커를 입력해주세요.")
                 else:
                     with st.spinner(f"{wl_ticker} 저장 중..."):
-                        # ✅ 저장 시점 현재가를 캐시 우회하여 신선하게 조회
-                        try:
-                            fetch_latest_prices_for_tickers.clear()
-                        except Exception:
-                            pass
-                        _wl_form_price = fetch_latest_prices_for_tickers((wl_ticker,)).get(wl_ticker, np.nan)
                         ok_wl, err_wl = add_to_watchlist(
                             uid_wl, wl_ticker,
                             memo=wl_memo.strip(),
                             alert_price=float(wl_alert_price) if wl_alert_price > 0 else None,
                             alert_rsi=float(wl_alert_rsi) if wl_alert_rsi > 0 else None,
                             alert_ma200=wl_alert_ma200,
-                            saved_price=float(_wl_form_price) if pd.notna(_wl_form_price) else None,  # ✅ 명시적 전달
                         )
                     if ok_wl:
                         st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!")
@@ -16814,36 +14232,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         else:
             st.markdown(f"### 📋 관심 종목 현황 ({len(wl_items)}개)")
             wl_tickers = [i["ticker"] for i in wl_items]
-
-            # ── 💰 등록가 일괄 복구 버튼 (saved_price 없는 종목 대상) ────────
-            _missing_sp = [i for i in wl_items if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce"))]
-            if _missing_sp:
-                st.warning(f"⚠️ **{len(_missing_sp)}개 종목**의 등록가(Saved Price)가 없어 '등록 시 대비'가 N/A로 표시됩니다.")
-                if st.button("💰 등록가 현재가로 일괄 복구", key="bulk_fix_saved_price", type="secondary"):
-                    with st.spinner("등록가 복구 중..."):
-                        try:
-                            fetch_latest_prices_for_tickers.clear()
-                        except Exception:
-                            pass
-                        _fix_tks = tuple(i["ticker"] for i in _missing_sp)
-                        _fix_prices = fetch_latest_prices_for_tickers(_fix_tks)
-                        _fix_count = 0
-                        for i in wl_items:
-                            if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce")):
-                                _fp = _fix_prices.get(i["ticker"], np.nan)
-                                if pd.notna(_fp):
-                                    i["saved_price"] = float(_fp)
-                                    _fix_count += 1
-                        if _fix_count > 0:
-                            _ok_fix, _err_fix = save_watchlist_sheet(uid_wl, wl_items)
-                            if _ok_fix:
-                                load_watchlist_sheet.clear()
-                                st.success(f"✅ {_fix_count}개 종목 등록가 복구 완료!")
-                                st.rerun()
-                            else:
-                                st.error(f"저장 실패: {_err_fix}")
-                        else:
-                            st.warning("복구할 가격 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
 
             with st.spinner("실시간 가격 및 지표 계산 중..."):
                 price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
@@ -17142,408 +14530,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.rerun()
                 else:
                     st.error(f"삭제 실패: {err_del}")
-
-    elif main_nav == _MAIN_NAV_OPTIONS[12]:
-        # ─────────────────────────────────────────────────────────────────────
-        # 📖 사용 가이드
-        # ─────────────────────────────────────────────────────────────────────
-        st.title("📖 사용 가이드")
-        st.caption("Quant Investment Terminal — 전체 기능 및 워크플로우 안내")
-
-        _uid_guide = str(st.session_state.get("user_id") or "").strip()
-        _role_guide = st.session_state.get("user_role", "guest")
-
-        # ── 전체 워크플로우 개요 ──────────────────────────────────────────────
-        st.markdown("## 🗺️ 투자 의사결정 워크플로우 (Top-Down)")
-        st.info(
-            "**권장 순서:** 🚨 Daily Risk → 🌐 거시경제 → 📰 내러티브 → 🎯 섹터 → "
-            "🚀 종목 스캐너 → 🔬 정밀 검사 → 🛡️ 포트폴리오 관리\n\n"
-            "매일 아침 ① Daily Risk Gauge 먼저 확인 → 위험이 낮으면 ② 내러티브 분석 실행 "
-            "→ AI가 추천한 섹터·종목을 ③ 스캐너로 검증 → ④ 정밀 검사 후 투자 결정"
-        )
-
-        # ── 섹션별 탭 구성 ────────────────────────────────────────────────────
-        _g_tab0, _g_tab1, _g_tab2, _g_tab3, _g_tab4 = st.tabs([
-            "🚀 시작하기",
-            "📊 분석 도구",
-            "💼 포트폴리오",
-            "🤖 AI 인사이트",
-            "❓ FAQ",
-        ])
-
-        # ════════════════════════════════════════════════════════════════════
-        with _g_tab0:
-            st.markdown("### 🚀 처음 시작하는 분들을 위한 2단계 셋업")
-
-            with st.expander("**STEP 1 — 포트폴리오 종목 등록**", expanded=False):
-                st.markdown("""
-**[4단계] 포트폴리오 매도 레이더** 탭에서:
-1. `계좌명(Account)` 입력 (예: Robinhood, Fidelity, ISA)
-2. `티커(Ticker)` 입력 (예: AAPL, TSLA, 005930.KS)
-3. `매수가`, `수량` 입력 후 **"종목 추가"** 클릭
-4. Google Sheets `Portfolio` 탭에 자동 저장 — 모든 기기에서 실시간 동기화
-
-> 💡 국내 주식도 `.KS` 접미사로 지원합니다 (예: `005930.KS` = 삼성전자)
-""")
-
-            with st.expander("**STEP 2 — 첫 AI 내러티브 분석 실행**", expanded=False):
-                st.markdown("""
-**[1단계] 시장 내러티브** 탭에서:
-1. 분석 타입 선택: `오늘의 최신 내러티브` 또는 `주간 메가 트렌드`
-2. **"🤖 AI 내러티브 분석 실행"** 버튼 클릭
-3. AI가 Winners(주도주)·Emerging(급부상 종목)·Sector Rotation을 자동 분석
-4. 결과가 `Narratives` 시트에 자동 저장 → 이후 모든 AI 탭에서 활용
-
-> ⏱️ 최초 분석 소요 시간: 약 30~60초
-""")
-
-            st.divider()
-            with st.expander("### 📅 일일 루틴 추천", expanded=False):
-                st.markdown("""
-| 시간 | 탭 | 행동 |
-|---|---|---|
-| 장 열기 전 (오전 9시 이전) | 🚨 Daily Risk Gauge | 선행 신호 6개 + 시장 위험도 확인 |
-| 장 중 | 📰 [1단계] 시장 내러티브 | AI 내러티브 분석 → Winners/Emerging 파악 |
-| 장 중 | 🎯 [2단계] 섹터 & 자금 흐름 | 자금이 몰리는 섹터 확인 |
-| 관심 종목 발생 시 | 🔬 [3단계] 정밀 검사 | 개별 종목 펀더멘털 + 기술적 분석 |
-| 주 1회 | 📋 [AI] 주간 포트폴리오 요약 | 전체 포트폴리오 AI 리뷰 |
-""")
-
-        # ════════════════════════════════════════════════════════════════════
-        with _g_tab1:
-            st.markdown("### 📊 분석 도구 탭 상세 가이드")
-
-            with st.expander("🚨 **Daily Risk Gauge** — 매일 첫 확인", expanded=False):
-                st.markdown("""
-**목적:** 당일 시장 진입 가능 여부를 빠르게 판단
-
-**선행 신호 6가지:**
-- 🌙 **VIX 공포지수** — 20 이하: 안전 / 30 이상: 위험
-- 📈 **선물 프리마켓** (S&P500·나스닥) — 장 열기 전 방향성 확인
-- 💵 **달러 인덱스(DXY)** — 강달러 = 신흥국·원자재 압박
-- 📉 **국채 수익률** — 10Y·2Y 스프레드로 경기침체 선행 신호 포착
-- 🌐 **글로벌 시장** — 전일 아시아·유럽 마감 분위기
-- 📅 **경제 이벤트 캘린더** — FOMC·CPI 등 고임팩트 발표 감지
-
-**오늘 투자해도 될까?** 버튼으로 AI가 6가지 신호를 종합해 매매 가능 여부 판단
-
-> ⚡ 데이터는 1시간 캐시. 강제 새로고침은 화면 상단 **🔄 데이터 새로고침** 버튼
-""")
-
-            with st.expander("🌐 **[1단계] 거시경제 지표**", expanded=False):
-                st.markdown("""
-**미국 거시경제 8대 지표 자동 수집·판독**
-
-| 지표 | 데이터 소스 | 판독 기준 |
-|---|---|---|
-| 기준금리 (Fed Funds) | FRED / FMP | 5% 이상 = 고금리 레짐 |
-| 국채 수익률 (10Y, 2Y) | FRED / FMP | 역전 = 침체 선행 신호 |
-| CPI 인플레이션 | FRED / FMP | 3% 이상 = 위험 |
-| 실업률 | FRED / FMP | 4.5% 이상 = 경기 둔화 |
-| GDP 성장률 | FMP | 2% 이하 = 경기 둔화 |
-| 소매판매 | FMP | 전월 대비 감소 = 소비 위축 |
-| VIX 공포지수 | FRED / yfinance | 25 이상 = 위험 선호 저하 |
-| 달러 인덱스 | FRED / FMP(UUP) | 52주 평균 대비 +5.5% 이상 = 달러 과강세 |
-
-**📊 Macro Score:** 8개 지표 합산 점수 (Pass/Warning/Fail)  
-**📈 2년 히스토리 차트:** 지표 추이를 시각화해 트렌드 파악
-""")
-
-            with st.expander("📰 **[1단계] 시장 내러티브**", expanded=False):
-                st.markdown("""
-**AI가 뉴스·시장 데이터를 분석해 투자 테마를 추출**
-
-**분석 타입:**
-- `오늘의 최신 내러티브` — 당일 뉴스 기반 단기 모멘텀 분석
-- `주간 메가 트렌드` — 최근 7일 흐름 기반 스윙/중기 투자용
-
-**분석 결과 구성:**
-1. **Market Regime** — 현재 시장 국면 (Risk-On / Risk-Off / Neutral)
-2. **테마별 내러티브** — AI가 추출한 핵심 투자 테마 (2~5개)
-3. **Winners** — 각 테마에서 주목할 선도 종목
-4. **Emerging** — 급부상 중인 초기 단계 종목
-5. **Sector Rotation Map** — 자금이 이동하는 섹터 시각화
-6. **내러티브 일관성 점수** — 이전 분석과의 연속성 평가
-
-**Emerging 종목 정량 교차 검증:** Winners/Emerging 종목을 RSI·RS·거래량으로 자동 검증  
-**시계열 분석 엔진:** 특정 내러티브가 얼마나 지속됐는지 추적  
-
-> 💾 분석 결과는 `Narratives` 시트에 자동 저장 (최근 40개 보관)
-""")
-
-            with st.expander("🎯 **[2단계] 섹터 & 자금 흐름**", expanded=False):
-                st.markdown("""
-**11개 GICS 섹터 ETF 상대 강도 분석**
-
-- **섹터 ETF 강도 순위** — XLK·XLV·XLE 등 섹터별 1개월 수익률 비교
-- **섹터별 P/E Snapshot** — 고평가/저평가 섹터 한눈에 파악
-- **Alpha Leaders** — 선택 섹터 내 실제 주도주 발굴
-- **Laggards** — 낙폭과대 반등 후보
-
-**추가 레이더:**
-- 🚀 **Hidden Alpha Radar** — 새로운 주도 테마 발굴 (섹터 이탈 강세주)
-- 🌱 **Early Signal Radar** — 막 강해지기 시작한 섹터 선제 감지
-- 🛡️ **섹터 꺾임 감지** — 고점 이탈 섹터 → 매도 타이밍 포착
-""")
-
-            with st.expander("🚀 **[2단계] AI 종목 스캐너**", expanded=False):
-                st.markdown("""
-**내러티브 DB의 Winners·Emerging 종목을 자동 스캔**
-
-**데이터 소스 선택:**
-- `오늘의 최신 내러티브` — 당일 분석 결과의 Winners/Emerging
-- `주간 메가 트렌드` — 7일 누적 상위 종목
-- `수동 섹터/티커 입력` — 직접 종목 지정
-
-**듀얼 엔진 스캔 결과:**
-- **Current Leaders** — RSI·모멘텀·거래량 기반 현재 주도주
-- **Emerging Opportunities** — 초기 부상 중인 기회 종목
-
-**🔬 종목/테마 X-Ray:** 특정 종목·섹터에 대한 심층 AI 분석  
-**📊 내러티브 팩트 체크:** 과거 AI 추천 종목의 실제 수익률 검증
-""")
-
-            with st.expander("🔬 **[3단계] 개별 종목 정밀 검사**", expanded=False):
-                st.markdown("""
-**사이드바에서 티커 입력 후 분석 실행**
-
-**펀더멘털 분석:**
-- 시가총액·P/E·P/B·PEG·ROE·부채비율 등 핵심 KPI
-- **투자 스타일 적합도** — 성장주/가치주/배당주/모멘텀 중 어디에 해당하는지
-- **DCF 내재가치 계산** — 현재가 대비 안전마진 산출
-- **어닝 서프라이즈 히스토리** — 최근 8분기 EPS 실제 vs 예상
-
-**기술적 분석:**
-- RSI(14), MACD, 볼린저밴드, 52주 고점/저점 대비
-- 200일선·50일선 위치 확인
-- 거래량 이상 감지
-
-**추가 데이터:**
-- 📞 어닝콜 트랜스크립트 AI 요약 (FMP)
-- 🏦 기관 투자자 보유 현황 변화
-- 🕵️ 인사이더 트레이딩 내역
-- 🎯 애널리스트 목표주가 컨센서스
-- 🏛️ 상원/하원 의원 거래 내역
-
-**🤖 AI 종합 진단:** 펀더멘털+기술적 신호를 종합한 매수/관망/매도 의견
-""")
-
-        # ════════════════════════════════════════════════════════════════════
-        with _g_tab2:
-            st.markdown("### 💼 포트폴리오 관리 탭 상세 가이드")
-
-            with st.expander("🛡️ **[4단계] 포트폴리오 매도 레이더**", expanded=False):
-                st.markdown("""
-**포트폴리오 전체 현황 + 매도 신호 자동 감지**
-
-#### 📋 포트폴리오 관리
-- **계좌별 등록** — Robinhood·Fidelity 등 여러 계좌를 분리 관리
-- **종목 추가/삭제** — 티커·매수가·수량 입력
-- **실시간 손익** — 현재가 자동 조회 → 투자 손익($) 및 수익률(%) 계산
-- **매도 기록** — 매도한 종목의 실현 손익 추적
-
-#### 📊 포트폴리오 분석 (고급)
-- **Correlation Matrix** — 보유 종목 간 상관관계 (분산투자 체크)
-- **수익률 히스토리** — 매수가 기준 누적 수익 추이
-- **Personal Benchmark 비교** — 내 포트폴리오 vs SPY·QQQ 성과 비교 (100 normalized)
-
-#### 📅 보유 종목 실적 발표 캘린더
-보유 종목의 다음 실적 발표일 자동 조회:
-- **빨간 🔴**: D-30일 이내 임박 → 변동성 대비 필요
-- **노란 🟡**: 예정 (30일 이후)
-- **초록 ✅**: 발표 완료
-- EPS 예상치 표시 (FMP 제공 시)
-
-#### 🎯 매도 타이밍 레이더
-RSI·MACD·52주 고점·200일선 4가지 기술적 신호로 **위험점수** 산출:
-
-| 신호 등급 | 기준 | 의미 |
-|---|---|---|
-| 🔴 매도 검토 | 위험점수 3점+ | RSI 과매수 + 복수 기술적 경고 |
-| 🟡 주의 | 위험점수 1~2점 | 일부 신호 경고 |
-| 🟢 유지 | 위험점수 0점 | 이상 신호 없음 |
-
-**🤖 AI 매도 우선순위:** 기술적 신호 + 펀더멘털을 AI가 종합해 매도 우선순위 제시
-""")
-
-            with st.expander("🔔 **Buy Watchlist & Alert**", expanded=False):
-                st.markdown("""
-**관심 종목 등록 + 매수 조건 자동 체크**
-
-#### 등록 방법
-1. 사이드바 티커 입력창에 종목 입력
-2. 투자 메모 작성 (선택)
-3. Alert 조건 설정:
-   - **목표 RSI** — RSI가 지정값 이하로 하락 시 알림 (예: 30 이하 → 과매도 매수 기회)
-   - **200일선 하향 돌파** — 200일선 아래로 내려갈 때 알림
-4. **"현재 티커 저장"** 클릭
-
-#### Watchlist 탭에서
-- **Alert 조건 충족 시** — 🔴 자동 하이라이트
-- 각 종목 클릭 → 바로 [3단계] 정밀 검사로 이동
-- 목표가·메모 직접 편집 가능
-
-> 💡 정기적으로 Watchlist를 관리해 관심 종목이 매수 조건에 들어올 때 빠르게 대응하세요.
-""")
-
-        # ════════════════════════════════════════════════════════════════════
-        with _g_tab3:
-            st.markdown("### 🤖 AI 인사이트 탭 상세 가이드")
-
-            with st.expander("📊 **[AI] 내러티브 적중률 트래커**", expanded=False):
-                st.markdown("""
-**AI 내러티브 분석의 실제 성과를 검증하는 팩트체크 시스템**
-
-#### 작동 방식
-1. 과거 내러티브 분석 시 기록된 Winners·Emerging 종목 불러오기
-2. 분석 시점으로부터 현재까지 실제 수익률 계산
-3. 종목별·테마별·월별 적중률 통계 제공
-
-#### 주요 지표
-- **평균 수익률** — AI가 추천한 종목들의 평균 성과
-- **적중률(%)** — 플러스 수익률을 기록한 비율
-- **Best 5 / Worst 5** — 가장 성공한/실패한 AI 추천 종목
-
-> 이 탭을 통해 어떤 내러티브 타입이 더 신뢰할 만한지, 어떤 섹터에서 AI가 강한지 파악할 수 있습니다.
-""")
-
-            with st.expander("💡 **[AI] Idea-to-Portfolio 추적**", expanded=False):
-                st.markdown("""
-**내러티브 분석에서 발굴한 아이디어가 실제 포트폴리오에 편입됐는지 추적**
-
-AI가 추천한 Winners·Emerging 종목 중:
-- 포트폴리오에 **이미 보유 중**인 종목 → ✅ 표시
-- 아직 **미편입** 종목 → 빠른 검사 버튼으로 바로 분석
-- **실현 손익**과 AI 추천 이후 수익률 비교
-
-> 💡 AI의 인사이트를 실제 투자로 연결하는 파이프라인을 관리합니다.
-""")
-
-            with st.expander("📋 **[AI] 주간 포트폴리오 요약**", expanded=False):
-                st.markdown("""
-**주 1회 실행 — 포트폴리오 전체에 대한 AI 주간 리뷰 리포트 자동 생성**
-
-#### 리포트 포함 내용
-- 현재 포트폴리오 전체 손익 현황
-- 최근 AI 내러티브와 보유 종목의 연관성 분석
-- 현재 거시경제 환경에서의 포트폴리오 리스크 평가
-- 주간 투자 전략 제언 (매도 검토 / 추가 매수 관심 / 유지)
-
-#### 사용 방법
-1. **[4단계] 포트폴리오 매도 레이더**를 먼저 열어 수익률 데이터 동기화
-2. **"🤖 주간 AI 리포트 생성"** 버튼 클릭
-3. 리포트가 `Narratives` 시트에 자동 저장 (이전 기록도 보관)
-
-> ⏱️ 생성 소요 시간: 약 20~30초
-""")
-
-            with st.expander("📡 **[AI] Emerging 종목 추적기**", expanded=False):
-                st.markdown("""
-**Emerging 종목이 반복 등장할수록 신뢰도 높은 매수 신호**
-
-#### 작동 방식
-- [1단계] 시장 내러티브 분석 후 **"Emerging 종목 검증 실행"** 클릭 시 자동 기록
-- 같은 종목이 여러 분석에서 반복 등장할 때 추적
-
-#### 신호 등급
-| 등장 횟수 | 의미 | 색상 |
-|---|---|---|
-| 1회 | 관심 후보 | 초록 |
-| 2~4회 | 반복 등장 — 관심 집중 | 주황 |
-| 5회+ | 강한 모멘텀 신호 | 빨강 |
-
-#### Best Verdict 분류
-- **최적 매수 타이밍** — RSI·RS 지표가 매수 구간에 있는 종목
-- **얼리버드 기회** — 아직 초기 단계지만 선취매 가능한 종목
-
-> 💡 [3단계] 개별 종목 정밀 검사 버튼으로 바로 심층 분석 진행 가능
-""")
-
-        # ════════════════════════════════════════════════════════════════════
-        with _g_tab4:
-            st.markdown("### ❓ 자주 묻는 질문 (FAQ)")
-
-            _faqs = [
-                (
-                    "Q. 실적 발표 캘린더에 데이터가 안 나와요",
-                    """**원인:** FMP API 키가 없거나 해당 종목의 다음 실적 발표일이 아직 확정되지 않은 경우입니다.
-
-**해결:**
-1. `FMP_API_KEY`가 Secrets에 설정되어 있는지 확인
-2. 실적 발표일이 확정된 종목만 표시됩니다 (보통 발표 3~4주 전부터 데이터 생성)
-3. 🔄 새로고침 후 재시도""",
-                ),
-                (
-                    "Q. AI 분석이 '생성 실패'로 뜹니다",
-                    """**원인:** Anthropic API 키 오류 또는 일시적 서버 부하
-
-**해결:**
-1. `ANTHROPIC_API_KEY`가 유효한지 확인
-2. 잠시 후(30초~1분) 재시도
-3. 분석 소요 시간은 최대 60초 — 네트워크 상태 확인""",
-                ),
-                (
-                    "Q. 포트폴리오에 추가했는데 다음에 들어오면 사라져요",
-                    """**원인:** Google Sheets 연결 오류로 저장 실패
-
-**해결:**
-1. 종목 추가 시 "✅ 저장 완료" 메시지가 나오는지 확인
-2. `SPREADSHEET_ID`와 서비스 계정 권한 확인
-3. Google Sheet에서 `Portfolio` 탭을 직접 열어 데이터 존재 여부 확인""",
-                ),
-                (
-                    "Q. Daily Risk Gauge의 선물 가격이 안 나와요",
-                    """**원인:** yfinance Rate Limit 또는 장외 시간(데이터 없음)
-
-**해결:**
-1. 🔄 데이터 새로고침 버튼 클릭
-2. 미국 프리마켓 시간(오후 4시~오전 4시 ET) 이외에는 선물 데이터가 제한될 수 있습니다
-3. FMP_API_KEY 설정 시 FMP 선물 데이터로 자동 대체""",
-                ),
-                (
-                    "Q. 한국 주식도 분석 가능한가요?",
-                    """**가능합니다.** 티커 형식: `종목코드.KS`
-
-예시:
-- 삼성전자: `005930.KS`
-- SK하이닉스: `000660.KS`
-- NAVER: `035420.KS`
-
-단, FMP 기반 데이터(기관 투자자·인사이더·어닝콜)는 한국 주식을 지원하지 않습니다.  
-yfinance 기반 기술적 분석·차트는 정상 작동합니다.""",
-                ),
-                (
-                    "Q. ETF 분석도 되나요?",
-                    """**됩니다.** ETF 티커를 [3단계] 정밀 검사에서 직접 입력하면:
-- 섹터 배분·보유 종목 Top 10 자동 표시 (FMP `etf-holder` API)
-- 기술적 분석 (RSI·MACD·차트) 정상 작동
-- 펀더멘털(P/E 등)은 ETF 특성상 N/A로 표시될 수 있음
-
-[2단계] AI 종목 스캐너에서도 ETF 유니버스를 기반으로 스캔합니다.""",
-                ),
-                (
-                    "Q. 데이터는 얼마나 자주 업데이트되나요?",
-                    """**실시간 데이터가 아닙니다.** 캐시 기반 운영:
-- 주가 데이터: 1시간마다 갱신 (🔄 버튼으로 강제 갱신 가능)
-- AI 내러티브: 버튼 클릭 시마다 새로 생성
-- Google Sheets (포트폴리오·Watchlist): 즉시 동기화
-
-Streamlit Community Cloud 환경의 특성상 동시 접속자가 많으면 응답이 느려질 수 있습니다.""",
-                ),
-            ]
-
-            for _q, _a in _faqs:
-                with st.expander(_q, expanded=False):
-                    st.markdown(_a)
-
-            st.divider()
-            st.markdown("### 📬 피드백 & 버그 리포트")
-            st.info(
-                "기능 요청이나 버그는 포트폴리오 탭 하단 메모 기능 또는 "
-                "관리자에게 직접 문의해 주세요.\n\n"
-                "**앱 버전:** v2.0 (2025) | "
-                "**Tech Stack:** Streamlit · Google Sheets · yfinance · FMP · Claude AI"
-            )
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
