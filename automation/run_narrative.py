@@ -302,6 +302,43 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
+# ── Emerging_Tracker (app.py와 동일한 시트 구조) ──────────────────────────────
+_EMERGING_TRACKER_WORKSHEET = "Emerging_Tracker"
+_EMERGING_TRACKER_COLS = ["ID", "Ticker", "Theme", "First_Seen", "Last_Seen",
+                          "Count", "Best_Verdict", "RS_Score", "Status"]
+# 검증에 쓸 FMP (app.py와 동일한 stable API)
+_FMP_BASE    = "https://financialmodelingprep.com/stable"
+_FMP_TIMEOUT = 10
+FMP_API_KEY  = os.environ.get("FMP_API_KEY", "").strip()
+
+
+def _safe_append_rows(ws, rows, value_input_option: str = "USER_ENTERED") -> None:
+    """gspread append_row의 '계단식 드리프트' 버그 회피. 항상 A열 기준 마지막 데이터 다음에 기록."""
+    if rows is None:
+        return
+    if len(rows) > 0 and not isinstance(rows[0], (list, tuple)):
+        rows = [rows]
+    rows = [list(r) for r in rows if r is not None]
+    if not rows:
+        return
+    existing = ws.get_all_values() or []
+    last_row = 0
+    for idx, r in enumerate(existing, start=1):
+        if any(str(c).strip() != "" for c in r):
+            last_row = idx
+    start_row = last_row + 1
+    end_row = start_row + len(rows) - 1
+    try:
+        if end_row > ws.row_count:
+            ws.add_rows(end_row - ws.row_count + 50)
+    except Exception:
+        pass
+    n_cols = max(len(r) for r in rows)
+    end_cell = gspread.utils.rowcol_to_a1(end_row, n_cols)
+    ws.update(rows, range_name=f"A{start_row}:{end_cell}",
+              value_input_option=value_input_option)
+
+
 def _session_label_for_utc(dt_utc) -> str:
     """app.py와 동일한 세션 라벨."""
     dt_et = dt_utc.astimezone(_ET)
@@ -343,8 +380,8 @@ def save_narrative_to_sheet(analysis: dict, news_count: int, fred_releases: list
             ws = sh.worksheet(_NARRATIVES_WORKSHEET)
         except gspread.exceptions.WorksheetNotFound:
             ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET, rows=3000, cols=7)
-            ws.append_row(["ID","Date","Category","Title","Content","Winners","Emerging"],
-                          value_input_option="USER_ENTERED")
+            _safe_append_rows(ws, ["ID","Date","Category","Title","Content","Winners","Emerging"],
+                              value_input_option="USER_ENTERED")
 
         from datetime import timezone
         now_utc = datetime.now(timezone.utc)
@@ -373,13 +410,193 @@ def save_narrative_to_sheet(analysis: dict, news_count: int, fred_releases: list
         e_csv   = ",".join(emerging_from_analysis(analysis))
 
         row = [_ADMIN_USER_ID, date_kst, category, title, content, w_csv, e_csv]
-        ws.append_row(row, value_input_option="USER_ENTERED")
+        _safe_append_rows(ws, row, value_input_option="USER_ENTERED")
         print(f"[OK] Sheets 저장 완료: {title} | {session_label}")
         return True
     except Exception as e:
         print(f"[ERROR] Sheets 저장 실패: {e}")
         traceback.print_exc()
         return False
+
+
+# ── Emerging 정량 검증 + 추적기 적재 (app.py 로직 포팅) ───────────────────────
+def _fmp_close_series(ticker: str, limit: int = 130):
+    """FMP stable historical-price-eod → 종가 Series (오래된→최신 정렬)."""
+    if not FMP_API_KEY:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+        data = r.json()
+        rows = data.get("historical", data) if isinstance(data, dict) else data
+        if not isinstance(rows, list) or not rows:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+        df = pd.DataFrame(rows)
+        if "date" not in df.columns or "close" not in df.columns:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        close = pd.to_numeric(df["close"], errors="coerce").dropna()
+        vol = pd.to_numeric(df["volume"], errors="coerce").dropna() if "volume" in df.columns else pd.Series(dtype=float)
+        return close, vol
+    except Exception:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+
+def verify_emerging_with_quant(emerging_tickers: list) -> list[dict]:
+    """app.py verify_emerging_with_quant와 동일한 판정 기준으로 Emerging 종목 검증."""
+    if not emerging_tickers or not FMP_API_KEY:
+        return []
+    unique = list(dict.fromkeys(str(t).strip().upper() for t in emerging_tickers if str(t).strip()))
+
+    # SPY 3개월 수익률 (RS 기준선)
+    spy_close, _ = _fmp_close_series("SPY", limit=130)
+    spy_3m = float((spy_close.iloc[-1] / spy_close.iloc[-64] - 1) * 100) if len(spy_close) >= 64 else 0.0
+
+    results = []
+    for tk in unique:
+        s, vol = _fmp_close_series(tk, limit=130)
+        if len(s) < 22:
+            continue
+        mom_1m = float((s.iloc[-1] / s.iloc[-22] - 1) * 100) if len(s) >= 22 else np.nan
+        mom_3m = float((s.iloc[-1] / s.iloc[-64] - 1) * 100) if len(s) >= 64 else np.nan
+        rs_score = float(mom_3m - spy_3m) if pd.notna(mom_3m) else np.nan
+        ma200 = float(s.rolling(200, min_periods=150).mean().iloc[-1]) if len(s) >= 150 else np.nan
+        above_ma200 = bool(s.iloc[-1] > ma200) if pd.notna(ma200) else None
+        vol_surge = float(vol.tail(5).mean() / vol.tail(21).mean()) if len(vol) >= 21 else np.nan
+
+        # app.py와 100% 동일한 판정 분기
+        if pd.notna(rs_score) and rs_score < 0 and pd.notna(vol_surge) and vol_surge >= 1.5:
+            verdict = "🎯 최적 매수 타이밍"
+        elif pd.notna(rs_score) and rs_score < 3 and above_ma200 and pd.notna(mom_1m) and mom_1m > 2:
+            verdict = "🌱 얼리버드 기회"
+        elif pd.notna(rs_score) and rs_score > 5 and above_ma200:
+            verdict = "✅ 이미 강세 (진입 시 고점 주의)"
+        elif above_ma200 is False:
+            verdict = "❌ 하락 추세 (대기)"
+        else:
+            verdict = "⏳ 신호 대기"
+
+        results.append({
+            "ticker": tk,
+            "rs_score": round(rs_score, 2) if pd.notna(rs_score) else None,
+            "verdict": verdict,
+        })
+        time.sleep(0.15)  # FMP rate-limit 완화
+    return results
+
+
+def upsert_emerging_tracker(ws, vals_cache: list, user_id: str, ticker: str,
+                            theme: str, verdict: str, rs_score) -> list:
+    """app.py upsert_emerging_tracker와 동일: 같은 티커면 Count++/Last_Seen 갱신, 없으면 신규.
+    vals_cache: 현재 시트 전체 값(중복 read 방지용). 갱신 후 최신 캐시를 반환."""
+    uid_u = str(user_id).strip().upper()
+    tk_u = str(ticker).strip().upper()
+    now_str = datetime.now(_ET).strftime("%Y-%m-%d %H:%M")
+    rs_str = f"{float(rs_score):.2f}" if rs_score is not None and rs_score == rs_score else ""
+
+    found_row = None
+    for i, r in enumerate(vals_cache[1:], start=2):
+        r = (r + [""] * 9)[:9]
+        if str(r[0]).strip().upper() == uid_u and str(r[1]).strip().upper() == tk_u:
+            found_row = (i, r)
+            break
+
+    verdict_priority = {"🎯 최적 매수 타이밍": 0, "🌱 얼리버드 기회": 1, "✅ 이미 강세 (진입 시 고점 주의)": 2}
+
+    if found_row:
+        row_idx, old_r = found_row
+        old_count = int(old_r[5]) if str(old_r[5]).isdigit() else 1
+        new_count = old_count + 1
+        best_verdict = verdict if verdict_priority.get(verdict, 99) < verdict_priority.get(old_r[6], 99) else old_r[6]
+        if new_count >= 5:
+            status = "🔥 지속 등장 (강한 신호)"
+        elif new_count >= 3:
+            status = "📌 반복 등장"
+        else:
+            status = "🆕 신규"
+        ws.update([[uid_u, tk_u, theme, old_r[3], now_str, str(new_count), best_verdict, rs_str, status]],
+                  range_name=f"A{row_idx}:I{row_idx}", value_input_option="USER_ENTERED")
+        # 캐시 갱신
+        vals_cache[row_idx - 1] = [uid_u, tk_u, theme, old_r[3], now_str, str(new_count), best_verdict, rs_str, status]
+    else:
+        new_row = [uid_u, tk_u, str(theme)[:60], now_str, now_str, "1", verdict, rs_str, "🆕 신규"]
+        _safe_append_rows(ws, new_row, value_input_option="USER_ENTERED")
+        vals_cache.append(new_row)
+    return vals_cache
+
+
+def should_load_emerging_tracker() -> bool:
+    """추적기 적재 여부 판단 — 하루 1회 규칙.
+    · 평일(월~금): ET 오전(낮 12시 이전, =8AM 실행)에만 적재. 평일 5PM 실행은 건너뜀.
+    · 주말(토·일): 5PM 실행 1회만 있으므로 항상 적재.
+    """
+    et_now = datetime.now(_ET)
+    weekday = et_now.weekday()  # 0=월 … 5=토, 6=일
+    if weekday >= 5:            # 주말
+        return True
+    return et_now.hour < 12     # 평일은 오전(8AM)만
+
+
+def run_emerging_tracking(analysis: dict) -> None:
+    """내러티브의 Emerging 티커를 정량 검증 후 Emerging_Tracker에 적재 (하루 1회)."""
+    if not should_load_emerging_tracker():
+        print("[INFO] Emerging 추적기 적재 스킵 (평일 오후 실행 — 하루 1회 규칙).")
+        return
+    if not FMP_API_KEY:
+        print("[WARN] FMP_API_KEY 없음 → Emerging 검증 건너뜀 (내러티브 저장은 정상).")
+        return
+
+    emerging = emerging_from_analysis(analysis)
+    if not emerging:
+        print("[INFO] 내러티브에 Emerging 티커 없음 → 추적기 적재 없음.")
+        return
+
+    print(f"[STEP 3.5] Emerging 종목 {len(emerging)}개 정량 검증 중...")
+    verified = verify_emerging_with_quant(emerging)
+    if not verified:
+        print("[WARN] Emerging 검증 결과 없음 (FMP 데이터 부족 가능).")
+        return
+
+    # 티커 → 테마 제목 매핑 (app.py와 동일하게 emerging에 등장한 테마명)
+    theme_of = {}
+    for theme in analysis.get("themes", []):
+        if not isinstance(theme, dict):
+            continue
+        title = str(theme.get("title", "") or "").strip()
+        for flow in theme.get("expanding_to", []):
+            for t in parse_tickers_from_csv(flow.get("expected_tickers", "")):
+                theme_of.setdefault(t, title)
+
+    try:
+        gc = get_gspread_client()
+        sh = gc.open(_SPREADSHEET_TITLE)
+        try:
+            ws = sh.worksheet(_EMERGING_TRACKER_WORKSHEET)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=_EMERGING_TRACKER_WORKSHEET, rows=2000, cols=9)
+            _safe_append_rows(ws, _EMERGING_TRACKER_COLS, value_input_option="USER_ENTERED")
+
+        vals_cache = ws.get_all_values() or [_EMERGING_TRACKER_COLS]
+        n_new = n_upd = 0
+        for v in verified:
+            before = len(vals_cache)
+            vals_cache = upsert_emerging_tracker(
+                ws, vals_cache, _ADMIN_USER_ID, v["ticker"],
+                theme_of.get(v["ticker"], "내러티브"), v["verdict"], v["rs_score"],
+            )
+            if len(vals_cache) > before:
+                n_new += 1
+            else:
+                n_upd += 1
+        print(f"[OK] Emerging 추적기 적재 완료: 신규 {n_new} · 갱신 {n_upd} (검증 {len(verified)}개)")
+    except Exception as e:
+        print(f"[ERROR] Emerging 추적기 적재 실패: {e}")
+        traceback.print_exc()
 
 
 # ── HTML 이메일 생성 ───────────────────────────────────────────────────────────
@@ -555,6 +772,12 @@ def main():
     # Sheets 저장
     print("[STEP 3] Google Sheets 저장 중...")
     save_narrative_to_sheet(analysis, raw_count, fred_releases)
+
+    # Emerging 추적기 적재 (하루 1회: 평일 8AM / 주말 5PM)
+    try:
+        run_emerging_tracking(analysis)
+    except Exception as e:
+        print(f"[WARN] Emerging 추적기 단계 예외(무시하고 계속): {e}")
 
     # 이메일 발송
     print("[STEP 4] 이메일 발송 중...")
