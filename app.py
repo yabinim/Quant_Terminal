@@ -7277,12 +7277,11 @@ _LEVERAGED_ETF_MAP = {
 }
 
 # 이름 문자열 보조 추정용 (매핑에 없을 때만). (정규식, 배수)
-_LEV_NAME_PATTERNS = [
-    (re.compile(r"\b3X\b|ULTRAPRO|TRIPLE", re.I), 3),
-    (re.compile(r"\b2X\b|ULTRA\b|DOUBLE", re.I), 2),
-    (re.compile(r"\b1\.5X\b", re.I), 1.5),
-    (re.compile(r"INVERSE|SHORT|BEAR", re.I), -1),
-]
+# 이름 문자열 보조 추정용 (매핑에 없을 때만): 배수 크기와 인버스 방향을 따로 판별.
+_LEV_MAG_3X = re.compile(r"\b3X\b|ULTRAPRO|TRIPLE", re.I)
+_LEV_MAG_2X = re.compile(r"\b2X\b|\bULTRA\b|DOUBLE", re.I)
+_LEV_MAG_15 = re.compile(r"\b1\.5X\b", re.I)
+_LEV_INVERSE = re.compile(r"INVERSE|SHORT|BEAR", re.I)
 
 
 def get_leverage_multiplier(ticker: str, name: str = "") -> float | None:
@@ -7292,9 +7291,21 @@ def get_leverage_multiplier(ticker: str, name: str = "") -> float | None:
     if t in _LEVERAGED_ETF_MAP:
         return _LEVERAGED_ETF_MAP[t]
     if name:
-        for pat, mult in _LEV_NAME_PATTERNS:
-            if pat.search(str(name)):
-                return mult
+        n = str(name)
+        # 배수 크기와 인버스 방향을 독립적으로 판별한 뒤 결합
+        if _LEV_MAG_3X.search(n):
+            mag = 3.0
+        elif _LEV_MAG_2X.search(n):
+            mag = 2.0
+        elif _LEV_MAG_15.search(n):
+            mag = 1.5
+        else:
+            mag = None
+        is_inverse = bool(_LEV_INVERSE.search(n))
+        if mag is not None:
+            return -mag if is_inverse else mag
+        if is_inverse:
+            return -1.0  # 배수 명시 없는 단순 인버스(-1x)
     return None
 
 
