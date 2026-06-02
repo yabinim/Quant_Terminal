@@ -16991,6 +16991,15 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
             # ── Thesis별 그룹 뷰 ───────────────────────────────────────────
             st.markdown("### 📋 Thesis별 포지션 현황")
+
+            # 매수가/수량 조회용 포트폴리오 (루프 밖에서 1회 로드)
+            try:
+                portfolio_df_thesis = load_portfolio()
+            except Exception:
+                portfolio_df_thesis = pd.DataFrame()
+            if portfolio_df_thesis is None:
+                portfolio_df_thesis = pd.DataFrame()
+
             thesis_groups = thesis_df.groupby("Thesis_Title")
 
             for thesis_title, group in thesis_groups:
@@ -17012,7 +17021,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     date_added = str(row["Date_Added"]).strip()
 
                     # 포트폴리오에서 매수가/수량 조회
-                    # portfolio_df_cur 는 루프 밖에서 이미 로드됨
+                    # portfolio_df_thesis 는 루프 밖에서 이미 로드됨
                     port_row = portfolio_df_thesis[
                         (portfolio_df_thesis["Ticker"] == tk) &
                         (portfolio_df_thesis["Account"] == acct)
