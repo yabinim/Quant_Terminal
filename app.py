@@ -2025,18 +2025,23 @@ def fetch_fmp_economic_calendar_risk() -> tuple[list, bool]:
             if not event_name:
                 continue
             date_str = str(ev.get("date", ""))[:10]
-            # 날짜 < 오늘이면 이미 발표된 과거 이벤트
+            actual_val = ev.get("actual")
+            has_actual = actual_val is not None and str(actual_val).strip() not in ("", "None")
+            # 발표완료 판정: 날짜가 오늘 이전이거나, 이미 actual 값이 채워졌으면 발표완료.
+            # (actual이 있으면 ET 날짜경계와 무관하게 '발표 끝남'이 확실하다)
             is_past = False
             try:
                 if date_str and datetime.strptime(date_str, "%Y-%m-%d").date() < today:
                     is_past = True
             except Exception:
                 is_past = False
+            if has_actual:
+                is_past = True
             events.append({
                 "date":     date_str,
                 "event":    event_name,
                 "impact":   impact,
-                "actual":   ev.get("actual"),
+                "actual":   actual_val,
                 "estimate": ev.get("estimate"),
                 "prior":    ev.get("previous") or ev.get("prior"),
                 "is_past":  is_past,
@@ -5931,15 +5936,17 @@ def load_portfolio():
                 "Ticker": str(cells[2]).strip().upper(),
                 "Purchase_Price": pd.to_numeric(cells[3], errors="coerce"),
                 "Quantity": pd.to_numeric(cells[4], errors="coerce"),
+                "Date_Added": str(cells[5]).strip() if len(cells) > 5 else "",
             }
         )
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=base_columns)
+        return pd.DataFrame(columns=base_columns + ["Date_Added"])
     df["Quantity"] = df["Quantity"].fillna(1.0)
     df = df[df["Ticker"].ne("") & df["Ticker"].ne("NAN") & df["Account"].astype(str).str.strip().ne("")]
     df = df.drop_duplicates(subset=["Account", "Ticker"], keep="last").reset_index(drop=True)
-    return df[base_columns].copy()
+    _out_cols = base_columns + (["Date_Added"] if "Date_Added" in df.columns else [])
+    return df[_out_cols].copy()
 
 
 def save_portfolio(df):
@@ -6195,10 +6202,10 @@ def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
 
         ret_pct = (pred_day_close / prev_close - 1.0) * 100.0
 
-        # 방향 판정 (±0.3% 기준)
-        if ret_pct >= 0.3:
+        # 방향 판정 (±0.7% 기준 — 그 안쪽은 사실상 보합이므로 '중립')
+        if ret_pct >= 0.7:
             actual_dir = "상승"
-        elif ret_pct <= -0.3:
+        elif ret_pct <= -0.7:
             actual_dir = "하락"
         else:
             actual_dir = "중립"
@@ -6537,6 +6544,75 @@ def suggest_stop_and_target(ticker: str, entry_price: float = None) -> dict:
     return out
 
 
+def compute_position_drawdown(close_series, purchase_price, current_price, date_added: str = ""):
+    """포지션의 '고점 대비 하락'을 보수적으로 계산 + 데이터 오류 플래그.
+
+    선택 1C: (a) 매수일 이후 고점, (b) 매수가를 바닥선으로 본 고점 중
+    더 보수적인(=덜 깊은 하락) 쪽을 채택해 허수 낙폭을 줄인다.
+    선택 2B: 비현실적 낙폭(스플릿 미조정·스파이크)으로 의심되면 data_error=True.
+
+    반환: (drawdown_pct, data_error: bool)
+      - drawdown_pct: 0 이하의 % (예: -12.3). 계산 불가 시 np.nan
+      - data_error:   True면 트레일링 경보/판정에서 낙폭을 신뢰하지 않음
+    """
+    try:
+        if close_series is None or len(close_series) == 0 or pd.isna(current_price) or current_price <= 0:
+            return np.nan, False
+
+        # (a) 매수일 이후 고점
+        high_since_buy = np.nan
+        if date_added:
+            try:
+                buy_dt = pd.to_datetime(str(date_added)[:10], errors="coerce")
+                if pd.notna(buy_dt) and isinstance(close_series.index, pd.DatetimeIndex):
+                    idx = close_series.index
+                    tz = getattr(idx, "tz", None)
+                    if tz is not None and buy_dt.tzinfo is None:
+                        buy_dt = buy_dt.tz_localize(tz)
+                    sliced = close_series[close_series.index >= buy_dt]
+                    if not sliced.empty:
+                        high_since_buy = float(sliced.max())
+            except Exception:
+                high_since_buy = np.nan
+
+        # (b) 1년 고점 (폴백/비교용)
+        high_1y = float(close_series.max()) if len(close_series) else np.nan
+
+        # 매수가 바닥선: 고점이 적어도 매수가보다는 높아야 '하락'이 의미 있음
+        pp = float(purchase_price) if (purchase_price is not None and pd.notna(purchase_price) and purchase_price > 0) else np.nan
+
+        # 채택할 고점 후보들: 매수일 이후 고점 우선, 없으면 1년 고점
+        ref_high = high_since_buy if pd.notna(high_since_buy) else high_1y
+        if pd.isna(ref_high) or ref_high <= 0:
+            return np.nan, False
+
+        # 1C: '매수일 이후 고점' 대비 낙폭을 기본으로 사용(트레일링 스톱의 본래 의미).
+        #     단, 고점이 비현실적으로 높으면(스플릿 미조정 등) 매수가 기준으로 보정.
+        dd_from_high = (current_price / ref_high - 1.0) * 100.0
+        drawdown_pct = dd_from_high
+
+        # 2B: 데이터 오류 의심 — 낙폭이 -70%보다 깊은데 현재 수익이 플러스면 모순,
+        #     또는 참조고점이 현재가의 5배를 초과하면(스플릿 미조정 전형) 오류로 간주
+        data_error = False
+        if pd.notna(pp):
+            in_profit = current_price >= pp
+            if dd_from_high <= -70.0 and in_profit:
+                data_error = True
+        if ref_high > current_price * 5:
+            data_error = True
+
+        if data_error:
+            # 오류 시 고점을 신뢰하지 않고 매수가 기준 낙폭만 사용(없으면 NaN)
+            if pd.notna(pp):
+                drawdown_pct = min(0.0, (current_price / pp - 1.0) * 100.0)
+            else:
+                drawdown_pct = np.nan
+
+        return drawdown_pct, data_error
+    except Exception:
+        return np.nan, False
+
+
 def _empty_sell_signal():
     return {
         "rsi": np.nan, "macd_signal": "N/A", "pct_from_52w_high": np.nan,
@@ -6698,37 +6774,19 @@ def build_portfolio_sell_radar_df(portfolio_df):
         current_price = float(clean_series.iloc[-1]) if not clean_series.empty else np.nan
         ma200 = clean_series.rolling(window=200, min_periods=200).mean().iloc[-1] if not clean_series.empty else np.nan
         one_month_return = calculate_period_return(clean_series, 21)
-        high_52w = float(clean_series.max()) if not clean_series.empty else np.nan
-        drawdown_pct = np.nan
-        if pd.notna(current_price) and pd.notna(high_52w) and high_52w > 0:
-            drawdown_pct = ((current_price - high_52w) / high_52w) * 100.0
 
         sig = sell_sig_map.get(ticker, {}) if isinstance(sell_sig_map, dict) else {}
         above_ma200_flag = (
             bool(current_price > ma200) if (pd.notna(current_price) and pd.notna(ma200)) else None
         )
 
-        if pd.isna(current_price) or pd.isna(ma200) or pd.isna(one_month_return):
-            status = "N/A"
-            status_reason = "데이터 부족"
-        else:
-            # 200일선 + 선행신호 + 트레일링 스톱 통합 판정
-            status, status_reason = integrated_sell_verdict(
-                above_ma200=above_ma200_flag,
-                one_month_return=one_month_return,
-                rsi=sig.get("rsi", np.nan),
-                macd_signal=sig.get("macd_signal", "N/A"),
-                pct_from_52w_high=sig.get("pct_from_52w_high", np.nan),
-                drawdown_from_high_pct=drawdown_pct,
-            )
-
         symbol_stats[ticker] = {
             "current_price": current_price,
             "ma200": ma200,
             "one_month_return": one_month_return,
-            "drawdown_pct": drawdown_pct,
-            "status": status,
-            "status_reason": status_reason,
+            "above_ma200": above_ma200_flag,
+            "sig": sig,
+            "close_series": clean_series,  # 매수일 기준 고점 슬라이싱용
         }
 
     total_market_value = 0.0
@@ -6749,9 +6807,31 @@ def build_portfolio_sell_radar_df(portfolio_df):
         current_price = pd.to_numeric(stat.get("current_price"), errors="coerce")
         ma200 = pd.to_numeric(stat.get("ma200"), errors="coerce")
         one_month_return = pd.to_numeric(stat.get("one_month_return"), errors="coerce")
-        drawdown_pct = pd.to_numeric(stat.get("drawdown_pct"), errors="coerce")
-        status = stat.get("status", "N/A")
-        status_reason = stat.get("status_reason", "")
+        date_added = str(row.get("Date_Added", "") or "")
+
+        # 포지션별 보수적 낙폭 + 데이터오류 플래그 (선택 1C/2B)
+        drawdown_pct, dd_data_error = compute_position_drawdown(
+            stat.get("close_series"), purchase_price, current_price, date_added
+        )
+
+        sig = stat.get("sig", {}) if isinstance(stat.get("sig"), dict) else {}
+        above_ma200_flag = stat.get("above_ma200")
+        if pd.isna(current_price) or pd.isna(ma200) or pd.isna(one_month_return):
+            status = "N/A"
+            status_reason = "데이터 부족"
+        else:
+            # 데이터 오류면 낙폭을 판정에 넣지 않는다(허수 매도신호 방지)
+            dd_for_verdict = np.nan if dd_data_error else drawdown_pct
+            status, status_reason = integrated_sell_verdict(
+                above_ma200=above_ma200_flag,
+                one_month_return=one_month_return,
+                rsi=sig.get("rsi", np.nan),
+                macd_signal=sig.get("macd_signal", "N/A"),
+                pct_from_52w_high=sig.get("pct_from_52w_high", np.nan),
+                drawdown_from_high_pct=dd_for_verdict,
+            )
+            if dd_data_error:
+                status_reason = (status_reason + " · ⚠️ 가격데이터 확인 필요(스플릿/이상치 의심)").strip(" ·")
 
         return_pct = np.nan
         gain_loss = np.nan
@@ -6807,10 +6887,12 @@ def build_portfolio_sell_radar_df(portfolio_df):
                 "유니버스 랭킹(Universe Rank)": universe_rank_cell,
                 "상태(Status)": status,
                 "판정 근거(Why)": status_reason,
+                "_dd_data_error": bool(dd_data_error),
             }
         )
 
-    return pd.DataFrame(rows)
+    out_df = pd.DataFrame(rows)
+    return out_df
 
 
 def open_etf_universe_worksheet():
@@ -11732,6 +11814,10 @@ if st.session_state.get("logged_in"):
                 "아래 4개 항목을 각각 작성하세요. "
                 "반드시 위 수치(선물 %, VIX 값, 이벤트명/예상치, 뉴스 종목명)를 직접 인용해 근거를 만드세요. "
                 "일반론·빈말 금지. 선물과 이벤트 데이터를 반드시 활용하세요.\n\n"
+                "**[방향 판단 규칙 — 중요]** 다음날 단기 시장 방향은 본질적으로 예측이 어렵습니다. "
+                "선물·VIX·이벤트가 **한 방향을 강하게(예: 선물 ±0.7% 이상, 또는 고임팩트 이벤트와 뉴스가 같은 방향) 가리킬 때만** "
+                "'상승 우세' 또는 '하락 우세'로 판단하세요. 신호가 혼재되거나 약하거나 보합권이면 **'중립'을 선택**하세요. "
+                "억지로 방향을 단정하지 말고, 확신이 없으면 '중립'이 정답입니다.\n\n"
                 "## 내일 시장 방향 판단: [상승 우세 / 중립 / 하락 우세]\n\n"
                 "**📊 핵심 근거** (선물 방향·VIX·이벤트 수치 직접 인용, 2~3문장):\n\n"
                 "**📰 뉴스 영향** (오버나잇 뉴스 중 내일 시장에 영향줄 종목/이슈, 2문장):\n\n"
@@ -15241,7 +15327,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         else:
             for acct in sorted(portfolio_df["Account"].astype(str).unique(), key=lambda x: str(x).lower()):
                 sub = portfolio_df[portfolio_df["Account"] == acct].sort_values("Ticker")
-                with st.expander(f"**{acct}** · {len(sub)}종목", expanded=len(sub) <= 8):
+                with st.expander(f"**{acct}** · {len(sub)}종목", expanded=False):
                     st.dataframe(
                         sub[["Ticker", "Purchase_Price", "Quantity"]].rename(
                             columns={"Purchase_Price": "평단가(AvgPrice)", "Quantity": "수량"}
@@ -15267,7 +15353,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
         st.markdown("### 포트폴리오 관리")
 
-        with st.expander("종목 추가", expanded=True):
+        with st.expander("종목 추가", expanded=False):
             add_account_options = ["직접 입력"] + sheet_accounts
             selected_account_option = st.selectbox(
                 "계좌명 (시트 Account 열)",
@@ -15722,7 +15808,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 try:
                     _ts_pct = _DEFAULT_TRAILING_STOP_PCT
                     _dd_col = pd.to_numeric(sell_radar_df.get("Drawdown(%)"), errors="coerce")
-                    _breached = sell_radar_df[_dd_col <= -_ts_pct] if _dd_col is not None else None
+                    # 데이터 오류로 의심되는 행은 경보에서 제외 (선택 2B)
+                    _err_col = sell_radar_df.get("_dd_data_error")
+                    if _err_col is None:
+                        _err_mask = pd.Series(False, index=sell_radar_df.index)
+                    else:
+                        _err_mask = _err_col.fillna(False).astype(bool)
+                    _breach_mask = (_dd_col <= -_ts_pct) & (~_err_mask)
+                    _breached = sell_radar_df[_breach_mask] if _dd_col is not None else None
                     if _breached is not None and not _breached.empty:
                         _msg_lines = []
                         for _, _br in _breached.iterrows():
@@ -15731,16 +15824,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 f"**{pd.to_numeric(_br['Drawdown(%)'], errors='coerce'):.0f}%** 하락"
                             )
                         st.warning(
-                            f"🔔 **트레일링 스톱 경보** — 보유 고점 대비 -{_ts_pct:.0f}% 이상 하락한 종목:\n\n"
+                            f"🔔 **트레일링 스톱 경보** — 매수 이후 고점 대비 -{_ts_pct:.0f}% 이상 하락한 종목:\n\n"
                             + "\n".join(_msg_lines)
                             + "\n\n번 수익을 지키려면 매도 또는 일부 익절을 검토하세요. "
                             "(이미 오른 종목이라면 본전까지 토해내기 전에 차익을 확정하는 장치입니다.)"
                         )
+                    # 데이터 오류 종목이 있으면 별도 안내
+                    if _err_mask.any():
+                        _err_tks = ", ".join(sell_radar_df[_err_mask]["티커"].astype(str).unique())
+                        st.info(
+                            f"ℹ️ {_err_tks} — 가격 데이터에 스플릿 미조정/이상치가 의심되어 "
+                            "고점 대비 낙폭 경보에서 제외했습니다. (매수가 대비 수익률은 정상 표시)"
+                        )
                 except Exception:
                     pass
 
+                # 표시용에서 내부 플래그 컬럼 제거
+                _display_radar_df = sell_radar_df.drop(columns=["_dd_data_error"], errors="ignore")
+
                 styled_sell_radar = (
-                    sell_radar_df.style.format(
+                    _display_radar_df.style.format(
                         {
                             "수량": "{:,.4f}",
                             "매수가": "{:,.2f}",
