@@ -207,8 +207,9 @@ def fetch_global_market_news() -> tuple[list, str, int]:
 
 
 # ── 거시지표 수집 (앱의 Daily Risk Gauge 5가지 신호와 동일) ──────────────────
-def fetch_macro_context(fred: Fred) -> str:
-    """앱의 compute_daily_risk_gauge와 동일한 5가지 선행 신호 수집."""
+def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
+    """앱의 compute_daily_risk_gauge와 동일한 6가지 선행 신호 수집
+    (VIX·신용·대장주·프리마켓·리스크오프·이벤트)."""
     lines = []
     signals_summary = []
 
@@ -288,37 +289,67 @@ def fetch_macro_context(fred: Fred) -> str:
     except Exception:
         lines.append("- 대장주 모멘텀: 조회 실패")
 
-    # ── 신호 4: 선물 프리마켓 방향 (ES=F / NQ=F) ───────────────────────────
+    # ── 신호 4: 프리마켓 방향 (SPY/QQQ 1일 변화율) ─────────────────────────
+    # FMP는 ES=F/NQ=F 선물 심볼을 지원하지 않아 기존 구현은 '조회 실패'였다.
+    # 앱의 compute_daily_risk_gauge._fetch_futures_data 와 동일하게
+    # stock-price-change(1D)로 대체하고, 실패 시 quote로 폴백한다.
     try:
-        _fut_syms = ["ES=F", "NQ=F"]
-        _fut_chgs = []
-        _fut_lines = []
-        for sym in _fut_syms:
+        _pm = {}
+        if FMP_KEY:
+            # 1차: stock-price-change (1D 변화율)
             try:
-                r_fut = requests.get(
-                    f"{FMP_BASE}/quote/{sym}?apikey={FMP_KEY}", timeout=8
+                r_chg = requests.get(
+                    f"{FMP_BASE}/stock-price-change?symbol=SPY,QQQ&apikey={FMP_KEY}",
+                    timeout=8,
                 )
-                if r_fut.status_code == 200:
-                    d_fut = r_fut.json()
-                    item = d_fut[0] if isinstance(d_fut, list) and d_fut else d_fut
-                    price = float(item.get("price") or item.get("lastPrice") or 0)
-                    prev  = float(item.get("previousClose") or item.get("prevClose") or 0)
-                    if prev > 0 and price > 0:
-                        chg = (price / prev - 1) * 100
-                        _fut_chgs.append(chg)
-                        _fut_lines.append(f"{sym} {chg:+.2f}%")
+                if r_chg.status_code == 200:
+                    data_chg = r_chg.json()
+                    items = data_chg if isinstance(data_chg, list) else [data_chg]
+                    for item in items:
+                        sym = str(item.get("symbol", "")).upper()
+                        raw = item.get("1D", item.get("1d", item.get("day")))
+                        try:
+                            chg1d = float(raw)
+                        except (TypeError, ValueError):
+                            chg1d = None
+                        if sym in ("SPY", "QQQ") and chg1d is not None:
+                            _pm[sym] = chg1d
             except Exception:
                 pass
-        if _fut_chgs:
-            avg_chg = float(np.mean(_fut_chgs))
-            fut_alert = avg_chg <= -0.5
-            status = "⚠️ 갭다운우려" if fut_alert else "✅ 정상"
-            lines.append(f"- 선물 프리마켓: {' / '.join(_fut_lines)} (평균 {avg_chg:+.2f}%) [{status}]")
-            signals_summary.append(f"선물 {'경고' if fut_alert else '정상'}")
+            # 2차: quote 폴백 (changesPercentage 또는 price/previousClose)
+            for sym in ("SPY", "QQQ"):
+                if sym in _pm:
+                    continue
+                try:
+                    r_q = requests.get(f"{FMP_BASE}/quote?symbol={sym}&apikey={FMP_KEY}", timeout=8)
+                    if r_q.status_code == 200:
+                        d_q = r_q.json()
+                        item = d_q[0] if isinstance(d_q, list) and d_q else d_q
+                        raw = item.get("changesPercentage", item.get("changePercent"))
+                        try:
+                            chg_pct = float(raw)
+                        except (TypeError, ValueError):
+                            chg_pct = None
+                        if chg_pct is None:
+                            price = float(item.get("price") or 0)
+                            prev = float(item.get("previousClose") or item.get("prevClose") or 0)
+                            if price > 0 and prev > 0:
+                                chg_pct = (price / prev - 1) * 100
+                        if chg_pct is not None:
+                            _pm[sym] = chg_pct
+                except Exception:
+                    pass
+        if _pm:
+            avg_chg = float(np.mean(list(_pm.values())))
+            pm_alert = avg_chg <= -0.5
+            _pm_lines = " / ".join(f"{s} {_pm[s]:+.2f}%" for s in ("SPY", "QQQ") if s in _pm)
+            status = "⚠️ 갭다운우려" if pm_alert else "✅ 정상"
+            lines.append(f"- 프리마켓 방향: {_pm_lines} (평균 {avg_chg:+.2f}%) [{status}]")
+            signals_summary.append(f"프리마켓 {'경고' if pm_alert else '정상'}")
         else:
-            lines.append("- 선물 프리마켓: 조회 실패")
+            lines.append("- 프리마켓 방향: 조회 실패")
     except Exception:
-        lines.append("- 선물 프리마켓: 조회 실패")
+        lines.append("- 프리마켓 방향: 조회 실패")
 
     # ── 신호 5: 달러·금·국채 리스크오프 신호 ────────────────────────────────
     try:
@@ -374,6 +405,32 @@ def fetch_macro_context(fred: Fred) -> str:
         lines.append("- 달러·금·국채: 조회 실패")
 
 
+    # ── 신호 6: 이벤트 리스크 (당일~3일 이내 고임팩트 경제 이벤트) ──────────
+    # 앱의 compute_daily_risk_gauge 신호 6과 동일 개념. full_events 는 main()에서
+    # get_todays_major_releases 로 받은 FMP economic-calendar 결과(오늘~+3일).
+    try:
+        upcoming = full_events or []
+        high_events = [
+            e for e in upcoming
+            if str(e.get("impact", "")).lower() in ("high", "3")
+        ]
+        if high_events:
+            ev_names = ", ".join(str(e.get("event", "")) for e in high_events[:3])
+            ev_date = str(high_events[0].get("date", ""))
+            lines.append(
+                f"- 이벤트 리스크: 고임팩트 {len(high_events)}건 ({ev_date}~) "
+                f"[⚠️ 변동성 확대 주의] {ev_names[:60]}"
+            )
+            signals_summary.append("이벤트 경고")
+        elif upcoming:
+            lines.append(f"- 이벤트 리스크: 고임팩트 없음 (예정 {len(upcoming)}건) [✅ 정상]")
+            signals_summary.append("이벤트 정상")
+        else:
+            lines.append("- 이벤트 리스크: 캘린더 조회 불가 [✅ 정상]")
+            signals_summary.append("이벤트 정상")
+    except Exception:
+        lines.append("- 이벤트 리스크: 조회 실패")
+
     # ── FRED 기준금리 + CPI (추가 컨텍스트) ────────────────────────────────
     try:
         rate = float(fred.get_series("FEDFUNDS").dropna().iloc[-1])
@@ -390,8 +447,9 @@ def fetch_macro_context(fred: Fred) -> str:
 
     # ── 종합 신호 요약 ───────────────────────────────────────────────────────
     warning_count = sum(1 for s in signals_summary if "경고" in s)
+    total_signals = len(signals_summary)
     risk_level = "🔴 HIGH RISK" if warning_count >= 3 else ("🟡 MEDIUM RISK" if warning_count >= 1 else "🟢 LOW RISK")
-    lines.insert(0, f"[선행 신호 종합: {risk_level} | 경고 {warning_count}/5개 (VIX·신용·대장주·선물·리스크오프)]")
+    lines.insert(0, f"[선행 신호 종합: {risk_level} | 경고 {warning_count}/{total_signals}개 (VIX·신용·대장주·프리마켓·리스크오프·이벤트)]")
 
     return "\n".join(lines) if lines else "데이터 없음"
 
@@ -460,7 +518,14 @@ def generate_drg_prediction(rss_news_text: str, macro_summary: str,
     _RETRY_WAITS = [10, 30, 60, 120]
     for attempt in range(5):
         try:
-            cfg = genai_types.GenerateContentConfig(temperature=0.7, max_output_tokens=4096)
+            # gemini-2.5-flash는 thinking이 기본 ON이고, 사고 토큰이 max_output_tokens
+            # 예산을 함께 깎는다 → 4096이면 본문이 문장 중간에 잘린다.
+            # 앱(app.py)과 동일하게 사고를 끄고(0) 출력 예산을 8192로 올린다.
+            cfg = genai_types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=8192,
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+            )
             response = client.models.generate_content(
                 model="gemini-2.5-flash", contents=prompt, config=cfg
             )
@@ -679,7 +744,7 @@ def main():
     print(f"[INFO] 뉴스 {raw_count}건 수집 완료")
 
     print("[STEP 2] 거시지표 수집 중...")
-    macro_summary = fetch_macro_context(fred)
+    macro_summary = fetch_macro_context(fred, full_events=full_events)
     print(f"[INFO] 거시지표:\n{macro_summary}")
 
     print("[STEP 3] Gemini DRG 예측 생성 중...")
