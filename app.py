@@ -7310,8 +7310,16 @@ def get_leverage_multiplier(ticker: str, name: str = "") -> float | None:
 
 
 def leverage_badge(ticker: str, name: str = "") -> str:
-    """티커 옆에 붙일 배지 문자열. 일반 종목이면 빈 문자열."""
+    """티커 옆에 붙일 배지 문자열. 일반 종목이면 빈 문자열.
+    매핑에 없고 이름도 안 넘어오면, FMP etf-list 이름맵(캐시)으로 한 번 더 추정한다."""
     m = get_leverage_multiplier(ticker, name)
+    if m is None and not name:
+        try:
+            _nm = _fmp_etf_symbol_name_map().get(str(ticker).strip().upper(), "")
+        except Exception:
+            _nm = ""
+        if _nm:
+            m = get_leverage_multiplier(ticker, _nm)
     if m is None:
         return ""
     if m < 0:
