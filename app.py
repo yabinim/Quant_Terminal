@@ -7251,6 +7251,64 @@ def import_txt_tickers_to_sheet() -> tuple[int, str]:
         return 0, str(exc)
 
 
+# 알려진 레버리지/인버스 ETF → 배수 매핑. 양수=레버리지, 음수=인버스.
+# 유니버스(미국 상장 ETF) 위주라 이 매핑이 이름 파싱보다 정확하다.
+_LEVERAGED_ETF_MAP = {
+    # ── 3x 롱 ──
+    "TQQQ": 3, "UPRO": 3, "SPXL": 3, "SOXL": 3, "TECL": 3, "FAS": 3,
+    "TNA": 3, "LABU": 3, "UDOW": 3, "WEBL": 3, "FNGU": 3, "BULZ": 3,
+    "NAIL": 3, "DPST": 3, "RETL": 3, "DFEN": 3, "CURE": 3, "DRN": 3,
+    "GUSH": 3, "ERX": 3, "YINN": 3, "TPOR": 3, "UTSL": 3, "MIDU": 3,
+    "URTY": 3, "TMF": 3, "DUST": 3, "JNUG": 3, "NUGT": 3, "USD": 3,
+    # ── 2x 롱 ──
+    "QLD": 2, "SSO": 2, "DDM": 2, "ROM": 2, "UWM": 2, "SAA": 2,
+    "USD2X": 2, "NVDL": 2, "TSLL": 2, "AAPU": 2, "MSFU": 2, "GGLL": 2,
+    "AMZU": 2, "FBL": 2, "NVDU": 2, "CONL": 2, "UYG": 2, "ROKT": 2,
+    "BITX": 2, "BITU": 2, "ETHT": 2, "AGQ": 2, "UGL": 2, "BOIL": 2,
+    "UCO": 2, "QID": -2,
+    # ── 1.5x ──
+    "TSLR": 1.5,
+    # ── 인버스 ──
+    "SQQQ": -3, "SPXU": -3, "SOXS": -3, "TECS": -3, "FAZ": -3,
+    "TZA": -3, "LABD": -3, "SDOW": -3, "WEBS": -3, "YANG": -3,
+    "DRV": -3, "ERY": -3, "JDST": -3, "DGAZ": -3, "KOLD": -3, "SCO": -3,
+    "SDS": -2, "QID": -2, "DXD": -2, "TWM": -2, "SKF": -2,
+    "SH": -1, "PSQ": -1, "DOG": -1, "RWM": -1, "EUM": -1,
+}
+
+# 이름 문자열 보조 추정용 (매핑에 없을 때만). (정규식, 배수)
+_LEV_NAME_PATTERNS = [
+    (re.compile(r"\b3X\b|ULTRAPRO|TRIPLE", re.I), 3),
+    (re.compile(r"\b2X\b|ULTRA\b|DOUBLE", re.I), 2),
+    (re.compile(r"\b1\.5X\b", re.I), 1.5),
+    (re.compile(r"INVERSE|SHORT|BEAR", re.I), -1),
+]
+
+
+def get_leverage_multiplier(ticker: str, name: str = "") -> float | None:
+    """티커(필요시 이름)로 레버리지 배수를 반환. 일반 ETF/주식이면 None.
+    양수=레버리지 롱, 음수=인버스."""
+    t = str(ticker).strip().upper()
+    if t in _LEVERAGED_ETF_MAP:
+        return _LEVERAGED_ETF_MAP[t]
+    if name:
+        for pat, mult in _LEV_NAME_PATTERNS:
+            if pat.search(str(name)):
+                return mult
+    return None
+
+
+def leverage_badge(ticker: str, name: str = "") -> str:
+    """티커 옆에 붙일 배지 문자열. 일반 종목이면 빈 문자열."""
+    m = get_leverage_multiplier(ticker, name)
+    if m is None:
+        return ""
+    if m < 0:
+        return f" ⚡{abs(int(m)) if float(m).is_integer() else abs(m)}x 인버스"
+    mult_str = str(int(m)) if float(m).is_integer() else str(m)
+    return f" ⚡{mult_str}x 레버리지"
+
+
 def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: str = "leaders") -> tuple[bool, str]:
     """AI 스캐너 TOP 결과를 Sheets에 저장. engine: 'leaders' | 'emerging'"""
     gc = get_gspread_client()
@@ -14005,7 +14063,8 @@ if st.session_state.get("logged_in"):
             ret_cols = ["1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
             tmp_show = _ha_df.copy()
             tmp_show["티커"] = tmp_show.apply(
-                lambda r: f"{r['Ticker']} 🔥" if bool(r["주도주"]) else r["Ticker"], axis=1
+                lambda r: f"{r['Ticker']} 🔥{leverage_badge(r['Ticker'])}" if bool(r["주도주"])
+                else f"{r['Ticker']}{leverage_badge(r['Ticker'])}", axis=1
             )
             display_cols = ["순위", "티커", "1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
             display_df = tmp_show[display_cols].copy()
@@ -14128,7 +14187,7 @@ if st.session_state.get("logged_in"):
                 st.success(f"🌱 **Early Signal {len(early_df)}개** — 아직 안 올랐지만 강해지기 시작한 섹터!")
                 for _, row in early_df.iterrows():
                     st.markdown(
-                        f"**{row['Ticker']}** — RS {row['RS_Now']:+.1f}%p "
+                        f"**{row['Ticker']}**{leverage_badge(row['Ticker'])} — RS {row['RS_Now']:+.1f}%p "
                         f"(1주 변화: {row['RS_Change']:+.1f}%p) "
                         f"→ Watchlist 등록 고려"
                     )
@@ -14138,19 +14197,27 @@ if st.session_state.get("logged_in"):
                 if not surge_df.empty:
                     st.info(f"🚀 **급부상 {len(surge_df)}개** — 강하면서 더 강해지는 중")
                     for _, row in surge_df.iterrows():
-                        st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 +{row['RS_Change']:.1f}%p")
+                        st.markdown(f"**{row['Ticker']}**{leverage_badge(row['Ticker'])} RS {row['RS_Now']:+.1f}%p / 주간 +{row['RS_Change']:.1f}%p")
             with es_col2:
                 if not weak_df.empty:
                     st.warning(f"⚠️ **모멘텀 약화 {len(weak_df)}개** — 주의 필요")
                     for _, row in weak_df.iterrows():
-                        st.markdown(f"**{row['Ticker']}** RS {row['RS_Now']:+.1f}%p / 주간 {row['RS_Change']:.1f}%p")
+                        st.markdown(f"**{row['Ticker']}**{leverage_badge(row['Ticker'])} RS {row['RS_Now']:+.1f}%p / 주간 {row['RS_Change']:.1f}%p")
 
             with st.expander("📋 전체 RS 변화율 테이블", expanded=False):
                 def _style_rs_change(val):
                     v = pd.to_numeric(val, errors="coerce")
                     if pd.isna(v): return ""
                     return "color:#16a34a;font-weight:600" if v > 2 else "color:#dc2626;font-weight:600" if v < -2 else ""
-                styled_rs = rs_change_df.style.map(_style_rs_change, subset=["RS_Change"])
+                rs_table = rs_change_df.copy()
+                if "Ticker" in rs_table.columns:
+                    rs_table.insert(
+                        1, "레버리지",
+                        rs_table["Ticker"].map(
+                            lambda t: (leverage_badge(t).replace(" ⚡", "").strip() or "—")
+                        ),
+                    )
+                styled_rs = rs_table.style.map(_style_rs_change, subset=["RS_Change"])
                 st.dataframe(styled_rs, use_container_width=True, hide_index=True)
 
         # ── 기능 3: 섹터 꺾임 감지 ───────────────────────────────────────
@@ -14175,7 +14242,7 @@ if st.session_state.get("logged_in"):
                 for alert in reversal_alerts:
                     is_critical = "분산 매도" in alert["signal"] or "급격" in alert["signal"]
                     with st.expander(
-                        f"{alert['signal']} **{alert['ticker']}** — RS {alert['rs_now']:+.1f}%p / 주간 변화 {alert['rs_change']:+.1f}%p",
+                        f"{alert['signal']} **{alert['ticker']}**{leverage_badge(alert['ticker'])} — RS {alert['rs_now']:+.1f}%p / 주간 변화 {alert['rs_change']:+.1f}%p",
                         expanded=is_critical,
                     ):
                         st.markdown(f"**신호:** {alert['description']}")
