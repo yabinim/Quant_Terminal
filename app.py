@@ -7529,6 +7529,46 @@ def load_emerging_tracker(user_id: str) -> pd.DataFrame:
         return pd.DataFrame(columns=_EMERGING_TRACKER_COLS)
 
 
+# Emerging 신선도: Last_Seen이 이 일수를 넘으면 '오래된 신호'로 간주(매수신호 제외, 기록은 보존)
+_EMERGING_STALE_DAYS = 10
+
+
+def _emerging_days_since_last_seen(last_seen_str) -> float:
+    """Last_Seen(ET 'YYYY-MM-DD HH:MM' 또는 'YYYY-MM-DD')로부터 경과 일수. 파싱 실패 시 NaN."""
+    s = str(last_seen_str or "").strip()
+    if not s:
+        return np.nan
+    try:
+        dt = None
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s[:len(fmt) + 2].strip(), fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            dt = pd.to_datetime(s, errors="coerce").to_pydatetime()
+        if dt is None or pd.isna(dt):
+            return np.nan
+        # ET 기준 현재와 비교 (naive끼리 비교)
+        now_et = datetime.now(_MARKET_ET_TZ).replace(tzinfo=None)
+        return max(0.0, (now_et - dt).total_seconds() / 86400.0)
+    except Exception:
+        return np.nan
+
+
+def _augment_emerging_with_freshness(et_df):
+    """et_df에 _days_old(경과일)와 _is_stale(오래됨 여부) 컬럼을 추가해 반환."""
+    if et_df is None or et_df.empty:
+        return et_df
+    out = et_df.copy()
+    out["_days_old"] = out["Last_Seen"].apply(_emerging_days_since_last_seen)
+    out["_is_stale"] = out["_days_old"].apply(
+        lambda d: bool(pd.notna(d) and d > _EMERGING_STALE_DAYS)
+    )
+    return out
+
+
 def upsert_emerging_tracker(user_id: str, ticker: str, theme: str, verdict: str, rs_score) -> tuple[bool, str]:
     """Emerging 종목 기록 추가/업데이트. 같은 티커면 Count++, Last_Seen 갱신."""
     ws, err = open_emerging_tracker_worksheet()
@@ -17221,12 +17261,38 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         st.rerun()
 
         # ── 생성된 리포트 표시 ─────────────────────────────────────────────
+        # 1순위: 이번 세션에서 방금 생성한 것. 없으면 시트에서 가장 최근 저장본을 복원.
         latest_summary = st.session_state.get("_weekly_summary_latest", "")
+        latest_saved_at = None
+        if not latest_summary:
+            try:
+                _all_recs, _ = fetch_narrative_records_from_sheet()
+                _mine = [
+                    r for r in (_all_recs or [])
+                    if str(r.get("_sheet_user_id", "")).strip().upper() == uid_weekly.upper()
+                    and isinstance(r.get("analysis"), dict)
+                    and r["analysis"].get("source") == "weekly_portfolio_summary"
+                ]
+                if _mine:
+                    _latest_rec = max(
+                        _mine,
+                        key=lambda r: _narrative_parse_saved_at_utc(r.get("saved_at"))
+                        or datetime.min.replace(tzinfo=timezone.utc),
+                    )
+                    latest_summary = _latest_rec["analysis"].get("summary", "")
+                    latest_saved_at = _narrative_parse_saved_at_utc(_latest_rec.get("saved_at"))
+            except Exception:
+                latest_summary = ""
+
         if latest_summary:
             st.divider()
-            st.success("✅ 이번 주 AI 포트폴리오 리포트")
+            if latest_saved_at is not None:
+                _saved_str = latest_saved_at.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M")
+                st.success(f"✅ 가장 최근 저장된 AI 포트폴리오 리포트 ({_saved_str} ET)")
+            else:
+                st.success("✅ 이번 주 AI 포트폴리오 리포트")
             st.markdown(latest_summary)
-            st.caption("이 리포트는 `Narratives` 시트에 자동 저장되었습니다. 투자 권유가 아닙니다.")
+            st.caption("이 리포트는 `Narratives` 시트에 자동 저장됩니다. 과거 기록은 위의 '📚 이전 주간 요약 기록 보기'에서 볼 수 있어요. 투자 권유가 아닙니다.")
 
     elif main_nav == _MAIN_NAV_OPTIONS[7]:
         # ─────────────────────────────────────────────────────────────────────
@@ -17709,6 +17775,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
         with st.spinner("Emerging 추적 기록 불러오는 중..."):
             et_df = load_emerging_tracker(uid_et)
+            et_df = _augment_emerging_with_freshness(et_df)
 
         if et_df.empty:
             st.info(
@@ -17721,7 +17788,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             total = len(et_df)
             hot = (et_df["Count"].astype(int) >= 3).sum() if "Count" in et_df.columns else 0
             new_ones = (et_df["Status"].str.contains("신규", na=False)).sum()
-            best_ones = et_df[et_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)]
+            # 매수 신호: 검증 라벨이 최적/얼리버드 AND 최근 10일 내 등장(신선)만
+            _is_stale_col = et_df["_is_stale"] if "_is_stale" in et_df.columns else pd.Series(False, index=et_df.index)
+            best_ones = et_df[
+                et_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)
+                & (~_is_stale_col.fillna(False).astype(bool))
+            ]
+            stale_count = int(_is_stale_col.fillna(False).astype(bool).sum())
 
             m1, m2, m3, m4 = st.columns(4)
             with m1:
@@ -17731,19 +17804,27 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             with m3:
                 st.metric("🆕 신규 등장", f"{new_ones}개")
             with m4:
-                st.metric("🎯 매수 신호 종목", f"{len(best_ones)}개")
+                st.metric("🎯 매수 신호 (신선)", f"{len(best_ones)}개")
+
+            if stale_count > 0:
+                st.caption(
+                    f"⏳ {stale_count}개 종목은 마지막 등장이 {_EMERGING_STALE_DAYS}일을 넘어 '오래된 신호'로 분류됐어요. "
+                    "매수 신호 섹션에서는 제외되며, 전체 목록에는 배지와 함께 남습니다."
+                )
 
             # ── 최우선 관심 종목 ───────────────────────────────────────────
             if not best_ones.empty:
                 st.divider()
-                st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드)")
-                st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 종목들이에요.")
+                st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드 · 최근 10일 내)")
+                st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 **신선한** 종목들이에요. RS 값은 등장 당시 검증값입니다.")
                 for _, row in best_ones.sort_values("Count", ascending=False).iterrows():
                     count = int(row["Count"]) if str(row["Count"]).isdigit() else 1
-                    rs_str = f"RS {float(row['RS_Score']):.1f}%p" if row["RS_Score"] else ""
+                    rs_str = f"RS {float(row['RS_Score']):.1f}%p(당시)" if row["RS_Score"] else ""
+                    _days_old = row.get("_days_old", np.nan)
+                    _fresh = f"{_days_old:.0f}일 전" if pd.notna(_days_old) else row["Last_Seen"]
                     st.markdown(
                         f"**{row['Ticker']}** — {row['Best_Verdict']} | "
-                        f"등장 **{count}회** | {rs_str} | 최근: {row['Last_Seen']}"
+                        f"등장 **{count}회** | {rs_str} | 최근: {_fresh}"
                     )
                     col_a, col_b = st.columns([1, 4])
                     with col_a:
@@ -17771,20 +17852,46 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     if "얼리" in str(val): return "color:#0ea5e9;font-weight:600"
                     return ""
 
+                def _freshness_badge(days_old):
+                    if pd.isna(days_old):
+                        return "—"
+                    d = float(days_old)
+                    if d > _EMERGING_STALE_DAYS:
+                        return f"⏳ 오래됨 ({d:.0f}일 전)"
+                    if d <= 2:
+                        return f"🟢 최신 ({d:.0f}일 전)"
+                    return f"🟡 {d:.0f}일 전"
+
+                hot_disp = hot_df.copy()
+                hot_disp["신선도"] = hot_disp["_days_old"].apply(_freshness_badge)
+
+                def _style_freshness(val):
+                    if "오래됨" in str(val): return "color:#9ca3af;font-style:italic"
+                    if "최신" in str(val): return "color:#16a34a;font-weight:600"
+                    return "color:#f59e0b"
+
                 styled_hot = (
-                    hot_df[["Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]]
+                    hot_disp[["Ticker", "Theme", "First_Seen", "Last_Seen", "신선도", "Count", "Best_Verdict", "RS_Score", "Status"]]
                     .style
                     .map(_style_count, subset=["Count"])
                     .map(_style_verdict, subset=["Best_Verdict"])
+                    .map(_style_freshness, subset=["신선도"])
                 )
                 st.dataframe(styled_hot, use_container_width=True, hide_index=True)
+                st.caption("RS_Score는 종목이 마지막으로 검증된 **당시 값**입니다(실시간 아님). '오래됨' 종목은 매수 판단에서 제외하세요.")
 
             # ── 전체 목록 ──────────────────────────────────────────────────
             st.divider()
             st.markdown("### 📋 전체 추적 목록")
             with st.expander("전체 보기", expanded=False):
+                _full = et_df.sort_values("Count", ascending=False).copy()
+                if "_days_old" in _full.columns:
+                    _full["경과일"] = _full["_days_old"].apply(
+                        lambda d: f"{d:.0f}일 전" if pd.notna(d) else "—"
+                    )
+                _drop = [c for c in ("_days_old", "_is_stale") if c in _full.columns]
                 st.dataframe(
-                    et_df.sort_values("Count", ascending=False),
+                    _full.drop(columns=_drop),
                     use_container_width=True, hide_index=True
                 )
 
