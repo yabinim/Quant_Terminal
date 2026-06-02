@@ -6970,68 +6970,125 @@ def save_new_etfs_to_sheet(new_etfs: list[dict]) -> tuple[int, str]:
         return 0, str(exc)
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fmp_etf_symbol_name_map() -> dict:
+    """
+    /stable/etf-list 로 'ETF인 심볼 → 이름' 맵을 만든다.
+    주의: 이 엔드포인트는 심볼·이름만 제공한다(상장일·거래소·AUM 없음).
+    그래서 '어떤 심볼이 ETF인지'를 가리는 멤버십 집합 용도로만 쓴다. 1일 캐시.
+    """
+    k = _fmp_key()
+    if not k:
+        return {}
+    try:
+        r = requests.get(f"{_FMP_BASE}/etf-list?apikey={k}", timeout=15)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        if not isinstance(data, list):
+            return {}
+        out = {}
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            sym = str(it.get("symbol", "") or "").strip().upper()
+            if not sym:
+                continue
+            out[sym] = str(it.get("name", "") or "").strip()
+        return out
+    except Exception:
+        return {}
+
+
 def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) -> list[dict]:
     """
-    FMP API로 최근 상장된 ETF를 스캔.
-    - days_lookback: 최근 N일 이내 상장된 ETF
-    - min_aum_m: 최소 AUM (백만달러)
+    최근 N일 내 '신규 상장'된 ETF를 스캔.
+
+    [수정 이유] 기존 구현은 /stable/etf-list 응답에서 ipoDate·exchange 를 읽으려 했으나,
+    이 엔드포인트는 심볼·이름만 반환하므로 모든 항목이 필터에서 탈락 → 항상 빈 결과였다.
+
+    [새 방식]
+      1) /stable/ipos-calendar 로 최근 N일 신규 상장(상장일·거래소 포함) 목록을 받고
+      2) /stable/etf-list(심볼 집합)와 교집합해 'ETF인 것'만 남긴 뒤
+      3) /stable/profile 로 AUM(totalAssets)을 확인한다.
+    - days_lookback: 최근 N일 이내 상장
+    - min_aum_m: 최소 AUM (백만달러). AUM 데이터가 없으면(신규라 미집계) 일단 통과시킨다.
     """
+    k = _fmp_key()
+    if not k:
+        return []
     try:
-        fmp_key = st.secrets.get("FMP_API_KEY", "")
-        if not fmp_key:
+        # 1) ETF 심볼 집합 (멤버십 판별용)
+        etf_map = _fmp_etf_symbol_name_map()
+        if not etf_map:
             return []
 
-        # FMP ETF 전체 목록
-        url = f"https://financialmodelingprep.com/stable/etf-list?apikey={fmp_key}"
+        # 2) 최근 N일 IPO/신규 상장 캘린더
+        today_et = datetime.now(_MARKET_ET_TZ)
+        cutoff_date = today_et - timedelta(days=days_lookback)
+        from_str = cutoff_date.strftime("%Y-%m-%d")
+        to_str = today_et.strftime("%Y-%m-%d")
+        # from/to 를 서버가 무시해도 아래에서 클라이언트측으로 한 번 더 거른다.
+        url = f"{_FMP_BASE}/ipos-calendar?from={from_str}&to={to_str}&apikey={k}"
         resp = requests.get(url, timeout=15)
         if resp.status_code != 200:
             return []
-        all_etfs = resp.json()
-        if not isinstance(all_etfs, list):
+        ipos = resp.json()
+        if not isinstance(ipos, list):
             return []
 
-        cutoff_date = datetime.now(_MARKET_ET_TZ) - timedelta(days=days_lookback)
-        new_etfs = []
+        _US_EXCH = {
+            "NYSE ARCA", "NYSEARCA", "ARCA", "NASDAQ", "NASDAQ GLOBAL MARKET",
+            "BATS", "CBOE", "CBOE BZX", "NYSE", "AMEX", "NYSE AMERICAN",
+        }
 
-        for etf in all_etfs:
-            if not isinstance(etf, dict):
+        candidates = []
+        seen = set()
+        for it in ipos:
+            if not isinstance(it, dict):
                 continue
-            ticker = str(etf.get("symbol", "") or "").strip().upper()
-            if not ticker:
+            sym = str(it.get("symbol", "") or "").strip().upper()
+            if not sym or sym in seen:
                 continue
-            # 미국 ETF만 필터링
-            exchange = str(etf.get("exchange", "") or "").upper()
-            if exchange not in ("NYSE ARCA", "NASDAQ", "BATS", "NYSEARCA", "NYSEArca"):
+            # ETF 목록에 있는 심볼만 (= 신규 상장 중 ETF인 것)
+            if sym not in etf_map:
                 continue
-            # 상장일 체크
-            ipo_date_str = str(etf.get("ipoDate", "") or "")
+            # 미국 거래소만 (거래소 정보가 있을 때만 필터, 없으면 통과)
+            exch = str(it.get("exchange", "") or it.get("exchangeShortName", "") or "").upper().strip()
+            if exch and exch not in _US_EXCH:
+                continue
+            # 상장일 클라이언트측 재확인
+            ipo_date_str = str(it.get("date", "") or it.get("ipoDate", "") or "")[:10]
             if ipo_date_str:
                 try:
-                    ipo_dt = datetime.strptime(ipo_date_str[:10], "%Y-%m-%d").replace(tzinfo=_MARKET_ET_TZ)
+                    ipo_dt = datetime.strptime(ipo_date_str, "%Y-%m-%d").replace(tzinfo=_MARKET_ET_TZ)
                     if ipo_dt < cutoff_date:
                         continue
                 except Exception:
-                    continue
-            else:
-                continue
-            new_etfs.append({
-                "ticker": ticker,
-                "name": str(etf.get("name", "") or "")[:80],
-                "category": str(etf.get("assetClass", "") or "")[:50],
+                    pass
+            seen.add(sym)
+            candidates.append({
+                "ticker": sym,
+                "name": (etf_map.get(sym) or str(it.get("company", "") or it.get("name", "") or ""))[:80],
+                "category": "",
                 "aum_m": "",
-                "ipo_date": ipo_date_str[:10],
+                "ipo_date": ipo_date_str,
             })
 
-        # AUM 필터링 — FMP profile로 체크
+        # 3) AUM 확인 (profile) — 레이트리밋 보호를 위해 호출 수 제한
         filtered = []
-        k = _fmp_key()
-        for etf in new_etfs[:50]:
+        for etf in candidates[:60]:
             try:
-                p = _fmp_profile(etf["ticker"]) if k else {}
+                p = _fmp_profile(etf["ticker"])
                 aum = float(p.get("totalAssets") or p.get("mktCap") or 0) / 1_000_000
-                if aum >= min_aum_m:
+                # AUM 집계가 안 된 신규 ETF는 일단 통과(빈 값), 집계됐는데 기준 미달이면 제외
+                if aum and aum < min_aum_m:
+                    continue
+                if aum:
                     etf["aum_m"] = f"{aum:.0f}"
-                    filtered.append(etf)
+                if not etf["category"]:
+                    etf["category"] = str(p.get("sector") or p.get("industry") or "")[:50]
+                filtered.append(etf)
             except Exception:
                 filtered.append(etf)
 
