@@ -7213,6 +7213,44 @@ def load_etf_universe_tickers_merged() -> list[str]:
     return merged
 
 
+def import_txt_tickers_to_sheet() -> tuple[int, str]:
+    """
+    etf_universe.txt 의 티커를 Google Sheets `ETF_Universe` 탭으로 1회성 통합한다.
+    - 이미 시트에 있는 티커는 건너뛴다.
+    - source='TXT_IMPORT' 로 저장하므로, 저품질 자동정리(cleanup, source=='FMP_AUTO'만 삭제)
+      대상에서 자동으로 보호된다.
+    통합 후에는 etf_universe.txt 가 없어도 동작한다.
+    반환: (추가된 수, 에러메시지)
+    """
+    txt_tickers = load_etf_universe_tickers()
+    if not txt_tickers:
+        return 0, "etf_universe.txt에서 읽은 티커가 없습니다."
+    ws, err = open_etf_universe_worksheet()
+    if err or ws is None:
+        return 0, err or "워크시트 열기 실패"
+    try:
+        existing_vals = ws.get_all_values()
+        existing = set(
+            str(r[0]).strip().upper()
+            for r in existing_vals[1:]
+            if r and r[0].strip()
+        )
+        added_date = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+        rows_to_add = []
+        for tk in txt_tickers:
+            tk = str(tk).strip().upper()
+            if not tk or tk in existing:
+                continue
+            # [Ticker, Name, Category, AUM_M, Added_Date, Source]
+            rows_to_add.append([tk, "", "", "", added_date, "TXT_IMPORT"])
+            existing.add(tk)
+        if rows_to_add:
+            _safe_append_rows(ws, rows_to_add, value_input_option="USER_ENTERED")
+        return len(rows_to_add), ""
+    except Exception as exc:
+        return 0, str(exc)
+
+
 def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: str = "leaders") -> tuple[bool, str]:
     """AI 스캐너 TOP 결과를 Sheets에 저장. engine: 'leaders' | 'emerging'"""
     gc = get_gspread_client()
@@ -13709,6 +13747,27 @@ if st.session_state.get("logged_in"):
                     else:
                         st.info("Sheets에 자동 추가된 ETF가 없어요.")
 
+            if st.button("📥 txt 티커를 시트로 통합 (1회 실행)", key="etf_txt_import_btn", use_container_width=True):
+                with st.spinner("etf_universe.txt 티커를 ETF_Universe 시트로 통합 중..."):
+                    _imp_added, _imp_err = import_txt_tickers_to_sheet()
+                if _imp_err:
+                    st.error(f"통합 오류: {_imp_err}")
+                elif _imp_added > 0:
+                    st.success(
+                        f"✅ txt 티커 {_imp_added}개를 시트로 통합했어요! "
+                        "이제 `etf_universe.txt` 없이도 동작합니다. "
+                        "(source=TXT_IMPORT → 저품질 자동정리에서 보호됨)"
+                    )
+                    load_etf_universe_from_sheet.clear()
+                    cached_etf_universe_rankings_full.clear()
+                    st.rerun()
+                else:
+                    st.info("시트에 이미 모든 txt 티커가 들어 있어요. 통합할 게 없습니다.")
+            st.caption(
+                "📥 txt → 시트 통합: `etf_universe.txt`의 티커를 시트로 옮깁니다. "
+                "통합 후에는 txt 파일이 없어도 됩니다."
+            )
+
             st.caption("🧹 저품질 ETF 자동 정리 조건: 상장 6개월 이상 & AUM $100M 미만 & 30일 평균 거래대금 $1M 미만")
             if st.button("🧹 저품질 ETF 정리 실행", key="etf_cleanup_btn", use_container_width=True):
                 with st.spinner("유동성/AUM 기준으로 저품질 ETF 정리 중..."):
@@ -13726,7 +13785,6 @@ if st.session_state.get("logged_in"):
 
         st.subheader(f"{_MAIN_NAV_OPTIONS[3]} · 섹터 ETF 상대 강도")
         st.caption("주요 섹터/테마 ETF 상대 강도 점검 (2년 데이터 기반)")
-        st.markdown(f"기준 티커: `{selected_ticker}`")
     
         sector_etfs = [
             ("XLK", "기술"),
@@ -13916,14 +13974,14 @@ if st.session_state.get("logged_in"):
     
         st.divider()
         st.subheader("🚀 Hidden Alpha Radar (새로운 주도 테마 발굴)")
-        etf_radar_universe = load_etf_universe_tickers()
+        etf_radar_universe = load_etf_universe_tickers_merged()
         st.caption(
-            f"`{_ETF_UNIVERSE_FILE.name}`에서 **{len(etf_radar_universe)}**개 티커를 읽었습니다. "
+            f"ETF Universe **{len(etf_radar_universe)}개**(`etf_universe.txt` + Google Sheets `ETF_Universe` 통합)를 사용합니다. "
             "최근 **5·10·21·63 거래일** 관점으로 1주~3개월 수익률을 일괄 계산합니다."
         )
         st.info(
-            "⚙️ 추적하는 ETF 리스트를 변경하거나 추가하고 싶다면, 코드 수정 없이 폴더 안의 "
-            "`etf_universe.txt` 파일만 수정하시면 앱에 즉시 반영됩니다."
+            "⚙️ 추적 ETF 추가·정리·txt 통합은 위의 「🆕 ETF Universe 관리」에서 하세요. "
+            "Google Sheets `ETF_Universe` 탭이 기준 소스입니다."
         )
         if st.button("지금 돈이 몰리는 미지의 ETF 찾기", key="hidden_alpha_radar_btn"):
             if not etf_radar_universe:
