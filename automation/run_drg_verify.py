@@ -191,9 +191,11 @@ def verify_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
 
         ret_pct = (pred_day_close / prev_close - 1.0) * 100.0
 
-        if ret_pct >= 0.3:
+        # 방향 판정 (±0.7% 기준 — 그 안쪽은 사실상 보합이므로 '중립')
+        # ⚠️ app.py의 verify_drg_prediction과 반드시 동일하게 유지할 것.
+        if ret_pct >= 0.7:
             actual_dir = "상승"
-        elif ret_pct <= -0.3:
+        elif ret_pct <= -0.7:
             actual_dir = "하락"
         else:
             actual_dir = "중립"
