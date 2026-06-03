@@ -4421,17 +4421,21 @@ def _fmp_etf_holdings(etf_ticker: str, top_n: int = 30) -> list:
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def _fmp_batch_pe(symbols_tuple: tuple) -> dict:
     """여러 심볼의 현재 PER → {symbol: pe(float|None)}.
-    /batch-quote 는 요금제에서 막힐 수 있어, 앱에서 정상 작동하는 단일 /quote 를
-    심볼별로 호출(개별 캐시 활용)한다."""
+    개별 종목 정밀검사와 동일하게 ratios-ttm 의 priceToEarningsRatioTTM 을 사용한다.
+    (stable /quote 의 pe 는 비어 오고, /batch-quote 는 요금제에서 막힘. 적자 종목은 양수 PER이
+    없으므로 None=N/A 로 둔다.)"""
     syms = [str(s).strip().upper() for s in symbols_tuple if str(s).strip()]
     out = {}
     for s in syms:
+        pe = None
         try:
-            q = _fmp_quote(s)
-            pe = to_float(q.get("pe") if isinstance(q, dict) else None)
-            out[s] = float(pe) if pd.notna(pe) else None
+            rat = _fmp_ratios(s)
+            v = to_float(rat.get("priceToEarningsRatioTTM")) if isinstance(rat, dict) else float("nan")
+            if pd.notna(v) and v > 0:
+                pe = float(v)
         except Exception:
-            out[s] = None
+            pe = None
+        out[s] = pe
     return out
 
 
@@ -15857,6 +15861,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             thesis_options = get_thesis_options_from_narratives(puid)
             thesis_labels = ["(Thesis 없음 - 일반 매수)"] + [o["label"] for o in thesis_options]
 
+            input_mode = st.radio(
+                "입력 방식",
+                options=["수량으로", "금액($)으로"],
+                horizontal=True,
+                key="form_portfolio_add_mode",
+                help="금액 방식: 평균 매수가 + 투자 금액($)을 넣으면 수량을 자동 계산합니다. 예) $500 ÷ $160 = 3.125주",
+            )
+
             with st.form("portfolio_add_form", clear_on_submit=False):
                 if selected_account_option == "직접 입력":
                     custom_account_input = st.text_input(
@@ -15874,13 +15886,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     placeholder="예: QQQ (저장 시 대문자)",
                     key="form_portfolio_add_ticker",
                 ).strip().upper()
-                input_mode = st.radio(
-                    "입력 방식",
-                    options=["수량으로", "금액($)으로"],
-                    horizontal=True,
-                    key="form_portfolio_add_mode",
-                    help="금액 방식: 평균 매수가 + 투자 금액($)을 넣으면 수량을 자동 계산합니다. 예) $500 ÷ $160 = 3.125주",
-                )
                 new_purchase_price = st.number_input(
                     "평균 매수가 (추가 매수 시 해당 매수 단가)",
                     min_value=0.0,
