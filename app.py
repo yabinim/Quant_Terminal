@@ -324,8 +324,8 @@ def get_thesis_options_from_narratives(user_id: str) -> list[dict]:
             title = str(theme.get("title", "") or "").strip()
             if not title:
                 continue
-            key = f"{title}_{date_str}"
-            if key in seen:
+            key = "".join(ch for ch in title.lower() if ch.isalnum())  # 날짜 무시·정규화 → 같은 테마 1회만(최신 유지)
+            if not key or key in seen:
                 continue
             seen.add(key)
             options.append({
@@ -339,6 +339,48 @@ def get_thesis_options_from_narratives(user_id: str) -> list[dict]:
         if len(options) >= 15:
             break
     return options
+
+
+def find_thesis_for_ticker(user_id: str, ticker: str) -> dict | None:
+    """최근 내러티브에서 ticker를 Winners/Emerging에 포함한 '가장 최근' 테마를 찾는다.
+    반환: {thesis_title, narrative_category, narrative_date, where} 또는 None."""
+    tk_u = str(ticker).strip().upper()
+    if not tk_u:
+        return None
+    records, _ = fetch_narrative_records_from_sheet()
+    if not records:
+        return None
+    uid_u = str(user_id).strip().upper()
+    for rec in reversed(records):  # 최신 내러티브부터
+        if str(rec.get("_sheet_user_id", "")).strip().upper() != uid_u:
+            continue
+        analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+        category = str(analysis.get("source") or "market_narrative").strip()
+        date_str = ""
+        try:
+            dt = _narrative_parse_saved_at_utc(rec.get("saved_at", ""))
+            if dt:
+                date_str = dt.astimezone(_MARKET_ET_TZ).strftime("%m/%d")
+        except Exception:
+            pass
+        themes = analysis.get("themes", [])
+        if not isinstance(themes, list):
+            themes = []
+        for theme in themes:
+            if not isinstance(theme, dict):
+                continue
+            w = [str(t).strip().upper() for t in parse_tickers_from_text(theme.get("winners", "") or "")]
+            e = [str(t).strip().upper() for t in parse_tickers_from_text(theme.get("emerging", "") or "")]
+            if tk_u in w or tk_u in e:
+                title = str(theme.get("title", "") or "").strip()
+                if title:
+                    return {
+                        "thesis_title": title,
+                        "narrative_category": category,
+                        "narrative_date": date_str,
+                        "where": "Winners" if tk_u in w else "Emerging",
+                    }
+    return None
 
 
 def ensure_portfolios_header_row(ws):
@@ -15859,7 +15901,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             )
             # Thesis 옵션 (폼 바깥에서 미리 로드)
             thesis_options = get_thesis_options_from_narratives(puid)
-            thesis_labels = ["(Thesis 없음 - 일반 매수)"] + [o["label"] for o in thesis_options]
+            _THESIS_NONE = "(Thesis 없음 - 일반 매수)"
+            _THESIS_CORE = "📈 코어/정기적립 (인덱스 DCA)"
+            thesis_labels = [_THESIS_NONE, _THESIS_CORE] + [o["label"] for o in thesis_options]
 
             input_mode = st.radio(
                 "입력 방식",
@@ -15920,7 +15964,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     options=thesis_labels,
                     index=0,
                     key="form_portfolio_add_thesis",
-                    help="최근 내러티브에서 추출한 테마 목록입니다. 선택하면 Thesis 탭에서 추적할 수 있어요.",
+                    help="내러티브 추천 종목이면 그대로 두세요 — 제출 시 해당 테마로 자동 연결됩니다. QQQM 같은 정기 적립은 '📈 코어/정기적립'을 고르세요.",
                 )
                 submitted_add = st.form_submit_button("포트폴리오에 추가", use_container_width=True, type="primary")
                 if submitted_add:
@@ -15998,19 +16042,31 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     # Trade_History에 BUY 기록
                                     _buy_date = _narrative_now_et_string()[:10]
                                     append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "신규 매수")
-                                    # Thesis 선택 시 Thesis 시트에도 저장
-                                    if selected_thesis_label != "(Thesis 없음 - 일반 매수)":
+                                    # ── Thesis 연결 ──
+                                    _thesis_msg = ""
+                                    if selected_thesis_label == _THESIS_CORE:
+                                        # 코어/정기적립(인덱스 DCA) — thesis가 아닌 별도 버킷
+                                        save_thesis_row(puid, new_ticker, account_name, "코어/정기적립 (DCA)", "core_dca", "")
+                                        _thesis_msg = " · 📈 코어/정기적립으로 기록"
+                                    elif selected_thesis_label != _THESIS_NONE:
+                                        # 사용자가 직접 고른 내러티브 테마
                                         matched = next((o for o in thesis_options if o["label"] == selected_thesis_label), None)
                                         if matched:
                                             save_thesis_row(
-                                                puid,
-                                                new_ticker,
-                                                account_name,
-                                                matched["thesis_title"],
-                                                matched["narrative_category"],
-                                                matched["narrative_date"],
+                                                puid, new_ticker, account_name,
+                                                matched["thesis_title"], matched["narrative_category"], matched["narrative_date"],
                                             )
-                                    st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다. (시트 ID={puid})")
+                                            _thesis_msg = f" · Thesis: {matched['thesis_title']}"
+                                    else:
+                                        # '없음'으로 두면 → 최근 내러티브에서 이 티커를 추천한 테마 자동 연결
+                                        auto = find_thesis_for_ticker(puid, new_ticker)
+                                        if auto:
+                                            save_thesis_row(
+                                                puid, new_ticker, account_name,
+                                                auto["thesis_title"], auto["narrative_category"], auto["narrative_date"],
+                                            )
+                                            _thesis_msg = f" · 🔗 자동 연결: [{auto['narrative_date']}] {auto['thesis_title']} ({auto['where']})"
+                                    st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다.{_thesis_msg}")
                                     st.rerun()
 
         with st.expander("데이터 수정하기", expanded=False):
