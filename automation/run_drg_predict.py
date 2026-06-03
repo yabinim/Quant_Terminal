@@ -208,8 +208,8 @@ def fetch_global_market_news() -> tuple[list, str, int]:
 
 # ── 거시지표 수집 (앱의 Daily Risk Gauge 5가지 신호와 동일) ──────────────────
 def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
-    """앱의 compute_daily_risk_gauge와 동일한 6가지 선행 신호 수집
-    (VIX·신용·대장주·프리마켓·리스크오프·이벤트)."""
+    """앱의 compute_daily_risk_gauge와 동일한 8가지 선행 신호 수집
+    (VIX·신용·대장주·프리마켓·리스크오프·이벤트·섹터로테이션·시장폭)."""
     lines = []
     signals_summary = []
 
@@ -431,6 +431,75 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
     except Exception:
         lines.append("- 이벤트 리스크: 조회 실패")
 
+    # ── 신호 7·8: 섹터 로테이션 + 시장 폭(breadth) ─────────────────────────
+    # sector-performance-snapshot 1콜로 두 신호를 함께 산출(앱과 동일 로직).
+    # app.py의 compute_daily_risk_gauge 신호 7·8 / fmp_extras.compute_sector_signals 와 동일.
+    try:
+        _FMP_KEY7 = os.environ.get("FMP_API_KEY", "")
+        _FMP_BASE7 = "https://financialmodelingprep.com/stable"
+        _DEF = {"Utilities", "Consumer Staples", "Consumer Defensive",
+                "Healthcare", "Health Care", "Real Estate"}
+        _CYC = {"Technology", "Consumer Cyclical", "Consumer Discretionary",
+                "Industrials", "Financial Services", "Financials",
+                "Energy", "Basic Materials", "Materials", "Communication Services"}
+        _snap = []
+        if _FMP_KEY7:
+            _today_et = datetime.now(pytz.timezone("America/New_York")).date()
+            for _back in range(0, 6):
+                _d = _today_et - timedelta(days=_back)
+                if _d.weekday() >= 5:
+                    continue
+                _r7 = requests.get(
+                    f"{_FMP_BASE7}/sector-performance-snapshot?date={_d.isoformat()}&apikey={_FMP_KEY7}",
+                    timeout=8,
+                )
+                if _r7.status_code == 200:
+                    _j7 = _r7.json()
+                    if isinstance(_j7, list) and _j7:
+                        _snap = _j7
+                        break
+        _vals = {}
+        for _row7 in _snap:
+            if not isinstance(_row7, dict):
+                continue
+            _sec = _row7.get("sector")
+            _chg = _row7.get("averageChange", _row7.get("changesPercentage", _row7.get("change")))
+            try:
+                _chg = float(_chg)
+            except (TypeError, ValueError):
+                continue
+            if _sec:
+                _vals[str(_sec)] = _chg
+        if _vals:
+            _defs = [v for s, v in _vals.items() if s in _DEF]
+            _cycs = [v for s, v in _vals.items() if s in _CYC]
+            _neg_frac = sum(1 for v in _vals.values() if v < 0) / len(_vals)
+            _def_avg = float(np.mean(_defs)) if _defs else float("nan")
+            _cyc_avg = float(np.mean(_cycs)) if _cycs else float("nan")
+            _rotation = (_def_avg - _cyc_avg) if (_defs and _cycs) else float("nan")
+
+            # 신호 7: 섹터 로테이션 (방어주 > 경기민감주 = 리스크오프)
+            _rot_alert = (not np.isnan(_rotation)) and _rotation > 0.3
+            _rot_status = "⚠️ 방어주 로테이션(리스크오프)" if _rot_alert else "✅ 정상"
+            if not np.isnan(_rotation):
+                lines.append(
+                    f"- 섹터 로테이션: 방어주 {_def_avg:+.2f}% vs 경기민감주 {_cyc_avg:+.2f}% "
+                    f"(스프레드 {_rotation:+.2f}%p) [{_rot_status}]"
+                )
+                signals_summary.append(f"섹터로테이션 {'경고' if _rot_alert else '정상'}")
+
+            # 신호 8: 시장 폭 (하락 섹터 비중)
+            _br_alert = _neg_frac >= 0.7
+            _br_status = "⚠️ 광범위 약세" if _br_alert else "✅ 정상"
+            lines.append(
+                f"- 시장 폭(breadth): 하락 섹터 {_neg_frac*100:.0f}% ({sum(1 for v in _vals.values() if v<0)}/{len(_vals)}) [{_br_status}]"
+            )
+            signals_summary.append(f"시장폭 {'경고' if _br_alert else '정상'}")
+        else:
+            lines.append("- 섹터 로테이션/시장 폭: 조회 실패")
+    except Exception:
+        lines.append("- 섹터 로테이션/시장 폭: 조회 실패")
+
     # ── FRED 기준금리 + CPI (추가 컨텍스트) ────────────────────────────────
     try:
         rate = float(fred.get_series("FEDFUNDS").dropna().iloc[-1])
@@ -449,7 +518,7 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
     warning_count = sum(1 for s in signals_summary if "경고" in s)
     total_signals = len(signals_summary)
     risk_level = "🔴 HIGH RISK" if warning_count >= 3 else ("🟡 MEDIUM RISK" if warning_count >= 1 else "🟢 LOW RISK")
-    lines.insert(0, f"[선행 신호 종합: {risk_level} | 경고 {warning_count}/{total_signals}개 (VIX·신용·대장주·프리마켓·리스크오프·이벤트)]")
+    lines.insert(0, f"[선행 신호 종합: {risk_level} | 경고 {warning_count}/{total_signals}개 (VIX·신용·대장주·프리마켓·리스크오프·이벤트·섹터로테이션·시장폭)]")
 
     return "\n".join(lines) if lines else "데이터 없음"
 
