@@ -4420,33 +4420,18 @@ def _fmp_etf_holdings(etf_ticker: str, top_n: int = 30) -> list:
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def _fmp_batch_pe(symbols_tuple: tuple) -> dict:
-    """여러 심볼의 현재 PER(quote.pe)를 batch-quote로 일괄 조회 → {symbol: pe(float|None)}."""
+    """여러 심볼의 현재 PER → {symbol: pe(float|None)}.
+    /batch-quote 는 요금제에서 막힐 수 있어, 앱에서 정상 작동하는 단일 /quote 를
+    심볼별로 호출(개별 캐시 활용)한다."""
     syms = [str(s).strip().upper() for s in symbols_tuple if str(s).strip()]
-    if not syms:
-        return {}
-    k = _fmp_key()
-    if not k:
-        return {}
     out = {}
-    try:
-        for i in range(0, len(syms), 50):
-            chunk = ",".join(syms[i:i + 50])
-            r = requests.get(f"{_FMP_BASE}/batch-quote?symbols={chunk}&apikey={k}", timeout=_FMP_TIMEOUT)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            if not isinstance(data, list):
-                continue
-            for it in data:
-                if not isinstance(it, dict):
-                    continue
-                sym = str(it.get("symbol") or "").strip().upper()
-                if not sym:
-                    continue
-                pe = to_float(it.get("pe") if it.get("pe") is not None else it.get("peRatio"))
-                out[sym] = float(pe) if pd.notna(pe) else None
-    except Exception:
-        pass
+    for s in syms:
+        try:
+            q = _fmp_quote(s)
+            pe = to_float(q.get("pe") if isinstance(q, dict) else None)
+            out[s] = float(pe) if pd.notna(pe) else None
+        except Exception:
+            out[s] = None
     return out
 
 
@@ -4493,16 +4478,15 @@ def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
     # ── 주도주: 1개월 수익률 상위 5 ──
     leaders = df.sort_values("_ret", ascending=False).head(5).copy()
 
-    # ── 저평가 후발주 ──
+    # ── 저평가 후발주 (흑자·저PER·비자유낙하 중, 가장 덜 오른 후발주 순) ──
     cand = df[df["_ret"] > -20.0].copy()                       # 1) 자유낙하 제외
     cand = cand[cand["_pe"] > 0].copy()                        # 2) 흑자(PER>0)
-    med = sector_median_pe if (sector_median_pe and sector_median_pe > 0) else cand["_pe"].median()
-    if pd.notna(med):
-        cand = cand[cand["_pe"] < med].copy()                  # 3) 저PER(중간값 미만)
     if not cand.empty:
-        ret_cut = df["_ret"].quantile(0.6)                     # 4) 수익률 하위(따라잡을 여지)
-        cand = cand[cand["_ret"] <= ret_cut]
-    laggards = cand.sort_values("_pe", ascending=True).head(5).copy()
+        med = sector_median_pe if (sector_median_pe and sector_median_pe > 0) else cand["_pe"].median()
+        if pd.notna(med):
+            cheap = cand[cand["_pe"] < med]                    # 3) 저PER(중간값 미만)
+            cand = cheap if not cheap.empty else cand          #    너무 타이트하면 흑자군 전체로 완화
+    laggards = cand.sort_values("_ret", ascending=True).head(5).copy()  # 4) 덜 오른(후발) 순
 
     def _fmt(_d):
         if _d.empty:
@@ -15890,6 +15874,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     placeholder="예: QQQ (저장 시 대문자)",
                     key="form_portfolio_add_ticker",
                 ).strip().upper()
+                input_mode = st.radio(
+                    "입력 방식",
+                    options=["수량으로", "금액($)으로"],
+                    horizontal=True,
+                    key="form_portfolio_add_mode",
+                    help="금액 방식: 평균 매수가 + 투자 금액($)을 넣으면 수량을 자동 계산합니다. 예) $500 ÷ $160 = 3.125주",
+                )
                 new_purchase_price = st.number_input(
                     "평균 매수가 (추가 매수 시 해당 매수 단가)",
                     min_value=0.0,
@@ -15898,14 +15889,27 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     format="%.2f",
                     key="form_portfolio_add_purchase_price",
                 )
-                new_quantity = st.number_input(
-                    "수량 (추가 매수 수량)",
-                    min_value=0.0,
-                    value=0.0,
-                    step=1.0,
-                    format="%.4f",
-                    key="form_portfolio_add_quantity",
-                )
+                if input_mode == "금액($)으로":
+                    new_amount = st.number_input(
+                        "투자 금액 ($) — 이 금액어치 매수",
+                        min_value=0.0,
+                        value=0.0,
+                        step=10.0,
+                        format="%.2f",
+                        key="form_portfolio_add_amount",
+                        help="예: 피델리티에서 QQQM을 $500어치 매수 → 평균가 입력 시 수량 자동 계산",
+                    )
+                    new_quantity = 0.0
+                else:
+                    new_amount = 0.0
+                    new_quantity = st.number_input(
+                        "수량 (추가 매수 수량)",
+                        min_value=0.0,
+                        value=0.0,
+                        step=1.0,
+                        format="%.4f",
+                        key="form_portfolio_add_quantity",
+                    )
                 selected_thesis_label = st.selectbox(
                     "📌 투자 Thesis (어떤 내러티브 테마에서 매수했나요?)",
                     options=thesis_labels,
@@ -15929,7 +15933,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             st.warning("티커를 입력해주세요.")
                         else:
                             ok_p, price_v, err_p = _validate_positive_portfolio_number("매수가", new_purchase_price)
-                            ok_q, qty_v, err_q = _validate_positive_portfolio_number("수량", new_quantity)
+                            if input_mode == "금액($)으로":
+                                ok_amt, amt_v, err_amt = _validate_positive_portfolio_number("금액", new_amount)
+                                if ok_p and ok_amt:
+                                    qty_v, ok_q, err_q = (amt_v / price_v), True, ""
+                                else:
+                                    qty_v, ok_q, err_q = 0.0, ok_amt, err_amt
+                            else:
+                                ok_q, qty_v, err_q = _validate_positive_portfolio_number("수량", new_quantity)
                             if not ok_p:
                                 st.error(err_p)
                             elif not ok_q:
