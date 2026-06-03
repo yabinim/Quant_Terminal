@@ -4325,6 +4325,69 @@ _SECTOR_THEME_ETFS = {
     "XLP":  [],
 }
 
+# 라이브(FMP /etf/holdings)가 비어 있을 때 사용하는 대표 보유종목 폴백.
+# (요금제에 ETF Holdings 엔드포인트가 없을 때를 대비 — 라이브가 오면 라이브 우선)
+_ETF_CONSTITUENTS = {
+    # GICS 11개 대형 섹터
+    "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "ADBE", "CRM", "AMD", "CSCO", "INTU", "QCOM", "AMAT", "TXN", "NOW", "IBM"],
+    "XLC": ["GOOGL", "META", "NFLX", "TMUS", "DIS", "VZ", "T", "CHTR", "CMCSA", "EA", "TTWO", "FOXA", "WBD", "DASH", "SPOT"],
+    "XLY": ["AMZN", "TSLA", "HD", "MCD", "BKNG", "LOW", "NKE", "SBUX", "TJX", "CMG", "RCL", "MAR", "GM", "F", "ORLY"],
+    "XLP": ["COST", "WMT", "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL", "TGT", "KMB", "GIS", "KVUE", "KHC", "STZ"],
+    "XLV": ["LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE", "TMO", "DHR", "AMGN", "GILD", "BMY", "ISRG", "VRTX", "SYK", "CVS"],
+    "XLF": ["JPM", "BRK-B", "V", "MA", "BAC", "WFC", "GS", "MS", "SCHW", "BLK", "AXP", "C", "PGR", "AIG", "USB"],
+    "XLE": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "KMI", "HAL", "BKR", "DVN", "FANG", "WMB"],
+    "XLI": ["GE", "CAT", "RTX", "HON", "UNP", "LMT", "DE", "ETN", "BA", "NOC", "UPS", "FDX", "WM", "EMR", "ITW"],
+    "XLB": ["LIN", "APD", "SHW", "ECL", "NUE", "FCX", "DOW", "DD", "CTVA", "NEM", "MLM", "VMC", "PPG", "LYB", "MOS"],
+    "XLRE": ["AMT", "PLD", "EQIX", "SPG", "O", "WELL", "PSA", "DLR", "CCI", "CBRE", "VICI", "AVB", "EQR", "ESS", "EXR"],
+    "XLU": ["NEE", "SO", "DUK", "CEG", "AEP", "EXC", "SRE", "XEL", "D", "PCG", "PEG", "ED", "EIX", "WEC", "ETR"],
+    # 테마/세부산업 ETF
+    "SOXX": ["NVDA", "AVGO", "AMD", "MU", "TXN", "AMAT", "QCOM", "INTC", "LRCX", "KLAC", "ADI", "MCHP", "MRVL", "NXPI", "ON"],
+    "IGV": ["MSFT", "ORCL", "CRM", "ADBE", "NOW", "PLTR", "PANW", "CRWD", "SNOW", "INTU", "FTNT", "DDOG", "WDAY", "TEAM", "ANSS"],
+    "CIBR": ["CRWD", "PANW", "FTNT", "ZS", "CSCO", "GEN", "CYBR", "OKTA", "CHKP", "NET", "TENB", "S", "QLYS", "RPD", "AKAM"],
+    "SKYY": ["ORCL", "MSFT", "GOOGL", "AMZN", "NOW", "CRM", "SNOW", "NET", "DDOG", "MDB", "ANET", "IBM", "ZS", "AKAM", "FTNT"],
+    "BOTZ": ["NVDA", "ABB", "ISRG", "PATH", "SYM", "ROK", "FANUY", "TER", "OMCL", "CGNX", "IRBT", "UI", "NARI", "MDT", "KEYS"],
+    "XBI": ["GILD", "BIIB", "REGN", "VRTX", "ALNY", "MRNA", "BNTX", "AMGN", "ILMN", "SRPT", "CRSP", "EXEL", "NBIX", "INCY", "ARGX"],
+    "IHI": ["ISRG", "ABT", "BSX", "MDT", "SYK", "BDX", "EW", "DXCM", "ZBH", "RMD", "STE", "GEHC", "PODD", "BAX", "COO"],
+    "IHF": ["UNH", "ELV", "CI", "HCA", "CVS", "CNC", "HUM", "MCK", "COR", "DVA", "MOH", "EHC", "UHS", "THC", "ENSG"],
+    "PPH": ["LLY", "JNJ", "ABBV", "MRK", "NVS", "NVO", "AZN", "PFE", "BMY", "ZTS", "GSK", "AMGN", "TAK", "HLN", "VTRS"],
+    "GNOM": ["CRSP", "NTLA", "BEAM", "TWST", "EXAS", "ARWR", "IONS", "PACB", "EDIT", "FATE", "RXRX", "DNA", "VCYT", "SDGR", "NVCR"],
+    "XOP": ["COP", "EOG", "FANG", "DVN", "OXY", "HES", "MPC", "VLO", "PSX", "APA", "CTRA", "OVV", "EQT", "AR", "MUR"],
+    "OIH": ["SLB", "HAL", "BKR", "TS", "FTI", "NOV", "CHX", "WFRD", "RIG", "LBRT", "HP", "NBR", "OII", "PTEN", "VAL"],
+    "URA": ["CCJ", "BWXT", "NXE", "UEC", "DNN", "LEU", "UUUU", "SMR", "OKLO", "LTBR", "URG", "EU", "UROY"],
+    "TAN": ["FSLR", "ENPH", "NXT", "SEDG", "RUN", "SHLS", "ARRY", "MAXN", "CSIQ", "FLNC", "NOVA", "DQ", "JKS", "SPWR", "CSLR"],
+    "AMLP": ["MPLX", "ET", "EPD", "PAA", "WES", "ENLC", "HESM", "DTM", "SUN", "NS", "CQP", "DMLP", "GLP"],
+    "ITA": ["RTX", "LMT", "NOC", "GD", "BA", "HII", "TXT", "TDG", "HEI", "KTOS", "AVAV", "LDOS", "LHX", "CW", "MRCY"],
+    "JETS": ["DAL", "UAL", "LUV", "AAL", "ALK", "BA", "RYAAY", "ALGT", "SKYW", "HA", "GD", "CPA", "JBLU", "MESA", "HXL"],
+    "IYT": ["UBER", "UPS", "UNP", "FDX", "CSX", "NSC", "ODFL", "JBHT", "CHRW", "EXPD", "R", "KNX", "LSTR", "WERN", "SAIA"],
+    "PAVE": ["PWR", "ETN", "URI", "NUE", "EMR", "JCI", "FAST", "DE", "CARR", "MLM", "VMC", "HUBB", "AME", "TT", "WAB"],
+    "UFO": ["PLTR", "RKLB", "LHX", "RTX", "NOC", "BA", "IRDM", "ASTS", "SPIR", "SATL", "VSAT", "GSAT", "TDY", "HEI", "CACI"],
+    "KRE": ["TFC", "USB", "FITB", "RF", "HBAN", "MTB", "KEY", "CFG", "FCNCA", "ZION", "CMA", "WAL", "WBS", "EWBC", "SNV"],
+    "KBE": ["COF", "GS", "MS", "BK", "STT", "JPM", "BAC", "WFC", "C", "USB", "PNC", "TFC", "FITB", "RF", "HBAN"],
+    "KIE": ["PGR", "ALL", "MET", "PRU", "TRV", "AIG", "HIG", "CB", "AFL", "CINF", "L", "GL", "AIZ", "ACGL", "RGA"],
+    "IAI": ["GS", "MS", "SCHW", "ICE", "CME", "SPGI", "MCO", "COIN", "IBKR", "MKTX", "NDAQ", "CBOE", "RJF", "LPLA", "TROW"],
+    "FINX": ["PYPL", "COIN", "FI", "GPN", "AFRM", "SOFI", "NU", "FIS", "MELI", "TOST", "BILL", "HOOD", "FOUR", "FLYW", "MQ"],
+    "XRT": ["ANF", "GAP", "W", "RH", "CVNA", "BBY", "DKS", "ULTA", "ROST", "TJX", "BURL", "FL", "KSS", "M", "GME"],
+    "ITB": ["DHI", "LEN", "PHM", "NVR", "TOL", "KBH", "TPH", "MTH", "BLDR", "MAS", "SHW", "LOW", "HD", "MHK", "FBIN"],
+    "IBUY": ["CHWY", "CVNA", "ETSY", "W", "AMZN", "EBAY", "MELI", "SE", "SHOP", "DASH", "ABNB", "EXPE", "PINS", "RVLV", "WSM"],
+    "PEJ": ["BKNG", "MAR", "HLT", "RCL", "CCL", "NCLH", "LVS", "WYNN", "MGM", "DAL", "UAL", "CMG", "SBUX", "YUM", "DPZ"],
+    "BETZ": ["DKNG", "FLUT", "PENN", "CZR", "MGM", "LVS", "WYNN", "BYD", "RSI", "GENI", "SGHC", "LNW", "GDEN", "CHDN", "ACEL"],
+    "GDX": ["NEM", "AEM", "GOLD", "WPM", "FNV", "KGC", "GFI", "AU", "RGLD", "PAAS", "BVN", "HMY", "SSRM", "EGO", "OR"],
+    "COPX": ["FCX", "SCCO", "TECK", "ERO", "HBM", "IVN", "FM", "LUN", "TGB", "CMMC", "AGI", "WRN", "CS", "ANTO", "GLEN"],
+    "LIT": ["ALB", "SQM", "TSLA", "BYDDY", "PCRFY", "LAC", "PLL", "SLI", "MP", "FREY", "ENVX", "AMPX", "QS", "SES", "LICY"],
+    "SLX": ["VALE", "NUE", "RIO", "STLD", "RS", "TX", "CLF", "MT", "GGB", "X", "CMC", "ATI", "WOR", "TMST", "SID"],
+    "WOOD": ["WY", "PCH", "RYN", "WFG", "IP", "PKG", "SW", "SON", "LPX", "UFPI", "BCC", "OSB", "MERC", "SLVM", "DTC"],
+    "VNQ": ["PLD", "AMT", "EQIX", "WELL", "SPG", "PSA", "O", "DLR", "CCI", "CBRE", "EXR", "AVB", "VICI", "IRM", "EQR"],
+    "REZ": ["WELL", "AVB", "EQR", "INVH", "VTR", "ESS", "MAA", "UDR", "AMH", "ELS", "SUI", "CPT", "DOC", "NNN", "STAG"],
+    "SRVR": ["EQIX", "DLR", "AMT", "CCI", "SBAC", "IRM", "UNIT", "DBRG", "GLPI", "LAMR", "FYBR", "T", "VZ", "CSGP", "WY"],
+    "INDS": ["PLD", "EXR", "PSA", "CUBE", "EGP", "FR", "REXR", "STAG", "TRNO", "NSA", "ILPT", "PLYM", "LXP", "GTY", "COLD"],
+    "REM": ["AGNC", "NLY", "STWD", "RITM", "BXMT", "ABR", "CIM", "TWO", "RC", "ARI", "PMT", "NYMT", "DX", "EFC", "MFA"],
+    "FDN": ["AMZN", "META", "GOOGL", "NFLX", "CRM", "UBER", "ABNB", "PYPL", "SHOP", "SNOW", "COIN", "DASH", "PINS", "SPOT", "Z"],
+    "SOCL": ["META", "GOOGL", "PINS", "SNAP", "RDDT", "MTCH", "BIDU", "YELP", "BMBL", "NTES", "Z", "CARG", "DJT", "CARS", "TTGT"],
+    "ESPO": ["NVDA", "NTES", "EA", "RBLX", "TTWO", "SE", "BILI", "U", "AMD", "LOGI", "CRSR", "PLTK", "SCPL", "GRVY", "SLGG"],
+    "GRID": ["ABB", "ETN", "GEV", "PWR", "AME", "HUBB", "JCI", "EMR", "SU", "APH", "GLW", "ENPH", "BMI", "ITRI", "POWL"],
+    "NLR": ["CEG", "CCJ", "BWXT", "PEG", "DUK", "SO", "EXC", "PWR", "GEV", "OKLO", "SMR", "NRG", "VST", "TLN", "LEU"],
+}
+
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def _fmp_etf_holdings(etf_ticker: str, top_n: int = 30) -> list:
@@ -4390,23 +4453,32 @@ def _fmp_batch_pe(symbols_tuple: tuple) -> dict:
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
     """
-    선택 ETF의 구성종목을 라이브로 받아(FMP /etf/holdings) 2개 표를 만든다.
+    선택 ETF의 구성종목으로 2개 표를 만든다.
       - 주도주(Alpha Leaders): 1개월 수익률 상위 5
       - 저평가 후발주(Undervalued Laggards): 자유낙하 제외(1M>-20%) + 흑자(PER>0)
-        + 저PER(섹터 중간 PER 또는 구성종목 중간값 미만) 중에서 수익률 하위(따라잡을 여지) → 싼 순 5
-    반환: (leaders_df, laggards_df) — 각 [Ticker, 1-Month (%), PER] (문자열 포맷)
+        + 저PER(섹터 중간 PER 또는 구성종목 중간값 미만) 중 수익률 하위(따라잡을 여지) → 싼 순 5
+    구성종목 소스: 라이브(FMP /etf/holdings) 우선, 비면 _ETF_CONSTITUENTS 대표종목 폴백.
+    반환: (leaders_df, laggards_df, source)  source ∈ {"live","fallback","none"}
     """
     empty = pd.DataFrame(columns=["Ticker", "1-Month (%)", "PER"])
-    holdings = _fmp_etf_holdings(etf_ticker, top_n=30)
-    # 미국 보통주 위주: 해외 접미사(.NS/.TO 등) 제외
-    syms = [s for s, _w in holdings if "." not in s]
-    syms = list(dict.fromkeys(syms))[:30]
+    etf_u = str(etf_ticker or "").strip().upper()
+
+    # 1) 라이브 우선 (FMP /etf/holdings)
+    holdings = _fmp_etf_holdings(etf_u, top_n=30)
+    live_syms = list(dict.fromkeys([s for s, _w in holdings if "." not in s]))
+    if len(live_syms) >= 3:
+        syms, source = live_syms[:30], "live"
+    else:
+        # 2) 대표종목 폴백 (요금제에 holdings 엔드포인트가 없을 때)
+        fb = [str(s).strip().upper() for s in _ETF_CONSTITUENTS.get(etf_u, []) if "." not in str(s)]
+        syms, source = list(dict.fromkeys(fb))[:30], "fallback"
+
     if len(syms) < 3:
-        return empty, empty
+        return empty, empty, "none"
 
     ret_df = cached_pool_monthly_returns(tuple(syms))  # [Ticker, 1-Month (%)] desc
     if ret_df is None or ret_df.empty:
-        return empty, empty
+        return empty, empty, "none"
     pe_map = _fmp_batch_pe(tuple(syms))
 
     df = ret_df.copy()
@@ -4416,7 +4488,7 @@ def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
     df["_pe"] = pd.to_numeric(df["_pe"], errors="coerce")
     df = df.dropna(subset=["_ret"]).copy()
     if df.empty:
-        return empty, empty
+        return empty, empty, "none"
 
     # ── 주도주: 1개월 수익률 상위 5 ──
     leaders = df.sort_values("_ret", ascending=False).head(5).copy()
@@ -4444,7 +4516,7 @@ def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
         })
         return o.reset_index(drop=True)
 
-    return _fmt(leaders), _fmt(laggards)
+    return _fmt(leaders), _fmt(laggards), source
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -14006,19 +14078,7 @@ if st.session_state.get("logged_in"):
         ]
         sector_tickers = [ticker for ticker, _ in sector_etfs]
         # 꺾임 스캔의 '보유 종목 → 섹터 ETF' 매핑에 사용 (GICS 11개 대표 보유종목)
-        sector_holdings_map = {
-            "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "ADBE", "CRM", "AMD", "CSCO", "INTU", "QCOM", "AMAT", "TXN", "NOW", "IBM"],
-            "XLC": ["GOOGL", "META", "NFLX", "TMUS", "DIS", "VZ", "T", "CHTR", "CMCSA", "EA", "TTWO", "FOXA", "WBD", "DASH", "SPOT"],
-            "XLY": ["AMZN", "TSLA", "HD", "MCD", "BKNG", "LOW", "NKE", "SBUX", "TJX", "CMG", "RCL", "MAR", "GM", "F", "ORLY"],
-            "XLP": ["COST", "WMT", "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL", "TGT", "KMB", "GIS", "KVUE", "KHC", "STZ"],
-            "XLV": ["LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE", "TMO", "DHR", "AMGN", "GILD", "BMY", "ISRG", "VRTX", "SYK", "CVS"],
-            "XLF": ["JPM", "BRK-B", "V", "MA", "BAC", "WFC", "GS", "MS", "SCHW", "BLK", "AXP", "C", "PGR", "AIG", "USB"],
-            "XLE": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "KMI", "HAL", "BKR", "DVN", "FANG", "WMB"],
-            "XLI": ["GE", "CAT", "RTX", "HON", "UNP", "LMT", "DE", "ETN", "BA", "NOC", "UPS", "FDX", "WM", "EMR", "ITW"],
-            "XLB": ["LIN", "APD", "SHW", "ECL", "NUE", "FCX", "DOW", "DD", "CTVA", "NEM", "MLM", "VMC", "PPG", "LYB", "MOS"],
-            "XLRE": ["AMT", "PLD", "EQIX", "SPG", "O", "WELL", "PSA", "DLR", "CCI", "CBRE", "VICI", "AVB", "EQR", "ESS", "EXR"],
-            "XLU": ["NEE", "SO", "DUK", "CEG", "AEP", "EXC", "SRE", "XEL", "D", "PCG", "PEG", "ED", "EIX", "WEC", "ETR"],
-        }
+        sector_holdings_map = {tk: _ETF_CONSTITUENTS.get(tk, []) for tk in sector_tickers}
 
         try:
             with st.spinner("섹터 ETF 데이터를 불러오는 중..."):
@@ -14123,9 +14183,13 @@ if st.session_state.get("logged_in"):
                     key="t3_etf_select",
                 )
 
-                # Tier 3: 주도주 + 저평가 후발주 (라이브 구성종목)
-                with st.spinner(f"{_sel_etf} 구성종목 분석 중 (라이브)..."):
-                    _leaders_df, _lagg_df = cached_etf_tier3_analysis(_sel_etf, _sector_median_pe)
+                # Tier 3: 주도주 + 저평가 후발주 (라이브 우선, 대표종목 폴백)
+                with st.spinner(f"{_sel_etf} 구성종목 분석 중..."):
+                    _leaders_df, _lagg_df, _t3_src = cached_etf_tier3_analysis(_sel_etf, _sector_median_pe)
+                if _t3_src == "fallback":
+                    st.caption("ⓘ 라이브 구성종목 미수신(FMP holdings 엔드포인트) → 대표 종목 기준 폴백으로 계산했습니다.")
+                elif _t3_src == "none":
+                    st.caption("ⓘ 이 ETF의 구성종목 데이터를 구하지 못했습니다 (라이브·폴백 모두 없음).")
 
                 _lead_col, _lag_col = st.columns(2)
                 with _lead_col:
