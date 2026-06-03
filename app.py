@@ -28,6 +28,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from fredapi import Fred
 
+import fmp_extras as fx
+
 
 st.set_page_config(page_title="장기 투자 주식 분석", layout="wide")
 
@@ -3245,14 +3247,21 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             pass
         return ("news", news)
 
-    # 7개 fetch 함수를 동시 실행
+    def _fetch_sector_snapshot_data():
+        """신호 7·8 공용 데이터: 최근 거래일 섹터 퍼포먼스 스냅샷."""
+        try:
+            return ("sector_snap", fx.fetch_sector_snapshot())
+        except Exception:
+            return ("sector_snap", [])
+
+    # 8개 fetch 함수를 동시 실행
     _prefetch_tasks = [
         _fetch_vix_data, _fetch_credit_data, _fetch_leaders_data,
         _fetch_futures_data, _fetch_riskoff_data, _fetch_calendar_data,
-        _fetch_news_data,
+        _fetch_news_data, _fetch_sector_snapshot_data,
     ]
     _prefetch = {}
-    with _cf_drg.ThreadPoolExecutor(max_workers=7) as _exe_drg:
+    with _cf_drg.ThreadPoolExecutor(max_workers=8) as _exe_drg:
         _futs_drg = {_exe_drg.submit(fn): fn.__name__ for fn in _prefetch_tasks}
         for fut in _cf_drg.as_completed(_futs_drg, timeout=20):
             try:
@@ -3467,6 +3476,58 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             signals["event_risk"] = {"ok": True, "value": "캘린더 조회 불가", "trend": ""}
     except Exception:
         signals["event_risk"] = {"ok": True, "value": "N/A", "trend": ""}
+
+    # ── 신호 7·8: 섹터 로테이션 + 시장 폭(breadth) — prefetch 결과 사용 ──
+    # sector-performance-snapshot 1콜로 두 신호 산출. run_drg_predict.py와 동일 로직.
+    try:
+        _snap = _prefetch.get("sector_snap", [])
+        _sec_sig = fx.compute_sector_signals(_snap)
+        if _sec_sig:
+            _rotation = _sec_sig.get("rotation", float("nan"))
+            _neg_frac = _sec_sig.get("neg_frac", float("nan"))
+            _def_avg = _sec_sig.get("def_avg", float("nan"))
+            _cyc_avg = _sec_sig.get("cyc_avg", float("nan"))
+            _n_total = len(_sec_sig.get("vals", {}))
+            _n_neg = int(round(_neg_frac * _n_total)) if _n_total else 0
+
+            # 신호 7: 섹터 로테이션 (방어주가 경기민감주보다 강하면 리스크오프)
+            _rot_alert = (not np.isnan(_rotation)) and _rotation > 0.3
+            signals["sector_rot"] = {
+                "ok": not _rot_alert,
+                "value": (f"방어 {_def_avg:+.1f}% / 민감 {_cyc_avg:+.1f}%"
+                          if not (np.isnan(_def_avg) or np.isnan(_cyc_avg)) else "N/A"),
+                "trend": (f"스프레드 {_rotation:+.2f}%p" if not np.isnan(_rotation) else ""),
+            }
+            details["섹터 로테이션"] = {
+                "방어주 평균": f"{_def_avg:+.2f}%" if not np.isnan(_def_avg) else "N/A",
+                "경기민감주 평균": f"{_cyc_avg:+.2f}%" if not np.isnan(_cyc_avg) else "N/A",
+                "스프레드": f"{_rotation:+.2f}%p" if not np.isnan(_rotation) else "N/A",
+                "판정": "⚠️ 방어주 로테이션(리스크오프)" if _rot_alert else "✅ 정상",
+            }
+            if _rot_alert:
+                warnings.append(
+                    f"⚠️ 방어주 로테이션 감지 (방어 {_def_avg:+.1f}% > 경기민감 {_cyc_avg:+.1f}%) — 리스크오프 경향"
+                )
+
+            # 신호 8: 시장 폭 (하락 섹터 비중 70% 이상이면 광범위 약세)
+            _br_alert = (not np.isnan(_neg_frac)) and _neg_frac >= 0.7
+            signals["breadth"] = {
+                "ok": not _br_alert,
+                "value": (f"하락 {_neg_frac*100:.0f}%" if not np.isnan(_neg_frac) else "N/A"),
+                "trend": (f"{_n_neg}/{_n_total} 섹터" if _n_total else ""),
+            }
+            details["시장 폭(breadth)"] = {
+                "하락 섹터": f"{_n_neg}/{_n_total} ({_neg_frac*100:.0f}%)" if _n_total else "N/A",
+                "판정": "⚠️ 광범위 약세" if _br_alert else "✅ 정상",
+            }
+            if _br_alert:
+                warnings.append(f"⚠️ 시장 폭 약화 — 전체 섹터의 {_neg_frac*100:.0f}%가 하락")
+        else:
+            signals["sector_rot"] = {"ok": True, "value": "N/A", "trend": ""}
+            signals["breadth"] = {"ok": True, "value": "N/A", "trend": ""}
+    except Exception:
+        signals["sector_rot"] = {"ok": True, "value": "N/A", "trend": ""}
+        signals["breadth"] = {"ok": True, "value": "N/A", "trend": ""}
 
     # ── 뉴스 — prefetch 결과 사용 ────────────────────────────────────────
     news_items = _prefetch.get("news", [])
@@ -11691,7 +11752,7 @@ if st.session_state.get("logged_in"):
         # 🚨 Daily Risk Gauge
         # ─────────────────────────────────────────────────────────────────────
         st.subheader("🚨 Daily Risk Gauge")
-        st.caption("매일 접속 시 시장 선행 신호 6가지를 자동 스캔합니다. 선물 프리마켓·이벤트 캘린더로 당일 장 방향을 장 열기 전에 파악하세요.")
+        st.caption("매일 접속 시 시장 선행 신호 8가지를 자동 스캔합니다. 선물 프리마켓·이벤트 캘린더로 당일 장 방향을 장 열기 전에 파악하세요.")
 
         drg_col1, drg_col2 = st.columns([2, 3])
         with drg_col1:
@@ -11708,7 +11769,7 @@ if st.session_state.get("logged_in"):
             fetch_vix_latest_and_history.clear()
             fetch_fmp_economic_calendar_risk.clear()
 
-        with st.spinner("📡 선행 신호 6가지 동시 분석 중... (약 5~10초)"):
+        with st.spinner("📡 선행 신호 8가지 동시 분석 중... (약 5~10초)"):
             drg = compute_daily_risk_gauge(sector_filter=sector_choice)
 
         risk_score = drg["risk_score"]
@@ -11730,36 +11791,41 @@ if st.session_state.get("logged_in"):
             unsafe_allow_html=True
         )
 
-        st.markdown("### 📡 선행 신호 6가지")
+        st.markdown("### 📡 선행 신호 8가지")
         sig = drg["signals"]
-        s_col1, s_col2, s_col3, s_col4, s_col5, s_col6 = st.columns(6)
         signal_defs = [
-            ("vix",        "VIX 방향",        "🌡️"),
-            ("credit",     "신용 스프레드",    "💳"),
-            ("leaders",    "대장주 모멘텀",    "🏆"),
-            ("futures",    "프리마켓 방향",    "📈"),
-            ("riskoff",    "달러·금·국채",     "🛡️"),
-            ("event_risk", "이벤트 리스크",    "📅"),
+            ("vix",         "VIX 방향",         "🌡️"),
+            ("credit",      "신용 스프레드",     "💳"),
+            ("leaders",     "대장주 모멘텀",     "🏆"),
+            ("futures",     "프리마켓 방향",     "📈"),
+            ("riskoff",     "달러·금·국채",      "🛡️"),
+            ("event_risk",  "이벤트 리스크",     "📅"),
+            ("sector_rot",  "섹터 로테이션",     "🔄"),
+            ("breadth",     "시장 폭",           "📊"),
         ]
-        for col, (key, label, emoji) in zip([s_col1, s_col2, s_col3, s_col4, s_col5, s_col6], signal_defs):
-            with col:
-                s = sig.get(key, {})
-                ok = s.get("ok", True)
-                val = s.get("value", "N/A")
-                trend = s.get("trend", "")
-                status = "✅ 정상" if ok else "⚠️ 경고"
-                color = "#16a34a" if ok else "#dc2626"
-                st.markdown(
-                    f"<div style='text-align:center;padding:10px;background:#1e293b;border-radius:8px;"
-                    f"border:1px solid {color};'>"
-                    f"<div style='font-size:20px'>{emoji}</div>"
-                    f"<div style='font-size:11px;color:#94a3b8'>{label}</div>"
-                    f"<div style='font-weight:700;color:{color}'>{status}</div>"
-                    f"<div style='font-size:11px;color:#cbd5e1'>{val}</div>"
-                    + (f"<div style='font-size:10px;color:#64748b;margin-top:2px'>{trend}</div>" if trend else "")
-                    + f"</div>",
-                    unsafe_allow_html=True
-                )
+        # 8개 신호를 4칸 × 2줄로 표시 (모바일/협소 화면 대응)
+        for _row_start in range(0, len(signal_defs), 4):
+            _row_defs = signal_defs[_row_start:_row_start + 4]
+            _cols = st.columns(len(_row_defs))
+            for col, (key, label, emoji) in zip(_cols, _row_defs):
+                with col:
+                    s = sig.get(key, {})
+                    ok = s.get("ok", True)
+                    val = s.get("value", "N/A")
+                    trend = s.get("trend", "")
+                    status = "✅ 정상" if ok else "⚠️ 경고"
+                    color = "#16a34a" if ok else "#dc2626"
+                    st.markdown(
+                        f"<div style='text-align:center;padding:10px;background:#1e293b;border-radius:8px;"
+                        f"border:1px solid {color};'>"
+                        f"<div style='font-size:20px'>{emoji}</div>"
+                        f"<div style='font-size:11px;color:#94a3b8'>{label}</div>"
+                        f"<div style='font-weight:700;color:{color}'>{status}</div>"
+                        f"<div style='font-size:11px;color:#cbd5e1'>{val}</div>"
+                        + (f"<div style='font-size:10px;color:#64748b;margin-top:2px'>{trend}</div>" if trend else "")
+                        + f"</div>",
+                        unsafe_allow_html=True
+                    )
 
         warnings_drg = drg.get("warnings", [])
         if warnings_drg:
@@ -11927,7 +11993,7 @@ if st.session_state.get("logged_in"):
 
         st.divider()
         st.markdown("### 🤖 AI 내일 시장 예측")
-        st.caption("선행 신호 6가지(선물·달러·금 포함) + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 장 열리기 전(8AM ET / 한국 밤 10시) 실행 권장.")
+        st.caption("선행 신호 8가지(선물·달러·금·섹터 포함) + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 장 열리기 전(8AM ET / 한국 밤 10시) 실행 권장.")
 
         if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
             with st.spinner("최신 데이터 수집 중..."):
@@ -12014,7 +12080,7 @@ if st.session_state.get("logged_in"):
                 "아래 실시간 데이터를 바탕으로 내일 미국 주식시장을 예측하세요.\n\n"
                 f"[현재 시각] {now_kst.strftime('%Y-%m-%d %H:%M')} ET ({market_session})\n"
                 f"[분석 섹터] {sector_choice}\n\n"
-                f"[선행 신호 6가지]\n{signal_summary}\n\n"
+                f"[선행 신호 8가지]\n{signal_summary}\n\n"
                 f"[선물·안전자산 핵심 데이터]\n"
                 f"- {_futures_line}\n"
                 f"- {_riskoff_line}\n\n"
@@ -14292,6 +14358,73 @@ if st.session_state.get("logged_in"):
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
         )
         st.markdown(f"**분석 티커:** `{selected_ticker}`")
+
+        # ── 밸류에이션 정밀 분석 (DCF·목표가 분포·동종업계·매출 세그먼트) ──
+        #    fmp_extras 신규 엔드포인트. 개별 주식에만 표시(ETF 제외).
+        if not is_etf_mode:
+            with st.expander("💰 밸류에이션 정밀 분석 (DCF · 목표가 · 동종업계 · 매출 구성)", expanded=False):
+                _vt = str(selected_ticker).strip().upper()
+                try:
+                    _dcf = fx.fmp_dcf(_vt)
+                    _pts = fx.fmp_price_target_summary(_vt)
+                    _vc1, _vc2 = st.columns(2)
+                    with _vc1:
+                        st.markdown("**DCF 적정주가**")
+                        if _dcf:
+                            st.metric(
+                                "DCF vs 현재가",
+                                f"${_dcf['dcf']:.2f}",
+                                delta=f"{_dcf['gap_pct']:+.1f}% (현재 ${_dcf['price']:.2f})",
+                            )
+                            st.caption(_dcf["verdict"])
+                        else:
+                            st.caption("DCF 데이터 없음 (해당 종목 미지원일 수 있음)")
+                    with _vc2:
+                        st.markdown("**애널리스트 목표가 분포**")
+                        if _pts:
+                            _avg = _pts.get("avg")
+                            st.metric("평균 목표가", f"${_avg:.2f}" if _avg else "N/A")
+                            _lo, _hi = _pts.get("low"), _pts.get("high")
+                            if _lo and _hi:
+                                st.caption(f"범위 ${_lo:.2f} ~ ${_hi:.2f}"
+                                           + (f" · 의견 {int(_pts['count'])}건" if _pts.get("count") else ""))
+                        else:
+                            st.caption("목표가 데이터 없음")
+                except Exception as _ve:
+                    st.warning(f"밸류에이션 조회 실패: {_ve}")
+
+                # 동종업계 peers
+                try:
+                    _peers = fx.fmp_stock_peers(_vt)
+                    if _peers:
+                        st.markdown("**🤝 동종업계 (Peers)**")
+                        st.caption(" · ".join(_peers))
+                except Exception:
+                    pass
+
+                # 매출 세그먼트 (제품별 / 지역별)
+                try:
+                    _prod = fx.fmp_revenue_product_segmentation(_vt)
+                    _geo = fx.fmp_revenue_geographic_segmentation(_vt)
+                    _sc1, _sc2 = st.columns(2)
+                    with _sc1:
+                        if _prod:
+                            st.markdown("**📦 제품별 매출 비중**")
+                            _pdf = pd.DataFrame(
+                                sorted(_prod.items(), key=lambda x: x[1], reverse=True)[:8],
+                                columns=["제품", "비중%"],
+                            )
+                            st.dataframe(_pdf, hide_index=True, use_container_width=True)
+                    with _sc2:
+                        if _geo:
+                            st.markdown("**🌍 지역별 매출 비중**")
+                            _gdf = pd.DataFrame(
+                                sorted(_geo.items(), key=lambda x: x[1], reverse=True)[:8],
+                                columns=["지역", "비중%"],
+                            )
+                            st.dataframe(_gdf, hide_index=True, use_container_width=True)
+                except Exception:
+                    pass
 
         # ── 회사 기본 정보 ────────────────────────────────────────────────
         try:
