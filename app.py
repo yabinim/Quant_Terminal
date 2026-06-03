@@ -4293,6 +4293,160 @@ def _fmp_sector_pe_snapshot() -> list:
     return []
 
 
+# ── 섹터 강도 표(3층) 전용 매핑/헬퍼 ────────────────────────────────────────
+# FMP sector-pe-snapshot 섹터명 → SPDR GICS 섹터 ETF 티커
+_FMP_SECTOR_NAME_TO_TICKER = {
+    "Technology": "XLK",
+    "Communication Services": "XLC",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Energy": "XLE",
+    "Financial Services": "XLF",
+    "Healthcare": "XLV",
+    "Industrials": "XLI",
+    "Basic Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+}
+
+# 부모 GICS 섹터 ETF → 하위 테마/세부산업 ETF [(티커, 한글라벨)]. 수익률 순 정렬은 호출부에서.
+# (테마가 3개 미만이면 테마 표는 생략하고 부모 ETF로 바로 종목 분석)
+_SECTOR_THEME_ETFS = {
+    "XLK":  [("SOXX", "반도체"), ("IGV", "소프트웨어"), ("CIBR", "사이버보안"), ("SKYY", "클라우드"), ("BOTZ", "AI·로봇")],
+    "XLV":  [("XBI", "바이오테크"), ("IHI", "의료기기"), ("IHF", "의료서비스"), ("PPH", "제약"), ("GNOM", "유전체")],
+    "XLE":  [("XOP", "탐사·생산"), ("OIH", "오일서비스"), ("URA", "우라늄/원자력"), ("TAN", "태양광"), ("AMLP", "미드스트림")],
+    "XLI":  [("ITA", "방산·항공"), ("JETS", "항공"), ("IYT", "운송"), ("PAVE", "인프라"), ("UFO", "우주")],
+    "XLF":  [("KRE", "지방은행"), ("KBE", "은행"), ("KIE", "보험"), ("IAI", "증권·브로커"), ("FINX", "핀테크")],
+    "XLY":  [("XRT", "소매"), ("ITB", "주택건설"), ("IBUY", "온라인소매"), ("PEJ", "레저·여행"), ("BETZ", "게이밍·베팅")],
+    "XLB":  [("GDX", "금광"), ("COPX", "구리광"), ("LIT", "리튬·배터리"), ("SLX", "철강"), ("WOOD", "목재")],
+    "XLRE": [("VNQ", "리츠 광범위"), ("REZ", "주거 리츠"), ("SRVR", "데이터센터 리츠"), ("INDS", "산업 리츠"), ("REM", "모기지 리츠")],
+    "XLC":  [("FDN", "인터넷"), ("SOCL", "소셜미디어"), ("ESPO", "게임·e스포츠")],
+    "XLU":  [("GRID", "스마트그리드"), ("NLR", "원자력")],
+    "XLP":  [],
+}
+
+
+@st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
+def _fmp_etf_holdings(etf_ticker: str, top_n: int = 30) -> list:
+    """FMP /etf/holdings — ETF 구성종목 상위 top_n [(심볼, 비중%)] (비중 내림차순)."""
+    t = str(etf_ticker or "").strip().upper()
+    k = _fmp_key()
+    if not t or not k:
+        return []
+    try:
+        r = requests.get(f"{_FMP_BASE}/etf/holdings?symbol={t}&apikey={k}", timeout=_FMP_TIMEOUT)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        rows = []
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            sym = str(it.get("asset") or it.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            w = to_float(it.get("weightPercentage") or it.get("weight") or it.get("pctVal"))
+            rows.append((sym, float(w) if pd.notna(w) else 0.0))
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return rows[:top_n]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
+def _fmp_batch_pe(symbols_tuple: tuple) -> dict:
+    """여러 심볼의 현재 PER(quote.pe)를 batch-quote로 일괄 조회 → {symbol: pe(float|None)}."""
+    syms = [str(s).strip().upper() for s in symbols_tuple if str(s).strip()]
+    if not syms:
+        return {}
+    k = _fmp_key()
+    if not k:
+        return {}
+    out = {}
+    try:
+        for i in range(0, len(syms), 50):
+            chunk = ",".join(syms[i:i + 50])
+            r = requests.get(f"{_FMP_BASE}/batch-quote?symbols={chunk}&apikey={k}", timeout=_FMP_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                sym = str(it.get("symbol") or "").strip().upper()
+                if not sym:
+                    continue
+                pe = to_float(it.get("pe") if it.get("pe") is not None else it.get("peRatio"))
+                out[sym] = float(pe) if pd.notna(pe) else None
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
+def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
+    """
+    선택 ETF의 구성종목을 라이브로 받아(FMP /etf/holdings) 2개 표를 만든다.
+      - 주도주(Alpha Leaders): 1개월 수익률 상위 5
+      - 저평가 후발주(Undervalued Laggards): 자유낙하 제외(1M>-20%) + 흑자(PER>0)
+        + 저PER(섹터 중간 PER 또는 구성종목 중간값 미만) 중에서 수익률 하위(따라잡을 여지) → 싼 순 5
+    반환: (leaders_df, laggards_df) — 각 [Ticker, 1-Month (%), PER] (문자열 포맷)
+    """
+    empty = pd.DataFrame(columns=["Ticker", "1-Month (%)", "PER"])
+    holdings = _fmp_etf_holdings(etf_ticker, top_n=30)
+    # 미국 보통주 위주: 해외 접미사(.NS/.TO 등) 제외
+    syms = [s for s, _w in holdings if "." not in s]
+    syms = list(dict.fromkeys(syms))[:30]
+    if len(syms) < 3:
+        return empty, empty
+
+    ret_df = cached_pool_monthly_returns(tuple(syms))  # [Ticker, 1-Month (%)] desc
+    if ret_df is None or ret_df.empty:
+        return empty, empty
+    pe_map = _fmp_batch_pe(tuple(syms))
+
+    df = ret_df.copy()
+    df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
+    df["_ret"] = pd.to_numeric(df["1-Month (%)"], errors="coerce")
+    df["_pe"] = df["Ticker"].map(lambda s: pe_map.get(s))
+    df["_pe"] = pd.to_numeric(df["_pe"], errors="coerce")
+    df = df.dropna(subset=["_ret"]).copy()
+    if df.empty:
+        return empty, empty
+
+    # ── 주도주: 1개월 수익률 상위 5 ──
+    leaders = df.sort_values("_ret", ascending=False).head(5).copy()
+
+    # ── 저평가 후발주 ──
+    cand = df[df["_ret"] > -20.0].copy()                       # 1) 자유낙하 제외
+    cand = cand[cand["_pe"] > 0].copy()                        # 2) 흑자(PER>0)
+    med = sector_median_pe if (sector_median_pe and sector_median_pe > 0) else cand["_pe"].median()
+    if pd.notna(med):
+        cand = cand[cand["_pe"] < med].copy()                  # 3) 저PER(중간값 미만)
+    if not cand.empty:
+        ret_cut = df["_ret"].quantile(0.6)                     # 4) 수익률 하위(따라잡을 여지)
+        cand = cand[cand["_ret"] <= ret_cut]
+    laggards = cand.sort_values("_pe", ascending=True).head(5).copy()
+
+    def _fmt(_d):
+        if _d.empty:
+            return empty
+        o = pd.DataFrame({
+            "Ticker": _d["Ticker"].values,
+            "1-Month (%)": pd.to_numeric(_d["_ret"], errors="coerce").map(
+                lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A"),
+            "PER": pd.to_numeric(_d["_pe"], errors="coerce").map(
+                lambda x: f"{x:.1f}x" if pd.notna(x) else "N/A"),
+        })
+        return o.reset_index(drop=True)
+
+    return _fmt(leaders), _fmt(laggards)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fmp_earnings_transcript(ticker: str) -> dict:
     """FMP /earning-call-transcript — 직전 분기 어닝콜 원문.
@@ -13832,64 +13986,67 @@ if st.session_state.get("logged_in"):
                     st.info("정리 대상 ETF가 없어요. 리스트 품질이 좋은 상태예요.")
 
         st.subheader(f"{_MAIN_NAV_OPTIONS[3]} · 섹터 ETF 상대 강도")
-        st.caption("주요 섹터/테마 ETF 상대 강도 점검 (최근 1년 수익률 기준)")
-    
+        st.caption(
+            "미국 시장 GICS 11개 대형 섹터의 상대 강도 + 현재 PER을 한눈에 보고 (최근 1년 수익률 기준), "
+            "섹터를 골라 테마 ETF → 주도주·저평가 후발주까지 내려갈 수 있어요."
+        )
+
         sector_etfs = [
             ("XLK", "기술"),
+            ("XLC", "통신"),
+            ("XLY", "자유소비재"),
+            ("XLP", "필수소비재"),
             ("XLV", "헬스케어"),
             ("XLF", "금융"),
             ("XLE", "에너지"),
-            ("XLY", "자유소비재"),
             ("XLI", "산업재"),
-            ("XLC", "통신"),
-            ("XLU", "유틸리티"),
-            ("XLRE", "부동산"),
             ("XLB", "소재"),
-            ("UFO", "우주항공"),
-            ("SOXX", "반도체"),
-            ("URA", "원자력/우라늄"),
-            ("BOTZ", "AI 및 로봇"),
-            ("XBI", "바이오테크"),
-            ("IWM", "중소형주/러셀2000"),
-            ("GLD", "금/안전자산"),
-            ("ITA", "방산/항공"),
-            ("CIBR", "사이버보안"),
-            ("INDA", "인도 시장"),
-            ("IBIT", "비트코인 현물"),
+            ("XLRE", "부동산"),
+            ("XLU", "유틸리티"),
         ]
         sector_tickers = [ticker for ticker, _ in sector_etfs]
+        # 꺾임 스캔의 '보유 종목 → 섹터 ETF' 매핑에 사용 (GICS 11개 대표 보유종목)
         sector_holdings_map = {
             "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "ADBE", "CRM", "AMD", "CSCO", "INTU", "QCOM", "AMAT", "TXN", "NOW", "IBM"],
+            "XLC": ["GOOGL", "META", "NFLX", "TMUS", "DIS", "VZ", "T", "CHTR", "CMCSA", "EA", "TTWO", "FOXA", "WBD", "DASH", "SPOT"],
+            "XLY": ["AMZN", "TSLA", "HD", "MCD", "BKNG", "LOW", "NKE", "SBUX", "TJX", "CMG", "RCL", "MAR", "GM", "F", "ORLY"],
+            "XLP": ["COST", "WMT", "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL", "TGT", "KMB", "GIS", "KVUE", "KHC", "STZ"],
             "XLV": ["LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE", "TMO", "DHR", "AMGN", "GILD", "BMY", "ISRG", "VRTX", "SYK", "CVS"],
             "XLF": ["JPM", "BRK-B", "V", "MA", "BAC", "WFC", "GS", "MS", "SCHW", "BLK", "AXP", "C", "PGR", "AIG", "USB"],
             "XLE": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "KMI", "HAL", "BKR", "DVN", "FANG", "WMB"],
-            "XLY": ["AMZN", "TSLA", "HD", "MCD", "BKNG", "LOW", "NKE", "SBUX", "TJX", "CMG", "RCL", "MAR", "GM", "F", "ORLY"],
             "XLI": ["GE", "CAT", "RTX", "HON", "UNP", "LMT", "DE", "ETN", "BA", "NOC", "UPS", "FDX", "WM", "EMR", "ITW"],
-            "XLC": ["GOOGL", "META", "NFLX", "TMUS", "DIS", "VZ", "T", "CHTR", "CMCSA", "EA", "TTWO", "FOXA", "WBD", "DASH", "SPOT"],
-            "XLU": ["NEE", "SO", "DUK", "CEG", "AEP", "EXC", "SRE", "XEL", "D", "PCG", "PEG", "ED", "EIX", "WEC", "ETR"],
-            "XLRE": ["AMT", "PLD", "EQIX", "SPG", "O", "WELL", "PSA", "DLR", "CCI", "CBRE", "VICI", "AVB", "EQR", "ESS", "EXR"],
             "XLB": ["LIN", "APD", "SHW", "ECL", "NUE", "FCX", "DOW", "DD", "CTVA", "NEM", "MLM", "VMC", "PPG", "LYB", "MOS"],
-            "UFO": ["PLTR", "RKLB", "LHX", "RTX", "NOC", "BA", "AJRD", "IRDM", "SPIR", "SATL", "ASTS", "MAXR", "MDA", "BKSY", "VSAT"],
-            "SOXX": ["NVDA", "AVGO", "AMD", "MU", "TXN", "AMAT", "QCOM", "INTC", "ASML", "LRCX", "KLAC", "ADI", "MCHP", "ON", "NXPI"],
-            "URA": ["CCJ", "BWXT", "UUUU", "SMR", "NXE", "LEU", "LTBR", "DNN", "UEC", "URNM", "CVI", "RYCEY", "FLR", "GEV", "CEG"],
-            "BOTZ": ["NVDA", "ABB", "ISRG", "PATH", "SYM", "ROK", "FANUY", "TER", "OMCL", "CGNX", "IRBT", "UI", "ROBO", "NARI", "MDT"],
-            "XBI": ["GILD", "BIIB", "REGN", "VRTX", "ALNY", "MRNA", "BNTX", "AMGN", "ILMN", "SRPT", "CRSP", "EXEL", "NBIX", "INCY", "ARGX"],
-            "IWM": ["SMCI", "CRWD", "INSM", "CELH", "DKNG", "PLTR", "RKLB", "APP", "SFM", "ONTO", "TMDX", "NXT", "FSLY", "CVNA", "UPST"],
-            "GLD": ["GLD", "IAU", "GDX", "NEM", "AEM", "GOLD", "WPM", "RGLD", "FNV", "KGC", "AU", "BTG", "SSRM", "PAAS", "AGI"],
-            "ITA": ["RTX", "LMT", "NOC", "GD", "BA", "HII", "TXT", "TDG", "HEI", "KTOS", "AVAV", "LDOS", "LHX", "CW", "MRCY"],
-            "CIBR": ["CRWD", "PANW", "FTNT", "ZS", "CYBR", "OKTA", "GEN", "CHKP", "TENB", "RPD", "S", "NET", "DDOG", "AKAM", "QLYS"],
-            "INDA": ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS", "LT.NS", "BHARTIARTL.NS", "SBIN.NS", "ITC.NS", "HINDUNILVR.NS", "AXISBANK.NS", "MARUTI.NS", "SUNPHARMA.NS", "KOTAKBANK.NS", "BAJFINANCE.NS"],
-            "IBIT": ["IBIT", "COIN", "MSTR", "MARA", "RIOT", "CLSK", "HUT", "BITF", "BTDR", "CIFR", "WULF", "IREN", "CORZ", "GLXY.TO", "HIVE"],
+            "XLRE": ["AMT", "PLD", "EQIX", "SPG", "O", "WELL", "PSA", "DLR", "CCI", "CBRE", "VICI", "AVB", "EQR", "ESS", "EXR"],
+            "XLU": ["NEE", "SO", "DUK", "CEG", "AEP", "EXC", "SRE", "XEL", "D", "PCG", "PEG", "ED", "EIX", "WEC", "ETR"],
         }
-    
+
         try:
             with st.spinner("섹터 ETF 데이터를 불러오는 중..."):
                 close_df = cached_sector_etf_closes(tuple(sector_tickers))
             sector_returns_df = build_sector_returns_table(close_df, sector_etfs)
-    
+
+            # ── 섹터 현재 PER 매핑 (FMP sector-pe-snapshot) ──
+            with st.spinner("섹터 PER 조회 중..."):
+                _spe_data = _fmp_sector_pe_snapshot()
+            pe_by_ticker = {}
+            _sector_median_pe = None
+            if _spe_data:
+                _pe_vals = []
+                for _sp in _spe_data:
+                    _nm = str(_sp.get("sector") or "").strip()
+                    _pe = to_float(_sp.get("pe") or _sp.get("peRatio"))
+                    _tk = _FMP_SECTOR_NAME_TO_TICKER.get(_nm)
+                    if _tk and pd.notna(_pe) and _pe > 0:
+                        pe_by_ticker[_tk] = round(float(_pe), 1)
+                        _pe_vals.append(float(_pe))
+                if _pe_vals:
+                    _sector_median_pe = round(float(np.median(_pe_vals)), 1)
+
             if sector_returns_df.empty:
                 st.warning("섹터 수익률 테이블을 생성할 수 없습니다. 데이터 제공 상태를 확인해주세요.")
             else:
+                sector_returns_df = sector_returns_df.copy()
+                sector_returns_df["현재 PER"] = sector_returns_df["Ticker"].map(pe_by_ticker)
                 perf_cols = ["1-Week (%)", "1-Month (%)", "3-Month (%)", "6-Month (%)", "1-Year (%)"]
                 st.info(
                     "🟩 진한 초록: 거대 자본 유입 (강한 매수세/대세 상승)\n"
@@ -13898,124 +14055,99 @@ if st.session_state.get("logged_in"):
                     "💡 [Tip] 1개월과 3개월이 모두 진한 초록색인 섹터가 진짜 '장기 주도 섹터'입니다. "
                     "이번 주(1-Week)만 빨간색이라면 훌륭한 분할 매수(조정) 기회일 수 있습니다."
                 )
+                _fmt_map = {c: "{:.2f}%" for c in perf_cols}
+                _fmt_map["현재 PER"] = "{:.1f}x"
                 styled = (
-                    sector_returns_df.style.format(
-                        {
-                            "1-Week (%)": "{:.2f}%",
-                            "1-Month (%)": "{:.2f}%",
-                            "3-Month (%)": "{:.2f}%",
-                            "6-Month (%)": "{:.2f}%",
-                            "1-Year (%)": "{:.2f}%",
-                        },
-                        na_rep="N/A",
-                    )
-                    .background_gradient(
-                        cmap="RdYlGn",
-                        subset=perf_cols,
-                        axis=0,
-                    )
+                    sector_returns_df.style.format(_fmt_map, na_rep="N/A")
+                    .background_gradient(cmap="RdYlGn", subset=perf_cols, axis=0)
+                    .background_gradient(cmap="RdYlGn_r", subset=["현재 PER"], vmin=10, vmax=50)
                 )
-                st.dataframe(styled, use_container_width=True, hide_index=True, height=560)
-    
+                st.dataframe(styled, use_container_width=True, hide_index=True, height=420)
+
+                if _sector_median_pe:
+                    st.caption(
+                        f"📊 섹터 중간 PER: {_sector_median_pe:.1f}x · 낮을수록(초록) 밸류에이션 매력, "
+                        "높을수록(빨강) 부담. RS가 강해도 PER이 과열이면 신중하게 접근하세요."
+                    )
+
                 missing_cells = int(sector_returns_df[perf_cols].isna().sum().sum())
                 if missing_cells > 0:
-                    st.info("일부 ETF는 거래일 부족 또는 데이터 누락으로 일부 기간 수익률이 N/A로 표시됩니다.")
+                    st.caption("일부 ETF는 거래일 부족 또는 데이터 누락으로 일부 기간 수익률이 N/A로 표시됩니다.")
 
-                # ── 섹터 PER 스냅샷 ──────────────────────────────────────────
+                # ── 드릴다운: 섹터 → 테마 ETF → 주도주·저평가 후발주 ──
                 st.divider()
-                st.markdown("### 💰 섹터별 현재 PER (Sector P/E Snapshot)")
-                st.caption("FMP sector-pe-snapshot 기준. RS 강한 섹터라도 PER이 지나치게 높으면 신중하게 접근하세요.")
-                with st.spinner("섹터 PER 데이터 조회 중..."):
-                    _spe_data = _fmp_sector_pe_snapshot()
-                if _spe_data:
-                    _spe_rows = []
-                    for _sp in _spe_data:
-                        _sp_pe = to_float(_sp.get("pe") or _sp.get("pe_ratio") or _sp.get("peRatio"))
-                        _sp_sec = str(_sp.get("sector") or "")
-                        if _sp_sec and pd.notna(_sp_pe) and _sp_pe > 0:
-                            _spe_rows.append({"섹터": _sp_sec, "현재 PER": round(_sp_pe, 1)})
-                    if _spe_rows:
-                        _spe_df = pd.DataFrame(_spe_rows).sort_values("현재 PER", ascending=True).reset_index(drop=True)
-                        _spe_styled = (
-                            _spe_df.style
-                            .format({"현재 PER": "{:.1f}x"})
-                            .background_gradient(cmap="RdYlGn_r", subset=["현재 PER"], vmin=10, vmax=50)
-                        )
-                        st.dataframe(_spe_styled, use_container_width=True, hide_index=True)
-                        _median_pe = _spe_df["현재 PER"].median()
-                        st.caption(f"📊 섹터 중간 PER: {_median_pe:.1f}x  |  낮을수록 밸류에이션 매력 높음 (초록), 높을수록 부담 (빨강)")
-                    else:
-                        st.caption("PER 데이터를 파싱할 수 없습니다.")
-                else:
-                    st.caption("섹터 PER 데이터를 조회할 수 없습니다.")
-
-                st.divider()
-                selected_sector_etf = st.selectbox(
-                    "세부 종목을 확인하고 싶은 섹터를 선택하세요",
-                    options=sector_tickers,
+                st.markdown("#### 🔬 섹터 → 테마 ETF → 종목 드릴다운")
+                _label_to_ticker = {lbl: tk for tk, lbl in sector_etfs}
+                _sel_label = st.selectbox(
+                    "① 세부 분석할 섹터",
+                    options=[lbl for _, lbl in sector_etfs],
                     index=0,
-                    key="sector_holdings_select",
+                    key="t1_sector_select",
                 )
-    
-                selected_row = sector_returns_df[sector_returns_df["Ticker"] == selected_sector_etf]
-                selected_1m_return = (
-                    pd.to_numeric(selected_row["1-Month (%)"], errors="coerce").iloc[0]
-                    if not selected_row.empty
-                    else np.nan
-                )
-    
-                selected_holdings = sector_holdings_map.get(selected_sector_etf, [])
-                if not selected_holdings:
-                    st.warning("선택한 섹터 ETF에 대한 세부 종목 데이터가 없습니다.")
+                _sel_sector = _label_to_ticker.get(_sel_label, sector_tickers[0])
+                _themes = _SECTOR_THEME_ETFS.get(_sel_sector, [])
+
+                # Tier 2: 하위 테마 ETF 상대 강도 (테마 3개 이상일 때만 표시)
+                if len(_themes) >= 3:
+                    _theme_pairs = [(tk, lbl) for tk, lbl in _themes]
+                    with st.spinner(f"{_sel_label} 하위 테마 ETF 수익률 계산 중..."):
+                        _theme_close = cached_sector_etf_closes(tuple([tk for tk, _ in _theme_pairs]))
+                        _theme_df = build_sector_returns_table(_theme_close, _theme_pairs)
+                    if _theme_df is not None and not _theme_df.empty:
+                        _theme_df = _theme_df.sort_values(
+                            "1-Month (%)", ascending=False, na_position="last"
+                        ).reset_index(drop=True)
+                        st.markdown(f"**②  `{_sel_sector}` 안의 테마 ETF 상대 강도** (1개월 수익률 순)")
+                        _theme_styled = (
+                            _theme_df.style.format({c: "{:.2f}%" for c in perf_cols}, na_rep="N/A")
+                            .background_gradient(cmap="RdYlGn", subset=perf_cols, axis=0)
+                        )
+                        st.dataframe(_theme_styled, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("테마 ETF 수익률을 계산할 수 없습니다.")
+                elif _themes:
+                    st.caption(f"`{_sel_sector}`는 하위 테마 ETF가 적어({len(_themes)}개) 테마 표는 생략하고 ETF를 바로 선택합니다.")
                 else:
-                    if pd.isna(selected_1m_return):
-                        st.markdown("### 세부 종목 (섹터 1개월 수익률 데이터 없음)")
+                    st.caption(f"`{_sel_sector}`는 마땅한 하위 테마 ETF가 없어 부모 ETF로 바로 종목을 분석합니다.")
+
+                # ③ 종목 분석할 ETF 선택 (부모 섹터 ETF + 하위 테마)
+                _etf_options = [_sel_sector] + [tk for tk, _ in _themes]
+                _etf_label_map = {_sel_sector: f"{_sel_sector} · {_sel_label} (섹터 대표)"}
+                for tk, lbl in _themes:
+                    _etf_label_map[tk] = f"{tk} · {lbl}"
+                _sel_etf = st.selectbox(
+                    "③ 주도주·저평가 후발주를 볼 ETF",
+                    options=_etf_options,
+                    format_func=lambda t: _etf_label_map.get(t, t),
+                    index=0,
+                    key="t3_etf_select",
+                )
+
+                # Tier 3: 주도주 + 저평가 후발주 (라이브 구성종목)
+                with st.spinner(f"{_sel_etf} 구성종목 분석 중 (라이브)..."):
+                    _leaders_df, _lagg_df = cached_etf_tier3_analysis(_sel_etf, _sector_median_pe)
+
+                _lead_col, _lag_col = st.columns(2)
+                with _lead_col:
+                    st.markdown("##### 🚀 진짜 주도주 (Alpha Leaders)")
+                    st.caption("1개월 수익률 상위 — 모멘텀 1등")
+                    if _leaders_df is not None and not _leaders_df.empty:
+                        st.dataframe(_leaders_df, use_container_width=True, hide_index=True)
                     else:
-                        st.markdown(f"선택 섹터 ETF `{selected_sector_etf}` 1-Month 수익률: **{selected_1m_return:.2f}%**")
-    
-                    with st.spinner(f"{selected_sector_etf} 세부 종목 1개월 수익률 계산 중..."):
-                        pool_returns_df = cached_pool_monthly_returns(tuple(dict.fromkeys(selected_holdings)))
-    
-                    if pool_returns_df.empty or pool_returns_df["1-Month (%)"].isna().all():
-                        st.warning("선택한 섹터의 세부 종목 수익률을 계산할 수 없습니다.")
+                        st.info("구성종목 수익률을 계산할 수 없습니다.")
+                with _lag_col:
+                    st.markdown("##### 💎 저평가 후발주 (Undervalued Laggards)")
+                    st.caption("흑자(PER>0)·저PER·비(非)자유낙하 — 2·3차 수혜 후보")
+                    if _lagg_df is not None and not _lagg_df.empty:
+                        st.dataframe(_lagg_df, use_container_width=True, hide_index=True)
                     else:
-                        leaders_df = pool_returns_df.head(5).copy()
-                        laggards_df = (
-                            pool_returns_df.sort_values("1-Month (%)", ascending=True, na_position="last")
-                            .head(5)
-                            .copy()
-                        )
-    
-                        leaders_df["1-Month (%)"] = leaders_df["1-Month (%)"].map(
-                            lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A"
-                        )
-                        laggards_df["1-Month (%)"] = laggards_df["1-Month (%)"].map(
-                            lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A"
-                        )
-    
-                        leader_col, laggard_col = st.columns(2)
-                        with leader_col:
-                            st.markdown("### 현재 섹터의 진짜 주도주 (Alpha Leaders)")
-                            st.dataframe(leaders_df, use_container_width=True, hide_index=True)
-                        with laggard_col:
-                            st.markdown("### 현재 섹터의 낙폭 과대주 (Laggards)")
-                            st.dataframe(laggards_df, use_container_width=True, hide_index=True)
-    
-                        top_ticker = leaders_df.iloc[0]["Ticker"] if not leaders_df.empty else None
-                        top_return = leaders_df.iloc[0]["1-Month (%)"] if not leaders_df.empty else None
-                        if top_ticker and top_return:
-                            st.success(
-                                f"이 종목들 중 1-Month 수익률이 가장 높은 종목이 Ryan님의 2단계 전략인 "
-                                f"'진짜 1등(Leader)'입니다. (현재: {top_ticker}, {top_return})"
-                            )
-                        else:
-                            st.info("이 종목들 중 1-Month 수익률이 가장 높은 종목이 Ryan님의 2단계 전략인 '진짜 1등(Leader)'입니다.")
-    
-                    st.info(
-                        "여기서 확인한 종목 티커를 왼쪽 사이드바에 입력한 뒤, "
-                        f"「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털과 매수 타점을 순서대로 확인하세요."
-                    )
-    
+                        st.info("조건(흑자·저PER·비자유낙하)을 만족하는 후발주가 없습니다.")
+
+                st.info(
+                    "🚀 주도주는 추세에 올라타고, 💎 저평가 후발주는 2·3차 수혜를 노리는 종목입니다. "
+                    f"티커를 사이드바에 입력한 뒤 「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털·매수 타점을 확인하세요."
+                )
+
         except Exception as e:
             st.error("섹터 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
