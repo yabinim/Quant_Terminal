@@ -294,50 +294,76 @@ def delete_thesis_row(user_id: str, ticker: str, thesis_title: str) -> tuple[boo
         return False, str(exc)
 
 
+# ── 내러티브 테마 → 대표 카테고리 분류기 (일관성 점수 탭 + Thesis 태깅 공용) ──
+# 앞 10개는 기존 일관성 탭 분류 그대로(순서 유지 → 과거 분류 불변), 뒤 5개는 누락 보강(append-only).
+_THEME_KEYWORD_MAP = [
+    (["AI", "인공지능", "Artificial"],            "🤖 AI / 인공지능"),
+    (["반도체", "Semiconductor", "Chip", "칩"],    "💾 반도체"),
+    (["클라우드", "Cloud", "데이터센터"],           "☁️ 클라우드 / 데이터센터"),
+    (["에너지", "Energy", "원자력", "Nuclear"],     "⚡ 에너지"),
+    (["방산", "Defense", "항공우주", "Aerospace"],  "🛡️ 방산 / 항공우주"),
+    (["바이오", "Bio", "헬스", "Health", "제약"],   "💊 바이오 / 헬스케어"),
+    (["금융", "Finance", "Bank", "은행"],           "🏦 금융"),
+    (["소비재", "Consumer", "리테일", "Retail"],    "🛒 소비재 / 리테일"),
+    (["인프라", "Infra", "산업재", "Industrial"],   "🏗️ 인프라 / 산업재"),
+    (["지정학", "Geo", "무역", "Trade", "관세"],    "🌍 지정학 / 무역"),
+    # ── 이하 보강(append-only): 기존에 매칭 안 돼 제목으로 떨어지던 테마만 흡수 ──
+    (["사이버", "Cyber", "Cybersecurity"],          "🔒 사이버보안"),
+    (["위성", "Satellite", "우주", "Space"],        "🚀 우주 / 위성"),
+    (["소재", "원자재", "Material", "Metal", "구리", "리튬", "광산", "Commodity"], "🪨 소재 / 원자재"),
+    (["유틸리티", "Utility", "전력", "Power"],       "🔌 유틸리티 / 전력"),
+    (["통신", "미디어", "Telecom", "Media", "콘텐츠"], "📡 통신 / 미디어"),
+]
+
+
+def classify_theme_category(title: str) -> str:
+    """내러티브 테마 제목 → 대표 카테고리 라벨. 매칭되는 카테고리가 없으면 ''(빈 문자열)."""
+    t_upper = str(title or "").upper()
+    for keywords, label in _THEME_KEYWORD_MAP:
+        if any(kw.upper() in t_upper for kw in keywords):
+            return label
+    return ""
+
+
 def get_thesis_options_from_narratives(user_id: str) -> list[dict]:
-    """최근 내러티브에서 Thesis 선택 옵션 생성 (최신 10개 테마)."""
+    """최근 14일 내러티브 테마를 대표 카테고리로 묶어 빈도순 Thesis 옵션을 만든다.
+    반환: [{label '🤖 AI / 인공지능 (31회)', thesis_title, narrative_category, narrative_date}] (빈도 내림차순)."""
     records, _ = fetch_narrative_records_from_sheet()
     if not records:
         return []
     uid_u = str(user_id).strip().upper()
-    options = []
-    seen = set()
-    for rec in reversed(records):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+    counts = {}
+    latest_dt = {}
+    for rec in records:
         if str(rec.get("_sheet_user_id", "")).strip().upper() != uid_u:
             continue
+        dt = _narrative_parse_saved_at_utc(rec.get("saved_at", ""))
+        if dt and dt < cutoff:
+            continue
         analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
-        saved_at = rec.get("saved_at", "")
-        date_str = ""
-        try:
-            dt = _narrative_parse_saved_at_utc(saved_at)
-            if dt:
-                date_str = dt.astimezone(_MARKET_ET_TZ).strftime("%m/%d")
-        except Exception:
-            pass
-        category = str(analysis.get("source") or "market_narrative").strip()
         themes = analysis.get("themes", [])
         if not isinstance(themes, list):
             themes = []
-        for theme in themes[:5]:
+        for theme in themes:
             if not isinstance(theme, dict):
                 continue
-            title = str(theme.get("title", "") or "").strip()
-            if not title:
+            cat = classify_theme_category(str(theme.get("title", "") or ""))
+            if not cat:
                 continue
-            key = "".join(ch for ch in title.lower() if ch.isalnum())  # 날짜 무시·정규화 → 같은 테마 1회만(최신 유지)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            options.append({
-                "label": f"[{date_str}] {title}",
-                "thesis_title": title,
-                "narrative_category": category,
-                "narrative_date": date_str,
-            })
-            if len(options) >= 6:
-                break
-        if len(options) >= 6:
-            break
+            counts[cat] = counts.get(cat, 0) + 1
+            if dt and (cat not in latest_dt or dt > latest_dt[cat]):
+                latest_dt[cat] = dt
+    options = []
+    for cat, cnt in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+        ld = latest_dt.get(cat)
+        date_str = ld.astimezone(_MARKET_ET_TZ).strftime("%m/%d") if ld else ""
+        options.append({
+            "label": f"{cat} ({cnt}회)",
+            "thesis_title": cat,
+            "narrative_category": cat,
+            "narrative_date": date_str,
+        })
     return options
 
 
@@ -374,9 +400,10 @@ def find_thesis_for_ticker(user_id: str, ticker: str) -> dict | None:
             if tk_u in w or tk_u in e:
                 title = str(theme.get("title", "") or "").strip()
                 if title:
+                    cat = classify_theme_category(title) or title[:30]
                     return {
-                        "thesis_title": title,
-                        "narrative_category": category,
+                        "thesis_title": cat,
+                        "narrative_category": cat,
                         "narrative_date": date_str,
                         "where": "Winners" if tk_u in w else "Emerging",
                     }
@@ -3929,27 +3956,7 @@ def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14)
     반환: {"top_themes": [(theme, count)], "top_tickers": [(ticker, count)],
            "consistency_score": 0~100}
     """
-    # 테마 키워드 정규화 맵: 포함 키워드 → 대표 테마명
-    _THEME_KEYWORD_MAP = [
-        (["AI", "인공지능", "Artificial"],          "🤖 AI / 인공지능"),
-        (["반도체", "Semiconductor", "Chip", "칩"],  "💾 반도체"),
-        (["클라우드", "Cloud", "데이터센터"],         "☁️ 클라우드 / 데이터센터"),
-        (["에너지", "Energy", "원자력", "Nuclear"],   "⚡ 에너지"),
-        (["방산", "Defense", "항공우주", "Aerospace"],"🛡️ 방산 / 항공우주"),
-        (["바이오", "Bio", "헬스", "Health", "제약"], "💊 바이오 / 헬스케어"),
-        (["금융", "Finance", "Bank", "은행"],         "🏦 금융"),
-        (["소비재", "Consumer", "리테일", "Retail"],  "🛒 소비재 / 리테일"),
-        (["인프라", "Infra", "산업재", "Industrial"], "🏗️ 인프라 / 산업재"),
-        (["지정학", "Geo", "무역", "Trade", "관세"],  "🌍 지정학 / 무역"),
-    ]
-
-    def _normalize_theme(title: str) -> str:
-        t_upper = str(title).upper()
-        for keywords, label in _THEME_KEYWORD_MAP:
-            if any(kw.upper() in t_upper for kw in keywords):
-                return label
-        return str(title)[:30]  # 매칭 안 되면 원본 앞 30자
-
+    # 테마 분류는 모듈 레벨 classify_theme_category() 공용 (Thesis 태깅과 동일 기준)
     try:
         records, _ = fetch_narrative_records_from_sheet()
         if not records:
@@ -3975,7 +3982,7 @@ def calculate_narrative_consistency_score(user_id: str, lookback_days: int = 14)
             themes = analysis.get("themes", [])
             for t in themes:
                 if isinstance(t, dict) and t.get("title"):
-                    normalized = _normalize_theme(str(t["title"]))
+                    normalized = classify_theme_category(str(t["title"])) or str(t["title"])[:30]
                     theme_counter[normalized] += 1
 
             # 티커: Winners + Emerging 모두 카운트 (정확히 일치하므로 신뢰도 높음)
