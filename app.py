@@ -334,9 +334,9 @@ def get_thesis_options_from_narratives(user_id: str) -> list[dict]:
                 "narrative_category": category,
                 "narrative_date": date_str,
             })
-            if len(options) >= 15:
+            if len(options) >= 6:
                 break
-        if len(options) >= 15:
+        if len(options) >= 6:
             break
     return options
 
@@ -4484,15 +4484,28 @@ def _fmp_batch_pe(symbols_tuple: tuple) -> dict:
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
     """
-    선택 ETF의 구성종목으로 2개 표를 만든다.
+    선택 ETF의 구성종목으로 2개 표 + ETF 요약을 만든다.
       - 주도주(Alpha Leaders): 1개월 수익률 상위 5
       - 저평가 후발주(Undervalued Laggards): 자유낙하 제외(1M>-20%) + 흑자(PER>0)
         + 저PER(섹터 중간 PER 또는 구성종목 중간값 미만) 중 수익률 하위(따라잡을 여지) → 싼 순 5
     구성종목 소스: 라이브(FMP /etf/holdings) 우선, 비면 _ETF_CONSTITUENTS 대표종목 폴백.
-    반환: (leaders_df, laggards_df, source)  source ∈ {"live","fallback","none"}
+    반환: (leaders_df, laggards_df, source, etf_summary)
+      source ∈ {"live","fallback","none"}
+      etf_summary = {"ret_1m": float|None, "pe_median": float|None}  # ETF 1개월 수익률 / 구성종목 중간 PER
     """
     empty = pd.DataFrame(columns=["Ticker", "1-Month (%)", "PER"])
     etf_u = str(etf_ticker or "").strip().upper()
+
+    # ETF 자체의 1개월 수익률 (구성종목과 무관하게 ETF 가격으로 계산)
+    etf_ret = None
+    try:
+        _er = cached_pool_monthly_returns((etf_u,))
+        if _er is not None and not _er.empty:
+            _v = to_float(_er.iloc[0].get("1-Month (%)"))
+            etf_ret = float(_v) if pd.notna(_v) else None
+    except Exception:
+        etf_ret = None
+    summary = {"ret_1m": etf_ret, "pe_median": None}
 
     # 1) 라이브 우선 (FMP /etf/holdings)
     holdings = _fmp_etf_holdings(etf_u, top_n=30)
@@ -4505,11 +4518,11 @@ def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
         syms, source = list(dict.fromkeys(fb))[:30], "fallback"
 
     if len(syms) < 3:
-        return empty, empty, "none"
+        return empty, empty, "none", summary
 
     ret_df = cached_pool_monthly_returns(tuple(syms))  # [Ticker, 1-Month (%)] desc
     if ret_df is None or ret_df.empty:
-        return empty, empty, "none"
+        return empty, empty, "none", summary
     pe_map = _fmp_batch_pe(tuple(syms))
 
     df = ret_df.copy()
@@ -4519,7 +4532,12 @@ def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
     df["_pe"] = pd.to_numeric(df["_pe"], errors="coerce")
     df = df.dropna(subset=["_ret"]).copy()
     if df.empty:
-        return empty, empty, "none"
+        return empty, empty, "none", summary
+
+    # 구성종목 중간 PER (양수만) → ETF 대표 PER
+    _pe_pos = df.loc[df["_pe"] > 0, "_pe"]
+    if not _pe_pos.empty:
+        summary["pe_median"] = round(float(_pe_pos.median()), 1)
 
     # ── 주도주: 1개월 수익률 상위 5 ──
     leaders = df.sort_values("_ret", ascending=False).head(5).copy()
@@ -4546,7 +4564,7 @@ def cached_etf_tier3_analysis(etf_ticker: str, sector_median_pe=None):
         })
         return o.reset_index(drop=True)
 
-    return _fmt(leaders), _fmt(laggards), source
+    return _fmt(leaders), _fmt(laggards), source, summary
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -14215,11 +14233,19 @@ if st.session_state.get("logged_in"):
 
                 # Tier 3: 주도주 + 저평가 후발주 (라이브 우선, 대표종목 폴백)
                 with st.spinner(f"{_sel_etf} 구성종목 분석 중..."):
-                    _leaders_df, _lagg_df, _t3_src = cached_etf_tier3_analysis(_sel_etf, _sector_median_pe)
+                    _leaders_df, _lagg_df, _t3_src, _etf_sum = cached_etf_tier3_analysis(_sel_etf, _sector_median_pe)
                 if _t3_src == "fallback":
                     st.caption("ⓘ 라이브 구성종목 미수신(FMP holdings 엔드포인트) → 대표 종목 기준 폴백으로 계산했습니다.")
                 elif _t3_src == "none":
                     st.caption("ⓘ 이 ETF의 구성종목 데이터를 구하지 못했습니다 (라이브·폴백 모두 없음).")
+
+                # 선택 ETF 자체 요약 (1개월 수익률 / 구성종목 중간 PER)
+                _esum = _etf_sum if isinstance(_etf_sum, dict) else {}
+                _eret = _esum.get("ret_1m")
+                _epe = _esum.get("pe_median")
+                _em1, _em2 = st.columns(2)
+                _em1.metric(f"{_sel_etf} · 1개월 수익률", f"{_eret:+.2f}%" if _eret is not None else "N/A")
+                _em2.metric(f"{_sel_etf} · 구성종목 중간 PER", f"{_epe:.1f}x" if _epe is not None else "N/A")
 
                 _lead_col, _lag_col = st.columns(2)
                 with _lead_col:
