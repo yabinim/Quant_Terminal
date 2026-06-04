@@ -47,6 +47,7 @@ jobs:
           python automation/run_narrative.py
 
       - name: 💰 Hidden Alpha Radar (주간 · Top5 로테이션)
+        if: always()
         env:
           FMP_API_KEY:        ${{ secrets.FMP_API_KEY }}
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
