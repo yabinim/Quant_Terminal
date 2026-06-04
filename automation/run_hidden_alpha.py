@@ -539,7 +539,7 @@ def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
   </div>
 
   <div style="text-align:center;padding:16px;">
-    <a href="https://quantdb.streamlit.app"
+    <a href="https://stocker.streamlit.app"
        style="background:#2563eb;color:#fff;text-decoration:none;padding:12px 32px;border-radius:8px;font-weight:700;font-size:14px;">
       🚀 Quant Terminal 열기
     </a>
