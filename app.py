@@ -7026,6 +7026,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
         "수량",
         "매수가",
         "현재가",
+        "보유금액($)",
         "투자 손익($)",
         "수익률(%)",
         "SPY Alpha(%)",
@@ -7198,6 +7199,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
                 "수량": quantity,
                 "매수가": purchase_price,
                 "현재가": current_price,
+                "보유금액($)": market_value,
                 "투자 손익($)": gain_loss,
                 "수익률(%)": return_pct,
                 "SPY Alpha(%)": spy_alpha,
@@ -16264,24 +16266,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     portfolio_df[portfolio_df["Account"] == sell_acct_sel]["Ticker"]
                     .dropna().astype(str).tolist()
                 ) if sell_acct_sel else []
+                # 종목 선택과 보유수량·평단가 조회는 폼 '밖'에서 한다.
+                # (st.form 안에 두면 종목을 바꿔도 제출 전까지 rerun이 안 일어나
+                #  보유수량·평단가·수량 상한이 이전 종목 값에 묶여 매도 저장이 막혔음)
+                sell_ticker_sel = st.selectbox(
+                    "매도할 종목",
+                    options=sell_tickers_avail if sell_tickers_avail else ["(종목 없음)"],
+                    key="sell_form_ticker_sel",
+                )
+                hold_row = portfolio_df[
+                    (portfolio_df["Account"] == sell_acct_sel) &
+                    (portfolio_df["Ticker"] == sell_ticker_sel)
+                ]
+                cur_hold_qty = float(pd.to_numeric(hold_row["Quantity"].values[0], errors="coerce") or 0) if not hold_row.empty else 0.0
+                cur_avg_price = float(pd.to_numeric(hold_row["Purchase_Price"].values[0], errors="coerce") or 0) if not hold_row.empty else 0.0
+                st.caption(f"현재 보유 수량: **{cur_hold_qty:g}주** | 평균 매수가: **${cur_avg_price:,.4f}**")
                 with st.form("portfolio_sell_form", clear_on_submit=False):
-                    sell_ticker_sel = st.selectbox(
-                        "매도할 종목",
-                        options=sell_tickers_avail if sell_tickers_avail else ["(종목 없음)"],
-                        key="sell_form_ticker_sel",
-                    )
-                    hold_row = portfolio_df[
-                        (portfolio_df["Account"] == sell_acct_sel) &
-                        (portfolio_df["Ticker"] == sell_ticker_sel)
-                    ]
-                    cur_hold_qty = float(pd.to_numeric(hold_row["Quantity"].values[0], errors="coerce") or 0) if not hold_row.empty else 0.0
-                    cur_avg_price = float(pd.to_numeric(hold_row["Purchase_Price"].values[0], errors="coerce") or 0) if not hold_row.empty else 0.0
-                    st.caption(f"현재 보유 수량: **{cur_hold_qty:g}주** | 평균 매수가: **${cur_avg_price:,.4f}**")
                     sell_price_input = st.number_input("매도가 (1주당 $)", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="sell_form_price")
                     sell_qty_input = st.number_input(
-                        f"매도 수량 (최대 {cur_hold_qty:g}주)",
+                        f"매도 수량 (최대 {cur_hold_qty:g}주 — 초과 시 저장되지 않습니다)",
                         min_value=0.0,
-                        max_value=float(max(cur_hold_qty, 0.0001)),
                         value=0.0, step=1.0, format="%.4f", key="sell_form_qty",
                     )
                     sell_date_input = st.date_input("매도 날짜", value=datetime.now(pytz.timezone("US/Eastern")).date(), key="sell_form_date")
@@ -16496,6 +16500,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             "수량": "{:,.4f}",
                             "매수가": "{:,.2f}",
                             "현재가": "{:,.2f}",
+                            "보유금액($)": "${:,.2f}",
                             "투자 손익($)": "${:,.2f}",
                             "수익률(%)": "{:.2f}%",
                             "SPY Alpha(%)": "{:+.2f}%",
@@ -16919,6 +16924,31 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             with st.spinner("매도 신호 분석 중..."):
                 sell_signals = compute_sell_signal_indicators(radar_tickers)
 
+            # 포트폴리오 표의 통합 판정(integrated_sell_verdict)을 단일 기준으로 재사용한다.
+            # 이전에는 매도 레이더 '신호'가 compute_sell_signal_indicators의 별도 점수를 써서
+            # 같은 종목이 표에선 🔴매도, 레이더에선 🟡주의로 갈렸음 → 한 소스로 통일.
+            _status_by_ticker = {}
+            _dd_by_ticker = {}
+            try:
+                if "sell_radar_df" in dir() and not sell_radar_df.empty:
+                    for _, _rr in sell_radar_df.iterrows():
+                        _tkk = str(_rr.get("티커", "")).strip().upper()
+                        if _tkk:
+                            _status_by_ticker[_tkk] = str(_rr.get("상태(Status)", "") or "")
+                            _dd_by_ticker[_tkk] = pd.to_numeric(_rr.get("Drawdown(%)"), errors="coerce")
+            except Exception:
+                pass
+
+            def _status_severity(_s):
+                _s = str(_s)
+                if "매도" in _s or "SELL" in _s:
+                    return 3
+                if "익절" in _s or "주의" in _s or "WARNING" in _s:
+                    return 2
+                if "보유" in _s or "HOLD" in _s:
+                    return 1
+                return 0
+
             sig_rows = []
             for tk in radar_tickers:
                 sig = sell_signals.get(tk, _empty_sell_signal())
@@ -16928,10 +16958,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 macd_s = sig.get("macd_signal", "N/A")
                 macd_display = {"DEAD_CROSS": "💀 데드크로스", "BELOW_SIGNAL": "📉 시그널 하회",
                                 "GOLDEN_CROSS": "✨ 골든크로스", "ABOVE_SIGNAL": "📈 시그널 상회"}.get(macd_s, macd_s)
+                # 신호 = 포트폴리오 표의 통합 판정(없으면 기술적 신호로 폴백)
+                _signal_label = _status_by_ticker.get(tk) or sig.get("signal_label", "⚪")
                 sig_rows.append({
-                    "신호": sig.get("signal_label", "⚪"),
+                    "신호": _signal_label,
                     "티커": tk,
                     "위험점수": sig.get("signal_score", 0),
+                    "_sev": _status_severity(_signal_label),
                     "RSI(14)": f"{rsi_v:.1f}" if pd.notna(rsi_v) else "N/A",
                     "MACD": macd_display,
                     "52주고점대비": f"{pct_high:+.1f}%" if pd.notna(pct_high) else "N/A",
@@ -16940,7 +16973,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 })
 
             if sig_rows:
-                sig_df = pd.DataFrame(sig_rows).sort_values("위험점수", ascending=False).reset_index(drop=True)
+                sig_df = (
+                    pd.DataFrame(sig_rows)
+                    .sort_values(["_sev", "위험점수"], ascending=[False, False])
+                    .drop(columns=["_sev"])
+                    .reset_index(drop=True)
+                )
 
                 def _c_signal(v):
                     if "🔴" in str(v): return "color:#dc2626;font-weight:700;"
@@ -16982,10 +17020,16 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 _high_str = "N/A" if pd.isna(sig.get("pct_from_52w_high", np.nan)) else f"{sig.get('pct_from_52w_high'):.1f}pct"
                                 _ma200_str = "위" if sig.get("above_ma200") else ("아래" if sig.get("above_ma200") is False else "N/A")
                                 _macd_str = sig.get("macd_signal", "N/A")
+                                # 포트폴리오 표의 통합 판정·고점대비 낙폭을 AI에 함께 전달해
+                                # AI 판단이 표/레이더와 어긋나지 않도록 같은 기준으로 앵커링한다.
+                                _verdict_str = _status_by_ticker.get(tk, "")
+                                _dd_v = _dd_by_ticker.get(tk, np.nan)
+                                _dd_str = "N/A" if pd.isna(_dd_v) else f"{float(_dd_v):.1f}pct"
                                 port_lines.append(
                                     f"- {tk}: 평단가${avg_p:.2f} 현재가${_cur_str} "
                                     f"수익률={_pnl_str} RSI={_rsi_str} MACD={_macd_str} "
-                                    f"52주고점대비={_high_str} 200일선={_ma200_str}"
+                                    f"52주고점대비={_high_str} 200일선={_ma200_str} "
+                                    f"고점대비낙폭={_dd_str} 시스템판정={_verdict_str or 'N/A'}"
                                 )
                             port_text = "\n".join(port_lines)
                             ai_prompt = (
@@ -16997,6 +17041,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 "priority 1 = most urgent to sell. Include ALL tickers. "
                                 "reason must be in Korean under 20 chars. "
                                 "target_price = suggested sell price in USD (e.g. $150.00), or N/A if no clear target.\n"
+                                "각 종목의 '시스템판정'(🔴매도/🟡일부익절/✅보유)은 200일선·트레일링스톱·모멘텀을 종합한 1차 판정이다. "
+                                "특별한 근거가 없으면 이 판정과 일관되게 action을 정하라(🔴→SELL NOW, 🟡→WATCH, ✅→HOLD). "
+                                "판정을 뒤집을 때만 reason에 그 이유를 밝혀라.\n"
                                 "[PORTFOLIO]\n" + port_text
                             )
                             _ai_m = _GenAIModel("gemini-2.5-flash", generation_config={
