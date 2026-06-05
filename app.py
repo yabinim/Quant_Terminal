@@ -6197,7 +6197,10 @@ def replace_user_portfolio_sheet_rows(user_id: str, df: pd.DataFrame) -> tuple[b
             qq = pd.to_numeric(row.get("Quantity"), errors="coerce")
             if pd.isna(pp) or pd.isna(qq):
                 continue
-            rows.append([uid, acct, tk, float(pp), float(qq), now_s])
+            # 기존 매수일(Date_Added)이 있으면 보존, 없을 때만 현재시각으로 채운다.
+            # (이전에는 무조건 now_s로 덮어써 매 저장마다 전 종목 날짜가 리셋됐음)
+            _da = str(row.get("Date_Added", "") or "").strip()
+            rows.append([uid, acct, tk, float(pp), float(qq), _da if _da else now_s])
         ws.clear()
         ws.update(rows, range_name=f"A1:F{len(rows)}", value_input_option="USER_ENTERED")
         _invalidate_portfolio_sheet_cache()
@@ -6269,7 +6272,10 @@ def save_portfolio(df):
     for col in base_columns:
         if col not in safe_df.columns:
             safe_df[col] = np.nan
-    safe_df = safe_df[base_columns].copy()
+    # Date_Added(실제 매수일)는 있으면 보존해서 넘긴다. 없으면 아래 저장 함수가 현재시각으로
+    # 채운다. (이전엔 base_columns만 남겨 Date_Added가 버려지고 매 저장마다 now로 리셋됐음)
+    _keep_cols = base_columns + (["Date_Added"] if "Date_Added" in safe_df.columns else [])
+    safe_df = safe_df[_keep_cols].copy()
     safe_df["Account"] = safe_df["Account"].astype(str).str.strip()
     safe_df["Ticker"] = safe_df["Ticker"].astype(str).str.strip().str.upper()
     safe_df["Purchase_Price"] = pd.to_numeric(safe_df["Purchase_Price"], errors="coerce")
@@ -6892,8 +6898,12 @@ def compute_position_drawdown(close_series, purchase_price, current_price, date_
         # 매수가 바닥선: 고점이 적어도 매수가보다는 높아야 '하락'이 의미 있음
         pp = float(purchase_price) if (purchase_price is not None and pd.notna(purchase_price) and purchase_price > 0) else np.nan
 
-        # 채택할 고점 후보들: 매수일 이후 고점 우선, 없으면 1년 고점
-        ref_high = high_since_buy if pd.notna(high_since_buy) else high_1y
+        # 트레일링 스톱 고점: 매수가를 바닥선으로, 매수일 이후 실제 고점이 있으면 래칫업.
+        # 매수일 이후 데이터가 없어도(매수일이 최신 가격일 이후 등) 52주 최고가(=매수 전
+        # 고점)로 새지 않도록 매수가를 고점으로 본다 → 본전 부근 종목의 허위 경보 방지.
+        # 매수가·매수일 둘 다 없을 때만 1년 고점으로 폴백.
+        _high_cands = [v for v in (high_since_buy, pp) if pd.notna(v)]
+        ref_high = max(_high_cands) if _high_cands else high_1y
         if pd.isna(ref_high) or ref_high <= 0:
             return np.nan, False
 
@@ -15999,6 +16009,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     key="form_portfolio_add_thesis",
                     help="내러티브 추천 종목이면 그대로 두세요 — 제출 시 해당 테마로 자동 연결됩니다. QQQM 같은 정기 적립은 '📈 코어/정기적립'을 고르세요.",
                 )
+                new_buy_date = st.date_input(
+                    "매수일 (실제 산 날짜)",
+                    value=datetime.now(_MARKET_ET_TZ).date(),
+                    key="form_portfolio_add_buy_date",
+                    help="실제로 매수한 날짜. 트레일링 스톱은 이 날짜 이후의 고점을 기준으로 계산합니다. "
+                         "오늘 추가하더라도 실제 매수일로 지정하세요.",
+                )
                 submitted_add = st.form_submit_button("포트폴리오에 추가", use_container_width=True, type="primary")
                 if submitted_add:
                     if not puid:
@@ -16047,7 +16064,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                         updated_df.loc[idx, "Purchase_Price"] = new_avg
                                         save_portfolio(updated_df)
                                         # Trade_History에 BUY 기록
-                                        _buy_date = _narrative_now_et_string()[:10]
+                                        _buy_date = new_buy_date.strftime("%Y-%m-%d")
                                         append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "추가 매수")
                                         st.success(
                                             f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
@@ -16065,6 +16082,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                                         "Ticker": new_ticker,
                                                         "Purchase_Price": price_v,
                                                         "Quantity": qty_v,
+                                                        "Date_Added": new_buy_date.strftime("%Y-%m-%d"),
                                                     }
                                                 ]
                                             ),
@@ -16073,7 +16091,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     )
                                     save_portfolio(updated_df)
                                     # Trade_History에 BUY 기록
-                                    _buy_date = _narrative_now_et_string()[:10]
+                                    _buy_date = new_buy_date.strftime("%Y-%m-%d")
                                     append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "신규 매수")
                                     # ── Thesis 연결 ──
                                     _thesis_msg = ""
@@ -16156,6 +16174,19 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     format="%.4f",
                                     key=f"form_portfolio_edit_price__{pair_key}",
                                 )
+                            # 매수일 보정: 기존에 일괄 기록된 Date_Added를 실제 매수일로 바로잡는다.
+                            try:
+                                _dd_def = pd.to_datetime(str(cur_row.get("Date_Added", "") or "")[:10], errors="coerce")
+                                _dd_def = _dd_def.date() if pd.notna(_dd_def) else datetime.now(_MARKET_ET_TZ).date()
+                            except Exception:
+                                _dd_def = datetime.now(_MARKET_ET_TZ).date()
+                            edit_buy_date = st.date_input(
+                                "매수일 (실제 산 날짜)",
+                                value=_dd_def,
+                                key=f"form_portfolio_edit_buydate__{pair_key}",
+                                help="실제 매수일. 기존에 일괄 기록된 날짜를 실제 매수일로 바로잡으면 "
+                                     "트레일링 스톱이 매수 이후 고점 기준으로 정확히 계산됩니다.",
+                            )
                             submitted_edit = st.form_submit_button("수정 완료", use_container_width=True, type="primary")
                             if submitted_edit:
                                 ok_eq, qty_ev, err_eq = _validate_positive_portfolio_number("수량", edit_quantity)
@@ -16174,11 +16205,15 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                         upd = upd.copy()
                                         upd["Quantity"] = upd["Quantity"].astype(object)
                                         upd["Purchase_Price"] = upd["Purchase_Price"].astype(object)
+                                        if "Date_Added" not in upd.columns:
+                                            upd["Date_Added"] = ""
+                                        upd["Date_Added"] = upd["Date_Added"].astype(object)
                                         upd.at[ix, "Quantity"] = float(qty_ev)
                                         upd.at[ix, "Purchase_Price"] = float(price_ev)
+                                        upd.at[ix, "Date_Added"] = edit_buy_date.strftime("%Y-%m-%d")
                                         save_portfolio(upd)
                                         st.success(
-                                            f"{edit_account} / {edit_ticker} 수량·평단가를 수정해 저장했습니다."
+                                            f"{edit_account} / {edit_ticker} 수량·평단가·매수일을 수정해 저장했습니다."
                                         )
                                         st.rerun()
 
