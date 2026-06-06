@@ -559,6 +559,18 @@ def generate_drg_prediction(rss_news_text: str, macro_summary: str,
             "→ 발표 전후 변동성 증가 예상.\n"
         )
 
+    # 고임팩트 발표일이면 시나리오 블록 추가 (단일 방향 판단 라인은 유지 → 검증 호환).
+    # fred_section 은 오늘 고임팩트 이벤트(또는 하드코딩 발표)가 있을 때만 채워지므로
+    # 그 자체를 '발표일' 여부 플래그로 재사용한다.
+    scenario_section = ""
+    if fred_section:
+        scenario_section = (
+            "**📅 발표 시나리오별 대응** (오늘 고임팩트 지표 발표 → 필수 작성, 각 1문장):\n"
+            "- 예상 상회(서프라이즈 ↑) 시: \n"
+            "- 예상 부합 시: \n"
+            "- 예상 하회(서프라이즈 ↓) 시: \n\n"
+        )
+
     prompt = (
         "당신은 월가 수석 퀀트 전략가입니다. "
         "아래 Pre-Market 실시간 데이터를 바탕으로 오늘 미국 주식시장을 예측하세요.\n\n"
@@ -581,6 +593,7 @@ def generate_drg_prediction(rss_news_text: str, macro_summary: str,
         "- 보유 중: \n"
         "- 매수 타이밍 보는 중: \n"
         "- 현금 대기 중: \n\n"
+        + scenario_section +
         "*본 분석은 AI 참고용이며 투자 권유가 아닙니다.*"
     )
 
@@ -824,6 +837,32 @@ def main():
 
     direction = extract_direction(full_text)
     print(f"[INFO] 예측 방향: {direction}")
+
+    # ── 발표일 가드레일 ──────────────────────────────────────────────────────
+    # 8:30 ET 발표 이전 예측임을 결정론적으로 명시(LLM 출력에 의존하지 않음).
+    # full_text 에 prepend → 시트·앱·이메일이 모두 같은 배너를 보게 됨(단일 소스).
+    # direction 은 위에서 '깨끗한' 본문으로 이미 추출했으므로 검증 점수에 영향 없음.
+    _today_et_str = datetime.now(_ET).strftime("%Y-%m-%d")
+    _high_today = [
+        e for e in (full_events or [])
+        if str(e.get("impact", "")).lower() in ("high", "3")
+        and str(e.get("date", ""))[:10] == _today_et_str
+    ]
+    _ev_names = (
+        [str(e.get("event", "")) for e in _high_today][:3]
+        if _high_today else list(fred_releases)[:3]
+    )
+    _ev_names = [n for n in _ev_names if n]
+    if _ev_names:
+        _names_str = ", ".join(_ev_names)
+        _guard = (
+            f"⚠️ **발표 전 예측 주의** — 오늘 고임팩트 경제지표 발표 예정: {_names_str}. "
+            "본 예측은 발표(통상 08:30 ET) 이전 데이터 기준이며, 발표 직후 시장 방향이 "
+            "급변할 수 있습니다. 발표 수치와 시장 초기 반응을 확인하기 전에는 "
+            "신규 진입을 보류하세요.\n\n"
+        )
+        full_text = _guard + full_text
+        print(f"[INFO] 발표일 가드레일 추가: {_names_str}")
 
     # SPY 현재가 — FMP
     try:
