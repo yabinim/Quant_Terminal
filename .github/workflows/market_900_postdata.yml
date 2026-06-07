@@ -1,0 +1,56 @@
+name: 🔄 9AM Post-Data (발표 후 DRG 갱신)
+
+on:
+  repository_dispatch:
+    types: [trigger-900-postdata]   # Cloud Scheduler가 보내는 event_type과 일치시킴
+  workflow_dispatch:                 # 수동 실행 허용 (테스트용)
+  # schedule 제거: Google Cloud Scheduler가 09:00 ET 트리거를 단독 관리
+  # (스크립트가 '고임팩트 발표일 + 8am 예측 존재' 일 때만 동작, 아니면 즉시 스킵)
+
+jobs:
+  run-900-postdata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install \
+            google-genai \
+            google-auth \
+            gspread \
+            feedparser \
+            requests \
+            numpy \
+            pandas \
+            pytz \
+            fredapi
+
+      - name: 🔄 DRG 발표 후 갱신
+        env:
+          GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
+          FRED_API_KEY:      ${{ secrets.FRED_API_KEY }}
+          FMP_API_KEY:       ${{ secrets.FMP_API_KEY }}
+          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:          ${{ secrets.GMAIL_TO }}
+          GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/run_drg_predict.py --mode revise
+
+      - name: 📋 실행 로그 요약
+        if: always()
+        run: |
+          echo "======================================"
+          echo "9AM Post-Data 갱신 완료"
+          echo "실행 시각 (UTC): $(date -u)"
+          echo "======================================"
