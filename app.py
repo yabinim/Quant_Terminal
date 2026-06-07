@@ -1037,6 +1037,8 @@ _MAIN_NAV_OPTIONS = (
     "📡 [AI] Emerging 종목 추적기",
     # ── 도움말 ─────────────────────────────────────────────────────────────
     "📖 사용 가이드",
+    # ── 복기 (index 13: 인덱스 분기 호환 위해 맨 끝에 append) ────────────────
+    "📊 매매 복기",
 )
 
 
@@ -6727,6 +6729,225 @@ def compute_realized_pnl(trade_df: pd.DataFrame) -> pd.DataFrame:
     if not results:
         return pd.DataFrame(columns=_cols)
     return pd.DataFrame(results).sort_values("sell_date", ascending=False).reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 📊 매매 복기(Trade Review) 분석 엔진
+# Chunk 1: 기존 Trade_History 데이터만 사용 (FMP·매수폼 변경 없음).
+# 청산(SELL)된 거래를 thesis 카테고리·보유기간별로 쪼개 '어디서 돈을 버는지' 파악.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 보유기간 버킷 (모멘텀 전략의 '스윗스팟' 탐색용)
+_TRADE_REVIEW_HOLD_BUCKETS = [
+    (0, 3,        "⚡ 단타 (≤3일)"),
+    (4, 10,       "🏃 단기 (4–10일)"),
+    (11, 30,      "📈 스윙 (11–30일)"),
+    (31, 90,      "🗓️ 중기 (31–90일)"),
+    (91, 10**9,   "🌳 장기 (90일+)"),
+]
+
+
+def _trade_review_hold_bucket(days) -> str:
+    """보유일수 → 버킷 라벨."""
+    try:
+        if pd.isna(days):
+            return "❓ 미상"
+        d = int(round(float(days)))
+    except Exception:
+        return "❓ 미상"
+    for lo, hi, label in _TRADE_REVIEW_HOLD_BUCKETS:
+        if lo <= d <= hi:
+            return label
+    return "❓ 미상"
+
+
+def compute_closed_trades_detail(trade_df: pd.DataFrame) -> pd.DataFrame:
+    """BUY/SELL 기록 → 청산(SELL) 단위 상세. 날짜 인식 FIFO로 보유기간까지 계산.
+
+    기존 compute_realized_pnl(손익만)과 별개로, '보유기간' 분석을 위해
+    소비된 매수 lot의 날짜를 추적한다(수량 가중 평균 보유일).
+    대응 매수가 없는 매도(기록 누락)는 매칭된 수량만큼만 계산하고, 0이면 스킵.
+
+    반환 컬럼: ticker, account, sell_date, first_buy_date, holding_days,
+              shares_sold, sell_price, fifo_cost, pnl, pnl_pct, memo
+    """
+    _cols = ["ticker", "account", "sell_date", "first_buy_date", "holding_days",
+             "shares_sold", "sell_price", "fifo_cost", "pnl", "pnl_pct", "memo"]
+    if trade_df is None or trade_df.empty:
+        return pd.DataFrame(columns=_cols)
+
+    results = []
+    for (ticker, account), grp in trade_df.groupby(["ticker", "account"]):
+        grp = grp.copy()
+        grp["date"] = pd.to_datetime(grp["date"], errors="coerce")
+        grp = grp.sort_values("date").reset_index(drop=True)
+        fifo_queue = []  # [shares_remaining, price, buy_date(Timestamp or NaT)]
+
+        for _, row in grp.iterrows():
+            act = str(row.get("action", "")).strip().upper()
+            sh = float(row.get("shares") or 0)
+            pr = float(row.get("price") or 0)
+            dt = row.get("date")
+
+            if act == "BUY" and sh > 0 and pr > 0:
+                fifo_queue.append([sh, pr, dt])
+
+            elif act == "SELL" and sh > 0 and pr > 0:
+                remaining = sh
+                cost_total = 0.0
+                hold_weighted = 0.0   # Σ(used_sh × holding_days)
+                hold_shares = 0.0
+                first_buy = pd.NaT
+                new_queue = []
+                for lot in fifo_queue:
+                    if remaining <= 1e-9:
+                        new_queue.append(lot)
+                        continue
+                    lot_sh, lot_pr, lot_dt = lot[0], lot[1], lot[2]
+                    use = min(lot_sh, remaining)
+                    cost_total += use * lot_pr
+                    if pd.notna(dt) and pd.notna(lot_dt):
+                        hd = max(0, (dt - lot_dt).days)
+                        hold_weighted += use * hd
+                        hold_shares += use
+                        if pd.isna(first_buy) or lot_dt < first_buy:
+                            first_buy = lot_dt
+                    lot_sh -= use
+                    remaining -= use
+                    if lot_sh > 1e-9:
+                        new_queue.append([lot_sh, lot_pr, lot_dt])
+                fifo_queue = new_queue
+
+                matched = sh - remaining  # 실제 매칭 수량 (매수 기록 부족 시 < sh)
+                if matched <= 1e-9:
+                    continue
+                fifo_cost_per = (cost_total / matched) if matched > 0 else np.nan
+                proceeds = matched * pr
+                pnl = proceeds - cost_total
+                pnl_pct = ((pr / fifo_cost_per) - 1.0) * 100.0 if (pd.notna(fifo_cost_per) and fifo_cost_per > 0) else np.nan
+                holding_days = (hold_weighted / hold_shares) if hold_shares > 1e-9 else np.nan
+
+                results.append({
+                    "ticker": ticker, "account": account,
+                    "sell_date": dt.strftime("%Y-%m-%d") if pd.notna(dt) else "",
+                    "first_buy_date": first_buy.strftime("%Y-%m-%d") if pd.notna(first_buy) else "",
+                    "holding_days": round(holding_days, 1) if pd.notna(holding_days) else np.nan,
+                    "shares_sold": matched, "sell_price": pr,
+                    "fifo_cost": fifo_cost_per, "pnl": pnl, "pnl_pct": pnl_pct,
+                    "memo": str(row.get("memo") or ""),
+                })
+
+    if not results:
+        return pd.DataFrame(columns=_cols)
+    return pd.DataFrame(results).sort_values("sell_date", ascending=False).reset_index(drop=True)
+
+
+def build_trade_thesis_map(user_id: str) -> dict:
+    """Thesis 시트 → {ticker_upper: category}. 같은 티커 중복 시 가장 최근 Date_Added 채택."""
+    out = {}
+    try:
+        th = load_thesis_records(user_id)
+        if th is None or th.empty:
+            return out
+        th = th.copy()
+        th["_dt"] = pd.to_datetime(th.get("Date_Added", ""), errors="coerce")
+        th = th.sort_values("_dt")  # 오래된→최신 정렬: 뒤(최신)가 덮어씀
+        for _, r in th.iterrows():
+            tk = str(r.get("Ticker", "")).strip().upper()
+            cat = str(r.get("Narrative_Category", "") or "").strip()
+            if tk and cat:
+                out[tk] = cat
+    except Exception:
+        return out
+    return out
+
+
+def _trade_review_group_metrics(g: pd.DataFrame) -> dict:
+    """청산 그룹(DataFrame) → 핵심 성과 지표 dict."""
+    pnl = pd.to_numeric(g["pnl"], errors="coerce")
+    pct = pd.to_numeric(g["pnl_pct"], errors="coerce")
+    valid = pnl.notna()
+    n = int(valid.sum())
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl < 0]
+    win_pct = pct[(pnl > 0)]
+    loss_pct = pct[(pnl < 0)]
+    gain_sum = float(wins.sum()) if not wins.empty else 0.0
+    loss_sum = float(losses.sum()) if not losses.empty else 0.0  # 음수
+    win_rate = (len(wins) / n * 100.0) if n else np.nan
+    avg_win = float(win_pct.mean()) if not win_pct.dropna().empty else np.nan
+    avg_loss = float(loss_pct.mean()) if not loss_pct.dropna().empty else np.nan  # 음수
+    if loss_sum < 0:
+        profit_factor = gain_sum / abs(loss_sum)
+    elif gain_sum > 0:
+        profit_factor = np.inf
+    else:
+        profit_factor = np.nan
+    payoff = (avg_win / abs(avg_loss)) if (pd.notna(avg_win) and pd.notna(avg_loss) and avg_loss != 0) else np.nan
+    return {
+        "거래수": n,
+        "승률(%)": win_rate,
+        "평균익절(%)": avg_win,
+        "평균손절(%)": avg_loss,
+        "손익비(PF)": profit_factor,
+        "손익률(배)": payoff,
+        "총손익($)": float(pnl.sum()) if n else 0.0,
+    }
+
+
+def build_trade_review_breakdown(closed_df: pd.DataFrame, by_col: str) -> pd.DataFrame:
+    """청산 상세를 by_col(카테고리/보유기간 등) 기준으로 묶어 지표 표를 만든다."""
+    if closed_df is None or closed_df.empty or by_col not in closed_df.columns:
+        return pd.DataFrame()
+    rows = []
+    for key, g in closed_df.groupby(by_col):
+        m = _trade_review_group_metrics(g)
+        rows.append({by_col: key, **m})
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("총손익($)", ascending=False).reset_index(drop=True)
+
+
+def _review_pnl_color(v):
+    """손익 양수=초록 / 음수=빨강 셀 스타일."""
+    try:
+        f = float(str(v).replace("$", "").replace("+", "").replace(",", "").replace("%", ""))
+        if f > 0:
+            return "color:#16a34a;font-weight:700;"
+        if f < 0:
+            return "color:#dc2626;font-weight:700;"
+    except Exception:
+        pass
+    return ""
+
+
+def _review_fmt_pf(v):
+    try:
+        if v == np.inf:
+            return "∞"
+        if pd.isna(v):
+            return "—"
+        return f"{float(v):.2f}"
+    except Exception:
+        return "—"
+
+
+def _style_review_table(df: pd.DataFrame):
+    """복기 분석 표 공통 스타일러(∞·NaN 안전 처리)."""
+    show = df.copy()
+    if "손익비(PF)" in show.columns:
+        show["손익비(PF)"] = show["손익비(PF)"].apply(_review_fmt_pf)
+    if "손익률(배)" in show.columns:
+        show["손익률(배)"] = show["손익률(배)"].apply(lambda x: "—" if pd.isna(x) else f"{float(x):.2f}x")
+    fmt = {
+        "승률(%)": "{:.0f}%", "평균익절(%)": "{:+.1f}%",
+        "평균손절(%)": "{:+.1f}%", "총손익($)": "${:+,.2f}",
+    }
+    fmt = {k: v for k, v in fmt.items() if k in show.columns}
+    sty = show.style.format(fmt, na_rep="—")
+    if "총손익($)" in show.columns:
+        sty = sty.map(_review_pnl_color, subset=["총손익($)"])
+    return sty
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -18593,6 +18814,147 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.rerun()
                 else:
                     st.error(f"삭제 실패: {err_del}")
+
+    elif main_nav == _MAIN_NAV_OPTIONS[13]:
+        # ─────────────────────────────────────────────────────────────────────
+        # 📊 매매 복기 (Trade Review) — Chunk 1
+        # 청산된 거래를 thesis 카테고리·보유기간별로 분석해 '어디서 돈을 버는지' 파악.
+        # 기존 Trade_History 데이터만 사용 (FMP·매수폼 변경 없음).
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader(f"{_MAIN_NAV_OPTIONS[13]} · 내 매매 패턴 분석")
+        st.caption(
+            "청산(매도)된 거래만 분석합니다. **어떤 thesis 카테고리·보유기간에서 실제로 수익이 나는지**를 "
+            "확인하고 다음 매매 규칙에 반영하세요. (FIFO 기준 실현손익)"
+        )
+        puid = str(st.session_state.get("user_id") or "").strip()
+        if not puid:
+            st.warning("로그인 후 이용하세요.")
+        else:
+            closed = pd.DataFrame()
+            try:
+                _tr_df = load_trade_history(puid)
+                closed = compute_closed_trades_detail(_tr_df)
+            except Exception as exc:
+                st.error(f"거래 내역을 불러오지 못했습니다: {exc}")
+
+            if closed is None or closed.empty:
+                st.info(
+                    "아직 분석할 **청산 거래**가 없습니다. `🛡️ [4단계] 포트폴리오 매도 레이더` 탭의 "
+                    "**💸 매도 기록**으로 매도를 남기면 여기서 자동으로 복기됩니다."
+                )
+            else:
+                # 카테고리·보유기간 부착
+                tmap = build_trade_thesis_map(puid)
+                closed = closed.copy()
+                closed["카테고리"] = closed["ticker"].astype(str).str.upper().map(tmap).fillna("🏷️ 미분류")
+                closed["보유기간"] = closed["holding_days"].apply(_trade_review_hold_bucket)
+
+                # ── 전체 요약 ────────────────────────────────────────────────
+                overall = _trade_review_group_metrics(closed)
+                _aw, _al = overall["평균익절(%)"], overall["평균손절(%)"]
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("총 실현손익", f"${overall['총손익($)']:+,.2f}")
+                with c2:
+                    _wr = overall["승률(%)"]
+                    st.metric("승률", f"{_wr:.0f}% ({overall['거래수']}건)" if pd.notna(_wr) else "N/A")
+                with c3:
+                    _pf = overall["손익비(PF)"]
+                    _pf_s = "∞" if _pf == np.inf else (f"{_pf:.2f}" if pd.notna(_pf) else "N/A")
+                    st.metric("손익비 (PF)", _pf_s, help="이익 합 ÷ 손실 합. 1.5↑ 양호, 2.0↑ 우수.")
+                with c4:
+                    if pd.notna(_aw) and pd.notna(_al):
+                        st.metric("평균 익절 / 손절", f"{_aw:+.1f}% / {_al:+.1f}%")
+                    elif pd.notna(_aw):
+                        st.metric("평균 익절 / 손절", f"{_aw:+.1f}% / —")
+                    else:
+                        st.metric("평균 익절 / 손절", "N/A")
+
+                # ── 자동 인사이트 ────────────────────────────────────────────
+                cat_bd = build_trade_review_breakdown(closed, "카테고리")
+                _insights = []
+                _payoff = overall["손익률(배)"]
+                _wr = overall["승률(%)"]
+                if pd.notna(_payoff) and _payoff < 1 and pd.notna(_wr) and _wr < 50:
+                    _insights.append(
+                        f"⚠️ 평균 손절폭({abs(_al):.1f}%)이 평균 익절폭({_aw:.1f}%)보다 크고 승률도 {_wr:.0f}%로 낮습니다. "
+                        "**손절은 더 빨리, 익절은 더 늦게** 가져가는 규칙이 필요해요."
+                    )
+                elif pd.notna(_payoff) and _payoff >= 1.5:
+                    _insights.append(
+                        f"✅ 손익률 {_payoff:.1f}배 — 익절폭이 손절폭보다 큽니다. 추세를 잘 끌고 가는 편이에요."
+                    )
+                if not cat_bd.empty and len(cat_bd) >= 2:
+                    _best, _worst = cat_bd.iloc[0], cat_bd.iloc[-1]
+                    if _best["총손익($)"] > 0:
+                        _insights.append(
+                            f"🏆 가장 잘 버는 카테고리: **{_best['카테고리']}** "
+                            f"(실현 ${_best['총손익($)']:+,.0f}, 승률 {_best['승률(%)']:.0f}%)"
+                        )
+                    if _worst["총손익($)"] < 0:
+                        _insights.append(
+                            f"🩹 가장 손실이 큰 카테고리: **{_worst['카테고리']}** "
+                            f"(실현 ${_worst['총손익($)']:+,.0f}). 진입 기준 재점검 권장."
+                        )
+                for _m in _insights:
+                    st.info(_m)
+
+                st.divider()
+
+                # ── 카테고리별 ───────────────────────────────────────────────
+                st.markdown("### 🏷️ Thesis 카테고리별 성과")
+                if cat_bd.empty:
+                    st.caption("분류 가능한 데이터가 없습니다.")
+                else:
+                    st.dataframe(_style_review_table(cat_bd), use_container_width=True, hide_index=True)
+                    try:
+                        _ch = cat_bd[cat_bd["거래수"] > 0].copy()
+                        if not _ch.empty:
+                            _bar = (
+                                alt.Chart(_ch).mark_bar()
+                                .encode(
+                                    x=alt.X("승률(%):Q", title="승률 (%)", scale=alt.Scale(domain=[0, 100])),
+                                    y=alt.Y("카테고리:N", sort="-x", title=""),
+                                    color=alt.Color("총손익($):Q",
+                                                    scale=alt.Scale(scheme="redyellowgreen", domainMid=0),
+                                                    title="총손익($)"),
+                                    tooltip=["카테고리", "거래수",
+                                             alt.Tooltip("승률(%):Q", format=".0f"),
+                                             alt.Tooltip("총손익($):Q", format="$,.0f")],
+                                ).properties(title="카테고리별 승률 (색 = 총손익)", height=max(160, 30 * len(_ch)))
+                            )
+                            st.altair_chart(_bar, use_container_width=True)
+                    except Exception:
+                        pass
+
+                # ── 보유기간별 ───────────────────────────────────────────────
+                st.markdown("### ⏱️ 보유기간별 성과")
+                hold_bd = build_trade_review_breakdown(closed, "보유기간")
+                if hold_bd.empty:
+                    st.caption("데이터가 없습니다.")
+                else:
+                    _order = [lbl for _, _, lbl in _TRADE_REVIEW_HOLD_BUCKETS] + ["❓ 미상"]
+                    hold_bd["_o"] = hold_bd["보유기간"].apply(lambda x: _order.index(x) if x in _order else 999)
+                    hold_bd = hold_bd.sort_values("_o").drop(columns="_o").reset_index(drop=True)
+                    st.dataframe(_style_review_table(hold_bd), use_container_width=True, hide_index=True)
+                    st.caption("💡 승률·손익비가 가장 좋은 보유기간이 당신의 '스윗스팟'입니다. 그 구간에 맞춰 익절·손절 규칙을 세우세요.")
+
+                # ── 청산 거래 상세 ───────────────────────────────────────────
+                with st.expander("📋 청산 거래 상세 (FIFO)", expanded=False):
+                    _disp = closed.rename(columns={
+                        "ticker": "티커", "account": "계좌", "sell_date": "매도일",
+                        "first_buy_date": "최초매수일", "holding_days": "보유일",
+                        "shares_sold": "수량", "sell_price": "매도가", "fifo_cost": "매수가(FIFO)",
+                        "pnl": "손익($)", "pnl_pct": "손익(%)", "memo": "메모",
+                    })[["매도일", "티커", "계좌", "카테고리", "보유기간", "보유일", "수량",
+                        "매수가(FIFO)", "매도가", "손익($)", "손익(%)", "메모"]]
+                    st.dataframe(
+                        _disp.style.format({
+                            "보유일": "{:.0f}일", "수량": "{:,.4f}", "매수가(FIFO)": "${:,.4f}",
+                            "매도가": "${:,.4f}", "손익($)": "${:+,.2f}", "손익(%)": "{:+.2f}%",
+                        }, na_rep="—").map(_review_pnl_color, subset=["손익($)", "손익(%)"]),
+                        use_container_width=True, hide_index=True,
+                    )
 
     elif main_nav == _MAIN_NAV_OPTIONS[12]:
         # ─────────────────────────────────────────────────────────────────────
