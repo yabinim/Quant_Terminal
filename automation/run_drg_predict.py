@@ -45,7 +45,9 @@ _DRG_PREDICTIONS_WORKSHEET = "DRG_Predictions"
 _DRG_SHEET_COLS = [
     "user_id", "pred_date", "direction", "sector_filter", "benchmark_etf",
     "spy_close_at_pred", "full_text", "actual_direction", "actual_return_pct",
-    "is_correct", "review_comment"
+    "is_correct", "review_comment",
+    # ── 2단계: 발표 후 9am 갱신 (revised_*) ──
+    "revised_direction", "revised_full_text", "revision_reason", "revised_at", "is_revised"
 ]
 _ADMIN_USER_ID = "yab"
 
@@ -650,11 +652,13 @@ def save_drg_to_sheet(pred_date: str, direction: str, sector: str,
         except gspread.exceptions.WorksheetNotFound:
             ws = sh.add_worksheet(title=_DRG_PREDICTIONS_WORKSHEET, rows=2000, cols=len(_DRG_SHEET_COLS))
             ws.append_row(_DRG_SHEET_COLS, value_input_option="USER_ENTERED")
+        _ensure_drg_header(ws)  # 16컬럼 스키마로 헤더 자동 확장(폭 일치 유지)
 
         row = [
             _ADMIN_USER_ID, pred_date, direction, sector, bench_etf,
             str(spy_close) if not np.isnan(spy_close) else "",
-            full_text, "", "", "", ""
+            full_text, "", "", "", "",
+            "", "", "", "", ""   # revised_direction, revised_full_text, revision_reason, revised_at, is_revised
         ]
         ws.append_row(row, value_input_option="USER_ENTERED")
         print(f"[OK] DRG 예측 저장 완료: {pred_date} | {direction}")
@@ -662,6 +666,283 @@ def save_drg_to_sheet(pred_date: str, direction: str, sector: str,
     except Exception as e:
         print(f"[ERROR] Sheets 저장 실패: {e}")
         return False
+
+
+# ── 2단계: 발표 후 9am 갱신 (revise mode) ────────────────────────────────────
+def _a1col(n: int) -> str:
+    """1-indexed 컬럼 번호 → A1 컬럼 문자 (1~26: A~Z, 그 이상도 처리)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _ensure_drg_header(ws):
+    """시트 헤더에 _DRG_SHEET_COLS 의 누락 컬럼을 뒤에 덧붙여 자동 마이그레이션.
+    기존 컬럼 순서는 건드리지 않으므로 기존 데이터/리더와 호환."""
+    rows = ws.get_all_values()
+    header = [str(c).strip() for c in rows[0]] if rows else []
+    missing = [c for c in _DRG_SHEET_COLS if c not in header]
+    if missing:
+        new_header = header + missing
+        ws.update([new_header],
+                  range_name=f"A1:{_a1col(len(new_header))}1",
+                  value_input_option="USER_ENTERED")
+        print(f"[OK] DRG 헤더 자동 확장: +{missing}")
+
+
+def load_today_baseline(pred_date: str) -> dict | None:
+    """오늘(pred_date) admin 예측 행에서 8am 베이스라인(direction, full_text)을 로드.
+    같은 날 여러 행이면 가장 마지막(최근) 것을 사용."""
+    try:
+        gc = get_gspread_client()
+        sh = gc.open(_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET)
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            return None
+        header = [str(c).strip() for c in rows[0]]
+        idx = {c: header.index(c) for c in ("user_id", "pred_date", "direction", "full_text")
+               if c in header}
+        match = None
+        for r in rows[1:]:
+            def g(c):
+                return r[idx[c]] if c in idx and len(r) > idx[c] else ""
+            if str(g("user_id")).strip() == _ADMIN_USER_ID and str(g("pred_date")).strip() == pred_date:
+                match = {"direction": g("direction"), "full_text": g("full_text")}
+        return match
+    except Exception as e:
+        print(f"[ERROR] 베이스라인 로드 실패: {e}")
+        return None
+
+
+def update_drg_revision(pred_date: str, revised_direction: str,
+                         revised_full_text: str, revision_reason: str) -> bool:
+    """오늘 8am 행의 revised_* 컬럼을 갱신(같은 행 = 단일 소스, 일관성 유지)."""
+    try:
+        gc = get_gspread_client()
+        sh = gc.open(_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET)
+        _ensure_drg_header(ws)
+        rows = ws.get_all_values()
+        header = [str(c).strip() for c in rows[0]]
+        ui  = header.index("user_id") + 1
+        pdc = header.index("pred_date") + 1
+        cols = {c: header.index(c) + 1 for c in
+                ("revised_direction", "revised_full_text", "revision_reason",
+                 "revised_at", "is_revised")}
+        target = None
+        for i, r in enumerate(rows[1:], start=2):
+            u = r[ui - 1]  if len(r) >= ui  else ""
+            d = r[pdc - 1] if len(r) >= pdc else ""
+            if str(u).strip() == _ADMIN_USER_ID and str(d).strip() == pred_date:
+                target = i
+        if target is None:
+            print("[WARN] 갱신할 8am 행을 찾지 못함.")
+            return False
+        now_et = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
+        ws.update_cell(target, cols["revised_direction"], revised_direction)
+        ws.update_cell(target, cols["revised_full_text"], revised_full_text)
+        ws.update_cell(target, cols["revision_reason"], revision_reason)
+        ws.update_cell(target, cols["revised_at"], now_et)
+        ws.update_cell(target, cols["is_revised"], "TRUE")
+        print(f"[OK] 갱신 저장: {pred_date} → {revised_direction}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] 갱신 저장 실패: {e}")
+        return False
+
+
+def _format_release_results(high_today: list) -> str:
+    """발표 결과 요약 (FMP actual/estimate best-effort)."""
+    parts = []
+    for e in high_today[:4]:
+        name = str(e.get("event", ""))
+        act  = e.get("actual")
+        est  = e.get("estimate")
+        seg = name
+        if act not in (None, ""):
+            seg += f" 실제={act}"
+            if est not in (None, ""):
+                seg += f" vs 예상={est}"
+        elif est not in (None, ""):
+            seg += f" (예상={est}, 실제값 미반영)"
+        parts.append(seg)
+    return "; ".join(parts) if parts else "발표 결과 수치 미확보"
+
+
+def _extract_reason(text: str) -> str:
+    """갱신 본문에서 '8am 대비 변경 사유' 문단만 best-effort 추출."""
+    m = re.search(r"변경 사유\*\*\s*(.+?)(?:\n\s*\*\*|\Z)", text, re.S)
+    return (m.group(1).strip()[:400] if m else "")
+
+
+def _extract_revised_direction(text: str) -> str:
+    """갱신 본문에서 '방향 판단' 라인만 보고 방향 추출.
+    변경 사유에 옛 방향(예: '8am 상승 우세를 …')이 언급돼도 오판하지 않도록
+    전체 텍스트가 아닌 판단 라인만 검사한다."""
+    m = re.search(r"방향 판단\s*[:：]\s*\[?\s*(상승 우세|중립|하락 우세)", text)
+    if m:
+        return m.group(1)
+    for line in text.splitlines():
+        if "방향 판단" in line:
+            if "상승 우세" in line:
+                return "상승 우세"
+            if "하락 우세" in line:
+                return "하락 우세"
+            if "중립" in line:
+                return "중립"
+    return extract_direction(text)  # 최후 폴백
+
+
+def generate_drg_revision(orig_direction: str, orig_full_text: str,
+                           macro_summary: str, release_results: str) -> str:
+    """발표 후 프리마켓 반응을 주 신호로 8am 예측을 갱신.
+    단일 방향 라인(상승/중립/하락 우세)은 유지 → 검증 호환."""
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+    prompt = (
+        "당신은 월가 수석 퀀트 전략가입니다. 지금은 미국 장 시작 전, "
+        "오늘 08:30 ET 경제지표 발표가 끝난 직후입니다.\n\n"
+        f"[오전 8시(발표 전) 예측 방향] {orig_direction}\n"
+        f"[오전 8시 예측 전문 앞 800자]\n{str(orig_full_text)[:800]}\n\n"
+        f"[오늘 발표 결과] {release_results}\n"
+        f"[발표 후 거시·프리마켓 신호]\n{macro_summary}\n\n"
+        "위 발표 결과와 '발표 후 프리마켓 반응(SPY/QQQ 방향)'을 반영해 예측을 갱신하세요. "
+        "프리마켓 반응이 가장 신뢰도 높은 핵심 신호입니다. 아래 형식을 정확히 지키세요:\n\n"
+        "## 갱신 시장 방향 판단: [상승 우세 / 중립 / 하락 우세]\n\n"
+        "**🔄 8am 대비 변경 사유** (2~3문장: 발표 결과와 프리마켓 반응이 8am 예측을 어떻게 바꿨는지. "
+        "방향이 그대로라면 왜 유지되는지)\n\n"
+        "**🎯 개장 대응** (1~2문장)\n\n"
+        "*본 분석은 AI 참고용이며 투자 권유가 아닙니다.*"
+    )
+    _RETRY = [10, 30, 60]
+    for attempt in range(3):
+        try:
+            cfg = genai_types.GenerateContentConfig(
+                temperature=0.3, max_output_tokens=4096,
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+            )
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash", contents=prompt, config=cfg)
+            t = str(getattr(resp, "text", "") or "").strip()
+            if t:
+                return t
+            raise ValueError("빈 응답")
+        except Exception as e:
+            wait = _RETRY[min(attempt, len(_RETRY) - 1)]
+            print(f"[WARN] 갱신 생성 시도 {attempt+1}/3 실패: {e} → {wait}초 대기")
+            if attempt < 2:
+                time.sleep(wait)
+    return ""
+
+
+def _md_to_html(text: str) -> str:
+    """간단 마크다운 → HTML (## 헤더, **굵게**, 줄바꿈)."""
+    html = str(text)
+    html = re.sub(r"^##\s*(.+)$",
+                  r'<div style="font-size:16px;font-weight:800;color:#60a5fa;margin:14px 0 6px;">\1</div>',
+                  html, flags=re.M)
+    html = re.sub(r"\*\*(.*?)\*\*", r'<strong style="color:#f1f5f9;">\1</strong>', html)
+    html = html.replace("\n", "<br>")
+    return html
+
+
+def build_revision_email_html(orig_dir: str, revised_dir: str, revised_text: str,
+                               release_results: str, macro_summary: str) -> str:
+    now_et = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
+    arrow_color = "#dc2626" if "하락" in revised_dir else ("#16a34a" if "상승" in revised_dir else "#6b7280")
+    body_html = _md_to_html(revised_text)
+    macro_html = _md_to_html(macro_summary)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:20px;">
+<div style="max-width:680px;margin:0 auto;">
+  <div style="background:linear-gradient(135deg,#3b1e5f,#0f172a);border-radius:12px;padding:24px;margin-bottom:20px;border:1px solid #334155;">
+    <div style="font-size:22px;font-weight:800;color:#a78bfa;">🔄 Quant Terminal</div>
+    <div style="font-size:14px;color:#94a3b8;margin-top:4px;">DRG 발표 후 갱신 예측 · 09:00 ET (개장 전)</div>
+    <div style="font-size:13px;color:#64748b;margin-top:8px;">{now_et}</div>
+  </div>
+
+  <div style="background:#1e293b;border-radius:10px;padding:16px;margin-bottom:16px;border:1px solid #334155;">
+    <div style="font-size:13px;color:#94a3b8;margin-bottom:6px;">방향 갱신</div>
+    <div style="font-size:18px;font-weight:800;">
+      <span style="color:#94a3b8;">{orig_dir or 'N/A'}</span>
+      <span style="color:#a78bfa;"> → </span>
+      <span style="color:{arrow_color};">{revised_dir}</span>
+    </div>
+    <div style="font-size:13px;color:#cbd5e1;margin-top:10px;"><strong>발표 결과:</strong> {release_results}</div>
+  </div>
+
+  <div style="background:#1e293b;border-radius:10px;padding:18px;margin-bottom:16px;border:1px solid #334155;font-size:14px;line-height:1.7;color:#e2e8f0;">
+    {body_html}
+  </div>
+
+  <div style="background:#0f172a;border-radius:10px;padding:14px;margin-bottom:16px;border:1px solid #334155;font-size:12px;line-height:1.6;color:#94a3b8;">
+    <div style="font-weight:700;color:#cbd5e1;margin-bottom:6px;">📊 발표 후 거시·프리마켓</div>
+    {macro_html}
+  </div>
+
+  <div style="text-align:center;color:#64748b;font-size:12px;padding:10px;">
+    ⚠️ 이 갱신은 8:30 발표를 반영한 개장 전 예측입니다. AI 참고용이며 투자 권유가 아닙니다.
+  </div>
+</div></body></html>"""
+
+
+def run_revise():
+    """발표 후(9am ET) 예측 갱신 모드 — 고임팩트 발표일에만 동작."""
+    print("=" * 60)
+    print(f"[START] DRG 발표후 갱신: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
+
+    if not is_market_open_today():
+        print("[SKIP] 오늘은 NYSE 휴장일. 갱신 스킵.")
+        sys.exit(0)
+
+    fred = Fred(api_key=FRED_API_KEY)
+    fred_releases, full_events = get_todays_major_releases(fred)
+    today = datetime.now(_ET).strftime("%Y-%m-%d")
+    high_today = [e for e in (full_events or [])
+                  if str(e.get("impact", "")).lower() in ("high", "3")
+                  and str(e.get("date", ""))[:10] == today]
+    if not (high_today or fred_releases):
+        print("[SKIP] 오늘 고임팩트 발표 없음 → 갱신 불필요.")
+        sys.exit(0)
+
+    baseline = load_today_baseline(today)
+    if not baseline or not str(baseline.get("full_text", "")).strip():
+        print("[SKIP] 오늘 8am 예측 행 없음 → 갱신 대상 없음.")
+        sys.exit(0)
+
+    print("[STEP 1] 발표 후 거시·프리마켓 수집 중...")
+    macro_summary = fetch_macro_context(fred, full_events=full_events)
+    release_results = _format_release_results(high_today) if high_today else ", ".join(fred_releases)
+    print(f"[INFO] 발표 결과: {release_results}")
+
+    print("[STEP 2] Gemini 갱신 예측 생성 중...")
+    revised_text = generate_drg_revision(
+        baseline.get("direction", ""), baseline.get("full_text", ""),
+        macro_summary, release_results)
+    if not revised_text:
+        print("[ERROR] 갱신 예측 생성 실패.")
+        sys.exit(1)
+
+    revised_dir = _extract_revised_direction(revised_text)
+    revision_reason = _extract_reason(revised_text)
+    print(f"[INFO] 방향 갱신: {baseline.get('direction','')} → {revised_dir}")
+
+    print("[STEP 3] 갱신 저장 중...")
+    update_drg_revision(today, revised_dir, revised_text, revision_reason)
+
+    print("[STEP 4] 갱신 이메일 발송 중...")
+    subject = (f"🔄 [DRG 갱신] {baseline.get('direction','')}→{revised_dir} · "
+               f"{datetime.now(_ET).strftime('%m/%d')} (발표후)")
+    html_body = build_revision_email_html(
+        baseline.get("direction", ""), revised_dir, revised_text,
+        release_results, macro_summary)
+    send_email(subject, html_body)
+
+    print(f"[DONE] 갱신 완료: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
+    print("=" * 60)
 
 
 # ── HTML 이메일 ───────────────────────────────────────────────────────────────
@@ -889,4 +1170,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _MODE = "predict"
+    if "--mode" in sys.argv:
+        _i = sys.argv.index("--mode")
+        if _i + 1 < len(sys.argv):
+            _MODE = sys.argv[_i + 1].strip().lower()
+    if _MODE == "revise":
+        run_revise()
+    else:
+        main()

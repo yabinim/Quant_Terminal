@@ -41,7 +41,8 @@ _DRG_PREDICTIONS_WORKSHEET = "DRG_Predictions"
 _DRG_SHEET_COLS = [
     "user_id", "pred_date", "direction", "sector_filter", "benchmark_etf",
     "spy_close_at_pred", "full_text", "actual_direction", "actual_return_pct",
-    "is_correct", "review_comment"
+    "is_correct", "review_comment",
+    "revised_direction", "revised_full_text", "revision_reason", "revised_at", "is_revised"
 ]
 _ADMIN_USER_ID = "yab"
 
@@ -240,7 +241,10 @@ def verify_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         else:
             actual_dir = "중립"
 
-        pred_dir = str(pred_row.get("direction", "")).strip()
+        # 발표 후 갱신본이 있으면 갱신 방향으로 채점(일관성 — app.py와 동일)
+        _is_rev = str(pred_row.get("is_revised", "")).strip().upper() == "TRUE"
+        _rev_dir = str(pred_row.get("revised_direction", "")).strip()
+        pred_dir = _rev_dir if (_is_rev and _rev_dir) else str(pred_row.get("direction", "")).strip()
         pred_dir_norm = "상승" if "상승" in pred_dir else ("하락" if "하락" in pred_dir else "중립")
         is_correct = "✅ 적중" if pred_dir_norm == actual_dir else "❌ 빗나감"
 
@@ -419,15 +423,22 @@ def main():
             print(f"[WARN] {pred_date} 검증 불가 (장 미마감 또는 데이터 없음)")
             continue
 
-        print(f"[INFO] {pred_date}: {row.get('direction','')} → 실제 {actual_dir} | {is_correct} ({actual_ret:+.2f}%)")
-        review = generate_review_comment(
-            str(row.get("direction", "")), actual_dir, actual_ret,
-            is_correct, str(row.get("full_text", "")))
+        # 채점·리뷰는 발표 후 갱신본이 있으면 그 기준으로(일관성)
+        _is_rev = str(row.get("is_revised", "")).strip().upper() == "TRUE"
+        _rev_dir = str(row.get("revised_direction", "")).strip()
+        _revised = _is_rev and bool(_rev_dir)
+        eff_dir = _rev_dir if _revised else str(row.get("direction", ""))
+        eff_text = str(row.get("revised_full_text", "")).strip() if _is_rev else ""
+        if not eff_text:
+            eff_text = str(row.get("full_text", ""))
+
+        print(f"[INFO] {pred_date}: {eff_dir}{' (갱신)' if _revised else ''} → 실제 {actual_dir} | {is_correct} ({actual_ret:+.2f}%)")
+        review = generate_review_comment(eff_dir, actual_dir, actual_ret, is_correct, eff_text)
         update_drg_result_in_sheet(pred_date, actual_dir, actual_ret, is_correct, review)
 
         verified_results.append({
             "pred_date":         pred_date,
-            "direction":         row.get("direction", ""),
+            "direction":         eff_dir + (" 🔄" if _revised else ""),
             "actual_direction":  actual_dir,
             "actual_return_pct": actual_ret,
             "is_correct":        is_correct,
