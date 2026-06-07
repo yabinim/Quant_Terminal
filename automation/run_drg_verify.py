@@ -21,12 +21,16 @@ import pytz
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from google import genai
+from google.genai import types as genai_types
 
 # ── 환경변수 ──────────────────────────────────────────────────────────────────
 GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 GMAIL_TO           = os.environ["GMAIL_TO"]
 GSPREAD_KEY_JSON   = os.environ["GSPREAD_KEY"]
+# AI 리뷰 생성용(검증 일관성). 워크플로에 시크릿이 없으면 리뷰만 생략(기존 동작 유지).
+GOOGLE_API_KEY     = os.environ.get("GOOGLE_API_KEY", "")
 _gcp_info          = json.loads(GSPREAD_KEY_JSON)
 
 # ── 상수 ───────────────────────────────────────────────────────────────────────
@@ -90,8 +94,9 @@ def load_drg_predictions() -> pd.DataFrame:
 
 
 def update_drg_result_in_sheet(pred_date: str, actual_dir: str,
-                                 actual_ret: float, is_correct: str) -> bool:
-    """pred_date 행의 검증 결과 업데이트."""
+                                 actual_ret: float, is_correct: str,
+                                 review_comment: str = "") -> bool:
+    """pred_date 행의 검증 결과 업데이트 (review_comment 포함)."""
     try:
         gc = get_gspread_client()
         sh = gc.open(_SPREADSHEET_TITLE)
@@ -110,6 +115,7 @@ def update_drg_result_in_sheet(pred_date: str, actual_dir: str,
         except ValueError as e:
             print(f"[ERROR] 컬럼 찾기 실패: {e}")
             return False
+        review_col = (header.index("review_comment") + 1) if "review_comment" in header else None
 
         updated = False
         for row_idx, row in enumerate(rows[1:], start=2):
@@ -122,7 +128,10 @@ def update_drg_result_in_sheet(pred_date: str, actual_dir: str,
                 ws.update_cell(row_idx, actual_dir_col, actual_dir)
                 ws.update_cell(row_idx, actual_ret_col, ret_str)
                 ws.update_cell(row_idx, is_correct_col, is_correct)
-                print(f"[OK] 검증 업데이트: {pred_date} → {actual_dir} | {is_correct}")
+                if review_col and review_comment:
+                    ws.update_cell(row_idx, review_col, review_comment)
+                print(f"[OK] 검증 업데이트: {pred_date} → {actual_dir} | {is_correct}"
+                      f"{' | 리뷰✓' if (review_col and review_comment) else ''}")
                 updated = True
 
         return updated
@@ -130,6 +139,37 @@ def update_drg_result_in_sheet(pred_date: str, actual_dir: str,
         print(f"[ERROR] Sheets 업데이트 실패: {e}")
         traceback.print_exc()
         return False
+
+
+# ── AI 리뷰 생성 (검증 일관성) ─────────────────────────────────────────────────
+def generate_review_comment(direction: str, actual_dir: str, actual_ret: float,
+                            is_correct: str, full_text: str) -> str:
+    """app.py의 '결과 검증' AI 리뷰와 동일한 review_comment 생성.
+    ⚠️ 프롬프트는 app.py의 결과 검증 리뷰와 반드시 동일하게 유지할 것 (검증 일관성).
+       full_text 앞부분에 발표일 가드레일 배너가 있으면 모델이 자연히
+       '발표 전 예측이었음'을 근거로 빗나간 이유를 귀속한다."""
+    if not GOOGLE_API_KEY:
+        return ""
+    try:
+        ret_str = f"{actual_ret:+.2f}%" if not np.isnan(actual_ret) else "N/A"
+        prompt = (
+            f"예측방향: {direction} / 실제: {actual_dir} ({ret_str}) / {is_correct}\n"
+            f"예측 전문(앞 500자): {str(full_text)[:500]}\n"
+            "3~4문장 한국어 리뷰: 맞았다면 어떤 근거가 적중했는지, 틀렸다면 무엇을 놓쳤는지, 다음 예측 시 참고할 인사이트."
+        )
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+        cfg = genai_types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=1024,
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        )
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash", contents=prompt, config=cfg
+        )
+        return str(getattr(resp, "text", "") or "").strip()
+    except Exception as e:
+        print(f"[WARN] AI 리뷰 생성 실패: {e}")
+        return ""
 
 
 # ── 예측 검증 로직 ────────────────────────────────────────────────────────────
@@ -252,6 +292,24 @@ def build_verify_email_html(results: list[dict]) -> str:
     r_correct = len(recent[recent["is_correct"].str.contains("적중", na=False)])
     r_acc_str = f"{r_correct/r_total*100:.0f}% ({r_correct}/{r_total})" if r_total > 0 else "N/A"
 
+    # AI 리뷰 블록 (검증 일관성 — 앱 '예측 전문 보기'의 AI 리뷰와 동일 내용)
+    reviews_html = ""
+    for r in results:
+        rev = str(r.get("review_comment", "") or "").strip()
+        if not rev:
+            continue
+        rc = r.get("is_correct", "")
+        bar = "#16a34a" if "적중" in rc else ("#dc2626" if "빗나감" in rc else "#6b7280")
+        rev_html = rev.replace("\n", "<br>")
+        reviews_html += f"""
+        <div style="background:#1e293b;border-left:3px solid {bar};border-radius:8px;padding:14px;margin-bottom:10px;">
+          <div style="font-size:12px;color:#64748b;margin-bottom:6px;">🤖 AI 리뷰 · {r.get('pred_date','')} · {r.get('direction','')} → {r.get('actual_direction','')} {rc}</div>
+          <div style="font-size:13px;color:#cbd5e1;line-height:1.6;">{rev_html}</div>
+        </div>"""
+    reviews_section = (
+        f'<div style="margin-bottom:16px;">{reviews_html}</div>' if reviews_html else ""
+    )
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:20px;">
@@ -290,6 +348,8 @@ def build_verify_email_html(results: list[dict]) -> str:
       <tbody>{rows_html}</tbody>
     </table>
   </div>
+
+  {reviews_section}
 
   <div style="text-align:center;padding:16px;">
     <a href="https://quantdb.streamlit.app"
@@ -360,7 +420,10 @@ def main():
             continue
 
         print(f"[INFO] {pred_date}: {row.get('direction','')} → 실제 {actual_dir} | {is_correct} ({actual_ret:+.2f}%)")
-        update_drg_result_in_sheet(pred_date, actual_dir, actual_ret, is_correct)
+        review = generate_review_comment(
+            str(row.get("direction", "")), actual_dir, actual_ret,
+            is_correct, str(row.get("full_text", "")))
+        update_drg_result_in_sheet(pred_date, actual_dir, actual_ret, is_correct, review)
 
         verified_results.append({
             "pred_date":         pred_date,
@@ -368,6 +431,7 @@ def main():
             "actual_direction":  actual_dir,
             "actual_return_pct": actual_ret,
             "is_correct":        is_correct,
+            "review_comment":    review,
         })
 
     print(f"[STEP 3] 이메일 발송 중... (검증 완료 {len(verified_results)}건)")
