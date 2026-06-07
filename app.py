@@ -6761,6 +6761,44 @@ def _trade_review_hold_bucket(days) -> str:
     return "❓ 미상"
 
 
+# ── 진입 사유(매수 신호 유형) — Chunk 3 ──
+# Trade_History 스키마(8컬럼)는 그대로 두고, memo 앞에 [진입:라벨] 태그로 저장한다.
+# (스키마 상수를 바꾸면 automation/ 5pm 스크립트·실현손익 경로까지 lockstep을 맞춰야 해 위험)
+_ENTRY_REASON_OPTIONS = [
+    "🧩 기타 / 미지정",
+    "🎯 최적 매수 타이밍 (눌림목·RS반전)",
+    "🌱 얼리버드 (선취매)",
+    "🚀 돌파 매수 (브레이크아웃)",
+    "📈 추세 추종 (이미 강세)",
+    "🧭 내러티브 / 테마 베팅",
+    "🔄 분할 매수 / 물타기",
+    "📊 정기 적립 (DCA)",
+]
+_ENTRY_REASON_DEFAULT = _ENTRY_REASON_OPTIONS[0]
+
+
+def _build_entry_memo(reason: str, base: str = "") -> str:
+    """진입 사유를 memo 앞에 '[진입:라벨] ' 태그로 붙인다. 기본값/빈값이면 태그 생략."""
+    r = str(reason or "").strip()
+    base = str(base or "").strip()
+    if not r or r == _ENTRY_REASON_DEFAULT:
+        return base
+    return f"[진입:{r}] {base}".strip()
+
+
+def _parse_entry_reason(memo: str) -> str:
+    """memo의 '[진입:라벨]' 태그에서 진입 사유 추출. 없으면 '🧩 기타 / 미기록'. (re 미사용)"""
+    s = str(memo or "")
+    a = s.find("[진입:")
+    if a != -1:
+        b = s.find("]", a)
+        if b != -1:
+            val = s[a + 4:b].strip()  # '[진입:' 는 4글자
+            if val:
+                return val
+    return "🧩 기타 / 미기록"
+
+
 def compute_closed_trades_detail(trade_df: pd.DataFrame) -> pd.DataFrame:
     """BUY/SELL 기록 → 청산(SELL) 단위 상세. 날짜 인식 FIFO로 보유기간까지 계산.
 
@@ -6769,10 +6807,11 @@ def compute_closed_trades_detail(trade_df: pd.DataFrame) -> pd.DataFrame:
     대응 매수가 없는 매도(기록 누락)는 매칭된 수량만큼만 계산하고, 0이면 스킵.
 
     반환 컬럼: ticker, account, sell_date, first_buy_date, holding_days,
-              shares_sold, sell_price, fifo_cost, pnl, pnl_pct, memo
+              shares_sold, sell_price, fifo_cost, pnl, pnl_pct, entry_reason, memo
+    entry_reason: 포지션을 연 '첫 매칭 매수 lot'의 진입 사유(memo 태그). (Chunk 3)
     """
     _cols = ["ticker", "account", "sell_date", "first_buy_date", "holding_days",
-             "shares_sold", "sell_price", "fifo_cost", "pnl", "pnl_pct", "memo"]
+             "shares_sold", "sell_price", "fifo_cost", "pnl", "pnl_pct", "entry_reason", "memo"]
     if trade_df is None or trade_df.empty:
         return pd.DataFrame(columns=_cols)
 
@@ -6781,7 +6820,7 @@ def compute_closed_trades_detail(trade_df: pd.DataFrame) -> pd.DataFrame:
         grp = grp.copy()
         grp["date"] = pd.to_datetime(grp["date"], errors="coerce")
         grp = grp.sort_values("date").reset_index(drop=True)
-        fifo_queue = []  # [shares_remaining, price, buy_date(Timestamp or NaT)]
+        fifo_queue = []  # [shares_remaining, price, buy_date(Timestamp or NaT), entry_reason]
 
         for _, row in grp.iterrows():
             act = str(row.get("action", "")).strip().upper()
@@ -6790,7 +6829,7 @@ def compute_closed_trades_detail(trade_df: pd.DataFrame) -> pd.DataFrame:
             dt = row.get("date")
 
             if act == "BUY" and sh > 0 and pr > 0:
-                fifo_queue.append([sh, pr, dt])
+                fifo_queue.append([sh, pr, dt, _parse_entry_reason(row.get("memo"))])
 
             elif act == "SELL" and sh > 0 and pr > 0:
                 remaining = sh
@@ -6798,13 +6837,17 @@ def compute_closed_trades_detail(trade_df: pd.DataFrame) -> pd.DataFrame:
                 hold_weighted = 0.0   # Σ(used_sh × holding_days)
                 hold_shares = 0.0
                 first_buy = pd.NaT
+                entry_reason = None
                 new_queue = []
                 for lot in fifo_queue:
                     if remaining <= 1e-9:
                         new_queue.append(lot)
                         continue
                     lot_sh, lot_pr, lot_dt = lot[0], lot[1], lot[2]
+                    lot_reason = lot[3] if len(lot) > 3 else "🧩 기타 / 미기록"
                     use = min(lot_sh, remaining)
+                    if use > 1e-9 and entry_reason is None:
+                        entry_reason = lot_reason  # 포지션을 연 첫 매칭 lot의 사유
                     cost_total += use * lot_pr
                     if pd.notna(dt) and pd.notna(lot_dt):
                         hd = max(0, (dt - lot_dt).days)
@@ -6815,7 +6858,7 @@ def compute_closed_trades_detail(trade_df: pd.DataFrame) -> pd.DataFrame:
                     lot_sh -= use
                     remaining -= use
                     if lot_sh > 1e-9:
-                        new_queue.append([lot_sh, lot_pr, lot_dt])
+                        new_queue.append([lot_sh, lot_pr, lot_dt, lot_reason])
                 fifo_queue = new_queue
 
                 matched = sh - remaining  # 실제 매칭 수량 (매수 기록 부족 시 < sh)
@@ -6834,12 +6877,50 @@ def compute_closed_trades_detail(trade_df: pd.DataFrame) -> pd.DataFrame:
                     "holding_days": round(holding_days, 1) if pd.notna(holding_days) else np.nan,
                     "shares_sold": matched, "sell_price": pr,
                     "fifo_cost": fifo_cost_per, "pnl": pnl, "pnl_pct": pnl_pct,
+                    "entry_reason": entry_reason or "🧩 기타 / 미기록",
                     "memo": str(row.get("memo") or ""),
                 })
 
     if not results:
         return pd.DataFrame(columns=_cols)
     return pd.DataFrame(results).sort_values("sell_date", ascending=False).reset_index(drop=True)
+
+
+def find_unmatched_sells(trade_df: pd.DataFrame) -> pd.DataFrame:
+    """대응 매수(BUY)가 없어 손익 계산에서 제외된 매도(또는 그 일부)를 찾는다.
+
+    같은 (티커+계좌)에서 보유 수량을 초과해 매도된 부분 = 매수 기록 누락분.
+    매매 복기에 5건만 잡히는 등 '왜 일부만 분석되나' 원인을 사용자에게 보여주기 위함.
+    반환: [ticker, account, sell_date, shares_unmatched]
+    """
+    _cols = ["ticker", "account", "sell_date", "shares_unmatched"]
+    if trade_df is None or trade_df.empty:
+        return pd.DataFrame(columns=_cols)
+    rows = []
+    for (ticker, account), grp in trade_df.groupby(["ticker", "account"]):
+        grp = grp.copy()
+        grp["date"] = pd.to_datetime(grp["date"], errors="coerce")
+        grp = grp.sort_values("date").reset_index(drop=True)
+        inv = 0.0  # 보유 수량(FIFO 총량)
+        for _, row in grp.iterrows():
+            act = str(row.get("action", "")).strip().upper()
+            sh = float(row.get("shares") or 0)
+            if act == "BUY" and sh > 0:
+                inv += sh
+            elif act == "SELL" and sh > 0:
+                matched = min(inv, sh)
+                inv -= matched
+                unmatched = sh - matched
+                if unmatched > 1e-9:
+                    dt = row.get("date")
+                    rows.append({
+                        "ticker": ticker, "account": account,
+                        "sell_date": dt.strftime("%Y-%m-%d") if pd.notna(dt) else "",
+                        "shares_unmatched": round(unmatched, 6),
+                    })
+    if not rows:
+        return pd.DataFrame(columns=_cols)
+    return pd.DataFrame(rows).sort_values("sell_date", ascending=False).reset_index(drop=True)
 
 
 def build_trade_thesis_map(user_id: str) -> dict:
@@ -6919,8 +7000,10 @@ def build_review_sector_map(tickers_tuple: tuple) -> dict:
 
     def _one(tk):
         try:
-            p = _fmp_profile(tk)
-            return tk, str((p or {}).get("sector") or "").strip()
+            p = _fmp_profile(tk) or {}
+            if p.get("isEtf") or p.get("isFund"):
+                return tk, "__ETF__"  # ETF는 발행사 섹터(예: 금융)로 오분류되므로 별도 처리
+            return tk, str(p.get("sector") or "").strip()
         except Exception:
             return tk, ""
 
@@ -6929,7 +7012,12 @@ def build_review_sector_map(tickers_tuple: tuple) -> dict:
         for fut in _cf.as_completed(futs):
             try:
                 tk, sec_en = fut.result()
-                out[tk] = translate_ko(sec_en, _SECTOR_KR) if sec_en else "❓ 미상"
+                if sec_en == "__ETF__":
+                    out[tk] = "📦 ETF"
+                elif sec_en:
+                    out[tk] = translate_ko(sec_en, _SECTOR_KR)
+                else:
+                    out[tk] = "❓ 미상"
             except Exception:
                 pass
     return out
@@ -16349,6 +16437,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     key="form_portfolio_add_thesis",
                     help="내러티브 추천 종목이면 그대로 두세요 — 제출 시 해당 테마로 자동 연결됩니다. QQQM 같은 정기 적립은 '📈 코어/정기적립'을 고르세요.",
                 )
+                selected_entry_reason = st.selectbox(
+                    "🎬 진입 사유 (어떤 신호로 매수했나요?)",
+                    options=_ENTRY_REASON_OPTIONS,
+                    index=0,
+                    key="form_portfolio_add_entry_reason",
+                    help="매매 복기의 '진입신호유형별 성과' 분석에 쓰입니다. 청산 후 어떤 진입 방식이 실제로 수익이 났는지 추적해요. (선택)",
+                )
                 new_buy_date = st.date_input(
                     "매수일 (실제 산 날짜)",
                     value=datetime.now(_MARKET_ET_TZ).date(),
@@ -16405,7 +16500,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                         save_portfolio(updated_df)
                                         # Trade_History에 BUY 기록
                                         _buy_date = new_buy_date.strftime("%Y-%m-%d")
-                                        append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "추가 매수")
+                                        append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, _build_entry_memo(selected_entry_reason, "추가 매수"))
                                         st.success(
                                             f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
                                             f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
@@ -16432,7 +16527,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     save_portfolio(updated_df)
                                     # Trade_History에 BUY 기록
                                     _buy_date = new_buy_date.strftime("%Y-%m-%d")
-                                    append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, "신규 매수")
+                                    append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, _build_entry_memo(selected_entry_reason, "신규 매수"))
                                     # ── Thesis 연결 ──
                                     _thesis_msg = ""
                                     if selected_thesis_label == _THESIS_CORE:
@@ -18932,11 +19027,25 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     "**💸 매도 기록**으로 매도를 남기면 여기서 자동으로 복기됩니다."
                 )
             else:
-                # 카테고리·보유기간 부착
+                # 카테고리·보유기간·진입신호 부착
                 tmap = build_trade_thesis_map(puid)
                 closed = closed.copy()
                 closed["카테고리"] = closed["ticker"].astype(str).str.upper().map(tmap).fillna("🏷️ 미분류")
                 closed["보유기간"] = closed["holding_days"].apply(_trade_review_hold_bucket)
+                closed["진입신호"] = closed.get("entry_reason", "🧩 기타 / 미기록")
+
+                # ── 매수 기록 없어 제외된 매도 경고 ──────────────────────────
+                try:
+                    _unmatched = find_unmatched_sells(_tr_df)
+                except Exception:
+                    _unmatched = pd.DataFrame()
+                if _unmatched is not None and not _unmatched.empty:
+                    _u_tk = ", ".join(sorted(_unmatched["ticker"].astype(str).unique())[:12])
+                    st.warning(
+                        f"⚠️ **{len(_unmatched)}건의 매도**는 같은 계좌에 대응하는 **매수(BUY) 기록이 없어** 분석에서 제외됐어요 "
+                        f"(원가를 알 수 없어 손익 계산 불가). 제외: {_u_tk}. "
+                        "정확한 복기를 위해 매수 시 `🛡️ 매도 레이더` 탭에서 포지션을 추가(BUY 기록)해 주세요."
+                    )
 
                 # ── 전체 요약 ────────────────────────────────────────────────
                 overall = _trade_review_group_metrics(closed)
@@ -19028,6 +19137,20 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.dataframe(_style_review_table(hold_bd), use_container_width=True, hide_index=True)
                     st.caption("💡 승률·손익비가 가장 좋은 보유기간이 당신의 '스윗스팟'입니다. 그 구간에 맞춰 익절·손절 규칙을 세우세요.")
 
+                # ── 진입신호유형별 (Chunk 3) ─────────────────────────────────
+                st.markdown("### 🎬 진입신호유형별 성과")
+                sig_bd = build_trade_review_breakdown(closed, "진입신호")
+                if sig_bd.empty:
+                    st.caption("데이터가 없습니다.")
+                else:
+                    st.dataframe(_style_review_table(sig_bd), use_container_width=True, hide_index=True)
+                    _untagged = int((closed["진입신호"] == "🧩 기타 / 미기록").sum())
+                    if _untagged:
+                        st.caption(
+                            f"ℹ️ 현재 {_untagged}건은 진입사유 태그가 없어 '기타/미기록'으로 묶였습니다. "
+                            "이제부터 매수 시 폼에서 **진입 사유**를 고르면, 어떤 진입 방식이 실제로 수익이 나는지 누적 분석됩니다."
+                        )
+
                 # ── 섹터별 + 놓친 수익 (FMP, on-demand) ───────────────────────
                 st.divider()
                 st.markdown("### 🌐 섹터별 성과 · 청산 품질 (FMP 조회)")
@@ -19089,6 +19212,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     _cols = ["매도일", "티커", "계좌", "카테고리"]
                     if "섹터" in _disp.columns:
                         _cols.append("섹터")
+                    if "진입신호" in _disp.columns:
+                        _cols.append("진입신호")
                     _cols += ["보유기간", "보유일", "수량", "매수가(FIFO)", "매도가", "손익($)", "손익(%)"]
                     if "놓친수익(%)" in _disp.columns:
                         _cols.append("놓친수익(%)")
