@@ -6896,7 +6896,7 @@ def _trade_review_group_metrics(g: pd.DataFrame) -> dict:
 
 
 def build_trade_review_breakdown(closed_df: pd.DataFrame, by_col: str) -> pd.DataFrame:
-    """청산 상세를 by_col(카테고리/보유기간 등) 기준으로 묶어 지표 표를 만든다."""
+    """청산 상세를 by_col(카테고리/보유기간/섹터 등) 기준으로 묶어 지표 표를 만든다."""
     if closed_df is None or closed_df.empty or by_col not in closed_df.columns:
         return pd.DataFrame()
     rows = []
@@ -6906,6 +6906,76 @@ def build_trade_review_breakdown(closed_df: pd.DataFrame, by_col: str) -> pd.Dat
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("총손익($)", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_review_sector_map(tickers_tuple: tuple) -> dict:
+    """티커 → 섹터(한글) 매핑. _fmp_profile(캐시) 병렬 조회. (Chunk 2)"""
+    out = {}
+    tickers = [t for t in dict.fromkeys(tickers_tuple) if t]
+    if not tickers:
+        return out
+    import concurrent.futures as _cf
+
+    def _one(tk):
+        try:
+            p = _fmp_profile(tk)
+            return tk, str((p or {}).get("sector") or "").strip()
+        except Exception:
+            return tk, ""
+
+    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(_one, t) for t in tickers]
+        for fut in _cf.as_completed(futs):
+            try:
+                tk, sec_en = fut.result()
+                out[tk] = translate_ko(sec_en, _SECTOR_KR) if sec_en else "❓ 미상"
+            except Exception:
+                pass
+    return out
+
+
+def compute_trade_exit_quality(closed_df: pd.DataFrame, fwd_days: int = 30) -> pd.DataFrame:
+    """각 청산에 대해 '청산 후 fwd_days 내 최고가 대비 놓친 수익%' 계산. (Chunk 2)
+
+    놓친수익(%) > 0 = 팔고 더 올랐다(이른 익절), ~0 = 거의 고점에서 잘 팔았다.
+    (음수는 0으로 floor — 고점이 매도가보다 낮으면 '놓친 것 없음'.)
+    매도일이 너무 오래돼 가격 이력이 닿지 않으면 NaN으로 둔다.
+    """
+    out = closed_df.copy()
+    out["놓친수익(%)"] = np.nan
+    out["청산후고가"] = np.nan
+    if out.empty:
+        return out
+    tickers = sorted({str(t).strip().upper() for t in out["ticker"] if str(t).strip()})
+    if not tickers:
+        return out
+    sell_dts = pd.to_datetime(out["sell_date"], errors="coerce")
+    oldest = sell_dts.min()
+    days_needed = 300
+    if pd.notna(oldest):
+        days_needed = int((pd.Timestamp.today().normalize() - oldest).days) + fwd_days + 10
+    limit = max(60, min(days_needed, 1500))
+    hist = _fmp_batch_price_history(tickers, limit=limit)
+    for idx, row in out.iterrows():
+        tk = str(row["ticker"]).strip().upper()
+        sd = pd.to_datetime(row["sell_date"], errors="coerce")
+        try:
+            sp = float(row["sell_price"])
+        except Exception:
+            sp = np.nan
+        df = hist.get(tk)
+        if df is None or df.empty or pd.isna(sd) or pd.isna(sp) or sp <= 0 or "High" not in df.columns:
+            continue
+        win = df[(df.index > sd) & (df.index <= sd + pd.Timedelta(days=fwd_days))]
+        if win.empty:
+            continue
+        hi = float(win["High"].max())
+        if not np.isfinite(hi):
+            continue
+        out.at[idx, "청산후고가"] = hi
+        out.at[idx, "놓친수익(%)"] = max(0.0, (hi / sp - 1.0) * 100.0)
+    return out
 
 
 def _review_pnl_color(v):
@@ -6933,18 +7003,37 @@ def _review_fmt_pf(v):
 
 
 def _style_review_table(df: pd.DataFrame):
-    """복기 분석 표 공통 스타일러(∞·NaN 안전 처리)."""
+    """복기 분석 표 공통 스타일러(∞·NaN 안전 처리).
+
+    Streamlit st.dataframe는 Styler의 na_rep을 일부 무시하고 NaN을 'None'으로 표기하므로,
+    표시 컬럼을 미리 문자열로 변환(NaN→'—')한다.
+    """
     show = df.copy()
+
+    def _pct(v, signed=True):
+        try:
+            if pd.isna(v):
+                return "—"
+            return f"{float(v):+.1f}%" if signed else f"{float(v):.0f}%"
+        except Exception:
+            return "—"
+
+    if "승률(%)" in show.columns:
+        show["승률(%)"] = show["승률(%)"].apply(lambda v: _pct(v, signed=False))
+    if "평균익절(%)" in show.columns:
+        show["평균익절(%)"] = show["평균익절(%)"].apply(lambda v: _pct(v, signed=True))
+    if "평균손절(%)" in show.columns:
+        show["평균손절(%)"] = show["평균손절(%)"].apply(lambda v: _pct(v, signed=True))
     if "손익비(PF)" in show.columns:
         show["손익비(PF)"] = show["손익비(PF)"].apply(_review_fmt_pf)
     if "손익률(배)" in show.columns:
         show["손익률(배)"] = show["손익률(배)"].apply(lambda x: "—" if pd.isna(x) else f"{float(x):.2f}x")
-    fmt = {
-        "승률(%)": "{:.0f}%", "평균익절(%)": "{:+.1f}%",
-        "평균손절(%)": "{:+.1f}%", "총손익($)": "${:+,.2f}",
-    }
-    fmt = {k: v for k, v in fmt.items() if k in show.columns}
-    sty = show.style.format(fmt, na_rep="—")
+    if "놓친수익(%)" in show.columns:
+        show["놓친수익(%)"] = show["놓친수익(%)"].apply(lambda v: _pct(v, signed=True))
+    if "총손익($)" in show.columns:
+        show["총손익($)"] = show["총손익($)"].apply(lambda v: "—" if pd.isna(v) else f"${float(v):+,.2f}")
+
+    sty = show.style
     if "총손익($)" in show.columns:
         sty = sty.map(_review_pnl_color, subset=["총손익($)"])
     return sty
@@ -18939,6 +19028,52 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.dataframe(_style_review_table(hold_bd), use_container_width=True, hide_index=True)
                     st.caption("💡 승률·손익비가 가장 좋은 보유기간이 당신의 '스윗스팟'입니다. 그 구간에 맞춰 익절·손절 규칙을 세우세요.")
 
+                # ── 섹터별 + 놓친 수익 (FMP, on-demand) ───────────────────────
+                st.divider()
+                st.markdown("### 🌐 섹터별 성과 · 청산 품질 (FMP 조회)")
+                _fmp_flag = f"_review_fmp_on_{puid}"
+                if st.button("🌐 섹터 분석 + '놓친 수익' 계산", key=f"btn_review_fmp_{puid}",
+                             help="FMP에서 섹터·청산 후 30일 고가를 조회합니다. (캐시 1시간)"):
+                    st.session_state[_fmp_flag] = True
+                if st.session_state.get(_fmp_flag):
+                    _fmp_ok = False
+                    with st.spinner("FMP에서 섹터·가격 이력 조회 중... (종목 수에 따라 5~15초)"):
+                        try:
+                            _tks = tuple(sorted(closed["ticker"].astype(str).str.upper().unique()))
+                            _secmap = build_review_sector_map(_tks)
+                            closed["섹터"] = closed["ticker"].astype(str).str.upper().map(_secmap).fillna("❓ 미상")
+                            closed = compute_trade_exit_quality(closed, fwd_days=30)
+                            _fmp_ok = True
+                        except Exception as exc:
+                            st.error(f"FMP 조회 실패: {exc}")
+                    if _fmp_ok:
+                        sec_bd = build_trade_review_breakdown(closed, "섹터")
+                        if not sec_bd.empty:
+                            st.markdown("#### 🌐 섹터별")
+                            st.dataframe(_style_review_table(sec_bd), use_container_width=True, hide_index=True)
+                        _mq = pd.to_numeric(closed["놓친수익(%)"], errors="coerce").dropna()
+                        if not _mq.empty:
+                            _avg_missed = float(_mq.mean())
+                            st.markdown("#### 🎯 청산 품질 (청산 후 30일 내 고점 대비)")
+                            _qc1, _qc2 = st.columns(2)
+                            with _qc1:
+                                st.metric("평균 '놓친 수익'", f"{_avg_missed:.1f}%",
+                                          help="청산 후 30일 내 최고가까지 더 갈 수 있었던 평균 상승폭. 낮을수록 익절 타이밍이 좋음.")
+                            with _qc2:
+                                _early = int((_mq >= 10).sum())
+                                st.metric("이른 익절 (≥+10% 더 상승)", f"{_early}/{len(_mq)}건")
+                            if _avg_missed >= 12:
+                                st.info(f"⏳ 청산 후 평균 {_avg_missed:.0f}% 더 올랐습니다 — **익절이 이른 편**. "
+                                        "트레일링 스톱(예: 20일선 이탈·고점 대비 -10%)으로 추세를 더 끌고 가는 걸 고려하세요.")
+                            elif _avg_missed <= 4:
+                                st.success(f"✅ 청산 후 평균 상승이 {_avg_missed:.0f}%로 작습니다 — **익절 타이밍이 좋습니다**. 거의 고점 근처에서 파는 편이에요.")
+                            else:
+                                st.caption(f"청산 후 평균 {_avg_missed:.0f}% 추가 상승 — 무난한 익절 구간입니다.")
+                        else:
+                            st.caption("놓친 수익을 계산할 가격 이력이 부족합니다(매도일이 너무 오래된 경우).")
+                else:
+                    st.caption("버튼을 누르면 섹터별 성과와 '놓친 수익'(청산 후 30일 추가 상승)을 계산합니다. FMP API를 사용합니다.")
+
                 # ── 청산 거래 상세 ───────────────────────────────────────────
                 with st.expander("📋 청산 거래 상세 (FIFO)", expanded=False):
                     _disp = closed.rename(columns={
@@ -18946,13 +19081,27 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         "first_buy_date": "최초매수일", "holding_days": "보유일",
                         "shares_sold": "수량", "sell_price": "매도가", "fifo_cost": "매수가(FIFO)",
                         "pnl": "손익($)", "pnl_pct": "손익(%)", "memo": "메모",
-                    })[["매도일", "티커", "계좌", "카테고리", "보유기간", "보유일", "수량",
-                        "매수가(FIFO)", "매도가", "손익($)", "손익(%)", "메모"]]
+                    })
+                    # 놓친수익(%) NaN이 Streamlit에서 'None'으로 보이지 않게 문자열화
+                    if "놓친수익(%)" in _disp.columns:
+                        _disp["놓친수익(%)"] = _disp["놓친수익(%)"].apply(
+                            lambda v: "—" if pd.isna(v) else f"{float(v):.1f}%")
+                    _cols = ["매도일", "티커", "계좌", "카테고리"]
+                    if "섹터" in _disp.columns:
+                        _cols.append("섹터")
+                    _cols += ["보유기간", "보유일", "수량", "매수가(FIFO)", "매도가", "손익($)", "손익(%)"]
+                    if "놓친수익(%)" in _disp.columns:
+                        _cols.append("놓친수익(%)")
+                    _cols.append("메모")
+                    _cols = [c for c in _cols if c in _disp.columns]
+                    _fmt = {
+                        "보유일": "{:.0f}일", "수량": "{:,.4f}", "매수가(FIFO)": "${:,.4f}",
+                        "매도가": "${:,.4f}", "손익($)": "${:+,.2f}", "손익(%)": "{:+.2f}%",
+                    }
+                    _fmt = {k: v for k, v in _fmt.items() if k in _cols}
+                    _color_cols = [c for c in ["손익($)", "손익(%)"] if c in _cols]
                     st.dataframe(
-                        _disp.style.format({
-                            "보유일": "{:.0f}일", "수량": "{:,.4f}", "매수가(FIFO)": "${:,.4f}",
-                            "매도가": "${:,.4f}", "손익($)": "${:+,.2f}", "손익(%)": "{:+.2f}%",
-                        }, na_rep="—").map(_review_pnl_color, subset=["손익($)", "손익(%)"]),
+                        _disp[_cols].style.format(_fmt, na_rep="—").map(_review_pnl_color, subset=_color_cols),
                         use_container_width=True, hide_index=True,
                     )
 
