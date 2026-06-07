@@ -61,7 +61,8 @@ _DRG_PREDICTIONS_WORKSHEET_TITLE = "DRG_Predictions"
 _DRG_PREDICTIONS_SHEET_COLS = [
     "user_id", "pred_date", "direction", "sector_filter", "benchmark_etf",
     "spy_close_at_pred", "full_text", "actual_direction", "actual_return_pct",
-    "is_correct", "review_comment"
+    "is_correct", "review_comment",
+    "revised_direction", "revised_full_text", "revision_reason", "revised_at", "is_revised"
 ]
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 _THESIS_WORKSHEET_TITLE = "Thesis"
@@ -6527,8 +6528,10 @@ def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         else:
             actual_dir = "중립"
 
-        # 예측 방향 추출
-        pred_dir = str(pred_row.get("direction", "")).strip()
+        # 예측 방향 추출 — 발표 후 갱신본이 있으면 갱신 방향으로 채점(일관성)
+        _is_rev = str(pred_row.get("is_revised", "")).strip().upper() == "TRUE"
+        _rev_dir = str(pred_row.get("revised_direction", "")).strip()
+        pred_dir = _rev_dir if (_is_rev and _rev_dir) else str(pred_row.get("direction", "")).strip()
         pred_dir_norm = "상승" if "상승" in pred_dir else ("하락" if "하락" in pred_dir else "중립")
 
         is_correct = "✅ 적중" if pred_dir_norm == actual_dir else "❌ 빗나감"
@@ -12425,8 +12428,12 @@ if st.session_state.get("logged_in"):
             if not unverified.empty:
                 st.markdown("#### 🔍 결과 검증 대기 중")
                 for _uidx, (_, urow) in enumerate(unverified.iterrows()):
+                    _u_rev = str(urow.get('is_revised','')).strip().upper() == "TRUE"
+                    _u_revdir = str(urow.get('revised_direction','')).strip()
+                    _u_dir = (_u_revdir if (_u_rev and _u_revdir) else urow.get('direction',''))
+                    _u_tag = " 🔄갱신됨(09:00 ET)" if (_u_rev and _u_revdir) else ""
                     uc1, uc2, uc3 = st.columns([2, 2, 1])
-                    uc1.write(f"📅 **{urow.get('pred_date','')}** | {urow.get('direction','')}")
+                    uc1.write(f"📅 **{urow.get('pred_date','')}** | {_u_dir}{_u_tag}")
                     uc2.write(f"벤치마크: {urow.get('benchmark_etf','SPY')} | 섹터: {urow.get('sector_filter','전체')}")
                     with uc3:
                         if st.button("결과 검증", key=f"verify_{urow.get('pred_date','')}_{_uidx}"):
@@ -12435,9 +12442,10 @@ if st.session_state.get("logged_in"):
                             if _ad:
                                 with st.spinner("AI 리뷰 작성 중..."):
                                     try:
+                                        _u_eff_text = (str(urow.get('revised_full_text','')).strip() if _u_rev else "") or str(urow.get('full_text',''))
                                         _rp = (
-                                            f"예측방향: {urow.get('direction','')} / 실제: {_ad} ({_ar:+.2f}%) / {_ic}\n"
-                                            f"예측 전문(앞 500자): {str(urow.get('full_text',''))[:500]}\n"
+                                            f"예측방향: {_u_dir} / 실제: {_ad} ({_ar:+.2f}%) / {_ic}\n"
+                                            f"예측 전문(앞 500자): {_u_eff_text[:500]}\n"
                                             "3~4문장 한국어 리뷰: 맞았다면 어떤 근거가 적중했는지, 틀렸다면 무엇을 놓쳤는지, 다음 예측 시 참고할 인사이트."
                                         )
                                         _rm = _GenAIModel("gemini-2.5-flash",
@@ -12476,10 +12484,16 @@ if st.session_state.get("logged_in"):
                 if "❌" in str(v): return "color:#dc2626;font-weight:700;"
                 return "color:#94a3b8;"
 
+            def _eff_dir_row(r):
+                _rev = str(r.get("is_revised", "")).strip().upper() == "TRUE"
+                _rd = str(r.get("revised_direction", "")).strip()
+                return (_rd + " 🔄") if (_rev and _rd) else str(r.get("direction", ""))
+            show_hist["_eff_dir"] = show_hist.apply(_eff_dir_row, axis=1)
+
             st.dataframe(
-                show_hist[["pred_date","direction","sector_filter","benchmark_etf",
+                show_hist[["pred_date","_eff_dir","sector_filter","benchmark_etf",
                             "actual_direction","actual_return_pct","is_correct","review_comment"]]
-                .rename(columns={"pred_date":"예측일","direction":"예측방향","sector_filter":"섹터",
+                .rename(columns={"pred_date":"예측일","_eff_dir":"예측방향","sector_filter":"섹터",
                                   "benchmark_etf":"ETF","actual_direction":"실제방향",
                                   "actual_return_pct":"실제수익률(%)","is_correct":"적중여부","review_comment":"AI리뷰"})
                 .style
@@ -12496,9 +12510,23 @@ if st.session_state.get("logged_in"):
                     _r = _sel_row.iloc[0]
                     _ft = str(_r.get("full_text", ""))
                     _corr = str(_r.get("is_correct", ""))
-                    if "✅" in _corr: st.success(_ft)
-                    elif "❌" in _corr: st.error(_ft)
-                    else: st.info(_ft)
+                    _is_rev = str(_r.get("is_revised", "")).strip().upper() == "TRUE"
+                    _rev_dir = str(_r.get("revised_direction", "")).strip()
+                    if _is_rev and _rev_dir:
+                        st.markdown(f"🔄 **발표 후 갱신됨 (09:00 ET)** · {_r.get('revised_at','')}")
+                        st.markdown(f"방향: ~~{_r.get('direction','')}~~ → **{_rev_dir}**")
+                        _rev_ft = str(_r.get("revised_full_text", "")).strip() or _ft
+                        if "✅" in _corr: st.success(_rev_ft)
+                        elif "❌" in _corr: st.error(_rev_ft)
+                        else: st.info(_rev_ft)
+                        if str(_r.get("revision_reason", "")).strip():
+                            st.caption(f"📝 변경 사유: {_r.get('revision_reason','')}")
+                        with st.expander("🕗 8am 원본 예측 보기"):
+                            st.markdown(_ft)
+                    else:
+                        if "✅" in _corr: st.success(_ft)
+                        elif "❌" in _corr: st.error(_ft)
+                        else: st.info(_ft)
                     if str(_r.get("review_comment", "")).strip():
                         st.markdown("**🤖 AI 리뷰:**")
                         st.markdown(str(_r.get("review_comment", "")))
