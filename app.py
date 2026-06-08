@@ -74,6 +74,8 @@ _SCANNER_HISTORY_SHEET_TITLE = "Scanner_History"
 _SCANNER_HISTORY_COLS = ["ID", "Date", "Engine", "Ticker", "Score", "Rank", "Verdict", "RS_Score", "Mom_1M"]
 _SCANNER_LAST_RESULT_SHEET_TITLE = "Scanner_Last_Result"
 _SCANNER_LAST_RESULT_COLS = ["ID", "Engine", "Saved_At", "Universe_Count", "Score_JSON"]
+_ACCURACY_TRACKER_LAST_SHEET_TITLE = "Accuracy_Tracker_Last"
+_ACCURACY_TRACKER_LAST_COLS = ["ID", "Saved_At", "Eval_Horizon", "Hit_Threshold", "Result_JSON"]
 _PORTFOLIO_HISTORY_COLS = ["ID", "Date", "Total_Value", "Total_Cost", "Return_Pct", "SPY_Pct", "Alpha_Pct", "Positions"]
 _EMERGING_TRACKER_COLS = ["ID", "Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]
 _ETF_UNIVERSE_SHEET_COLS = ["Ticker", "Name", "Category", "AUM_M", "Added_Date", "Source"]
@@ -8413,6 +8415,289 @@ def load_scanner_last_result(user_id: str, engine: str) -> dict | None:
         return None
 
 
+def save_accuracy_tracker_last_result(user_id: str, snap: dict) -> tuple[bool, str]:
+    """내러티브 적중률 분석 결과를 Accuracy_Tracker_Last 탭에 JSON 으로 저장 (user_id 당 최신 1건)."""
+    gc = get_gspread_client()
+    if gc is None:
+        return False, "Google 서비스 계정 미설정"
+    try:
+        result_df = snap.get("result_df")
+        if not isinstance(result_df, pd.DataFrame) or result_df.empty:
+            return False, "결과 데이터 없음"
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [w.title for w in sh.worksheets()]
+        if _ACCURACY_TRACKER_LAST_SHEET_TITLE not in existing:
+            ws = sh.add_worksheet(title=_ACCURACY_TRACKER_LAST_SHEET_TITLE, rows=100, cols=5)
+            ws.update([_ACCURACY_TRACKER_LAST_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
+        else:
+            ws = sh.worksheet(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
+        uid_u = str(user_id).strip().upper()
+        saved_at = snap.get("saved_at") or datetime.now(timezone.utc).isoformat()
+        eval_horizon = str(snap.get("eval_horizon", ""))
+        hit_threshold = str(snap.get("hit_threshold", ""))
+        # 차트용 보조 컴럼(날짜_dt) 제거 후 records JSON 직렬화
+        df_to_save = result_df.drop(
+            columns=[c for c in ["날짜_dt"] if c in result_df.columns], errors="ignore"
+        )
+        result_json = df_to_save.to_json(orient="records", force_ascii=False)
+        new_row = [uid_u, saved_at, eval_horizon, hit_threshold, result_json]
+        all_vals = ws.get_all_values()
+        target_row = None
+        for ri, row in enumerate(all_vals[1:], start=2):
+            row = (row + [""] * 5)[:5]
+            if str(row[0]).strip().upper() == uid_u:
+                target_row = ri
+                break
+        if target_row:
+            ws.update([new_row], range_name=f"A{target_row}:E{target_row}", value_input_option="USER_ENTERED")
+        else:
+            _safe_append_rows(ws, [new_row], value_input_option="USER_ENTERED")
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def load_accuracy_tracker_last_result(user_id: str) -> dict | None:
+    """Accuracy_Tracker_Last 탭에서 마지막 적중률 분석 결과 복원. 반환: snap dict 또는 None."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [w.title for w in sh.worksheets()]
+        if _ACCURACY_TRACKER_LAST_SHEET_TITLE not in existing:
+            return None
+        ws = sh.worksheet(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
+        all_vals = ws.get_all_values()
+        if not all_vals or len(all_vals) < 2:
+            return None
+        uid_u = str(user_id).strip().upper()
+        for row in all_vals[1:]:
+            row = (row + [""] * 5)[:5]
+            if str(row[0]).strip().upper() == uid_u:
+                payload_str = str(row[4]).strip()
+                if not payload_str:
+                    return None
+                try:
+                    rows_data = json.loads(payload_str)
+                    if not rows_data:
+                        return None
+                    result_df = pd.DataFrame(rows_data)
+                    return {
+                        "result_df": result_df,
+                        "saved_at": str(row[1]).strip(),
+                        "eval_horizon": str(row[2]).strip(),
+                        "hit_threshold": float(row[3]) if str(row[3]).strip() else 5.0,
+                        "_restored_from_sheet": True,
+                    }
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
+
+def _render_accuracy_tracker_results(result_df, eval_horizon, hit_threshold):
+    """적중률 분석 결과 표시 — 신규 실행과 복원된 스냅샷 모두에서 재사용."""
+    if not isinstance(result_df, pd.DataFrame) or result_df.empty:
+        st.info("표시할 적중률 결과가 없습니다.")
+        return
+    # ── 요약 지표 ──────────────────────────────────────
+    st.divider()
+    st.markdown("### 📈 종합 적중률 요약")
+
+    valid_df = result_df[result_df["적중 여부"] != "N/A"].copy()
+    total_valid = len(valid_df)
+    hit_count = (valid_df["적중 여부"] == "✅ 적중").sum()
+    hit_rate = (hit_count / total_valid * 100) if total_valid > 0 else 0.0
+
+    winners_df = valid_df[valid_df["타입"] == "Winners"]
+    emerging_df = valid_df[valid_df["타입"] == "Emerging"]
+    w_hit = (winners_df["적중 여부"] == "✅ 적중").sum()
+    e_hit = (emerging_df["적중 여부"] == "✅ 적중").sum()
+    w_rate = (w_hit / len(winners_df) * 100) if len(winners_df) > 0 else 0.0
+    e_rate = (e_hit / len(emerging_df) * 100) if len(emerging_df) > 0 else 0.0
+
+    avg_ret_winners = pd.to_numeric(
+        winners_df[f"수익률(%, {eval_horizon})"], errors="coerce"
+    ).mean()
+    avg_ret_emerging = pd.to_numeric(
+        emerging_df[f"수익률(%, {eval_horizon})"], errors="coerce"
+    ).mean()
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric(
+            "전체 적중률",
+            f"{hit_rate:.1f}%",
+            delta=f"{hit_count}/{total_valid}건",
+        )
+    with m2:
+        st.metric(
+            "Winners 적중률",
+            f"{w_rate:.1f}%",
+            delta=f"평균 {avg_ret_winners:+.1f}%" if pd.notna(avg_ret_winners) else "N/A",
+        )
+    with m3:
+        st.metric(
+            "Emerging 적중률",
+            f"{e_rate:.1f}%",
+            delta=f"평균 {avg_ret_emerging:+.1f}%" if pd.notna(avg_ret_emerging) else "N/A",
+        )
+    with m4:
+        na_count = (result_df["적중 여부"] == "N/A").sum()
+        st.metric(
+            "데이터 없음",
+            f"{na_count}건",
+            delta="데이터 미수신 티커",
+        )
+
+    # 적중률 수준별 평가 메시지
+    if total_valid > 0:
+        if hit_rate >= 60:
+            st.success(
+                f"🏆 AI 예측 품질 우수: 적중률 **{hit_rate:.1f}%** — "
+                f"내러티브 신호를 적극 활용할 수 있는 수준입니다."
+            )
+        elif hit_rate >= 40:
+            st.warning(
+                f"🟡 AI 예측 품질 보통: 적중률 **{hit_rate:.1f}%** — "
+                f"내러티브를 참고 지표로만 활용하고, 다른 기준과 병행하세요."
+            )
+        else:
+            st.error(
+                f"🔴 AI 예측 품질 저조: 적중률 **{hit_rate:.1f}%** — "
+                f"현재 시장 환경이 내러티브 패턴과 맞지 않을 수 있습니다."
+            )
+
+    # ── 티커별 베스트/워스트 ──────────────────────────
+    st.divider()
+    st.markdown("### 🏅 티커별 수익률 순위")
+
+    ticker_summary = (
+        result_df.groupby("티커")
+        .agg(
+            타입=("타입", "first"),
+            평균수익률=(f"수익률(%, {eval_horizon})", lambda x: pd.to_numeric(x, errors="coerce").mean()),
+            등장횟수=("티커", "count"),
+        )
+        .reset_index()
+        .sort_values("평균수익률", ascending=False, na_position="last")
+    )
+
+    best5 = ticker_summary.head(5)
+    worst5 = ticker_summary.tail(5).sort_values("평균수익률", ascending=True)
+
+    rank_col1, rank_col2 = st.columns(2)
+    with rank_col1:
+        st.markdown("#### 🟢 Best 5 티커")
+        for _, r in best5.iterrows():
+            val = r["평균수익률"]
+            val_str = f"{val:+.2f}%" if pd.notna(val) else "N/A"
+            st.markdown(
+                f"**{r['티커']}** `{r['타입']}` — {val_str} "
+                f"_(등장 {int(r['등장횟수'])}회)_"
+            )
+
+    with rank_col2:
+        st.markdown("#### 🔴 Worst 5 티커")
+        for _, r in worst5.iterrows():
+            val = r["평균수익률"]
+            val_str = f"{val:+.2f}%" if pd.notna(val) else "N/A"
+            st.markdown(
+                f"**{r['티커']}** `{r['타입']}` — {val_str} "
+                f"_(등장 {int(r['등장횟수'])}회)_"
+            )
+
+    # ── 상세 결과 테이블 ──────────────────────────────
+    st.divider()
+    st.markdown("### 📋 상세 결과 테이블")
+    ret_col = f"수익률(%, {eval_horizon})"
+
+    def _style_hit(val):
+        if "적중" in str(val):
+            return "color: #16a34a; font-weight: 700;"
+        if "미적중" in str(val):
+            return "color: #dc2626; font-weight: 600;"
+        return "color: #9ca3af;"
+
+    def _style_return(val):
+        v = pd.to_numeric(val, errors="coerce")
+        if pd.isna(v):
+            return "color: #9ca3af;"
+        if v >= hit_threshold:
+            return "color: #16a34a; font-weight: 600;"
+        if v < 0:
+            return "color: #dc2626;"
+        return ""
+
+    styled_result = (
+        result_df.style
+        .format(
+            {ret_col: lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A"},
+            na_rep="N/A",
+        )
+        .map(_style_hit, subset=["적중 여부"])
+        .map(_style_return, subset=[ret_col])
+        .background_gradient(
+            cmap="RdYlGn",
+            subset=[ret_col],
+            axis=0,
+        )
+    )
+    st.dataframe(styled_result, use_container_width=True, hide_index=True)
+
+    st.caption(
+        f"⚠️ 적중 기준: 내러티브 생성 시점 이후 {eval_horizon} 기준 **+{hit_threshold:.1f}%** 이상 상승. "
+        "데이터가 horizon보다 짧은 경우 현재까지 수익률로 대체합니다. 투자 권유가 아닙니다."
+    )
+
+    # ── 월별 적중률 트렌드 차트 ──────────────────
+    st.divider()
+    st.markdown("### 📅 월별 적중률 트렌드")
+    try:
+        result_df["날짜_dt"] = pd.to_datetime(
+            result_df["날짜"].apply(
+                lambda x: f"2026/{x}" if "/" in str(x) else str(x)
+            ), errors="coerce"
+        )
+        valid_monthly = result_df[result_df["적중 여부"] != "N/A"].copy()
+        valid_monthly["월"] = valid_monthly["날짜_dt"].dt.to_period("M").astype(str)
+        monthly_stats = (
+            valid_monthly.groupby("월")
+            .apply(lambda g: round((g["적중 여부"] == "✅ 적중").sum() / len(g) * 100, 1))
+            .reset_index()
+            .rename(columns={0: "적중률(%)"})
+        )
+        if len(monthly_stats) >= 2:
+            monthly_chart = (
+                alt.Chart(monthly_stats)
+                .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+                .encode(
+                    x=alt.X("월:N", title="월"),
+                    y=alt.Y("적중률(%):Q", scale=alt.Scale(domain=[0, 100]), title="적중률(%)"),
+                    color=alt.condition(
+                        "datum['적중률(%)'] >= 50",
+                        alt.value("#16a34a"),
+                        alt.value("#dc2626"),
+                    ),
+                    tooltip=["월:N", "적중률(%):Q"],
+                )
+                .properties(height=200)
+            )
+            rule_50 = (
+                alt.Chart(pd.DataFrame({"y": [50]}))
+                .mark_rule(color="gray", strokeDash=[4, 4])
+                .encode(y="y:Q")
+            )
+            st.altair_chart(monthly_chart + rule_50, use_container_width=True)
+            st.caption("초록 = 50% 이상 적중 · 빨강 = 50% 미만 | 점선 = 50% 기준선")
+        else:
+            st.info("월별 트렌드를 표시하려면 2개월 이상의 내러티브 기록이 필요해요.")
+    except Exception as _me:
+        st.warning(f"월별 트렌드 차트 오류: {_me}")
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_scanner_history(user_id: str, engine: str = "all") -> pd.DataFrame:
     """스캐너 히스토리 로드. engine: 'all' | 'leaders' | 'emerging'"""
@@ -9228,8 +9513,24 @@ def load_narrative_history_records():
     if not uid_u:
         return []
     pruned = prune_narrative_history_records(mine)
-    if pruned != mine:
-        ok, merr = save_narrative_history_records_merge_user(uid, pruned)
+    # prune 은 weekly_portfolio_summary 를 제외(continue)하므로 pruned 엔 주간 요약이 없다.
+    # merge-save 는 해당 유저의 전체 행을 전달된 records 로 덮어쓰기 때문에, 주간 요약을
+    # 함께 넘기지 않으면 시트에서 영구 삭제된다. → 항상 보존해서 다시 써넣는다.
+    weekly_keep = [
+        r for r in mine
+        if isinstance(r.get("analysis"), dict)
+        and r["analysis"].get("source") == "weekly_portfolio_summary"
+    ]
+    non_weekly_mine = [
+        r for r in mine
+        if not (
+            isinstance(r.get("analysis"), dict)
+            and r["analysis"].get("source") == "weekly_portfolio_summary"
+        )
+    ]
+    # 비-주간 구간이 prune 으로 실제 변경된 경우에만 시트 재기록 (불필요한 write 방지).
+    if pruned != non_weekly_mine:
+        ok, merr = save_narrative_history_records_merge_user(uid, pruned + weekly_keep)
         if not ok and merr:
             try:
                 st.warning(merr)
@@ -12226,11 +12527,19 @@ def _build_narrative_context_for_summary(user_id: str) -> list:
 def _build_macro_context_for_summary() -> dict:
     """cached_analyze_us_macro_dashboard에서 Gemini 입력용 macro context 생성."""
     try:
-        macro_rows = cached_analyze_us_macro_dashboard()
+        macro_pack = cached_analyze_us_macro_dashboard()
+        # analyze_us_macro_dashboard() 는 {"rows": [...], ...} dict 를 반환한다.
+        # (과거: dict 를 그대로 순회 → 키 문자열만 돌다 예외 → 빈 dict 반환 버그)
+        if isinstance(macro_pack, dict):
+            macro_rows = macro_pack.get("rows", [])
+        else:
+            macro_rows = macro_pack or []
         if not macro_rows:
             return {}
         out = {}
         for row in macro_rows:
+            if not isinstance(row, dict):
+                continue
             label = str(row.get("지표", ""))
             val = str(row.get("현재값", ""))
             status = str(row.get("_status", ""))
@@ -17894,6 +18203,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
         uid_tracker = str(st.session_state.get("user_id") or "").strip()
 
+        # 세션 최초 진입 시 Quant_DB 에서 마지막 적중률 분석 결과 복원
+        if not st.session_state.get("_accuracy_tracker_restored"):
+            if uid_tracker:
+                _acc_restored = load_accuracy_tracker_last_result(uid_tracker)
+                if _acc_restored:
+                    st.session_state["_accuracy_tracker_last"] = _acc_restored
+            st.session_state["_accuracy_tracker_restored"] = True
+
         # ── 설정 컨트롤 ────────────────────────────────────────────────────
         ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
         with ctrl_col1:
@@ -18069,210 +18386,48 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
                             result_df = pd.DataFrame(result_rows)
 
-                            # ── 요약 지표 ──────────────────────────────────────
-                            st.divider()
-                            st.markdown("### 📈 종합 적중률 요약")
-
-                            valid_df = result_df[result_df["적중 여부"] != "N/A"].copy()
-                            total_valid = len(valid_df)
-                            hit_count = (valid_df["적중 여부"] == "✅ 적중").sum()
-                            hit_rate = (hit_count / total_valid * 100) if total_valid > 0 else 0.0
-
-                            winners_df = valid_df[valid_df["타입"] == "Winners"]
-                            emerging_df = valid_df[valid_df["타입"] == "Emerging"]
-                            w_hit = (winners_df["적중 여부"] == "✅ 적중").sum()
-                            e_hit = (emerging_df["적중 여부"] == "✅ 적중").sum()
-                            w_rate = (w_hit / len(winners_df) * 100) if len(winners_df) > 0 else 0.0
-                            e_rate = (e_hit / len(emerging_df) * 100) if len(emerging_df) > 0 else 0.0
-
-                            avg_ret_winners = pd.to_numeric(
-                                winners_df[f"수익률(%, {eval_horizon})"], errors="coerce"
-                            ).mean()
-                            avg_ret_emerging = pd.to_numeric(
-                                emerging_df[f"수익률(%, {eval_horizon})"], errors="coerce"
-                            ).mean()
-
-                            m1, m2, m3, m4 = st.columns(4)
-                            with m1:
-                                st.metric(
-                                    "전체 적중률",
-                                    f"{hit_rate:.1f}%",
-                                    delta=f"{hit_count}/{total_valid}건",
-                                )
-                            with m2:
-                                st.metric(
-                                    "Winners 적중률",
-                                    f"{w_rate:.1f}%",
-                                    delta=f"평균 {avg_ret_winners:+.1f}%" if pd.notna(avg_ret_winners) else "N/A",
-                                )
-                            with m3:
-                                st.metric(
-                                    "Emerging 적중률",
-                                    f"{e_rate:.1f}%",
-                                    delta=f"평균 {avg_ret_emerging:+.1f}%" if pd.notna(avg_ret_emerging) else "N/A",
-                                )
-                            with m4:
-                                na_count = (result_df["적중 여부"] == "N/A").sum()
-                                st.metric(
-                                    "데이터 없음",
-                                    f"{na_count}건",
-                                    delta="데이터 미수신 티커",
-                                )
-
-                            # 적중률 수준별 평가 메시지
-                            if total_valid > 0:
-                                if hit_rate >= 60:
-                                    st.success(
-                                        f"🏆 AI 예측 품질 우수: 적중률 **{hit_rate:.1f}%** — "
-                                        f"내러티브 신호를 적극 활용할 수 있는 수준입니다."
-                                    )
-                                elif hit_rate >= 40:
-                                    st.warning(
-                                        f"🟡 AI 예측 품질 보통: 적중률 **{hit_rate:.1f}%** — "
-                                        f"내러티브를 참고 지표로만 활용하고, 다른 기준과 병행하세요."
-                                    )
-                                else:
-                                    st.error(
-                                        f"🔴 AI 예측 품질 저조: 적중률 **{hit_rate:.1f}%** — "
-                                        f"현재 시장 환경이 내러티브 패턴과 맞지 않을 수 있습니다."
-                                    )
-
-                            # ── 티커별 베스트/워스트 ──────────────────────────
-                            st.divider()
-                            st.markdown("### 🏅 티커별 수익률 순위")
-
-                            ticker_summary = (
-                                result_df.groupby("티커")
-                                .agg(
-                                    타입=("타입", "first"),
-                                    평균수익률=(f"수익률(%, {eval_horizon})", lambda x: pd.to_numeric(x, errors="coerce").mean()),
-                                    등장횟수=("티커", "count"),
-                                )
-                                .reset_index()
-                                .sort_values("평균수익률", ascending=False, na_position="last")
-                            )
-
-                            best5 = ticker_summary.head(5)
-                            worst5 = ticker_summary.tail(5).sort_values("평균수익률", ascending=True)
-
-                            rank_col1, rank_col2 = st.columns(2)
-                            with rank_col1:
-                                st.markdown("#### 🟢 Best 5 티커")
-                                for _, r in best5.iterrows():
-                                    val = r["평균수익률"]
-                                    val_str = f"{val:+.2f}%" if pd.notna(val) else "N/A"
-                                    st.markdown(
-                                        f"**{r['티커']}** `{r['타입']}` — {val_str} "
-                                        f"_(등장 {int(r['등장횟수'])}회)_"
-                                    )
-
-                            with rank_col2:
-                                st.markdown("#### 🔴 Worst 5 티커")
-                                for _, r in worst5.iterrows():
-                                    val = r["평균수익률"]
-                                    val_str = f"{val:+.2f}%" if pd.notna(val) else "N/A"
-                                    st.markdown(
-                                        f"**{r['티커']}** `{r['타입']}` — {val_str} "
-                                        f"_(등장 {int(r['등장횟수'])}회)_"
-                                    )
-
-                            # ── 상세 결과 테이블 ──────────────────────────────
-                            st.divider()
-                            st.markdown("### 📋 상세 결과 테이블")
-                            ret_col = f"수익률(%, {eval_horizon})"
-
-                            def _style_hit(val):
-                                if "적중" in str(val):
-                                    return "color: #16a34a; font-weight: 700;"
-                                if "미적중" in str(val):
-                                    return "color: #dc2626; font-weight: 600;"
-                                return "color: #9ca3af;"
-
-                            def _style_return(val):
-                                v = pd.to_numeric(val, errors="coerce")
-                                if pd.isna(v):
-                                    return "color: #9ca3af;"
-                                if v >= hit_threshold:
-                                    return "color: #16a34a; font-weight: 600;"
-                                if v < 0:
-                                    return "color: #dc2626;"
-                                return ""
-
-                            styled_result = (
-                                result_df.style
-                                .format(
-                                    {ret_col: lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A"},
-                                    na_rep="N/A",
-                                )
-                                .map(_style_hit, subset=["적중 여부"])
-                                .map(_style_return, subset=[ret_col])
-                                .background_gradient(
-                                    cmap="RdYlGn",
-                                    subset=[ret_col],
-                                    axis=0,
-                                )
-                            )
-                            st.dataframe(styled_result, use_container_width=True, hide_index=True)
-
-                            st.caption(
-                                f"⚠️ 적중 기준: 내러티브 생성 시점 이후 {eval_horizon} 기준 **+{hit_threshold:.1f}%** 이상 상승. "
-                                "데이터가 horizon보다 짧은 경우 현재까지 수익률로 대체합니다. 투자 권유가 아닙니다."
-                            )
-
-                            # ── 월별 적중률 트렌드 차트 ──────────────────
-                            st.divider()
-                            st.markdown("### 📅 월별 적중률 트렌드")
-                            try:
-                                result_df["날짜_dt"] = pd.to_datetime(
-                                    result_df["날짜"].apply(
-                                        lambda x: f"2026/{x}" if "/" in str(x) else str(x)
-                                    ), errors="coerce"
-                                )
-                                valid_monthly = result_df[result_df["적중 여부"] != "N/A"].copy()
-                                valid_monthly["월"] = valid_monthly["날짜_dt"].dt.to_period("M").astype(str)
-                                monthly_stats = (
-                                    valid_monthly.groupby("월")
-                                    .apply(lambda g: round((g["적중 여부"] == "✅ 적중").sum() / len(g) * 100, 1))
-                                    .reset_index()
-                                    .rename(columns={0: "적중률(%)"})
-                                )
-                                if len(monthly_stats) >= 2:
-                                    monthly_chart = (
-                                        alt.Chart(monthly_stats)
-                                        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
-                                        .encode(
-                                            x=alt.X("월:N", title="월"),
-                                            y=alt.Y("적중률(%):Q", scale=alt.Scale(domain=[0, 100]), title="적중률(%)"),
-                                            color=alt.condition(
-                                                "datum['적중률(%)'] >= 50",
-                                                alt.value("#16a34a"),
-                                                alt.value("#dc2626"),
-                                            ),
-                                            tooltip=["월:N", "적중률(%):Q"],
-                                        )
-                                        .properties(height=200)
-                                    )
-                                    rule_50 = (
-                                        alt.Chart(pd.DataFrame({"y": [50]}))
-                                        .mark_rule(color="gray", strokeDash=[4, 4])
-                                        .encode(y="y:Q")
-                                    )
-                                    st.altair_chart(monthly_chart + rule_50, use_container_width=True)
-                                    st.caption("초록 = 50% 이상 적중 · 빨강 = 50% 미만 | 점선 = 50% 기준선")
-                                else:
-                                    st.info("월별 트렌드를 표시하려면 2개월 이상의 내러티브 기록이 필요해요.")
-                            except Exception as _me:
-                                st.warning(f"월별 트렌드 차트 오류: {_me}")
+                            # 결과를 세션 + Quant_DB 에 저장 후 공용 렌더러로 표시 (rerun 후에도 유지)
+                            _acc_snap = {
+                                "result_df": result_df,
+                                "eval_horizon": eval_horizon,
+                                "hit_threshold": float(hit_threshold),
+                                "saved_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            st.session_state["_accuracy_tracker_last"] = _acc_snap
+                            _ok_acc, _err_acc = save_accuracy_tracker_last_result(uid_tracker, _acc_snap)
+                            if not _ok_acc and _err_acc:
+                                st.warning(f"적중률 결과 Quant_DB 저장 실패 (화면 표시는 정상): {_err_acc}")
+                            _render_accuracy_tracker_results(result_df, eval_horizon, float(hit_threshold))
 
         else:
-            # 버튼 미클릭 상태 안내
-            st.info(
-                "설정을 완료한 후 **📊 적중률 분석 실행** 버튼을 클릭하면 분석이 시작됩니다.\n\n"
-                "**분석 방식:**\n"
-                "- `Narratives` 시트에서 현재 계정의 내러티브 기록을 불러옵니다.\n"
-                "- 각 내러티브의 **Winners**와 **Emerging** 티커에 대해 생성 시점 이후 수익률을 계산합니다.\n"
-                "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
-            )
+            _acc_last = st.session_state.get("_accuracy_tracker_last")
+            if (
+                isinstance(_acc_last, dict)
+                and isinstance(_acc_last.get("result_df"), pd.DataFrame)
+                and not _acc_last["result_df"].empty
+            ):
+                _acc_saved_dt = _narrative_parse_saved_at_utc(_acc_last.get("saved_at"))
+                _acc_saved_str = (
+                    _acc_saved_dt.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M") + " ET"
+                    if _acc_saved_dt else "이전 분석"
+                )
+                _acc_src = "Quant_DB 복원" if _acc_last.get("_restored_from_sheet") else "이번 세션"
+                st.success(f"✅ 가장 최근 적중률 분석 결과 ({_acc_saved_str} · {_acc_src})")
+                st.caption("아래는 마지막으로 실행한 분석 결과입니다. 새로 계산하려면 위의 **📊 적중률 분석 실행** 버튼을 누르세요.")
+                _render_accuracy_tracker_results(
+                    _acc_last["result_df"],
+                    str(_acc_last.get("eval_horizon") or eval_horizon),
+                    float(_acc_last.get("hit_threshold") or hit_threshold),
+                )
+            else:
+                # 버튼 미클릭 상태 안내
+                st.info(
+                    "설정을 완료한 후 **📊 적중률 분석 실행** 버튼을 클릭하면 분석이 시작됩니다.\n\n"
+                    "**분석 방식:**\n"
+                    "- `Narratives` 시트에서 현재 계정의 내러티브 기록을 불러옵니다.\n"
+                    "- 각 내러티브의 **Winners**와 **Emerging** 티커에 대해 생성 시점 이후 수익률을 계산합니다.\n"
+                    "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
+                )
 
     elif main_nav == _MAIN_NAV_OPTIONS[9]:
         render_sync_button("sync_tab_idea", [], "Idea-to-Portfolio 데이터를 다시 불러옵니다.")
