@@ -7360,14 +7360,31 @@ _SECTOR_TO_ETF = {
 
 
 def _regime_params(drg: dict) -> dict:
-    """DRG 국면 → 손절 ATR배수·손익비·라벨. (#3) 라벨/점수 없으면 중립."""
+    """DRG risk_score(0~10) → 손절 ATR배수·손익비·라벨. (#3)
+    점수가 없으면 risk_level 텍스트(영문 HIGH/CAUTION/MODERATE/LOW 또는 한글)로 폴백.
+    """
     d = drg or {}
-    lvl = str(d.get("risk_level") or "").strip()
-    if any(k in lvl for k in ("위험", "하락", "공포", "심각")):
+    s = None
+    try:
+        s = float(d.get("risk_score"))
+    except Exception:
+        s = None
+    if s is not None:
+        if s >= 7:
+            return {"atr_mult": 1.5, "rr": 1.5, "label": "🔴 위험 (방어)", "note": "손절 타이트 · 목표 짧게 · 신규 자제"}
+        if s >= 4:
+            return {"atr_mult": 1.8, "rr": 1.8, "label": "🟡 경계", "note": "보수적 운용"}
+        if s >= 2:
+            return {"atr_mult": 2.2, "rr": 2.5, "label": "🟢 양호", "note": "표준 운용"}
+        return {"atr_mult": 2.5, "rr": 3.0, "label": "🟢 안전 (공격)", "note": "손절 넓게 · 러너 허용"}
+    lvl = str(d.get("risk_level") or "").upper()
+    if "HIGH" in lvl or "위험" in lvl:
         return {"atr_mult": 1.5, "rr": 1.5, "label": "🔴 위험 (방어)", "note": "손절 타이트 · 목표 짧게 · 신규 자제"}
-    if any(k in lvl for k in ("경계", "주의", "불안")):
+    if "CAUTION" in lvl or "경계" in lvl:
         return {"atr_mult": 1.8, "rr": 1.8, "label": "🟡 경계", "note": "보수적 운용"}
-    if any(k in lvl for k in ("안전", "양호", "안정", "강세")):
+    if "MODERATE" in lvl:
+        return {"atr_mult": 2.2, "rr": 2.5, "label": "🟢 양호", "note": "표준 운용"}
+    if "LOW" in lvl or "안전" in lvl:
         return {"atr_mult": 2.5, "rr": 3.0, "label": "🟢 안전 (공격)", "note": "손절 넓게 · 러너 허용"}
     return {"atr_mult": 2.0, "rr": 2.0, "label": "⚪ 중립", "note": "기본 손익비 1:2"}
 
@@ -7393,14 +7410,14 @@ def _position_state(entry, cur, regime_stop) -> tuple:
         r_gain = None
     if r_gain is not None:
         if r_gain < 1.0:
-            return "🌱 진입 직후", "손절선 사수 (아직 +1R 미만)"
+            return "🌱 +1R 미확보", "손절선 사수 (아직 +1R 미만)"
         if r_gain < 2.0:
             return "🟡 +1R 확보", "손절을 본전(매수가)으로 상향"
         return "🟢 러너 (+2R)", "고점 대비 트레일링으로 추세 유지"
     # ATR 손절 산출 불가 → 수익률 폴백
     gain = (cur / entry - 1.0) * 100.0
     if gain < 8:
-        return "🌱 진입 직후", "손절 규칙 유지"
+        return "🌱 +1R 미확보", "손절 규칙 유지"
     if gain < 20:
         return "🟡 차익 구간", "손절을 본전으로 상향 검토"
     return "🟢 러너", "트레일링으로 추세 유지"
@@ -12468,6 +12485,16 @@ if st.session_state.get("logged_in"):
 
     _nav_key = "main_sidebar_nav"
     _nav_opts = list(_MAIN_NAV_OPTIONS)
+    # 표시 순서만 재배치: '📊 매매 복기'를 '🛡️ [4단계] 포트폴리오 매도 레이더'(index 6) 바로 뒤로.
+    # (분기는 문자열 비교이므로 _MAIN_NAV_OPTIONS 인덱스/cross-nav는 영향 없음)
+    try:
+        _review_label = _MAIN_NAV_OPTIONS[13]
+        _radar_label = _MAIN_NAV_OPTIONS[6]
+        if _review_label in _nav_opts and _radar_label in _nav_opts:
+            _nav_opts.remove(_review_label)
+            _nav_opts.insert(_nav_opts.index(_radar_label) + 1, _review_label)
+    except Exception:
+        pass
     if st.session_state.get("user_role") == "admin":
         _nav_opts.append(_NAV_ADMIN_APPROVAL)
     if "main_nav_idx" in st.session_state:
@@ -17041,7 +17068,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     if _intel_df is not None and not _intel_df.empty:
                         st.dataframe(_intel_df, use_container_width=True, hide_index=True)
                         st.caption(
-                            "🌱 진입직후=손절 사수 · 🟡 +1R=손절을 본전으로 · 🟢 러너=트레일링 · "
+                            "🌱 +1R미확보=손절 사수 · 🟡 +1R=손절을 본전으로 · 🟢 러너=트레일링 · "
                             "🔴 후행=섹터 대비 약세(선행 경고) · 💤 정체=자금 회전 검토 · 📅=실적 임박"
                         )
                     else:
@@ -17813,7 +17840,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         # 섹션 C: 📒 매매 히스토리 & 실현 손익
         # ═══════════════════════════════════════════════════════════════════
         st.divider()
-        st.markdown("## 📒 매매 히스토리 & 실현 손익")
+        st.markdown("## 📋 전체 거래 내역")
+        st.caption("실현 손익·누적 손익 차트 분석은 **📊 매매 복기** 탭으로 이동했습니다. 여기서는 거래 원장만 표시합니다.")
 
         trade_hist_df = load_trade_history(puid)
 
@@ -17832,113 +17860,24 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.info("아직 매매 기록이 없습니다. '종목 추가' 또는 '매도 기록'을 통해 거래를 기록하면 여기에 표시됩니다.")
                     st.caption("💡 동기화 버튼을 눌러도 안 나타나면 Google Sheets Quant_DB에 'Trade_History' 탭이 생성됐는지 확인해주세요.")
         else:
-            th_tab1, th_tab2, th_tab3 = st.tabs(["📋 전체 거래 내역", "💰 실현 손익 분석", "📈 누적 손익 차트"])
+            show_df = trade_hist_df.copy()
+            show_df["거래금액"] = show_df["shares"] * show_df["price"]
+            disp = show_df.rename(columns={
+                "account": "계좌", "ticker": "티커", "action": "매수/매도",
+                "shares": "수량", "price": "가격", "date": "날짜", "memo": "메모"
+            })[["날짜", "계좌", "티커", "매수/매도", "수량", "가격", "거래금액", "메모"]]
 
-            with th_tab1:
-                show_df = trade_hist_df.copy()
-                show_df["거래금액"] = show_df["shares"] * show_df["price"]
-                disp = show_df.rename(columns={
-                    "account": "계좌", "ticker": "티커", "action": "매수/매도",
-                    "shares": "수량", "price": "가격", "date": "날짜", "memo": "메모"
-                })[["날짜", "계좌", "티커", "매수/매도", "수량", "가격", "거래금액", "메모"]]
+            def _c_act2(v):
+                if str(v).upper() == "BUY": return "color:#2563eb;font-weight:700;"
+                if str(v).upper() == "SELL": return "color:#dc2626;font-weight:700;"
+                return ""
 
-                def _c_act2(v):
-                    if str(v).upper() == "BUY": return "color:#2563eb;font-weight:700;"
-                    if str(v).upper() == "SELL": return "color:#dc2626;font-weight:700;"
-                    return ""
-
-                st.dataframe(
-                    disp.style
-                    .format({"수량": "{:,.4f}", "가격": "${:,.4f}", "거래금액": "${:,.2f}"}, na_rep="N/A")
-                    .map(_c_act2, subset=["매수/매도"]),
-                    use_container_width=True, hide_index=True,
-                )
-
-            with th_tab2:
-                pnl_df = compute_realized_pnl(trade_hist_df)
-                if pnl_df.empty:
-                    st.info("실현된 손익이 없습니다. 매도 기록이 있어야 계산됩니다.")
-                else:
-                    total_fifo = pnl_df["fifo_pnl"].sum()
-                    total_avg = pnl_df["avg_pnl"].sum()
-                    total_trades = len(pnl_df)
-                    win_trades = (pnl_df["fifo_pnl"] > 0).sum()
-                    pm1, pm2, pm3 = st.columns(3)
-                    with pm1:
-                        st.metric("총 실현 손익 (FIFO)", f"${total_fifo:+,.2f}")
-                    with pm2:
-                        st.metric("총 실현 손익 (평균단가)", f"${total_avg:+,.2f}")
-                    with pm3:
-                        st.metric("승률 (FIFO 기준)", f"{win_trades}/{total_trades} ({win_trades/total_trades*100:.0f}%)" if total_trades else "N/A")
-                    st.divider()
-
-                    def _c_pnl(v):
-                        try:
-                            f = float(str(v).replace("$","").replace("+","").replace(",",""))
-                            if f > 0: return "color:#16a34a;font-weight:700;"
-                            if f < 0: return "color:#dc2626;font-weight:700;"
-                        except Exception: pass
-                        return ""
-
-                    disp_pnl = pnl_df.rename(columns={
-                        "ticker": "티커", "account": "계좌", "sell_date": "매도일",
-                        "shares_sold": "매도수량", "sell_price": "매도가",
-                        "fifo_cost": "FIFO매수가", "avg_cost": "평균매수가",
-                        "fifo_pnl": "FIFO손익($)", "avg_pnl": "평균단가손익($)",
-                        "fifo_pnl_pct": "FIFO손익(%)", "avg_pnl_pct": "평균단가손익(%)", "memo": "메모",
-                    })
-                    st.dataframe(
-                        disp_pnl.style
-                        .format({"매도수량": "{:,.4f}", "매도가": "${:,.4f}", "FIFO매수가": "${:,.4f}",
-                                 "평균매수가": "${:,.4f}", "FIFO손익($)": "${:+,.2f}", "평균단가손익($)": "${:+,.2f}",
-                                 "FIFO손익(%)": "{:+.2f}%", "평균단가손익(%)": "{:+.2f}%"}, na_rep="N/A")
-                        .map(_c_pnl, subset=["FIFO손익($)", "평균단가손익($)"]),
-                        use_container_width=True, hide_index=True,
-                    )
-
-            with th_tab3:
-                pnl_c = compute_realized_pnl(trade_hist_df)
-                if pnl_c.empty:
-                    st.info("실현 손익 데이터가 없습니다.")
-                else:
-                    pnl_c["sell_date"] = pd.to_datetime(pnl_c["sell_date"], errors="coerce")
-                    pnl_c = pnl_c.dropna(subset=["sell_date"]).sort_values("sell_date")
-                    pnl_c["cum_fifo"] = pnl_c["fifo_pnl"].cumsum()
-                    pnl_c["cum_avg"] = pnl_c["avg_pnl"].cumsum()
-
-                    cum_long = pd.concat([
-                        pnl_c[["sell_date", "cum_fifo"]].rename(columns={"cum_fifo": "손익"}).assign(방식="FIFO"),
-                        pnl_c[["sell_date", "cum_avg"]].rename(columns={"cum_avg": "손익"}).assign(방식="평균단가"),
-                    ])
-                    cum_chart = (
-                        alt.Chart(cum_long).mark_line(point=True)
-                        .encode(
-                            x=alt.X("sell_date:T", title="매도일"),
-                            y=alt.Y("손익:Q", title="누적 실현 손익 ($)"),
-                            color=alt.Color("방식:N"),
-                            tooltip=[alt.Tooltip("sell_date:T", title="날짜"), alt.Tooltip("방식:N"), alt.Tooltip("손익:Q", format="$,.2f")],
-                        ).properties(title="누적 실현 손익 추이")
-                    )
-                    zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="gray", strokeDash=[4,4]).encode(y="y:Q")
-                    st.altair_chart(cum_chart + zero_rule, use_container_width=True)
-
-                    # 종목별 바 차트
-                    tk_pnl = pnl_c.groupby("ticker")[["fifo_pnl","avg_pnl"]].sum().reset_index()
-                    tk_long = pd.concat([
-                        tk_pnl[["ticker","fifo_pnl"]].rename(columns={"fifo_pnl":"손익"}).assign(방식="FIFO"),
-                        tk_pnl[["ticker","avg_pnl"]].rename(columns={"avg_pnl":"손익"}).assign(방식="평균단가"),
-                    ])
-                    bar_chart = (
-                        alt.Chart(tk_long).mark_bar()
-                        .encode(
-                            x=alt.X("ticker:N", title="티커"),
-                            y=alt.Y("손익:Q", title="실현 손익 ($)"),
-                            color=alt.Color("방식:N"),
-                            xOffset="방식:N",
-                            tooltip=[alt.Tooltip("ticker:N"), alt.Tooltip("방식:N"), alt.Tooltip("손익:Q", format="$,.2f")],
-                        ).properties(title="종목별 실현 손익 (FIFO vs 평균단가)")
-                    )
-                    st.altair_chart(bar_chart, use_container_width=True)
+            st.dataframe(
+                disp.style
+                .format({"수량": "{:,.4f}", "가격": "${:,.4f}", "거래금액": "${:,.2f}"}, na_rep="N/A")
+                .map(_c_act2, subset=["매수/매도"]),
+                use_container_width=True, hide_index=True,
+            )
 
     elif main_nav == _MAIN_NAV_OPTIONS[8]:
         # ─────────────────────────────────────────────────────────────────────
@@ -19486,6 +19425,82 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         _disp[_cols].style.format(_fmt, na_rep="—").map(_review_pnl_color, subset=_color_cols),
                         use_container_width=True, hide_index=True,
                     )
+
+                # ── 💰 실현 손익 상세 + 📈 누적 차트 (매도 레이더에서 이동) ────
+                _pnl_df = compute_realized_pnl(_tr_df)
+                with st.expander("💰 실현 손익 상세 (FIFO · 평균단가)", expanded=False):
+                    if _pnl_df is None or _pnl_df.empty:
+                        st.info("실현된 손익이 없습니다. 매도 기록이 있어야 계산됩니다.")
+                    else:
+                        _tf = _pnl_df["fifo_pnl"].sum()
+                        _ta = _pnl_df["avg_pnl"].sum()
+                        _tt = len(_pnl_df)
+                        _tw = int((_pnl_df["fifo_pnl"] > 0).sum())
+                        _pm1, _pm2, _pm3 = st.columns(3)
+                        with _pm1:
+                            st.metric("총 실현 손익 (FIFO)", f"${_tf:+,.2f}")
+                        with _pm2:
+                            st.metric("총 실현 손익 (평균단가)", f"${_ta:+,.2f}")
+                        with _pm3:
+                            st.metric("승률 (FIFO)", f"{_tw}/{_tt} ({_tw / _tt * 100:.0f}%)" if _tt else "N/A")
+                        _disp_pnl = _pnl_df.rename(columns={
+                            "ticker": "티커", "account": "계좌", "sell_date": "매도일",
+                            "shares_sold": "매도수량", "sell_price": "매도가",
+                            "fifo_cost": "FIFO매수가", "avg_cost": "평균매수가",
+                            "fifo_pnl": "FIFO손익($)", "avg_pnl": "평균단가손익($)",
+                            "fifo_pnl_pct": "FIFO손익(%)", "avg_pnl_pct": "평균단가손익(%)", "memo": "메모",
+                        })
+                        st.dataframe(
+                            _disp_pnl.style
+                            .format({"매도수량": "{:,.4f}", "매도가": "${:,.4f}", "FIFO매수가": "${:,.4f}",
+                                     "평균매수가": "${:,.4f}", "FIFO손익($)": "${:+,.2f}", "평균단가손익($)": "${:+,.2f}",
+                                     "FIFO손익(%)": "{:+.2f}%", "평균단가손익(%)": "{:+.2f}%"}, na_rep="N/A")
+                            .map(_review_pnl_color, subset=["FIFO손익($)", "평균단가손익($)"]),
+                            use_container_width=True, hide_index=True,
+                        )
+
+                with st.expander("📈 누적 손익 차트", expanded=False):
+                    _pnl_c = compute_realized_pnl(_tr_df)
+                    if _pnl_c is None or _pnl_c.empty:
+                        st.info("실현 손익 데이터가 없습니다.")
+                    else:
+                        _pnl_c = _pnl_c.copy()
+                        _pnl_c["sell_date"] = pd.to_datetime(_pnl_c["sell_date"], errors="coerce")
+                        _pnl_c = _pnl_c.dropna(subset=["sell_date"]).sort_values("sell_date")
+                        _pnl_c["cum_fifo"] = _pnl_c["fifo_pnl"].cumsum()
+                        _pnl_c["cum_avg"] = _pnl_c["avg_pnl"].cumsum()
+                        _cum_long = pd.concat([
+                            _pnl_c[["sell_date", "cum_fifo"]].rename(columns={"cum_fifo": "손익"}).assign(방식="FIFO"),
+                            _pnl_c[["sell_date", "cum_avg"]].rename(columns={"cum_avg": "손익"}).assign(방식="평균단가"),
+                        ])
+                        _cum_chart = (
+                            alt.Chart(_cum_long).mark_line(point=True)
+                            .encode(
+                                x=alt.X("sell_date:T", title="매도일"),
+                                y=alt.Y("손익:Q", title="누적 실현 손익 ($)"),
+                                color=alt.Color("방식:N"),
+                                tooltip=[alt.Tooltip("sell_date:T", title="날짜"), alt.Tooltip("방식:N"),
+                                         alt.Tooltip("손익:Q", format="$,.2f")],
+                            ).properties(title="누적 실현 손익 추이")
+                        )
+                        _zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="gray", strokeDash=[4, 4]).encode(y="y:Q")
+                        st.altair_chart(_cum_chart + _zero, use_container_width=True)
+                        _tk_pnl = _pnl_c.groupby("ticker")[["fifo_pnl", "avg_pnl"]].sum().reset_index()
+                        _tk_long = pd.concat([
+                            _tk_pnl[["ticker", "fifo_pnl"]].rename(columns={"fifo_pnl": "손익"}).assign(방식="FIFO"),
+                            _tk_pnl[["ticker", "avg_pnl"]].rename(columns={"avg_pnl": "손익"}).assign(방식="평균단가"),
+                        ])
+                        _bar = (
+                            alt.Chart(_tk_long).mark_bar()
+                            .encode(
+                                x=alt.X("ticker:N", title="티커"),
+                                y=alt.Y("손익:Q", title="실현 손익 ($)"),
+                                color=alt.Color("방식:N"), xOffset="방식:N",
+                                tooltip=[alt.Tooltip("ticker:N"), alt.Tooltip("방식:N"),
+                                         alt.Tooltip("손익:Q", format="$,.2f")],
+                            ).properties(title="종목별 실현 손익 (FIFO vs 평균단가)")
+                        )
+                        st.altair_chart(_bar, use_container_width=True)
 
     elif main_nav == _MAIN_NAV_OPTIONS[12]:
         # ─────────────────────────────────────────────────────────────────────
