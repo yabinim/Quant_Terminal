@@ -161,13 +161,27 @@ def generate_review_comment(direction: str, actual_dir: str, actual_ret: float,
         client = genai.Client(api_key=GOOGLE_API_KEY)
         cfg = genai_types.GenerateContentConfig(
             temperature=0.3,
-            max_output_tokens=1024,
+            # 1024는 thinking 잔여 소비 시 빈 응답(finish_reason=MAX_TOKENS) 위험 —
+            # 코드베이스 다른 Gemini 호출(4096~8192)과 동일하게 상향. (조용한 리뷰 누락 방지)
+            max_output_tokens=4096,
             thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
         )
         resp = client.models.generate_content(
             model="gemini-2.5-flash", contents=prompt, config=cfg
         )
-        return str(getattr(resp, "text", "") or "").strip()
+        text = ""
+        try:
+            text = str(getattr(resp, "text", "") or "").strip()
+        except Exception:
+            text = ""
+        if not text:
+            # 빈 응답이면 원인(주로 MAX_TOKENS)을 로그로 노출 — 조용히 누락되는 것 방지
+            try:
+                fr = resp.candidates[0].finish_reason
+            except Exception:
+                fr = "unknown"
+            print(f"[WARN] AI 리뷰 비어있음 (finish_reason={fr})")
+        return text
     except Exception as e:
         print(f"[WARN] AI 리뷰 생성 실패: {e}")
         return ""
