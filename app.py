@@ -12473,6 +12473,192 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
         return f"Weekly Summary 생성 실패: {exc}"
 
 
+def _fetch_portfolio_movement_data(tickers: list) -> tuple:
+    """'지금 무슨일이야?' 분석용 데이터 수집.
+
+    반환: (movement_map, spy_change_pct)
+      movement_map = {TICKER: {"change_pct": float|None, "price": float|None, "news": [헤드라인...]}}
+      spy_change_pct = float|None  (시장 컨텍스트용 SPY 당일 등락률)
+
+    가격·등락률은 FMP /batch-quote 1콜(누락분만 단일 quote 폴백),
+    뉴스는 종목별 /stock-news 를 ThreadPoolExecutor 로 병렬 조회한다.
+    """
+    import concurrent.futures as _cf
+
+    clean = list(dict.fromkeys([str(t).strip().upper() for t in tickers if str(t).strip()]))
+    movement_map = {tk: {"change_pct": None, "price": None, "news": []} for tk in clean}
+    spy_change_pct = None
+    k = _fmp_key()
+    if not k or not clean:
+        return movement_map, spy_change_pct
+
+    quote_syms = list(dict.fromkeys(clean + ["SPY"]))
+
+    def _apply_quote(item):
+        nonlocal spy_change_pct
+        if not isinstance(item, dict):
+            return
+        sym = str(item.get("symbol") or "").strip().upper()
+        chg = to_float(item.get("changesPercentage"))
+        prc = to_float(item.get("price"))
+        if pd.isna(chg):
+            prev = to_float(item.get("previousClose"))
+            if pd.notna(prc) and pd.notna(prev) and prev:
+                chg = (prc / prev - 1.0) * 100.0
+        if sym == "SPY":
+            if pd.notna(chg):
+                spy_change_pct = round(float(chg), 2)
+            return
+        if sym in movement_map:
+            if pd.notna(chg):
+                movement_map[sym]["change_pct"] = round(float(chg), 2)
+            if pd.notna(prc):
+                movement_map[sym]["price"] = round(float(prc), 2)
+
+    # ── 1) 당일 등락률: batch-quote 1콜 ──────────────────────────────────────
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/batch-quote?symbols={','.join(quote_syms)}&apikey={k}",
+            timeout=_FMP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                for it in data:
+                    _apply_quote(it)
+    except Exception:
+        pass
+
+    # 누락 종목만 단일 quote 폴백
+    missing = [
+        tk for tk in quote_syms
+        if (tk == "SPY" and spy_change_pct is None)
+        or (tk in movement_map and movement_map[tk]["change_pct"] is None)
+    ]
+    for tk in missing:
+        try:
+            r = requests.get(f"{_FMP_BASE}/quote?symbol={tk}&apikey={k}", timeout=_FMP_TIMEOUT)
+            if r.status_code == 200:
+                d = r.json()
+                if isinstance(d, list) and d:
+                    _apply_quote(d[0])
+        except Exception:
+            pass
+
+    # ── 2) 종목별 뉴스: 병렬 조회 ────────────────────────────────────────────
+    def _fetch_one_news(tk):
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/stock-news?symbols={tk}&limit=3&apikey={k}",
+                timeout=_FMP_TIMEOUT,
+            )
+            if r.status_code == 200:
+                d = r.json()
+                if isinstance(d, list):
+                    heads = []
+                    for n in d[:3]:
+                        title = _clean_news_text(str(n.get("title") or ""))
+                        if title:
+                            heads.append(title)
+                    return tk, heads
+        except Exception:
+            pass
+        return tk, []
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=min(8, len(clean))) as exe:
+            for tk, heads in exe.map(_fetch_one_news, clean):
+                if tk in movement_map:
+                    movement_map[tk]["news"] = heads
+    except Exception:
+        pass
+
+    return movement_map, spy_change_pct
+
+
+def _generate_portfolio_movement_brief(movement_map: dict, spy_change_pct) -> dict:
+    """movement_map + SPY 컨텍스트 → Gemini '지금 무슨일이야?' 브리핑 생성.
+
+    반환 dict:
+      {"market_summary": str,
+       "holdings": [{"ticker": str, "category": str, "reason": str}, ...]}
+      category ∈ {"stock_specific", "market_driven", "no_catalyst"}
+    실패 시 {"market_summary": "", "holdings": [], "_error": msg}.
+    """
+    if not movement_map:
+        return {"market_summary": "", "holdings": []}
+
+    lines = []
+    for tk, info in movement_map.items():
+        chg = info.get("change_pct")
+        chg_str = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "N/A"
+        news = info.get("news") or []
+        news_str = " / ".join(news[:3]) if news else "(관련 뉴스 없음)"
+        lines.append(f"- {tk} | 당일 등락률: {chg_str} | 최근 헤드라인: {news_str}")
+    holdings_block = "\n".join(lines)
+
+    spy_str = f"{spy_change_pct:+.2f}%" if isinstance(spy_change_pct, (int, float)) else "N/A"
+    ticker_list = list(movement_map.keys())
+
+    prompt = f"""너는 신중한 퀀트 포트폴리오 애널리스트다. 아래 보유 종목들이 '오늘' 왜 오르거나 내렸는지 한국어로 간결하게 설명하라.
+
+[시장 컨텍스트]
+- SPY(시장 전체) 당일 등락률: {spy_str}
+
+[보유 종목 데이터]
+{holdings_block}
+
+[분석 규칙 — 매우 중요]
+1. 절대 없는 뉴스를 지어내지 마라. 헤드라인이 없으면 "특별한 개별 촉매가 확인되지 않음"이라고 정직하게 말하라.
+2. 종목의 등락 방향·크기가 SPY와 비슷하면, 개별 악재/호재가 아니라 '시장 전체 흐름 동조'로 판단하라.
+3. 헤드라인이 그 등락을 설득력 있게 설명할 때만 '개별 이슈'로 판단하라.
+4. 각 종목을 다음 셋 중 하나로 분류하라:
+   - "stock_specific": 개별 종목 뉴스/이슈가 등락의 주 원인
+   - "market_driven": 뚜렷한 개별 촉매 없이 시장/섹터 흐름에 동조
+   - "no_catalyst": 등락이 미미하거나 원인을 특정할 근거가 없음
+5. reason 은 한국어 한 문장(최대 60자)으로 핵심만 담아라.
+
+[출력 형식 — JSON만 출력. 그 외 텍스트·마크다운·백틱 금지]
+{{
+  "market_summary": "오늘 시장 전체 분위기 한 문장 (SPY 방향 언급)",
+  "holdings": [
+    {{"ticker": "<티커>", "category": "stock_specific|market_driven|no_catalyst", "reason": "한 문장"}}
+  ]
+}}
+holdings 배열에는 다음 티커를 모두 포함하라: {", ".join(ticker_list)}
+"""
+
+    try:
+        brief_model = _GenAIModel(
+            "gemini-2.5-flash",
+            generation_config={
+                "temperature": 0.2,
+                "top_p": 1,
+                "top_k": 1,
+                "max_output_tokens": 4096,
+                "thinking_budget": 0,
+                "response_mime_type": "application/json",
+            },
+        )
+        resp = brief_model.generate_content(prompt)
+        raw = (_gemini_response_text_utf8_safe(resp) or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw[:4].lower() == "json":
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {"market_summary": "", "holdings": [], "_error": "예상치 못한 응답 형식"}
+        data.setdefault("market_summary", "")
+        data.setdefault("holdings", [])
+        if not isinstance(data["holdings"], list):
+            data["holdings"] = []
+        return data
+    except Exception as exc:
+        return {"market_summary": "", "holdings": [], "_error": str(exc)}
+
+
 def _build_portfolio_context_for_summary(sell_radar_df: pd.DataFrame) -> dict:
     """sell_radar_df에서 Gemini 입력용 포트폴리오 context 생성."""
     if sell_radar_df is None or sell_radar_df.empty:
@@ -17545,6 +17731,109 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     .map(style_universe_rank_cell, subset=["유니버스 랭킹(Universe Rank)"])
                 )
                 st.dataframe(styled_sell_radar, use_container_width=True, hide_index=True)
+
+                # ── 📡 지금 왜 움직이나? (실시간 등락 브리핑) ────────────────
+                st.divider()
+                st.markdown("### 📡 지금 왜 움직이나?")
+                st.caption(
+                    "버튼을 누르면 보유 종목의 **당일 등락률 + 최근 헤드라인 + 시장(SPY) 흐름**을 "
+                    "AI가 종합해 '왜 오르내리는지'를 분석합니다. "
+                    "장중~마감 직후에 가장 의미 있고, 개별 뉴스가 없으면 '시장 동조'로 솔직하게 표시합니다."
+                )
+
+                _mv_tickers = (
+                    sell_radar_df["티커"].dropna().astype(str).str.strip().str.upper().unique().tolist()
+                )
+                _mv_tickers = [t for t in _mv_tickers if t and t != "SPY"]
+
+                if st.button(
+                    "📡 지금 왜 움직이나? 분석하기",
+                    key="portfolio_movement_brief_btn",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    if not _mv_tickers:
+                        st.warning("분석할 보유 종목이 없습니다.")
+                    else:
+                        with st.spinner("📡 보유 종목 실시간 동향을 분석하는 중..."):
+                            _now_et = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M ET")
+                            try:
+                                _mv_map, _mv_spy = _fetch_portfolio_movement_data(_mv_tickers)
+                                _mv_brief = _generate_portfolio_movement_brief(_mv_map, _mv_spy)
+                                st.session_state["_portfolio_movement_result"] = {
+                                    "ts": _now_et,
+                                    "tickers": _mv_tickers,
+                                    "map": _mv_map,
+                                    "spy": _mv_spy,
+                                    "brief": _mv_brief,
+                                }
+                            except Exception as _mv_exc:
+                                st.session_state["_portfolio_movement_result"] = {
+                                    "ts": _now_et,
+                                    "tickers": _mv_tickers,
+                                    "map": {},
+                                    "spy": None,
+                                    "brief": {"market_summary": "", "holdings": [], "_error": str(_mv_exc)},
+                                }
+
+                _mv_res = st.session_state.get("_portfolio_movement_result")
+                if _mv_res:
+                    _brief = _mv_res.get("brief") or {}
+                    _mv_map_r = _mv_res.get("map") or {}
+                    _spy_r = _mv_res.get("spy")
+                    _res_tickers = _mv_res.get("tickers") or list(_mv_map_r.keys())
+                    if _brief.get("_error"):
+                        st.error(f"분석 생성에 실패했습니다: {_brief['_error']}")
+                    else:
+                        # 시장 전체 요약 배너
+                        _spy_txt = f"{_spy_r:+.2f}%" if isinstance(_spy_r, (int, float)) else "N/A"
+                        _market_line = _brief.get("market_summary") or "시장 전체 요약을 생성하지 못했습니다."
+                        st.info(f"🌐 **오늘 시장 (SPY {_spy_txt})** — {_market_line}")
+
+                        # 종목별 카드
+                        _cat_meta = {
+                            "stock_specific": ("🎯 개별 이슈", "#2563eb"),
+                            "market_driven":  ("🌊 시장 동조", "#64748b"),
+                            "no_catalyst":    ("➖ 촉매 없음", "#94a3b8"),
+                        }
+                        _hmap = {}
+                        for _h in (_brief.get("holdings") or []):
+                            if isinstance(_h, dict):
+                                _hmap[str(_h.get("ticker", "")).strip().upper()] = _h
+                        for _tk in _res_tickers:
+                            _info = _mv_map_r.get(_tk, {})
+                            _chg = _info.get("change_pct")
+                            _h = _hmap.get(_tk, {})
+                            _cat = str(_h.get("category", "")).strip()
+                            _label, _color = _cat_meta.get(_cat, ("• 분석 정보 없음", "#94a3b8"))
+                            _reason = str(_h.get("reason", "")).strip() or "분석 정보를 가져오지 못했습니다."
+                            if isinstance(_chg, (int, float)):
+                                if _chg > 0:
+                                    _chg_md = f":green[+{_chg:.2f}%]"
+                                elif _chg < 0:
+                                    _chg_md = f":red[{_chg:.2f}%]"
+                                else:
+                                    _chg_md = f"{_chg:.2f}%"
+                            else:
+                                _chg_md = ":gray[N/A]"
+                            with st.container(border=True):
+                                _c1, _c2 = st.columns([1, 3])
+                                with _c1:
+                                    st.markdown(f"### {_tk}")
+                                    st.markdown(f"**{_chg_md}**")
+                                    st.markdown(
+                                        f"<span style='background:{_color};color:#fff;"
+                                        f"padding:2px 9px;border-radius:10px;font-size:0.78rem;'>"
+                                        f"{_label}</span>",
+                                        unsafe_allow_html=True,
+                                    )
+                                with _c2:
+                                    st.markdown(_reason)
+                        st.caption(
+                            f"분석 시점: {_mv_res.get('ts', '')} · "
+                            "당일 등락률은 FMP 데이터(플랜에 따라 지연 가능)이며, "
+                            "사유는 AI 추정으로 투자 판단의 근거가 아닙니다."
+                        )
 
                 # ── Correlation Matrix ─────────────────────────────────────
                 st.divider()
