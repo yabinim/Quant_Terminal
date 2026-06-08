@@ -3634,11 +3634,15 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     news_items = _prefetch.get("news", [])
 
     # ── 종합 점수 계산 ─────────────────────────────────────────────────────
-    ok_count = sum(1 for v in signals.values() if v["ok"])
+    # risk_score = 경고(비정상) 신호 개수 (0~total). 신호가 8개면 표시도 x/8.
+    # (과거엔 (1-정상/전체)*10 으로 0~10 환산 → 신호 8개인데 /10 으로 떠 혼란.
+    #  레벨 임계값은 기존 동작을 그대로 보존: 6+ HIGH, 4~5 CAUTION, 2~3 MODERATE, 0~1 LOW)
     total = len(signals)
-    risk_score = int((1 - ok_count / total) * 10) if total > 0 else 0
+    ok_count = sum(1 for v in signals.values() if v["ok"])
+    warn_count = total - ok_count
+    risk_score = warn_count
 
-    if risk_score >= 7:
+    if risk_score >= 6:
         risk_level = "🔴 HIGH RISK"
         risk_color = "#dc2626"
         risk_msg = "복수의 선행 지표에서 경고 신호. 신규 매수 자제, 포지션 축소 권장."
@@ -3657,6 +3661,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
 
     return {
         "risk_score": risk_score,
+        "risk_total": total,
         "risk_level": risk_level,
         "risk_color": risk_color,
         "risk_msg": risk_msg,
@@ -7420,7 +7425,7 @@ _SECTOR_TO_ETF = {
 
 
 def _regime_params(drg: dict) -> dict:
-    """DRG risk_score(0~10) → 손절 ATR배수·손익비·라벨. (#3)
+    """DRG risk_score(경고 개수 0~8) → 손절 ATR배수·손익비·라벨. (#3)
     점수가 없으면 risk_level 텍스트(영문 HIGH/CAUTION/MODERATE/LOW 또는 한글)로 폴백.
     """
     d = drg or {}
@@ -7430,7 +7435,7 @@ def _regime_params(drg: dict) -> dict:
     except Exception:
         s = None
     if s is not None:
-        if s >= 7:
+        if s >= 6:
             return {"atr_mult": 1.5, "rr": 1.5, "label": "🔴 위험 (방어)", "note": "손절 타이트 · 목표 짧게 · 신규 자제"}
         if s >= 4:
             return {"atr_mult": 1.8, "rr": 1.8, "label": "🟡 경계", "note": "보수적 운용"}
@@ -13194,6 +13199,7 @@ if st.session_state.get("logged_in"):
             drg = compute_daily_risk_gauge(sector_filter=sector_choice)
 
         risk_score = drg["risk_score"]
+        risk_total = drg.get("risk_total", 8)
         st.markdown(
             f"<div style='background:{drg['risk_color']}22;border:2px solid {drg['risk_color']};"
             f"border-radius:12px;padding:20px;margin:12px 0;text-align:center;'>"
@@ -13202,12 +13208,12 @@ if st.session_state.get("logged_in"):
             f"</div>",
             unsafe_allow_html=True
         )
-        bar_width = int(risk_score / 10 * 100)
+        bar_width = int(risk_score / risk_total * 100) if risk_total else 0
         st.markdown(
             f"<div style='background:#1e293b;border-radius:8px;padding:4px;margin:4px 0 8px 0;'>"
             f"<div style='background:{drg['risk_color']};width:{bar_width}%;height:20px;border-radius:6px;"
             f"display:flex;align-items:center;justify-content:center;color:white;font-size:12px;font-weight:700;'>"
-            f"Risk {risk_score}/10"
+            f"Risk {risk_score}/{risk_total}"
             f"</div></div>",
             unsafe_allow_html=True
         )
@@ -13766,7 +13772,7 @@ if st.session_state.get("logged_in"):
         with _itb_info_c2:
             st.info(
                 f"**DRG:** {drg.get('risk_level', 'N/A')}\n\n"
-                f"Risk Score: {drg.get('risk_score', 'N/A')}/10"
+                f"Risk Score: {drg.get('risk_score', 'N/A')}/{drg.get('risk_total', 8)}"
             )
         with _itb_info_c3:
             if st.session_state.get(_itb_ts_key):
@@ -13827,7 +13833,7 @@ if st.session_state.get("logged_in"):
                     _sig_lines.append(f"  - {_sl}: {_ok_str} | {_sv.get('value', 'N/A')}")
             _drg_section = (
                 f"[DRG (Daily Risk Gauge) 현재 상태]\n"
-                f"종합 Risk Score: {drg.get('risk_score', 'N/A')}/10 — {drg.get('risk_level', '')}\n"
+                f"종합 Risk Score: {drg.get('risk_score', 'N/A')}/{drg.get('risk_total', 8)} — {drg.get('risk_level', '')}\n"
                 f"요약: {drg.get('risk_msg', '')}\n"
                 f"선행 신호 상세:\n" + "\n".join(_sig_lines) + "\n"
             )
@@ -13901,6 +13907,7 @@ if st.session_state.get("logged_in"):
                             "validity": _validity,
                             "pred_direction": _itb_today_pred.get("direction", "없음") if _itb_today_pred is not None else "없음",
                             "drg_score": drg.get("risk_score", "N/A"),
+                            "drg_total": drg.get("risk_total", 8),
                             "macro_score": _macro_score,
                         }
                         st.session_state[_itb_ts_key] = _ts_str
@@ -13915,7 +13922,7 @@ if st.session_state.get("logged_in"):
             _itb_meta_c1, _itb_meta_c2, _itb_meta_c3, _itb_meta_c4 = st.columns(4)
             _itb_meta_c1.metric("분석 시각", _itb_saved.get("timestamp", "N/A"))
             _itb_meta_c2.metric("유효 시간", _itb_saved.get("validity", "N/A"))
-            _itb_meta_c3.metric("DRG 점수", f"{_itb_saved.get('drg_score', 'N/A')}/10")
+            _itb_meta_c3.metric("DRG 점수", f"{_itb_saved.get('drg_score', 'N/A')}/{_itb_saved.get('drg_total', 8)}")
             _itb_meta_c4.metric("Macro Score", f"{_itb_saved.get('macro_score', 'N/A')}/100")
             st.markdown("---")
             st.markdown(_itb_saved["text"])
