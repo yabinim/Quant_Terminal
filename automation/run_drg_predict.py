@@ -291,54 +291,108 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
     except Exception:
         lines.append("- 대장주 모멘텀: 조회 실패")
 
-    # ── 신호 4: 프리마켓 방향 (SPY/QQQ 1일 변화율) ─────────────────────────
-    # FMP는 ES=F/NQ=F 선물 심볼을 지원하지 않아 기존 구현은 '조회 실패'였다.
-    # 앱의 compute_daily_risk_gauge._fetch_futures_data 와 동일하게
-    # stock-price-change(1D)로 대체하고, 실패 시 quote로 폴백한다.
-    try:
-        _pm = {}
-        if FMP_KEY:
-            # 1차: stock-price-change (1D 변화율)
-            try:
-                r_chg = requests.get(
-                    f"{FMP_BASE}/stock-price-change?symbol=SPY,QQQ&apikey={FMP_KEY}",
-                    timeout=8,
-                )
-                if r_chg.status_code == 200:
-                    data_chg = r_chg.json()
-                    items = data_chg if isinstance(data_chg, list) else [data_chg]
-                    for item in items:
-                        sym = str(item.get("symbol", "")).upper()
-                        raw = item.get("1D", item.get("1d", item.get("day")))
+    # ── 신호 4: 프리마켓 방향 (SPY/QQQ 실시간 확장시간 가격 기준) ───────────
+    # [중요] FMP는 선물(ES=F/NQ=F)을 지원하지 않는다. 과거 구현은 stock-price-change
+    # 의 1D(전일 정규장 종가-대-종가 변화율)를 "프리마켓"이라 라벨만 붙여 사용했는데,
+    # 이는 '오늘 프리마켓'이 아니라 '직전 거래일 움직임'이라 라이브와 정반대로 나올 수
+    # 있었다(예: 월요일 아침엔 금요일 종가 움직임을 표시).
+    # → 실제 확장시간(프리/애프터) 체결가를 aftermarket-trade/aftermarket-quote 로
+    #    받아 전일 종가 대비 % 를 계산한다. 확장시간 데이터가 없으면(플랜 미포함 등)
+    #    stock-price-change(1D)로 폴백하되 라벨을 '전일 종가 기준'으로 정직하게 표기.
+    def _eod_prev_close(sym: str):
+        try:
+            r = requests.get(
+                f"{FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=1&apikey={FMP_KEY}",
+                timeout=8,
+            )
+            if r.status_code == 200:
+                d = r.json()
+                rows = d.get("historical", d) if isinstance(d, dict) else d
+                if isinstance(rows, list) and rows:
+                    return float(rows[0]["close"])
+        except Exception:
+            pass
+        return None
+
+    def _ext_price(sym: str):
+        """실시간 확장시간 체결가. (price) | None"""
+        # 1차: aftermarket-trade (최근 확장시간 체결가)
+        try:
+            r = requests.get(f"{FMP_BASE}/aftermarket-trade?symbol={sym}&apikey={FMP_KEY}", timeout=8)
+            if r.status_code == 200:
+                d = r.json()
+                it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+                for f in ("price", "lastSalePrice", "tradePrice", "last"):
+                    v = it.get(f)
+                    if v not in (None, "", 0):
                         try:
-                            chg1d = float(raw)
+                            return float(v)
                         except (TypeError, ValueError):
-                            chg1d = None
-                        if sym in ("SPY", "QQQ") and chg1d is not None:
-                            _pm[sym] = chg1d
-            except Exception:
-                pass
-            # 2차: quote 폴백 (changesPercentage 또는 price/previousClose)
-            for sym in ("SPY", "QQQ"):
-                if sym in _pm:
-                    continue
+                            pass
+        except Exception:
+            pass
+        # 2차: aftermarket-quote (bid/ask 중간값)
+        try:
+            r = requests.get(f"{FMP_BASE}/aftermarket-quote?symbol={sym}&apikey={FMP_KEY}", timeout=8)
+            if r.status_code == 200:
+                d = r.json()
+                it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+                bid = it.get("bidPrice", it.get("bid"))
+                ask = it.get("askPrice", it.get("ask"))
                 try:
-                    r_q = requests.get(f"{FMP_BASE}/quote?symbol={sym}&apikey={FMP_KEY}", timeout=8)
-                    if r_q.status_code == 200:
-                        d_q = r_q.json()
-                        item = d_q[0] if isinstance(d_q, list) and d_q else d_q
-                        raw = item.get("changesPercentage", item.get("changePercent"))
-                        try:
-                            chg_pct = float(raw)
-                        except (TypeError, ValueError):
-                            chg_pct = None
-                        if chg_pct is None:
-                            price = float(item.get("price") or 0)
-                            prev = float(item.get("previousClose") or item.get("prevClose") or 0)
-                            if price > 0 and prev > 0:
-                                chg_pct = (price / prev - 1) * 100
-                        if chg_pct is not None:
-                            _pm[sym] = chg_pct
+                    bid = float(bid); ask = float(ask)
+                    if bid > 0 and ask > 0:
+                        return (bid + ask) / 2.0
+                except (TypeError, ValueError):
+                    pass
+                v = it.get("price", it.get("lastPrice"))
+                if v not in (None, "", 0):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
+        return None
+
+    try:
+        _pm = {}          # sym -> chg_pct
+        _pm_src = "조회실패"
+        _is_live = False
+        if FMP_KEY:
+            # 1차: 실시간 확장시간 가격 vs 전일 종가
+            for sym in ("SPY", "QQQ"):
+                px = _ext_price(sym)
+                prev = _eod_prev_close(sym)
+                if px and prev and prev > 0:
+                    _pm[sym] = (px / prev - 1) * 100
+                    print(f"[INFO] 프리마켓(실시간) {sym}: ext={px} prev={prev} → {_pm[sym]:+.2f}%")
+            if len(_pm) == 2:
+                _is_live = True
+                _pm_src = "FMP aftermarket(실시간 확장시간)"
+            # 2차 폴백: 확장시간 데이터 없음 → stock-price-change 1D (전일 종가 기준)
+            if not _is_live:
+                _pm = {}
+                try:
+                    r_chg = requests.get(
+                        f"{FMP_BASE}/stock-price-change?symbol=SPY,QQQ&apikey={FMP_KEY}",
+                        timeout=8,
+                    )
+                    if r_chg.status_code == 200:
+                        data_chg = r_chg.json()
+                        items = data_chg if isinstance(data_chg, list) else [data_chg]
+                        for item in items:
+                            sym = str(item.get("symbol", "")).upper()
+                            raw = item.get("1D", item.get("1d", item.get("day")))
+                            try:
+                                chg1d = float(raw)
+                            except (TypeError, ValueError):
+                                chg1d = None
+                            if sym in ("SPY", "QQQ") and chg1d is not None:
+                                _pm[sym] = chg1d
+                    if _pm:
+                        _pm_src = "FMP stock-price-change 1D (전일 종가 기준·실시간 아님)"
+                        print(f"[WARN] 프리마켓 실시간 조회 실패 → 전일 종가(1D) 폴백: {_pm}")
                 except Exception:
                     pass
         if _pm:
@@ -346,7 +400,8 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
             pm_alert = avg_chg <= -0.5
             _pm_lines = " / ".join(f"{s} {_pm[s]:+.2f}%" for s in ("SPY", "QQQ") if s in _pm)
             status = "⚠️ 갭다운우려" if pm_alert else "✅ 정상"
-            lines.append(f"- 프리마켓 방향: {_pm_lines} (평균 {avg_chg:+.2f}%) [{status}]")
+            _label = "프리마켓 방향(실시간)" if _is_live else "프리마켓 방향(⚠️전일 종가 기준)"
+            lines.append(f"- {_label}: {_pm_lines} (평균 {avg_chg:+.2f}%) [{status}] · 출처: {_pm_src}")
             signals_summary.append(f"프리마켓 {'경고' if pm_alert else '정상'}")
         else:
             lines.append("- 프리마켓 방향: 조회 실패")

@@ -140,7 +140,7 @@ def _clean_text(raw: str) -> str:
 
 
 def fetch_global_market_news():
-    """멀티소스 RSS 수집 + 중복 제거 + 가중치 정렬. (top_news, context_text, raw_count)"""
+    """멀티소스 RSS 수집 + 중복 제거 + 가중치 정렬. (top_news, context_text, raw_count, news_meta)"""
     browser_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -203,6 +203,24 @@ def fetch_global_market_news():
     ranked = sorted(deduped, key=lambda x: (x["weight"], x["published_dt"]), reverse=True)
     top = ranked[:50]
 
+    # ── 뉴스 신선도 메타 (실시간성 가시화) ──────────────────────────────────
+    # published_dt 를 pop 하기 전에 최신/최오래 시각과 6시간 이내 비중을 계산.
+    _now_utc = datetime.now(timezone.utc)
+    _valid_dts = [n["published_dt"] for n in top
+                  if n.get("published_dt") and n["published_dt"].year > 2000]
+    news_meta = {"newest": None, "oldest": None, "fresh_6h": 0,
+                 "total": len(top), "sources": sorted({n["source"] for n in top})}
+    if _valid_dts:
+        newest = max(_valid_dts); oldest = min(_valid_dts)
+        news_meta["newest_min_ago"] = int((_now_utc - newest).total_seconds() // 60)
+        news_meta["oldest_hr_ago"]  = round((_now_utc - oldest).total_seconds() / 3600, 1)
+        news_meta["newest"] = newest.astimezone(_ET).strftime("%m/%d %H:%M ET")
+        news_meta["oldest"] = oldest.astimezone(_ET).strftime("%m/%d %H:%M ET")
+        news_meta["fresh_6h"] = sum(1 for d in _valid_dts
+                                    if (_now_utc - d).total_seconds() <= 6 * 3600)
+    print(f"[INFO] 뉴스 신선도: 최신 {news_meta.get('newest_min_ago','?')}분 전 / "
+          f"6h이내 {news_meta['fresh_6h']}/{news_meta['total']}건 / 소스 {len(news_meta['sources'])}곳")
+
     chunks = []
     for i, item in enumerate(top, 1):
         chunks.append(
@@ -214,7 +232,7 @@ def fetch_global_market_news():
     context_text = "\n\n".join(chunks).strip()
     for item in top:
         item.pop("published_dt", None)
-    return top, context_text, len(all_news)
+    return top, context_text, len(all_news), news_meta
 
 
 # ── Gemini 내러티브 생성 ───────────────────────────────────────────────────────
@@ -600,7 +618,7 @@ def run_emerging_tracking(analysis: dict) -> None:
 
 
 # ── HTML 이메일 생성 ───────────────────────────────────────────────────────────
-def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], is_market_day: bool) -> str:
+def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], is_market_day: bool, news_meta: dict = None) -> str:
     now_et  = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
     now_kst = datetime.now(_KST).strftime("%Y-%m-%d %H:%M KST")
     regime  = analysis.get("regime", {})
@@ -645,6 +663,22 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
         '<span style="background:#6b7280;color:#fff;border-radius:4px;padding:2px 8px;font-size:12px;">🔒 장 닫힌 날</span>'
     )
 
+    # 뉴스 신선도 라인 (실시간성 가시화) — RSS 헤드라인 기반 요약임을 명시
+    _m = news_meta or {}
+    if _m.get("newest"):
+        _newest_min = _m.get("newest_min_ago")
+        _fresh_color = "#16a34a" if (isinstance(_newest_min, int) and _newest_min <= 180) else "#d97706"
+        fresh_line = (
+            f'<div style="font-size:12px;color:{_fresh_color};margin-top:4px;">'
+            f'🕐 뉴스 신선도: 최신 {_newest_min}분 전 · 6시간 이내 {_m.get("fresh_6h",0)}/{_m.get("total",0)}건 · '
+            f'소스 {len(_m.get("sources",[]))}곳 (RSS 헤드라인 요약, 실시간 웹검색 아님)</div>'
+        )
+    else:
+        fresh_line = (
+            '<div style="font-size:12px;color:#d97706;margin-top:4px;">'
+            '🕐 뉴스 신선도: 발행시각 정보 없음 (RSS 헤드라인 요약, 실시간 웹검색 아님)</div>'
+        )
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:20px;">
@@ -656,6 +690,7 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
     <div style="font-size:14px;color:#94a3b8;margin-top:4px;">시장 내러티브 자동 분석 리포트</div>
     <div style="margin-top:8px;font-size:13px;color:#64748b;">{now_et} &nbsp;|&nbsp; {now_kst} &nbsp;|&nbsp; {market_badge}</div>
     <div style="font-size:12px;color:#64748b;margin-top:4px;">뉴스 {news_count}건 수집 · Gemini 2.5 Flash 분석</div>
+    {fresh_line}
   </div>
 
   <!-- 레짐 -->
@@ -754,7 +789,7 @@ def main():
 
     # 뉴스 수집
     print("[STEP 1] 뉴스 수집 중...")
-    top_news, context_text, raw_count = fetch_global_market_news()
+    top_news, context_text, raw_count, news_meta = fetch_global_market_news()
     print(f"[INFO] 수집 완료: {raw_count}건 → Top {len(top_news)}건 사용")
 
     if not context_text:
@@ -786,7 +821,7 @@ def main():
     fred_tag = " ⚠️FRED발표" if fred_releases else ""
     subject = f"📰 [{session_label}] 시장 내러티브 리포트 {now_et.strftime('%m/%d')}{fred_tag}"
 
-    html_body = build_email_html(analysis, raw_count, fred_releases, market_day)
+    html_body = build_email_html(analysis, raw_count, fred_releases, market_day, news_meta=news_meta)
     send_email(subject, html_body)
 
     print(f"[DONE] 완료: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
