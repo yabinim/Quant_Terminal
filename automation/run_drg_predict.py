@@ -299,17 +299,35 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
     # → 실제 확장시간(프리/애프터) 체결가를 aftermarket-trade/aftermarket-quote 로
     #    받아 전일 종가 대비 % 를 계산한다. 확장시간 데이터가 없으면(플랜 미포함 등)
     #    stock-price-change(1D)로 폴백하되 라벨을 '전일 종가 기준'으로 정직하게 표기.
-    def _eod_prev_close(sym: str):
+    def _prev_close(sym: str):
+        # 전일(직전 정규장) 종가. quote.previousClose 가 가장 명확하다.
+        # [중요] historical-price-eod(limit=1)는 장중에 '오늘'의 진행중 봉을 돌려줘서
+        # 프리마켓 % 가 (오늘÷오늘)=~0% 로 뭉개지는 버그가 있었다. previousClose 사용.
+        try:
+            r = requests.get(f"{FMP_BASE}/quote?symbol={sym}&apikey={FMP_KEY}", timeout=8)
+            if r.status_code == 200:
+                d = r.json()
+                it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+                pc = it.get("previousClose")
+                if pc not in (None, "", 0):
+                    return float(pc)
+        except Exception:
+            pass
+        # 폴백: historical-price-eod 2개 받아 '오늘'이 아닌 직전 종가 사용
         try:
             r = requests.get(
-                f"{FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=1&apikey={FMP_KEY}",
+                f"{FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=2&apikey={FMP_KEY}",
                 timeout=8,
             )
             if r.status_code == 200:
                 d = r.json()
                 rows = d.get("historical", d) if isinstance(d, dict) else d
                 if isinstance(rows, list) and rows:
-                    return float(rows[0]["close"])
+                    today = datetime.now(_ET).strftime("%Y-%m-%d")
+                    for row in rows:
+                        if str(row.get("date", ""))[:10] != today:
+                            return float(row["close"])
+                    return float(rows[-1]["close"])
         except Exception:
             pass
         return None
@@ -363,7 +381,7 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
             # 1차: 실시간 확장시간 가격 vs 전일 종가
             for sym in ("SPY", "QQQ"):
                 px = _ext_price(sym)
-                prev = _eod_prev_close(sym)
+                prev = _prev_close(sym)
                 if px and prev and prev > 0:
                     _pm[sym] = (px / prev - 1) * 100
                     print(f"[INFO] 프리마켓(실시간) {sym}: ext={px} prev={prev} → {_pm[sym]:+.2f}%")
