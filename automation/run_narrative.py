@@ -200,8 +200,36 @@ def fetch_global_market_news():
             if news["weight"] > k["weight"] or (news["weight"] == k["weight"] and news["published_dt"] > k["published_dt"]):
                 deduped[dup_idx] = news
 
-    ranked = sorted(deduped, key=lambda x: (x["weight"], x["published_dt"]), reverse=True)
-    top = ranked[:50]
+    # ── 신선도·다양성 정렬 (C: 시간 컷 + B: 소스별 쿼터) ──────────────────────
+    CUTOFF_HOURS = 48     # C: 이보다 오래된 기사는 1차 제외(신선도 확보)
+    PER_SOURCE   = 15     # B: 소스별 최대 채택(한 소스가 상위 독식 방지 → 4곳 골고루)
+    TARGET       = 50     # Gemini에 넣을 최종 건수
+    _now    = datetime.now(timezone.utc)
+    _cutoff = _now - timedelta(hours=CUTOFF_HOURS)
+
+    def _has_dt(n):
+        return n["published_dt"].year > 2000   # datetime.min(발행시각 파싱 실패) 제외
+
+    fresh = [n for n in deduped if _has_dt(n) and n["published_dt"] >= _cutoff]
+    rest  = [n for n in deduped if not (_has_dt(n) and n["published_dt"] >= _cutoff)]
+
+    # B: 소스별로 최신순 PER_SOURCE개씩만 채택
+    _by_src = {}
+    for n in fresh:
+        _by_src.setdefault(n["source"], []).append(n)
+    quota_pool = []
+    for _src, _items in _by_src.items():
+        _items.sort(key=lambda x: x["published_dt"], reverse=True)
+        quota_pool.extend(_items[:PER_SOURCE])
+
+    # 신선도 우선 정렬(최신순, 동점은 소스 가중치)
+    quota_pool.sort(key=lambda x: (x["published_dt"], x["weight"]), reverse=True)
+    top = quota_pool[:TARGET]
+
+    # 부족하면(저녁·조용한 장) 컷오프 밖·발행시각 미상 기사로 보충(가중치·최신순)
+    if len(top) < TARGET:
+        filler = sorted(rest, key=lambda x: (x["weight"], x["published_dt"]), reverse=True)
+        top.extend(filler[: TARGET - len(top)])
 
     # ── 뉴스 신선도 메타 (실시간성 가시화) ──────────────────────────────────
     # published_dt 를 pop 하기 전에 최신/최오래 시각과 6시간 이내 비중을 계산.
@@ -689,7 +717,7 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
     <div style="font-size:22px;font-weight:800;color:#60a5fa;">📰 Quant Terminal</div>
     <div style="font-size:14px;color:#94a3b8;margin-top:4px;">시장 내러티브 자동 분석 리포트</div>
     <div style="margin-top:8px;font-size:13px;color:#64748b;">{now_et} &nbsp;|&nbsp; {now_kst} &nbsp;|&nbsp; {market_badge}</div>
-    <div style="font-size:12px;color:#64748b;margin-top:4px;">뉴스 {news_count}건 수집 · Gemini 2.5 Flash 분석</div>
+    <div style="font-size:12px;color:#64748b;margin-top:4px;">뉴스 {news_count}건 수집 → 상위 {_m.get('total', news_count)}건 분석 · Gemini 2.5 Flash</div>
     {fresh_line}
   </div>
 
