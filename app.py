@@ -3187,50 +3187,84 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             return ("leaders", pd.DataFrame())
 
     def _fetch_futures_data():
-        """프리마켓 방향 — SPY/QQQ stock-price-change API (1일 변화율).
-        FMP는 ES=F/NQ=F 선물 심볼 미지원. stock-price-change가 가장 정확한 대체.
-        프리마켓 시간대에는 quote의 price가 프리마켓 가격을 반영함.
+        """프리마켓 방향 — SPY/QQQ 실시간 확장시간(프리/애프터) 가격 vs 전일 종가.
+        FMP는 선물(ES=F/NQ=F) 미지원. 과거엔 stock-price-change(1D)=전일 종가 변화율을
+        '프리마켓'이라 라벨만 붙여 라이브와 반대로 나올 수 있었음.
+        → aftermarket-trade/quote 로 실제 확장시간가를 받아 전일 종가 대비 % 계산.
+          확장시간 데이터가 없으면 1D로 폴백하되 source='eod-fallback'로 표기(라벨 정직화).
         """
         results = {}
         if not k_drg:
             return ("futures", results)
 
-        # 1차: stock-price-change API (1D 변화율 — 가장 신뢰도 높음)
-        try:
-            r_chg = requests.get(
-                f"{_FMP_BASE}/stock-price-change?symbol=SPY,QQQ&apikey={k_drg}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r_chg.status_code == 200:
-                data_chg = r_chg.json()
-                items = data_chg if isinstance(data_chg, list) else [data_chg]
-                for item in items:
-                    sym = str(item.get("symbol", "")).upper()
-                    chg1d = to_float(item.get("1D") or item.get("1d") or item.get("day"))
-                    if sym in ("SPY", "QQQ") and pd.notna(chg1d):
-                        results[sym] = {"chg_pct": chg1d, "source": "price-change"}
-        except Exception:
-            pass
-
-        # 2차: quote API 폴백 (price vs previousClose)
-        for sym in ["SPY", "QQQ"]:
-            if sym in results:
-                continue
+        def _prev_close(sym):
             try:
-                r_q = requests.get(
-                    f"{_FMP_BASE}/quote?symbol={sym}&apikey={k_drg}",
+                r = requests.get(
+                    f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=1&apikey={k_drg}",
                     timeout=_FMP_TIMEOUT,
                 )
-                if r_q.status_code == 200:
-                    d_q = r_q.json()
-                    item = d_q[0] if isinstance(d_q, list) and d_q else d_q
-                    price = to_float(item.get("price"))
-                    prev  = to_float(item.get("previousClose") or item.get("prevClose"))
-                    chg_pct = to_float(item.get("changesPercentage") or item.get("changePercent"))
-                    if pd.notna(chg_pct):
-                        results[sym] = {"chg_pct": chg_pct, "source": "quote"}
-                    elif pd.notna(price) and pd.notna(prev) and prev > 0:
-                        results[sym] = {"chg_pct": (price / prev - 1) * 100, "source": "quote"}
+                if r.status_code == 200:
+                    d = r.json()
+                    rows = d.get("historical", d) if isinstance(d, dict) else d
+                    if isinstance(rows, list) and rows:
+                        return to_float(rows[0].get("close"))
+            except Exception:
+                pass
+            return np.nan
+
+        def _ext_price(sym):
+            # 1차: aftermarket-trade (확장시간 체결가)
+            try:
+                r = requests.get(f"{_FMP_BASE}/aftermarket-trade?symbol={sym}&apikey={k_drg}", timeout=_FMP_TIMEOUT)
+                if r.status_code == 200:
+                    d = r.json()
+                    it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+                    for f in ("price", "lastSalePrice", "tradePrice", "last"):
+                        v = to_float(it.get(f))
+                        if pd.notna(v) and v > 0:
+                            return v
+            except Exception:
+                pass
+            # 2차: aftermarket-quote (bid/ask 중간값)
+            try:
+                r = requests.get(f"{_FMP_BASE}/aftermarket-quote?symbol={sym}&apikey={k_drg}", timeout=_FMP_TIMEOUT)
+                if r.status_code == 200:
+                    d = r.json()
+                    it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+                    bid = to_float(it.get("bidPrice", it.get("bid")))
+                    ask = to_float(it.get("askPrice", it.get("ask")))
+                    if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask > 0:
+                        return (bid + ask) / 2.0
+                    v = to_float(it.get("price", it.get("lastPrice")))
+                    if pd.notna(v) and v > 0:
+                        return v
+            except Exception:
+                pass
+            return np.nan
+
+        # 1차: 실시간 확장시간 가격 vs 전일 종가
+        for sym in ["SPY", "QQQ"]:
+            px = _ext_price(sym)
+            prev = _prev_close(sym)
+            if pd.notna(px) and pd.notna(prev) and prev > 0:
+                results[sym] = {"chg_pct": (px / prev - 1) * 100, "source": "aftermarket", "live": True}
+
+        # 2차 폴백: 확장시간 데이터 없음 → stock-price-change 1D (전일 종가 기준)
+        if len(results) < 2:
+            results = {}
+            try:
+                r_chg = requests.get(
+                    f"{_FMP_BASE}/stock-price-change?symbol=SPY,QQQ&apikey={k_drg}",
+                    timeout=_FMP_TIMEOUT,
+                )
+                if r_chg.status_code == 200:
+                    data_chg = r_chg.json()
+                    items = data_chg if isinstance(data_chg, list) else [data_chg]
+                    for item in items:
+                        sym = str(item.get("symbol", "")).upper()
+                        chg1d = to_float(item.get("1D") or item.get("1d") or item.get("day"))
+                        if sym in ("SPY", "QQQ") and pd.notna(chg1d):
+                            results[sym] = {"chg_pct": chg1d, "source": "eod-fallback", "live": False}
             except Exception:
                 pass
 
@@ -3401,6 +3435,8 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             _fut_chgs = [v["chg_pct"] for v in _fut_results.values()
                          if pd.notna(v.get("chg_pct", np.nan))]
             _avg_chg = float(np.mean(_fut_chgs)) if _fut_chgs else np.nan
+            _fut_live = bool(_fut_results) and all(v.get("live", False) for v in _fut_results.values())
+            _fut_src = "FMP aftermarket(실시간 확장시간)" if _fut_live else "FMP stock-price-change 1D (⚠️전일 종가 기준·실시간 아님)"
             if pd.notna(_avg_chg):
                 fut_alert = _avg_chg <= -0.5
                 if _avg_chg >= 0.3:
@@ -3413,22 +3449,24 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
                 qqq_chg = _fut_results.get("QQQ", {}).get("chg_pct", np.nan)
                 spy_str = f"SPY {spy_chg:+.2f}%" if pd.notna(spy_chg) else "N/A"
                 qqq_str = f"QQQ {qqq_chg:+.2f}%" if pd.notna(qqq_chg) else "N/A"
+                _live_tag = "" if _fut_live else " (전일종가)"
                 signals["futures"] = {
                     "ok": not fut_alert,
-                    "value": fut_label,
+                    "value": fut_label + _live_tag,
                     "trend": f"{spy_str} / {qqq_str}",
                 }
-                details["프리마켓 방향"] = {
+                details["프리마켓 방향" if _fut_live else "프리마켓 방향(⚠️전일 종가 기준)"] = {
                     "SPY (S&P500)": spy_str,
                     "QQQ (나스닥100)": qqq_str,
                     "평균 변화율": f"{_avg_chg:+.2f}%",
                     "판정": "⚠️ 갭다운 우려" if fut_alert else "✅ 정상",
-                    "데이터 소스": "FMP stock-price-change / quote",
+                    "데이터 소스": _fut_src,
                 }
                 if fut_alert:
-                    warnings.append(
-                        f"⚠️ 프리마켓 하락 ({spy_str} / {qqq_str}) — 갭다운 개장 가능성"
-                    )
+                    _wmsg = (f"⚠️ 프리마켓 하락 ({spy_str} / {qqq_str}) — 갭다운 개장 가능성"
+                             if _fut_live else
+                             f"⚠️ 전일 종가 하락 ({spy_str} / {qqq_str}) — ⚠️실시간 프리마켓 데이터 아님(참고용)")
+                    warnings.append(_wmsg)
             else:
                 signals["futures"] = {"ok": True, "value": "N/A", "trend": ""}
         else:
