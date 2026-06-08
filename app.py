@@ -7335,6 +7335,226 @@ def compute_position_drawdown(close_series, purchase_price, current_price, date_
         return np.nan, False
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 🧠 포지션 인텔리전스 (제안 2~5 통합) — 추가(additive) 레이어
+# 기존 integrated_sell_verdict(실제 매도 판정)은 절대 건드리지 않는다. 보조 표시용.
+#   #3 DRG 국면 → 손절 ATR배수·손익비 조정
+#   #2 포지션 상태기계 (진입직후 → +1R 본전확보 → +2R 러너)
+#   #4 섹터 ETF 대비 상대강도(RS) — 절대 추세 붕괴보다 빠른 선행 약세 감지
+#   #5 죽은 돈(정체) + 실적 임박 가드
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SECTOR_TO_ETF = {
+    "Technology": "XLK", "Information Technology": "XLK",
+    "Financial Services": "XLF", "Financials": "XLF", "Financial": "XLF",
+    "Healthcare": "XLV", "Health Care": "XLV",
+    "Energy": "XLE",
+    "Consumer Cyclical": "XLY", "Consumer Discretionary": "XLY",
+    "Consumer Defensive": "XLP", "Consumer Staples": "XLP",
+    "Industrials": "XLI", "Industrial Goods": "XLI",
+    "Basic Materials": "XLB", "Materials": "XLB",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    "Communication Services": "XLC", "Communications": "XLC",
+}
+
+
+def _regime_params(drg: dict) -> dict:
+    """DRG 국면 → 손절 ATR배수·손익비·라벨. (#3) 라벨/점수 없으면 중립."""
+    d = drg or {}
+    lvl = str(d.get("risk_level") or "").strip()
+    if any(k in lvl for k in ("위험", "하락", "공포", "심각")):
+        return {"atr_mult": 1.5, "rr": 1.5, "label": "🔴 위험 (방어)", "note": "손절 타이트 · 목표 짧게 · 신규 자제"}
+    if any(k in lvl for k in ("경계", "주의", "불안")):
+        return {"atr_mult": 1.8, "rr": 1.8, "label": "🟡 경계", "note": "보수적 운용"}
+    if any(k in lvl for k in ("안전", "양호", "안정", "강세")):
+        return {"atr_mult": 2.5, "rr": 3.0, "label": "🟢 안전 (공격)", "note": "손절 넓게 · 러너 허용"}
+    return {"atr_mult": 2.0, "rr": 2.0, "label": "⚪ 중립", "note": "기본 손익비 1:2"}
+
+
+def _position_state(entry, cur, regime_stop) -> tuple:
+    """현재 R배수(없으면 수익률)로 포지션 단계 판정. (#2) 반환 (단계, 권장액션)."""
+    try:
+        entry = float(entry); cur = float(cur)
+    except Exception:
+        return "❓ 미상", "—"
+    if not (entry > 0 and cur > 0):
+        return "❓ 미상", "—"
+    r_gain = None
+    try:
+        rstop = float(regime_stop)
+        if pd.notna(rstop):
+            if cur <= rstop:
+                return "🔴 손절선 이탈", "손절 규칙 발동 — 매도 검토"
+            risk = entry - rstop
+            if risk > 0:
+                r_gain = (cur - entry) / risk
+    except Exception:
+        r_gain = None
+    if r_gain is not None:
+        if r_gain < 1.0:
+            return "🌱 진입 직후", "손절선 사수 (아직 +1R 미만)"
+        if r_gain < 2.0:
+            return "🟡 +1R 확보", "손절을 본전(매수가)으로 상향"
+        return "🟢 러너 (+2R)", "고점 대비 트레일링으로 추세 유지"
+    # ATR 손절 산출 불가 → 수익률 폴백
+    gain = (cur / entry - 1.0) * 100.0
+    if gain < 8:
+        return "🌱 진입 직후", "손절 규칙 유지"
+    if gain < 20:
+        return "🟡 차익 구간", "손절을 본전으로 상향 검토"
+    return "🟢 러너", "트레일링으로 추세 유지"
+
+
+def _rs_status(stock_ret, bench_ret) -> tuple:
+    """종목 vs 섹터(ETF) 수익률 차이로 상대강도 판정. (#4) 반환 (라벨, 설명)."""
+    try:
+        d = float(stock_ret) - float(bench_ret)
+        if pd.isna(d):
+            return "❓", "—"
+    except Exception:
+        return "❓", "—"
+    if d >= 2.0:
+        return "🟢 주도", f"섹터 대비 +{d:.1f}%p"
+    if d <= -2.0:
+        return "🔴 후행", f"섹터 대비 {d:.1f}%p (선행 약세 주의)"
+    return "🟡 동행", f"섹터 대비 {d:+.1f}%p"
+
+
+def _parse_pct_value(v) -> float:
+    """'+3.2%' / 3.2 / '3.2' → 3.2 (float). 실패 시 np.nan."""
+    try:
+        if v is None:
+            return np.nan
+        s = str(v).replace("%", "").replace("+", "").replace(",", "").strip()
+        if s in ("", "-", "—", "N/A", "nan", "None"):
+            return np.nan
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _position_benchmark_map(tickers_tuple: tuple) -> dict:
+    """티커 → 비교 벤치마크 ETF 심볼. ETF/펀드는 SPY, 개별주는 섹터 SPDR. (#4)"""
+    out = {}
+    tickers = [t for t in dict.fromkeys(tickers_tuple) if t]
+    if not tickers:
+        return out
+    import concurrent.futures as _cf
+
+    def _one(tk):
+        try:
+            p = _fmp_profile(tk) or {}
+            if p.get("isEtf") or p.get("isFund"):
+                return tk, "SPY"
+            sec = str(p.get("sector") or "").strip()
+            return tk, _SECTOR_TO_ETF.get(sec, "SPY")
+        except Exception:
+            return tk, "SPY"
+
+    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+        for fut in _cf.as_completed([ex.submit(_one, t) for t in tickers]):
+            try:
+                tk, etf = fut.result()
+                out[tk] = etf
+            except Exception:
+                pass
+    return out
+
+
+def compute_position_intelligence(sell_radar_df: pd.DataFrame, drg: dict) -> tuple:
+    """매도 레이더 df + DRG → 포지션별 보조 인텔리전스 표. (제안 2~5 통합)
+
+    반환 (intel_df, regime_dict). intel_df 컬럼은 표시용 문자열로 미리 변환.
+    """
+    regime = _regime_params(drg)
+    _cols = ["티커", "단계", "권장 액션", "국면 손절", "국면 목표", "상대강도(RS)", "신호"]
+    if sell_radar_df is None or sell_radar_df.empty or "티커" not in sell_radar_df.columns:
+        return pd.DataFrame(columns=_cols), regime
+
+    tickers = [str(t).strip().upper() for t in sell_radar_df["티커"] if str(t).strip()]
+    bench_map = _position_benchmark_map(tuple(sorted(set(tickers))))
+    bench_etfs = sorted(set(bench_map.values()) | {"SPY"})
+    try:
+        etf_hist = _fmp_batch_price_history(bench_etfs, limit=45)
+    except Exception:
+        etf_hist = {}
+
+    def _ret21(sym):
+        df = etf_hist.get(sym)
+        if df is None or df.empty or "Close" not in df.columns:
+            return np.nan
+        c = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if len(c) < 22:
+            return np.nan
+        return (c.iloc[-1] / c.iloc[-22] - 1.0) * 100.0
+
+    etf_ret = {e: _ret21(e) for e in bench_etfs}
+
+    try:
+        cal = {str(x.get("ticker", "")).upper(): x.get("days_until")
+               for x in (fetch_earnings_calendar(tuple(sorted(set(tickers)))) or [])}
+    except Exception:
+        cal = {}
+
+    rows = []
+    for _, r in sell_radar_df.iterrows():
+        tk = str(r.get("티커", "")).strip().upper()
+        if not tk:
+            continue
+        entry = pd.to_numeric(r.get("매수가"), errors="coerce")
+        cur = pd.to_numeric(r.get("현재가"), errors="coerce")
+        stock_1m = _parse_pct_value(r.get("1개월 수익률"))
+
+        # 국면 손절/목표 (ATR 기반 + 국면 배수)
+        regime_stop = np.nan
+        regime_target = np.nan
+        try:
+            sst = suggest_stop_and_target(tk, float(entry) if pd.notna(entry) else None)
+            atr = sst.get("atr")
+            ent = sst.get("entry")
+            if pd.notna(atr) and atr > 0 and pd.notna(ent) and ent > 0:
+                regime_stop = ent - regime["atr_mult"] * atr
+                regime_target = ent + regime["rr"] * (ent - regime_stop)
+        except Exception:
+            pass
+
+        stage, action = _position_state(entry, cur, regime_stop)
+
+        # 상대강도
+        bench = bench_map.get(tk, "SPY")
+        rs_label, rs_note = _rs_status(stock_1m, etf_ret.get(bench, np.nan))
+        rs_disp = f"{rs_label} {rs_note}" if rs_label != "❓" else "—"
+
+        # 정체 + 실적 임박
+        flags = []
+        if pd.notna(stock_1m) and abs(stock_1m) < 3.0:
+            flags.append("💤 정체")
+        d_e = cal.get(tk)
+        if d_e is not None:
+            try:
+                d_e = int(d_e)
+                if 0 <= d_e <= 10:
+                    flags.append(f"📅 실적 D-{d_e}")
+            except Exception:
+                pass
+
+        rows.append({
+            "티커": tk,
+            "단계": stage,
+            "권장 액션": action,
+            "국면 손절": f"${regime_stop:,.2f}" if pd.notna(regime_stop) else "—",
+            "국면 목표": f"${regime_target:,.2f}" if pd.notna(regime_target) else "—",
+            "상대강도(RS)": rs_disp,
+            "신호": " · ".join(flags) if flags else "—",
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=_cols), regime
+    return pd.DataFrame(rows)[_cols], regime
+
+
 def _empty_sell_signal():
     return {
         "rsi": np.nan, "macd_signal": "N/A", "pct_from_52w_high": np.nan,
@@ -16791,6 +17011,43 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             if sell_radar_df.empty:
                 st.warning("실시간 데이터를 불러오지 못했습니다. 네트워크 또는 티커를 확인해주세요.")
             else:
+                # ── 🧠 포지션 인텔리전스 (제안 2~5 통합, FMP 게이트) ──────────
+                _intel_uid = str(st.session_state.get("user_id") or "").strip()
+                _intel_flag = f"_pos_intel_on_{_intel_uid}"
+                st.markdown("#### 🧠 포지션 인텔리전스 — 손절·익절 타이밍 보조")
+                st.caption(
+                    "기존 매도 판정과 **별개의 보조 지표**입니다. ① 시장 국면별 손절/목표 ② 포지션 단계(진입→+1R→러너) "
+                    "③ 섹터 ETF 대비 상대강도 ④ 정체·실적 임박을 한눈에 봅니다. (FMP 조회)"
+                )
+                if st.button("🧠 포지션 인텔리전스 계산", key=f"btn_pos_intel_{_intel_uid}",
+                             help="DRG 국면·ATR·섹터 ETF·실적일을 조회합니다. (캐시)"):
+                    st.session_state[_intel_flag] = True
+                if st.session_state.get(_intel_flag):
+                    with st.spinner("국면·변동성·상대강도 계산 중..."):
+                        try:
+                            _drg = compute_daily_risk_gauge("전체")
+                        except Exception:
+                            _drg = {}
+                        try:
+                            _intel_df, _regime = compute_position_intelligence(sell_radar_df, _drg)
+                        except Exception as _e:
+                            _intel_df, _regime = pd.DataFrame(), _regime_params({})
+                            st.error(f"인텔리전스 계산 실패: {_e}")
+                    if _regime:
+                        st.info(
+                            f"**현재 시장 국면: {_regime.get('label', '')}** — {_regime.get('note', '')} "
+                            f"(손절 ATR×{_regime.get('atr_mult')}, 목표 1:{_regime.get('rr')})"
+                        )
+                    if _intel_df is not None and not _intel_df.empty:
+                        st.dataframe(_intel_df, use_container_width=True, hide_index=True)
+                        st.caption(
+                            "🌱 진입직후=손절 사수 · 🟡 +1R=손절을 본전으로 · 🟢 러너=트레일링 · "
+                            "🔴 후행=섹터 대비 약세(선행 경고) · 💤 정체=자금 회전 검토 · 📅=실적 임박"
+                        )
+                    else:
+                        st.caption("표시할 포지션이 없습니다.")
+                st.divider()
+
                 total_gain_loss = pd.to_numeric(sell_radar_df["투자 손익($)"], errors="coerce").sum(min_count=1)
                 total_market_value = (
                     pd.to_numeric(sell_radar_df["현재가"], errors="coerce")
