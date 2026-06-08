@@ -3198,16 +3198,36 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             return ("futures", results)
 
         def _prev_close(sym):
+            # 전일(직전 정규장) 종가. quote.previousClose 가 가장 명확.
+            # [중요] historical-price-eod(limit=1)는 장중에 '오늘' 진행중 봉을 돌려줘
+            # 프리마켓 %가 (오늘÷오늘)=~0%로 뭉개지는 버그가 있었다. previousClose 사용.
+            try:
+                r = requests.get(f"{_FMP_BASE}/quote?symbol={sym}&apikey={k_drg}", timeout=_FMP_TIMEOUT)
+                if r.status_code == 200:
+                    d = r.json()
+                    it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+                    pc = to_float(it.get("previousClose"))
+                    if pd.notna(pc) and pc > 0:
+                        return pc
+            except Exception:
+                pass
+            # 폴백: historical-price-eod 2개 중 '오늘'이 아닌 직전 종가
             try:
                 r = requests.get(
-                    f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=1&apikey={k_drg}",
+                    f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=2&apikey={k_drg}",
                     timeout=_FMP_TIMEOUT,
                 )
                 if r.status_code == 200:
                     d = r.json()
                     rows = d.get("historical", d) if isinstance(d, dict) else d
                     if isinstance(rows, list) and rows:
-                        return to_float(rows[0].get("close"))
+                        today = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+                        for row in rows:
+                            if str(row.get("date", ""))[:10] != today:
+                                v = to_float(row.get("close"))
+                                if pd.notna(v) and v > 0:
+                                    return v
+                        return to_float(rows[-1].get("close"))
             except Exception:
                 pass
             return np.nan
