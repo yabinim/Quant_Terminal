@@ -592,7 +592,16 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
     # ── 종합 신호 요약 ───────────────────────────────────────────────────────
     warning_count = sum(1 for s in signals_summary if "경고" in s)
     total_signals = len(signals_summary)
-    risk_level = "🔴 HIGH RISK" if warning_count >= 3 else ("🟡 MEDIUM RISK" if warning_count >= 1 else "🟢 LOW RISK")
+    # 앱(compute_daily_risk_gauge)과 동일한 경고-개수 기반 임계값으로 동기화.
+    # 6+ HIGH / 4~5 CAUTION / 2~3 MODERATE / 0~1 LOW
+    if warning_count >= 6:
+        risk_level = "🔴 HIGH RISK"
+    elif warning_count >= 4:
+        risk_level = "🟡 CAUTION"
+    elif warning_count >= 2:
+        risk_level = "🟢 MODERATE"
+    else:
+        risk_level = "🟢 LOW RISK"
     lines.insert(0, f"[선행 신호 종합: {risk_level} | 경고 {warning_count}/{total_signals}개 (VIX·신용·대장주·프리마켓·리스크오프·이벤트·섹터로테이션·시장폭)]")
 
     return "\n".join(lines) if lines else "데이터 없음"
