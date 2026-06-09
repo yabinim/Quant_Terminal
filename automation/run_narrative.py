@@ -30,8 +30,11 @@ from fredapi import Fred
 
 # ── 공유 뉴스 파이프라인 (SSOT) ──────────────────────────────────────────────
 # app.py 와 동일한 narrative_core 모듈을 import (드리프트 방지).
-# 자동화가 어느 작업 디렉터리에서 실행돼도 sibling 모듈을 찾도록 경로 보강.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 자동화는 automation/ 하위에서 실행되므로, narrative_core.py 가 위치한
+# 레포 루트(app.py·fmp_extras.py와 동일 폴더)를 sys.path 에 추가한다.
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                    # automation/ (모듈이 여기 있을 경우 대비)
+sys.path.insert(0, os.path.dirname(_here))   # 레포 루트 (app.py·fmp_extras.py·narrative_core.py 위치)
 import narrative_core
 from narrative_core import fetch_global_market_news
 
