@@ -13653,7 +13653,7 @@ if st.session_state.get("logged_in"):
                                             "3~4문장 한국어 리뷰: 맞았다면 어떤 근거가 적중했는지, 틀렸다면 무엇을 놓쳤는지, 다음 예측 시 참고할 인사이트."
                                         )
                                         _rm = _GenAIModel("gemini-2.5-flash",
-                                            generation_config={"temperature": 0.3, "max_output_tokens": 1024, "thinking_budget": 0})
+                                            generation_config={"temperature": 0.3, "max_output_tokens": 4096, "thinking_budget": 0})
                                         _rv = _gemini_response_text_utf8_safe(_rm.generate_content(_rp)) or ""
                                     except Exception:
                                         _rv = ""
