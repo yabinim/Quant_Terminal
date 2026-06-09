@@ -29,6 +29,7 @@ from google.oauth2.service_account import Credentials
 from fredapi import Fred
 
 import fmp_extras as fx
+import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_narrative)와 동일 모듈
 
 
 st.set_page_config(page_title="장기 투자 주식 분석", layout="wide")
@@ -11928,51 +11929,15 @@ def fetch_global_market_news():
       raw_count:    int         (중복 제거 전 수집 건수)
     """
     k = _fmp_key()
-    all_news: list = []
-    source_log: list[str] = []
 
-    if k:
-        # ── Layer A: Stock News (티커 태그 포함, 가장 중요) ──────────────────
-        stock_items = _fmp_news_fetch("news/stock-latest", {"page": 0, "limit": 50})
-        layer_a = _fmp_news_to_unified(stock_items, "FMP Stock News", weight=1.2, body_key="text", max_body=300)
-        all_news.extend(layer_a)
-        source_log.append(f"Stock News {len(layer_a)}건")
-
-        # ── Layer B: Press Releases (고임팩트 기업 이벤트) ───────────────────
-        press_items = _fmp_news_fetch("press-releases-latest", {"page": 0, "limit": 30})
-        layer_b = _fmp_news_to_unified(press_items, "FMP Press Release", weight=1.3, body_key="text", max_body=300)
-        all_news.extend(layer_b)
-        source_log.append(f"Press Releases {len(layer_b)}건")
-
-        # ── Layer C: FMP Articles (분석 깊이) ────────────────────────────────
-        article_items = _fmp_news_fetch("fmp-articles", {"page": 0, "limit": 20})
-        layer_c = _fmp_news_to_unified(article_items, "FMP Article", weight=1.0, body_key="content", max_body=300)
-        all_news.extend(layer_c)
-        source_log.append(f"FMP Articles {len(layer_c)}건")
-
-        # ── Layer D: General News (매크로 맥락) ──────────────────────────────
-        general_items = _fmp_news_fetch("news/general-latest", {"page": 0, "limit": 20})
-        layer_d = _fmp_news_to_unified(general_items, "FMP General News", weight=0.8, body_key="text", max_body=200)
-        all_news.extend(layer_d)
-        source_log.append(f"General News {len(layer_d)}건")
-
-    raw_count = len(all_news)
-
-    # FMP 키 없거나 전체 수집 0건 → RSS fallback
-    if raw_count == 0:
-        all_news = _rss_news_fallback()
-        raw_count = len(all_news)
-        source_log = [f"RSS Fallback {raw_count}건"]
-
-    top_news = _dedup_and_rank(all_news, top_n=60)
-    context_text = _build_news_context_text(top_news)
+    # ── 뉴스 수집/디둡/랭킹/컨텍스트는 공유 모듈 narrative_core 로 위임 (SSOT) ──
+    # 아래 _fmp_news_fetch/_dedup_and_rank/_build_news_context_text 등 로컬 헬퍼는
+    # narrative_core 로 이전되었다. 자동화(run_narrative)와 동일 코드를 사용하므로
+    # 뉴스 파이프라인 변경은 narrative_core 한 곳만 고치면 양쪽에 반영된다.
+    top_news, context_text, raw_count, news_meta = narrative_core.fetch_global_market_news(k, top_n=60)
 
     # session_state에 소스 수집 현황 기록 (UI 디버그용)
-    st.session_state["_news_source_log"] = " | ".join(source_log)
-
-    # published_dt는 내부용이므로 최종 반환 전 제거
-    for item in top_news:
-        item.pop("published_dt", None)
+    st.session_state["_news_source_log"] = news_meta.get("source_log", "")
 
     return top_news, context_text, raw_count
 
