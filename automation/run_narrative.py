@@ -156,60 +156,12 @@ def _clean_text(raw: str) -> str:
 
 # ── Gemini 내러티브 생성 ───────────────────────────────────────────────────────
 def generate_market_narrative(news_text: str, fred_alert: str = "") -> dict:
-    """뉴스 텍스트 → Gemini → 내러티브 JSON."""
+    """뉴스 텍스트 → Gemini → 내러티브 JSON.
+    프롬프트/파싱은 공유 모듈 narrative_core (SSOT, app.py와 동일).
+    Gemini 호출·재시도는 자동화 자체 google-genai 클라이언트로 수행.
+    """
     client = genai.Client(api_key=GOOGLE_API_KEY)
-
-    fred_section = fred_alert if fred_alert else ""
-
-    prompt = f"""당신은 월가 수석 퀀트 전략가입니다.
-아래 뉴스와 경제지표 정보를 종합 분석하여 지정된 JSON 스키마 그대로만 응답하세요.
-
-핵심 원칙:
-- 뉴스(정성) + 가격 모멘텀(정량)이 동시에 확인된 종목만 Winners로 선정
-- 뉴스만 좋고 가격이 안 받쳐주는 종목은 emerging으로만 분류
-- 각 theme의 winners는 반드시 3~6개 티커
-
-중요 규칙:
-1) 반드시 순수 JSON 텍스트만 출력 (```json 같은 마크다운 금지)
-2) 모든 키를 빠짐없이 포함
-3) themes는 최소 3개 이상 생성
-4) winners/emerging은 티커를 쉼표로 구분한 문자열
-5) 각 theme의 expanding_to는 반드시 객체 배열(list)이어야 함
-6) expanding_to의 각 객체는 반드시 "stage"와 "expected_tickers" 키를 포함
-7) expected_tickers는 각 stage마다 반드시 2~4개 티커를 쉼표 구분 문자열로 작성
-8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력
-9) 결과는 반드시 한국어로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
-{fred_section}
-
-[뉴스 데이터]
-{news_text}
-
-[출력 JSON 스키마]
-{{
-  "regime": {{
-    "risk": "Risk On 또는 Risk Off",
-    "growth_value": "Growth 선호 또는 Value 선호",
-    "liquidity": "Expanding 또는 Tightening"
-  }},
-  "themes": [
-    {{
-      "title": "테마명 (예: AI Capex Expansion)",
-      "driver": "무엇이 이 테마를 촉발했는가?",
-      "winners": "정량+정성 모두 확인된 수혜주 (예: NVDA, MSFT, SOXX)",
-      "emerging": "뉴스 모멘텀은 있으나 가격 확인 필요 종목 (예: ARM, MRVL)",
-      "momentum_note": "강함/보통/약함 중 하나만 선택",
-      "expanding_to": [
-        {{"stage": "기업용 AI 솔루션", "expected_tickers": "CRM, NOW, WDAY"}},
-        {{"stage": "AI 기반 사이버 보안", "expected_tickers": "CRWD, PANW, FTNT"}}
-      ],
-      "risk": "이 테마가 무너질 수 있는 위험 요인"
-    }}
-  ],
-  "rotation": "과열 섹터 -> 수혜 섹터 플로우 요약",
-  "top_quant_picks": "내러티브와 일치하는 최우선 종목 3~5개 (쉼표 구분)",
-  "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약"
-}}
-You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings."""
+    prompt = narrative_core.build_narrative_prompt(news_text, target_language="ko", fred_alert=fred_alert)
 
     for attempt in range(5):
         try:
@@ -218,16 +170,16 @@ You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings."
                 model="gemini-2.5-flash", contents=prompt, config=cfg
             )
             raw = str(getattr(response, "text", "") or "").strip()
-            raw = re.sub(r"^```json", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"^```", "", raw.strip()).rstrip("`").strip()
-            return json.loads(raw)
+            result = narrative_core.parse_narrative_json(raw)
+            if result is not None:
+                return result
+            print(f"[WARN] Gemini 시도 {attempt+1}/5: 파싱 실패")
         except Exception as e:
-            wait = [10, 30, 60, 120][min(attempt, 3)]
-            print(f"[WARN] Gemini 시도 {attempt+1}/5 실패: {e} → {wait}초 대기")
-            if attempt < 4:
-                time.sleep(wait)
+            print(f"[WARN] Gemini 시도 {attempt+1}/5 실패: {e}")
+        wait = [10, 30, 60, 120][min(attempt, 3)]
+        if attempt < 4:
+            time.sleep(wait)
     return {}
-
 
 # ── Google Sheets 저장 ────────────────────────────────────────────────────────
 def get_gspread_client():
