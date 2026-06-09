@@ -12188,81 +12188,9 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
         return {}
 
     st.session_state["last_gemini_raw_text"] = ""
-    language_label = "한국어" if target_language == "ko" else "English"
+    # 프롬프트는 공유 모듈 narrative_core (SSOT) — app.py·자동화 동일 프롬프트
+    prompt = narrative_core.build_narrative_prompt(news_text, target_language, quant_data=quant_data)
 
-    # 정량 데이터 섹션 구성
-    quant_section = ""
-    if quant_data and quant_data.get("summary_text"):
-        quant_section = f"""
-[정량 스크리닝 데이터 — 실제 가격/거래량 기반]
-{quant_data['summary_text']}
-
-중요: winners 선정 시 위 정량 데이터에서 RS Score가 양수(+)이고 200일선 위에 있는 종목을 우선적으로 포함하세요.
-뉴스 테마와 정량 모멘텀이 일치하는 종목이 가장 신뢰도 높은 Winners입니다.
-"""
-
-    prompt = f"""
-당신은 월가 수석 퀀트 전략가입니다.
-아래 뉴스와 정량 스크리닝 데이터를 종합 분석하여 지정된 JSON 스키마 그대로만 응답하세요.
-
-핵심 원칙:
-- 뉴스(정성) + 가격 모멘텀(정량)이 동시에 확인된 종목만 Winners로 선정
-- 정량 데이터에서 RS Score 양수 + 200일선 위 종목을 우선 포함
-- 뉴스만 좋고 가격이 안 받쳐주는 종목은 emerging으로만 분류
-- 각 theme의 winners는 반드시 3~6개 티커
-
-뉴스 소스 유형별 활용 지침 (매우 중요):
-- [SECTION A] Press Releases: 기업이 직접 발표한 공식 공시입니다.
-  해당 섹션의 "Tickers:" 필드에 태그된 종목은 실적·M&A·가이던스 등 고임팩트 이벤트가 확인된 종목이므로,
-  정량 데이터와 방향이 일치하면 반드시 winners의 최우선 후보로 선정하세요.
-- [SECTION B] Stock News: 각 기사의 "Tickers:" 필드는 해당 뉴스와 직접 연관된 종목입니다.
-  동일 티커가 여러 기사에 반복 등장할수록 모멘텀이 강한 종목으로 간주하세요.
-- [SECTION C] FMP Articles: 테마의 구조적 맥락과 expanding_to 단계 설정에 활용하세요.
-- [SECTION D] General/Macro News: regime(Risk On/Off, liquidity 방향) 판단에 주로 활용하세요.
-
-중요 규칙:
-1) 반드시 순수 JSON 텍스트만 출력 (```json 같은 마크다운 금지)
-2) 모든 키를 빠짐없이 포함
-3) themes는 최소 3개 이상 생성
-4) winners/emerging은 티커를 쉼표로 구분한 문자열
-5) 각 theme의 expanding_to는 반드시 객체 배열(list)이어야 함
-6) expanding_to의 각 객체는 반드시 "stage"와 "expected_tickers" 키를 포함
-7) expected_tickers는 각 stage마다 반드시 2~4개 티커를 쉼표 구분 문자열로 작성
-8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력 (설명 금지, 큰따옴표 사용 금지)
-9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
-10) winners/emerging 선정 근거: 뉴스의 Tickers 태그 + 반복 등장 횟수 + 정량 RS Score를 종합해 판단하세요.
-    근거 없이 유명 대형주를 임의로 채워 넣는 것을 금지합니다.
-{quant_section}
-[뉴스 데이터 — 소스 유형별 섹션 구분]
-{news_text}
-
-[출력 JSON 스키마]
-{{
-  "regime": {{
-    "risk": "Risk On 또는 Risk Off",
-    "growth_value": "Growth 선호 또는 Value 선호",
-    "liquidity": "Expanding 또는 Tightening"
-  }},
-  "themes": [
-    {{
-      "title": "테마명 (예: AI Capex Expansion)",
-      "driver": "무엇이 이 테마를 촉발했는가? Press Release·Stock News 기반 구체적 근거 포함",
-      "winners": "정량+정성 모두 확인된 수혜주 (예: NVDA, MSFT, SOXX)",
-      "emerging": "뉴스 Tickers 태그는 있으나 정량 가격 확인 필요 종목 (예: ARM, MRVL)",
-      "momentum_note": "강함/보통/약함 중 하나만 선택 (예: 강함)",
-      "expanding_to": [
-        {{"stage": "기업용 AI 솔루션", "expected_tickers": "CRM, NOW, WDAY"}},
-        {{"stage": "AI 기반 사이버 보안", "expected_tickers": "CRWD, PANW, FTNT"}}
-      ],
-      "risk": "이 테마가 무너질 수 있는 위험 요인"
-    }}
-  ],
-  "rotation": "과열 섹터 -> 수혜 섹터 플로우 요약 (예: Tech -> Industrials)",
-  "top_quant_picks": "정량 스크리닝 상위 종목 중 내러티브와 일치하는 최우선 종목 3~5개 (쉼표 구분)",
-  "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약 (뉴스+모멘텀 종합, 기관 vs 개인 뷰 차이 포함)"
-}}
-You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings.
-"""
     try:
         response = model.generate_content(prompt)
         raw_text = _gemini_response_text_utf8_safe(response)
@@ -12270,22 +12198,8 @@ You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings.
         if not raw_text:
             return {}
 
-        # JSON 자동 복구: 3단계 파싱 시도
-        def _try_parse_json(text):
-            try:
-                return json.loads(text)
-            except Exception:
-                pass
-            try:
-                c = re.sub(r"^```json", "", text.strip(), flags=re.IGNORECASE)
-                c = re.sub(r"^```", "", c.strip())
-                c = re.sub(r"```$", "", c.strip())
-                return json.loads(c.strip())
-            except Exception:
-                pass
-            return None
-
-        result_data = _try_parse_json(raw_text)
+        # 파싱은 공유 모듈 narrative_core (SSOT)
+        result_data = narrative_core.parse_narrative_json(raw_text)
         if result_data is None:
             err_lower = ""
             try:
