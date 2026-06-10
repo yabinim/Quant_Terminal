@@ -1,0 +1,48 @@
+name: ⏱️ 2PM 장중 워치리스트 헤드업 (잠정)
+
+on:
+  repository_dispatch:
+    types: [trigger-2pm-weekday]   # Cloud Scheduler가 보내는 event_type과 일치 (평일 2PM ET)
+  workflow_dispatch:
+
+jobs:
+  run-2pm-intraday:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install \
+            google-auth \
+            gspread \
+            requests \
+            numpy \
+            pandas \
+            pytz
+
+      - name: ⏱️ 워치리스트 장중 헤드업 (regime_core, --mode intraday)
+        env:
+          FMP_API_KEY:       ${{ secrets.FMP_API_KEY }}
+          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:          ${{ secrets.GMAIL_TO }}
+          GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/run_watchlist_alerts.py --mode intraday
+
+      - name: 📋 실행 로그 요약
+        if: always()
+        run: |
+          echo "======================================"
+          echo "2PM 장중 헤드업 완료 (UTC): $(date -u)"
+          echo "======================================"
