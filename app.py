@@ -30,6 +30,7 @@ from fredapi import Fred
 
 import fmp_extras as fx
 import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_narrative)와 동일 모듈
+import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화와 동일 모듈
 
 
 st.set_page_config(page_title="장기 투자 주식 분석", layout="wide")
@@ -16357,49 +16358,61 @@ if st.session_state.get("logged_in"):
                     vol_delta = "거래량 급증🔥" if pd.notna(vol_surge) and vol_surge >= 1.5 else ("평균 이하" if pd.notna(vol_surge) and vol_surge < 0.8 else "")
                     st.metric("거래량 (5일/21일)", vol_str, delta=vol_delta)
 
-                # RSI 종합 판정
-                if pd.isna(current_rsi):
-                    st.warning("RSI 계산에 필요한 데이터가 부족합니다.")
-                elif current_rsi >= 70:
-                    st.error("🚨 과매수 구간 — 추격 매수 금지. 인내심을 가지세요.")
-                elif current_rsi >= 50:
-                    st.warning("🟡 중립 구간 — 관망. 조정을 기다리세요.")
-                else:
-                    st.success("✅ 조정 구간 — 분할 매수 고려.")
-
-                if is_buy_on_dip:
-                    st.warning("🎯 [눌림목 포착] 장기 우상향 중인 종목의 단기 조정 구간입니다. 매수를 검토하세요!")
-
-                # ── 매수 타이밍 게이트: "지금 사도 되나" 종합 판정 ──────────────
-                # RSI 과매수 + 신고가 부근(과열) 여부를 합쳐 추격 매수를 한 박자 늦춘다.
-                # 좋은 종목이라도 '나쁜 가격(고점)'에 사는 실수를 줄이는 장치.
-                _bg_overheated = (
-                    pd.notna(current_rsi) and current_rsi >= 70
-                    and pd.notna(pct_from_high) and pct_from_high >= -3
-                )
-                _bg_hot_rsi = pd.notna(current_rsi) and current_rsi >= 75
-                _bg_uptrend = (
-                    pd.notna(current_price) and pd.notna(current_ma200)
-                    and current_price > current_ma200
-                )
-                if _bg_overheated or _bg_hot_rsi:
-                    _reason_bits = []
-                    if pd.notna(current_rsi):
-                        _reason_bits.append(f"RSI {current_rsi:.0f}(과매수)")
-                    if pd.notna(pct_from_high) and pct_from_high >= -3:
-                        _reason_bits.append("52주 신고가 부근")
-                    if pd.notna(vol_surge) and vol_surge >= 1.5:
-                        _reason_bits.append(f"거래량 {vol_surge:.1f}x 급증")
-                    st.error(
-                        "⛔ **지금은 매수 보류 (단기 과열)** — "
-                        + ", ".join(_reason_bits)
-                        + ".\n\n추세 자체는 살아있을 수 있으나 **지금 진입하면 고점 매수 위험**이 큽니다. "
-                        "RSI가 60 아래로 식거나 20일선/50일선 눌림목까지 기다렸다가 분할 매수하는 편이 유리합니다."
+                # ── 레짐(국면) 기반 매수 타이밍 판정 — regime_core 엔진 (SSOT) ──
+                #    고정 30/70 대신 종목의 추세 강도(대장주/횡보/약세)에 맞춰
+                #    Cardwell RSI 밴드(강세 40·80 / 횡보 40·70 / 약세 20·60)를 적용.
+                try:
+                    _spy_hist = cached_timing_price_history("SPY")
+                    _spy_close = (
+                        _spy_hist["Close"]
+                        if (_spy_hist is not None and not _spy_hist.empty and "Close" in _spy_hist.columns)
+                        else None
                     )
-                elif is_buy_on_dip:
-                    st.success("🟢 **매수 타이밍 양호** — 우상향 추세 + 눌림목 구간. 분할 매수 고려 가능 구간입니다.")
-                elif _bg_uptrend and pd.notna(current_rsi) and current_rsi < 60:
-                    st.info("🟢 **진입 가능 구간** — 추세 유지 + 과열 아님. 다만 분할 매수로 리스크를 나누세요.")
+                except Exception:
+                    _spy_close = None
+                _regime_res = rc.classify_regime(timing_history, spy_close=_spy_close)
+                _timing_res = rc.evaluate_timing(timing_history, _regime_res)
+
+                if not _regime_res.get("enough_data"):
+                    st.info("레짐 판정에 필요한 가격 데이터가 부족합니다(약 50거래일 이상 필요).")
+                else:
+                    _band_lo, _band_hi = _regime_res["rsi_band"]
+                    _regime_label = {
+                        "strong": "🟢 강세 추세 (대장주)",
+                        "sideways": "🟡 횡보",
+                        "weak": "🔴 약세/하락",
+                    }.get(_regime_res["regime"], "⚪ 판정 불가")
+                    _topping_txt = " · ⚠️ 천장 신호" if _regime_res.get("topping") else ""
+                    st.markdown(
+                        f"**국면 판정:** {_regime_label}{_topping_txt} "
+                        f"(강도 {_regime_res['score']:.0f}/100 · 적용 RSI 밴드 {_band_lo:.0f}~{_band_hi:.0f})"
+                    )
+
+                    # 매수 타이밍 verdict (레짐 적응형)
+                    _verdict = _timing_res.get("verdict", "")
+                    _reasons = " · ".join(_timing_res.get("reasons", []))
+                    _code = _timing_res.get("code")
+                    if _timing_res.get("is_entry"):
+                        st.success(f"🎯 **{_verdict}** — {_reasons}\n\n분할 매수 고려 구간입니다.")
+                    elif _code == "overheat":
+                        st.error(
+                            f"⛔ **{_verdict}** — {_reasons}.\n\n지금 진입하면 고점 매수 위험. "
+                            f"RSI가 밴드 지지선({_band_lo:.0f})까지 식거나 상승 이평선 눌림을 기다리는 편이 유리합니다."
+                        )
+                    elif _code == "trend_break":
+                        st.error(f"🚫 **{_verdict}** — {_reasons}.\n\n추세가 약해지는 신호입니다. 신규 진입 자제.")
+                    elif _code == "avoid":
+                        st.warning(f"**{_verdict}** — {_reasons}.")
+                    else:
+                        st.info(f"⏳ **{_verdict}** — {_reasons}.")
+
+                    # 청산(보유 시) 신호 — 강세 추세가 꺾이는지 점검
+                    _exit_res = rc.compute_exit_signals(timing_history)
+                    if _exit_res.get("is_exit"):
+                        st.warning(
+                            "💰 **청산 신호 감지** (보유 중이라면 점검): "
+                            + " · ".join(_exit_res.get("reasons", []))
+                        )
 
                 # 볼린저밴드 위치 알림
                 if pd.notna(current_price) and pd.notna(current_bb_lower) and pd.notna(current_bb_upper):
