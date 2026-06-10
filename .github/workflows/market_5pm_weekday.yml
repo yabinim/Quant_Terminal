@@ -1,4 +1,4 @@
-name: 📊 5PM After-Close 평일 (내러티브 + DRG 검증)
+name: 📊 5PM After-Close 평일 (내러티브 + DRG 검증 + 워치리스트 알림)
 
 on:
   repository_dispatch:
@@ -9,7 +9,7 @@ on:
 jobs:
   run-5pm-weekday:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: 📥 코드 체크아웃
@@ -58,6 +58,19 @@ jobs:
           GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
         run: |
           python automation/run_drg_verify.py
+
+      - name: ⏳ 15초 대기
+        run: sleep 15
+
+      - name: 🔔 워치리스트 레짐/타이밍 알림 (regime_core 엔진, app.py와 lockstep)
+        env:
+          FMP_API_KEY:       ${{ secrets.FMP_API_KEY }}
+          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:          ${{ secrets.GMAIL_TO }}
+          GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/run_watchlist_alerts.py
 
       - name: 📋 실행 로그 요약
         if: always()
