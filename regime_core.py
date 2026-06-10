@@ -80,6 +80,37 @@ CHANDELIER_LOOKBACK = 22     # entry_price 없을 때 최고가 룩백
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# 표시 라벨 (직관적 단어 — app.py 배지/범례/툴팁이 이 한 곳을 공유)
+# ──────────────────────────────────────────────────────────────────────────
+REGIME_LABEL = {
+    "strong":   "🟢 강세 (대장주)",
+    "sideways": "🟡 횡보",
+    "weak":     "🔴 약세",
+    "unknown":  "⚪ 판정 불가",
+}
+
+# 워치리스트 압축 배지 (timing code → 짧고 직관적인 라벨)
+TIMING_BADGE = {
+    "entry":       "🎯 지금 매수 구간",
+    "wait":        "⏳ 조금 기다리기",
+    "overheat":    "🔴 과열(비쌈)",
+    "trend_break": "⚠️ 추세 흔들림",
+    "avoid":       "⛔ 약세 회피",
+}
+TOPPING_BADGE = "🔺 고점 신호"
+
+# 범례/툴팁용 한 줄 설명
+TIMING_HELP = {
+    "entry":       "강세 종목이 눌려서 싸진 타이밍 — 분할 매수 고려",
+    "wait":        "추세는 좋은데 아직 안 눌림(상대적으로 비쌈) — 눌림 대기",
+    "overheat":    "너무 올라 지금 사면 고점 매수 위험 — 식을 때까지 대기",
+    "trend_break": "상승 추세가 흔들리는 신호 — 신규 진입 자제",
+    "avoid":       "하락/약세 추세 — 매수 대상 아님",
+}
+TOPPING_HELP = "상투 가능성 — 보유 중이면 비중 점검"
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # 지표 헬퍼 (순수)
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -312,31 +343,31 @@ def evaluate_timing(hist: pd.DataFrame, regime_res: dict) -> dict:
                 reasons.append(f"최근 고점 대비 {pullback * 100:.0f}% 눌림(추세 위험)")
             if rsi_lost:
                 reasons.append(f"RSI {rsi:.0f} < 강세 지지 {band_lo:.0f} 이탈")
-            out.update({"verdict": "🚫 추세 이탈 위험", "code": "trend_break", "reasons": reasons})
+            out.update({"verdict": "⚠️ 추세 흔들림", "code": "trend_break", "reasons": reasons})
         elif pd.notna(rsi) and rsi >= STRONG_OVERHEAT_RSI:
             reasons.append(f"RSI {rsi:.0f} ≥ {STRONG_OVERHEAT_RSI:.0f}(강세 과열) — 식을 때까지 대기")
-            out.update({"verdict": "⛔ 단기 과열", "code": "overheat", "reasons": reasons})
+            out.update({"verdict": "🔴 과열(비쌈)", "code": "overheat", "reasons": reasons})
         elif (pd.notna(rsi) and STRONG_ENTRY_RSI_LO <= rsi <= STRONG_ENTRY_RSI_HI
               and (near_ma20 or near_ma50) and pd.notna(ma50) and price > ma50):
             tgt = "20일선" if near_ma20 else "50일선"
             reasons.append(f"RSI {rsi:.0f}(강세 지지대) + 상승 {tgt} 눌림")
-            out.update({"verdict": "🎯 매수 적기", "code": "entry", "reasons": reasons, "is_entry": True})
+            out.update({"verdict": "🎯 지금 매수 구간", "code": "entry", "reasons": reasons, "is_entry": True})
         else:
             reasons.append(f"강세 유지 · RSI {rsi:.0f}(아직 안 식음)" if pd.notna(rsi) else "강세 유지")
-            out.update({"verdict": "⏳ 눌림 대기", "code": "wait", "reasons": reasons})
+            out.update({"verdict": "⏳ 조금 기다리기", "code": "wait", "reasons": reasons})
 
     elif regime == "sideways":
         if regime_res.get("topping"):
             reasons.append("천장(Stage3) 신호 — 신규 진입 자제")
-            out.update({"verdict": "⚠️ 천장 주의", "code": "trend_break", "reasons": reasons})
+            out.update({"verdict": "🔺 고점 신호 주의", "code": "trend_break", "reasons": reasons})
         elif pd.notna(rsi) and rsi <= SIDEWAYS_ENTRY_RSI:
             reasons.append(f"RSI {rsi:.0f}(박스 하단 지지)")
-            out.update({"verdict": "🎯 매수 적기(횡보 저점)", "code": "entry", "reasons": reasons, "is_entry": True})
+            out.update({"verdict": "🎯 지금 매수 구간 (횡보 저점)", "code": "entry", "reasons": reasons, "is_entry": True})
         elif pd.notna(rsi) and rsi >= SIDEWAYS_OVERBOUGHT_RSI:
             reasons.append(f"RSI {rsi:.0f}(박스 상단)")
-            out.update({"verdict": "⛔ 박스 상단", "code": "overheat", "reasons": reasons})
+            out.update({"verdict": "🔴 박스 상단(비쌈)", "code": "overheat", "reasons": reasons})
         else:
-            out.update({"verdict": "⏳ 관망(횡보)", "code": "wait", "reasons": ["뚜렷한 방향 없음"]})
+            out.update({"verdict": "⏳ 관망 (횡보)", "code": "wait", "reasons": ["뚜렷한 방향 없음"]})
 
     else:  # weak
         band_lo_w, band_hi_w = RSI_BAND["weak"]
@@ -344,7 +375,7 @@ def evaluate_timing(hist: pd.DataFrame, regime_res: dict) -> dict:
             reasons.append(f"RSI {rsi:.0f}가 약세 저항 {band_hi_w:.0f} 회복 시도 — 레짐 전환 관찰")
             out.update({"verdict": "👀 약세 · 전환 관찰", "code": "avoid", "reasons": reasons})
         else:
-            out.update({"verdict": "🚫 약세 회피", "code": "avoid", "reasons": ["200일선 아래/하락 추세"]})
+            out.update({"verdict": "⛔ 약세 회피", "code": "avoid", "reasons": ["200일선 아래/하락 추세"]})
 
     return out
 
@@ -414,3 +445,139 @@ def analyze_ticker(hist: pd.DataFrame, spy_close=None, entry_price: float | None
     timing = evaluate_timing(hist, regime)
     exits = compute_exit_signals(hist, entry_price=entry_price)
     return {"regime": regime, "timing": timing, "exit": exits}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 5) 상태 기반 알림 (전환 감지 + 2일 확정 + 재무장) — 순수, app/automation 공유
+# ──────────────────────────────────────────────────────────────────────────
+
+import json as _json
+
+ALERT_CONFIRM_DAYS = 2
+ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price")
+ALERT_EVENT_LABELS = {
+    "entry":  "🎯 지금 매수 구간",
+    "regime": "🔄 레짐 전환",
+    "risk":   "🚫 추세 이탈/위험",
+    "exit":   "💰 청산 신호",
+    "price":  "📌 가격(손절/목표) 도달",
+}
+_REGIME_KR = {"strong": "🟢 강세", "sideways": "🟡 횡보", "weak": "🔴 약세"}
+
+
+def _isna(x) -> bool:
+    try:
+        return x is None or pd.isna(x)
+    except Exception:
+        return x is None
+
+
+def resolve_alert_events(raw, default_csv: str = "entry,risk") -> list:
+    """저장된 alert_states(문자열 또는 리스트) → 실제 적용할 이벤트 리스트.
+
+    규칙 (app.py·automation 공유 SSOT):
+      - "" / 미설정 / 빈 리스트  → 기본값(default_csv)   (신규·마이그레이션 종목)
+      - "none"                    → []  (사용자가 알림 전부 해제)
+      - "entry,risk" 등           → 유효 이벤트만 파싱
+    """
+    if isinstance(raw, (list, tuple)):
+        toks = [str(s).strip() for s in raw if str(s).strip()]
+    else:
+        toks = [s.strip() for s in str(raw or "").split(",") if s.strip()]
+    if not toks:
+        return [s.strip() for s in default_csv.split(",") if s.strip()]
+    if toks == ["none"]:
+        return []
+    return [t for t in toks if t in ALERT_EVENTS]
+
+
+def alert_conditions(analysis: dict, price=None, stop_loss=None, target_price=None) -> dict:
+    """현재 시점의 이벤트별 (조건 bool, 설명) 산출. regime 은 별도 처리."""
+    reg = analysis.get("regime", {}) or {}
+    tim = analysis.get("timing", {}) or {}
+    exi = analysis.get("exit", {}) or {}
+    conds = {}
+    conds["entry"] = (bool(tim.get("is_entry")), tim.get("verdict", ""))
+    risk_on = (tim.get("code") == "trend_break") or bool(reg.get("topping")) or (reg.get("regime") == "weak")
+    conds["risk"] = (bool(risk_on), " · ".join(tim.get("reasons", [])) or "추세 약화")
+    conds["exit"] = (bool(exi.get("is_exit")), " · ".join(exi.get("reasons", [])))
+    price_on, price_msg = False, ""
+    if not _isna(price):
+        if not _isna(stop_loss) and float(price) <= float(stop_loss):
+            price_on, price_msg = True, f"손절가 ${float(stop_loss):.2f} 도달(현재 ${float(price):.2f})"
+        elif not _isna(target_price) and float(price) >= float(target_price):
+            price_on, price_msg = True, f"목표가 ${float(target_price):.2f} 도달(현재 ${float(price):.2f})"
+    conds["price"] = (price_on, price_msg)
+    return conds
+
+
+def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: str = "",
+                               today_str: str = "", price=None, stop_loss=None,
+                               target_price=None, confirm_days: int = ALERT_CONFIRM_DAYS):
+    """상태 전환 기반 알림 평가 (2일 확정 + 재무장). 순수 함수.
+
+    ※ 하루 1회 호출 전제(자동화). 호출 1회 = 평가 1회로 pending 카운터가 1 진행된다.
+       앱(rerun마다 호출)에서는 절대 호출하지 말 것 — 미리보기는 alert_conditions 사용.
+
+    반환: (fired: list[{event,label,message}], new_last_state_json: str)
+    """
+    try:
+        state = _json.loads(last_state_json) if last_state_json else {}
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+    events_state = state.get("events", {}) or {}
+    baseline_regime = state.get("regime")
+
+    reg = analysis.get("regime", {}) or {}
+    cur_regime = reg.get("regime") if reg.get("enough_data") else None
+
+    enabled = set(enabled_events or [])
+    conds = alert_conditions(analysis, price, stop_loss, target_price)
+    fired = []
+
+    # 일반 이벤트: 조건 지속 + confirm_days 확정 + 재무장(조건 해제 시)
+    for e in ("entry", "risk", "exit", "price"):
+        if e not in enabled:
+            events_state[e] = {"status": "armed", "pending": 0}
+            continue
+        cond, msg = conds.get(e, (False, ""))
+        s = events_state.get(e) or {"status": "armed", "pending": 0}
+        status = s.get("status", "armed")
+        pending = int(s.get("pending", 0) or 0)
+        if cond:
+            if status == "armed":
+                pending += 1
+                if pending >= confirm_days:
+                    fired.append({"event": e, "label": ALERT_EVENT_LABELS.get(e, e), "message": msg})
+                    status, pending = "fired", 0
+            # fired 면 유지(재발동 금지)
+        else:
+            status, pending = "armed", 0  # 재무장
+        events_state[e] = {"status": status, "pending": pending}
+
+    # 레짐 전환: baseline 대비 변경 + 확정 → 발동 후 baseline 갱신(자동 재무장)
+    if cur_regime is not None:
+        if baseline_regime is None:
+            baseline_regime = cur_regime  # 최초 기준점, 발동 안 함
+            events_state["regime"] = {"cand": None, "pending": 0}
+        elif "regime" in enabled and cur_regime != baseline_regime:
+            rs = events_state.get("regime") or {"cand": None, "pending": 0}
+            if rs.get("cand") == cur_regime:
+                rs["pending"] = int(rs.get("pending", 0) or 0) + 1
+            else:
+                rs = {"cand": cur_regime, "pending": 1}
+            if rs["pending"] >= confirm_days:
+                fired.append({
+                    "event": "regime", "label": ALERT_EVENT_LABELS["regime"],
+                    "message": f"{_REGIME_KR.get(baseline_regime, baseline_regime)} → {_REGIME_KR.get(cur_regime, cur_regime)}",
+                })
+                baseline_regime = cur_regime
+                rs = {"cand": None, "pending": 0}
+            events_state["regime"] = rs
+        else:
+            events_state["regime"] = {"cand": None, "pending": 0}
+
+    new_state = {"regime": baseline_regime, "events": events_state, "ts": today_str}
+    return fired, _json.dumps(new_state, ensure_ascii=False)
