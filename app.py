@@ -19185,14 +19185,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
         uid_wl = str(st.session_state.get("user_id") or "").strip()
 
-        # ── Alert 발동 현황 ────────────────────────────────────────────────
+        # ── Alert 발동 현황 (활성 종목 요약 — 상세는 아래 각 종목 배지) ──────────
         triggered = st.session_state.get("_watchlist_triggered_alerts", [])
         if triggered:
-            st.error(f"🔔 현재 **{len(triggered)}개 종목**에서 매수 조건이 발동됐어요!")
-            for t in triggered:
-                with st.expander(f"⚡ {t['ticker']} — 현재가 ${t['current_price']:.2f}" if pd.notna(t.get('current_price')) else f"⚡ {t['ticker']}", expanded=True):
-                    for a in t["alerts"]:
-                        st.markdown(f"- {a}")
+            st.warning(
+                f"🔔 현재 **{len(triggered)}개 종목**에서 알림 조건이 활성 상태입니다: "
+                + ", ".join(str(t) for t in triggered)
+                + " — 아래 각 종목에서 상세를 확인하세요."
+            )
             st.divider()
 
         # ── Watchlist 로드 ─────────────────────────────────────────────────
