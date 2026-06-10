@@ -19218,7 +19218,17 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
             with st.spinner("실시간 가격 및 지표 계산 중..."):
                 price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
-                rsi_map_wl, ma200_map_wl = {}, {}
+                rsi_map_wl, ma200_map_wl, regime_map_wl = {}, {}, {}
+                # RS(상대강도) 계산용 SPY 종가 — 1회만 조회
+                try:
+                    _spy_hist_wl = _fmp_price_history("SPY", limit=252)
+                    _spy_close_wl = (
+                        _spy_hist_wl["Close"]
+                        if (_spy_hist_wl is not None and not _spy_hist_wl.empty and "Close" in _spy_hist_wl.columns)
+                        else None
+                    )
+                except Exception:
+                    _spy_close_wl = None
                 for tk in wl_tickers:
                     try:
                         hist = _fmp_price_history(tk, limit=252)
@@ -19226,9 +19236,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         rsi_series = calculate_rsi(close).dropna()
                         rsi_map_wl[tk] = float(rsi_series.iloc[-1]) if not rsi_series.empty else np.nan
                         ma200_map_wl[tk] = float(close.rolling(200, min_periods=200).mean().iloc[-1]) if len(close) >= 200 else np.nan
+                        # 레짐/타이밍 — 개별종목 탭과 동일한 regime_core 엔진(SSOT)
+                        regime_map_wl[tk] = rc.analyze_ticker(hist, spy_close=_spy_close_wl)
                     except Exception:
                         rsi_map_wl[tk] = np.nan
                         ma200_map_wl[tk] = np.nan
+                        regime_map_wl[tk] = None
 
             for idx, item in enumerate(wl_items):
                 tk = item["ticker"]
@@ -19242,8 +19255,25 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 item_alerts = check_watchlist_alerts([item], price_map_wl, rsi_map_wl, ma200_map_wl)
                 alert_badge = "⚡ Alert 발동!" if item_alerts else ""
 
+                # 레짐/타이밍 압축 배지 (regime_core — 개별종목 탭과 동일 엔진)
+                _an = regime_map_wl.get(tk)
+                _reg_badge, _tim_badge = "", ""
+                if _an and _an.get("regime", {}).get("enough_data"):
+                    _reg_badge = _an["regime"].get("color", "")
+                    _tv = _an["timing"]
+                    if _tv.get("is_entry"):
+                        _tim_badge = "🎯 매수적기"
+                    else:
+                        _tim_badge = {
+                            "overheat": "⛔ 과열", "trend_break": "🚫 이탈",
+                            "avoid": "🚫 회피", "wait": "⏳ 대기",
+                        }.get(_tv.get("code"), "")
+                    if _an["regime"].get("topping"):
+                        _tim_badge = (_tim_badge + " ⚠️천장").strip()
+                _badge_str = " ".join(b for b in [_reg_badge, _tim_badge] if b)
+
                 with st.expander(
-                    f"**{tk}** {alert_badge} | "
+                    f"**{tk}** {_badge_str} {alert_badge} | "
                     f"현재가 {'${:.2f}'.format(float(current_price)) if pd.notna(current_price) else 'N/A'} | "
                     f"RSI {'{:.1f}'.format(float(rsi_val)) if pd.notna(rsi_val) else 'N/A'} | "
                     f"등록 시 대비 {'{:+.1f}%'.format(pnl) if pd.notna(pnl) else 'N/A'}",
@@ -19251,6 +19281,28 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 ):
                     info_col, alert_col = st.columns([3, 2])
                     with info_col:
+                        # ── 국면/타이밍 요약 (상세는 개별종목 탭) ──
+                        if _an and _an.get("regime", {}).get("enough_data"):
+                            _rg, _tg = _an["regime"], _an["timing"]
+                            _rlabel = {"strong": "🟢 강세(대장주)", "sideways": "🟡 횡보",
+                                       "weak": "🔴 약세"}.get(_rg["regime"], "⚪ 판정 불가")
+                            _topp = " · ⚠️천장" if _rg.get("topping") else ""
+                            _blo, _bhi = _rg["rsi_band"]
+                            st.markdown(
+                                f"**국면:** {_rlabel}{_topp} "
+                                f"(강도 {_rg['score']:.0f}/100 · RSI밴드 {_blo:.0f}~{_bhi:.0f})"
+                            )
+                            _tg_reasons = " · ".join(_tg.get("reasons", []))
+                            st.markdown(f"**타이밍:** {_tg.get('verdict', '')}"
+                                        + (f" — {_tg_reasons}" if _tg_reasons else ""))
+
+                            def _goto_micro_wl(_t=tk):
+                                st.session_state["selected_ticker"] = _t
+                                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                            st.button(f"🔬 {tk} 정밀 검사로 자세히 보기",
+                                      key=f"wl_goto_micro_{idx}_{tk}",
+                                      on_click=_goto_micro_wl,
+                                      help="3단계 개별 종목 정밀 검사 탭으로 이동합니다.")
                         st.markdown(f"**메모:** {item.get('memo', '') or '없음'}")
                         st.markdown(f"**등록일:** {item.get('date_added', 'N/A')}")
                         st.markdown(f"**200일선:** {'${:.2f}'.format(float(ma200_val)) if pd.notna(ma200_val) else 'N/A'}")
