@@ -291,8 +291,14 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
 3) themes는 최소 3개 이상 생성
 4) winners/emerging은 티커를 쉼표로 구분한 문자열
 5) 각 theme의 expanding_to는 반드시 객체 배열(list)이어야 함
-6) expanding_to의 각 객체는 반드시 "stage"와 "expected_tickers" 키를 포함
-7) expected_tickers는 각 stage마다 반드시 2~4개 티커를 쉼표 구분 문자열로 작성
+6) expanding_to의 각 객체는 반드시 "stage", "expected_tickers", "linkage" 세 키를 포함
+7) expanding_to 작성 규칙 (확산주 품질 — 매우 중요):
+   - 각 stage는 테마가 번지는 '순서'를 따른다: stage 1 = 직접 인접 섹터, stage 2 = 한 다리 건너, stage 3 = 원거리. 병렬 테마 나열 금지.
+   - expected_tickers는 각 stage마다 2~4개 티커를 쉼표 구분 문자열로 작성.
+   - linkage는 "이 단계가 왜/어떻게 테마의 수혜를 받는가"의 인과 고리를 한 줄로 명시한다.
+   - driver(이 테마의 실제 원동력)에서 출발해 전파를 추론하라. 일반 섹터 상식으로 채우지 말 것.
+   - 인과 고리를 설명할 수 없는 종목은 포함하지 말 것.
+   - 이미 크게 오른 유명 대형주보다, 아직 시장이 주목하지 않은 후발 수혜주를 우선하라.
 8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력 (설명 금지, 큰따옴표 사용 금지)
 9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
 10) winners/emerging 선정 근거: 뉴스의 Tickers 태그 + 반복 등장 횟수 + 정량 RS Score를 종합해 판단하세요.
@@ -317,8 +323,8 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
       "emerging": "뉴스 Tickers 태그는 있으나 정량 가격 확인 필요 종목 (예: ARM, MRVL)",
       "momentum_note": "강함/보통/약함 중 하나만 선택 (예: 강함)",
       "expanding_to": [
-        {{"stage": "기업용 AI 솔루션", "expected_tickers": "CRM, NOW, WDAY"}},
-        {{"stage": "AI 기반 사이버 보안", "expected_tickers": "CRWD, PANW, FTNT"}}
+        {{"stage": "기업용 AI 솔루션 (2차)", "expected_tickers": "CRM, NOW, WDAY", "linkage": "AI 인프라 구축 → 기업 워크플로우 AI 적용 수요 연쇄"}},
+        {{"stage": "AI 기반 사이버 보안 (3차)", "expected_tickers": "CRWD, PANW, FTNT", "linkage": "AI 도입 확산 → 공격면 증가 → 보안 수요 연쇄"}}
       ],
       "risk": "이 테마가 무너질 수 있는 위험 요인"
     }}
