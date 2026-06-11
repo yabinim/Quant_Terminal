@@ -80,6 +80,11 @@ _SCANNER_HISTORY_SHEET_TITLE = "Scanner_History"
 _SCANNER_HISTORY_COLS = ["ID", "Date", "Engine", "Ticker", "Score", "Rank", "Verdict", "RS_Score", "Mom_1M"]
 _SCANNER_LAST_RESULT_SHEET_TITLE = "Scanner_Last_Result"
 _SCANNER_LAST_RESULT_COLS = ["ID", "Engine", "Saved_At", "Universe_Count", "Score_JSON"]
+# 점수표 스키마 버전 — 변경 시 옛 캐시(load_scanner_last_result)는 자동 무효화되어 재스캔 유도.
+# v2-3bucket: 주도주(Regime/절대앵커) 스키마 도입 (RS·Valuation Score 가중 제외, Regime Score 추가).
+_SCANNER_SCHEMA_VERSION = "v2-3bucket"
+# 절대 컷오프 — Final Score가 이 값 미만이면 "관망"(추천 없음) 신호. 절대 앵커링이라 의미 보존. 보정 대상.
+_SCANNER_CUTOFF = {"leaders": 55.0, "setups": 50.0, "expansion": 50.0}
 _ACCURACY_TRACKER_LAST_SHEET_TITLE = "Accuracy_Tracker_Last"
 _ACCURACY_TRACKER_LAST_COLS = ["ID", "Saved_At", "Eval_Horizon", "Hit_Threshold", "Result_JSON"]
 _PORTFOLIO_HISTORY_COLS = ["ID", "Date", "Total_Value", "Total_Cost", "Return_Pct", "SPY_Pct", "Alpha_Pct", "Positions"]
@@ -1088,6 +1093,8 @@ if "scanner_results" not in st.session_state:
     st.session_state["scanner_results"] = None
 if "scanner_results_emerging" not in st.session_state:
     st.session_state["scanner_results_emerging"] = None
+if "scanner_results_expansion" not in st.session_state:
+    st.session_state["scanner_results_expansion"] = None
 if "_scanner_last_result_restored" not in st.session_state:
     st.session_state["_scanner_last_result_restored"] = False
 if "narrative_timeseries_briefing" not in st.session_state:
@@ -8483,6 +8490,7 @@ def save_scanner_last_result(user_id: str, snap: dict, engine: str) -> tuple[boo
             "scanner_mode": snap.get("scanner_mode", ""),
             "universe": snap.get("universe", []),
             "completed_at": snap.get("completed_at", saved_at),
+            "schema_version": _SCANNER_SCHEMA_VERSION,
         }
         payload = json.dumps({"meta": meta, "rows": json.loads(score_json)}, ensure_ascii=False)
 
@@ -8533,6 +8541,9 @@ def load_scanner_last_result(user_id: str, engine: str) -> dict | None:
                 try:
                     payload = json.loads(payload_str)
                     meta = payload.get("meta", {})
+                    # 스키마 버전 불일치 → 옛 컬럼 구조이므로 무효화(재스캔 유도)
+                    if str(meta.get("schema_version", "")) != _SCANNER_SCHEMA_VERSION:
+                        return None
                     rows_data = payload.get("rows", [])
                     if not rows_data:
                         return None
@@ -10658,6 +10669,21 @@ def resolve_opportunity_scanner_narrative_for_direct_mode():
     }
 
 
+def _scanner_cutoff_banner(score_df, engine):
+    """절대 컷오프 기준 충족 종목 수를 배너로 표시. 0개면 '관망' 경고. cut 값을 반환."""
+    cut = _SCANNER_CUTOFF.get(engine, 50.0)
+    fs = pd.to_numeric(score_df.get("Final Score"), errors="coerce")
+    n_pass = int((fs >= cut).sum()) if fs is not None else 0
+    if n_pass == 0:
+        st.warning(
+            f"🅿️ 절대 컷오프({cut:.0f}) 충족 종목이 없습니다 — **관망 권장**. "
+            "현재 구간에선 신규 진입 신호가 약합니다."
+        )
+    else:
+        st.caption(f"✅ 절대 컷오프 {cut:.0f} 이상: **{n_pass}개** (그 미만은 참고용)")
+    return cut
+
+
 def render_opportunity_scanner_snapshot(snap):
     """
     1.6 스캐너 결과 UI. `snap`은 st.session_state['scanner_results'] 형식(dict).
@@ -10695,13 +10721,14 @@ def render_opportunity_scanner_snapshot(snap):
     with st.expander("스캔 당시 유니버스 보기", expanded=False):
         st.code(", ".join(universe) if universe else "(기록 없음)")
 
+    _cut_l = _scanner_cutoff_banner(score_df, "leaders")
+
     _scanner_factor_defs = [
-        ("Narrative\n(35%)", "Narrative Score"),
-        ("Momentum\n(20%)", "Momentum Score"),
-        ("RS\n(15%)", "RS Score"),
-        ("Fundamentals\n(15%)", "Fundamentals Score"),
-        ("Inst. Interest\n(10%)", "Institutional Score"),
-        ("Valuation\n(5%)", "Valuation Score"),
+        ("추세·RS\n(35%)", "Regime Score"),
+        ("Momentum\n(15%)", "Momentum Score"),
+        ("Fundamentals\n(20%)", "Fundamentals Score"),
+        ("Inst. Interest\n(15%)", "Institutional Score"),
+        ("Narrative\n(15%)", "Narrative Score"),
     ]
 
     top3 = score_df.head(3).copy()
@@ -10712,10 +10739,13 @@ def render_opportunity_scanner_snapshot(snap):
             f"🏆 TOP {rank} | {tk_scan} ({row['Name']}) | "
             f"Final {_scanner_ui_fmt_2f(row['Final Score'])} / 100"
         )
-        fac_cols = st.columns(6)
+        _fs_l = to_float(row.get("Final Score"))
+        if pd.notna(_fs_l) and _fs_l < _cut_l:
+            st.caption(f"⚠️ 절대 컷오프({_cut_l:.0f}) 미달 — 참고용 (신규 진입 보류 권장)")
+        fac_cols = st.columns(len(_scanner_factor_defs))
         for i, (label, key) in enumerate(_scanner_factor_defs):
             with fac_cols[i]:
-                st.metric(label, _scanner_ui_fmt_2f(row[key]))
+                st.metric(label, _scanner_ui_fmt_2f(row.get(key)))
         st.markdown(f"**Narrative Why:** {row['Narrative Why']}")
         st.markdown(f"**Risk:** {row['Risk']}")
         # Watchlist 추가 버튼 (on_click 방식)
@@ -10755,10 +10785,11 @@ def render_opportunity_scanner_snapshot(snap):
     if not remain_df.empty:
         st.markdown("### 4위 이하 종목")
         show_cols = [
-            "Ticker", "Name", "Final Score", "Narrative Score",
-            "Momentum Score", "RS Score", "Fundamentals Score",
-            "Institutional Score", "Valuation Score",
+            "Ticker", "Name", "Final Score", "Regime Score",
+            "Momentum Score", "Fundamentals Score",
+            "Institutional Score", "Narrative Score",
         ]
+        show_cols = [c for c in show_cols if c in remain_df.columns]
         num_fmt = st.column_config.NumberColumn(format="%.2f")
         st.dataframe(
             remain_df[show_cols], use_container_width=True, hide_index=True,
@@ -10794,8 +10825,8 @@ def render_opportunity_scanner_snapshot(snap):
     # ── 아이디어D: 팩터 레이더 차트 ──────────────────────────────────────
     with st.expander("📊 팩터 레이더 차트 (상위 종목 팩터 프로파일 비교)", expanded=False):
         _radar_df = score_df.head(5).copy()
-        _factor_cols = ["Narrative Score", "Momentum Score", "RS Score", "Fundamentals Score", "Institutional Score", "Valuation Score"]
-        _factor_short = ["Narrative", "Momentum", "RS", "Fundamen.", "Inst.", "Valuation"]
+        _factor_cols = ["Regime Score", "Momentum Score", "Fundamentals Score", "Institutional Score", "Narrative Score"]
+        _factor_short = ["추세·RS", "Momentum", "Fundamen.", "Inst.", "Narrative"]
         _available_cols = [c for c in _factor_cols if c in _radar_df.columns]
         if not _radar_df.empty and len(_available_cols) >= 3:
             _rows = []
@@ -10903,16 +10934,19 @@ def render_opportunity_emerging_snapshot(snap):
                 st.warning("⚠️ 스캔 결과가 6시간 이상 지났습니다. 최신 시장 상황 반영을 위해 재스캔을 권장합니다.")
         except Exception:
             st.caption(f"완료 시각 (UTC): `{completed_at}`")
-    st.info(f"[{mode_note}] 유니버스 **{len(universe)}**개 · 후발·2차 수혜 관점 브리핑")
+    st.info(f"[{mode_note}] 유니버스 **{len(universe)}**개 · 대기주(출발 직전) 관점 브리핑")
     with st.expander("스캔 당시 유니버스", expanded=False):
         st.code(", ".join(universe) if universe else "(기록 없음)")
 
+    _cut_em = _scanner_cutoff_banner(score_df, "setups")
+
     _em_factor_defs = [
-        ("Narrative\nExpansion (35%)", "Narrative Score"),
-        ("Early RS\n(20%)", "Early RS Score"),
-        ("Vol Accel\n(20%)", "Vol Accel Score"),
-        ("Fund.\nReadiness (15%)", "Fundamentals Score"),
+        ("Vol Accel\n(25%)", "Vol Accel Score"),
+        ("Narrative\n(20%)", "Narrative Score"),
+        ("Base Maturity\n(20%)", "Base Maturity Score"),
+        ("Early RS\n(15%)", "Early RS Score"),
         ("Overext.\n(10%)", "Overextension Score"),
+        ("Fund.\n(10%)", "Fundamentals Score"),
     ]
 
     top3 = score_df.head(3).copy()
@@ -10926,10 +10960,13 @@ def render_opportunity_emerging_snapshot(snap):
             f"🌱 TOP {rank} | {tk_em} ({row['Name']}) | Final {_scanner_ui_fmt_2f(row['Final Score'])} / 100\n"
             f"RSI(14): {rsi_s} · 5일/30일 거래량 비: {volx_s}"
         )
-        fac_cols = st.columns(5)
+        _fs_em = to_float(row.get("Final Score"))
+        if pd.notna(_fs_em) and _fs_em < _cut_em:
+            st.caption(f"⚠️ 절대 컷오프({_cut_em:.0f}) 미달 — 참고용 (베이스 미성숙)")
+        fac_cols = st.columns(len(_em_factor_defs))
         for i, (label, key) in enumerate(_em_factor_defs):
             with fac_cols[i]:
-                st.metric(label, _scanner_ui_fmt_2f(row[key]))
+                st.metric(label, _scanner_ui_fmt_2f(row.get(key)))
         st.markdown(f"**다음 타자 AI 코멘트:** {row['Narrative Why']}")
         st.markdown(f"**리스크:** {row['Risk']}")
 
@@ -10977,15 +11014,17 @@ def render_opportunity_emerging_snapshot(snap):
             "Ticker",
             "Name",
             "Final Score",
-            "Narrative Score",
-            "Early RS Score",
             "Vol Accel Score",
-            "Fundamentals Score",
+            "Narrative Score",
+            "Base Maturity Score",
+            "Early RS Score",
             "Overextension Score",
+            "Fundamentals Score",
             "RSI(14)",
             "Vol5/30x",
             "Narrative Why",
         ]
+        show_cols = [c for c in show_cols if c in remain_df.columns]
         num_fmt = st.column_config.NumberColumn(format="%.2f")
         st.dataframe(
             remain_df[show_cols],
@@ -10996,6 +11035,7 @@ def render_opportunity_emerging_snapshot(snap):
                 "Narrative Score": num_fmt,
                 "Early RS Score": num_fmt,
                 "Vol Accel Score": num_fmt,
+                "Base Maturity Score": num_fmt,
                 "Fundamentals Score": num_fmt,
                 "Overextension Score": num_fmt,
                 "RSI(14)": st.column_config.NumberColumn(format="%.1f"),
@@ -11008,8 +11048,8 @@ def render_opportunity_emerging_snapshot(snap):
     # ── Emerging 팩터 비교 차트 ────────────────────────────────────────
     with st.expander("📊 Emerging 팩터 비교 차트 (Top 5)", expanded=False):
         _em_radar_df = score_df.head(5).copy()
-        _em_factor_cols = ["Narrative Score", "Early RS Score", "Vol Accel Score", "Fundamentals Score", "Overextension Score"]
-        _em_factor_short = ["Narrative", "Early RS", "Vol Accel", "Fundamen.", "Overext."]
+        _em_factor_cols = ["Vol Accel Score", "Narrative Score", "Base Maturity Score", "Early RS Score", "Overextension Score", "Fundamentals Score"]
+        _em_factor_short = ["Vol Accel", "Narrative", "Base Mat.", "Early RS", "Overext.", "Fundamen."]
         _em_avail_cols = [c for c in _em_factor_cols if c in _em_radar_df.columns]
         if not _em_radar_df.empty and len(_em_avail_cols) >= 3:
             _em_rows = []
@@ -11055,6 +11095,131 @@ def render_opportunity_emerging_snapshot(snap):
         )
 
 
+def render_opportunity_expansion_snapshot(snap):
+    """확산주(Next Wave) 스냅샷 렌더러 — 감시 티어. 구조/초기축적/펀더/밸류 팩터."""
+    if not isinstance(snap, dict):
+        return
+    score_df = snap.get("score_df")
+    if not isinstance(score_df, pd.DataFrame) or score_df.empty:
+        return
+    mode_note = snap.get("mode_note", "확산주")
+    universe = snap.get("universe", []) or []
+    completed_at = snap.get("completed_at", "")
+
+    if completed_at:
+        try:
+            _ca_dt_x = datetime.fromisoformat(str(completed_at).replace("Z", "+00:00"))
+            _ca_kst_x = _ca_dt_x.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M ET")
+            st.caption(f"⏱️ 완료 시각: `{_ca_kst_x}`")
+        except Exception:
+            st.caption(f"완료 시각 (UTC): `{completed_at}`")
+    st.info(f"[{mode_note}] 유니버스 **{len(universe)}**개 · 2·3차 확산 후발주 (감시 티어)")
+    st.warning(
+        "🔭 **감시 티어** — 확산주는 아직 가격이 안 움직인 예측 단계입니다. "
+        "**지금 매수 신호가 아니라**, 거래량 베이스·돌파 등 정량 신호가 확인되면 대기주→주도주로 승격되는 *관찰 대상*입니다."
+    )
+
+    _cut_x = _scanner_cutoff_banner(score_df, "expansion")
+
+    _x_factor_defs = [
+        ("구조 연결\n(40%)", "Structural Score"),
+        ("초기 축적\n(25%)", "Accumulation Score"),
+        ("Fund.\n(20%)", "Fundamentals Score"),
+        ("밸류 여유\n(15%)", "Valuation Score"),
+    ]
+
+    top3 = score_df.head(3).copy()
+    for rank_idx, row in top3.iterrows():
+        rank = rank_idx + 1
+        tk_x = str(row["Ticker"]).strip().upper()
+        volx = row.get("Vol5/30x")
+        volx_s = f"{float(volx):.2f}x" if pd.notna(volx) else "N/A"
+        st.success(
+            f"🔭 TOP {rank} | {tk_x} ({row['Name']}) | Final {_scanner_ui_fmt_2f(row['Final Score'])} / 100\n"
+            f"5일/30일 거래량 비: {volx_s}"
+        )
+        _fs_x = to_float(row.get("Final Score"))
+        if pd.notna(_fs_x) and _fs_x < _cut_x:
+            st.caption(f"⚠️ 절대 컷오프({_cut_x:.0f}) 미달 — 구조 연결 약함, 감시 보류")
+        fac_cols = st.columns(len(_x_factor_defs))
+        for i, (label, key) in enumerate(_x_factor_defs):
+            with fac_cols[i]:
+                st.metric(label, _scanner_ui_fmt_2f(row.get(key)))
+        st.markdown(f"**구조 연결 코멘트:** {row.get('Narrative Why', '—')}")
+        st.markdown(f"**운용 메모:** {row.get('Risk', '—')}")
+
+        _x_wl_key = f"_x_snap_wl_{tk_x}"
+        def _do_add_x(tk=tk_x, r=rank, sc=row['Final Score'], _row=row):
+            _uid = str(st.session_state.get("user_id") or "").strip()
+            _sp_x = pd.to_numeric(_row.get("Price", _row.get("Close", np.nan)), errors="coerce")
+            _ok, _ = add_to_watchlist(
+                _uid, tk,
+                memo=f"확산주(감시) TOP{r} - Score: {_scanner_ui_fmt_2f(sc)}",
+                saved_price=float(_sp_x) if pd.notna(_sp_x) else None,
+            )
+            if _ok:
+                st.session_state[f"_x_snap_wl_{tk}"] = True
+        _x_c1, _x_c2, _x_c3 = st.columns([1, 1, 2])
+        with _x_c1:
+            if st.session_state.get(_x_wl_key):
+                st.success(f"✅ {tk_x} 감시 추가됨!")
+            else:
+                st.button(
+                    f"🔔 {tk_x} 감시 추가",
+                    key=f"x_snap_wl_{rank_idx}_{tk_x}",
+                    on_click=_do_add_x,
+                    use_container_width=True,
+                )
+        with _x_c2:
+            def _goto_micro_x(tk=tk_x):
+                st.session_state["selected_ticker"] = tk
+                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+            st.button(
+                f"🔬 {tk_x} 정밀검사",
+                key=f"x_snap_micro_{rank_idx}_{tk_x}",
+                on_click=_goto_micro_x,
+                use_container_width=True,
+                help="3단계 개별 종목 정밀 검사 탭으로 이동합니다.",
+            )
+        st.divider()
+
+    remain_df = score_df.iloc[3:].copy()
+    if not remain_df.empty:
+        st.markdown("### 4위 이하 (감시 후보)")
+        show_cols = [
+            "Ticker", "Name", "Final Score", "Structural Score",
+            "Accumulation Score", "Fundamentals Score", "Valuation Score",
+            "Vol5/30x", "Narrative Why",
+        ]
+        show_cols = [c for c in show_cols if c in remain_df.columns]
+        num_fmt = st.column_config.NumberColumn(format="%.2f")
+        st.dataframe(
+            remain_df[show_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                c: num_fmt for c in show_cols
+                if c not in ("Ticker", "Name", "Narrative Why", "Vol5/30x")
+            } | {"Vol5/30x": st.column_config.NumberColumn(format="%.2f")},
+        )
+    else:
+        st.caption("확산주 후보가 3개 이하입니다.")
+
+    with st.expander("📐 확산주 점수 산식", expanded=False):
+        st.markdown(
+            """
+| 팩터 | 가중치 | 설명 |
+|---|---|---|
+| 구조 연결 강도 | **40%** | 테마 driver→이 종목까지의 공급망 인과 고리 강도 (Gemini) |
+| 초기 축적 | **25%** | 조용한 베이스에서 거래량이 막 붙기 시작(저밴드도 가점) + 저변동성 |
+| Fundamentals | **20%** | EPS·매출 성장 등 FMP 펀더멘털 |
+| 밸류에이션 여유 | **15%** | forward PE 기반 재평가 여지 (낮을수록 고득점) |
+
+모멘텀·RS는 **의도적으로 제외**(아직 안 움직인 예측 단계). 결측 팩터는 분모에서 제외해 100점 만점 환산.
+"""
+        )
+
+
 def normalize_series_to_100(series):
     values = pd.to_numeric(series, errors="coerce")
     valid = values.dropna()
@@ -11076,15 +11241,48 @@ def clip_series_0_100(series):
     return v.clip(lower=0.0, upper=100.0)
 
 
+# === [3-버킷 재설계 §4·§5] 절대 앵커 곡선 =====================================
+# 풀 상대정규화(normalize_series_to_100) 대신, raw 값을 고정 곡선으로 0~100 매핑.
+# → 약장에서도 점수가 종목 고유값으로 유지되어 "관망"을 표현할 수 있음.
+def anchor_momentum_1m(series):
+    """1개월 수익률(%, calculate_period_return 단위) → 0~100 절대 앵커.
+    -10%→0 · 0%→50 · +20%→100 (구간 선형, 범위 밖은 양끝값으로 클램프)."""
+    v = pd.to_numeric(series, errors="coerce")
+    out = pd.Series(np.nan, index=v.index)
+    valid = v.notna()
+    if valid.any():
+        out[valid] = np.interp(
+            v[valid].astype(float),
+            [-100.0, -10.0, 0.0, 20.0, 100.0],
+            [0.0, 0.0, 50.0, 100.0, 100.0],
+        )
+    return out
+
+
+def anchor_valuation_pe(series):
+    """forwardPE → 0~100 절대 앵커 (재평가 여지). PE 15→100 · 30→60 · 50→20 · 60↑→0.
+    PE 결측/0 이하는 NaN(해석 불가) → Available=False 처리용."""
+    v = pd.to_numeric(series, errors="coerce")
+    out = pd.Series(np.nan, index=v.index)
+    valid = v.notna() & (v > 0)
+    if valid.any():
+        out[valid] = np.interp(
+            v[valid].astype(float),
+            [0.0, 15.0, 30.0, 50.0, 60.0, 1.0e9],
+            [100.0, 100.0, 60.0, 20.0, 0.0, 0.0],
+        )
+    return out
+
+
 def _scanner_score_df_format_for_display(score_df: pd.DataFrame, mode: str) -> pd.DataFrame:
     """보조 점수 결측은 50(중립), 모든 Score·Final은 소수 둘째 자리로 정리."""
     df = score_df.copy()
     if mode == "leaders":
-        for c in ("Fundamentals Score", "Institutional Score", "Valuation Score"):
+        for c in ("Fundamentals Score", "Institutional Score"):
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(50.0).clip(0.0, 100.0)
     elif mode == "emerging":
-        for c in ("Fundamentals Score", "Overextension Score"):
+        for c in ("Fundamentals Score", "Overextension Score", "Base Maturity Score"):
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(50.0).clip(0.0, 100.0)
     for c in df.columns:
@@ -11103,69 +11301,101 @@ def _scanner_ui_fmt_2f(val) -> str:
 
 def emerging_final_weighted_score(score_df):
     """
-    Emerging Final Score: 원시 0~100 점수에 가중치를 곱해 합산. 결측/비가용 팩터는 분자·분모 모두에서 제외.
-    (Narrative×0.35 + Early RS×0.20 + Vol Accel×0.20 + Fundamentals×0.15 + Overextension×0.10),
-    합이 항상 ≤100이 되도록 가용 가중치 합으로 나눔.
-    Overextension 항은 '덜 과열일수록 높은' 원시점수(0~100)로, 패널티는 낮은 원시점수로 반영됨.
+    대기주(Setups) Final Score — 절대 앵커링. '출발 직전' 신호 중심.
+    Vol Accel 0.25 + Narrative 0.20 + Base Maturity 0.20 + Early RS 0.15 + Overextension 0.10 + Fundamentals 0.10.
+    Base Maturity: 50MA 근접 + RSI 회복 구간(베이스 성숙=곧 돌파). Overextension은 '덜 과열일수록 높은' 점수.
+    결측/비가용 팩터는 분자·분모 모두에서 제외(동적 분모).
     """
-    w_n, w_e, w_v, w_f, w_o = 0.35, 0.20, 0.20, 0.15, 0.10
+    w_v, w_n, w_b, w_e, w_o, w_f = 0.25, 0.20, 0.20, 0.15, 0.10, 0.10
 
     n = clip_series_0_100(score_df["Narrative Raw"]).fillna(0.0)
     e = clip_series_0_100(score_df["Early RS Raw"])
     v = clip_series_0_100(score_df["Vol Accel Raw"])
     f = clip_series_0_100(score_df["Fundamentals Raw"])
     o = clip_series_0_100(score_df["Overextension Raw"])
+    b = clip_series_0_100(score_df["Base Maturity Raw"])
 
     na = score_df["Narrative Available"].astype(float)
     ea = score_df["Early RS Available"].astype(float)
     va = score_df["Vol Accel Available"].astype(float)
     fa = score_df["Fundamentals Available"].astype(float)
     oa = score_df["Overextension Available"].astype(float)
+    ba = score_df["Base Maturity Available"].astype(float)
 
     numer = (
-        na * n * w_n
+        va * v.fillna(0.0) * w_v
+        + na * n * w_n
+        + ba * b.fillna(0.0) * w_b
         + ea * e.fillna(0.0) * w_e
-        + va * v.fillna(0.0) * w_v
-        + fa * f.fillna(0.0) * w_f
         + oa * o.fillna(0.0) * w_o
+        + fa * f.fillna(0.0) * w_f
     )
-    denom = na * w_n + ea * w_e + va * w_v + fa * w_f + oa * w_o
+    denom = va * w_v + na * w_n + ba * w_b + ea * w_e + oa * w_o + fa * w_f
     denom = denom.replace(0.0, np.nan)
     out = (numer / denom).fillna(0.0).clip(upper=100.0)
-    return out, n, e, v, f, o
+    return out, n, e, v, f, o, b
 
 
 def leaders_final_weighted_score(score_df):
     """
-    Current Leaders Final Score: 원시/정규화 점수(각 0~100)에 가중치를 곱해 합산.
-    Narrative 가용 시 0.35N + 0.20M + 0.15RS + 0.15F + 0.10I + 0.05V ≤ 100.
-    Narrative 비가용 시 내러티브 항 제외 후 나머지 가중치 합으로 나누어 100점 만점(동적 분모, 전체 비가용 시 약 0.65).
+    주도주(Leaders) Final Score — 절대 앵커링.
+    Regime 0.35 + Momentum(절대) 0.15 + Fundamentals 0.20 + Institutional 0.15 + Narrative 0.15.
+    추세·RS는 regime_core.score(0~100, 이미 절대)가 백본으로 흡수 → 별도 RS 항 없음.
+    Valuation은 주도주 가중에서 제외(리스크 텍스트용으로만 계산). 결측 팩터는 동적 분모로 제외.
     """
-    w_n, w_m, w_rs, w_f, w_i, w_v = 0.35, 0.20, 0.15, 0.15, 0.10, 0.05
+    w_reg, w_m, w_f, w_i, w_n = 0.35, 0.15, 0.20, 0.15, 0.15
 
-    n = clip_series_0_100(score_df["Narrative Raw"]).fillna(0.0)
-    m = normalize_series_to_100(score_df["Momentum 1M Raw"])
-    rs = normalize_series_to_100(score_df["RS Raw"])
+    reg = clip_series_0_100(score_df["Regime Score Raw"]).fillna(0.0)
+    m = anchor_momentum_1m(score_df["Momentum 1M Raw"]).fillna(0.0)
     f = clip_series_0_100(score_df["Fundamentals Raw"]).fillna(0.0)
     inst = clip_series_0_100(score_df["Institutional Raw"]).fillna(0.0)
-    val = clip_series_0_100(score_df["Valuation Raw"]).fillna(0.0)
+    n = clip_series_0_100(score_df["Narrative Raw"]).fillna(0.0)
 
+    rega = score_df["Regime Available"].astype(float)
+    fa = score_df["Fundamentals Available"].astype(float)
     na = score_df["Narrative Available"].astype(float)
+
+    numer = (
+        rega * reg * w_reg
+        + m * w_m
+        + fa * f * w_f
+        + inst * w_i
+        + na * n * w_n
+    )
+    denom = rega * w_reg + w_m + fa * w_f + w_i + na * w_n
+    denom = denom.replace(0.0, np.nan)
+    out = (numer / denom).fillna(0.0).clip(upper=100.0)
+    return out, n, m, reg, f, inst
+
+
+def expansion_final_weighted_score(score_df):
+    """
+    확산주(Next Wave) Final Score — 절대 앵커링. 가격 신호가 없는 2·3차 후발주.
+    Structural 0.40 + Accumulation 0.25 + Fundamentals 0.20 + Valuation 0.15.
+    모멘텀·RS는 의도적으로 제외(아직 안 움직여 0으로 깔리므로 노이즈). 결측은 동적 분모로 제외.
+    """
+    w_s, w_a, w_f, w_v = 0.40, 0.25, 0.20, 0.15
+
+    s = clip_series_0_100(score_df["Structural Raw"]).fillna(0.0)
+    a = clip_series_0_100(score_df["Accumulation Raw"])
+    f = clip_series_0_100(score_df["Fundamentals Raw"])
+    val = anchor_valuation_pe(score_df["Valuation PE Raw"])
+
+    sa = score_df["Structural Available"].astype(float)
+    aa = score_df["Accumulation Available"].astype(float)
     fa = score_df["Fundamentals Available"].astype(float)
     va = score_df["Valuation Available"].astype(float)
 
     numer = (
-        na * n * w_n
-        + m * w_m
-        + rs * w_rs
-        + fa * f * w_f
-        + inst * w_i
-        + va * val * w_v
+        sa * s * w_s
+        + aa * a.fillna(0.0) * w_a
+        + fa * f.fillna(0.0) * w_f
+        + va * val.fillna(0.0) * w_v
     )
-    denom = na * w_n + w_m + w_rs + fa * w_f + w_i + va * w_v
+    denom = sa * w_s + aa * w_a + fa * w_f + va * w_v
     denom = denom.replace(0.0, np.nan)
     out = (numer / denom).fillna(0.0).clip(upper=100.0)
-    return out, n, m, rs, f, inst, val
+    return out, s, a, f, val
 
 
 def _parse_gemini_ticker_score_json_array(raw_text):
@@ -11235,13 +11465,17 @@ def batch_narrative_alignment_scores(tickers, narrative_text):
 {tickers_json}
 
 작업:
-- 주어진 **모든** 티커에 대해 Narrative Alignment 점수(0~100 정수)와 그 이유(reason, **한국어 15단어 이내**)를 평가하라.
+- 각 티커에 "주도주 적합도"를 0~100 정수로 채점하라. (reason: 한국어 15단어 이내)
+- 채점 기준(이 순서로 비중):
+  1) 테마 중심성: 테마의 핵심 드라이버(대장)인가, 단순 주변 언급인가. 중심일수록 고점.
+  2) 테마 강화 여부: 이 종목이 속한 테마가 지금 강화·확대 중인가, 식어가는가. 강화 중일수록 고점.
+  3) 내러티브 일치: winners/top_quant_picks에 명시될수록 고점, 근거 없으면 저점.
+- "유명하다/자주 언급된다"는 이유만으로 고점을 주지 말 것.
 - 반드시 **JSON 배열 형식만** 응답하라. 마크다운·설명 문장·코드펜스 금지.
-- 배열 원소 형식: {{"ticker": "VRT", "score": 85, "reason": "AI 전력망 핵심 수혜"}}
 - 배열 길이는 반드시 {len(chunk)}이며, 위 티커 리스트의 각 심볼을 **정확히 한 번씩** 포함할 것.
 
 예시 형식:
-[{{"ticker":"VRT","score":85,"reason":"AI 전력망 핵심 수혜"}},{{"ticker":"ANET","score":72,"reason":"클라우드 네트워크 수혜"}}]
+[{{"ticker":"NVDA","score":88,"reason":"AI칩 테마 핵심 드라이버, 확대 중"}},{{"ticker":"ANET","score":72,"reason":"네트워크 수혜, 테마 주변부"}}]
 """
         try:
             response = _scanner_narrative_batch_generate_chunk_with_retries(prompt)
@@ -11280,9 +11514,10 @@ def batch_narrative_alignment_scores(tickers, narrative_text):
     return out
 
 
-def batch_narrative_emerging_second_order_scores(tickers, narrative_text):
+def batch_narrative_expansion_scores(tickers, narrative_text):
     """
-    Emerging: 2차 수혜 관점 내러티브를 Gemini **청크(최대 20티커)별** 호출로 일괄 평가.
+    확산주(Next Wave): 2·3차 공급망 구조 연결 강도를 Gemini **청크(최대 20티커)별** 호출로 채점.
+    (구 batch_narrative_emerging_second_order_scores — 3-버킷 재설계에서 확산주 전용으로 이전·강화)
     """
     clean = [str(t).strip().upper() for t in tickers if str(t).strip()]
     if not clean:
@@ -11306,15 +11541,18 @@ def batch_narrative_emerging_second_order_scores(tickers, narrative_text):
 {tickers_json}
 
 작업:
-- **이미 과도하게 오른 1차 대장주·직접 수혜주는 제외**하는 관점에서,
-  인프라/공급망/후속 기술 등 **2차 수혜(Second-order)** 로서 각 티커의 기대도를 0~100 정수로 채점하라.
-- 이유(reason)는 **한국어 15단어 이내**.
-- 반드시 **JSON 배열만** 출력. 마크다운 금지.
-- 원소 형식: {{"ticker": "VRT", "score": 82, "reason": "데이터센터 전력 인프라 연쇄"}}
+- 각 티커를 테마가 옆 섹터로 번질 때의 '2·3차 확산 수혜(Next Wave)'로서 0~100 정수로 채점하라.
+- 채점 기준:
+  1) 공급망 연결 강도: 테마 driver에서 이 종목까지의 인과 고리가 구체적이고 짧은가. 강할수록 고점.
+  2) 미발화 프리미엄: 아직 시장이 주목하지 않은 종목일수록 고점.
+  3) 대형주 남발 배제: 단지 유명해서/인접 섹터라서 고른 종목은 감점.
+- 인과 고리를 설명할 수 없으면 낮게 채점하라.
+- reason은 **인과 고리를 담아 한국어 15단어 이내**. 반드시 **JSON 배열만** 출력, 마크다운 금지.
+- 원소 형식: {{"ticker": "VRT", "score": 82, "reason": "데이터센터 전력 폭증→정밀냉각 연쇄"}}
 - 배열 길이는 반드시 {len(chunk)}이며 모든 티커를 빠짐없이 포함할 것.
 
 예시:
-[{{"ticker":"VRT","score":82,"reason":"데이터센터 전력 인프라 연쇄"}},{{"ticker":"MU","score":70,"reason":"메모리 공급망 후방"}}]
+[{{"ticker":"VRT","score":82,"reason":"데이터센터 전력 폭증→정밀냉각 연쇄"}},{{"ticker":"VST","score":74,"reason":"AI 전력수요→발전사업자 수혜"}}]
 """
         try:
             response = _scanner_narrative_batch_generate_chunk_with_retries(prompt)
@@ -11353,7 +11591,179 @@ def batch_narrative_emerging_second_order_scores(tickers, narrative_text):
     return out
 
 
-def score_opportunity_universe(universe_tickers, latest_analysis):
+def batch_narrative_setup_scores(tickers, narrative_text):
+    """
+    대기주(Setups): 테마의 직접(1차) 수혜주이지만 아직 본격 상승 전 종목의 적합도를
+    Gemini **청크(최대 20티커)별** 호출로 채점. 반환: ticker -> (score 0~100, reason str)
+    """
+    clean = [str(t).strip().upper() for t in tickers if str(t).strip()]
+    if not clean:
+        return {}
+    nt = str(narrative_text or "").strip()
+    if not nt:
+        return {t: (0.0, "내러티브 텍스트가 부족합니다.") for t in clean}
+
+    out = {}
+    n_chunk = max(1, (len(clean) + _SCANNER_NARRATIVE_TICKER_CHUNK_SIZE - 1) // _SCANNER_NARRATIVE_TICKER_CHUNK_SIZE)
+    for ci, i in enumerate(range(0, len(clean), _SCANNER_NARRATIVE_TICKER_CHUNK_SIZE), start=1):
+        chunk = clean[i : i + _SCANNER_NARRATIVE_TICKER_CHUNK_SIZE]
+        tickers_json = json.dumps(chunk, ensure_ascii=False)
+        prompt = f"""
+당신은 진입 타이밍 중심의 종목 발굴 전략가입니다.
+
+[Market Narrative JSON]
+{nt}
+
+[Tickers to score (이번 청크)]
+{tickers_json}
+
+작업:
+- 각 티커는 테마의 '직접(1차) 수혜주이지만 아직 본격 상승 전' 후보다.
+- "대기주 적합도"를 0~100 정수로 채점하라.
+- 채점 기준:
+  1) 테마 직접성: 테마의 직접 수혜 라인인가(멀리 떨어진 후방 공급망이 아니라). 직접일수록 고점.
+  2) 촉매 임박도: 곧 가격을 움직일 구체적 촉매(실적·제품·정책·수주)가 가까운가.
+  3) 미상승 프리미엄: 아직 크게 안 오른 종목일수록 고점, 이미 급등한 종목은 감점.
+- 이미 테마 대장으로 크게 오른 종목은 여기 대상이 아니므로 낮게 채점.
+- reason은 **한국어 15단어 이내**. 반드시 **JSON 배열만** 출력, 마크다운 금지.
+- 원소 형식: {{"ticker": "MRVL", "score": 78, "reason": "AI칩 직접 라인, 실적 임박, 아직 횡보"}}
+- 배열 길이는 반드시 {len(chunk)}이며 모든 티커를 빠짐없이 포함할 것.
+
+예시:
+[{{"ticker":"MRVL","score":78,"reason":"AI칩 직접 라인, 실적 임박, 아직 횡보"}},{{"ticker":"ARM","score":70,"reason":"IP 직접 수혜, 베이스 형성 중"}}]
+"""
+        try:
+            response = _scanner_narrative_batch_generate_chunk_with_retries(prompt)
+            raw_text = str(getattr(response, "text", "") or "").strip()
+            items = _parse_gemini_ticker_score_json_array(raw_text)
+            if not items:
+                st.warning(
+                    f"대기주 내러티브 배치: 청크 {ci}/{n_chunk} JSON 배열 파싱 결과가 비어 있습니다. "
+                    f"({len(chunk)}티커)"
+                )
+                for t in chunk:
+                    out[t] = (0.0, SCANNER_NARRATIVE_API_FAIL_MESSAGE)
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                tk = str(it.get("ticker") or it.get("Ticker") or "").strip().upper()
+                if not tk:
+                    continue
+                sc = to_float(it.get("score"))
+                if pd.isna(sc):
+                    sc = 0.0
+                sc = float(np.clip(sc, 0.0, 100.0))
+                reason = str(it.get("reason") or it.get("why") or "").strip() or "N/A"
+                out[tk] = (sc, reason)
+            for t in chunk:
+                if t not in out:
+                    out[t] = (0.0, SCANNER_NARRATIVE_API_FAIL_MESSAGE)
+        except Exception as exc:
+            st.warning(
+                f"대기주 내러티브 배치 Gemini 호출 실패 ({_SCANNER_GEMINI_CHUNK_MAX_RETRIES}회 재시도 후, 청크 {ci}/{n_chunk}): {exc}"
+            )
+            st.code(traceback.format_exc(), language="bash")
+            for t in chunk:
+                out[t] = (0.0, SCANNER_NARRATIVE_API_FAIL_MESSAGE)
+    return out
+
+
+# =============================================================================
+# [3-버킷 재설계 §2·§3] 정량 라우팅 — winners∪emerging 합친 풀을 regime_core로 분기
+#   주도주(strong/Stage2) / 대기주(sideways/Stage1) / 제외(weak·topping) 로 배정.
+#   확산주(expanding_to)는 가격 신호가 없어 라우팅 대상이 아니며 별도 풀로 처리한다.
+#   (이 블록은 순수 추가 — 기존 엔진 입력 배선은 다음 단계에서 교체)
+# =============================================================================
+def theme_emerging_tickers_from_analysis(analysis):
+    """themes[].emerging 텍스트에서 티커만 추출 (winners와 합쳐 라우팅 후보 풀 구성용).
+    주의: expanding_to를 읽는 emerging_tickers_from_theme_analysis 와는 다른 필드(theme.emerging)."""
+    if not isinstance(analysis, dict):
+        return []
+    themes = analysis.get("themes", [])
+    if not isinstance(themes, list):
+        themes = analysis.get("Themes", []) if isinstance(analysis.get("Themes"), list) else []
+    if not isinstance(themes, list):
+        themes = []
+    out, seen = [], set()
+    for theme in themes:
+        theme = theme if isinstance(theme, dict) else {}
+        for ticker in parse_tickers_from_text(theme.get("emerging", "") or ""):
+            t = str(ticker).strip().upper()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+    return filter_scanner_ticker_list(out)
+
+
+def build_routing_candidate_pool(analysis):
+    """주도주+대기주 라우팅용 후보 풀 = winners ∪ theme.emerging (중복 제거·순서 유지)."""
+    w = winners_tickers_from_theme_analysis(analysis)
+    e = theme_emerging_tickers_from_analysis(analysis)
+    out, seen = [], set()
+    for t in list(w) + list(e):
+        tu = str(t).strip().upper()
+        if tu and tu not in seen:
+            seen.add(tu)
+            out.append(tu)
+    return out
+
+
+def route_candidates_by_regime(candidate_tickers, limit: int = 252):
+    """후보 풀 각 종목을 regime_core.classify_regime 으로 분기.
+    반환: {
+      "leaders":  [티커...],          # regime strong (Stage 2), 천장 아님
+      "setups":   [티커...],          # regime sideways (Stage 1), 천장 아님
+      "excluded": [(티커, 사유)...],   # weak(Stage4)/topping(Stage3)/데이터부족 → 매도 레이더
+      "detail":   {티커: classify_regime dict},
+    }
+    """
+    result = {"leaders": [], "setups": [], "excluded": [], "detail": {}}
+    clean = filter_scanner_ticker_list(
+        [str(t).strip().upper() for t in (candidate_tickers or []) if str(t).strip()]
+    )
+    if not clean:
+        return result
+    try:
+        batch = _fmp_batch_price_history(clean + ["SPY"], limit=limit)
+    except Exception:
+        batch = {}
+    spy_df = batch.get("SPY", pd.DataFrame())
+    spy_close = (
+        spy_df["Close"]
+        if isinstance(spy_df, pd.DataFrame) and "Close" in spy_df.columns
+        else None
+    )
+    for tk in clean:
+        hist = batch.get(tk)
+        if not isinstance(hist, pd.DataFrame) or hist.empty or "Close" not in hist.columns:
+            result["excluded"].append((tk, "가격 데이터 없음"))
+            continue
+        try:
+            reg = rc.classify_regime(hist, spy_close=spy_close)
+        except Exception:
+            result["excluded"].append((tk, "레짐 분류 실패"))
+            continue
+        result["detail"][tk] = reg
+        if not reg.get("enough_data", False):
+            result["excluded"].append((tk, "데이터 부족"))
+            continue
+        regime = str(reg.get("regime", "unknown"))
+        topping = bool(reg.get("topping", False))
+        if topping:
+            result["excluded"].append((tk, "천장(Stage3)"))
+        elif regime == "strong":
+            result["leaders"].append(tk)
+        elif regime == "sideways":
+            result["setups"].append(tk)
+        elif regime == "weak":
+            result["excluded"].append((tk, "약추세(Stage4)"))
+        else:
+            result["excluded"].append((tk, "분류 불가"))
+    return result
+
+
+def score_opportunity_universe(universe_tickers, latest_analysis, regime_detail=None):
     if not universe_tickers:
         return pd.DataFrame()
 
@@ -11363,6 +11773,7 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
         return pd.DataFrame()
 
     narrative_text = json.dumps(latest_analysis or {}, ensure_ascii=False)
+    regime_detail = regime_detail if isinstance(regime_detail, dict) else {}
     progress = st.progress(0.0, text="스캐너 준비 중...")
 
     with st.spinner("Gemini 내러티브 배치 평가 중 (티커 청크별, gemini-2.5-flash)..."):
@@ -11370,7 +11781,7 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
 
     with st.spinner("가격/거래량 데이터 다운로드 중..."):
         try:
-            batch = _fmp_batch_price_history(tickers + ["SPY"], limit=130)
+            batch = _fmp_batch_price_history(tickers + ["SPY"], limit=252)
             close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch.items() if "Close" in df.columns}).sort_index()
             volume_df = pd.DataFrame({tk: df["Volume"] for tk, df in batch.items() if "Volume" in df.columns}).sort_index()
             spy_hist = batch.get("SPY", pd.DataFrame())
@@ -11378,6 +11789,7 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
             close_df = pd.DataFrame()
             volume_df = pd.DataFrame()
             spy_hist = pd.DataFrame()
+    _spy_close_for_regime = spy_hist["Close"] if "Close" in spy_hist.columns else None
 
     # ── 병렬 웜업: _fmp_fill() HTTP 호출을 루프 전에 한꺼번에 병렬 처리 ──
     # 캐시 콜드(첫 스캔)일 때 180종목 × 순차 7회 HTTP → 병렬화로 대폭 단축
@@ -11403,6 +11815,18 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
         m1_ret = calculate_period_return(close_series, 21)
         m3_ret = calculate_period_return(close_series, 63)
         rs_raw = to_float(m3_ret) - to_float(spy_3m)
+
+        # Regime Score: 라우터가 계산한 결과(regime_detail) 재사용, 없으면 인라인 분류 (fallback)
+        _reg = regime_detail.get(ticker)
+        if not isinstance(_reg, dict):
+            try:
+                _reg = rc.classify_regime(
+                    pd.DataFrame({"Close": close_series}), spy_close=_spy_close_for_regime
+                )
+            except Exception:
+                _reg = {}
+        regime_score_raw = to_float(_reg.get("score")) if isinstance(_reg, dict) else np.nan
+        regime_available = bool(isinstance(_reg, dict) and _reg.get("enough_data", False))
 
         # 병렬 웜업 딕셔너리에서 조회 (캐시 히트) — 없으면 fallback으로 직접 호출
         info = _info_cache.get(ticker) or _fmp_fill({}, ticker)
@@ -11476,6 +11900,8 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
                 "Narrative Available": bool(narrative_available),
                 "Momentum 1M Raw": to_float(m1_ret),
                 "RS Raw": to_float(rs_raw),
+                "Regime Score Raw": float(regime_score_raw) if pd.notna(regime_score_raw) else np.nan,
+                "Regime Available": bool(regime_available),
                 "Fundamentals Raw": float(_fund_raw),
                 "Fundamentals Available": bool(fundamentals_data_available),
                 "Institutional Raw": float(_inst_raw),
@@ -11499,14 +11925,13 @@ def score_opportunity_universe(universe_tickers, latest_analysis):
     _nw = score_df["Narrative Why"].isin(SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS)
     score_df.loc[_nw, "Narrative Raw"] = 0.0
 
-    final_s, n_s, m_s, rs_s, f_s, inst_s, val_s = leaders_final_weighted_score(score_df)
+    final_s, n_s, m_s, reg_s, f_s, inst_s = leaders_final_weighted_score(score_df)
     score_df["Final Score"] = final_s
     score_df["Narrative Score"] = n_s
     score_df["Momentum Score"] = m_s
-    score_df["RS Score"] = rs_s
+    score_df["Regime Score"] = reg_s
     score_df["Fundamentals Score"] = f_s
     score_df["Institutional Score"] = inst_s
-    score_df["Valuation Score"] = val_s
     score_df = _scanner_score_df_format_for_display(score_df, "leaders")
     score_df = score_df.sort_values(
         ["Final Score", "Ticker"], ascending=[False, True], na_position="last"
@@ -11541,8 +11966,8 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
             close_df = pd.DataFrame()
             volume_df = pd.DataFrame()
 
-    with st.spinner("Emerging Gemini 내러티브 배치 평가 중 (티커 청크별, gemini-2.5-flash)..."):
-        narrative_map_em = batch_narrative_emerging_second_order_scores(tickers, narrative_text)
+    with st.spinner("대기주 Gemini 내러티브 배치 평가 중 (티커 청크별, gemini-2.5-flash)..."):
+        narrative_map_em = batch_narrative_setup_scores(tickers, narrative_text)
 
     # ── 병렬 웜업: _fmp_fill() HTTP 호출을 루프 전에 한꺼번에 병렬 처리 ──
     with st.spinner(f"Emerging: 펀더멘털 데이터 병렬 수집 중... ({len(tickers)}종목)"):
@@ -11615,6 +12040,25 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
         else:
             over_raw = np.nan
 
+        # Base Maturity: 50MA 근접(-8%~+3%) + RSI 회복 구간(45~58) → 베이스 성숙=곧 돌파 신호
+        base_available = pd.notna(rsi_last) and pd.notna(stretch_pct)
+        if base_available:
+            if -8.0 <= stretch_pct <= 3.0:
+                prox = 100.0
+            elif stretch_pct < -8.0:
+                prox = max(0.0, 100.0 - (abs(stretch_pct) - 8.0) * 5.0)
+            else:  # 50MA 위로 이미 이격
+                prox = max(0.0, 100.0 - (stretch_pct - 3.0) * 6.0)
+            if 45.0 <= rsi_last <= 58.0:
+                rsi_band = 100.0
+            elif rsi_last < 45.0:
+                rsi_band = max(0.0, 100.0 - (45.0 - rsi_last) * 5.0)
+            else:  # 58 초과 = 회복 구간 상단 이탈(과열 방향)
+                rsi_band = max(0.0, 100.0 - (rsi_last - 58.0) * 5.0)
+            base_raw = round((prox + rsi_band) / 2.0, 2)
+        else:
+            base_raw = np.nan
+
         # 병렬 웜업 딕셔너리에서 조회 — 없으면 fallback으로 직접 호출
         info = _em_info_cache.get(ticker) or _fmp_fill({}, ticker)
 
@@ -11672,6 +12116,8 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
                 "Fundamentals Available": bool(fund_data_available),
                 "Overextension Raw": over_raw,
                 "Overextension Available": bool(overext_available),
+                "Base Maturity Raw": base_raw,
+                "Base Maturity Available": bool(base_available),
                 "RSI(14)": rsi_last,
                 "Stretch vs MA50(%)": stretch_pct,
                 "1M Return(%)": m1,
@@ -11693,19 +12139,179 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
     _nw_em = score_df["Narrative Why"].isin(SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS)
     score_df.loc[_nw_em, "Narrative Raw"] = 0.0
 
-    final_s, n_s, e_s, v_s, f_s, o_s = emerging_final_weighted_score(score_df)
+    final_s, n_s, e_s, v_s, f_s, o_s, b_s = emerging_final_weighted_score(score_df)
     score_df["Final Score"] = final_s
     score_df["Narrative Score"] = n_s
     score_df["Early RS Score"] = e_s
     score_df["Vol Accel Score"] = v_s
     score_df["Fundamentals Score"] = f_s
     score_df["Overextension Score"] = o_s
+    score_df["Base Maturity Score"] = b_s
     score_df = _scanner_score_df_format_for_display(score_df, "emerging")
     score_df = score_df.sort_values(["Final Score", "Ticker"], ascending=[False, True], na_position="last").reset_index(
         drop=True
     )
 
     progress.progress(1.0, text="Emerging 스캐너 계산 완료")
+    return score_df
+
+
+def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
+    """
+    확산주(Next Wave) 엔진 — expanding_to(2·3차 후발주) 풀 대상.
+    가격 신호가 없어 모멘텀/RS 제외. Structural(공급망 연결강도) 0.40 + Accumulation(초기 축적) 0.25
+    + Fundamentals 0.20 + Valuation(재평가 여지) 0.15. 절대 앵커링.
+    """
+    if not universe_tickers:
+        return pd.DataFrame()
+
+    tickers = list(dict.fromkeys([str(t).strip().upper() for t in universe_tickers if str(t).strip()]))
+    tickers = filter_scanner_ticker_list(tickers)
+    if not tickers:
+        return pd.DataFrame()
+
+    narrative_text = json.dumps(latest_analysis or {}, ensure_ascii=False)
+    progress = st.progress(0.0, text="확산주 스캐너 준비 중...")
+
+    with st.spinner("확산주: 가격·거래량 데이터 다운로드 중..."):
+        try:
+            batch_x = _fmp_batch_price_history(tickers, limit=130)
+            close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch_x.items() if "Close" in df.columns}).sort_index()
+            volume_df = pd.DataFrame({tk: df["Volume"] for tk, df in batch_x.items() if "Volume" in df.columns}).sort_index()
+        except Exception:
+            close_df = pd.DataFrame()
+            volume_df = pd.DataFrame()
+
+    # 구조 연결 강도: second-order/공급망 프롬프트 재사용 (step4에서 batch_narrative_expansion_scores로 이전 예정)
+    with st.spinner("확산주 Gemini 구조 연결 강도 평가 중 (gemini-2.5-flash)..."):
+        narrative_map_x = batch_narrative_expansion_scores(tickers, narrative_text)
+
+    with st.spinner(f"확산주: 펀더멘털 데이터 병렬 수집 중... ({len(tickers)}종목)"):
+        _x_info_cache = _fmp_fill_parallel_warmup(tickers)
+
+    rows = []
+    total = len(tickers)
+    for idx, ticker in enumerate(tickers, start=1):
+        progress.progress(idx / total, text=f"[확산주 {idx}/{total}] {ticker} 계산 중...")
+
+        close_series = close_df[ticker] if ticker in close_df.columns else pd.Series(dtype=float)
+        vol_series = volume_df[ticker] if ticker in volume_df.columns else pd.Series(dtype=float)
+        close_num = pd.to_numeric(close_series, errors="coerce").dropna()
+        last_px = to_float(close_num.iloc[-1]) if not close_num.empty else np.nan
+
+        # 거래량 비율 (저밴드도 가점)
+        vol_num = pd.to_numeric(vol_series, errors="coerce")
+        v5 = float(vol_num.tail(5).mean()) if not vol_num.empty else np.nan
+        v30 = float(vol_num.tail(30).mean()) if not vol_num.empty else np.nan
+        vol_ratio = (v5 / v30) if (pd.notna(v5) and pd.notna(v30) and v30 > 0) else np.nan
+
+        # 초기 축적: 조용한 베이스에서 거래량이 막 붙기 시작(저밴드 가점) + 저변동성 베이스
+        accum_available = pd.notna(vol_ratio) and len(close_num) >= 20
+        if accum_available:
+            if vol_ratio >= 1.3:
+                vol_acc = 100.0
+            elif vol_ratio >= 1.1:
+                vol_acc = 70.0
+            elif vol_ratio >= 1.0:
+                vol_acc = 50.0
+            elif vol_ratio >= 0.9:
+                vol_acc = 30.0
+            else:
+                vol_acc = 15.0
+            recent = close_num.tail(20)
+            _mean = float(recent.mean())
+            cv = float(recent.std() / _mean) if _mean > 0 else np.nan
+            if pd.notna(cv):
+                base_tight = float(np.interp(cv, [0.0, 0.02, 0.10, 1.0], [100.0, 100.0, 20.0, 0.0]))
+            else:
+                base_tight = 50.0
+            accum_raw = round((vol_acc + base_tight) / 2.0, 2)
+        else:
+            accum_raw = np.nan
+
+        info = _x_info_cache.get(ticker) or _fmp_fill({}, ticker)
+
+        # 펀더멘털 (대기주와 동일 기준)
+        eg = to_float(info.get("earningsGrowth"))
+        if pd.isna(eg):
+            eg = to_float(info.get("epsGrowth"))
+        if pd.isna(eg):
+            eg = to_float(info.get("earningsQuarterlyGrowth"))
+        rev_g = to_float(info.get("revenueGrowth"))
+        trail_eps = to_float(info.get("trailingEps"))
+        fund_data_available = any(pd.notna(x) for x in (eg, rev_g, trail_eps))
+        fund_raw = np.nan
+        if fund_data_available:
+            if pd.notna(eg) and eg > 0:
+                fund_raw = 100.0
+            elif pd.notna(rev_g) and rev_g > 0 and pd.notna(trail_eps) and trail_eps > 0:
+                fund_raw = 85.0
+            elif pd.notna(trail_eps) and trail_eps > 0:
+                fund_raw = 55.0
+            else:
+                fund_raw = 20.0
+
+        # 밸류에이션 여유 (forward PE → anchor_valuation_pe)
+        pe_val = to_float(info.get("forwardPE"))
+        if pd.isna(pe_val):
+            pe_val = to_float(info.get("forwardPe"))
+        if pd.isna(pe_val):
+            pe_val = to_float(info.get("trailingPE"))
+        if pd.isna(pe_val):
+            pe_val = to_float(info.get("pe"))
+        valuation_available = pd.notna(pe_val) and pe_val > 0
+
+        structural_score, structural_why = narrative_map_x.get(ticker, (0.0, "배치 미응답"))
+        structural_available = structural_why not in SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS
+        if not structural_available:
+            structural_score = 0.0
+
+        long_name = str(info.get("longName") or info.get("shortName") or ticker).strip()
+
+        rows.append(
+            {
+                "Ticker": ticker,
+                "Name": long_name,
+                "Price": round(float(last_px), 4) if pd.notna(last_px) else np.nan,
+                "Structural Raw": structural_score,
+                "Structural Available": bool(structural_available),
+                "Narrative Why": structural_why,
+                "Accumulation Raw": accum_raw,
+                "Accumulation Available": bool(accum_available),
+                "Vol5/30x": vol_ratio,
+                "Fundamentals Raw": fund_raw,
+                "Fundamentals Available": bool(fund_data_available),
+                "Valuation PE Raw": float(pe_val) if pd.notna(pe_val) else np.nan,
+                "Valuation Available": bool(valuation_available),
+                "Risk": "감시 티어 — 진입은 정량 신호(거래량 베이스·돌파) 확인 후",
+            }
+        )
+
+    score_df = pd.DataFrame(rows)
+    if score_df.empty:
+        progress.empty()
+        return score_df
+
+    # 가격 데이터 자체가 없는 종목(초기 축적 계산 불가)은 제외
+    score_df = score_df.dropna(subset=["Accumulation Raw"])
+    if score_df.empty:
+        progress.empty()
+        return score_df
+
+    _nw_x = score_df["Narrative Why"].isin(SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS)
+    score_df.loc[_nw_x, "Structural Raw"] = 0.0
+
+    final_s, s_s, a_s, f_s, v_s = expansion_final_weighted_score(score_df)
+    score_df["Final Score"] = final_s
+    score_df["Structural Score"] = s_s
+    score_df["Accumulation Score"] = a_s
+    score_df["Fundamentals Score"] = f_s
+    score_df["Valuation Score"] = v_s
+    score_df = score_df.sort_values(["Final Score", "Ticker"], ascending=[False, True], na_position="last").reset_index(
+        drop=True
+    )
+
+    progress.progress(1.0, text="확산주 스캐너 계산 완료")
     return score_df
 
 
@@ -14793,11 +15399,16 @@ if st.session_state.get("logged_in"):
                     _restored_e = load_scanner_last_result(_uid_restore, "emerging")
                     if _restored_e:
                         st.session_state["scanner_results_emerging"] = _restored_e
+                if st.session_state.get("scanner_results_expansion") is None:
+                    _restored_x = load_scanner_last_result(_uid_restore, "expansion")
+                    if _restored_x:
+                        st.session_state["scanner_results_expansion"] = _restored_x
             st.session_state["_scanner_last_result_restored"] = True
 
-        st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 듀얼 엔진")
+        st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 3-버킷 (주도주·대기주·확산주)")
         st.caption(
-            "**Current Leaders**는 기존 6대 팩터로 대장·테마 정렬을, **Emerging**은 2차 수혜·초기 모멘텀·거래량 가속·과열 회피 관점으로 같은 유니버스를 재스코어링합니다."
+            "winners∪emerging 후보 풀을 regime(추세 단계)으로 라우팅: **주도주**(강세 추세)·**대기주**(베이스/출발 직전)로 분기하고, "
+            "**확산주**는 내러티브의 expanding_to(2·3차 후발)를 감시 티어로 스코어링합니다. 모든 점수는 절대 앵커링."
         )
     
         scanner_data_src = st.radio(
@@ -14806,8 +15417,8 @@ if st.session_state.get("logged_in"):
             key="opportunity_scanner_data_source",
         )
     
-        tab_scan_leaders, tab_scan_emerge = st.tabs(
-            ["🔥 Current Leaders (대장주 추종)", "🚀 Emerging Opportunities (후발주 선점)"]
+        tab_scan_leaders, tab_scan_emerge, tab_scan_expansion = st.tabs(
+            ["🔥 주도주 (Leaders · 대장주)", "🌱 대기주 (Setups · 출발 직전)", "🔭 확산주 (Next Wave · 2·3차 후발)"]
         )
 
         # ── 아이디어C: 두 엔진 결과가 모두 있을 때 교집합/차집합 요약 ──────────
@@ -15030,10 +15641,30 @@ if st.session_state.get("logged_in"):
                         )
     
                 if target_universe:
-                    mode_note = f"Current Leaders · {src_note}"
-                    score_df = score_opportunity_universe(target_universe, latest_analysis)
+                    mode_note = f"주도주 · {src_note}"
+                    # 정량 라우팅: 내러티브 소스는 winners∪emerging 합쳐 분기, 직접입력 모드는 그대로
+                    _route_pool = target_universe
+                    if isinstance(latest_analysis, dict) and latest_analysis.get("themes"):
+                        _merged_l = build_routing_candidate_pool(latest_analysis)
+                        if _merged_l:
+                            _route_pool = _merged_l
+                    routed_l = route_candidates_by_regime(_route_pool)
+                    # setups 풀·regime detail을 세션에 저장 → 대기주 탭에서 재사용
+                    st.session_state["_scanner_routed"] = {
+                        "setups": routed_l["setups"],
+                        "detail": routed_l["detail"],
+                        "analysis": latest_analysis,
+                        "universe": list(_route_pool),
+                    }
+                    st.caption(
+                        f"🧭 정량 라우팅: 주도주 {len(routed_l['leaders'])} · "
+                        f"대기주 {len(routed_l['setups'])} · 제외 {len(routed_l['excluded'])}"
+                    )
+                    score_df = score_opportunity_universe(
+                        routed_l["leaders"], latest_analysis, regime_detail=routed_l["detail"]
+                    )
                     if score_df.empty:
-                        st.error("스코어링 결과가 비어 있습니다. 데이터 소스 상태를 확인한 뒤 다시 시도해주세요.")
+                        st.error("주도주(강세 추세) 종목이 없습니다. 대기주 탭을 확인하거나 데이터 소스를 점검해주세요.")
                     else:
                         narrative_summary_rows = score_df[["Ticker", "Narrative Why", "Risk"]].copy()
                         st.session_state["scanner_results"] = {
@@ -15042,7 +15673,7 @@ if st.session_state.get("logged_in"):
                             "mode_note": mode_note,
                             "scanner_mode": scanner_mode_saved,
                             "scanner_data_source": scanner_data_src,
-                            "universe": list(target_universe),
+                            "universe": list(_route_pool),
                             "completed_at": datetime.now(timezone.utc).isoformat(),
                         }
                         st.success("Current Leaders 스캔 완료 — 결과가 세션에 저장되었습니다.")
@@ -15169,9 +15800,13 @@ if st.session_state.get("logged_in"):
                     if not target_u_em:
                         st.warning("섹터를 하나 이상 선택하거나, 티커를 입력한 뒤 다시 실행해주세요.")
                 elif scanner_data_src == _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS[0]:
-                    target_u_em, latest_a_em = get_latest_narrative_sheet_emerging_tickers_only()
-                    src_note_em = "최신 내러티브 · Emerging"
-                    scanner_mode_saved_em = "내러티브 Emerging 스캔"
+                    _w_em, latest_a_em = get_latest_narrative_sheet_winners_tickers_only()
+                    if isinstance(latest_a_em, dict) and latest_a_em.get("themes"):
+                        target_u_em = build_routing_candidate_pool(latest_a_em)
+                    else:
+                        target_u_em = _w_em
+                    src_note_em = "최신 내러티브 · 대기주"
+                    scanner_mode_saved_em = "내러티브 대기주 스캔"
                     if not target_u_em:
                         st.info("분석된 티커가 없습니다.")
                 else:
@@ -15189,10 +15824,17 @@ if st.session_state.get("logged_in"):
                         )
     
                 if target_u_em:
-                    mode_note_em = f"Emerging · {src_note_em}"
-                    em_df = score_emerging_opportunity_universe(target_u_em, latest_a_em)
+                    # 정량 라우팅: 후보 풀을 regime로 분기, 대기주(sideways) subset만 채점
+                    routed_e = route_candidates_by_regime(target_u_em)
+                    _setup_pool = routed_e["setups"]
+                    st.caption(
+                        f"🧭 정량 라우팅: 주도주 {len(routed_e['leaders'])} · "
+                        f"대기주 {len(_setup_pool)} · 제외 {len(routed_e['excluded'])}"
+                    )
+                    mode_note_em = f"대기주 · {src_note_em}"
+                    em_df = score_emerging_opportunity_universe(_setup_pool, latest_a_em)
                     if em_df.empty:
-                        st.error("Emerging 스코어링 결과가 비어 있습니다. 데이터 소스를 확인해주세요.")
+                        st.error("대기주(베이스 단계) 종목이 없습니다. 주도주 탭을 확인하거나 데이터 소스를 점검해주세요.")
                     else:
                         st.session_state["scanner_results_emerging"] = {
                             "score_df": em_df.copy(),
@@ -15276,7 +15918,46 @@ if st.session_state.get("logged_in"):
                     st.markdown("**📅 최근 Emerging 스캔 기록**")
                     recent_em = em_sc_hist.sort_values("Date", ascending=False).head(20)
                     st.dataframe(recent_em, use_container_width=True, hide_index=True)
-    
+
+        with tab_scan_expansion:
+            st.markdown("##### 🔭 확산주 (Next Wave · 2·3차 후발)")
+            st.caption(
+                "확산주는 최신 내러티브의 `expanding_to`(테마가 옆 섹터로 번질 2·3차 후발 수혜주)를 대상으로 합니다. "
+                "**감시 티어** — 가격 신호가 확인되면 대기주→주도주로 승격됩니다."
+            )
+            run_expansion = st.button(
+                "확산주 스캔",
+                key="run_expansion_opportunity_scanner",
+                use_container_width=True,
+            )
+            if run_expansion:
+                target_u_x, latest_a_x = get_latest_narrative_sheet_emerging_tickers_only()
+                if not target_u_x:
+                    st.info("최신 내러티브에 expanding_to(확산) 종목이 없습니다. 「주간 트렌드 추출」을 먼저 실행해 주세요.")
+                else:
+                    mode_note_x = "확산주 · 최신 내러티브 expanding_to"
+                    x_df = score_expansion_opportunity_universe(target_u_x, latest_a_x)
+                    if x_df.empty:
+                        st.error("확산주 스코어링 결과가 비어 있습니다. 데이터 소스를 확인해주세요.")
+                    else:
+                        st.session_state["scanner_results_expansion"] = {
+                            "score_df": x_df.copy(),
+                            "mode_note": mode_note_x,
+                            "scanner_mode": "내러티브 확산주 스캔",
+                            "scanner_data_source": scanner_data_src,
+                            "universe": list(target_u_x),
+                            "completed_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        st.success("확산주 스캔 완료 — 결과가 세션에 저장되었습니다.")
+                        _x_lr_uid = str(st.session_state.get("user_id") or "").strip()
+                        save_scanner_last_result(_x_lr_uid, st.session_state["scanner_results_expansion"], engine="expansion")
+
+            snap_x = st.session_state.get("scanner_results_expansion")
+            if isinstance(snap_x, dict) and isinstance(snap_x.get("score_df"), pd.DataFrame) and not snap_x["score_df"].empty:
+                render_opportunity_expansion_snapshot(snap_x)
+            elif not run_expansion:
+                st.caption("확산주 스캔을 실행하면 2·3차 후발 수혜주가 감시 티어로 표시됩니다.")
+
     elif main_nav == _MAIN_NAV_OPTIONS[3]:
         syn_s1, syn_s2 = st.columns([1, 3])
         with syn_s1:
