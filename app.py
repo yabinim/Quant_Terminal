@@ -2838,6 +2838,61 @@ def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "")
         return []
 
 
+def _classify_narrative_etfs(tickers_tuple: tuple) -> set:
+    """후보 티커 중 ETF/펀드(isEtf/isFund) 집합 반환. _fmp_profile(캐시) 병렬 조회.
+    개별주 단계(Phase 1)에 ETF가 섞여 들어온 경우 제거 대상 판별용."""
+    tickers = [str(t).upper().strip() for t in dict.fromkeys(tickers_tuple) if str(t).strip()]
+    if not tickers:
+        return set()
+    import concurrent.futures as _cf
+    etf = set()
+
+    def _one(tk):
+        try:
+            p = _fmp_profile(tk) or {}
+            return tk, bool(p.get("isEtf") or p.get("isFund"))
+        except Exception:
+            return tk, False
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+            for fut in _cf.as_completed([ex.submit(_one, t) for t in tickers]):
+                try:
+                    tk, is_etf = fut.result()
+                    if is_etf:
+                        etf.add(tk)
+                except Exception:
+                    pass
+    except Exception:
+        return set()
+    return etf
+
+
+def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "") -> str:
+    """티커 CSV → 종목별 정량 한 줄 요약(캡션용).
+    tier='winner'면 정량 불일치(200일선 아래/RS 음수) 시 ⚠️ 플래그(제거 아님).
+    제거된 fake/ETF는 이미 필드에서 빠졌으므로, 여기 남은 무지표 티커=신규 상장 등 '정량 부족'."""
+    parts = []
+    for t in [x.strip().upper() for x in str(tickers_csv or "").split(",") if x.strip()]:
+        if not t or t == "N/A":
+            continue
+        q = (quant_map or {}).get(t)
+        if not q:
+            parts.append(f"{t} ⏳정량부족(신규)")
+            continue
+        rs = q.get("rs_score")
+        above = q.get("above_ma200")
+        verdict = str(q.get("verdict", "") or "").strip()
+        rs_s = f"RS{rs:+.1f}%p" if isinstance(rs, (int, float)) else ""
+        ma_s = "200MA▲" if above else ("200MA▼" if above is False else "")
+        flag = ""
+        if tier == "winner" and (above is False or (isinstance(rs, (int, float)) and rs < 0)):
+            flag = " ⚠️정량미확인"
+        seg = " ".join(x for x in [verdict, rs_s, ma_s] if x)
+        parts.append(f"{t} {seg}{flag}".strip())
+    return " · ".join(parts)
+
+
 def detect_sector_momentum_reversal(universe_tickers: list) -> list[dict]:
     """
     섹터 꺾임 감지: 연속 2주 RS 하락 + 거래량 감소 + 가격 유지 패턴.
@@ -12912,11 +12967,14 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
                 st.error(f"🤖 Gemini 실제 답변 원문:\n\n{raw_text}")
             result_data = {}
 
-        # ── 티커 실거래 검증 게이트 (SSOT, narrative_core) ──────────────────
-        # LLM이 만든 무효(상장폐지·비상장·오타) 티커를 실투자 필드에서 제거하고,
-        # 제거 리포트를 세션에 저장(렌더 시 배너 표시). FMP 장애 시 fail-open.
-        result_data, _gate_report = narrative_core.sanitize_narrative_tickers(
-            result_data, _fmp_key())
+        # ── 추천 티커 정량 검증 게이트 (SSOT, narrative_core) ───────────────
+        # 전 티커를 verify_emerging_with_quant로 검증 → fake(실거래 quote 없음)·ETF 제거,
+        # 신규 상장주는 보존(정량부족 표기), 통과분에 RS·200일선·verdict 부착
+        # (result_data["_quant"]). 정량/내러티브 불일치는 제거 않고 렌더에서 ⚠️. FMP 장애 시 fail-open.
+        _cands = narrative_core._collect_output_tickers(result_data)
+        _etf_syms = _classify_narrative_etfs(tuple(_cands)) if _cands else set()
+        result_data, _gate_report = narrative_core.verify_narrative_with_quant(
+            result_data, verify_emerging_with_quant, fmp_key=_fmp_key(), etf_symbols=_etf_syms)
         st.session_state["narrative_ticker_gate"] = _gate_report
         return result_data
     except Exception as e:
@@ -14890,16 +14948,23 @@ if st.session_state.get("logged_in"):
             if not narrative_data:
                 st.warning("아직 AI 분석 결과가 없습니다. 상단 버튼을 눌러 실시간 내러티브를 생성하세요.")
 
-            # ── 티커 실거래 검증 게이트 결과 배너 ────────────────────────────
+            # ── 추천 티커 정량 검증 게이트 결과 배너 ──────────────────────────
             _gate = st.session_state.get("narrative_ticker_gate") or {}
-            if _gate.get("verified_ok") and _gate.get("removed"):
+            _rm_fake = _gate.get("removed_fake") or []
+            _rm_etf = _gate.get("removed_etf") or []
+            if _gate.get("verified_ok") and (_rm_fake or _rm_etf):
+                _msgs = []
+                if _rm_fake:
+                    _msgs.append(f"🛑 fake/데이터없음 {len(_rm_fake)}개: `{', '.join(_rm_fake)}`")
+                if _rm_etf:
+                    _msgs.append(f"📦 ETF {len(_rm_etf)}개: `{', '.join(_rm_etf)}`")
                 st.warning(
-                    f"🛑 **무효 티커 {len(_gate['removed'])}개 자동 제거됨** "
-                    f"(상장폐지·비상장·오타): `{', '.join(_gate['removed'])}`  \n"
-                    f"실거래 검증 {_gate.get('checked', 0)}개 중. 아래 종목 리스트는 검증 통과분만 표시됩니다."
+                    "**추천 종목 정량 검증 — 무효 티커 자동 제거됨**  \n"
+                    + "  \n".join(_msgs)
+                    + f"  \n실거래·정량 검증 {_gate.get('checked', 0)}개 중. 아래는 통과분만 표시됩니다."
                 )
             elif _gate and not _gate.get("verified_ok"):
-                st.caption("⚠️ 이번 분석은 티커 실거래 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애).")
+                st.caption("⚠️ 이번 분석은 추천 티커 정량 검증을 수행하지 못했습니다 (가격 데이터 배치 실패).")
 
             st.markdown("### 🧭 Market Regime Indicator")
             regime_col_1, regime_col_2, regime_col_3 = st.columns(3)
@@ -14925,6 +14990,7 @@ if st.session_state.get("logged_in"):
             if isinstance(themes_data, list) and themes_data:
                 for idx, theme in enumerate(themes_data, start=1):
                     theme = theme if isinstance(theme, dict) else {}
+                    _qmap = narrative_data.get("_quant", {}) if isinstance(narrative_data, dict) else {}
                     title = theme.get("title", f"Theme {idx}")
                     expanding_to_data = theme.get("expanding_to", [])
                     if isinstance(expanding_to_data, list):
@@ -14934,7 +15000,9 @@ if st.session_state.get("logged_in"):
                             stage = str(flow.get("stage", "") or "").strip()
                             expected_tickers = str(flow.get("expected_tickers", "") or "").strip()
                             if stage or expected_tickers:
-                                expanding_lines.append(f"- ➔ **{stage if stage else 'N/A'}**: `{expected_tickers if expected_tickers else 'N/A'}`")
+                                _xq = _fmt_quant_inline(expected_tickers, _qmap, "expand")
+                                _xq_s = f" — 📊 {_xq}" if _xq else ""
+                                expanding_lines.append(f"- ➔ **{stage if stage else 'N/A'}**: `{expected_tickers if expected_tickers else 'N/A'}`{_xq_s}")
                         expanding_to_display = "\n".join(expanding_lines) if expanding_lines else "- ➔ **N/A**: `N/A`"
                     else:
                         fallback_text = str(expanding_to_data or "N/A").strip()
@@ -14952,9 +15020,15 @@ if st.session_state.get("logged_in"):
                         mom_emoji = "📊"
 
                     with st.expander(f"Theme {idx}: {title} {mom_emoji}", expanded=(idx == 1)):
-                        st.markdown(f"**🎯 Winners (정량+정성 확인):** `{winners_str}`")
+                        st.markdown(f"**🎯 Winners:** `{winners_str}`")
+                        _wq = _fmt_quant_inline(winners_str, _qmap, "winner")
+                        if _wq:
+                            st.caption(f"📊 정량: {_wq}")
                         if emerging_tickers:
                             st.markdown(f"**🌱 Emerging (추적 필요):** `{emerging_tickers}`")
+                            _eq = _fmt_quant_inline(emerging_tickers, _qmap, "emerging")
+                            if _eq:
+                                st.caption(f"📊 정량: {_eq}")
                         if momentum_note:
                             st.caption(f"📈 모멘텀: {momentum_note}")
                         st.markdown(
