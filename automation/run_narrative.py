@@ -28,6 +28,10 @@ from google import genai
 from google.genai import types as genai_types
 from fredapi import Fred
 
+# ── repo root 를 sys.path 에 추가 → narrative_core(app.py와 동일 SSOT 모듈) import ──
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import narrative_core
+
 # ── 환경변수 로드 ──────────────────────────────────────────────────────────────
 GOOGLE_API_KEY   = os.environ["GOOGLE_API_KEY"]
 FRED_API_KEY     = os.environ["FRED_API_KEY"]
@@ -601,7 +605,8 @@ def run_emerging_tracking(analysis: dict) -> None:
 
 
 # ── HTML 이메일 생성 ───────────────────────────────────────────────────────────
-def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], is_market_day: bool) -> str:
+def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], is_market_day: bool,
+                     gate_report: dict = None) -> str:
     now_et  = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
     now_kst = datetime.now(_KST).strftime("%Y-%m-%d %H:%M KST")
     regime  = analysis.get("regime", {})
@@ -646,6 +651,23 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
         '<span style="background:#6b7280;color:#fff;border-radius:4px;padding:2px 8px;font-size:12px;">🔒 장 닫힌 날</span>'
     )
 
+    # 티커 실거래 검증 게이트 배너
+    gate_html = ""
+    gr = gate_report or {}
+    if gr.get("verified_ok") and gr.get("removed"):
+        removed_txt = ", ".join(gr["removed"])
+        gate_html = f"""
+        <div style="background:#7f1d1d;border-radius:8px;padding:12px 16px;margin-bottom:16px;border:1px solid #ef4444;">
+          <div style="font-weight:700;color:#fecaca;">🛑 무효 티커 {len(gr['removed'])}개 자동 제거됨 (상장폐지·비상장·오타)</div>
+          <div style="color:#fca5a5;font-size:13px;margin-top:6px;font-family:monospace;">{removed_txt}</div>
+          <div style="color:#f87171;font-size:12px;margin-top:6px;">실거래 검증 {gr.get('checked', 0)}개 중 · 아래 종목은 검증 통과분만 표시됩니다.</div>
+        </div>"""
+    elif gr and not gr.get("verified_ok"):
+        gate_html = """
+        <div style="background:#422006;border-radius:8px;padding:10px 16px;margin-bottom:16px;border:1px solid #a16207;">
+          <div style="color:#fde68a;font-size:12px;">⚠️ 이번 리포트는 티커 실거래 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애).</div>
+        </div>"""
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:20px;">
@@ -658,6 +680,8 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
     <div style="margin-top:8px;font-size:13px;color:#64748b;">{now_et} &nbsp;|&nbsp; {now_kst} &nbsp;|&nbsp; {market_badge}</div>
     <div style="font-size:12px;color:#64748b;margin-top:4px;">뉴스 {news_count}건 수집 · Gemini 2.5 Flash 분석</div>
   </div>
+
+  {gate_html}
 
   <!-- 레짐 -->
   <div style="background:#1e293b;border-radius:10px;padding:16px;margin-bottom:16px;display:flex;gap:12px;flex-wrap:wrap;">
@@ -768,6 +792,12 @@ def main():
     if not analysis:
         print("[ERROR] 내러티브 생성 실패. 종료.")
         sys.exit(1)
+
+    # ── 티커 실거래 검증 게이트 (app.py와 동일 SSOT) ──
+    # 무효(상장폐지·비상장·오타) 티커를 Sheet 저장·이메일 전에 제거.
+    analysis, _gate_report = narrative_core.sanitize_narrative_tickers(analysis, FMP_API_KEY)
+    print("[INFO]", narrative_core.format_ticker_gate_note(_gate_report))
+
     print(f"[INFO] 내러티브 생성 완료. 테마 수: {len(analysis.get('themes', []))}")
 
     # Sheets 저장
@@ -787,7 +817,7 @@ def main():
     fred_tag = " ⚠️FRED발표" if fred_releases else ""
     subject = f"📰 [{session_label}] 시장 내러티브 리포트 {now_et.strftime('%m/%d')}{fred_tag}"
 
-    html_body = build_email_html(analysis, raw_count, fred_releases, market_day)
+    html_body = build_email_html(analysis, raw_count, fred_releases, market_day, gate_report=_gate_report)
     send_email(subject, html_body)
 
     print(f"[DONE] 완료: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
