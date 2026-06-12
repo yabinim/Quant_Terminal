@@ -12911,6 +12911,13 @@ def generate_market_narrative(news_text, target_language, quant_data: dict = Non
                 st.error("❌ Gemini 응답 파싱에 실패했습니다.")
                 st.error(f"🤖 Gemini 실제 답변 원문:\n\n{raw_text}")
             result_data = {}
+
+        # ── 티커 실거래 검증 게이트 (SSOT, narrative_core) ──────────────────
+        # LLM이 만든 무효(상장폐지·비상장·오타) 티커를 실투자 필드에서 제거하고,
+        # 제거 리포트를 세션에 저장(렌더 시 배너 표시). FMP 장애 시 fail-open.
+        result_data, _gate_report = narrative_core.sanitize_narrative_tickers(
+            result_data, _fmp_key())
+        st.session_state["narrative_ticker_gate"] = _gate_report
         return result_data
     except Exception as e:
         st.error("❌ JSON 파싱 에러가 발생했습니다.")
@@ -14882,6 +14889,17 @@ if st.session_state.get("logged_in"):
 
             if not narrative_data:
                 st.warning("아직 AI 분석 결과가 없습니다. 상단 버튼을 눌러 실시간 내러티브를 생성하세요.")
+
+            # ── 티커 실거래 검증 게이트 결과 배너 ────────────────────────────
+            _gate = st.session_state.get("narrative_ticker_gate") or {}
+            if _gate.get("verified_ok") and _gate.get("removed"):
+                st.warning(
+                    f"🛑 **무효 티커 {len(_gate['removed'])}개 자동 제거됨** "
+                    f"(상장폐지·비상장·오타): `{', '.join(_gate['removed'])}`  \n"
+                    f"실거래 검증 {_gate.get('checked', 0)}개 중. 아래 종목 리스트는 검증 통과분만 표시됩니다."
+                )
+            elif _gate and not _gate.get("verified_ok"):
+                st.caption("⚠️ 이번 분석은 티커 실거래 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애).")
 
             st.markdown("### 🧭 Market Regime Indicator")
             regime_col_1, regime_col_2, regime_col_3 = st.columns(3)

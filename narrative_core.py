@@ -355,3 +355,171 @@ def parse_narrative_json(raw_text):
         return json.loads(c.strip())
     except Exception:
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 티커 검증 게이트 (SSOT) — LLM 출력 종목의 "존재·거래가능성"을 하드 검증한다.
+# app.py(parse_narrative_json 직후)·자동화(run_narrative.generate 직후)가 함께 호출.
+# Streamlit 비의존(requests만 사용) → 자동화에서도 동일하게 동작.
+#
+# 설계:
+#  - 제거 + 리포트: 무효(상장폐지/비상장/오타) 티커는 실투자 필드에서 제거하되,
+#    제거 목록을 report로 반환해 화면·이메일에 투명 표기.
+#  - fail-open: FMP 키 없음/배치콜 0건(API 장애)이면 아무것도 제거하지 않고
+#    verified_ok=False 만 반환(일시 장애로 내러티브 전체가 비는 것 방지).
+#  - 검증 대상 필드: winners, emerging, top_quant_picks(문자열),
+#    각 theme.expanding_to[].expected_tickers(문자열).
+#  - summary(자유서술)의 이름-티커 오매칭은 v1 범위 밖(별도 퍼지 검증 영역).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 티커 후보 토큰: 점/하이픈 포함 클래스주(BRK.B)와 LLM이 만들어낸 변종 가짜
+# 티커(예: P-SPAC)까지 폭넓게 포착한다. 시작은 영문자, 허용 문자는 [A-Z0-9.-],
+# 길이 1~12, 공백·한글·문장은 제외. 일반 약어/가짜 오탐은 FMP 실거래 조회로
+# 자연 필터(존재하지 않으면 제거)되므로 추출은 관대하게, 검증은 엄격하게.
+_TICKER_TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,11}$")
+
+
+def _split_ticker_field(value) -> list:
+    """winners/emerging/expected_tickers 같은 쉼표구분 문자열 → 티커 후보 리스트(순서/원형 보존)."""
+    out = []
+    for raw in str(value or "").replace("、", ",").replace("，", ",").split(","):
+        tok = raw.strip().strip("·•*`()[]{} ").upper()
+        if tok and _TICKER_TOKEN_RE.match(tok):
+            out.append(tok)
+    return out
+
+
+def _fmp_validate_symbols(symbols, fmp_key: str, timeout: int = 8) -> set:
+    """FMP batch-quote-short 로 '현재 시세가 나오는'(=실재·거래가능) 심볼 집합 반환.
+    응답에 없는 심볼 = 상장폐지/비상장/오타. 키 없음·전건 실패 시 빈 set(검증 불가)."""
+    syms = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
+    if not fmp_key or not syms:
+        return set()
+    valid = set()
+    got_any = False
+    # URL 길이 안전을 위해 40개씩 청크
+    for i in range(0, len(syms), 40):
+        chunk = syms[i:i + 40]
+        try:
+            r = requests.get(
+                f"{_FMP_BASE}/batch-quote-short",
+                params={"symbols": ",".join(chunk), "apikey": fmp_key},
+                timeout=timeout,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+            got_any = True
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                sym = str(row.get("symbol", "")).upper().strip()
+                price = row.get("price")
+                # 시세 행이 존재하고 price가 유효(양수)면 거래 가능으로 판정
+                try:
+                    ok_price = price is not None and float(price) > 0
+                except (TypeError, ValueError):
+                    ok_price = False
+                if sym and ok_price:
+                    valid.add(sym)
+        except Exception:
+            continue
+    # 한 청크라도 정상 응답(200+list)이 있었으면 검증 성립. 전부 실패면 검증 불가.
+    return valid if got_any else set()
+
+
+def sanitize_narrative_tickers(analysis, fmp_key: str = "") -> tuple:
+    """내러티브 dict의 실투자 티커 필드에서 무효(비거래) 티커 제거 + 리포트 반환.
+    Returns: (analysis, report)
+      report = {
+        "verified_ok": bool,        # FMP 검증이 실제로 수행됐는지
+        "checked": int,             # 검증한 고유 티커 수
+        "removed": [str, ...],      # 제거된 무효 티커(중복 제거, 정렬)
+        "removed_detail": {ticker: [위치라벨, ...]},  # 어디서 제거됐는지
+      }
+    fail-open: verified_ok=False면 원본을 그대로 반환(아무것도 제거 안 함)."""
+    report = {"verified_ok": False, "checked": 0, "removed": [], "removed_detail": {}}
+    if not isinstance(analysis, dict) or not analysis:
+        return analysis, report
+
+    themes = analysis.get("themes")
+    themes = themes if isinstance(themes, list) else []
+
+    # 1) 전체 티커 수집(1회 배치 검증용)
+    candidates = set()
+    for fld in ("top_quant_picks",):
+        candidates.update(_split_ticker_field(analysis.get(fld, "")))
+    for theme in themes:
+        if not isinstance(theme, dict):
+            continue
+        candidates.update(_split_ticker_field(theme.get("winners", "")))
+        candidates.update(_split_ticker_field(theme.get("emerging", "")))
+        flows = theme.get("expanding_to")
+        if isinstance(flows, list):
+            for flow in flows:
+                if isinstance(flow, dict):
+                    candidates.update(_split_ticker_field(flow.get("expected_tickers", "")))
+
+    if not candidates:
+        return analysis, report
+
+    valid = _fmp_validate_symbols(candidates, fmp_key)
+    if not valid:
+        # 검증 불가(키 없음/API 장애) → fail-open: 원본 유지
+        return analysis, report
+
+    report["verified_ok"] = True
+    report["checked"] = len(candidates)
+    removed_detail = {}
+
+    def _clean_field(value, where_label):
+        """문자열 필드에서 무효 티커만 제거하고, 유효 티커는 순서대로 재조합."""
+        toks = _split_ticker_field(value)
+        if not toks:
+            return value  # 티커 형태가 아니면 원본 보존(예: 빈 값/설명문)
+        kept = []
+        for t in toks:
+            if t in valid:
+                kept.append(t)
+            else:
+                removed_detail.setdefault(t, []).append(where_label)
+        return ", ".join(kept)
+
+    # 2) 필드별 정제
+    if analysis.get("top_quant_picks"):
+        analysis["top_quant_picks"] = _clean_field(analysis.get("top_quant_picks", ""), "top_quant_picks")
+
+    for ti, theme in enumerate(themes):
+        if not isinstance(theme, dict):
+            continue
+        tlabel = str(theme.get("title", "") or f"theme[{ti}]")[:40]
+        if theme.get("winners"):
+            theme["winners"] = _clean_field(theme.get("winners", ""), f"{tlabel}/winners")
+        if theme.get("emerging"):
+            theme["emerging"] = _clean_field(theme.get("emerging", ""), f"{tlabel}/emerging")
+        flows = theme.get("expanding_to")
+        if isinstance(flows, list):
+            for flow in flows:
+                if isinstance(flow, dict) and flow.get("expected_tickers"):
+                    stage = str(flow.get("stage", "") or "expanding")[:30]
+                    flow["expected_tickers"] = _clean_field(
+                        flow.get("expected_tickers", ""), f"{tlabel}/{stage}")
+
+    report["removed"] = sorted(removed_detail.keys())
+    report["removed_detail"] = removed_detail
+    return analysis, report
+
+
+def format_ticker_gate_note(report) -> str:
+    """리포트 → 사람이 읽는 한 줄 요약(화면/이메일/로그 공용)."""
+    if not isinstance(report, dict):
+        return ""
+    if not report.get("verified_ok"):
+        return "⚠️ 티커 실거래 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애)."
+    removed = report.get("removed") or []
+    if not removed:
+        return f"✅ 티커 실거래 검증 완료 — {report.get('checked', 0)}개 모두 유효."
+    return (f"🛑 무효(상장폐지·비상장·오타) 티커 {len(removed)}개 제거: "
+            f"{', '.join(removed)} (검증 {report.get('checked', 0)}개 중)")
