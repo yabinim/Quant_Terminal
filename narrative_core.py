@@ -281,7 +281,7 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
 뉴스 소스 유형별 활용 지침 (매우 중요):
 - [SECTION A] Press Releases: 기업이 직접 발표한 공식 공시입니다.
   해당 섹션의 "Tickers:" 필드에 태그된 종목은 실적·M&A·가이던스 등 고임팩트 이벤트가 확인된 종목이므로,
-  정량 데이터와 방향이 일치하면 반드시 winners의 최우선 후보로 선정하세요.
+  이런 이벤트가 가격 상승으로 확인되는 종목을 winners의 최우선 후보로 선정하세요.
 - [SECTION B] Stock News: 각 기사의 "Tickers:" 필드는 해당 뉴스와 직접 연관된 종목입니다.
   동일 티커가 여러 기사에 반복 등장할수록 모멘텀이 강한 종목으로 간주하세요.
 - [SECTION C] FMP Articles: 테마의 구조적 맥락과 expanding_to 단계 설정에 활용하세요.
@@ -333,7 +333,7 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
   ],
   "rotation": "과열 섹터 -> 수혜 섹터 플로우 요약 (예: Tech -> Industrials)",
   "top_quant_picks": "내러티브상 확신도가 가장 높은 개별 종목 3~5개 (ETF 금지, 쉼표 구분)",
-  "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약 (뉴스+모멘텀 종합, 기관 vs 개인 뷰 차이 포함)"
+  "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약. 반드시 뉴스에 등장한 구체적 기업명·사건(실적·계약·IPO·제품 출시 등)을 2~3개 직접 근거로 인용할 것. 테마 제목만 재진술하는 일반론은 금지. 기관 vs 개인 투자자 뷰 차이 포함."
 }}
 You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings.
 """
