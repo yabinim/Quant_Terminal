@@ -14913,10 +14913,11 @@ if st.session_state.get("logged_in"):
             # ── Top Quant Picks 배너 ─────────────────────────────────────────
             if top_quant_picks:
                 st.divider()
-                st.markdown("### 🏆 Top Quant Picks (정량+정성 동시 확인)")
-                st.success(
-                    f"**정량 모멘텀 + 뉴스 내러티브가 동시에 확인된 최우선 종목:** `{top_quant_picks}`  "
-                    "RS Score 양수 + 200일선 위 + 내러티브 테마 일치 종목입니다."
+                st.markdown("### 🏆 Top Quant Picks (뉴스 내러티브 후보)")
+                st.info(
+                    f"**뉴스 내러티브상 확신도가 가장 높은 후보 종목 (실거래 검증 완료):** `{top_quant_picks}`  \n"
+                    "⚠️ 이 단계는 **뉴스 기반 후보**입니다. RS Score·200일선 등 정량 모멘텀 확인은 "
+                    "**[2단계] 스캐너**, 밸류에이션은 **[3단계] 개별 종목 정밀 검사**에서 수행하세요."
                 )
 
             st.divider()
