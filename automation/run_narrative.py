@@ -271,7 +271,7 @@ def generate_market_narrative(news_text: str, fred_alert: str = "") -> dict:
   ],
   "rotation": "과열 섹터 -> 수혜 섹터 플로우 요약",
   "top_quant_picks": "내러티브와 일치하는 최우선 종목 3~5개 (쉼표 구분)",
-  "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약"
+  "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약. 반드시 뉴스에 등장한 구체적 기업명·사건(실적·계약·IPO·제품 등)을 2~3개 직접 근거로 인용할 것. 테마 제목만 재진술하는 일반론 금지."
 }}
 You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings."""
 
