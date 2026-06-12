@@ -268,13 +268,15 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
 
     prompt = f"""
 당신은 월가 수석 퀀트 전략가입니다.
-아래 뉴스와 정량 스크리닝 데이터를 종합 분석하여 지정된 JSON 스키마 그대로만 응답하세요.
+아래 뉴스를 종합 분석하여 지정된 JSON 스키마 그대로만 응답하세요.
 
 핵심 원칙:
 - 뉴스(정성) + 가격 모멘텀(정량)이 동시에 확인된 종목만 Winners로 선정
-- 정량 데이터에서 RS Score 양수 + 200일선 위 종목을 우선 포함
 - 뉴스만 좋고 가격이 안 받쳐주는 종목은 emerging으로만 분류
 - 각 theme의 winners는 반드시 3~6개 티커
+- **winners / emerging / top_quant_picks / expanding_to의 expected_tickers는 모두 개별 종목(individual stocks)만 사용**.
+  ETF·레버리지 ETF(예: TQQQ, UPRO, SOXL)·섹터 ETF(예: XLK, SMH, SOXX)·국가 ETF(예: EWY, EWT)·인덱스 ETF는 **절대 포함 금지**.
+  (이 단계는 개별주 발굴이 목적이며, ETF/섹터 흐름은 별도 단계에서 다룬다.)
 
 뉴스 소스 유형별 활용 지침 (매우 중요):
 - [SECTION A] Press Releases: 기업이 직접 발표한 공식 공시입니다.
@@ -301,8 +303,8 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
    - 이미 크게 오른 유명 대형주보다, 아직 시장이 주목하지 않은 후발 수혜주를 우선하라.
 8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력 (설명 금지, 큰따옴표 사용 금지)
 9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
-10) winners/emerging 선정 근거: 뉴스의 Tickers 태그 + 반복 등장 횟수 + 정량 RS Score를 종합해 판단하세요.
-    근거 없이 유명 대형주를 임의로 채워 넣는 것을 금지합니다.
+10) winners/emerging 선정 근거: 뉴스의 Tickers 태그 + 반복 등장 횟수 + 뉴스에 드러난 가격 모멘텀을 종합해 판단하세요.
+    근거 없이 유명 대형주를 임의로 채워 넣는 것을 금지합니다. (가격 정량 검증은 다음 단계 스캐너가 수행)
 {quant_section}
 {fred_section}
 [뉴스 데이터 — 소스 유형별 섹션 구분]
@@ -319,8 +321,8 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
     {{
       "title": "테마명 (예: AI Capex Expansion)",
       "driver": "무엇이 이 테마를 촉발했는가? Press Release·Stock News 기반 구체적 근거 포함",
-      "winners": "정량+정성 모두 확인된 수혜주 (예: NVDA, MSFT, SOXX)",
-      "emerging": "뉴스 Tickers 태그는 있으나 정량 가격 확인 필요 종목 (예: ARM, MRVL)",
+      "winners": "정성+정량 모두 확인된 개별 수혜주 (예: NVDA, MSFT, AVGO)",
+      "emerging": "뉴스 Tickers 태그는 있으나 가격 확인 필요한 개별주 (예: ARM, MRVL)",
       "momentum_note": "강함/보통/약함 중 하나만 선택 (예: 강함)",
       "expanding_to": [
         {{"stage": "기업용 AI 솔루션 (2차)", "expected_tickers": "CRM, NOW, WDAY", "linkage": "AI 인프라 구축 → 기업 워크플로우 AI 적용 수요 연쇄"}},
@@ -330,7 +332,7 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
     }}
   ],
   "rotation": "과열 섹터 -> 수혜 섹터 플로우 요약 (예: Tech -> Industrials)",
-  "top_quant_picks": "정량 스크리닝 상위 종목 중 내러티브와 일치하는 최우선 종목 3~5개 (쉼표 구분)",
+  "top_quant_picks": "내러티브상 확신도가 가장 높은 개별 종목 3~5개 (ETF 금지, 쉼표 구분)",
   "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약 (뉴스+모멘텀 종합, 기관 vs 개인 뷰 차이 포함)"
 }}
 You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings.

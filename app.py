@@ -14748,16 +14748,9 @@ if st.session_state.get("logged_in"):
                         st.write(f"✔️ 중복 제거/랭킹 완료: Top {len(top_news)}개 핵심 뉴스 선별 (티커 태그 포함)")
                         st.session_state["latest_top_news"] = top_news
     
-                        st.write("📊 3단계: ETF Universe 정량 스크리닝 (RS·모멘텀·거래량 분석) 중...")
-                        quant_result = compute_quantitative_sector_leaders(top_n=30)
-                        if quant_result.get("leaders"):
-                            st.write(f"✔️ 정량 스크리닝 완료: RS 상위 {len(quant_result['leaders'])}개 종목 선별 | 강세 섹터: {', '.join(quant_result.get('top_sectors', []))}")
-                        else:
-                            st.write("⚠️ 정량 스크리닝 데이터 없음 — 뉴스 분석만으로 진행")
-
-                        st.write("🧠 4단계: 뉴스(티커 태그 포함) + 정량 데이터를 Gemini 2.5 Flash 엔진으로 전송하여 내러티브 분석 중...")
-                        narrative_data = generate_market_narrative(news_text, selected_language, quant_data=quant_result)
-                        st.write("🔍 5단계: AI 응답 수신 완료. JSON 데이터 파싱 및 필터링 중...")
+                        st.write("🧠 3단계: 뉴스(티커 태그 포함)를 Gemini 2.5 Flash 엔진으로 전송하여 개별주 내러티브 분석 중...")
+                        narrative_data = generate_market_narrative(news_text, selected_language, quant_data=None)
+                        st.write("🔍 4단계: AI 응답 수신 완료. JSON 데이터 파싱 및 필터링 중...")
     
                         if narrative_data:
                             st.session_state["narrative_history"].append(narrative_data)
