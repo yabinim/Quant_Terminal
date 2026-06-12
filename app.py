@@ -2869,17 +2869,24 @@ def _classify_narrative_etfs(tickers_tuple: tuple) -> set:
     return etf
 
 
-def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "", systemic_failed: bool = False) -> str:
+def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "", status_map=None) -> str:
     """티커 CSV → 종목별 정량 한 줄 요약(캡션용).
     tier='winner'면 정량 불일치(200일선 아래/RS 음수) 시 ⚠️ 플래그(제거 아님).
-    지표 없는 티커: systemic_failed면 '검증실패(재시도)', 아니면 '신규'로 정직하게 구분."""
+    무지표 티커는 status_map으로 정직하게 구분: new=🆕신규 / unchecked=🔁검증보류."""
+    status_map = status_map or {}
     parts = []
     for t in [x.strip().upper() for x in str(tickers_csv or "").split(",") if x.strip()]:
         if not t or t == "N/A":
             continue
         q = (quant_map or {}).get(t)
         if not q:
-            parts.append(f"{t} 🔁검증실패" if systemic_failed else f"{t} ⏳정량부족(신규)")
+            stt = status_map.get(t)
+            if stt == "new":
+                parts.append(f"{t} 🆕신규(데이터 축적 전)")
+            elif stt == "unchecked":
+                parts.append(f"{t} 🔁검증보류(재시도)")
+            else:
+                parts.append(f"{t} ⏳정량부족")
             continue
         rs = q.get("rs_score")
         above = q.get("above_ma200")
@@ -15073,7 +15080,7 @@ if st.session_state.get("logged_in"):
                 for idx, theme in enumerate(themes_data, start=1):
                     theme = theme if isinstance(theme, dict) else {}
                     _qmap = narrative_data.get("_quant", {}) if isinstance(narrative_data, dict) else {}
-                    _qfail = bool((st.session_state.get("narrative_ticker_gate") or {}).get("quant_failed"))
+                    _qstatus = narrative_data.get("_quant_status", {}) if isinstance(narrative_data, dict) else {}
                     title = theme.get("title", f"Theme {idx}")
                     expanding_to_data = theme.get("expanding_to", [])
                     if isinstance(expanding_to_data, list):
@@ -15083,7 +15090,7 @@ if st.session_state.get("logged_in"):
                             stage = str(flow.get("stage", "") or "").strip()
                             expected_tickers = str(flow.get("expected_tickers", "") or "").strip()
                             if stage or expected_tickers:
-                                _xq = _fmt_quant_inline(expected_tickers, _qmap, "expand", _qfail)
+                                _xq = _fmt_quant_inline(expected_tickers, _qmap, "expand", _qstatus)
                                 _xq_s = f" — 📊 {_xq}" if _xq else ""
                                 expanding_lines.append(f"- ➔ **{stage if stage else 'N/A'}**: `{expected_tickers if expected_tickers else 'N/A'}`{_xq_s}")
                         expanding_to_display = "\n".join(expanding_lines) if expanding_lines else "- ➔ **N/A**: `N/A`"
@@ -15104,12 +15111,12 @@ if st.session_state.get("logged_in"):
 
                     with st.expander(f"Theme {idx}: {title} {mom_emoji}", expanded=(idx == 1)):
                         st.markdown(f"**🎯 Winners:** `{winners_str}`")
-                        _wq = _fmt_quant_inline(winners_str, _qmap, "winner", _qfail)
+                        _wq = _fmt_quant_inline(winners_str, _qmap, "winner", _qstatus)
                         if _wq:
                             st.caption(f"📊 정량: {_wq}")
                         if emerging_tickers:
                             st.markdown(f"**🌱 Emerging (추적 필요):** `{emerging_tickers}`")
-                            _eq = _fmt_quant_inline(emerging_tickers, _qmap, "emerging", _qfail)
+                            _eq = _fmt_quant_inline(emerging_tickers, _qmap, "emerging", _qstatus)
                             if _eq:
                                 st.caption(f"📊 정량: {_eq}")
                         if momentum_note:

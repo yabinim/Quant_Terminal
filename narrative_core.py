@@ -562,33 +562,55 @@ def _collect_output_tickers(analysis) -> list:
     return out
 
 
+def _fmp_validate_symbols_ex(symbols, fmp_key: str, timeout: int = 8):
+    """batch-quote-short 존재검증 — (유효심볼 set, 검사성공 bool) 반환.
+    검사성공=True면 '없는 심볼=fake' 확정 가능; False면 검사 자체 실패(판단 보류)."""
+    syms = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
+    if not fmp_key or not syms:
+        return set(), False
+    valid, got_any = set(), False
+    for i in range(0, len(syms), 40):
+        chunk = syms[i:i + 40]
+        try:
+            r = requests.get(f"{_FMP_BASE}/batch-quote-short",
+                             params={"symbols": ",".join(chunk), "apikey": fmp_key}, timeout=timeout)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+            got_any = True
+            for row in data:
+                if isinstance(row, dict) and row.get("symbol"):
+                    try:
+                        if row.get("price") is not None and float(row["price"]) > 0:
+                            valid.add(str(row["symbol"]).upper().strip())
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            continue
+    return valid, got_any
+
+
 def verify_narrative_with_quant(analysis, verify_fn, fmp_key: str = "", etf_symbols=None) -> tuple:
-    """추천 티커 전체를 검증: 실거래 존재로 fake 제거, 정량 지표 부착, ETF 제거.
-    제거 기준은 '실거래 quote 존재'(_fmp_validate_symbols) — 신규 상장주(히스토리 부족)는
-    quote가 있으면 보존하고 '정량 부족'으로만 표기(잘못된 fake 삭제 방지).
-    정량 지표(RS·200일선·verdict)는 verify_fn 결과로 부착(없으면 no_quant 플래그).
-    Args:
-      verify_fn  : list[str]->list[dict] (호출자의 verify_emerging_with_quant 주입; 공식 단일화)
-      fmp_key    : 실거래 존재 검증용(batch-quote-short)
-      etf_symbols: ETF로 판별된 티커 집합(제거 대상)
-    Returns: (analysis, report). fail-open: 존재 검증 불가 시 원본 그대로.
-      analysis["_quant"] = {ticker: metrics}
-      report = {verified_ok, checked, removed_fake[], removed_etf[], kept[], no_quant[], metrics{}}"""
+    """추천 티커 검증 — 정량(historical)을 1차 주력으로 실행하고, 존재검증은 비차단 보조.
+    - 1차 PRIMARY: verify_fn(robust historical)로 RS·200일선·verdict 확보 = ✅검증됨.
+    - 2차 SECONDARY(비차단): 미검증분만 quote 존재검증 → quote있음=🆕신규(유지),
+      quote없음(검사성공시)=⛔fake 제거, 검사실패=🔁보류(유지, 제거 안 함).
+    - 어떤 단계가 실패해도 정량 결과는 그대로 살림(차단 게이트 제거). ETF는 항상 제거.
+    Returns: (analysis, report). analysis["_quant"]=지표, analysis["_quant_status"]=무지표 사유."""
     report = {"verified_ok": False, "checked": 0, "removed_fake": [], "removed_etf": [],
-              "kept": [], "no_quant": [], "quant_failed": False, "metrics": {}}
+              "kept": [], "no_quant": [], "new_ipo": [], "unchecked": [],
+              "quant_failed": False, "metrics": {}}
     if not isinstance(analysis, dict) or not analysis:
         return analysis, report
 
     candidates = _collect_output_tickers(analysis)
     if not candidates:
         return analysis, report
+    cand_set = set(candidates)
 
-    # 1) 실거래 존재 검증(신규 상장주도 quote가 있으면 통과) — 제거의 기준
-    valid_exist = _fmp_validate_symbols(candidates, fmp_key)
-    if not valid_exist:
-        return analysis, report  # 검증 불가 → fail-open(원본 유지)
-
-    # 2) 정량 지표(있으면 부착; 신규 상장 등 히스토리 부족분은 metrics에 없을 수 있음)
+    # 1) PRIMARY: robust 정량 페치 (존재+지표 동시 확인)
     try:
         results = verify_fn(candidates) or []
     except Exception:
@@ -597,20 +619,32 @@ def verify_narrative_with_quant(analysis, verify_fn, fmp_key: str = "", etf_symb
     for row in results:
         if isinstance(row, dict) and row.get("ticker"):
             metrics[str(row["ticker"]).upper().strip()] = row
+    verified = set(metrics.keys())
 
+    # 2) SECONDARY(비차단): 미검증분만 quote 존재검증으로 fake/신규 구분
     etf_set = {str(t).upper().strip() for t in (etf_symbols or set())}
-    cand_set = set(candidates)
-    removed_fake = sorted(cand_set - valid_exist)       # 실거래 quote 없음 = fake/상폐
-    removed_etf = sorted(valid_exist & etf_set)         # 실재하나 ETF(개별주 단계 규칙 위반)
-    keep = valid_exist - etf_set
-    no_quant = sorted(keep - set(metrics.keys()))       # 실재하나 정량 부족(신규 상장 등)
-    # 전건 정량 실패(systemic): keep는 있는데 지표가 0개 → 신규 둔갑 금지, '검증 실패'로 분류.
-    quant_failed = bool(keep) and (len(metrics) == 0)
+    unverified = [t for t in candidates if t not in verified and t not in etf_set]
+    exist_ok, exist_checked = (_fmp_validate_symbols_ex(unverified, fmp_key)
+                               if unverified else (set(), True))
+
+    removed_fake, new_ipo, unchecked = [], [], []
+    for t in unverified:
+        if t in exist_ok:
+            new_ipo.append(t)         # 🆕 quote 있음·히스토리 부족 = 신규
+        elif exist_checked:
+            removed_fake.append(t)    # ⛔ quote 없음(검사 성공) = fake/상폐
+        else:
+            unchecked.append(t)       # 🔁 존재검사 실패 = 판단 보류(제거 안 함)
+
+    removed_etf = sorted(cand_set & etf_set)
+    keep = (verified | set(new_ipo) | set(unchecked)) - etf_set
+    quant_failed = (len(verified) == 0 and len(cand_set) > 0)
 
     report.update({
         "verified_ok": True, "checked": len(cand_set),
-        "removed_fake": removed_fake, "removed_etf": removed_etf,
-        "kept": sorted(keep), "no_quant": ([] if quant_failed else no_quant),
+        "removed_fake": sorted(removed_fake), "removed_etf": removed_etf,
+        "kept": sorted(keep), "no_quant": sorted(set(new_ipo) | set(unchecked)),
+        "new_ipo": sorted(new_ipo), "unchecked": sorted(unchecked),
         "quant_failed": quant_failed,
         "metrics": {k: metrics[k] for k in keep if k in metrics},
     })
@@ -635,6 +669,9 @@ def verify_narrative_with_quant(analysis, verify_fn, fmp_key: str = "", etf_symb
                 flow["expected_tickers"] = _clean(flow.get("expected_tickers", ""))
 
     analysis["_quant"] = report["metrics"]
+    status = {t: "new" for t in new_ipo}
+    status.update({t: "unchecked" for t in unchecked})
+    analysis["_quant_status"] = status
     return analysis, report
 
 
@@ -652,8 +689,10 @@ def format_quant_gate_note(report) -> str:
         parts.append(f"🛑 fake/데이터없음 {len(report['removed_fake'])}개 제거: {', '.join(report['removed_fake'])}")
     if report.get("removed_etf"):
         parts.append(f"📦 ETF {len(report['removed_etf'])}개 제거: {', '.join(report['removed_etf'])}")
-    if report.get("no_quant"):
-        parts.append(f"⚠️ 정량부족(신규상장 등) {len(report['no_quant'])}개: {', '.join(report['no_quant'])}")
+    if report.get("new_ipo"):
+        parts.append(f"🆕 신규(데이터 축적 전) {len(report['new_ipo'])}개: {', '.join(report['new_ipo'])}")
+    if report.get("unchecked"):
+        parts.append(f"🔁 검증보류 {len(report['unchecked'])}개: {', '.join(report['unchecked'])}")
     if not parts:
         return f"✅ 추천 티커 정량 검증 완료 — {report.get('checked', 0)}개 모두 유효."
     return f"정량 검증 {report.get('checked', 0)}개 중 · " + " · ".join(parts)
