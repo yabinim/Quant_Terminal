@@ -184,35 +184,71 @@ def send_email(subject: str, html_body: str) -> bool:
 _REGIME_KR = {"strong": "🟢 강세(대장주)", "sideways": "🟡 횡보", "weak": "🔴 약세"}
 
 
-def build_email_html(fired_by_user: dict, today: str) -> str:
-    total = sum(len(v) for v in fired_by_user.values())
+def _render_hit_card(h) -> str:
+    """단일 알림 카드 HTML (워치리스트·보유 공용)."""
+    an = h["an"]
+    reg = an.get("regime", {})
+    reg_label = _REGIME_KR.get(reg.get("regime"), "⚪")
+    score = reg.get("score")
+    band = reg.get("rsi_band", (None, None))
+    html = (
+        f"<div style='margin:10px 0;padding:12px;border:1px solid #e1e4e8;border-radius:8px'>"
+        f"<div style='font-size:17px;font-weight:700'>{h['ticker']} "
+        f"<span style='font-weight:400;color:#555;font-size:14px'>· {reg_label}"
+        + (f" (강도 {score:.0f}/100 · RSI밴드 {band[0]:.0f}~{band[1]:.0f})"
+           if score is not None and band[0] is not None else "")
+        + "</span></div>"
+    )
+    for ev in h["fired"]:
+        html += (
+            f"<div style='margin-top:6px'><b>{ev.get('label','')}</b> — "
+            f"{ev.get('message','')}</div>"
+        )
+    return html + "</div>"
+
+
+def build_email_html(wl_by_user: dict, pf_by_user: dict, today: str) -> str:
+    """매매 레이더 이메일 — 🔭 Watchlist(매수)와 💼 Portfolio(보유·매도) 섹션 분리,
+    Portfolio는 account별로 그룹핑."""
+    wl_by_user = wl_by_user or {}
+    pf_by_user = pf_by_user or {}
+    wl_total = sum(len(v) for v in wl_by_user.values())
+    pf_total = sum(len(v) for v in pf_by_user.values())
+    total = wl_total + pf_total
+
     parts = [
         "<div style='font-family:Apple SD Gothic Neo,Arial,sans-serif;max-width:680px;margin:0 auto'>",
-        f"<h2 style='color:#1f6feb'>🔔 Watchlist 알림 — {total}건</h2>",
+        f"<h2 style='color:#1f6feb'>🔔 매매 레이더 — {total}건</h2>",
         f"<p style='color:#666'>{today} (ET) 장 마감 후 평가 · 2일 연속 확정된 상태 전환만 발송</p>",
     ]
-    for uid, hits in fired_by_user.items():
-        parts.append(f"<h3 style='border-bottom:2px solid #eee;padding-bottom:6px'>👤 {uid}</h3>")
-        for h in hits:
-            an = h["an"]
-            reg = an.get("regime", {})
-            reg_label = _REGIME_KR.get(reg.get("regime"), "⚪")
-            score = reg.get("score")
-            band = reg.get("rsi_band", (None, None))
-            parts.append(
-                f"<div style='margin:10px 0;padding:12px;border:1px solid #e1e4e8;border-radius:8px'>"
-                f"<div style='font-size:17px;font-weight:700'>{h['ticker']} "
-                f"<span style='font-weight:400;color:#555;font-size:14px'>· {reg_label}"
-                + (f" (강도 {score:.0f}/100 · RSI밴드 {band[0]:.0f}~{band[1]:.0f})"
-                   if score is not None and band[0] is not None else "")
-                + "</span></div>"
-            )
-            for ev in h["fired"]:
-                parts.append(
-                    f"<div style='margin-top:6px'><b>{ev.get('label','')}</b> — "
-                    f"{ev.get('message','')}</div>"
-                )
-            parts.append("</div>")
+
+    # 🔭 Watchlist (매수 후보)
+    if wl_total:
+        parts.append(
+            "<h2 style='color:#1f6feb;border-bottom:2px solid #1f6feb;"
+            "padding-bottom:6px;margin-top:24px'>🔭 Watchlist (매수 후보)</h2>"
+        )
+        for uid, hits in wl_by_user.items():
+            parts.append(f"<h3 style='border-bottom:1px solid #eee;padding-bottom:6px'>👤 {uid}</h3>")
+            for h in hits:
+                parts.append(_render_hit_card(h))
+
+    # 💼 Portfolio (보유 · 매도/관리) — account별 그룹
+    if pf_total:
+        parts.append(
+            "<h2 style='color:#d29922;border-bottom:2px solid #d29922;"
+            "padding-bottom:6px;margin-top:24px'>💼 Portfolio (보유 · 매도/관리)</h2>"
+        )
+        for uid, hits in pf_by_user.items():
+            parts.append(f"<h3 style='border-bottom:1px solid #eee;padding-bottom:6px'>👤 {uid}</h3>")
+            by_acct = {}
+            for h in hits:
+                by_acct.setdefault(str(h.get("account") or "기타"), []).append(h)
+            for acct, ah in by_acct.items():
+                parts.append(f"<h4 style='margin:14px 0 4px;color:#444'>🏦 {acct}</h4>")
+                for h in ah:
+                    parts.append(_render_hit_card(h))
+
     parts.append(
         "<p style='color:#999;font-size:12px;margin-top:20px'>"
         "본 메일은 regime_core 엔진(앱과 동일)으로 자동 평가되었습니다. "
@@ -341,7 +377,7 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
             new_rows.append([key, states_csv, new_state, today]); n_eval += 1
             if fired:
                 fired_by_user.setdefault(uid, []).append(
-                    {"ticker": f"{tk} · {account}", "fired": fired, "an": an})
+                    {"ticker": tk, "account": account, "fired": fired, "an": an})
                 print(f"  [FIRE-PF] {uid}/{account}/{tk}: {[e['event'] for e in fired]}")
         except Exception as e:
             print(f"  [WARN] {uid}/{account}/{tk} 평가 실패: {e}")
@@ -454,7 +490,7 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
                       for e in _PF_INTRADAY_EVENTS if e in enabled and conds.get(e, (False, ""))[0]]
             if active:
                 hits_by_user.setdefault(uid, []).append(
-                    {"ticker": f"{tk} · {account}", "fired": active, "an": an})
+                    {"ticker": tk, "account": account, "fired": active, "an": an})
                 print(f"  [INTRADAY-PF] {uid}/{account}/{tk}: {[a['event'] for a in active]}")
         except Exception as e:
             print(f"  [WARN] {uid}/{account}/{tk} 장중 평가 실패: {e}")
@@ -488,29 +524,31 @@ def main():
 
     try:
         if args.mode == "intraday":
-            res = {}
+            wl_res, pf_res = {}, {}
             if do_wl:
-                res = _merge_fired(res, eval_watchlist_intraday(spy_close, hist_cache, quote_cache, today))
+                wl_res = eval_watchlist_intraday(spy_close, hist_cache, quote_cache, today)
             if do_pf:
-                res = _merge_fired(res, eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today))
-            if res:
-                total = sum(len(v) for v in res.values())
+                pf_res = eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today)
+            total = (sum(len(v) for v in wl_res.values())
+                     + sum(len(v) for v in pf_res.values()))
+            if total:
                 html = ("<p style='background:#fff8e1;padding:8px;border-radius:6px;color:#8a6d00'>"
                         "⏱️ <b>장중 잠정 신호</b> — 진행 중인 봉 기준이라 마감까지 바뀔 수 있습니다. "
-                        "분할 매수/청산 참고용.</p>") + build_email_html(res, today)
+                        "분할 매수/청산 참고용.</p>") + build_email_html(wl_res, pf_res, today)
                 send_email(f"⏱️ [장중] 후보 — {total}건 ({today} ET)", html)
             else:
                 print("[INFO] 장중 활성 후보 없음 — 이메일 생략.")
         else:
-            res = {}
+            wl_res, pf_res = {}, {}
             if do_wl:
-                res = _merge_fired(res, eval_watchlist_eod(spy_close, hist_cache, today))
+                wl_res = eval_watchlist_eod(spy_close, hist_cache, today)
             if do_pf:
-                res = _merge_fired(res, eval_portfolio_eod(spy_close, hist_cache, today))
-            if res:
-                total = sum(len(v) for v in res.values())
-                send_email(f"🔔 Watchlist·보유 알림 — {total}건 ({today} ET)",
-                           build_email_html(res, today))
+                pf_res = eval_portfolio_eod(spy_close, hist_cache, today)
+            total = (sum(len(v) for v in wl_res.values())
+                     + sum(len(v) for v in pf_res.values()))
+            if total:
+                send_email(f"🔔 매매 레이더 — {total}건 ({today} ET)",
+                           build_email_html(wl_res, pf_res, today))
             else:
                 print("[INFO] 발동된 알림 없음 — 이메일 생략.")
     except Exception as e:
