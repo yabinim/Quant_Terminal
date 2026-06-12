@@ -2762,7 +2762,8 @@ def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "")
     try:
         unique = list(dict.fromkeys(str(t).strip().upper() for t in emerging_tickers if str(t).strip()))
         all_tickers = list(dict.fromkeys(unique + ["SPY"]))
-        close_df = _fmp_batch_to_close_df(all_tickers, limit=130)
+        # 느려도 확실하게: 재시도·버스트억제·빈결과 캐시안함. limit 220 → MA200 실제 계산.
+        close_df = _fmp_robust_batch_close(all_tickers, limit=220)
         if close_df.empty:
             return []
 
@@ -2868,17 +2869,17 @@ def _classify_narrative_etfs(tickers_tuple: tuple) -> set:
     return etf
 
 
-def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "") -> str:
+def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "", systemic_failed: bool = False) -> str:
     """티커 CSV → 종목별 정량 한 줄 요약(캡션용).
     tier='winner'면 정량 불일치(200일선 아래/RS 음수) 시 ⚠️ 플래그(제거 아님).
-    제거된 fake/ETF는 이미 필드에서 빠졌으므로, 여기 남은 무지표 티커=신규 상장 등 '정량 부족'."""
+    지표 없는 티커: systemic_failed면 '검증실패(재시도)', 아니면 '신규'로 정직하게 구분."""
     parts = []
     for t in [x.strip().upper() for x in str(tickers_csv or "").split(",") if x.strip()]:
         if not t or t == "N/A":
             continue
         q = (quant_map or {}).get(t)
         if not q:
-            parts.append(f"{t} ⏳정량부족(신규)")
+            parts.append(f"{t} 🔁검증실패" if systemic_failed else f"{t} ⏳정량부족(신규)")
             continue
         rs = q.get("rs_score")
         above = q.get("above_ma200")
@@ -4404,6 +4405,80 @@ def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
     if not close_dict:
         return pd.DataFrame()
     return pd.DataFrame(close_dict).sort_index()
+
+
+def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float = 0.0,
+                             max_retries: int = 5, base_delay: float = 2.0) -> pd.DataFrame:
+    """historical-price-eod/full 1종목 — 일시 실패(429·5xx·타임아웃)에만 지수 백오프 재시도.
+    HTTP 200은 (빈 응답이라도) 확정 답으로 보고 즉시 반환(신규 상장주의 '데이터 없음'을 존중,
+    무의미한 재시도로 시간 낭비 방지). deadline_ts(epoch초) 도달 시 재시도 중단."""
+    k = _fmp_key()
+    if not k:
+        return pd.DataFrame()
+    url = f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={k}"
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.get(url, timeout=_FMP_TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                rows = data.get("historical", data) if isinstance(data, dict) else data
+                if not isinstance(rows, list) or not rows:
+                    return pd.DataFrame()  # 200·빈 = 진짜 데이터 없음(신규) → 재시도 안 함
+                df = pd.DataFrame(rows)
+                if "date" not in df.columns:
+                    return pd.DataFrame()
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.set_index("date").sort_index()
+                df = df.rename(columns={"close": "Close", "open": "Open", "high": "High",
+                                        "low": "Low", "volume": "Volume", "adjClose": "Adj Close"})
+                for col in ["Close", "Open", "High", "Low", "Volume"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                return df
+            # 비-200(429/5xx) → 일시 실패로 보고 재시도
+        except Exception:
+            pass  # 타임아웃/커넥션 → 재시도
+        if attempt >= max_retries or (deadline_ts and time.time() >= deadline_ts):
+            break
+        # 지수 백오프(상한 20s) + 약간의 지터
+        time.sleep(min(base_delay * (2 ** attempt), 20.0) + (0.1 * attempt))
+    return pd.DataFrame()  # 재시도 소진(일시 실패) — 호출자가 '검증 실패'로 처리
+
+
+def _fmp_robust_batch_close(tickers: list, limit: int = 220,
+                            time_budget_sec: int = 300, max_workers: int = 3,
+                            max_retries: int = 5) -> pd.DataFrame:
+    """다수 티커의 Close DataFrame을 '느려도 확실하게' 수집.
+    - 동시 요청 3개로 버스트 억제(레이트리밋 회피), 종목당 최대 5회 재시도.
+    - 전체 시간 예산(기본 5분) 내에서 동작; 빈/부분 결과를 캐시하지 않음(매 호출 신선).
+    - HTTP 200·빈 응답(신규 상장)은 컬럼 없이 통과 → 호출자가 '신규'로 분류."""
+    import concurrent.futures as _cf
+    syms = list(dict.fromkeys(str(t).upper().strip() for t in tickers if str(t).strip()))
+    if not syms:
+        return pd.DataFrame()
+    deadline = time.time() + max(30, time_budget_sec)
+    close_dict = {}
+
+    def _one(tk):
+        return tk, _fmp_price_history_robust(tk, limit=limit, deadline_ts=deadline,
+                                             max_retries=max_retries)
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_one, t): t for t in syms}
+            for fut in _cf.as_completed(futs):
+                try:
+                    tk, df = fut.result()
+                    if df is not None and not df.empty and "Close" in df.columns:
+                        close_dict[tk] = df["Close"]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if not close_dict:
+        return pd.DataFrame()
+    return pd.DataFrame(close_dict).sort_index()
+
 
 def _fmp_fill_parallel_warmup(tickers: list, max_workers: int = 10) -> dict:
     """
@@ -14952,19 +15027,26 @@ if st.session_state.get("logged_in"):
             _gate = st.session_state.get("narrative_ticker_gate") or {}
             _rm_fake = _gate.get("removed_fake") or []
             _rm_etf = _gate.get("removed_etf") or []
-            if _gate.get("verified_ok") and (_rm_fake or _rm_etf):
-                _msgs = []
-                if _rm_fake:
-                    _msgs.append(f"🛑 fake/데이터없음 {len(_rm_fake)}개: `{', '.join(_rm_fake)}`")
-                if _rm_etf:
-                    _msgs.append(f"📦 ETF {len(_rm_etf)}개: `{', '.join(_rm_etf)}`")
-                st.warning(
-                    "**추천 종목 정량 검증 — 무효 티커 자동 제거됨**  \n"
-                    + "  \n".join(_msgs)
-                    + f"  \n실거래·정량 검증 {_gate.get('checked', 0)}개 중. 아래는 통과분만 표시됩니다."
-                )
-            elif _gate and not _gate.get("verified_ok"):
-                st.caption("⚠️ 이번 분석은 추천 티커 정량 검증을 수행하지 못했습니다 (가격 데이터 배치 실패).")
+            if _gate.get("verified_ok"):
+                if _rm_fake or _rm_etf:
+                    _msgs = []
+                    if _rm_fake:
+                        _msgs.append(f"🛑 fake/데이터없음 {len(_rm_fake)}개: `{', '.join(_rm_fake)}`")
+                    if _rm_etf:
+                        _msgs.append(f"📦 ETF {len(_rm_etf)}개: `{', '.join(_rm_etf)}`")
+                    st.warning(
+                        "**추천 종목 정량 검증 — 무효 티커 자동 제거됨**  \n"
+                        + "  \n".join(_msgs)
+                        + f"  \n실거래·정량 검증 {_gate.get('checked', 0)}개 중. 아래는 통과분만 표시됩니다."
+                    )
+                if _gate.get("quant_failed"):
+                    st.warning(
+                        "🔁 **정량 검증 일시 실패** — 가격 데이터를 받지 못했습니다(레이트리밋/일시 장애). "
+                        "fake·상폐 제거는 적용됐지만 RS·200일선 지표는 비어 있습니다. "
+                        "**엔진을 한 번 더 실행하면 채워집니다.** (티커를 신규로 오표기하지 않았습니다.)"
+                    )
+            elif _gate:
+                st.caption("⚠️ 이번 분석은 추천 티커 정량 검증을 수행하지 못했습니다 (실거래 존재 검증 실패).")
 
             st.markdown("### 🧭 Market Regime Indicator")
             regime_col_1, regime_col_2, regime_col_3 = st.columns(3)
@@ -14991,6 +15073,7 @@ if st.session_state.get("logged_in"):
                 for idx, theme in enumerate(themes_data, start=1):
                     theme = theme if isinstance(theme, dict) else {}
                     _qmap = narrative_data.get("_quant", {}) if isinstance(narrative_data, dict) else {}
+                    _qfail = bool((st.session_state.get("narrative_ticker_gate") or {}).get("quant_failed"))
                     title = theme.get("title", f"Theme {idx}")
                     expanding_to_data = theme.get("expanding_to", [])
                     if isinstance(expanding_to_data, list):
@@ -15000,7 +15083,7 @@ if st.session_state.get("logged_in"):
                             stage = str(flow.get("stage", "") or "").strip()
                             expected_tickers = str(flow.get("expected_tickers", "") or "").strip()
                             if stage or expected_tickers:
-                                _xq = _fmt_quant_inline(expected_tickers, _qmap, "expand")
+                                _xq = _fmt_quant_inline(expected_tickers, _qmap, "expand", _qfail)
                                 _xq_s = f" — 📊 {_xq}" if _xq else ""
                                 expanding_lines.append(f"- ➔ **{stage if stage else 'N/A'}**: `{expected_tickers if expected_tickers else 'N/A'}`{_xq_s}")
                         expanding_to_display = "\n".join(expanding_lines) if expanding_lines else "- ➔ **N/A**: `N/A`"
@@ -15021,12 +15104,12 @@ if st.session_state.get("logged_in"):
 
                     with st.expander(f"Theme {idx}: {title} {mom_emoji}", expanded=(idx == 1)):
                         st.markdown(f"**🎯 Winners:** `{winners_str}`")
-                        _wq = _fmt_quant_inline(winners_str, _qmap, "winner")
+                        _wq = _fmt_quant_inline(winners_str, _qmap, "winner", _qfail)
                         if _wq:
                             st.caption(f"📊 정량: {_wq}")
                         if emerging_tickers:
                             st.markdown(f"**🌱 Emerging (추적 필요):** `{emerging_tickers}`")
-                            _eq = _fmt_quant_inline(emerging_tickers, _qmap, "emerging")
+                            _eq = _fmt_quant_inline(emerging_tickers, _qmap, "emerging", _qfail)
                             if _eq:
                                 st.caption(f"📊 정량: {_eq}")
                         if momentum_note:

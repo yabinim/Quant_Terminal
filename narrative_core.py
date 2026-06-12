@@ -575,7 +575,7 @@ def verify_narrative_with_quant(analysis, verify_fn, fmp_key: str = "", etf_symb
       analysis["_quant"] = {ticker: metrics}
       report = {verified_ok, checked, removed_fake[], removed_etf[], kept[], no_quant[], metrics{}}"""
     report = {"verified_ok": False, "checked": 0, "removed_fake": [], "removed_etf": [],
-              "kept": [], "no_quant": [], "metrics": {}}
+              "kept": [], "no_quant": [], "quant_failed": False, "metrics": {}}
     if not isinstance(analysis, dict) or not analysis:
         return analysis, report
 
@@ -604,11 +604,14 @@ def verify_narrative_with_quant(analysis, verify_fn, fmp_key: str = "", etf_symb
     removed_etf = sorted(valid_exist & etf_set)         # 실재하나 ETF(개별주 단계 규칙 위반)
     keep = valid_exist - etf_set
     no_quant = sorted(keep - set(metrics.keys()))       # 실재하나 정량 부족(신규 상장 등)
+    # 전건 정량 실패(systemic): keep는 있는데 지표가 0개 → 신규 둔갑 금지, '검증 실패'로 분류.
+    quant_failed = bool(keep) and (len(metrics) == 0)
 
     report.update({
         "verified_ok": True, "checked": len(cand_set),
         "removed_fake": removed_fake, "removed_etf": removed_etf,
-        "kept": sorted(keep), "no_quant": no_quant,
+        "kept": sorted(keep), "no_quant": ([] if quant_failed else no_quant),
+        "quant_failed": quant_failed,
         "metrics": {k: metrics[k] for k in keep if k in metrics},
     })
 
@@ -641,6 +644,9 @@ def format_quant_gate_note(report) -> str:
         return ""
     if not report.get("verified_ok"):
         return "⚠️ 추천 티커 정량 검증을 수행하지 못했습니다 (가격 데이터 배치 실패)."
+    if report.get("quant_failed"):
+        return ("🔁 정량 검증 일시 실패 — 가격 데이터를 받지 못했습니다(재시도 권장). "
+                "fake 제거는 적용됨, 정량 지표는 다음 실행에서 채워집니다.")
     parts = []
     if report.get("removed_fake"):
         parts.append(f"🛑 fake/데이터없음 {len(report['removed_fake'])}개 제거: {', '.join(report['removed_fake'])}")
