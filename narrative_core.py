@@ -563,32 +563,55 @@ def _collect_output_tickers(analysis) -> list:
 
 
 def _fmp_validate_symbols_ex(symbols, fmp_key: str, timeout: int = 8):
-    """batch-quote-short 존재검증 — (유효심볼 set, 검사성공 bool) 반환.
-    검사성공=True면 '없는 심볼=fake' 확정 가능; False면 검사 자체 실패(판단 보류)."""
+    """존재검증 — 단일 /quote?symbol= 로 종목별 확인(앱 가격 폴백이 쓰는 검증된 단일심볼 방식).
+    반환 (유효심볼 set, 검사성공 bool). 미검증 티커만 들어오므로 보통 소수.
+    판정: 200+행 있고 price>0 → 존재 / 200+빈리스트 → 없음(fake) / 비200·예외 → 보류(None)."""
     syms = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
     if not fmp_key or not syms:
         return set(), False
-    valid, got_any = set(), False
-    for i in range(0, len(syms), 40):
-        chunk = syms[i:i + 40]
+    import concurrent.futures as _cf
+
+    def _one(s):
         try:
-            r = requests.get(f"{_FMP_BASE}/batch-quote-short",
-                             params={"symbols": ",".join(chunk), "apikey": fmp_key}, timeout=timeout)
+            r = requests.get(f"{_FMP_BASE}/quote",
+                             params={"symbol": s, "apikey": fmp_key}, timeout=timeout)
             if r.status_code != 200:
-                continue
-            data = r.json()
-            if not isinstance(data, list):
-                continue
-            got_any = True
-            for row in data:
-                if isinstance(row, dict) and row.get("symbol"):
-                    try:
-                        if row.get("price") is not None and float(row["price"]) > 0:
-                            valid.add(str(row["symbol"]).upper().strip())
-                    except (TypeError, ValueError):
-                        pass
+                return s, None  # 일시 실패 → 보류
+            d = r.json()
+            if isinstance(d, list):
+                if not d:
+                    return s, False  # 200+빈 = 존재하지 않음(fake)
+                row = d[0]
+            elif isinstance(d, dict):
+                row = d
+            else:
+                return s, None
+            if isinstance(row, dict):
+                price = row.get("price")
+                try:
+                    return s, (price is not None and float(price) > 0)
+                except (TypeError, ValueError):
+                    return s, True  # 행이 있으면 존재로 간주
+            return s, None
         except Exception:
-            continue
+            return s, None  # 타임아웃/커넥션 → 보류
+
+    valid, got_any = set(), False
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+            for fut in _cf.as_completed([ex.submit(_one, s) for s in syms]):
+                try:
+                    s, res = fut.result()
+                except Exception:
+                    res = None
+                    s = None
+                if res is None:
+                    continue           # 보류(판단 불가)
+                got_any = True         # 확정 답을 1건이라도 받음
+                if res:
+                    valid.add(s)
+    except Exception:
+        return set(), False
     return valid, got_any
 
 
