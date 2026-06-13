@@ -2869,10 +2869,21 @@ def _classify_narrative_etfs(tickers_tuple: tuple) -> set:
     return etf
 
 
+def _quant_verdict_emoji(verdict) -> str:
+    """verdict 문자열 → 선두 판정 이모지 1개."""
+    v = str(verdict or "")
+    for e in ("🎯", "🌱", "✅", "❌"):
+        if e in v:
+            return e
+    return "⏳"
+
+
 def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "", status_map=None) -> str:
-    """티커 CSV → 종목별 정량 한 줄 요약(캡션용).
-    tier='winner'면 정량 불일치(200일선 아래/RS 음수) 시 ⚠️ 플래그(제거 아님).
-    무지표 티커는 status_map으로 정직하게 구분: new=🆕신규 / unchecked=🔁검증보류."""
+    """티커 CSV → 종목별 정량 요약. 단계별 상세도 차등(화면 정리):
+      - winner : 풀 정보 (판정 + RS + 200일선 + ⚠️불일치 플래그)
+      - emerging: 판정 라벨만 (RS·200일선 숫자 생략)
+      - expand : 판정 이모지 1개만 (티커 뒤 부착, 텍스트 없음)
+    무지표 티커는 status_map으로 구분(new=🆕 / unchecked=🔁)."""
     status_map = status_map or {}
     parts = []
     for t in [x.strip().upper() for x in str(tickers_csv or "").split(",") if x.strip()]:
@@ -2881,24 +2892,33 @@ def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "", status_map=None) -
         q = (quant_map or {}).get(t)
         if not q:
             stt = status_map.get(t)
-            if stt == "new":
-                parts.append(f"{t} 🆕신규(데이터 축적 전)")
-            elif stt == "unchecked":
-                parts.append(f"{t} 🔁검증보류(재시도)")
-            else:
-                parts.append(f"{t} ⏳정량부족")
+            ic = "🆕" if stt == "new" else ("🔁" if stt == "unchecked" else "⏳")
+            if tier == "expand":
+                parts.append(f"{t}{ic}")
+            elif tier == "emerging":
+                parts.append(f"{t} {ic}")
+            else:  # winner
+                full = {"new": "🆕신규(데이터 축적 전)",
+                        "unchecked": "🔁검증보류(재시도)"}.get(stt, "⏳정량부족")
+                parts.append(f"{t} {full}")
             continue
-        rs = q.get("rs_score")
-        above = q.get("above_ma200")
         verdict = str(q.get("verdict", "") or "").strip()
-        rs_s = f"RS{rs:+.1f}%p" if isinstance(rs, (int, float)) else ""
-        ma_s = "200MA▲" if above else ("200MA▼" if above is False else "")
-        flag = ""
-        if tier == "winner" and (above is False or (isinstance(rs, (int, float)) and rs < 0)):
-            flag = " ⚠️정량미확인"
-        seg = " ".join(x for x in [verdict, rs_s, ma_s] if x)
-        parts.append(f"{t} {seg}{flag}".strip())
-    return " · ".join(parts)
+        if tier == "expand":
+            parts.append(f"{t}{_quant_verdict_emoji(verdict)}")
+        elif tier == "emerging":
+            parts.append(f"{t} {verdict}")
+        else:  # winner: 풀 정보
+            rs = q.get("rs_score")
+            above = q.get("above_ma200")
+            rs_s = f"RS{rs:+.1f}%p" if isinstance(rs, (int, float)) else ""
+            ma_s = "200MA▲" if above else ("200MA▼" if above is False else "")
+            flag = ""
+            if above is False or (isinstance(rs, (int, float)) and rs < 0):
+                flag = " ⚠️정량미확인"
+            seg = " ".join(x for x in [verdict, rs_s, ma_s] if x)
+            parts.append(f"{t} {seg}{flag}".strip())
+    sep = "  " if tier == "expand" else " · "
+    return sep.join(parts)
 
 
 def detect_sector_momentum_reversal(universe_tickers: list) -> list[dict]:
@@ -15076,6 +15096,27 @@ if st.session_state.get("logged_in"):
 
             st.divider()
             st.markdown("### 🔥 Current Market Themes & 📊 Narrative Breakdown")
+            with st.expander("📊 뱃지 설명 (참조표)", expanded=False):
+                st.markdown(
+                    "**정량 판정 (모멘텀 진입 타이밍)**\n"
+                    "| 뱃지 | 의미 | 발동 기준 |\n|---|---|---|\n"
+                    "| 🎯 최적 매수 타이밍 | 아직 안 올랐는데 돈이 들어오기 시작 | RS 음수 + 거래량 1.5배↑ |\n"
+                    "| 🌱 얼리버드 기회 | 추세 초입 | RS<3%p + 200일선 위 + 1개월 +2%↑ |\n"
+                    "| ✅ 이미 강세 | 강한 추세(진입 시 고점 주의) | RS>5%p + 200일선 위 |\n"
+                    "| ❌ 하락 추세 | 추세 꺾임, 진입 보류 | 200일선 아래 |\n"
+                    "| ⏳ 신호 대기 | 뚜렷한 신호 없음(중립) | 위 조건 미해당 |\n\n"
+                    "**정량 지표**\n"
+                    "| 뱃지 | 의미 |\n|---|---|\n"
+                    "| RS ±x%p | 상대강도(SPY 대비 3개월 초과수익). 양수=시장보다 강함 |\n"
+                    "| 200MA▲ / ▼ | 200일 이동평균선 위/아래 (장기 추세 방향) |\n\n"
+                    "**검증 상태**\n"
+                    "| 뱃지 | 의미 |\n|---|---|\n"
+                    "| ⚠️ 정량미확인 | winner인데 정량 자격 미달(뉴스만 좋고 모멘텀은 아님) |\n"
+                    "| 🆕 신규 | 실재하나 히스토리 부족(신규 상장 등) — 추적만 |\n"
+                    "| 🔁 검증보류 | 존재검증 실패로 가짜/신규 판단 불가 — 재실행 시 재확인 |\n\n"
+                    "*표시 차등: **Winners**=판정+RS+200일선 / **Emerging**=판정 라벨만 / "
+                    "**확산(2·3차)**=판정 이모지만.*"
+                )
             if isinstance(themes_data, list) and themes_data:
                 for idx, theme in enumerate(themes_data, start=1):
                     theme = theme if isinstance(theme, dict) else {}
