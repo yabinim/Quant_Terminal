@@ -17386,53 +17386,68 @@ if st.session_state.get("logged_in"):
                 _regime_res = rc.classify_regime(timing_history, spy_close=_spy_close)
                 _timing_res = rc.evaluate_timing(timing_history, _regime_res)
 
-                if not _regime_res.get("enough_data"):
-                    st.info("레짐 판정에 필요한 가격 데이터가 부족합니다(약 50거래일 이상 필요).")
-                else:
-                    _band_lo, _band_hi = _regime_res["rsi_band"]
-                    _regime_label = {
-                        "strong": "🟢 강세 추세 (대장주)",
-                        "sideways": "🟡 횡보",
-                        "weak": "🔴 약세/하락",
-                    }.get(_regime_res["regime"], "⚪ 판정 불가")
-                    _topping_txt = " · ⚠️ 천장 신호" if _regime_res.get("topping") else ""
-                    st.markdown(
-                        f"**국면 판정:** {_regime_label}{_topping_txt} "
-                        f"(강도 {_regime_res['score']:.0f}/100 · 적용 RSI 밴드 {_band_lo:.0f}~{_band_hi:.0f})"
-                    )
-
-                    # 매수 타이밍 verdict (레짐 적응형)
-                    _verdict = _timing_res.get("verdict", "")
-                    _reasons = " · ".join(_timing_res.get("reasons", []))
-                    _code = _timing_res.get("code")
-                    if _timing_res.get("is_entry"):
-                        st.success(f"🎯 **{_verdict}** — {_reasons}\n\n분할 매수 고려 구간입니다.")
-                    elif _code == "overheat":
-                        st.error(
-                            f"⛔ **{_verdict}** — {_reasons}.\n\n지금 진입하면 고점 매수 위험. "
-                            f"RSI가 밴드 지지선({_band_lo:.0f})까지 식거나 상승 이평선 눌림을 기다리는 편이 유리합니다."
-                        )
-                    elif _code == "trend_break":
-                        st.error(f"🚫 **{_verdict}** — {_reasons}.\n\n추세가 약해지는 신호입니다. 신규 진입 자제.")
-                    elif _code == "avoid":
-                        st.warning(f"**{_verdict}** — {_reasons}.")
+                # ── 관점별 신호 (대상별로 묶어 표시: 신규 진입 / 보유 관리 / 단기) ──
+                # ① 신규 진입 관점 — 아직 안 샀다면 ('지금 새로 살까?')
+                with st.container(border=True):
+                    st.markdown("##### 🛒 신규 진입 관점")
+                    st.caption("아직 안 샀다면 — '지금 새로 살까?'")
+                    if not _regime_res.get("enough_data"):
+                        st.info("레짐 판정에 필요한 가격 데이터가 부족합니다(약 50거래일 이상 필요).")
                     else:
-                        st.info(f"⏳ **{_verdict}** — {_reasons}.")
+                        _band_lo, _band_hi = _regime_res["rsi_band"]
+                        _regime_label = {
+                            "strong": "🟢 강세 추세 (대장주)",
+                            "sideways": "🟡 횡보",
+                            "weak": "🔴 약세/하락",
+                        }.get(_regime_res["regime"], "⚪ 판정 불가")
+                        _topping_txt = " · ⚠️ 천장 신호" if _regime_res.get("topping") else ""
+                        st.markdown(
+                            f"**국면 판정:** {_regime_label}{_topping_txt} "
+                            f"(강도 {_regime_res['score']:.0f}/100 · 적용 RSI 밴드 {_band_lo:.0f}~{_band_hi:.0f})"
+                        )
+                        _verdict = _timing_res.get("verdict", "")
+                        _reasons = " · ".join(_timing_res.get("reasons", []))
+                        _code = _timing_res.get("code")
+                        if _timing_res.get("is_entry"):
+                            st.success(f"🎯 **{_verdict}** — {_reasons}\n\n분할 매수 고려 구간입니다.")
+                        elif _code == "overheat":
+                            st.error(
+                                f"⛔ **{_verdict}** — {_reasons}.\n\n지금 진입하면 고점 매수 위험. "
+                                f"RSI가 밴드 지지선({_band_lo:.0f})까지 식거나 상승 이평선 눌림을 기다리는 편이 유리합니다."
+                            )
+                        elif _code == "trend_break":
+                            st.error(f"🚫 **{_verdict}** — {_reasons}.\n\n추세가 약해지는 신호입니다. 신규 진입 자제.")
+                        elif _code == "avoid":
+                            st.warning(f"**{_verdict}** — {_reasons}.")
+                        else:
+                            st.info(f"⏳ **{_verdict}** — {_reasons}.")
 
-                    # 청산(보유 시) 신호 — 강세 추세가 꺾이는지 점검
+                # ② 보유 관리 관점 — 이미 보유 중이라면 ('청산할까?')
+                with st.container(border=True):
+                    st.markdown("##### 💼 보유 관리 관점")
+                    st.caption("이미 보유 중이라면 — '청산할까?'")
                     _exit_res = rc.compute_exit_signals(timing_history)
                     if _exit_res.get("is_exit"):
                         st.warning(
-                            "💰 **청산 신호 감지** (보유 중이라면 점검): "
+                            "💰 **청산 신호 감지** (점검 필요): "
                             + " · ".join(_exit_res.get("reasons", []))
                         )
+                    else:
+                        st.success("✅ 현재 청산 신호 없음 — 추세 유지 중")
 
-                # 볼린저밴드 위치 알림
-                if pd.notna(current_price) and pd.notna(current_bb_lower) and pd.notna(current_bb_upper):
-                    if current_price <= current_bb_lower:
-                        st.success(f"📊 볼린저밴드 하단 터치 (${current_bb_lower:.2f}) — 단기 반등 가능성.")
-                    elif current_price >= current_bb_upper:
-                        st.error(f"📊 볼린저밴드 상단 터치 (${current_bb_upper:.2f}) — 단기 과열 주의.")
+                # ③ 단기 트레이딩 관점 — 단타·반등 (참고용)
+                with st.container(border=True):
+                    st.markdown("##### ⚡ 단기 트레이딩 관점")
+                    st.caption("단타·반등 노린다면 — 추세 역행이라 고위험 (참고용)")
+                    if pd.notna(current_price) and pd.notna(current_bb_lower) and pd.notna(current_bb_upper):
+                        if current_price <= current_bb_lower:
+                            st.info(f"📊 볼린저밴드 하단 터치 (${current_bb_lower:.2f}) — 단기 반등 가능성.")
+                        elif current_price >= current_bb_upper:
+                            st.warning(f"📊 볼린저밴드 상단 터치 (${current_bb_upper:.2f}) — 단기 과열 주의.")
+                        else:
+                            st.caption("밴드 중앙 구간 — 단기 시그널 없음.")
+                    else:
+                        st.caption("볼린저밴드 데이터 부족.")
 
                 # ── 차트 탭 ───────────────────────────────────────────────
                 chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📈 가격 + 이평선 + 볼린저밴드", "📊 MACD", "📦 거래량"])
