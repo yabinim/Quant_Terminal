@@ -7004,26 +7004,34 @@ def compute_realized_pnl(trade_df: pd.DataFrame) -> pd.DataFrame:
                     remaining -= use
                 fifo_queue = [[q[0], q[1]] for q in temp_q if q[0] > 1e-9]
 
-                # 평균단가 비용
+                # 보유(BUY) 재고로 실제 충당된 수량만 실현손익으로 인정한다.
+                # 대응 매수 없이 잡힌 SELL(계좌 이동·중간부터 기록 등)은 원가 0으로
+                # 전액이 '유령 수익'이 되어 누적손익/상세표가 헤드라인과 어긋나므로,
+                # compute_closed_trades_detail 과 동일하게 충당분(covered)만 계산한다.
+                covered = sh - remaining
+                if covered <= 1e-9:
+                    continue  # 매칭 재고 전무 → 원가 기준 없음. 실현손익 미계상.
+
+                # 평균단가 비용 — 충당 수량 기준으로 일관 처리
                 avg_per = (avg_total_cost / avg_total_shares) if avg_total_shares > 1e-9 else 0.0
-                avg_cost_total = sh * avg_per
+                avg_cost_total = covered * avg_per
                 avg_total_cost = max(0.0, avg_total_cost - avg_cost_total)
-                avg_total_shares = max(0.0, avg_total_shares - sh)
+                avg_total_shares = max(0.0, avg_total_shares - covered)
                 if avg_total_shares < 1e-9:
                     avg_total_shares = avg_total_cost = 0.0
 
-                proceeds = sh * pr
+                proceeds = covered * pr
                 fifo_pnl = proceeds - fifo_cost_total
                 avg_pnl = proceeds - avg_cost_total
-                fifo_cost_per = fifo_cost_total / sh if sh > 0 else 0
-                avg_cost_per = avg_cost_total / sh if sh > 0 else 0
+                fifo_cost_per = fifo_cost_total / covered if covered > 0 else 0
+                avg_cost_per = avg_cost_total / covered if covered > 0 else 0
                 fifo_pct = ((pr / fifo_cost_per) - 1.0) * 100.0 if fifo_cost_per > 0 else np.nan
                 avg_pct = ((pr / avg_cost_per) - 1.0) * 100.0 if avg_cost_per > 0 else np.nan
 
                 results.append({
                     "ticker": ticker, "account": account,
                     "sell_date": dt.strftime("%Y-%m-%d") if pd.notna(dt) else "",
-                    "shares_sold": sh, "sell_price": pr,
+                    "shares_sold": covered, "sell_price": pr,
                     "fifo_cost": fifo_cost_per, "avg_cost": avg_cost_per,
                     "fifo_pnl": fifo_pnl, "avg_pnl": avg_pnl,
                     "fifo_pnl_pct": fifo_pct, "avg_pnl_pct": avg_pct, "memo": memo,
