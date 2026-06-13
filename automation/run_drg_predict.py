@@ -13,12 +13,10 @@ import time
 import smtplib
 import traceback
 from datetime import datetime, timezone, timedelta
-from difflib import SequenceMatcher
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import requests
-import feedparser
 import numpy as np
 import pandas as pd
 import pytz
@@ -27,6 +25,10 @@ from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types as genai_types
 from fredapi import Fred
+
+# ── repo root 를 sys.path 에 추가 → narrative_core(app.py와 동일 SSOT 모듈) import ──
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import narrative_core
 
 # ── 환경변수 ──────────────────────────────────────────────────────────────────
 GOOGLE_API_KEY     = os.environ["GOOGLE_API_KEY"]
@@ -152,60 +154,6 @@ def get_todays_major_releases(fred: Fred = None) -> tuple:
     return releases, full_events
 
 
-# ── 뉴스 수집 ─────────────────────────────────────────────────────────────────
-def _clean_text(raw: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", str(raw or ""))
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def fetch_global_market_news() -> tuple[list, str, int]:
-    browser_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    rss_sources = {
-        "Yahoo Finance":       {"url": "https://finance.yahoo.com/news/rssindex", "weight": 1.0},
-        "CNBC":                {"url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?profile=120000000", "weight": 0.9},
-        "Google News Finance": {"url": "https://news.google.com/rss/search?q=finance+market+economy&hl=en-US&gl=US&ceid=US:en", "weight": 0.8},
-        "MarketWatch":         {"url": "http://feeds.marketwatch.com/marketwatch/marketpulse/", "weight": 0.7},
-    }
-    all_news = []
-    for src, cfg in rss_sources.items():
-        try:
-            resp = requests.get(cfg["url"], headers=browser_headers, timeout=8)
-            if resp.status_code != 200:
-                continue
-            for entry in getattr(feedparser.parse(resp.content), "entries", []):
-                title   = _clean_text(getattr(entry, "title", ""))
-                summary = _clean_text(getattr(entry, "summary", "") or "")
-                if not (title or summary):
-                    continue
-                parsed = getattr(entry, "published_parsed", None)
-                pub_dt = datetime(*parsed[:6], tzinfo=timezone.utc) if parsed else datetime.min.replace(tzinfo=timezone.utc)
-                all_news.append({"title": title, "summary": summary,
-                                  "published": str(getattr(entry,"published","") or "N/A"),
-                                  "published_dt": pub_dt, "source": src, "weight": cfg["weight"]})
-        except Exception:
-            continue
-
-    deduped = []
-    for news in all_news:
-        dup_idx = None
-        for i, kept in enumerate(deduped):
-            if SequenceMatcher(None, news["title"].lower(), kept["title"].lower()).ratio() >= 0.7:
-                dup_idx = i; break
-        if dup_idx is None:
-            deduped.append(news)
-        else:
-            k = deduped[dup_idx]
-            if news["weight"] > k["weight"] or (news["weight"] == k["weight"] and news["published_dt"] > k["published_dt"]):
-                deduped[dup_idx] = news
-
-    ranked = sorted(deduped, key=lambda x: (x["weight"], x["published_dt"]), reverse=True)[:30]
-    chunks = [
-        f"- [{item['source']}] {item['title']} | {item['summary'][:80]}"
-        for item in ranked
-    ]
-    for item in ranked:
-        item.pop("published_dt", None)
-    return ranked, "\n".join(chunks), len(all_news)
 
 
 # ── 거시지표 수집 (앱의 Daily Risk Gauge 5가지 신호와 동일) ──────────────────
@@ -1185,7 +1133,9 @@ def main():
         print(f"[INFO] FMP 이벤트 캘린더: {len(full_events)}개")
 
     print("[STEP 1] 뉴스 수집 중...")
-    _, rss_news_text, raw_count = fetch_global_market_news()
+    _top, rss_news_text, raw_count, _news_meta = narrative_core.fetch_global_market_news(
+        os.environ.get("FMP_API_KEY", "").strip(), top_n=60)
+    print(f"[INFO] 뉴스 소스: {_news_meta.get('source_log', '')}")
     print(f"[INFO] 뉴스 {raw_count}건 수집 완료")
 
     print("[STEP 2] 거시지표 수집 중...")
