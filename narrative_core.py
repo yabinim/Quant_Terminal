@@ -480,16 +480,19 @@ def sanitize_narrative_tickers(analysis, fmp_key: str = "") -> tuple:
 
 
 def format_ticker_gate_note(report) -> str:
-    """리포트 → 사람이 읽는 한 줄 요약(화면/이메일/로그 공용)."""
+    """리포트 → 사람이 읽는 한 줄 요약(화면/이메일/로그 공용).
+    신형(verify_narrative_with_quant: removed_fake/removed_etf) · 구형(sanitize: removed) 둘 다 호환."""
     if not isinstance(report, dict):
         return ""
     if not report.get("verified_ok"):
-        return "⚠️ 티커 실거래 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애)."
-    removed = report.get("removed") or []
+        return "⚠️ 티커 정량 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애)."
+    removed = sorted(set(report.get("removed_fake") or []) | set(report.get("removed_etf") or [])) \
+              or (report.get("removed") or [])
+    checked = report.get("checked", 0)
     if not removed:
-        return f"✅ 티커 실거래 검증 완료 — {report.get('checked', 0)}개 모두 유효."
-    return (f"🛑 무효(상장폐지·비상장·오타) 티커 {len(removed)}개 제거: "
-            f"{', '.join(removed)} (검증 {report.get('checked', 0)}개 중)")
+        return f"✅ 티커 정량 검증 완료 — {checked}개 모두 유효."
+    return (f"🛑 무효(상장폐지·비상장·오타·ETF) 티커 {len(removed)}개 제거: "
+            f"{', '.join(removed)} (검증 {checked}개 중)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
