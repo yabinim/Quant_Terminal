@@ -317,6 +317,52 @@ def _fmp_close_series(ticker: str, limit: int = 130):
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
 
+def _fmp_profile(ticker: str) -> dict:
+    """FMP profile 단건 (isEtf/isFund 판별용) — app.py _fmp_profile와 동일 목적."""
+    if not FMP_API_KEY or not str(ticker).strip():
+        return {}
+    try:
+        r = requests.get(f"{_FMP_BASE}/profile",
+                         params={"symbol": str(ticker).strip().upper(), "apikey": FMP_API_KEY},
+                         timeout=8)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        return data[0] if isinstance(data, list) and data else {}
+    except Exception:
+        return {}
+
+
+def _classify_narrative_etfs(tickers_tuple: tuple) -> set:
+    """후보 티커 중 ETF/펀드(isEtf/isFund) 집합 반환 — app.py _classify_narrative_etfs와 동일.
+    Phase 1(개별주 픽)에 ETF가 섞여 들어온 경우 제거 대상 판별용."""
+    tickers = [str(t).upper().strip() for t in dict.fromkeys(tickers_tuple) if str(t).strip()]
+    if not tickers:
+        return set()
+    import concurrent.futures as _cf
+    etf = set()
+
+    def _one(tk):
+        try:
+            p = _fmp_profile(tk) or {}
+            return tk, bool(p.get("isEtf") or p.get("isFund"))
+        except Exception:
+            return tk, False
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+            for fut in _cf.as_completed([ex.submit(_one, t) for t in tickers]):
+                try:
+                    tk, is_etf = fut.result()
+                    if is_etf:
+                        etf.add(tk)
+                except Exception:
+                    pass
+    except Exception:
+        return set()
+    return etf
+
+
 def verify_emerging_with_quant(emerging_tickers: list) -> list[dict]:
     """app.py verify_emerging_with_quant와 동일한 판정 기준으로 Emerging 종목 검증."""
     if not emerging_tickers or not FMP_API_KEY:
@@ -339,22 +385,33 @@ def verify_emerging_with_quant(emerging_tickers: list) -> list[dict]:
         above_ma200 = bool(s.iloc[-1] > ma200) if pd.notna(ma200) else None
         vol_surge = float(vol.tail(5).mean() / vol.tail(21).mean()) if len(vol) >= 21 else np.nan
 
-        # app.py와 100% 동일한 판정 분기
+        # app.py verify_emerging_with_quant와 100% 동일한 판정 분기 + detail
         if pd.notna(rs_score) and rs_score < 0 and pd.notna(vol_surge) and vol_surge >= 1.5:
             verdict = "🎯 최적 매수 타이밍"
+            detail = f"RS {rs_score:+.1f}%p (아직 저평가) + 거래량 {vol_surge:.1f}x 급증"
         elif pd.notna(rs_score) and rs_score < 3 and above_ma200 and pd.notna(mom_1m) and mom_1m > 2:
             verdict = "🌱 얼리버드 기회"
+            detail = f"RS {rs_score:+.1f}%p + 200일선 위 + 1개월 {mom_1m:+.1f}%"
         elif pd.notna(rs_score) and rs_score > 5 and above_ma200:
             verdict = "✅ 이미 강세 (진입 시 고점 주의)"
+            detail = f"RS {rs_score:+.1f}%p + 200일선 위"
         elif above_ma200 is False:
             verdict = "❌ 하락 추세 (대기)"
+            detail = "200일선 아래 — 아직 때가 아님"
         else:
             verdict = "⏳ 신호 대기"
+            detail = f"RS {rs_score:+.1f}%p" if pd.notna(rs_score) else "데이터 부족"
 
+        # app.py와 동일한 8키 반환(앱이 _quant 렌더 시 동일 필드 사용)
         results.append({
             "ticker": tk,
             "rs_score": round(rs_score, 2) if pd.notna(rs_score) else None,
+            "mom_1m": round(mom_1m, 2) if pd.notna(mom_1m) else None,
+            "above_ma200": above_ma200,
+            "vol_surge": round(vol_surge, 2) if pd.notna(vol_surge) else None,
             "verdict": verdict,
+            "detail": detail,
+            "current_price": round(float(s.iloc[-1]), 4) if not s.empty and pd.notna(s.iloc[-1]) else None,
         })
         time.sleep(0.15)  # FMP rate-limit 완화
     return results
@@ -516,21 +573,26 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
         '<span style="background:#6b7280;color:#fff;border-radius:4px;padding:2px 8px;font-size:12px;">🔒 장 닫힌 날</span>'
     )
 
-    # 티커 실거래 검증 게이트 배너
+    # 티커 정량 검증 게이트 배너 (verify_narrative_with_quant 리포트)
     gate_html = ""
     gr = gate_report or {}
-    if gr.get("verified_ok") and gr.get("removed"):
-        removed_txt = ", ".join(gr["removed"])
+    _removed = sorted(set(gr.get("removed_fake") or []) | set(gr.get("removed_etf") or []))
+    _new_ipo = gr.get("new_ipo") or []
+    if gr.get("verified_ok") and _removed:
+        removed_txt = ", ".join(_removed)
+        _ipo_line = (f'<div style="color:#fcd34d;font-size:12px;margin-top:6px;">🆕 신규 상장 {len(_new_ipo)}개: '
+                     f'{", ".join(_new_ipo)} (정량 데이터 부족 · 유지)</div>') if _new_ipo else ""
         gate_html = f"""
         <div style="background:#7f1d1d;border-radius:8px;padding:12px 16px;margin-bottom:16px;border:1px solid #ef4444;">
-          <div style="font-weight:700;color:#fecaca;">🛑 무효 티커 {len(gr['removed'])}개 자동 제거됨 (상장폐지·비상장·오타)</div>
+          <div style="font-weight:700;color:#fecaca;">🛑 무효·ETF 티커 {len(_removed)}개 자동 제거됨 (상장폐지·비상장·오타·ETF)</div>
           <div style="color:#fca5a5;font-size:13px;margin-top:6px;font-family:monospace;">{removed_txt}</div>
-          <div style="color:#f87171;font-size:12px;margin-top:6px;">실거래 검증 {gr.get('checked', 0)}개 중 · 아래 종목은 검증 통과분만 표시됩니다.</div>
+          <div style="color:#f87171;font-size:12px;margin-top:6px;">정량 검증 {gr.get('checked', 0)}개 중 · 아래 종목은 검증 통과분만 표시됩니다.</div>
+          {_ipo_line}
         </div>"""
     elif gr and not gr.get("verified_ok"):
         gate_html = """
         <div style="background:#422006;border-radius:8px;padding:10px 16px;margin-bottom:16px;border:1px solid #a16207;">
-          <div style="color:#fde68a;font-size:12px;">⚠️ 이번 리포트는 티커 실거래 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애).</div>
+          <div style="color:#fde68a;font-size:12px;">⚠️ 이번 리포트는 티커 정량 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애).</div>
         </div>"""
 
     # 뉴스 신선도 메타 (있으면 표시)
@@ -684,7 +746,12 @@ def main():
 
     # ── 티커 실거래 검증 게이트 (app.py와 동일 SSOT) ──
     # 무효(상장폐지·비상장·오타) 티커를 Sheet 저장·이메일 전에 제거.
-    analysis, _gate_report = narrative_core.sanitize_narrative_tickers(analysis, FMP_API_KEY)
+    # 추천 티커 정량 검증 게이트 (SSOT, app.py 13086줄과 동일 경로)
+    # verify_narrative_with_quant: fake/ETF 제거 + 통과분에 RS·200일선·verdict 부착(analysis["_quant"]).
+    _cands = narrative_core._collect_output_tickers(analysis)
+    _etf_syms = _classify_narrative_etfs(tuple(_cands)) if _cands else set()
+    analysis, _gate_report = narrative_core.verify_narrative_with_quant(
+        analysis, verify_emerging_with_quant, fmp_key=FMP_API_KEY, etf_symbols=_etf_syms)
     print("[INFO]", narrative_core.format_ticker_gate_note(_gate_report))
 
     print(f"[INFO] 내러티브 생성 완료. 테마 수: {len(analysis.get('themes', []))}")
