@@ -527,6 +527,57 @@ def run_emerging_tracking(analysis: dict) -> None:
 
 
 # ── HTML 이메일 생성 ───────────────────────────────────────────────────────────
+def _quant_verdict_emoji(verdict) -> str:
+    """verdict 문자열 → 선두 판정 이모지 1개 (app.py와 동일)."""
+    v = str(verdict or "")
+    for e in ("🎯", "🌱", "✅", "❌"):
+        if e in v:
+            return e
+    return "⏳"
+
+
+def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "", status_map=None) -> str:
+    """티커 CSV → 종목별 정량 요약 (app.py _fmt_quant_inline과 동일).
+      - winner : 풀 정보 (판정 + RS + 200일선 + ⚠️불일치 플래그)
+      - emerging: 판정 라벨만 / expand: 판정 이모지 1개만.
+    무지표 티커는 status_map으로 구분(new=🆕 / unchecked=🔁)."""
+    status_map = status_map or {}
+    parts = []
+    for t in [x.strip().upper() for x in str(tickers_csv or "").split(",") if x.strip()]:
+        if not t or t == "N/A":
+            continue
+        q = (quant_map or {}).get(t)
+        if not q:
+            stt = status_map.get(t)
+            ic = "🆕" if stt == "new" else ("🔁" if stt == "unchecked" else "⏳")
+            if tier == "expand":
+                parts.append(f"{t}{ic}")
+            elif tier == "emerging":
+                parts.append(f"{t} {ic}")
+            else:  # winner
+                full = {"new": "🆕신규(데이터 축적 전)",
+                        "unchecked": "🔁검증보류(재시도)"}.get(stt, "⏳정량부족")
+                parts.append(f"{t} {full}")
+            continue
+        verdict = str(q.get("verdict", "") or "").strip()
+        if tier == "expand":
+            parts.append(f"{t}{_quant_verdict_emoji(verdict)}")
+        elif tier == "emerging":
+            parts.append(f"{t} {verdict}")
+        else:  # winner: 풀 정보
+            rs = q.get("rs_score")
+            above = q.get("above_ma200")
+            rs_s = f"RS{rs:+.1f}%p" if isinstance(rs, (int, float)) else ""
+            ma_s = "200MA▲" if above else ("200MA▼" if above is False else "")
+            flag = ""
+            if above is False or (isinstance(rs, (int, float)) and rs < 0):
+                flag = " ⚠️정량미확인"
+            seg = " ".join(x for x in [verdict, rs_s, ma_s] if x)
+            parts.append(f"{t} {seg}{flag}".strip())
+    sep = "  " if tier == "expand" else " · "
+    return sep.join(parts)
+
+
 def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], is_market_day: bool,
                      gate_report: dict = None, news_meta: dict = None) -> str:
     now_et  = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
@@ -538,10 +589,17 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
     risk_color = "#16a34a" if "On" in risk else "#dc2626"
 
     # 테마 섹션
+    _qmap = analysis.get("_quant", {}) if isinstance(analysis, dict) else {}
+    _qstatus = analysis.get("_quant_status", {}) if isinstance(analysis, dict) else {}
     themes_html = ""
     for i, theme in enumerate(analysis.get("themes", []), 1):
         mom = str(theme.get("momentum_note", "보통"))
         mom_color = {"강함": "#16a34a", "보통": "#d97706", "약함": "#dc2626"}.get(mom, "#6b7280")
+        # 정량 뱃지 (앱과 동일: Winners=판정+RS+200MA / Emerging=판정 라벨만)
+        _wq = _fmt_quant_inline(theme.get("winners", ""), _qmap, "winner", _qstatus)
+        _eq = _fmt_quant_inline(theme.get("emerging", ""), _qmap, "emerging", _qstatus)
+        _wq_html = f'<div style="font-size:12px;color:#cbd5e1;margin-top:3px;">📊 정량: {_wq}</div>' if _wq else ""
+        _eq_html = f'<div style="font-size:12px;color:#cbd5e1;margin-top:3px;">📊 정량: {_eq}</div>' if _eq else ""
         themes_html += f"""
         <div style="background:#1e293b;border-radius:8px;padding:14px 16px;margin-bottom:12px;border-left:4px solid {mom_color};">
           <div style="font-size:15px;font-weight:700;color:#f1f5f9;">
@@ -550,8 +608,10 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
           </div>
           <div style="font-size:13px;color:#94a3b8;margin-top:6px;">📌 {theme.get('driver','')}</div>
           <div style="margin-top:8px;font-size:13px;">
-            <span style="color:#34d399;">✅ Winners: {theme.get('winners','')}</span><br>
-            <span style="color:#60a5fa;">🔍 Emerging: {theme.get('emerging','')}</span>
+            <div style="color:#34d399;">✅ Winners: {theme.get('winners','')}</div>
+            {_wq_html}
+            <div style="color:#60a5fa;margin-top:6px;">🔍 Emerging: {theme.get('emerging','')}</div>
+            {_eq_html}
           </div>
           <div style="font-size:12px;color:#f87171;margin-top:6px;">⚠️ Risk: {theme.get('risk','')}</div>
         </div>"""
