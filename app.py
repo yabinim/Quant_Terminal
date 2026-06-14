@@ -19789,6 +19789,115 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
                 )
 
+        # ═══════════════════════════════════════════════════════════════════
+        # 🔬 신호 검증 (백테스트) — Signal_Backtest 시트(run_signal_backtest 자동화 적재) 읽기 전용
+        #   레짐 엔진 verdict(entry/wait/overheat/trend_break/avoid)가 과거에 실제로 낸
+        #   forward-return·MFE/MAE 를 버킷별로 표시. 엔진의 '판별력'을 정량 확인.
+        # ═══════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("🔬 신호 검증 (백테스트)")
+        st.caption(
+            "레짐 엔진의 **매수/대기/과열/이탈/회피** 판정이 과거에 실제로 어떤 수익을 냈는지 "
+            "**워크포워드**(미래 훔쳐보기 없음)로 역검증한 결과입니다. `run_signal_backtest` 자동화가 "
+            "계산해 `Signal_Backtest` 시트에 적재하며, 여기서는 **읽기 전용**으로 최신 실행을 표시합니다."
+        )
+
+        _sb_reload = st.button(
+            "🔄 백테스트 결과 새로고침", key="reload_signal_backtest_btn",
+            help="Signal_Backtest 시트에서 최신 실행 결과를 다시 불러옵니다.",
+        )
+        if _sb_reload or "_signal_backtest_cache" not in st.session_state:
+            _sb_rows, _sb_err = [], None
+            try:
+                _gc_sb = get_gspread_client()
+                if _gc_sb is None:
+                    _sb_err = "Google 서비스 계정이 설정되지 않았습니다."
+                else:
+                    _sh_sb = _gc_sb.open(_QUANT_DB_SPREADSHEET_TITLE)
+                    if "Signal_Backtest" in [w.title for w in _sh_sb.worksheets()]:
+                        _sb_rows = _sh_sb.worksheet("Signal_Backtest").get_all_values() or []
+                    else:
+                        _sb_err = "no_sheet"
+            except Exception as _e_sb:
+                _sb_err = str(_e_sb)
+            st.session_state["_signal_backtest_cache"] = {"rows": _sb_rows, "err": _sb_err}
+
+        _sb = st.session_state.get("_signal_backtest_cache") or {"rows": [], "err": None}
+        _sb_rows, _sb_err = (_sb.get("rows") or []), _sb.get("err")
+
+        if _sb_err == "no_sheet" or (not _sb_rows or len(_sb_rows) < 2):
+            st.info(
+                "아직 신호 백테스트 결과가 없습니다. `run_signal_backtest` 자동화(월 1회/수동)를 "
+                "한 번 실행하면 여기에 버킷별 검증 결과가 표시됩니다."
+            )
+        elif _sb_err:
+            st.warning(f"백테스트 결과 로드 실패: {_sb_err}")
+        else:
+            _sb_df = pd.DataFrame(_sb_rows[1:], columns=_sb_rows[0])
+            if "Run_Date" in _sb_df.columns and not _sb_df.empty:
+                _sb_latest = _sb_df["Run_Date"].astype(str).max()
+                _sb_df = _sb_df[_sb_df["Run_Date"].astype(str) == _sb_latest]
+
+            if _sb_df.empty:
+                st.info("표시할 백테스트 결과가 없습니다.")
+            else:
+                _sb_meta = _sb_df.iloc[0]
+                st.success(
+                    f"📅 최신 실행: **{_sb_meta.get('Run_Date', '')}** · "
+                    f"검증 구간 {_sb_meta.get('History_Start', '')} ~ {_sb_meta.get('History_End', '')} · "
+                    f"유니버스 {_sb_meta.get('Universe_Size', '')}종목"
+                )
+
+                _sb_order = ["entry", "wait", "overheat", "trend_break", "avoid"]
+                _sb_df["_o"] = _sb_df["Verdict"].map({c: i for i, c in enumerate(_sb_order)})
+                _sb_df = _sb_df.sort_values("_o", na_position="last")
+
+                _sb_disp = _sb_df.copy()
+                _sb_disp["판정"] = _sb_disp["Verdict"].map(
+                    lambda c: rc.TIMING_BADGE.get(str(c), str(c))
+                )
+                _sb_numcols = ["Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean",
+                               "Ret_20d_Median", "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean"]
+                for _c in _sb_numcols:
+                    if _c in _sb_disp.columns:
+                        _sb_disp[_c] = pd.to_numeric(_sb_disp[_c], errors="coerce")
+                _sb_disp = _sb_disp.rename(columns={
+                    "Event_Count": "이벤트수", "WinRate_20d": "승률20d(%)",
+                    "Ret_5d_Mean": "평균5d(%)", "Ret_20d_Mean": "평균20d(%)",
+                    "Ret_20d_Median": "중앙20d(%)", "Ret_60d_Mean": "평균60d(%)",
+                    "MFE_20d_Mean": "MFE20d(%)", "MAE_20d_Mean": "MAE20d(%)",
+                })
+                _sb_ret_cols = ["평균5d(%)", "평균20d(%)", "중앙20d(%)", "평균60d(%)",
+                                "MFE20d(%)", "MAE20d(%)"]
+                _sb_show = ["판정", "이벤트수", "승률20d(%)"] + _sb_ret_cols
+
+                def _sb_color(v):
+                    try:
+                        x = float(v)
+                    except (TypeError, ValueError):
+                        return ""
+                    if x > 0:
+                        return "color:#16a34a;font-weight:600;"
+                    if x < 0:
+                        return "color:#dc2626;font-weight:600;"
+                    return ""
+
+                _sb_fmt = {"이벤트수": "{:,.0f}", "승률20d(%)": "{:,.1f}"}
+                _sb_fmt.update({c: "{:,.2f}" for c in _sb_ret_cols})
+
+                st.dataframe(
+                    _sb_disp[_sb_show].style
+                    .format(_sb_fmt, na_rep="-")
+                    .map(_sb_color, subset=_sb_ret_cols),
+                    use_container_width=True, hide_index=True,
+                )
+                st.caption(
+                    "**읽는 법:** `🎯 지금 매수 구간`의 +20일 평균·승률이 `대기/과열/회피`보다 높을수록 "
+                    "엔진의 **판별력**이 유효하다는 신호입니다. **MFE/MAE**(최대 상승/하락 여력)는 다음 단계인 "
+                    "**사이징·손익비(R:R)** 설계에서 손절·목표 거리 산정의 입력으로 쓰입니다. "
+                    "이벤트수가 적은 버킷은 통계가 불안정할 수 있습니다."
+                )
+
     elif main_nav == _MAIN_NAV_OPTIONS[9]:
         render_sync_button("sync_tab_idea", [], "Idea-to-Portfolio 데이터를 다시 불러옵니다.")
         # ─────────────────────────────────────────────────────────────────────
