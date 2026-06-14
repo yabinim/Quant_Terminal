@@ -13,12 +13,10 @@ import time
 import smtplib
 import traceback
 from datetime import datetime, timezone, timedelta
-from difflib import SequenceMatcher
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import requests
-import feedparser
 import numpy as np
 import pandas as pd
 import pytz
@@ -137,147 +135,13 @@ def build_fred_alert_text(releases: list[str]) -> str:
     )
 
 
-# ── 뉴스 수집 ─────────────────────────────────────────────────────────────────
-def _clean_text(raw: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", str(raw or ""))
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def fetch_global_market_news():
-    """멀티소스 RSS 수집 + 중복 제거 + 가중치 정렬. (top_news, context_text, raw_count)"""
-    browser_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    rss_sources = {
-        "Yahoo Finance":       {"url": "https://finance.yahoo.com/news/rssindex", "weight": 1.0},
-        "CNBC":                {"url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?profile=120000000", "weight": 0.9},
-        "Google News Finance": {"url": "https://news.google.com/rss/search?q=finance+market+economy&hl=en-US&gl=US&ceid=US:en", "weight": 0.8},
-        "MarketWatch":         {"url": "http://feeds.marketwatch.com/marketwatch/marketpulse/", "weight": 0.7},
-    }
-
-    all_news = []
-    for source_name, cfg in rss_sources.items():
-        try:
-            resp = requests.get(cfg["url"], headers=browser_headers, timeout=8)
-            if resp.status_code != 200:
-                continue
-            feed = feedparser.parse(resp.content)
-            for entry in getattr(feed, "entries", []):
-                title   = _clean_text(getattr(entry, "title", ""))
-                summary = _clean_text(getattr(entry, "summary", "") or getattr(entry, "description", ""))
-                if not (title or summary):
-                    continue
-                published_raw = str(getattr(entry, "published", "") or "").strip()
-                parsed = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
-                if parsed:
-                    try:
-                        pub_dt = datetime(*parsed[:6], tzinfo=timezone.utc)
-                    except Exception:
-                        pub_dt = datetime.min.replace(tzinfo=timezone.utc)
-                else:
-                    pub_dt = datetime.min.replace(tzinfo=timezone.utc)
-                all_news.append({
-                    "title": title, "summary": summary,
-                    "published": published_raw or "N/A",
-                    "published_dt": pub_dt,
-                    "source": source_name, "weight": cfg["weight"],
-                })
-        except Exception:
-            continue
-
-    # 중복 제거
-    deduped = []
-    for news in all_news:
-        dup_idx = None
-        for i, kept in enumerate(deduped):
-            if SequenceMatcher(None, news["title"].lower(), kept["title"].lower()).ratio() >= 0.7:
-                dup_idx = i
-                break
-        if dup_idx is None:
-            deduped.append(news)
-        else:
-            k = deduped[dup_idx]
-            if news["weight"] > k["weight"] or (news["weight"] == k["weight"] and news["published_dt"] > k["published_dt"]):
-                deduped[dup_idx] = news
-
-    ranked = sorted(deduped, key=lambda x: (x["weight"], x["published_dt"]), reverse=True)
-    top = ranked[:50]
-
-    chunks = []
-    for i, item in enumerate(top, 1):
-        chunks.append(
-            f"[{i}] Source: {item['source']} (Weight: {item['weight']:.1f})\n"
-            f"Published: {item['published']}\n"
-            f"Title: {item['title']}\n"
-            f"Summary: {item['summary']}"
-        )
-    context_text = "\n\n".join(chunks).strip()
-    for item in top:
-        item.pop("published_dt", None)
-    return top, context_text, len(all_news)
-
-
 # ── Gemini 내러티브 생성 ───────────────────────────────────────────────────────
 def generate_market_narrative(news_text: str, fred_alert: str = "") -> dict:
-    """뉴스 텍스트 → Gemini → 내러티브 JSON."""
+    """뉴스 텍스트 → Gemini → 내러티브 JSON.
+    프롬프트·파싱은 narrative_core(SSOT)를 사용 — app.py와 동일 프롬프트/스키마.
+    (Gemini '호출'만 자동화 자체 클라이언트로 수행)"""
     client = genai.Client(api_key=GOOGLE_API_KEY)
-
-    fred_section = fred_alert if fred_alert else ""
-
-    prompt = f"""당신은 월가 수석 퀀트 전략가입니다.
-아래 뉴스와 경제지표 정보를 종합 분석하여 지정된 JSON 스키마 그대로만 응답하세요.
-
-핵심 원칙:
-- 뉴스(정성) + 가격 모멘텀(정량)이 동시에 확인된 종목만 Winners로 선정
-- 뉴스만 좋고 가격이 안 받쳐주는 종목은 emerging으로만 분류
-- 각 theme의 winners는 반드시 3~6개 티커
-- winners / emerging / top_quant_picks / expanding_to의 expected_tickers는 모두 개별 종목만 사용. ETF·레버리지/섹터/국가/인덱스 ETF(예: TQQQ, UPRO, XLK, SMH, SOXX, EWY, EWT)는 절대 포함 금지. (이 단계는 개별주 발굴 목적)
-
-중요 규칙:
-1) 반드시 순수 JSON 텍스트만 출력 (```json 같은 마크다운 금지)
-2) 모든 키를 빠짐없이 포함
-3) themes는 최소 3개 이상 생성
-4) winners/emerging은 티커를 쉼표로 구분한 문자열
-5) 각 theme의 expanding_to는 반드시 객체 배열(list)이어야 함
-6) expanding_to의 각 객체는 반드시 "stage"와 "expected_tickers" 키를 포함
-7) expected_tickers는 각 stage마다 반드시 2~4개 티커를 쉼표 구분 문자열로 작성
-8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력
-9) 결과는 반드시 한국어로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
-{fred_section}
-
-[뉴스 데이터]
-{news_text}
-
-[출력 JSON 스키마]
-{{
-  "regime": {{
-    "risk": "Risk On 또는 Risk Off",
-    "growth_value": "Growth 선호 또는 Value 선호",
-    "liquidity": "Expanding 또는 Tightening"
-  }},
-  "themes": [
-    {{
-      "title": "테마명 (예: AI Capex Expansion)",
-      "driver": "무엇이 이 테마를 촉발했는가?",
-      "winners": "정성+정량 모두 확인된 개별 수혜주 (예: NVDA, MSFT, AVGO)",
-      "emerging": "뉴스 모멘텀은 있으나 가격 확인 필요 종목 (예: ARM, MRVL)",
-      "momentum_note": "강함/보통/약함 중 하나만 선택",
-      "expanding_to": [
-        {{"stage": "기업용 AI 솔루션", "expected_tickers": "CRM, NOW, WDAY"}},
-        {{"stage": "AI 기반 사이버 보안", "expected_tickers": "CRWD, PANW, FTNT"}}
-      ],
-      "risk": "이 테마가 무너질 수 있는 위험 요인"
-    }}
-  ],
-  "rotation": "과열 섹터 -> 수혜 섹터 플로우 요약",
-  "top_quant_picks": "내러티브와 일치하는 최우선 종목 3~5개 (쉼표 구분)",
-  "summary": "월가 퀀트 리포트 스타일 전체 시장 핵심 요약. 반드시 뉴스에 등장한 구체적 기업명·사건(실적·계약·IPO·제품 등)을 2~3개 직접 근거로 인용할 것. 테마 제목만 재진술하는 일반론 금지."
-}}
-You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings."""
+    prompt = narrative_core.build_narrative_prompt(news_text, "ko", fred_alert=fred_alert)
 
     for attempt in range(5):
         try:
@@ -286,9 +150,10 @@ You MUST respond ONLY with a valid JSON object. No markdown tags, no greetings."
                 model="gemini-2.5-flash", contents=prompt, config=cfg
             )
             raw = str(getattr(response, "text", "") or "").strip()
-            raw = re.sub(r"^```json", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"^```", "", raw.strip()).rstrip("`").strip()
-            return json.loads(raw)
+            parsed = narrative_core.parse_narrative_json(raw)
+            if parsed is not None:
+                return parsed
+            raise ValueError("parse_narrative_json 실패(None)")
         except Exception as e:
             wait = [10, 30, 60, 120][min(attempt, 3)]
             print(f"[WARN] Gemini 시도 {attempt+1}/5 실패: {e} → {wait}초 대기")
@@ -606,7 +471,7 @@ def run_emerging_tracking(analysis: dict) -> None:
 
 # ── HTML 이메일 생성 ───────────────────────────────────────────────────────────
 def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], is_market_day: bool,
-                     gate_report: dict = None) -> str:
+                     gate_report: dict = None, news_meta: dict = None) -> str:
     now_et  = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
     now_kst = datetime.now(_KST).strftime("%Y-%m-%d %H:%M KST")
     regime  = analysis.get("regime", {})
@@ -668,6 +533,27 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
           <div style="color:#fde68a;font-size:12px;">⚠️ 이번 리포트는 티커 실거래 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애).</div>
         </div>"""
 
+    # 뉴스 신선도 메타 (있으면 표시)
+    nm = news_meta or {}
+    _top_used = nm.get("total")
+    top_str = f" \u2192 \uc0c1\uc704 {_top_used}\uac74 \ubd84\uc11d" if _top_used else ""
+    freshness_html = ""
+    _newest_min = nm.get("newest_min_ago")
+    if _newest_min is not None:
+        _is_rss = "RSS Fallback" in str(nm.get("source_log", ""))
+        _src_label = ("RSS \ud3f4\ubc31 \uae30\ubc18, \uc2e4\uc2dc\uac04 \uc544\ub2d8"
+                      if _is_rss else
+                      "FMP \ub274\uc2a4 API \uae30\ubc18, \uc2e4\uc2dc\uac04 \uc6f9\uac80\uc0c9 \uc544\ub2d8")
+        _n_src = len(nm.get("sources", []) or [])
+        _fresh6 = nm.get("fresh_6h", 0)
+        _tot = nm.get("total", 0)
+        freshness_html = (
+            '<div style="font-size:12px;color:#d97706;margin-top:4px;">'
+            f'\U0001f550 \ub274\uc2a4 \uc2e0\uc120\ub3c4: \ucd5c\uc2e0 {_newest_min}\ubd84 \uc804 \u00b7 '
+            f'6\uc2dc\uac04 \uc774\ub0b4 {_fresh6}/{_tot}\uac74 \u00b7 '
+            f'\uc18c\uc2a4 {_n_src}\uacf3 ({_src_label})</div>'
+        )
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:20px;">
@@ -678,7 +564,8 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
     <div style="font-size:22px;font-weight:800;color:#60a5fa;">📰 Quant Terminal</div>
     <div style="font-size:14px;color:#94a3b8;margin-top:4px;">시장 내러티브 자동 분석 리포트</div>
     <div style="margin-top:8px;font-size:13px;color:#64748b;">{now_et} &nbsp;|&nbsp; {now_kst} &nbsp;|&nbsp; {market_badge}</div>
-    <div style="font-size:12px;color:#64748b;margin-top:4px;">뉴스 {news_count}건 수집 · Gemini 2.5 Flash 분석</div>
+    <div style="font-size:12px;color:#64748b;margin-top:4px;">뉴스 {news_count}건 수집{top_str} · Gemini 2.5 Flash 분석</div>
+    {freshness_html}
   </div>
 
   {gate_html}
@@ -779,8 +666,10 @@ def main():
 
     # 뉴스 수집
     print("[STEP 1] 뉴스 수집 중...")
-    top_news, context_text, raw_count = fetch_global_market_news()
-    print(f"[INFO] 수집 완료: {raw_count}건 → Top {len(top_news)}건 사용")
+    top_news, context_text, raw_count, _news_meta = narrative_core.fetch_global_market_news(
+        FMP_API_KEY, top_n=60)
+    print(f"[INFO] 수집 완료: {raw_count}건 → Top {len(top_news)}건 사용 "
+          f"(소스: {_news_meta.get('source_log', '')})")
 
     if not context_text:
         print("[ERROR] 뉴스 수집 실패. 종료.")
@@ -817,7 +706,7 @@ def main():
     fred_tag = " ⚠️FRED발표" if fred_releases else ""
     subject = f"📰 [{session_label}] 시장 내러티브 리포트 {now_et.strftime('%m/%d')}{fred_tag}"
 
-    html_body = build_email_html(analysis, raw_count, fred_releases, market_day, gate_report=_gate_report)
+    html_body = build_email_html(analysis, raw_count, fred_releases, market_day, gate_report=_gate_report, news_meta=_news_meta)
     send_email(subject, html_body)
 
     print(f"[DONE] 완료: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
