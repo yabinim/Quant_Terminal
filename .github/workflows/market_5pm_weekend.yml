@@ -4,6 +4,11 @@ on:
   repository_dispatch:
     types: [trigger-5pm-weekend]   # Cloud Scheduler → GitHub API로 트리거
   workflow_dispatch:
+    inputs:
+      force_hidden_alpha:
+        description: 'Hidden Alpha 강제 발송 (주1회 가드 무시)'
+        type: boolean
+        default: false
   # schedule 제거: GitHub Actions 자체 스케줄 비활성화
 
 jobs:
@@ -54,6 +59,7 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GMAIL_TO:           ${{ secrets.GMAIL_TO }}
           GSPREAD_KEY:        ${{ secrets.GSPREAD_KEY }}
+          HIDDEN_ALPHA_FORCE: ${{ inputs.force_hidden_alpha }}
         run: |
           python automation/run_hidden_alpha.py
 
