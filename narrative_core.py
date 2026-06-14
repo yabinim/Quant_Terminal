@@ -390,43 +390,10 @@ def _split_ticker_field(value) -> list:
 
 
 def _fmp_validate_symbols(symbols, fmp_key: str, timeout: int = 8) -> set:
-    """FMP batch-quote-short 로 '현재 시세가 나오는'(=실재·거래가능) 심볼 집합 반환.
-    응답에 없는 심볼 = 상장폐지/비상장/오타. 키 없음·전건 실패 시 빈 set(검증 불가)."""
-    syms = sorted({str(s).upper().strip() for s in symbols if str(s).strip()})
-    if not fmp_key or not syms:
-        return set()
-    valid = set()
-    got_any = False
-    # URL 길이 안전을 위해 40개씩 청크
-    for i in range(0, len(syms), 40):
-        chunk = syms[i:i + 40]
-        try:
-            r = requests.get(
-                f"{_FMP_BASE}/batch-quote-short",
-                params={"symbols": ",".join(chunk), "apikey": fmp_key},
-                timeout=timeout,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            if not isinstance(data, list):
-                continue
-            got_any = True
-            for row in data:
-                if not isinstance(row, dict):
-                    continue
-                sym = str(row.get("symbol", "")).upper().strip()
-                price = row.get("price")
-                # 시세 행이 존재하고 price가 유효(양수)면 거래 가능으로 판정
-                try:
-                    ok_price = price is not None and float(price) > 0
-                except (TypeError, ValueError):
-                    ok_price = False
-                if sym and ok_price:
-                    valid.add(sym)
-        except Exception:
-            continue
-    # 한 청크라도 정상 응답(200+list)이 있었으면 검증 성립. 전부 실패면 검증 불가.
+    """단건 /quote 기반 존재·거래가능 검증으로 위임(앱과 동일 경로).
+    batch-quote-short는 일부 FMP 플랜에서 Restricted → 단건 quote로 대체.
+    키 없음·전건 실패 시 빈 set(검증 불가, fail-open)."""
+    valid, got_any = _fmp_validate_symbols_ex(symbols, fmp_key, timeout)
     return valid if got_any else set()
 
 
