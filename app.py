@@ -19837,6 +19837,10 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             if "Run_Date" in _sb_df.columns and not _sb_df.empty:
                 _sb_latest = _sb_df["Run_Date"].astype(str).max()
                 _sb_df = _sb_df[_sb_df["Run_Date"].astype(str) == _sb_latest]
+                # 같은 Run_Date 에 여러 번 실행된 경우(동일 날짜 재실행) 중복 방지:
+                # append 순서가 시간순이므로 버킷별 마지막 행(=최신 실행)만 유지
+                if "Verdict" in _sb_df.columns:
+                    _sb_df = _sb_df.drop_duplicates(subset=["Verdict"], keep="last")
 
             if _sb_df.empty:
                 st.info("표시할 백테스트 결과가 없습니다.")
