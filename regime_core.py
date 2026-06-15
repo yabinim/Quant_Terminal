@@ -789,3 +789,162 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
                      "gate_reason": "타이밍 판정 데이터 부족", "enter_ok": False})
 
     return plan
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 7) 근거 중첩도(Confluence) 점수 (#3) — 순수, app/scanner 공유 SSOT
+#    철학: '확신/예측'이 아니라 '확률을 높이는 근거의 합'. 보장 아님.
+#    정직성: 결측 팩터는 점수에서 제외 + 가중 재정규화(허수 방지).
+#    백테스트 반영: 타이밍은 약알파라 과대가중 금지, avoid 는 점수와 무관하게 회피 우선.
+# ──────────────────────────────────────────────────────────────────────────
+
+CONFLUENCE_WEIGHTS = {
+    "timing": 2.0, "rs": 2.0, "fundamental": 2.0, "insider": 1.0, "analyst": 1.0,
+}
+CONFLUENCE_FACTOR_LABELS = {
+    "timing": "추세·타이밍",
+    "rs": "상대강도(RS)",
+    "fundamental": "펀더멘털 건전성",
+    "insider": "내부자 순매수",
+    "analyst": "애널리스트 상승여력",
+}
+_TIMING_SIGNAL = {"entry": 1.0, "wait": 0.5, "overheat": 0.0, "trend_break": -0.5, "avoid": -1.0}
+
+
+def _confluence_label(score, avoid_flag: bool) -> str:
+    if avoid_flag:
+        return "⛔ 회피 우선"
+    if score is None:
+        return "⚪ 데이터 부족"
+    if score >= 70:
+        return "🟢 근거 강함"
+    if score >= 50:
+        return "🟡 근거 보통"
+    if score >= 35:
+        return "🟠 근거 약함"
+    return "🔴 근거 희박"
+
+
+def confluence_score(verdict_code=None, rs_excess=None, piotroski=None, altman_z=None,
+                     insider_ratio=None, analyst_upside=None, short_pct=None,
+                     earnings_days=None, weights: dict = None) -> dict:
+    """여러 근거(정량)를 -1/0/+1 신호로 환산 → 가중 합산 → 0~100 정규화.
+
+    입력(모두 선택; None 이면 해당 팩터 제외 후 재정규화):
+      verdict_code   : analyze_ticker timing code
+      rs_excess      : 종목 63일 수익 − SPY 63일 수익 (소수, 0.08=+8%p)
+      piotroski      : Piotroski F-Score (0~9)
+      altman_z       : Altman Z-Score
+      insider_ratio  : 내부자 매수/매도 비율
+      analyst_upside : (목표가평균/현재가 − 1) (소수)
+      short_pct      : 공매도 비율(점수 미반영 — 정보 표시용)
+      earnings_days  : 다음 실적까지 일수(점수 미반영 — D-5 이내 갱리스크 플래그)
+
+    반환: {score, raw_score, label, avoid_flag, earnings_warning, n_factors,
+           breakdown:[{key,label,signal,weight,contribution,value,available}], short_note}
+    """
+    w = dict(CONFLUENCE_WEIGHTS)
+    if weights:
+        w.update({k: float(v) for k, v in weights.items() if k in w})
+
+    def _num(x):
+        try:
+            v = float(x)
+            return v if np.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
+
+    signals = {}   # key -> (signal or None, value_str)
+
+    # 1) 추세·타이밍
+    code = str(verdict_code) if verdict_code is not None else ""
+    if code in _TIMING_SIGNAL:
+        signals["timing"] = (_TIMING_SIGNAL[code], code)
+    else:
+        signals["timing"] = (None, "데이터 없음")
+
+    # 2) 상대강도(RS): SPY 대비 초과수익
+    rs = _num(rs_excess)
+    if rs is None:
+        signals["rs"] = (None, "데이터 없음")
+    else:
+        sig = 1.0 if rs > 0.05 else (-1.0 if rs < -0.05 else 0.0)
+        signals["rs"] = (sig, f"{rs * 100:+.1f}%p vs SPY(63일)")
+
+    # 3) 펀더멘털 건전성: Piotroski + Altman 평균
+    subs, parts = [], []
+    p = _num(piotroski)
+    if p is not None:
+        subs.append(1.0 if p >= 7 else (-1.0 if p <= 3 else 0.0))
+        parts.append(f"P {p:.0f}/9")
+    z = _num(altman_z)
+    if z is not None:
+        subs.append(1.0 if z > 3 else (-1.0 if z < 1.8 else 0.0))
+        parts.append(f"Z {z:.1f}")
+    if subs:
+        signals["fundamental"] = (float(np.mean(subs)), " · ".join(parts))
+    else:
+        signals["fundamental"] = (None, "데이터 없음")
+
+    # 4) 내부자 순매수
+    ir = _num(insider_ratio)
+    if ir is None:
+        signals["insider"] = (None, "데이터 없음")
+    else:
+        sig = 1.0 if ir > 1.2 else (-1.0 if ir < 0.8 else 0.0)
+        signals["insider"] = (sig, f"매수/매도 {ir:.2f}")
+
+    # 5) 애널리스트 상승여력
+    au = _num(analyst_upside)
+    if au is None:
+        signals["analyst"] = (None, "데이터 없음")
+    else:
+        sig = 1.0 if au > 0.15 else (-1.0 if au < 0.0 else 0.0)
+        signals["analyst"] = (sig, f"상승여력 {au * 100:+.0f}%")
+
+    # ── 점수 산출 (가용 팩터만, 재정규화) ──
+    breakdown = []
+    raw = 0.0
+    total_w = 0.0
+    n_factors = 0
+    for key in ("timing", "rs", "fundamental", "insider", "analyst"):
+        sig, val = signals[key]
+        wt = w.get(key, 0.0)
+        avail = sig is not None
+        contrib = (sig * wt) if avail else 0.0
+        if avail:
+            raw += contrib
+            total_w += wt
+            n_factors += 1
+        breakdown.append({
+            "key": key, "label": CONFLUENCE_FACTOR_LABELS[key],
+            "signal": (round(sig, 2) if avail else None), "weight": wt,
+            "contribution": round(contrib, 2), "value": val, "available": avail,
+        })
+
+    score = round((raw + total_w) / (2 * total_w) * 100.0, 1) if total_w > 0 else None
+    raw_score = score
+    avoid_flag = (code == "avoid")
+    if avoid_flag and score is not None:
+        score = min(score, 35.0)
+
+    # 공매도: 정보 표시용(점수 미반영)
+    sp = _num(short_pct)
+    if sp is None:
+        short_note = ""
+    elif sp >= 20:
+        short_note = f"🔥 공매도 {sp:.1f}% — 스퀴즈 연료/경고"
+    elif sp >= 10:
+        short_note = f"⚠️ 공매도 {sp:.1f}%"
+    else:
+        short_note = f"공매도 {sp:.1f}%(낮음)"
+
+    ed = _num(earnings_days)
+    earnings_warning = (ed is not None and 0 <= ed <= 5)
+
+    return {
+        "score": score, "raw_score": raw_score,
+        "label": _confluence_label(score, avoid_flag),
+        "avoid_flag": avoid_flag, "earnings_warning": earnings_warning,
+        "n_factors": n_factors, "breakdown": breakdown, "short_note": short_note,
+    }

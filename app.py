@@ -17394,6 +17394,94 @@ if st.session_state.get("logged_in"):
                 _regime_res = rc.classify_regime(timing_history, spy_close=_spy_close)
                 _timing_res = rc.evaluate_timing(timing_history, _regime_res)
 
+                # ── ⓪ 왜 이 종목인가 — 근거 중첩도(Confluence) (#3) ──
+                with st.container(border=True):
+                    st.markdown("##### 🧩 왜 이 종목인가 — 근거 중첩도")
+                    if not _regime_res.get("enough_data"):
+                        st.info("근거 종합에 필요한 데이터가 부족합니다.")
+                    else:
+                        # 상대강도(RS): 종목 63일 − SPY 63일 초과수익
+                        _rs_excess = None
+                        try:
+                            _cc = pd.to_numeric(close, errors="coerce").dropna()
+                            if len(_cc) >= 64:
+                                _st63 = float(_cc.iloc[-1]) / float(_cc.iloc[-64]) - 1.0
+                                _sp63 = None
+                                if _spy_close is not None:
+                                    _sc = pd.to_numeric(_spy_close, errors="coerce").dropna()
+                                    if len(_sc) >= 64:
+                                        _sp63 = float(_sc.iloc[-1]) / float(_sc.iloc[-64]) - 1.0
+                                _rs_excess = (_st63 - _sp63) if _sp63 is not None else None
+                        except Exception:
+                            _rs_excess = None
+
+                        # 펀더멘털·내부자·애널리스트·공매도·어닝 — 개별주만(ETF 제외)
+                        _piotroski = _altman = _insider_ratio = _analyst_up = _short = _edays = None
+                        if not is_etf_mode:
+                            _tkr_u = str(selected_ticker).strip().upper()
+                            with st.spinner("근거 종합 중..."):
+                                try:
+                                    _fsc = _fmp_financial_scores(_tkr_u)
+                                    _piotroski = to_float(_fsc.get("piotroskiScore"))
+                                    _altman = to_float(_fsc.get("altmanZScore"))
+                                except Exception:
+                                    pass
+                                try:
+                                    _insider_ratio = to_float(fetch_insider_statistics(_tkr_u).get("ratio"))
+                                except Exception:
+                                    pass
+                                try:
+                                    _tm = to_float(fetch_analyst_price_targets(_tkr_u).get("target_mean"))
+                                    if pd.notna(_tm) and pd.notna(current_price) and float(current_price) > 0:
+                                        _analyst_up = float(_tm) / float(current_price) - 1.0
+                                except Exception:
+                                    pass
+                                try:
+                                    _short = to_float(fetch_short_interest(_tkr_u).get("short_pct"))
+                                except Exception:
+                                    pass
+                                try:
+                                    _ec = fetch_earnings_calendar((_tkr_u,))
+                                    if _ec:
+                                        _edays = _ec[0].get("days_until")
+                                except Exception:
+                                    pass
+
+                        _conf = rc.confluence_score(
+                            verdict_code=_timing_res.get("code"),
+                            rs_excess=_rs_excess,
+                            piotroski=float(_piotroski) if pd.notna(_piotroski) else None,
+                            altman_z=float(_altman) if pd.notna(_altman) else None,
+                            insider_ratio=float(_insider_ratio) if pd.notna(_insider_ratio) else None,
+                            analyst_upside=_analyst_up,
+                            short_pct=float(_short) if pd.notna(_short) else None,
+                            earnings_days=_edays,
+                        )
+
+                        _cc1, _cc2 = st.columns([1, 2.4])
+                        with _cc1:
+                            _score_txt = f"{_conf['score']:.0f}/100" if _conf["score"] is not None else "N/A"
+                            st.metric("근거 중첩도", _score_txt, _conf["label"])
+                        with _cc2:
+                            if _conf["avoid_flag"]:
+                                st.error("⛔ **회피 우선** — 약세 회피 구간. 근거 점수와 무관하게 신규 진입을 권하지 않습니다(백테스트상 음의 초과수익).")
+                            st.caption(f"가용 근거 {_conf['n_factors']}개로 산출. " + (_conf["short_note"] or ""))
+                            if _conf["earnings_warning"]:
+                                st.warning("⚠️ 실적 발표 D-5 이내 — 갭 리스크. 진입·사이징 신중.")
+
+                        def _conf_icon(_s):
+                            return "✅" if _s > 0 else ("⚠️" if _s < 0 else "⚪")
+                        _conf_rows = [{
+                            "근거": _b["label"],
+                            "신호": (_conf_icon(_b["signal"]) if _b["available"] else "—"),
+                            "내용": _b["value"],
+                        } for _b in _conf["breakdown"]]
+                        st.dataframe(pd.DataFrame(_conf_rows), use_container_width=True, hide_index=True)
+                        st.caption(
+                            "**근거 중첩도**는 독립 근거들이 같은 방향을 가리키는 정도 — 상승 *확률을 높이는 근거의 합*이지 "
+                            "*보장*이 아닙니다. 점수가 높아도 진입 타이밍의 실증 엣지는 작으니, 사이징은 아래 **포지션 플랜**대로 보수적으로."
+                        )
+
                 # ── 관점별 신호 (대상별로 묶어 표시: 신규 진입 / 보유 관리 / 단기) ──
                 # ① 신규 진입 관점 — 아직 안 샀다면 ('지금 새로 살까?')
                 with st.container(border=True):
