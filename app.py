@@ -71,7 +71,7 @@ _THESIS_WORKSHEET_TITLE = "Thesis"
 _WATCHLIST_SHEET_TITLE = "Watchlist"
 _PORTFOLIO_ALERT_STATE_TITLE = "Portfolio_Alert_State"
 # 보유 종목 상태 기반 알림: 키 = "user_id|account|ticker"
-_PORTFOLIO_ALERT_STATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At"]
+_PORTFOLIO_ALERT_STATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At", "Stop_Loss", "Target_Price"]
 _PORTFOLIO_ALERT_DEFAULT = "exit,risk"   # 보유 기본 알림: 청산 + 추세 흔들림 (손절은 exit의 ATR 트레일링에 포함)
 _ETF_UNIVERSE_SHEET_TITLE = "ETF_Universe"
 _EMERGING_TRACKER_SHEET_TITLE = "Emerging_Tracker"
@@ -241,10 +241,19 @@ def open_portfolio_alert_state_worksheet():
     try:
         sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
         existing_titles = [w.title for w in sh.worksheets()]
+        _last_col = chr(ord("A") + len(_PORTFOLIO_ALERT_STATE_COLS) - 1)
         if _PORTFOLIO_ALERT_STATE_TITLE in existing_titles:
-            return sh.worksheet(_PORTFOLIO_ALERT_STATE_TITLE), None
-        ws = sh.add_worksheet(title=_PORTFOLIO_ALERT_STATE_TITLE, rows=2000, cols=4)
-        ws.update([_PORTFOLIO_ALERT_STATE_COLS], range_name="A1:D1", value_input_option="USER_ENTERED")
+            ws = sh.worksheet(_PORTFOLIO_ALERT_STATE_TITLE)
+            try:  # 스키마 확장(4→6칸) 시 헤더 자동 갱신 — 기존 행은 빈칸 패딩
+                if (ws.row_values(1) or []) != _PORTFOLIO_ALERT_STATE_COLS:
+                    ws.update([_PORTFOLIO_ALERT_STATE_COLS], range_name=f"A1:{_last_col}1",
+                              value_input_option="USER_ENTERED")
+            except Exception:
+                pass
+            return ws, None
+        ws = sh.add_worksheet(title=_PORTFOLIO_ALERT_STATE_TITLE, rows=2000,
+                              cols=len(_PORTFOLIO_ALERT_STATE_COLS))
+        ws.update([_PORTFOLIO_ALERT_STATE_COLS], range_name=f"A1:{_last_col}1", value_input_option="USER_ENTERED")
         return ws, None
     except Exception as exc:
         return None, f"Portfolio_Alert_State 워크시트 열기/생성 실패: {exc}"
@@ -266,10 +275,17 @@ def load_portfolio_alert_states() -> dict:
         return {}
     out = {}
     for r in vals[1:]:
-        r = (list(r) + [""] * 4)[:4]
+        r = (list(r) + [""] * 6)[:6]
         key = str(r[0]).strip()
         if key:
-            out[key] = {"states": str(r[1]).strip(), "last_state": str(r[2]).strip()}
+            _sl = to_float(r[4])
+            _tp = to_float(r[5])
+            out[key] = {
+                "states": str(r[1]).strip(),
+                "last_state": str(r[2]).strip(),
+                "stop_loss": float(_sl) if pd.notna(_sl) else None,
+                "target_price": float(_tp) if pd.notna(_tp) else None,
+            }
     return out
 
 
@@ -292,6 +308,41 @@ def save_portfolio_alert_states_setting(user_id: str, account: str, ticker: str,
             ws.update([[now_str]], range_name=f"D{row_idx}", value_input_option="RAW")
         else:
             _safe_append_rows(ws, [key, states_csv, "", now_str], value_input_option="RAW")
+        load_portfolio_alert_states.clear()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def save_portfolio_plan_setting(user_id: str, account: str, ticker: str,
+                                stop_loss, target_price) -> tuple[bool, str]:
+    """보유 종목의 손절/목표가(Stop_Loss·Target_Price)만 upsert. Alert_States/last_state 보존.
+    NaN/<=0 은 빈칸(미설정)으로 저장."""
+    ws, err = open_portfolio_alert_state_worksheet()
+    if ws is None:
+        return False, err or "시트 열기 실패"
+    key = _pf_alert_key(user_id, account, ticker)
+
+    def _cell(v):
+        try:
+            f = float(v)
+            return f if (f == f and f > 0) else ""
+        except (TypeError, ValueError):
+            return ""
+    sl_cell, tp_cell = _cell(stop_loss), _cell(target_price)
+    try:
+        vals = ws.get_all_values() or []
+        row_idx = None
+        for i, r in enumerate(vals[1:], start=2):
+            if r and str(r[0]).strip() == key:
+                row_idx = i
+                break
+        now_str = _narrative_now_et_string()
+        if row_idx:
+            ws.update([[sl_cell, tp_cell]], range_name=f"E{row_idx}:F{row_idx}", value_input_option="RAW")
+            ws.update([[now_str]], range_name=f"D{row_idx}", value_input_option="RAW")
+        else:
+            _safe_append_rows(ws, [key, "", "", now_str, sl_cell, tp_cell], value_input_option="RAW")
         load_portfolio_alert_states.clear()
         return True, ""
     except Exception as exc:
@@ -18364,6 +18415,72 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     st.toast(f"{_tk} 알림 저장됨")
                                 else:
                                     st.error(f"저장 실패: {_e}")
+
+                        # ── 보유 플랜 (손절/목표 저장 · R:R) — #2 build_trade_plan 소비 (item2) ──
+                        _ps = _pf_states.get(_key, {})
+                        _saved_sl = _ps.get("stop_loss")
+                        _saved_tp = _ps.get("target_price")
+                        try:
+                            _cur_px = float(pd.to_numeric(_pf_hist_cache[_tk]["Close"], errors="coerce").dropna().iloc[-1])
+                        except Exception:
+                            _cur_px = float("nan")
+                        _pcol1, _pcol2, _pcol3 = st.columns([1, 1, 0.7])
+                        with _pcol1:
+                            _in_sl = st.number_input("손절가 ($)", min_value=0.0, step=0.5,
+                                                     value=float(_saved_sl) if _saved_sl else 0.0,
+                                                     key=f"pf_sl_{acct}_{_tk}")
+                        with _pcol2:
+                            _in_tp = st.number_input("목표가 ($)", min_value=0.0, step=0.5,
+                                                     value=float(_saved_tp) if _saved_tp else 0.0,
+                                                     key=f"pf_tp_{acct}_{_tk}")
+                        with _pcol3:
+                            st.write("")
+                            if st.button("💾 플랜", key=f"pf_plan_save_{acct}_{_tk}", help="이 종목 손절/목표 저장"):
+                                _ok, _e = save_portfolio_plan_setting(
+                                    puid, acct, _tk,
+                                    _in_sl if _in_sl > 0 else None,
+                                    _in_tp if _in_tp > 0 else None)
+                                if _ok:
+                                    st.toast(f"{_tk} 플랜 저장됨"); st.rerun()
+                                else:
+                                    st.error(f"저장 실패: {_e}")
+                        if pd.notna(_cur_px) and _cur_px > 0:
+                            try:
+                                _rp_pf = _regime_params(compute_daily_risk_gauge("전체"))
+                            except Exception:
+                                _rp_pf = _regime_params({})
+                            _atr_pf = rc.compute_atr(_pf_hist_cache[_tk])
+                            _csp = pd.to_numeric(_pf_hist_cache[_tk]["Close"], errors="coerce").dropna()
+                            _ma200_pf = float("nan")
+                            try:
+                                if len(_csp) >= 150:
+                                    _ma200_pf = float(_csp.rolling(200, min_periods=150).mean().dropna().iloc[-1])
+                            except Exception:
+                                pass
+                            _hi_pf = float("nan")
+                            try:
+                                _hh = _pf_hist_cache[_tk]["High"] if "High" in _pf_hist_cache[_tk].columns else _csp
+                                _hi_pf = float(pd.to_numeric(_hh, errors="coerce").dropna().tail(120).max())
+                            except Exception:
+                                pass
+                            _plan_pf = rc.build_trade_plan(
+                                verdict_code=_tv.get("code"), entry=_cur_px,
+                                atr=_atr_pf, ma200=_ma200_pf,
+                                equity=float(st.session_state.get("_size_equity", 10000.0)),
+                                risk_pct=float(st.session_state.get("_size_risk_pct", 1.0)),
+                                atr_mult=_rp_pf["atr_mult"], rr_target=_rp_pf["rr"],
+                                stop_source=("manual" if (_saved_sl and _saved_sl > 0) else "atr"),
+                                manual_stop=(float(_saved_sl) if _saved_sl else None),
+                                manual_target=(float(_saved_tp) if _saved_tp else None),
+                                recent_high=_hi_pf,
+                            )
+                            if _plan_pf["gate"] != "na":
+                                _bits = [f"손절 ${_plan_pf['stop']:.2f} ({_plan_pf['stop_pct']:.1f}%)"]
+                                if pd.notna(_plan_pf["target"]):
+                                    _bits.append(f"목표 ${_plan_pf['target']:.2f} ({_plan_pf['target_pct']:+.1f}%)")
+                                _bits.append(f"R:R {_plan_pf['rr_label']}")
+                                _src_kr = {"manual": "내 설정", "atr": "ATR 기본", "ma200": "200MA"}.get(str(_plan_pf["stop_source"]), "")
+                                st.caption("🧮 보유 플랜: " + " · ".join(_bits) + (f"  (손절 {_src_kr})" if _src_kr else ""))
                         st.divider()
 
         st.markdown("### 계좌 필터 (매도 레이더)")
