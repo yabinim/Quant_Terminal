@@ -7,29 +7,33 @@ GitHub Actions 자동 실행: 레짐 엔진 신호 자기검증(워크포워드 
 목적
 ----
 라이브와 *동일한* regime_core.analyze_ticker 를 과거 시점마다(미래 훔쳐보기 없이) 호출하여,
-verdict(entry/wait/overheat/trend_break/avoid)가 켜진 '전환 시점' 이후 실제로 어떻게 됐는지
-(+5/+20/+60일 수익 · MFE · MAE)를 버킷별로 집계한다.
+verdict(entry/wait/overheat/trend_break/avoid)가 켜진 시점 이후 실제로 어떻게 됐는지
+(+5/+20/+60일 수익 · SPY 대비 초과수익 · MFE · MAE)를 버킷별로 집계한다.
 
-  → "🎯 entry 가 정말 돈이 됐나? entry > wait > overheat > avoid 순으로 갈리나?"를 숫자로.
+  → "🎯 entry 가 정말 돈이 됐나? 시장(SPY) 대비 알파가 있나? entry>wait>overheat>avoid 로 갈리나?"
+
+v1.1 변경
+---------
+- 초과수익(excess): 각 이벤트 +Nd 수익에서 SPY 동일 캘린더창 수익을 빼 베타 제거 → 알파 측정.
+- 디플랩(de-flap): raw verdict 가 confirm_days(2) 연속 유지된 그날만 1회 이벤트로 확정,
+  같은 code 는 cooldown_days(5) 내 재기록 금지 → 경계 진동(flapping)으로 인한 중복 폭증 제거.
 
 흐름
 ----
-  [STEP 1] 유니버스 로드: ETF_Universe + Watchlist + Portfolios (합집합, 중복 제거)
-  [STEP 2] SPY + 유니버스 장기 일봉 fetch (FMP /stable historical-price-eod/full)
-  [STEP 3] 티커마다 워크포워드: hist[:D] 슬라이스 → analyze_ticker → verdict 전환 = 이벤트
-           각 이벤트의 forward-return(+5/+20/+60일) · MFE/MAE(20일창) 측정
-  [STEP 4] verdict 버킷별 집계: 이벤트수 · 승률(+20일) · 평균/중앙값 수익 · 평균 MFE/MAE
-  [STEP 5] Signal_Backtest 시트에 'run당 × 버킷당 1행' append (스냅샷 누적)
+  [1] 유니버스: ETF_Universe + Watchlist + Portfolios (합집합, 중복 제거)
+  [2] SPY + 유니버스 장기 일봉 fetch (FMP /stable historical-price-eod/full)
+  [3] 티커마다 워크포워드: hist[:D] 슬라이스 → analyze_ticker → 2일 확정 시 이벤트
+      forward-return(+5/+20/+60일) · SPY 대비 초과수익 · MFE/MAE(20일창) 측정
+  [4] 버킷별 집계: 이벤트수 · 승률 · 평균/중앙 수익 · MFE/MAE · 초과20d 평균 · 초과승률
+  [5] Signal_Backtest 시트에 'run당 × 버킷당 1행' append (헤더 불일치 시 자동 갱신)
 
 설계 메모
 ---------
-- 무결성: 분류에는 D 이전 데이터만 사용(엄격 슬라이스). 200일선 위해 최소 220봉 선행 요구.
-  +N일 미래가 아직 없는 최근 이벤트의 해당 수익은 NaN.
-- SSOT: regime_core 를 '소비'만 한다(재구현 금지). app.py·run_watchlist_alerts 와 동일 판정.
-- 순수 엔진(_forward_metrics / walk_forward_events / aggregate_events)은 numpy/pandas만 의존 →
-  FMP·시트 없이 단위 테스트 가능(analyze_fn 주입). I/O·main 은 파일 하단에 분리.
-- 2번(사이징·R:R)이 MFE/MAE 분포를 직접 소비하므로 v1부터 MFE/MAE 를 결과에 담는다.
-  이벤트는 dict 라 3번(확신점수)에서 태그 추가만으로 additive 확장 가능.
+- 무결성: 분류엔 D 이전 데이터만(엄격 슬라이스). 최소 220봉 선행. 미래 부족분 NaN.
+- SSOT: regime_core 를 '소비'만(재구현 금지). app.py·run_watchlist_alerts 와 동일 판정.
+- 순수 엔진(_forward_metrics / walk_forward_events / aggregate_events)은 numpy/pandas 만 의존 →
+  FMP·시트 없이 단위 테스트 가능(analyze_fn 주입). I/O·main 은 하단 분리.
+- MFE/MAE 는 절대값(사이징·R:R 의 손절/목표 거리 입력). 초과수익은 점수익(5/20/60d)에만.
 
 실행 주기: 월 1회 또는 workflow_dispatch 수동.
 """
@@ -76,18 +80,21 @@ _RESULT_COLS = [
     "Run_Date", "History_Start", "History_End", "Universe_Size", "Verdict",
     "Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean", "Ret_20d_Median",
     "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean",
+    "Excess_20d_Mean", "ExcessWin_20d",   # v1.1: SPY 대비 알파
 ]
 
 _FMP_BASE    = "https://financialmodelingprep.com/stable"
 _FMP_TIMEOUT = 8
 _FETCH_WORKERS = 8           # FMP Starter 300 req/min 여유
 
-# 백테스트 파라미터
-HORIZONS         = (5, 20, 60)   # forward-return 측정 거래일
-MFE_WINDOW       = 20            # MFE/MAE 측정 창(거래일)
-MIN_PRIOR_BARS   = 220          # 200일선 산출 위한 최소 선행 봉수 (그 전엔 평가 안 함)
-TEST_LOOKBACK    = 756          # 평가 구간(거래일 ≈ 3년). 부하·표본 균형 — 튜닝 한 곳.
-HISTORY_LIMIT    = MIN_PRIOR_BARS + TEST_LOOKBACK + max(HORIZONS) + 40  # fetch 봉수 여유
+# 백테스트 파라미터 (튜닝 한 곳)
+HORIZONS       = (5, 20, 60)   # forward-return 측정 거래일
+MFE_WINDOW     = 20            # MFE/MAE 측정 창(거래일)
+MIN_PRIOR_BARS = 220           # 200일선 산출 위한 최소 선행 봉수
+TEST_LOOKBACK  = 756           # 평가 구간(거래일 ≈ 3년)
+CONFIRM_DAYS   = 2             # v1.1: raw code 가 N일 연속 유지돼야 이벤트 확정(라이브 알림과 동일 철학)
+COOLDOWN_DAYS  = 5             # v1.1: 같은 code 재기록 최소 간격(경계 진동 압축)
+HISTORY_LIMIT  = MIN_PRIOR_BARS + TEST_LOOKBACK + max(HORIZONS) + 40
 
 # 집계 대상 버킷 (regime_core evaluate_timing code 와 일치, unknown 제외)
 BUCKETS = ("entry", "wait", "overheat", "trend_break", "avoid")
@@ -97,16 +104,18 @@ BUCKETS = ("entry", "wait", "overheat", "trend_break", "avoid")
 # 순수 엔진 (numpy/pandas 만 의존 — FMP·시트 없이 테스트 가능)
 # ════════════════════════════════════════════════════════════════════════════
 
-def _forward_metrics(close, high, low, pos: int,
-                     horizons=HORIZONS, mfe_window: int = MFE_WINDOW) -> dict:
-    """pos 시점 종가를 진입가로 보고 forward-return 과 MFE/MAE 산출.
+def _forward_metrics(close, high, low, pos: int, horizons=HORIZONS,
+                     mfe_window: int = MFE_WINDOW, spy_arr=None) -> dict:
+    """pos 시점 종가를 진입가로 보고 forward-return / 초과수익 / MFE·MAE 산출.
 
-    - ret_{h}d : pos+h 종가 / 진입가 - 1   (미래 봉 부족 시 NaN)
-    - mfe      : [pos+1, pos+mfe_window] 최고가 / 진입가 - 1  (최대 상승, +)
-    - mae      : [pos+1, pos+mfe_window] 최저가 / 진입가 - 1  (최대 하락, 보통 -)
+    - ret_{h}d    : pos+h 종가 / 진입가 - 1            (미래 부족 시 NaN)
+    - excess_{h}d : ret_{h}d - (SPY 동일창 수익)        (spy_arr 정렬 제공 시; 베타 제거 알파)
+    - mfe / mae   : [pos+1, pos+mfe_window] 최고/최저 / 진입가 - 1  (절대값, 사이징 입력)
+    spy_arr: 종목 거래일에 정렬(ffill)된 SPY 종가 배열(없으면 초과수익 NaN).
     """
     n = len(close)
     out = {f"ret_{h}d": np.nan for h in horizons}
+    out.update({f"excess_{h}d": np.nan for h in horizons})
     out["mfe"] = np.nan
     out["mae"] = np.nan
     if pos < 0 or pos >= n:
@@ -115,10 +124,17 @@ def _forward_metrics(close, high, low, pos: int,
     if not np.isfinite(entry) or entry <= 0:
         return out
 
+    spy_entry = None
+    if spy_arr is not None and pos < len(spy_arr) and np.isfinite(spy_arr[pos]) and spy_arr[pos] > 0:
+        spy_entry = float(spy_arr[pos])
+
     for h in horizons:
         j = pos + h
         if j < n and np.isfinite(close[j]):
-            out[f"ret_{h}d"] = float(close[j]) / entry - 1.0
+            r = float(close[j]) / entry - 1.0
+            out[f"ret_{h}d"] = r
+            if spy_entry is not None and j < len(spy_arr) and np.isfinite(spy_arr[j]):
+                out[f"excess_{h}d"] = r - (float(spy_arr[j]) / spy_entry - 1.0)
 
     end = min(pos + mfe_window, n - 1)
     if end > pos:
@@ -135,12 +151,14 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                         min_prior: int = MIN_PRIOR_BARS,
                         test_lookback: int = TEST_LOOKBACK,
                         horizons=HORIZONS, mfe_window: int = MFE_WINDOW,
+                        confirm_days: int = CONFIRM_DAYS,
+                        cooldown_days: int = COOLDOWN_DAYS,
                         analyze_fn=None):
-    """한 티커의 워크포워드 평가.
+    """한 티커의 워크포워드 평가 (v1.1: 2일 확정 + 쿨다운 디플랩).
 
-    각 평가 시점 i 에서 hist[:i+1] 슬라이스를 analyze_fn 에 넘겨 verdict code 를 얻고,
-    code 가 직전과 '다르게 전환'될 때만 이벤트로 기록(실제 매매 = 한 번 진입과 정합).
-    분류는 i 까지의 데이터만 사용 → 미래 훔쳐보기 없음. forward 측정만 미래 종가 참조.
+    각 평가일 i 에서 hist[:i+1] → analyze_fn → raw code. 분류는 i 까지 데이터만(미래 차단).
+    raw code 가 confirm_days 연속 유지된 '그날' 1회 확정 → 직전 기록과 다르거나(또는 같아도
+    cooldown_days 경과 시) 이벤트로 기록. forward 측정만 미래 종가 참조.
 
     반환: (events: list[dict], first_eval_date, last_eval_date)
     """
@@ -162,10 +180,23 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     if n < min_prior + 2:
         return events, None, None
 
+    # SPY 를 종목 거래일에 정렬(ffill) → 같은 캘린더창 초과수익 계산
+    spy_arr = None
+    if spy_close is not None:
+        try:
+            spy_arr = (pd.to_numeric(spy_close, errors="coerce")
+                       .reindex(dates, method="ffill").to_numpy(dtype=float))
+        except Exception:
+            spy_arr = None
+
     start_i = max(min_prior, n - test_lookback)
-    prev_code = None
     first_eval_date = None
     last_eval_date = None
+
+    pending_code = None     # 현재 연속 유지 중인 raw code
+    pending_count = 0       # 연속 유지 일수
+    last_rec_code = None    # 마지막으로 '기록'된 code
+    last_rec_pos = -10 ** 9  # 마지막 기록 위치(쿨다운용)
 
     for i in range(start_i, n):
         date_i = dates[i]
@@ -186,19 +217,27 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
             first_eval_date = date_i
         last_eval_date = date_i
 
-        if code == "unknown":
-            prev_code = "unknown"
+        # 연속 유지 카운트
+        if code == pending_code:
+            pending_count += 1
+        else:
+            pending_code = code
+            pending_count = 1
+
+        if code not in BUCKETS:
             continue
-        if prev_code is None:
-            prev_code = code           # 최초 평가 = 기준점(발동 안 함)
+        # 확정: confirm_days 에 '도달한 그날'만 1회 (이후 같은 run 은 재발동 안 함)
+        if pending_count != confirm_days:
             continue
-        if code != prev_code:
-            fm = _forward_metrics(close, high, low, i, horizons, mfe_window)
+        # de-dup: 직전 기록과 다른 code 이거나, 같아도 쿨다운 경과 시에만 기록
+        if (code != last_rec_code) or (i - last_rec_pos >= cooldown_days):
+            fm = _forward_metrics(close, high, low, i, horizons, mfe_window, spy_arr=spy_arr)
             ev = {"date": str(pd.Timestamp(date_i).date()),
                   "code": code, "entry_price": float(close[i])}
             ev.update(fm)
             events.append(ev)
-        prev_code = code
+            last_rec_code = code
+            last_rec_pos = i
 
     return events, first_eval_date, last_eval_date
 
@@ -220,6 +259,9 @@ def aggregate_events(events: list[dict]) -> dict:
         r20 = np.array([e.get("ret_20d", np.nan) for e in evs], dtype=float)
         valid20 = r20[np.isfinite(r20)]
         winrate = round(float(np.mean(valid20 > 0)) * 100.0, 2) if valid20.size else np.nan
+        ex20 = np.array([e.get("excess_20d", np.nan) for e in evs], dtype=float)
+        ex20v = ex20[np.isfinite(ex20)]
+        excess_win = round(float(np.mean(ex20v > 0)) * 100.0, 2) if ex20v.size else np.nan
         agg[code] = {
             "count": len(evs),
             "winrate_20d": winrate,
@@ -229,6 +271,8 @@ def aggregate_events(events: list[dict]) -> dict:
             "ret_60d_mean": _nan_pct([e.get("ret_60d") for e in evs], np.mean),
             "mfe_20d_mean": _nan_pct([e.get("mfe") for e in evs], np.mean),
             "mae_20d_mean": _nan_pct([e.get("mae") for e in evs], np.mean),
+            "excess_20d_mean": _nan_pct(ex20, np.mean),
+            "excess_win_20d": excess_win,
         }
     return agg
 
@@ -247,6 +291,7 @@ def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
             _cell(a.get("ret_5d_mean")), _cell(a.get("ret_20d_mean")),
             _cell(a.get("ret_20d_median")), _cell(a.get("ret_60d_mean")),
             _cell(a.get("mfe_20d_mean")), _cell(a.get("mae_20d_mean")),
+            _cell(a.get("excess_20d_mean")), _cell(a.get("excess_win_20d")),
         ])
     return rows
 
@@ -356,13 +401,21 @@ def load_universe(gc) -> list:
 
 
 def open_result_worksheet(gc):
-    """Signal_Backtest 탭. 없으면 생성 + 헤더."""
+    """Signal_Backtest 탭. 없으면 생성 + 헤더. 헤더가 현재 스키마와 다르면 헤더만 갱신(마이그레이션)."""
     sh = gc.open(_SPREADSHEET_TITLE)
     titles = [ws.title for ws in sh.worksheets()]
-    if _RESULT_WORKSHEET in titles:
-        return sh.worksheet(_RESULT_WORKSHEET)
-    ws = sh.add_worksheet(title=_RESULT_WORKSHEET, rows=2000, cols=len(_RESULT_COLS))
     last_col = chr(ord("A") + len(_RESULT_COLS) - 1)
+    if _RESULT_WORKSHEET in titles:
+        ws = sh.worksheet(_RESULT_WORKSHEET)
+        try:
+            if (ws.row_values(1) or []) != _RESULT_COLS:
+                ws.update([_RESULT_COLS], range_name=f"A1:{last_col}1",
+                          value_input_option="USER_ENTERED")
+                print("[INFO] Signal_Backtest 헤더 갱신(스키마 변경 반영)")
+        except Exception:
+            pass
+        return ws
+    ws = sh.add_worksheet(title=_RESULT_WORKSHEET, rows=2000, cols=len(_RESULT_COLS))
     ws.update([_RESULT_COLS], range_name=f"A1:{last_col}1", value_input_option="USER_ENTERED")
     return ws
 
@@ -429,15 +482,17 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict):
 def _print_summary(agg: dict, meta: dict) -> None:
     print(f"\n[백테스트 요약] 유니버스 {meta['universe_size']}종목 · "
           f"구간 {meta['hist_start']}~{meta['hist_end']} · 총 이벤트 {meta['total_events']}")
-    print(f"{'버킷':<12}{'N':>6}{'승률20d':>9}{'평균5d':>9}{'평균20d':>9}{'중앙20d':>9}"
-          f"{'평균60d':>9}{'MFE20':>8}{'MAE20':>8}")
+    hdr = (f"{'버킷':<12}{'N':>6}{'승률20d':>9}{'평균5d':>8}{'평균20d':>8}{'중앙20d':>8}"
+           f"{'평균60d':>8}{'MFE20':>7}{'MAE20':>7}{'초과20d':>8}{'초과승률':>9}")
+    print(hdr)
     for code in BUCKETS:
         a = agg[code]
         def s(v):
             return "-" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else f"{v}"
-        print(f"{code:<12}{a['count']:>6}{s(a['winrate_20d']):>9}{s(a['ret_5d_mean']):>9}"
-              f"{s(a['ret_20d_mean']):>9}{s(a['ret_20d_median']):>9}{s(a['ret_60d_mean']):>9}"
-              f"{s(a['mfe_20d_mean']):>8}{s(a['mae_20d_mean']):>8}")
+        print(f"{code:<12}{a['count']:>6}{s(a['winrate_20d']):>9}{s(a['ret_5d_mean']):>8}"
+              f"{s(a['ret_20d_mean']):>8}{s(a['ret_20d_median']):>8}{s(a['ret_60d_mean']):>8}"
+              f"{s(a['mfe_20d_mean']):>7}{s(a['mae_20d_mean']):>7}"
+              f"{s(a['excess_20d_mean']):>8}{s(a['excess_win_20d']):>9}")
 
 
 def main():
@@ -447,30 +502,26 @@ def main():
 
     t0 = time.time()
     run_date = datetime.now(_ET).strftime("%Y-%m-%d")
-    print(f"[START] 신호 백테스트 run_date={run_date} (ET)")
+    print(f"[START] 신호 백테스트 run_date={run_date} (ET) · confirm={CONFIRM_DAYS}d cooldown={COOLDOWN_DAYS}d")
 
     gc = get_gspread_client()
 
-    # STEP 1 — 유니버스
     universe = load_universe(gc)
     print(f"[STEP1] 유니버스 {len(universe)}종목")
     if not universe:
         print("[INFO] 유니버스 비어 있음 — 중단")
         return 0
 
-    # STEP 2 — SPY + 유니버스 이력
     spy_hist = _fmp_price_history("SPY")
     if spy_hist.empty:
-        print("[WARN] SPY 이력 fetch 실패 — RS 없이 진행")
+        print("[WARN] SPY 이력 fetch 실패 — 초과수익 NaN 으로 진행")
     hist_cache = _batch_fetch_history(universe)
     print(f"[STEP2] 이력 확보 {len(hist_cache)}/{len(universe)}종목 "
           f"(SPY {'OK' if not spy_hist.empty else '실패'})")
 
-    # STEP 3~4 — 워크포워드 + 집계
     agg, meta = run_backtest(universe, spy_hist, hist_cache)
     _print_summary(agg, meta)
 
-    # STEP 5 — 저장
     rows = build_result_rows(agg, run_date, meta["hist_start"], meta["hist_end"],
                              meta["universe_size"])
     try:
