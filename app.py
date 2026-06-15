@@ -18393,6 +18393,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             st.warning(_line + " · ⚠️ 추세 흔들림\n\n" + " · ".join(_tv.get("reasons", [])))
                         else:
                             st.success(_line + " · ✅ 보유 양호")
+                        _ex_warns = _ex.get("warnings", [])
+                        if _ex_warns:
+                            st.caption("⚠️ " + " · ".join(_ex_warns) + " — 분할 청산·스톱 타이트닝 고려")
 
                         # 종목별 알림 토글 (Portfolio_Alert_State 에 저장)
                         _key = _pf_alert_key(puid, acct, _tk)

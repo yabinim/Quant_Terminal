@@ -385,6 +385,65 @@ def evaluate_timing(hist: pd.DataFrame, regime_res: dict) -> dict:
 #    reasons 리스트 구조 → v2(네거티브 리버설) additive
 # ──────────────────────────────────────────────────────────────────────────
 
+# 네거티브 리버설(Cardwell) — 조기 토핑 경고 파라미터
+NEG_REV_PIVOT_N = 3       # 스윙 고점 피벗: 좌우 N봉보다 높아야
+NEG_REV_LOOKBACK = 120    # 최근 N봉 내에서 고점 2개 탐색
+NEG_REV_RSI_MIN = 55.0    # 두 고점 모두 RSI 이 값 이상일 때만(상단에서만 의미)
+NEG_REV_MIN_GAP = 5       # 두 고점 최소 간격(봉)
+
+
+def _find_swing_highs(values, pivot_n: int) -> list:
+    """좌우 pivot_n 봉보다 엄격히 높은 스윙 고점 인덱스 목록(우측 pivot_n 봉으로 확정)."""
+    n = len(values)
+    out = []
+    for i in range(pivot_n, n - pivot_n):
+        c = values[i]
+        if not np.isfinite(c):
+            continue
+        left = values[i - pivot_n:i]
+        right = values[i + 1:i + pivot_n + 1]
+        if left.size and right.size and c > np.nanmax(left) and c > np.nanmax(right):
+            out.append(i)
+    return out
+
+
+def _detect_negative_reversal(close, rsi, pivot_n: int = NEG_REV_PIVOT_N,
+                              lookback: int = NEG_REV_LOOKBACK,
+                              rsi_min: float = NEG_REV_RSI_MIN,
+                              min_gap: int = NEG_REV_MIN_GAP) -> dict:
+    """Cardwell 네거티브 리버설: 가격은 더 낮은 고점인데 RSI는 더 높은 고점 → 토핑 경고.
+    노이즈 억제: 두 고점 RSI ≥ rsi_min, 간격 ≥ min_gap, 현재가·RSI가 2번째 고점에서 꺾임(확정).
+    반환: {detected, message, detail}."""
+    out = {"detected": False, "message": "", "detail": {}}
+    try:
+        df = pd.concat([pd.to_numeric(close, errors="coerce"),
+                        pd.to_numeric(rsi, errors="coerce")], axis=1).dropna()
+    except Exception:
+        return out
+    if len(df) < (pivot_n * 2 + min_gap + 2):
+        return out
+    df = df.tail(lookback)
+    cv = df.iloc[:, 0].to_numpy(dtype=float)
+    rv = df.iloc[:, 1].to_numpy(dtype=float)
+    highs = _find_swing_highs(cv, pivot_n)
+    if len(highs) < 2:
+        return out
+    p1, p2 = highs[-2], highs[-1]
+    if (p2 - p1) < min_gap:
+        return out
+    price_lower_high = cv[p2] < cv[p1]
+    rsi_higher_high = rv[p2] > rv[p1]
+    upper_range = (rv[p1] >= rsi_min) and (rv[p2] >= rsi_min)
+    confirmed = (cv[-1] < cv[p2]) and (rv[-1] < rv[p2])   # 2번째 고점에서 꺾임
+    if price_lower_high and rsi_higher_high and upper_range and confirmed:
+        out["detected"] = True
+        out["message"] = (f"네거티브 리버설: 고점 ${cv[p1]:.2f}→${cv[p2]:.2f}(낮아짐)인데 "
+                          f"RSI {rv[p1]:.0f}→{rv[p2]:.0f}(높아짐) — 토핑 경고")
+        out["detail"] = {"high1": float(cv[p1]), "high2": float(cv[p2]),
+                         "rsi1": float(rv[p1]), "rsi2": float(rv[p2])}
+    return out
+
+
 def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -> dict:
     """보유 종목 청산 신호. 강세 추세가 꺾이는지 점검.
 
@@ -427,12 +486,18 @@ def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -
         if price < chandelier:
             reasons.append(f"ATR 트레일링 스톱(${chandelier:.2f}) 하회")
 
-    # --- v2 seam: 네거티브 리버설 detector 를 여기 reasons 에 append 하면 끝 ---
+    # --- v2: 네거티브 리버설 (조기 경고 — is_exit 미반영, 거짓 청산 방지) ---
+    warnings: list[str] = []
+    neg_rev = _detect_negative_reversal(close, rsi)
+    if neg_rev["detected"]:
+        warnings.append(neg_rev["message"])
 
     out["is_exit"] = len(reasons) > 0
     out["reasons"] = reasons
+    out["warnings"] = warnings
     out["detail"] = {"price": price, "ma50": ma50, "rsi": rsi_last,
-                     "atr": atr, "chandelier": chandelier}
+                     "atr": atr, "chandelier": chandelier,
+                     "negative_reversal": bool(neg_rev["detected"])}
     return out
 
 
