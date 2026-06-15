@@ -19857,7 +19857,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     lambda c: rc.TIMING_BADGE.get(str(c), str(c))
                 )
                 _sb_numcols = ["Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean",
-                               "Ret_20d_Median", "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean"]
+                               "Ret_20d_Median", "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean",
+                               "Excess_20d_Mean", "ExcessWin_20d"]  # v1.1: SPY 대비 알파
                 for _c in _sb_numcols:
                     if _c in _sb_disp.columns:
                         _sb_disp[_c] = pd.to_numeric(_sb_disp[_c], errors="coerce")
@@ -19866,10 +19867,16 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     "Ret_5d_Mean": "평균5d(%)", "Ret_20d_Mean": "평균20d(%)",
                     "Ret_20d_Median": "중앙20d(%)", "Ret_60d_Mean": "평균60d(%)",
                     "MFE_20d_Mean": "MFE20d(%)", "MAE_20d_Mean": "MAE20d(%)",
+                    "Excess_20d_Mean": "초과20d(%)", "ExcessWin_20d": "초과승률20d(%)",
                 })
                 _sb_ret_cols = ["평균5d(%)", "평균20d(%)", "중앙20d(%)", "평균60d(%)",
                                 "MFE20d(%)", "MAE20d(%)"]
+                # 초과수익 컬럼은 v1.1 백테스트 이후에만 존재 → 있을 때만 표시(구버전 시트 호환)
+                if "초과20d(%)" in _sb_disp.columns:
+                    _sb_ret_cols = _sb_ret_cols + ["초과20d(%)"]   # 초과수익도 색상 적용
                 _sb_show = ["판정", "이벤트수", "승률20d(%)"] + _sb_ret_cols
+                if "초과승률20d(%)" in _sb_disp.columns:
+                    _sb_show = _sb_show + ["초과승률20d(%)"]
 
                 def _sb_color(v):
                     try:
@@ -19882,8 +19889,16 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         return "color:#dc2626;font-weight:600;"
                     return ""
 
-                _sb_fmt = {"이벤트수": "{:,.0f}", "승률20d(%)": "{:,.1f}"}
-                _sb_fmt.update({c: "{:,.2f}" for c in _sb_ret_cols})
+                _sb_fmt = {}
+                for _c in _sb_show:
+                    if _c == "판정":
+                        continue
+                    elif _c == "이벤트수":
+                        _sb_fmt[_c] = "{:,.0f}"
+                    elif _c in ("승률20d(%)", "초과승률20d(%)"):
+                        _sb_fmt[_c] = "{:,.1f}"
+                    else:
+                        _sb_fmt[_c] = "{:,.2f}"
 
                 st.dataframe(
                     _sb_disp[_sb_show].style
@@ -19892,10 +19907,11 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     use_container_width=True, hide_index=True,
                 )
                 st.caption(
-                    "**읽는 법:** `🎯 지금 매수 구간`의 +20일 평균·승률이 `대기/과열/회피`보다 높을수록 "
-                    "엔진의 **판별력**이 유효하다는 신호입니다. **MFE/MAE**(최대 상승/하락 여력)는 다음 단계인 "
-                    "**사이징·손익비(R:R)** 설계에서 손절·목표 거리 산정의 입력으로 쓰입니다. "
-                    "이벤트수가 적은 버킷은 통계가 불안정할 수 있습니다."
+                    "**읽는 법:** **초과20d(%)**·**초과승률**은 SPY를 같은 기간 보유한 것 대비 성과(=**알파**, 베타 제거)입니다. "
+                    "0보다 클수록 시장 표류가 아닌 **타이밍이 더한 진짜 수익**을 뜻합니다. `🎯 지금 매수 구간`의 +20일·초과수익이 "
+                    "`대기/과열/회피`보다 높을수록 엔진의 **판별력**이 유효하다는 신호입니다. **MFE/MAE**(최대 상승/하락 여력)는 "
+                    "다음 단계인 **사이징·손익비(R:R)** 설계에서 손절·목표 거리 산정의 입력으로 쓰입니다. "
+                    "이벤트는 **2일 확정 + 5일 쿨다운**으로 경계 진동(중복)을 걸러냈고, 이벤트수가 적은 버킷은 통계가 불안정할 수 있습니다."
                 )
 
     elif main_nav == _MAIN_NAV_OPTIONS[9]:
