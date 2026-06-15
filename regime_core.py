@@ -581,3 +581,211 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
 
     new_state = {"regime": baseline_regime, "events": events_state, "ts": today_str}
     return fired, _json.dumps(new_state, ensure_ascii=False)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 6) 포지션 사이징 · R:R 게이트 (#2) — 순수, app/automation 공유 SSOT
+#    철학(백테스트 기반): 손실 회피 우선. avoid=음알파→진입 비추, entry=약한 +알파→정상 사이즈.
+#    거래당 리스크 고정(고정 분율). 손절/목표 '가격'은 app.suggest_stop_and_target 가 공급,
+#    국면 적응 배수/손익비는 app._regime_params 가 공급 → 여기서 '조합'만(드리프트 방지).
+# ──────────────────────────────────────────────────────────────────────────
+
+# 게이트 코드 → 라벨 (UI 공유)
+GATE_LABELS = {
+    "fit":     "✅ 진입 적합",
+    "skip":    "⚠️ 자리 나쁨 — 건너뛰기",
+    "avoid":   "⛔ 진입 비추 — 회피 구간",
+    "caution": "🔶 신중 — 분할·관망 고려",
+    "na":      "⚪ 판단 보류(데이터 부족)",
+}
+DEFAULT_RISK_PCT = 1.0       # 거래당 자본 대비 리스크 %
+DEFAULT_MAX_POSITION_PCT = 20.0  # 단일 종목 최대 비중 %
+
+
+def evaluate_rr(entry, stop, target) -> dict:
+    """손익비(R:R) 산출. target 은 진입가보다 위여야 의미 있음.
+    반환: {risk, reward, r_multiple, label}. 산출 불가 시 NaN/"-"."""
+    out = {"risk": np.nan, "reward": np.nan, "r_multiple": np.nan, "label": "-"}
+    try:
+        e, s, t = float(entry), float(stop), float(target)
+    except (TypeError, ValueError):
+        return out
+    if not (np.isfinite(e) and np.isfinite(s) and np.isfinite(t)):
+        return out
+    if e <= 0 or s >= e or t <= e:        # 손절은 진입 아래, 목표는 진입 위
+        return out
+    risk = e - s
+    reward = t - e
+    r = reward / risk if risk > 0 else np.nan
+    out.update({"risk": risk, "reward": reward, "r_multiple": r,
+                "label": (f"1:{r:.1f}" if np.isfinite(r) else "-")})
+    return out
+
+
+def position_size(equity, risk_pct, entry, stop,
+                  max_position_pct: float = DEFAULT_MAX_POSITION_PCT) -> dict:
+    """고정 분율 리스크 사이징. 거래당 잃을 금액을 자본의 risk_pct% 로 고정.
+    shares = floor((equity*risk_pct%) / (entry-stop)), 단일 종목 max_position_pct% 상한.
+    반환: {shares, dollars, risk_dollars, position_pct, capped}."""
+    out = {"shares": 0, "dollars": 0.0, "risk_dollars": 0.0,
+           "position_pct": 0.0, "capped": False}
+    try:
+        eq, rp, e, s = float(equity), float(risk_pct), float(entry), float(stop)
+        mp = float(max_position_pct)
+    except (TypeError, ValueError):
+        return out
+    if not all(np.isfinite(v) for v in (eq, rp, e, s, mp)):
+        return out
+    if eq <= 0 or rp <= 0 or e <= 0 or s >= e:
+        return out
+    risk_per_share = e - s
+    risk_budget = eq * (rp / 100.0)
+    shares = int(np.floor(risk_budget / risk_per_share))
+    if shares < 0:
+        shares = 0
+    capped = False
+    max_dollars = eq * (mp / 100.0)
+    if shares * e > max_dollars and e > 0:
+        shares = int(np.floor(max_dollars / e))
+        capped = True
+    dollars = shares * e
+    out.update({
+        "shares": shares,
+        "dollars": round(dollars, 2),
+        "risk_dollars": round(shares * risk_per_share, 2),
+        "position_pct": round((dollars / eq * 100.0) if eq > 0 else 0.0, 2),
+        "capped": capped,
+    })
+    return out
+
+
+def resolve_stop(entry, atr, ma200, atr_mult, source: str = "atr", manual_stop=None):
+    """손절가 결정. source: 'atr'|'ma200'|'manual'. 반환: (stop, used_source).
+    유효(진입 아래·양수) 못 만들면 (NaN, source)."""
+    try:
+        e = float(entry)
+    except (TypeError, ValueError):
+        return np.nan, source
+    stop = np.nan
+    used = source
+    if source == "manual" and manual_stop is not None and np.isfinite(float(manual_stop)):
+        stop = float(manual_stop)
+    elif source == "ma200" and ma200 is not None and np.isfinite(float(ma200)) and float(ma200) > 0:
+        stop = float(ma200) * 0.98
+    else:  # atr 기본
+        try:
+            a, m = float(atr), float(atr_mult)
+            if np.isfinite(a) and a > 0 and np.isfinite(m):
+                stop = e - m * a
+                used = "atr"
+        except (TypeError, ValueError):
+            stop = np.nan
+    if not (np.isfinite(stop) and 0 < stop < e):
+        return np.nan, used
+    return stop, used
+
+
+def resolve_target(entry, risk_per_share, rr_target, recent_high=None, manual_target=None):
+    """목표가 결정 (우선순위: 수동 > 구조적 고점 > R:R 파생).
+    반환: (target, basis). basis: 'manual'|'structural_high'|'rr_derived'|'na'.
+    rr_derived 는 R:R 게이트의 '실제 필터'로 쓰지 않음(자기참조)."""
+    try:
+        e = float(entry)
+    except (TypeError, ValueError):
+        return np.nan, "na"
+    if manual_target is not None:
+        try:
+            mt = float(manual_target)
+            if np.isfinite(mt) and mt > e:
+                return mt, "manual"
+        except (TypeError, ValueError):
+            pass
+    if recent_high is not None:
+        try:
+            rh = float(recent_high)
+            if np.isfinite(rh) and rh > e:
+                return rh, "structural_high"
+        except (TypeError, ValueError):
+            pass
+    try:
+        rps, rr = float(risk_per_share), float(rr_target)
+        if np.isfinite(rps) and rps > 0 and np.isfinite(rr) and rr > 0:
+            return e + rr * rps, "rr_derived"
+    except (TypeError, ValueError):
+        pass
+    return np.nan, "na"
+
+
+def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult, rr_target,
+                     stop_source: str = "atr", manual_stop=None, manual_target=None,
+                     recent_high=None, max_position_pct: float = DEFAULT_MAX_POSITION_PCT) -> dict:
+    """verdict + 손절/목표 + 자본 → 게이트 판정 + 사이즈 일괄. 순수 조합 함수.
+
+    게이트(백테스트 반영):
+      avoid → 회피(사이즈 0 권고) · entry/wait & R:R≥목표 → 적합 · 좋아도 R:R<목표 → 건너뛰기
+      overheat/trend_break → 신중. (R:R 필터는 독립 목표가 있을 때만; rr_derived 면 정보용)
+    """
+    plan = {
+        "entry": np.nan, "stop": np.nan, "stop_source": stop_source, "stop_pct": np.nan,
+        "target": np.nan, "target_basis": "na", "target_pct": np.nan,
+        "risk_per_share": np.nan, "r_multiple": np.nan, "rr_label": "-",
+        "shares": 0, "dollars": 0.0, "risk_dollars": 0.0, "position_pct": 0.0, "capped": False,
+        "gate": "na", "gate_label": GATE_LABELS["na"], "gate_reason": "",
+        "atr_mult": atr_mult, "rr_target": rr_target, "enter_ok": False,
+    }
+    try:
+        e = float(entry)
+    except (TypeError, ValueError):
+        return plan
+    if not (np.isfinite(e) and e > 0):
+        return plan
+    plan["entry"] = e
+
+    stop, used_src = resolve_stop(e, atr, ma200, atr_mult, stop_source, manual_stop)
+    plan["stop"], plan["stop_source"] = stop, used_src
+    if not np.isfinite(stop):
+        plan["gate_reason"] = "손절가 산출 불가(ATR/200MA/입력 확인)"
+        return plan
+    plan["stop_pct"] = round((stop / e - 1.0) * 100.0, 2)
+    risk_ps = e - stop
+    plan["risk_per_share"] = round(risk_ps, 4)
+
+    target, basis = resolve_target(e, risk_ps, rr_target, recent_high, manual_target)
+    plan["target"], plan["target_basis"] = target, basis
+    if np.isfinite(target):
+        plan["target_pct"] = round((target / e - 1.0) * 100.0, 2)
+    rr = evaluate_rr(e, stop, target)
+    plan["r_multiple"], plan["rr_label"] = rr["r_multiple"], rr["label"]
+
+    sz = position_size(equity, risk_pct, e, stop, max_position_pct)
+    plan.update({k: sz[k] for k in ("shares", "dollars", "risk_dollars", "position_pct", "capped")})
+
+    # ── 게이트 판정 ──────────────────────────────────────────────────────
+    code = str(verdict_code or "")
+    rr_val = plan["r_multiple"]
+    rr_is_real = (basis in ("manual", "structural_high")) and np.isfinite(rr_val)
+
+    if code == "avoid":
+        plan.update({"gate": "avoid", "gate_label": GATE_LABELS["avoid"],
+                     "gate_reason": "약세 회피 구간 — 백테스트상 음(-)의 초과수익", "enter_ok": False})
+    elif code in ("entry", "wait"):
+        try:
+            bar = float(rr_target)
+        except (TypeError, ValueError):
+            bar = np.nan
+        if rr_is_real and np.isfinite(bar) and rr_val < bar:
+            plan.update({"gate": "skip", "gate_label": GATE_LABELS["skip"],
+                         "gate_reason": f"R:R {plan['rr_label']} < 목표 1:{bar:.1f} — 손익비 부족",
+                         "enter_ok": False})
+        else:
+            note = "독립 목표 미설정(R:R 정보용)" if not rr_is_real else f"R:R {plan['rr_label']} 충족"
+            plan.update({"gate": "fit", "gate_label": GATE_LABELS["fit"],
+                         "gate_reason": note, "enter_ok": True})
+    elif code in ("overheat", "trend_break"):
+        plan.update({"gate": "caution", "gate_label": GATE_LABELS["caution"],
+                     "gate_reason": "과열/추세 흔들림 — 분할 진입·관망 권장", "enter_ok": False})
+    else:
+        plan.update({"gate": "na", "gate_label": GATE_LABELS["na"],
+                     "gate_reason": "타이밍 판정 데이터 부족", "enter_ok": False})
+
+    return plan

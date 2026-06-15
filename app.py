@@ -17457,6 +17457,126 @@ if st.session_state.get("logged_in"):
                     else:
                         st.caption("볼린저밴드 데이터 부족.")
 
+                # ── ④ 포지션 플랜 (사이징 · R:R 게이트) — regime_core SSOT (#2) ──
+                with st.container(border=True):
+                    st.markdown("##### 🧮 포지션 플랜 (사이징 · R:R)")
+                    st.caption("이 자리에 '얼마' 들어갈지 + 손익비가 받쳐주는지. 거래당 리스크 고정(고정 분율).")
+                    if not _regime_res.get("enough_data") or not (pd.notna(current_price) and current_price > 0):
+                        st.info("사이징에 필요한 가격/레짐 데이터가 부족합니다.")
+                    else:
+                        _c1, _c2, _c3 = st.columns([1.2, 1, 1.2])
+                        with _c1:
+                            _equity = st.number_input(
+                                "계좌 자본금 ($)", min_value=0.0, step=1000.0,
+                                value=float(st.session_state.get("_size_equity", 10000.0)),
+                                key="_size_equity_input",
+                            )
+                            st.session_state["_size_equity"] = _equity
+                        with _c2:
+                            _risk_pct = st.number_input(
+                                "거래당 리스크 (%)", min_value=0.1, max_value=5.0, step=0.1,
+                                value=float(st.session_state.get("_size_risk_pct", 1.0)),
+                                key="_size_risk_pct_input",
+                            )
+                            st.session_state["_size_risk_pct"] = _risk_pct
+                        with _c3:
+                            _stop_src = st.selectbox(
+                                "손절 기준", ["ATR(변동성)", "200일선", "직접 입력"],
+                                index=0, key=f"_size_stopsrc_{selected_ticker}",
+                            )
+                        _src_map = {"ATR(변동성)": "atr", "200일선": "ma200", "직접 입력": "manual"}
+                        _manual_stop = None
+                        _manual_target = None
+                        if _src_map[_stop_src] == "manual":
+                            _mc1, _mc2 = st.columns(2)
+                            with _mc1:
+                                _manual_stop = st.number_input(
+                                    "손절가 ($)", min_value=0.0, step=0.5,
+                                    value=float(round(float(current_price) * 0.95, 2)),
+                                    key=f"_size_mstop_{selected_ticker}",
+                                )
+                            with _mc2:
+                                _mt = st.number_input(
+                                    "목표가 ($, 선택)", min_value=0.0, step=0.5, value=0.0,
+                                    key=f"_size_mtgt_{selected_ticker}",
+                                )
+                                _manual_target = _mt if _mt > 0 else None
+                        else:
+                            _mt = st.number_input(
+                                "목표가 ($, 선택 — 비우면 최근 고점/파생)", min_value=0.0, step=0.5,
+                                value=0.0, key=f"_size_tgt_{selected_ticker}",
+                            )
+                            _manual_target = _mt if _mt > 0 else None
+
+                        # 국면 적응 배수/손익비 (이미 있는 _regime_params + 캐시된 DRG 재사용)
+                        try:
+                            _drg_plan = compute_daily_risk_gauge("전체")
+                        except Exception:
+                            _drg_plan = {}
+                        _rp = _regime_params(_drg_plan)
+
+                        # 사이징 입력값 산출 (scope 내 close/timing_history 사용 — 의존 최소화)
+                        try:
+                            _atr_val = rc.compute_atr(timing_history)
+                        except Exception:
+                            _atr_val = float("nan")
+                        _ma200_val = float("nan")
+                        try:
+                            _cs = pd.to_numeric(close, errors="coerce").dropna()
+                            if len(_cs) >= 150:
+                                _ma_ser = _cs.rolling(200, min_periods=150).mean().dropna()
+                                if not _ma_ser.empty:
+                                    _ma200_val = float(_ma_ser.iloc[-1])
+                        except Exception:
+                            pass
+                        _recent_high = float("nan")
+                        try:
+                            _hi_src = timing_history["High"] if "High" in timing_history.columns else timing_history["Close"]
+                            _recent_high = float(pd.to_numeric(_hi_src, errors="coerce").dropna().tail(120).max())
+                        except Exception:
+                            pass
+
+                        _plan = rc.build_trade_plan(
+                            verdict_code=_timing_res.get("code"),
+                            entry=float(current_price), atr=_atr_val, ma200=_ma200_val,
+                            equity=_equity, risk_pct=_risk_pct,
+                            atr_mult=_rp["atr_mult"], rr_target=_rp["rr"],
+                            stop_source=_src_map[_stop_src],
+                            manual_stop=_manual_stop, manual_target=_manual_target,
+                            recent_high=_recent_high,
+                        )
+
+                        _gate = _plan["gate"]
+                        _gate_fn = {"fit": st.success, "skip": st.warning, "avoid": st.error,
+                                    "caution": st.warning, "na": st.info}.get(_gate, st.info)
+                        _gate_fn(f"**{_plan['gate_label']}** — {_plan['gate_reason']}")
+
+                        if _gate == "na":
+                            st.caption("손절가를 산출할 수 없어 사이즈를 제안하지 않습니다. 손절 기준을 바꾸거나 직접 입력해 보세요.")
+                        else:
+                            _basis_kr = {"manual": "직접 입력", "structural_high": "최근 고점",
+                                         "rr_derived": "R:R 파생(정보용)", "na": "-"}.get(_plan["target_basis"], "-")
+                            _m1, _m2, _m3 = st.columns(3)
+                            _m1.metric("손절가", f"${_plan['stop']:.2f}",
+                                       f"{_plan['stop_pct']:.1f}% ({str(_plan['stop_source']).upper()})")
+                            _m2.metric(
+                                "목표가",
+                                f"${_plan['target']:.2f}" if pd.notna(_plan["target"]) else "-",
+                                f"{_plan['target_pct']:.1f}% · {_basis_kr}" if pd.notna(_plan["target_pct"]) else _basis_kr,
+                            )
+                            _m3.metric("손익비 (R:R)", _plan["rr_label"], f"목표 1:{_rp['rr']:.1f} (국면적응)")
+                            _s1, _s2, _s3 = st.columns(3)
+                            _s1.metric("제안 수량", f"{_plan['shares']:,}주")
+                            _s2.metric("투입 금액", f"${_plan['dollars']:,.0f}",
+                                       f"비중 {_plan['position_pct']:.1f}%" + (" · 상한적용" if _plan["capped"] else ""))
+                            _s3.metric("최대 손실(1R)", f"-${_plan['risk_dollars']:,.0f}", f"자본의 {_risk_pct:.1f}%")
+                            if not _plan["enter_ok"]:
+                                st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 수량은 참고용이며, 회피/건너뛰기/신중 구간에서는 신규 진입을 권하지 않습니다.")
+                            st.caption(
+                                f"국면 적응: {_rp['label']} (ATR×{_rp['atr_mult']}, 목표 1:{_rp['rr']}). "
+                                "손익비는 독립 목표(직접 입력·최근 고점)가 있을 때만 게이트 필터로 작동합니다."
+                            )
+
                 # ── 차트 탭 ───────────────────────────────────────────────
                 chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📈 가격 + 이평선 + 볼린저밴드", "📊 MACD", "📦 거래량"])
 
