@@ -501,7 +501,7 @@ def main():
         return 1
 
     t0 = time.time()
-    run_date = datetime.now(_ET).strftime("%Y-%m-%d")
+    run_date = datetime.now(_ET).strftime("%Y-%m-%d %H:%M")
     print(f"[START] 신호 백테스트 run_date={run_date} (ET) · confirm={CONFIRM_DAYS}d cooldown={COOLDOWN_DAYS}d")
 
     gc = get_gspread_client()
