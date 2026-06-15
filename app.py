@@ -18477,7 +18477,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             if _plan_pf["gate"] != "na":
                                 _bits = [f"손절 ${_plan_pf['stop']:.2f} ({_plan_pf['stop_pct']:.1f}%)"]
                                 if pd.notna(_plan_pf["target"]):
-                                    _bits.append(f"목표 ${_plan_pf['target']:.2f} ({_plan_pf['target_pct']:+.1f}%)")
+                                    _tb = {"manual": "내 목표", "structural_high": "최근 고점",
+                                           "rr_derived": "측정 이동"}.get(_plan_pf["target_basis"], "")
+                                    _bits.append(f"목표 ${_plan_pf['target']:.2f} ({_plan_pf['target_pct']:+.1f}%, {_tb})")
                                 _bits.append(f"R:R {_plan_pf['rr_label']}")
                                 _src_kr = {"manual": "내 설정", "atr": "ATR 기본", "ma200": "200MA"}.get(str(_plan_pf["stop_source"]), "")
                                 st.caption("🧮 보유 플랜: " + " · ".join(_bits) + (f"  (손절 {_src_kr})" if _src_kr else ""))

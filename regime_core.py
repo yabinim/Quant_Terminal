@@ -703,7 +703,11 @@ def resolve_target(entry, risk_per_share, rr_target, recent_high=None, manual_ta
     if recent_high is not None:
         try:
             rh = float(recent_high)
-            if np.isfinite(rh) and rh > e:
+            rps = float(risk_per_share)
+            # 최근 고점은 '의미 있는' 목표일 때만 사용: 진입 위로 최소 1R(손절거리) 이상.
+            # (신고가 부근이라 고점이 코앞이면 +0.5% 같은 허수 목표 → R:R 파생으로 폴백)
+            if (np.isfinite(rh) and rh > e and np.isfinite(rps) and rps > 0
+                    and (rh - e) >= rps):
                 return rh, "structural_high"
         except (TypeError, ValueError):
             pass
