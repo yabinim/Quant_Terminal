@@ -20598,6 +20598,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             with st.spinner("실시간 가격 및 지표 계산 중..."):
                 price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
                 rsi_map_wl, ma200_map_wl, regime_map_wl = {}, {}, {}
+                atr_map_wl, high_map_wl = {}, {}   # #2 사이징용 ATR·최근고점
                 # RS(상대강도) 계산용 SPY 종가 — 1회만 조회
                 try:
                     _spy_hist_wl = _fmp_price_history("SPY", limit=252)
@@ -20617,10 +20618,41 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         ma200_map_wl[tk] = float(close.rolling(200, min_periods=200).mean().iloc[-1]) if len(close) >= 200 else np.nan
                         # 레짐/타이밍 — 개별종목 탭과 동일한 regime_core 엔진(SSOT)
                         regime_map_wl[tk] = rc.analyze_ticker(hist, spy_close=_spy_close_wl)
+                        atr_map_wl[tk] = rc.compute_atr(hist) if not hist.empty else np.nan
+                        _hi_wl = (pd.to_numeric(hist["High"], errors="coerce")
+                                  if "High" in hist.columns else close)
+                        high_map_wl[tk] = float(_hi_wl.dropna().tail(120).max()) if not _hi_wl.dropna().empty else np.nan
                     except Exception:
                         rsi_map_wl[tk] = np.nan
                         ma200_map_wl[tk] = np.nan
                         regime_map_wl[tk] = None
+                        atr_map_wl[tk] = np.nan
+                        high_map_wl[tk] = np.nan
+
+            # ── 포지션 플랜 입력 (사이징·R:R) — 개별종목 탭과 세션 공유 (#2) ──
+            _wl_equity = float(st.session_state.get("_size_equity", 10000.0))
+            _wl_risk_pct = float(st.session_state.get("_size_risk_pct", 1.0))
+            try:
+                _wl_rp = _regime_params(compute_daily_risk_gauge("전체"))
+            except Exception:
+                _wl_rp = _regime_params({})
+            if wl_items:
+                _pc1, _pc2, _pc3 = st.columns([1.2, 1, 1.6])
+                with _pc1:
+                    _wl_equity = st.number_input(
+                        "계좌 자본금 ($)", min_value=0.0, step=1000.0,
+                        value=_wl_equity, key="_wl_size_equity")
+                    st.session_state["_size_equity"] = _wl_equity
+                with _pc2:
+                    _wl_risk_pct = st.number_input(
+                        "거래당 리스크 (%)", min_value=0.1, max_value=5.0, step=0.1,
+                        value=_wl_risk_pct, key="_wl_size_risk")
+                    st.session_state["_size_risk_pct"] = _wl_risk_pct
+                with _pc3:
+                    st.caption(
+                        "각 종목에 '얼마' 들어갈지 + R:R 게이트를 제안합니다. "
+                        f"국면 {_wl_rp['label']} (ATR×{_wl_rp['atr_mult']}, 목표 1:{_wl_rp['rr']}). "
+                        "손절/목표가를 설정해두면 R:R 게이트가 정확해집니다.")
 
             for idx, item in enumerate(wl_items):
                 tk = item["ticker"]
@@ -20718,6 +20750,34 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     st.success(f"🎯 목표가 도달! 현재가 ${float(current_price):.2f} ≥ 목표 ${_tp:.2f} — 익절 검토")
                         else:
                             st.caption("🛑🎯 손절/목표가 미설정 — 편집에서 추가하면 도달 시 알림을 줍니다.")
+
+                        # ── 포지션 플랜 (사이징·R:R 게이트) — regime_core SSOT (#2) ──
+                        if _an and _an.get("regime", {}).get("enough_data") and pd.notna(current_price) and float(current_price) > 0:
+                            _wl_atr = pd.to_numeric(atr_map_wl.get(tk), errors="coerce")
+                            _wl_hi = pd.to_numeric(high_map_wl.get(tk), errors="coerce")
+                            _wl_plan = rc.build_trade_plan(
+                                verdict_code=_an["timing"].get("code"),
+                                entry=float(current_price),
+                                atr=float(_wl_atr) if pd.notna(_wl_atr) else float("nan"),
+                                ma200=float(ma200_val) if pd.notna(ma200_val) else float("nan"),
+                                equity=_wl_equity, risk_pct=_wl_risk_pct,
+                                atr_mult=_wl_rp["atr_mult"], rr_target=_wl_rp["rr"],
+                                stop_source=("manual" if pd.notna(_sl_item) else "atr"),
+                                manual_stop=float(_sl_item) if pd.notna(_sl_item) else None,
+                                manual_target=float(_tp_item) if pd.notna(_tp_item) else None,
+                                recent_high=float(_wl_hi) if pd.notna(_wl_hi) else None,
+                            )
+                            if _wl_plan["gate"] == "na":
+                                st.caption(f"🧮 플랜: {_wl_plan['gate_label']} — {_wl_plan['gate_reason']}")
+                            else:
+                                st.markdown(
+                                    f"**🧮 플랜: {_wl_plan['gate_label']}** · "
+                                    f"{_wl_plan['shares']:,}주 (${_wl_plan['dollars']:,.0f} · 비중 {_wl_plan['position_pct']:.1f}%) · "
+                                    f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
+                                    f"R:R {_wl_plan['rr_label']} · 1R -${_wl_plan['risk_dollars']:,.0f}"
+                                )
+                                if not _wl_plan["enter_ok"]:
+                                    st.caption(f"↳ {_wl_plan['gate_reason']} — 신규 진입 비권장")
 
                     with alert_col:
                         st.markdown("**🔔 상태 기반 알림:**")
