@@ -65,7 +65,7 @@ _COL_ALERT_LASTSTATE = 11   # 0-index → 시트 L열
 # 보유(Portfolio) — app.py 와 lockstep
 _PF_WORKSHEET = "Portfolios"                  # [ID, Account, Ticker, AvgPrice, Quantity, Date_Added]
 _PFSTATE_WORKSHEET = "Portfolio_Alert_State"  # [Key, Alert_States, Alert_LastState, Updated_At]
-_PFSTATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At"]
+_PFSTATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At", "Stop_Loss", "Target_Price"]
 _PF_ALERT_DEFAULT = "exit,risk"               # 보유 기본 알림 (손절은 exit의 ATR 트레일링에 포함)
 _PF_INTRADAY_EVENTS = ("exit", "risk")        # 장중 보유 행동 가능 이벤트
 
@@ -268,8 +268,9 @@ def _open_pf_state(sh):
     titles = [w.title for w in sh.worksheets()]
     if _PFSTATE_WORKSHEET in titles:
         return sh.worksheet(_PFSTATE_WORKSHEET)
-    ws = sh.add_worksheet(title=_PFSTATE_WORKSHEET, rows=2000, cols=4)
-    ws.update([_PFSTATE_COLS], range_name="A1:D1", value_input_option="USER_ENTERED")
+    ws = sh.add_worksheet(title=_PFSTATE_WORKSHEET, rows=2000, cols=len(_PFSTATE_COLS))
+    _lc = chr(ord("A") + len(_PFSTATE_COLS) - 1)
+    ws.update([_PFSTATE_COLS], range_name=f"A1:{_lc}1", value_input_option="USER_ENTERED")
     return ws
 
 
@@ -403,9 +404,15 @@ def _pf_state_map_readonly(sh):
         return {}
     m = {}
     for r in st_vals[1:]:
-        r = (list(r) + [""] * 4)[:4]
+        r = (list(r) + [""] * 6)[:6]
         if str(r[0]).strip():
-            m[str(r[0]).strip()] = {"states": str(r[1]).strip()}
+            _sl = pd.to_numeric(r[4], errors="coerce")
+            _tp = pd.to_numeric(r[5], errors="coerce")
+            m[str(r[0]).strip()] = {
+                "states": str(r[1]).strip(),
+                "stop_loss": float(_sl) if pd.notna(_sl) else None,
+                "target_price": float(_tp) if pd.notna(_tp) else None,
+            }
     return m
 
 
@@ -470,8 +477,13 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
             continue
         avg = pd.to_numeric(r[3], errors="coerce")
         key = f"{uid}|{account}|{tk}"
-        enabled = rc.resolve_alert_events(state_map.get(key, {}).get("states"), _PF_ALERT_DEFAULT)
-        if not any(e in enabled for e in _PF_INTRADAY_EVENTS):
+        _pf_st = state_map.get(key, {})
+        enabled = rc.resolve_alert_events(_pf_st.get("states"), _PF_ALERT_DEFAULT)
+        _sl = _pf_st.get("stop_loss")
+        _tp = _pf_st.get("target_price")
+        _has_plan = (_sl is not None) or (_tp is not None)
+        # 손절/목표를 설정해 둔 보유는 가격 도달도 평가(설정 = 암묵적 알림 동의)
+        if not (any(e in enabled for e in _PF_INTRADAY_EVENTS) or _has_plan):
             continue
         try:
             if tk not in hist_cache:
@@ -485,9 +497,13 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
             if not an.get("regime", {}).get("enough_data"):
                 continue
             live = quote_cache[tk] if quote_cache[tk] is not None else float(hist["Close"].iloc[-1])
-            conds = rc.alert_conditions(an, price=live)
+            conds = rc.alert_conditions(an, price=live, stop_loss=_sl, target_price=_tp)
             active = [{"event": e, "label": rc.ALERT_EVENT_LABELS[e], "message": conds[e][1]}
                       for e in _PF_INTRADAY_EVENTS if e in enabled and conds.get(e, (False, ""))[0]]
+            # 손절/목표 도달(price)은 플랜이 설정된 보유에서 항상 발화
+            if _has_plan and conds.get("price", (False, ""))[0]:
+                active.append({"event": "price", "label": rc.ALERT_EVENT_LABELS["price"],
+                               "message": conds["price"][1]})
             if active:
                 hits_by_user.setdefault(uid, []).append(
                     {"ticker": tk, "account": account, "fired": active, "an": an})
