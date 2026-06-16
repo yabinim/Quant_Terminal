@@ -521,11 +521,11 @@ import json as _json
 ALERT_CONFIRM_DAYS = 2
 ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price")
 ALERT_EVENT_LABELS = {
-    "entry":  "🎯 지금 매수 구간",
+    "entry":  "🟢 매수 신호",
     "regime": "🔄 레짐 전환",
-    "risk":   "🚫 추세 이탈/위험",
-    "exit":   "💰 청산 신호",
-    "price":  "📌 가격(손절/목표) 도달",
+    "risk":   "🟡 줄이기 (추세 흔들림·리버설)",
+    "exit":   "🔴 청산",
+    "price":  "📌 손절/목표 도달",
 }
 _REGIME_KR = {"strong": "🟢 강세", "sideways": "🟡 횡보", "weak": "🔴 약세"}
 
