@@ -7549,9 +7549,9 @@ def integrated_sell_verdict(
 
     # ── 판정 ───────────────────────────────────────────────────────
     if score >= 4:
-        label = "🔴 매도 (SELL)"
+        label = "🔴 청산 (SELL)"
     elif score >= 2:
-        label = "🟡 일부 익절 검토"
+        label = "🟡 줄이기 (일부 익절)"
     else:
         label = "✅ 보유 (HOLD)"
         if not reasons:
@@ -18392,6 +18392,20 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             except Exception:
                 _spy_pf_close = None
             _pf_hist_cache = {}
+            # 카드·표 매도 판정 통일: integrated_sell_verdict(표와 동일 소스) 상태를 미리 계산해 공유
+            _card_status, _card_status_tk = {}, {}
+            try:
+                _crdf = build_portfolio_sell_radar_df(portfolio_df)
+                for _, _cr in _crdf.iterrows():
+                    _ck = str(_cr.get("티커", "")).strip().upper()
+                    _ca = str(_cr.get("계좌", "")).strip()
+                    if _ck:
+                        _val = (str(_cr.get("상태(Status)", "") or ""),
+                                str(_cr.get("판정 근거(Why)", "") or ""))
+                        _card_status[(_ca, _ck)] = _val
+                        _card_status_tk[_ck] = _val
+            except Exception:
+                _card_status, _card_status_tk = {}, {}
 
             for acct in sorted(portfolio_df["Account"].astype(str).unique(), key=lambda x: str(x).lower()):
                 sub = portfolio_df[portfolio_df["Account"] == acct].sort_values("Ticker")
@@ -18433,13 +18447,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         _rg, _ex, _tv = _an["regime"], _an["exit"], _an["timing"]
                         _rlabel = rc.REGIME_LABEL.get(_rg["regime"], "⚪")
                         _line = f"**{_tk}** · {_rlabel} · 평단 {_avg_s} {_qty_s}"
-                        _scard = rc.build_sell_card(_an, None)
-                        _stone = {"success": st.success, "warning": st.warning,
-                                  "error": st.error, "info": st.info}.get(_scard["tone"], st.info)
-                        _smsg = f"{_line} · **{_scard['label']}**\n\n{_scard['headline']}"
-                        if _scard["detail"]:
-                            _smsg += "\n\n" + _scard["detail"]
-                        _stone(_smsg)
+                        # 표(integrated_sell_verdict)와 동일한 단일 판정 사용 → 카드·표 일치
+                        _st_lbl, _st_why = _card_status.get((acct, _tk)) or _card_status_tk.get(_tk, ("", ""))
+                        if _st_lbl:
+                            _stone = (st.error if ("SELL" in _st_lbl or "청산" in _st_lbl)
+                                      else st.warning if ("익절" in _st_lbl or "줄이기" in _st_lbl)
+                                      else st.success)
+                            _smsg = f"{_line} · **{_st_lbl}**"
+                            if _st_why:
+                                _smsg += f"\n\n{_st_why}"
+                            _stone(_smsg)
+                        else:
+                            _scard = rc.build_sell_card(_an, None)
+                            _stone = {"success": st.success, "warning": st.warning,
+                                      "error": st.error, "info": st.info}.get(_scard["tone"], st.info)
+                            _stone(f"{_line} · **{_scard['label']}**\n\n{_scard['headline']}"
+                                   + (("\n\n" + _scard["detail"]) if _scard["detail"] else ""))
+                        # 조기 토핑 경고(네거티브 리버설 등) — 단일 판정과 별개로 표시
+                        _exw = _ex.get("warnings", [])
+                        if _exw:
+                            st.caption("⚠️ " + " · ".join(_exw) + " — 조기 토핑 경고(분할 청산·스톱 타이트닝 고려)")
 
                         # 종목별 알림 토글 (Portfolio_Alert_State 에 저장)
                         _key = _pf_alert_key(puid, acct, _tk)
@@ -18921,9 +18948,11 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             st.error("매도가를 입력해주세요.")
                         elif sell_qty_input <= 0:
                             st.error("매도 수량을 입력해주세요.")
-                        elif sell_qty_input > cur_hold_qty + 1e-9:
+                        elif sell_qty_input > cur_hold_qty + 1e-4:
                             st.error(f"매도 수량({sell_qty_input:g})이 보유 수량({cur_hold_qty:g})을 초과합니다.")
                         else:
+                            # 부동소수 오차로 전량 매도가 '초과'로 오판되는 것 방지 — 보유 이내로 클램프
+                            sell_qty_input = min(sell_qty_input, cur_hold_qty)
                             sell_date_str = sell_date_input.strftime("%Y-%m-%d")
                             ok_th, err_th = append_trade_history_row(
                                 puid, sell_acct_sel, sell_ticker_sel, "SELL",
@@ -18938,7 +18967,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 if m_sell.any():
                                     ix_sell = upd_sell.index[m_sell][0]
                                     new_qty = cur_hold_qty - sell_qty_input
-                                    if new_qty < 1e-9:
+                                    if new_qty < 1e-4:
                                         upd_sell = upd_sell.drop(index=ix_sell).reset_index(drop=True)
                                         save_portfolio(upd_sell)
                                         realized = (sell_price_input - cur_avg_price) * sell_qty_input
