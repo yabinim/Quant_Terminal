@@ -204,6 +204,26 @@ def _render_hit_card(h) -> str:
             f"<div style='margin-top:6px'><b>{ev.get('label','')}</b> — "
             f"{ev.get('message','')}</div>"
         )
+    if h.get("swing") or h.get("position"):
+        def _vcolor(_l):
+            if "SELL" in _l or "청산" in _l:
+                return "#d62728"
+            if "익절" in _l or "줄이기" in _l:
+                return "#f59e0b"
+            if "HOLD" in _l or "보유" in _l:
+                return "#16a34a"
+            return "#555"
+        html += "<div style='margin-top:8px;padding-top:6px;border-top:1px dashed #e1e4e8'>"
+        sw, po = h.get("swing"), h.get("position")
+        if sw:
+            html += (f"<div style='margin-top:2px'>📈 <b>스윙(단기)</b>: "
+                     f"<span style='color:{_vcolor(sw[0])};font-weight:700'>{sw[0]}</span>"
+                     + (f" — {sw[1]}" if sw[1] else "") + "</div>")
+        if po:
+            html += (f"<div style='margin-top:2px'>🛡 <b>포지션(중장기)</b>: "
+                     f"<span style='color:{_vcolor(po[0])};font-weight:700'>{po[0]}</span>"
+                     + (f" — {po[1]}" if po[1] else "") + "</div>")
+        html += "</div>"
     return html + "</div>"
 
 
@@ -377,8 +397,12 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
             )
             new_rows.append([key, states_csv, new_state, today]); n_eval += 1
             if fired:
+                _swc = rc.build_sell_card(an, None)
+                _posv = rc.position_sell_verdict(hist, float(avg) if pd.notna(avg) else None)
                 fired_by_user.setdefault(uid, []).append(
-                    {"ticker": tk, "account": account, "fired": fired, "an": an})
+                    {"ticker": tk, "account": account, "fired": fired, "an": an,
+                     "swing": (_swc["label"], _swc["detail"] or _swc["headline"]),
+                     "position": _posv})
                 print(f"  [FIRE-PF] {uid}/{account}/{tk}: {[e['event'] for e in fired]}")
         except Exception as e:
             print(f"  [WARN] {uid}/{account}/{tk} 평가 실패: {e}")
@@ -505,8 +529,12 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
                 active.append({"event": "price", "label": rc.ALERT_EVENT_LABELS["price"],
                                "message": conds["price"][1]})
             if active:
+                _swc = rc.build_sell_card(an, None)
+                _posv = rc.position_sell_verdict(hist, float(avg) if pd.notna(avg) else None)
                 hits_by_user.setdefault(uid, []).append(
-                    {"ticker": tk, "account": account, "fired": active, "an": an})
+                    {"ticker": tk, "account": account, "fired": active, "an": an,
+                     "swing": (_swc["label"], _swc["detail"] or _swc["headline"]),
+                     "position": _posv})
                 print(f"  [INTRADAY-PF] {uid}/{account}/{tk}: {[a['event'] for a in active]}")
         except Exception as e:
             print(f"  [WARN] {uid}/{account}/{tk} 장중 평가 실패: {e}")
