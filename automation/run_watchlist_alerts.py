@@ -388,7 +388,7 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
     try:
         prev_len = max(0, len(st_vals) - 1)
         padded = new_rows + [["", "", "", ""]] * max(0, prev_len - len(new_rows))
-        body = [_PFSTATE_COLS] + padded
+        body = [_PFSTATE_COLS[:4]] + padded   # A:D만 관리(상태머신). E/F(손절·목표)는 보존
         state_ws.update(body, range_name=f"A1:D{len(body)}", value_input_option="RAW")
         print(f"[OK] Portfolio_Alert_State 저장: {len(new_rows)}행 (평가 {n_eval})")
     except Exception as e:
