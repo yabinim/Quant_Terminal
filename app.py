@@ -7494,70 +7494,10 @@ def _style_review_table(df: pd.DataFrame):
 # ──────────────────────────────────────────────────────────────────────────────
 
 # 트레일링 스톱 기본값: 보유 기간 고점 대비 이 % 이상 하락 시 경보
-_DEFAULT_TRAILING_STOP_PCT = 15.0
+_DEFAULT_TRAILING_STOP_PCT = rc._DEFAULT_TRAILING_STOP_PCT  # SSOT: regime_core
 
 
-def integrated_sell_verdict(
-    *,
-    above_ma200,
-    one_month_return,
-    rsi,
-    macd_signal,
-    pct_from_52w_high,
-    drawdown_from_high_pct,
-    trailing_stop_pct: float = _DEFAULT_TRAILING_STOP_PCT,
-) -> tuple[str, str]:
-    """200일선 + 선행신호(RSI·MACD·52주 이격) + 트레일링 스톱을 종합한 매도 판정.
-
-    기존 매도 레이더는 '현재가 < 200일선'만 봐서 신호가 늦었다.
-    여기서는 추세 붕괴(후행)와 과열·꺾임(선행), 그리고 고점 대비 하락(트레일링)을
-    한 점수로 합쳐 🟢보유 / 🟡일부 익절 검토 / 🔴매도 3단계로 반환한다.
-    반환: (status_label, reason_text)
-    """
-    reasons = []
-    score = 0
-
-    # ── 후행: 추세 붕괴 (가장 무거움) ───────────────────────────────
-    if above_ma200 is False:
-        score += 4
-        reasons.append("200일선 이탈(추세 붕괴)")
-
-    # ── 트레일링 스톱: 보유 고점 대비 하락 ──────────────────────────
-    if pd.notna(drawdown_from_high_pct) and drawdown_from_high_pct <= -abs(trailing_stop_pct):
-        score += 3
-        reasons.append(f"고점 대비 {drawdown_from_high_pct:.0f}% 하락(트레일링 스톱 -{abs(trailing_stop_pct):.0f}%)")
-
-    # ── 선행: 모멘텀 꺾임 ──────────────────────────────────────────
-    if macd_signal == "DEAD_CROSS":
-        score += 2
-        reasons.append("MACD 데드크로스(추세 꺾임)")
-    elif macd_signal == "BELOW_SIGNAL":
-        score += 1
-
-    if pd.notna(one_month_return) and one_month_return < 0:
-        score += 1
-        reasons.append(f"1개월 {one_month_return:+.1f}%")
-
-    # ── 선행: 과열 (신고가 부근 + RSI 과매수) ──────────────────────
-    overheated = (
-        pd.notna(rsi) and rsi > 70
-        and pd.notna(pct_from_52w_high) and pct_from_52w_high > -3
-    )
-    if overheated:
-        score += 1
-        reasons.append(f"RSI {rsi:.0f} 과열 + 신고가 부근(단기 조정 위험)")
-
-    # ── 판정 ───────────────────────────────────────────────────────
-    if score >= 4:
-        label = "🔴 청산 (SELL)"
-    elif score >= 2:
-        label = "🟡 줄이기 (일부 익절)"
-    else:
-        label = "✅ 보유 (HOLD)"
-        if not reasons:
-            reasons.append("추세 유지 · 이상 신호 없음")
-
-    return label, " · ".join(reasons)
+integrated_sell_verdict = rc.integrated_sell_verdict  # SSOT: regime_core로 이전
 
 
 def suggest_stop_and_target(ticker: str, entry_price: float = None) -> dict:
@@ -18375,13 +18315,20 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         if portfolio_df.empty:
             st.info("등록된 포트폴리오가 없습니다. 하단에서 종목을 추가해 주세요.")
         else:
-            with st.expander("📖 청산 신호 배지 설명", expanded=False):
+            with st.expander("📖 스윙 · 포지션 — 두 호흡(보유기간) 판정 설명", expanded=False):
                 st.markdown(
-                    "- 💰 **청산 신호**: RSI 과열(강세 80) / 50일선 종가 이탈 / ATR 트레일링 스톱 중 1개 이상\n"
-                    "- ⚠️ **추세 흔들림**: 상승 추세가 약해지는 신호 (또는 🔺 고점)\n"
-                    "- ✅ **보유 양호**: 청산 신호 없음, 추세 유지"
+                    "종목마다 **매도 판정을 두 개** 함께 표시합니다. 호흡(보유 기간)이 다릅니다.\n\n"
+                    "**📈 스윙(단기)** — 며칠~수주, *민감한* 청산\n"
+                    "- 신호: RSI 과열(강세 80) · 50일선 종가 이탈 · ATR 트레일링 스톱\n"
+                    "- 눌림 한 번에도 빠질 수 있음 → 차익을 빨리 지키는 쪽\n\n"
+                    "**🛡 포지션(중장기)** — 수주~수개월, *느슨한* 청산(추세추종)\n"
+                    "- 신호: 200일선 이탈 · 고점 대비 -15% 트레일링 · MACD 데드크로스 · 신고가 과열\n"
+                    "- 일반 눌림은 견디고 추세가 진짜 깨질 때만 → 늦지만 확실\n\n"
+                    "**판정 단계(공통)**: 🟢 보유 → 🟡 줄이기(일부 익절) → 🔴 청산\n\n"
+                    "두 판정이 **다를 수 있고 그게 정상**입니다(호흡 차이). "
+                    "빠른 회전이면 스윙, 길게 보면 포지션을 기준으로 삼으세요."
                 )
-                st.caption("알림은 2PM 장중(잠정) + 5PM 마감 후(확정) 자동 발송됩니다. 종목별로 켜고 끌 수 있어요.")
+                st.caption("알림은 2PM 장중(잠정) + 5PM 마감 후(확정) 자동 발송. 이메일에도 스윙·포지션 둘 다 표기됩니다.")
 
             _pf_states = load_portfolio_alert_states()
             try:
@@ -18406,6 +18353,16 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         _card_status_tk[_ck] = _val
             except Exception:
                 _card_status, _card_status_tk = {}, {}
+            _swing_by_ticker, _swing_by_ticker_tk = {}, {}   # 카드에서 계산 → 표 재사용(일치)
+
+            def _verdict_md(_l):
+                if ("SELL" in _l or "청산" in _l):
+                    return f":red[**{_l}**]"
+                if ("익절" in _l or "줄이기" in _l):
+                    return f":orange[**{_l}**]"
+                if ("HOLD" in _l or "보유" in _l):
+                    return f":green[**{_l}**]"
+                return f"**{_l}**"
 
             for acct in sorted(portfolio_df["Account"].astype(str).unique(), key=lambda x: str(x).lower()):
                 sub = portfolio_df[portfolio_df["Account"] == acct].sort_values("Ticker")
@@ -18446,27 +18403,20 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             continue
                         _rg, _ex, _tv = _an["regime"], _an["exit"], _an["timing"]
                         _rlabel = rc.REGIME_LABEL.get(_rg["regime"], "⚪")
-                        _line = f"**{_tk}** · {_rlabel} · 평단 {_avg_s} {_qty_s}"
-                        # 표(integrated_sell_verdict)와 동일한 단일 판정 사용 → 카드·표 일치
-                        _st_lbl, _st_why = _card_status.get((acct, _tk)) or _card_status_tk.get(_tk, ("", ""))
-                        if _st_lbl:
-                            _stone = (st.error if ("SELL" in _st_lbl or "청산" in _st_lbl)
-                                      else st.warning if ("익절" in _st_lbl or "줄이기" in _st_lbl)
-                                      else st.success)
-                            _smsg = f"{_line} · **{_st_lbl}**"
-                            if _st_why:
-                                _smsg += f"\n\n{_st_why}"
-                            _stone(_smsg)
-                        else:
-                            _scard = rc.build_sell_card(_an, None)
-                            _stone = {"success": st.success, "warning": st.warning,
-                                      "error": st.error, "info": st.info}.get(_scard["tone"], st.info)
-                            _stone(f"{_line} · **{_scard['label']}**\n\n{_scard['headline']}"
-                                   + (("\n\n" + _scard["detail"]) if _scard["detail"] else ""))
-                        # 조기 토핑 경고(네거티브 리버설 등) — 단일 판정과 별개로 표시
-                        _exw = _ex.get("warnings", [])
-                        if _exw:
-                            st.caption("⚠️ " + " · ".join(_exw) + " — 조기 토핑 경고(분할 청산·스톱 타이트닝 고려)")
+                        # 스윙(단기) · 포지션(중장기) 두 호흡 판정 동시 표시
+                        _sw = rc.build_sell_card(_an, None)
+                        _sw_lbl = _sw["label"]
+                        _sw_why = _sw["detail"] or _sw["headline"]
+                        _po_lbl, _po_why = (_card_status.get((acct, _tk))
+                                            or _card_status_tk.get(_tk) or ("", ""))
+                        if not _po_lbl:
+                            _po_lbl, _po_why = "⚪ 판정 보류", "데이터 부족"
+                        _swing_by_ticker[(acct, _tk)] = (_sw_lbl, _sw_why)
+                        _swing_by_ticker_tk[_tk] = (_sw_lbl, _sw_why)
+                        with st.container(border=True):
+                            st.markdown(f"**{_tk}** · {_rlabel} · 평단 {_avg_s} {_qty_s}")
+                            st.markdown(f"📈 스윙(단기): {_verdict_md(_sw_lbl)} — {_sw_why}")
+                            st.markdown(f"🛡 포지션(중장기): {_verdict_md(_po_lbl)} — {_po_why}")
 
                         # 종목별 알림 토글 (Portfolio_Alert_State 에 저장)
                         _key = _pf_alert_key(puid, acct, _tk)
@@ -18993,6 +18943,17 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             )
             with st.spinner("기관급 포트폴리오 레이더를 계산하는 중..."):
                 sell_radar_df = build_portfolio_sell_radar_df(filtered_portfolio_df)
+                # 스윙(단기) 판정 열 — 카드 루프에서 계산한 값 재사용(카드·표 일치)
+                try:
+                    sell_radar_df["스윙(Status)"] = [
+                        (_swing_by_ticker.get((str(r.get("계좌", "")).strip(),
+                                               str(r.get("티커", "")).strip().upper()))
+                         or _swing_by_ticker_tk.get(str(r.get("티커", "")).strip().upper())
+                         or ("—", ""))[0] or "—"
+                        for _, r in sell_radar_df.iterrows()
+                    ]
+                except Exception:
+                    sell_radar_df["스윙(Status)"] = "—"
 
                 # 포트폴리오 스냅샷 자동 저장 (일 1회)
                 _ph_uid = str(st.session_state.get("user_id") or "").strip()
@@ -19110,9 +19071,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
     
                 def style_status(cell_value):
                     s = str(cell_value)
-                    if "SELL" in s or "매도" in s:
+                    if "SELL" in s or "매도" in s or "청산" in s:
                         return "color: #d62728; font-weight: 700;"
-                    if "익절" in s or "WARNING" in s or "주의" in s:
+                    if "익절" in s or "WARNING" in s or "주의" in s or "줄이기" in s:
                         return "color: #f59e0b; font-weight: 700;"
                     if "HOLD" in s or "보유" in s:
                         return "color: #16a34a; font-weight: 700;"
@@ -19179,6 +19140,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
                 # 표시용에서 내부 플래그 컬럼 제거
                 _display_radar_df = sell_radar_df.drop(columns=["_dd_data_error"], errors="ignore")
+                # 상태(Status)=포지션(중장기)으로 명시 + 스윙(단기)을 바로 앞에 배치
+                _display_radar_df = _display_radar_df.rename(columns={"상태(Status)": "포지션(Status)"})
+                if "스윙(Status)" in _display_radar_df.columns and "포지션(Status)" in _display_radar_df.columns:
+                    _cols = [c for c in _display_radar_df.columns if c != "스윙(Status)"]
+                    _pi = _cols.index("포지션(Status)")
+                    _cols = _cols[:_pi] + ["스윙(Status)"] + _cols[_pi:]
+                    _display_radar_df = _display_radar_df[_cols]
 
                 styled_sell_radar = (
                     _display_radar_df.style.format(
@@ -19200,7 +19168,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     .background_gradient(cmap="RdYlGn", subset=["수익률(%)", "1개월 수익률"], axis=0)
                     .background_gradient(cmap="RdYlGn", subset=["투자 손익($)"], axis=0)
                     .map(highlight_deep_drawdown, subset=["Drawdown(%)"])
-                    .map(style_status, subset=["상태(Status)"])
+                    .map(style_status, subset=[c for c in ["스윙(Status)", "포지션(Status)"]
+                                               if c in _display_radar_df.columns])
                     .map(style_spy_alpha, subset=["SPY Alpha(%)"])
                     .map(style_universe_rank_cell, subset=["유니버스 랭킹(Universe Rank)"])
                 )

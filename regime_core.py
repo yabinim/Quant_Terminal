@@ -1216,3 +1216,99 @@ def build_sell_card(analysis: dict, plan: dict = None) -> dict:
             line += f" · 목표 {_fmt(target)}"
     return {"key": key, "label": dec["label"], "tone": dec["tone"],
             "headline": headline, "detail": detail, "line": line, "badge": dec["label"]}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 9) 포지션(Position) 매도 판정 — SSOT (앱·자동화·이메일 공유)
+#    스윙(Swing) = compute_exit_signals/sell_decision (50일선·ATR·RSI 과열, 며칠~수주)
+#    포지션(Position) = integrated_sell_verdict (200일선·-15% 트레일링·MACD, 수주~수개월)
+# ──────────────────────────────────────────────────────────────────────────
+
+_DEFAULT_TRAILING_STOP_PCT = 15.0
+
+
+def integrated_sell_verdict(*, above_ma200, one_month_return, rsi, macd_signal,
+                            pct_from_52w_high, drawdown_from_high_pct,
+                            trailing_stop_pct: float = _DEFAULT_TRAILING_STOP_PCT):
+    """200일선(후행) + 트레일링 스톱 + MACD/1개월/과열(선행)을 한 점수로 종합한
+    포지션(중장기) 매도 판정. 반환: (label, reason). 라벨은 청산/줄이기/보유 통일 용어
+    (괄호에 SELL/익절/HOLD 키워드 유지 → 기존 파서·스타일러 호환)."""
+    reasons = []
+    score = 0
+    if above_ma200 is False:
+        score += 4
+        reasons.append("200일선 이탈(추세 붕괴)")
+    if pd.notna(drawdown_from_high_pct) and drawdown_from_high_pct <= -abs(trailing_stop_pct):
+        score += 3
+        reasons.append(f"고점 대비 {drawdown_from_high_pct:.0f}% 하락(트레일링 스톱 -{abs(trailing_stop_pct):.0f}%)")
+    if macd_signal == "DEAD_CROSS":
+        score += 2
+        reasons.append("MACD 데드크로스(추세 꺾임)")
+    elif macd_signal == "BELOW_SIGNAL":
+        score += 1
+    if pd.notna(one_month_return) and one_month_return < 0:
+        score += 1
+        reasons.append(f"1개월 {one_month_return:+.1f}%")
+    overheated = (pd.notna(rsi) and rsi > 70
+                  and pd.notna(pct_from_52w_high) and pct_from_52w_high > -3)
+    if overheated:
+        score += 1
+        reasons.append(f"RSI {rsi:.0f} 과열 + 신고가 부근(단기 조정 위험)")
+    if score >= 4:
+        label = "🔴 청산 (SELL)"
+    elif score >= 2:
+        label = "🟡 줄이기 (일부 익절)"
+    else:
+        label = "✅ 보유 (HOLD)"
+        if not reasons:
+            reasons.append("추세 유지 · 이상 신호 없음")
+    return label, " · ".join(reasons)
+
+
+def _macd_state(close: pd.Series) -> str:
+    """MACD(12/26/9) 상태: DEAD_CROSS / BELOW_SIGNAL / ABOVE_SIGNAL / N/A."""
+    c = pd.to_numeric(close, errors="coerce").dropna()
+    if len(c) < 35:
+        return "N/A"
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    sig = macd.ewm(span=9, adjust=False).mean()
+    m, s = float(macd.iloc[-1]), float(sig.iloc[-1])
+    mp, sp = float(macd.iloc[-2]), float(sig.iloc[-2])
+    if mp >= sp and m < s:
+        return "DEAD_CROSS"
+    if m < s:
+        return "BELOW_SIGNAL"
+    return "ABOVE_SIGNAL"
+
+
+def position_sell_verdict(hist, entry_price=None,
+                          trailing_stop_pct: float = _DEFAULT_TRAILING_STOP_PCT):
+    """raw 시세(hist)에서 포지션(중장기) 매도 판정을 직접 계산 → integrated_sell_verdict.
+    자동화/이메일용. 반환: (label, reason). (앱 표는 자체 입력으로 같은 함수를 호출하므로
+    경계값에서 미세 차이가 날 수 있으나 동일 로직 계열.)"""
+    try:
+        close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+    except Exception:
+        return ("N/A", "데이터 부족")
+    if len(close) < 60:
+        return ("N/A", "데이터 부족")
+    price = float(close.iloc[-1])
+    ma200 = _ma_last(close, 200)
+    above_ma200 = bool(price > ma200) if np.isfinite(ma200) else None
+    one_month_return = np.nan
+    if len(close) > 22:
+        p0 = float(close.iloc[-22])
+        if p0 > 0:
+            one_month_return = (price / p0 - 1.0) * 100.0
+    r = compute_rsi(close).dropna()
+    rsi = float(r.iloc[-1]) if not r.empty else np.nan
+    macd_signal = _macd_state(close)
+    hi52 = float(close.tail(252).max())
+    pct_from_52w_high = (price / hi52 - 1.0) * 100.0 if hi52 > 0 else np.nan
+    peak = float(close.tail(NEG_REV_LOOKBACK).max())  # 보유 고점 근사(최근 구간 고점)
+    drawdown_from_high_pct = (price / peak - 1.0) * 100.0 if peak > 0 else np.nan
+    return integrated_sell_verdict(
+        above_ma200=above_ma200, one_month_return=one_month_return, rsi=rsi,
+        macd_signal=macd_signal, pct_from_52w_high=pct_from_52w_high,
+        drawdown_from_high_pct=drawdown_from_high_pct, trailing_stop_pct=trailing_stop_pct,
+    )
