@@ -563,8 +563,13 @@ def alert_conditions(analysis: dict, price=None, stop_loss=None, target_price=No
     exi = analysis.get("exit", {}) or {}
     conds = {}
     conds["entry"] = (bool(tim.get("is_entry")), tim.get("verdict", ""))
-    risk_on = (tim.get("code") == "trend_break") or bool(reg.get("topping")) or (reg.get("regime") == "weak")
-    conds["risk"] = (bool(risk_on), " · ".join(tim.get("reasons", [])) or "추세 약화")
+    neg_rev = bool(exi.get("detail", {}).get("negative_reversal")) or bool(exi.get("warnings"))
+    risk_on = ((tim.get("code") == "trend_break") or bool(reg.get("topping"))
+               or (reg.get("regime") == "weak") or neg_rev)
+    _risk_msgs = list(tim.get("reasons", []))
+    if neg_rev:
+        _risk_msgs += list(exi.get("warnings", []))
+    conds["risk"] = (bool(risk_on), " · ".join([m for m in _risk_msgs if m]) or "추세 약화")
     conds["exit"] = (bool(exi.get("is_exit")), " · ".join(exi.get("reasons", [])))
     price_on, price_msg = False, ""
     if not _isna(price):
@@ -1017,3 +1022,197 @@ def confluence_score(verdict_code=None, rs_excess=None, piotroski=None, altman_z
         "avoid_flag": avoid_flag, "earnings_warning": earnings_warning,
         "n_factors": n_factors, "breakdown": breakdown, "short_note": short_note,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 8) 통일 결정(Decision) 합성 — 표시 SSOT (재계산 없음, 있는 값 조립만)
+#    매수: 매수 / 매수(분할) / 대기(눌림) / 대기(횡보) / 회피
+#    매도: 보유 / 줄이기 / 청산
+#    [5]·[6] 결정 카드 + [7] 글랜스 뱃지가 모두 이 함수를 공유.
+# ──────────────────────────────────────────────────────────────────────────
+
+BUY_DECISION_LABELS = {
+    "buy": "🟢 매수", "buy_split": "🟢 매수(분할)",
+    "wait_pullback": "🟡 대기(눌림)", "wait_range": "🟡 대기(횡보)",
+    "avoid": "🔴 회피", "na": "⚪ 판단보류",
+}
+SELL_DECISION_LABELS = {
+    "hold": "🟢 보유", "trim": "🟡 줄이기", "exit": "🔴 청산", "na": "⚪ 판단보류",
+}
+_BUY_TONE = {"buy": "success", "buy_split": "success", "wait_pullback": "warning",
+             "wait_range": "warning", "avoid": "error", "na": "info"}
+_SELL_TONE = {"hold": "success", "trim": "warning", "exit": "error", "na": "info"}
+
+
+def buy_decision(verdict_code, gate_code=None, regime: str = "unknown") -> dict:
+    """타이밍 코드 + R:R 게이트 + 레짐 → 통일 매수 결정(순수 라벨 매핑)."""
+    code = str(verdict_code or "")
+    g = str(gate_code or "")
+    strong = (regime == "strong")
+    if code in ("avoid", "trend_break") or g == "avoid":
+        key = "avoid"
+    elif code == "overheat":
+        key = "buy_split"
+    elif code == "entry":
+        key = "buy" if g != "skip" else ("wait_pullback" if strong else "wait_range")
+    elif code == "wait":
+        key = "wait_pullback" if strong else "wait_range"
+    else:
+        key = "na"
+    return {"key": key, "label": BUY_DECISION_LABELS[key], "tone": _BUY_TONE[key]}
+
+
+def sell_decision(exit_dict: dict, timing_code=None, topping: bool = False) -> dict:
+    """청산 신호 dict + (선택)타이밍/토핑 → 통일 매도 결정.
+    청산(하드) > 줄이기(경고: 리버설·추세 흔들림·토핑) > 보유."""
+    ex = exit_dict or {}
+    if ex.get("is_exit"):
+        key = "exit"
+    elif ex.get("warnings") or str(timing_code or "") == "trend_break" or topping:
+        key = "trim"
+    elif ex:
+        key = "hold"
+    else:
+        key = "na"
+    return {"key": key, "label": SELL_DECISION_LABELS[key], "tone": _SELL_TONE[key]}
+
+
+def _fmt(v, dollar=True):
+    try:
+        f = float(v)
+        if not np.isfinite(f):
+            return "-"
+        return f"${f:.2f}" if dollar else f"{f:.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def build_buy_card(hist, analysis: dict, plan: dict, confluence=None,
+                   lookback: int = NEG_REV_LOOKBACK) -> dict:
+    """[5] 매수 결정 카드 + [7] 글랜스용 표시 dict. 모두 기존 값 조립(재계산 없음).
+    반환: {key,label,tone,headline,trigger,invalidation,plan_line,why,badge,glance_num}."""
+    timing = analysis.get("timing", {}) if analysis else {}
+    regime = analysis.get("regime", {}) if analysis else {}
+    reg = regime.get("regime", "unknown")
+    dec = buy_decision(timing.get("code"), (plan or {}).get("gate"), reg)
+    key = dec["key"]
+
+    # 레벨(있는 값 읽기)
+    price = ma20 = ma50 = ma200 = rhigh = rlow = rsi_last = np.nan
+    try:
+        close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        if not close.empty:
+            price = float(close.iloc[-1])
+            ma20 = _ma_last(close, 20)
+            ma50 = _ma_last(close, 50)
+            ma200 = _ma_last(close, 200)
+            tail = close.tail(lookback)
+            hi_src = pd.to_numeric(hist["High"], errors="coerce").dropna() if "High" in hist.columns else close
+            lo_src = pd.to_numeric(hist["Low"], errors="coerce").dropna() if "Low" in hist.columns else close
+            rhigh = float(hi_src.tail(lookback).max())
+            rlow = float(lo_src.tail(lookback).min())
+            r = compute_rsi(close).dropna()
+            rsi_last = float(r.iloc[-1]) if not r.empty else np.nan
+    except Exception:
+        pass
+
+    stop = (plan or {}).get("stop")
+    target = (plan or {}).get("target")
+    rr = (plan or {}).get("rr_label", "-")
+    shares = (plan or {}).get("shares", 0)
+    pos_pct = (plan or {}).get("position_pct", 0.0)
+    stop_pct = (plan or {}).get("stop_pct")
+    target_pct = (plan or {}).get("target_pct")
+
+    trigger = invalidation = plan_line = headline = ""
+    trigger_price = np.nan
+
+    if key == "buy":
+        headline = "진입 확인됨 — R:R·근거 충족."
+        plan_line = (f"진입 {_fmt(price)} · {shares:,}주 (비중 {pos_pct:.0f}%) · "
+                     f"손절 {_fmt(stop)} ({stop_pct:.1f}%) · 목표 {_fmt(target)} · R:R {rr}")
+        invalidation = f"{_fmt(stop)} ({stop_pct:.1f}%)" if stop_pct is not None else _fmt(stop)
+    elif key == "buy_split":
+        headline = "강세지만 과열 — 일괄은 고점 위험, 관망은 놓칠 위험. 분할 권장."
+        add_lv = ma20 if (np.isfinite(ma20) and ma20 < price) else (ma50 if np.isfinite(ma50) else np.nan)
+        trigger = f"1차 지금 (목표의 절반) · 2차 추가 {_fmt(add_lv)} 눌림 회복 시 (나머지)"
+        plan_line = f"진입 시 총 {shares:,}주 · 손절 {_fmt(stop)} · R:R {rr}"
+        invalidation = f"{_fmt(stop)} ({stop_pct:.1f}%)" if stop_pct is not None else _fmt(stop)
+        trigger_price = price
+    elif key == "wait_pullback":
+        headline = "강세 추세의 눌림 — 진입 확인 아직."
+        if np.isfinite(ma20) and price < ma20:
+            trigger = f"20일선({_fmt(ma20)}) 위 종가 회복"; trigger_price = ma20
+        elif np.isfinite(ma50) and price < ma50:
+            trigger = f"50일선({_fmt(ma50)}) 회복"; trigger_price = ma50
+        else:
+            trigger = f"최근 고점({_fmt(rhigh)}) 돌파"; trigger_price = rhigh
+        invalidation = (f"200일선({_fmt(ma200)}) 하회" if np.isfinite(ma200)
+                        else (f"{_fmt(stop)} 하회" if np.isfinite(stop) else "-"))
+        plan_line = f"진입 시 {shares:,}주 · R:R {rr}"
+    elif key == "wait_range":
+        headline = "박스권 — 방향 미정. 돌파/이탈 확인 후 대응."
+        trigger = f"박스 상단({_fmt(rhigh)}) 돌파"; trigger_price = rhigh
+        invalidation = f"박스 하단({_fmt(rlow)}) 이탈"
+        plan_line = f"돌파 시 {shares:,}주 · R:R {rr}"
+    elif key == "avoid":
+        headline = "약세 회피 구간 — 신규 진입 비권장. (백테스트상 음의 초과수익)"
+    else:
+        headline = "데이터 부족 — 판단 보류."
+
+    why_bits = []
+    if confluence is not None:
+        try:
+            why_bits.append(f"근거중첩 {float(confluence):.0f}")
+        except (TypeError, ValueError):
+            pass
+    why_bits.append(REGIME_LABEL.get(reg, "⚪"))
+    if np.isfinite(rsi_last):
+        why_bits.append(f"RSI {rsi_last:.0f}")
+    why = " · ".join(why_bits)
+
+    if key in ("buy",):
+        glance_num = f"R:R {rr}"
+    elif key == "buy_split":
+        glance_num = "1차 지금"
+    elif key in ("wait_pullback", "wait_range"):
+        glance_num = f"트리거 {_fmt(trigger_price)}"
+    else:
+        glance_num = "—"
+
+    return {"key": key, "label": dec["label"], "tone": dec["tone"],
+            "headline": headline, "trigger": trigger, "invalidation": invalidation,
+            "plan_line": plan_line, "why": why, "badge": dec["label"],
+            "glance_num": glance_num, "trigger_price": trigger_price}
+
+
+def build_sell_card(analysis: dict, plan: dict = None) -> dict:
+    """[6] 매도 결정 카드 표시 dict."""
+    ex = (analysis or {}).get("exit", {})
+    tv = (analysis or {}).get("timing", {})
+    rg = (analysis or {}).get("regime", {})
+    dec = sell_decision(ex, tv.get("code"), rg.get("topping", False))
+    key = dec["key"]
+    headline = {"exit": "추세 꺾임 — 청산 신호 발생.",
+                "trim": "추세 흔들림·토핑 경고 — 분할 청산·스톱 타이트닝 고려.",
+                "hold": "추세 유지 — 청산 신호 없음.",
+                "na": "데이터 부족."}[key]
+    if key == "exit":
+        detail = " · ".join(ex.get("reasons", []))
+    elif key == "trim":
+        bits = list(ex.get("warnings", []))
+        if str(tv.get("code") or "") == "trend_break" or rg.get("topping"):
+            bits += list(tv.get("reasons", []))
+        detail = " · ".join([b for b in bits if b])
+    else:
+        detail = ""
+    stop = (plan or {}).get("stop")
+    target = (plan or {}).get("target")
+    stop_pct = (plan or {}).get("stop_pct")
+    line = ""
+    if stop is not None and (np.isfinite(stop) if isinstance(stop, (int, float)) else False):
+        line = f"손절 {_fmt(stop)}" + (f" ({stop_pct:.1f}%)" if stop_pct is not None else "")
+        if target is not None and np.isfinite(target):
+            line += f" · 목표 {_fmt(target)}"
+    return {"key": key, "label": dec["label"], "tone": dec["tone"],
+            "headline": headline, "detail": detail, "line": line, "badge": dec["label"]}

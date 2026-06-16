@@ -17445,6 +17445,52 @@ if st.session_state.get("logged_in"):
                 _regime_res = rc.classify_regime(timing_history, spy_close=_spy_close)
                 _timing_res = rc.evaluate_timing(timing_history, _regime_res)
 
+                # ── 🎯 매수 결정 카드 (헤드라인) — regime_core SSOT (2-2) ──
+                if _regime_res.get("enough_data") and pd.notna(current_price) and float(current_price) > 0:
+                    _exit_card = rc.compute_exit_signals(timing_history)
+                    try:
+                        _rp_card = _regime_params(compute_daily_risk_gauge("전체"))
+                    except Exception:
+                        _rp_card = _regime_params({})
+                    _atr_card = rc.compute_atr(timing_history)
+                    _ma200_card = float("nan")
+                    try:
+                        _csc = pd.to_numeric(close, errors="coerce").dropna()
+                        if len(_csc) >= 150:
+                            _ma200_card = float(_csc.rolling(200, min_periods=150).mean().dropna().iloc[-1])
+                    except Exception:
+                        pass
+                    _rhigh_card = float("nan")
+                    try:
+                        _hsrc = timing_history["High"] if "High" in timing_history.columns else close
+                        _rhigh_card = float(pd.to_numeric(_hsrc, errors="coerce").dropna().tail(120).max())
+                    except Exception:
+                        pass
+                    _plan_card = rc.build_trade_plan(
+                        verdict_code=_timing_res.get("code"), entry=float(current_price),
+                        atr=_atr_card, ma200=_ma200_card,
+                        equity=float(st.session_state.get("_size_equity", 10000.0)),
+                        risk_pct=float(st.session_state.get("_size_risk_pct", 1.0)),
+                        atr_mult=_rp_card["atr_mult"], rr_target=_rp_card["rr"],
+                        recent_high=_rhigh_card,
+                    )
+                    _card = rc.build_buy_card(
+                        timing_history,
+                        {"timing": _timing_res, "regime": _regime_res, "exit": _exit_card},
+                        _plan_card, confluence=None,
+                    )
+                    _tone_fn = {"success": st.success, "warning": st.warning,
+                                "error": st.error, "info": st.info}.get(_card["tone"], st.info)
+                    _msg = f"**{_card['label']}** — {_card['headline']}"
+                    if _card["trigger"]:
+                        _msg += f"\n\n✅ **트리거:** {_card['trigger']}"
+                    if _card["invalidation"]:
+                        _msg += f"\n\n⛔ **무효화/손절:** {_card['invalidation']}"
+                    if _card["plan_line"]:
+                        _msg += f"\n\n🧮 {_card['plan_line']}"
+                    _tone_fn(_msg)
+                    st.caption(f"왜 ▸ {_card['why']}  ·  아래는 세부 근거")
+
                 # ── ⓪ 왜 이 종목인가 — 근거 중첩도(Confluence) (#3) ──
                 with st.container(border=True):
                     st.markdown("##### 🧩 왜 이 종목인가 — 근거 중첩도")
@@ -18387,15 +18433,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         _rg, _ex, _tv = _an["regime"], _an["exit"], _an["timing"]
                         _rlabel = rc.REGIME_LABEL.get(_rg["regime"], "⚪")
                         _line = f"**{_tk}** · {_rlabel} · 평단 {_avg_s} {_qty_s}"
-                        if _ex.get("is_exit"):
-                            st.error(_line + " · 💰 청산 신호\n\n" + " · ".join(_ex.get("reasons", [])))
-                        elif _tv.get("code") == "trend_break" or _rg.get("topping"):
-                            st.warning(_line + " · ⚠️ 추세 흔들림\n\n" + " · ".join(_tv.get("reasons", [])))
-                        else:
-                            st.success(_line + " · ✅ 보유 양호")
-                        _ex_warns = _ex.get("warnings", [])
-                        if _ex_warns:
-                            st.caption("⚠️ " + " · ".join(_ex_warns) + " — 분할 청산·스톱 타이트닝 고려")
+                        _scard = rc.build_sell_card(_an, None)
+                        _stone = {"success": st.success, "warning": st.warning,
+                                  "error": st.error, "info": st.info}.get(_scard["tone"], st.info)
+                        _smsg = f"{_line} · **{_scard['label']}**\n\n{_scard['headline']}"
+                        if _scard["detail"]:
+                            _smsg += "\n\n" + _scard["detail"]
+                        _stone(_smsg)
 
                         # 종목별 알림 토글 (Portfolio_Alert_State 에 저장)
                         _key = _pf_alert_key(puid, acct, _tk)
@@ -20809,6 +20853,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
                 rsi_map_wl, ma200_map_wl, regime_map_wl = {}, {}, {}
                 atr_map_wl, high_map_wl = {}, {}   # #2 사이징용 ATR·최근고점
+                hist_map_wl, wl_dec_key = {}, {}   # 결정 카드/정렬용
                 # RS(상대강도) 계산용 SPY 종가 — 1회만 조회
                 try:
                     _spy_hist_wl = _fmp_price_history("SPY", limit=252)
@@ -20832,12 +20877,19 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         _hi_wl = (pd.to_numeric(hist["High"], errors="coerce")
                                   if "High" in hist.columns else close)
                         high_map_wl[tk] = float(_hi_wl.dropna().tail(120).max()) if not _hi_wl.dropna().empty else np.nan
+                        hist_map_wl[tk] = hist
+                        _amwl = regime_map_wl[tk]
+                        wl_dec_key[tk] = (rc.buy_decision(_amwl["timing"].get("code"), None,
+                                                          _amwl["regime"].get("regime"))["key"]
+                                          if _amwl else "na")
                     except Exception:
                         rsi_map_wl[tk] = np.nan
                         ma200_map_wl[tk] = np.nan
                         regime_map_wl[tk] = None
                         atr_map_wl[tk] = np.nan
                         high_map_wl[tk] = np.nan
+                        hist_map_wl[tk] = None
+                        wl_dec_key[tk] = "na"
 
             # ── 포지션 플랜 입력 (사이징·R:R) — 개별종목 탭과 세션 공유 (#2) ──
             _wl_equity = float(st.session_state.get("_size_equity", 10000.0))
@@ -20863,6 +20915,24 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         "각 종목에 '얼마' 들어갈지 + R:R 게이트를 제안합니다. "
                         f"국면 {_wl_rp['label']} (ATR×{_wl_rp['atr_mult']}, 목표 1:{_wl_rp['rr']}). "
                         "손절/목표가를 설정해두면 R:R 게이트가 정확해집니다.")
+
+            # ── 결정 필터·정렬 (2-5) ──
+            if wl_items:
+                _dec_order = {"buy": 0, "buy_split": 1, "wait_pullback": 2, "wait_range": 3, "na": 4, "avoid": 5}
+                _fc1, _fc2 = st.columns([1, 1])
+                with _fc1:
+                    _wl_dfilter = st.selectbox("결정 필터", ["전체", "🟢 매수 계열", "🟡 대기", "🔴 회피"],
+                                               key="_wl_dec_filter")
+                with _fc2:
+                    _wl_dsort = st.checkbox("결정 순 정렬(매수 먼저)", value=True, key="_wl_dec_sort")
+                _grp = {"🟢 매수 계열": ("buy", "buy_split"), "🟡 대기": ("wait_pullback", "wait_range"),
+                        "🔴 회피": ("avoid",)}.get(_wl_dfilter)
+                if _grp:
+                    wl_items = [it for it in wl_items if wl_dec_key.get(it.get("ticker"), "na") in _grp]
+                if _wl_dsort:
+                    wl_items = sorted(wl_items, key=lambda it: _dec_order.get(wl_dec_key.get(it.get("ticker"), "na"), 9))
+                if not wl_items:
+                    st.caption("해당 결정에 맞는 종목이 없습니다.")
 
             for idx, item in enumerate(wl_items):
                 tk = item["ticker"]
@@ -20977,6 +21047,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 manual_target=float(_tp_item) if pd.notna(_tp_item) else None,
                                 recent_high=float(_wl_hi) if pd.notna(_wl_hi) else None,
                             )
+                            _bc = rc.build_buy_card(hist_map_wl.get(tk), _an, _wl_plan, confluence=None)
+                            st.markdown(f"**🎯 {_bc['badge']}** · {_bc['glance_num']}")
                             if _wl_plan["gate"] == "na":
                                 st.caption(f"🧮 플랜: {_wl_plan['gate_label']} — {_wl_plan['gate_reason']}")
                             else:
