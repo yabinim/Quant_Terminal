@@ -519,13 +519,14 @@ def analyze_ticker(hist: pd.DataFrame, spy_close=None, entry_price: float | None
 import json as _json
 
 ALERT_CONFIRM_DAYS = 2
-ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price")
+ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price", "watch")
 ALERT_EVENT_LABELS = {
     "entry":  "🟢 매수 신호",
     "regime": "🔄 레짐 전환",
     "risk":   "🟡 줄이기 (추세 흔들림·리버설)",
     "exit":   "🔴 청산",
     "price":  "📌 손절/목표 도달",
+    "watch":  "🎯 관심가 도달 (목표가·RSI·200일선)",
 }
 _REGIME_KR = {"strong": "🟢 강세", "sideways": "🟡 횡보", "weak": "🔴 약세"}
 
@@ -556,7 +557,30 @@ def resolve_alert_events(raw, default_csv: str = "entry,risk") -> list:
     return [t for t in toks if t in ALERT_EVENTS]
 
 
-def alert_conditions(analysis: dict, price=None, stop_loss=None, target_price=None) -> dict:
+def watch_condition_msgs(price=None, rsi=None, ma200=None,
+                         alert_price=None, alert_rsi=None, alert_ma200=False) -> list:
+    """수동 관심 조건(목표 매수가·RSI·200일선 근접) 충족 메시지 리스트.
+
+    app.py 인앱 배너(check_watchlist_alerts) · automation 이메일 레이더(watch 이벤트)
+    공유 SSOT. 어느 하나라도 충족 시 해당 메시지를 담아 반환(빈 리스트 = 미충족).
+    임계값은 기존 app.py 인앱 체크와 동일하게 유지.
+    """
+    msgs = []
+    if not _isna(alert_price) and not _isna(price) and float(price) <= float(alert_price):
+        msgs.append(f"💰 목표가 도달: 현재 ${float(price):.2f} ≤ 설정 ${float(alert_price):.2f}")
+    if not _isna(alert_rsi) and not _isna(rsi) and float(rsi) <= float(alert_rsi):
+        msgs.append(f"📉 RSI 과매도: 현재 RSI {float(rsi):.1f} ≤ 설정 {float(alert_rsi):.1f}")
+    if alert_ma200 and not _isna(price) and not _isna(ma200) and float(ma200) > 0:
+        gap_pct = (float(price) / float(ma200) - 1.0) * 100
+        if abs(gap_pct) <= 3.0:
+            msgs.append(
+                f"📊 200일선 근접: 현재가 ${float(price):.2f} / 200일선 ${float(ma200):.2f} (괴리 {gap_pct:+.1f}%)"
+            )
+    return msgs
+
+
+def alert_conditions(analysis: dict, price=None, stop_loss=None, target_price=None,
+                     alert_price=None, alert_rsi=None, alert_ma200=False) -> dict:
     """현재 시점의 이벤트별 (조건 bool, 설명) 산출. regime 은 별도 처리."""
     reg = analysis.get("regime", {}) or {}
     tim = analysis.get("timing", {}) or {}
@@ -578,12 +602,20 @@ def alert_conditions(analysis: dict, price=None, stop_loss=None, target_price=No
         elif not _isna(target_price) and float(price) >= float(target_price):
             price_on, price_msg = True, f"목표가 ${float(target_price):.2f} 도달(현재 ${float(price):.2f})"
     conds["price"] = (price_on, price_msg)
+    # 수동 관심 조건(watch): 목표 매수가·RSI·200일선 근접 — 공유 SSOT
+    _comp = reg.get("components") or {}
+    _wmsgs = watch_condition_msgs(
+        price=price, rsi=_comp.get("rsi"), ma200=_comp.get("ma200"),
+        alert_price=alert_price, alert_rsi=alert_rsi, alert_ma200=alert_ma200,
+    )
+    conds["watch"] = (bool(_wmsgs), " · ".join(_wmsgs))
     return conds
 
 
 def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: str = "",
                                today_str: str = "", price=None, stop_loss=None,
-                               target_price=None, confirm_days: int = ALERT_CONFIRM_DAYS):
+                               target_price=None, confirm_days: int = ALERT_CONFIRM_DAYS,
+                               alert_price=None, alert_rsi=None, alert_ma200=False):
     """상태 전환 기반 알림 평가 (2일 확정 + 재무장). 순수 함수.
 
     ※ 하루 1회 호출 전제(자동화). 호출 1회 = 평가 1회로 pending 카운터가 1 진행된다.
@@ -604,11 +636,12 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
     cur_regime = reg.get("regime") if reg.get("enough_data") else None
 
     enabled = set(enabled_events or [])
-    conds = alert_conditions(analysis, price, stop_loss, target_price)
+    conds = alert_conditions(analysis, price, stop_loss, target_price,
+                             alert_price=alert_price, alert_rsi=alert_rsi, alert_ma200=alert_ma200)
     fired = []
 
     # 일반 이벤트: 조건 지속 + confirm_days 확정 + 재무장(조건 해제 시)
-    for e in ("entry", "risk", "exit", "price"):
+    for e in ("entry", "risk", "exit", "price", "watch"):
         if e not in enabled:
             events_state[e] = {"status": "armed", "pending": 0}
             continue

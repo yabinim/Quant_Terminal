@@ -94,8 +94,8 @@ _ETF_AUTO_UPDATE_INTERVAL_DAYS = 7  # 자동 업데이트 주기
 _WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added", "Stop_Loss", "Target_Price", "Alert_States", "Alert_LastState"]
 _WL_NCOL = len(_WATCHLIST_SHEET_COLS)  # =12. 과거 8/10열 시트는 읽을 때 빈 칸으로 패딩되어 자동 마이그레이션됨.
 # 상태 기반 알림 이벤트 코드 (Alert_States 콤마 플래그). 기본 ON = entry + risk.
-_WL_ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price")
-_WL_ALERT_DEFAULT = "entry,risk"
+_WL_ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price", "watch")
+_WL_ALERT_DEFAULT = "entry,risk,watch"
 _THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
 
@@ -9618,15 +9618,11 @@ def check_watchlist_alerts(items: list[dict], price_map: dict, rsi_map: dict, ma
         alert_rsi = pd.to_numeric(item.get("alert_rsi"), errors="coerce")
         alert_ma200 = bool(item.get("alert_ma200"))
 
-        alerts = []
-        if pd.notna(alert_price) and pd.notna(current_price) and current_price <= alert_price:
-            alerts.append(f"💰 목표가 도달: 현재 ${current_price:.2f} ≤ 설정 ${alert_price:.2f}")
-        if pd.notna(alert_rsi) and pd.notna(current_rsi) and current_rsi <= alert_rsi:
-            alerts.append(f"📉 RSI 과매도: 현재 RSI {current_rsi:.1f} ≤ 설정 {alert_rsi:.1f}")
-        if alert_ma200 and pd.notna(current_price) and pd.notna(ma200):
-            gap_pct = (current_price / ma200 - 1.0) * 100
-            if abs(gap_pct) <= 3.0:
-                alerts.append(f"📊 200일선 근접: 현재가 ${current_price:.2f} / 200일선 ${ma200:.2f} (괴리 {gap_pct:+.1f}%)")
+        # 공유 SSOT — 이메일 레이더(watch 이벤트)와 동일 임계값/메시지
+        alerts = rc.watch_condition_msgs(
+            price=current_price, rsi=current_rsi, ma200=ma200,
+            alert_price=alert_price, alert_rsi=alert_rsi, alert_ma200=alert_ma200,
+        )
         if alerts:
             triggered.append({"ticker": tk, "alerts": alerts, "current_price": current_price})
     return triggered
@@ -13773,18 +13769,24 @@ if st.session_state.get("logged_in"):
                         _an2 = rc.analyze_ticker(_hist, spy_close=_spy_c)
                         if not _an2.get("regime", {}).get("enough_data"):
                             continue
-                        _en = rc.resolve_alert_events(_it.get("alert_states"))
+                        _en = rc.resolve_alert_events(_it.get("alert_states"), _WL_ALERT_DEFAULT)
                         _px = _price_map.get(_tk, np.nan)
                         _sl2 = pd.to_numeric(_it.get("stop_loss"), errors="coerce")
                         _tp2 = pd.to_numeric(_it.get("target_price"), errors="coerce")
+                        _ap2 = pd.to_numeric(_it.get("alert_price"), errors="coerce")
+                        _ar2 = pd.to_numeric(_it.get("alert_rsi"), errors="coerce")
+                        _am2 = bool(_it.get("alert_ma200"))
                         _cn = rc.alert_conditions(
                             _an2,
                             price=float(_px) if pd.notna(_px) else None,
                             stop_loss=float(_sl2) if pd.notna(_sl2) else None,
                             target_price=float(_tp2) if pd.notna(_tp2) else None,
+                            alert_price=float(_ap2) if pd.notna(_ap2) else None,
+                            alert_rsi=float(_ar2) if pd.notna(_ar2) else None,
+                            alert_ma200=_am2,
                         )
                         if any(e in _en and _cn.get(e, (False, ""))[0]
-                               for e in ("entry", "risk", "exit", "price")):
+                               for e in ("entry", "risk", "exit", "price", "watch")):
                             _alert_hits.append(_tk)
                     except Exception:
                         continue
@@ -20622,21 +20624,25 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
         # ── 종목 추가 폼 ───────────────────────────────────────────────────
         with st.expander("➕ 관심 종목 추가", expanded=not wl_items):
-            # 손절/목표가 제안 미리보기 (폼 바깥 — 폼은 제출 시 초기화되므로)
-            st.caption("💡 티커를 넣고 아래 **제안값 계산**을 누르면 ATR·200일선 기준 손절/목표가가 표시됩니다. 그 값을 참고해 폼에 직접 입력하세요.")
+            # 제출 직후 티커칸 비우기 (폼 바깥 위젯이라 clear_on_submit 미적용 → rerun 전 플래그로 처리)
+            if st.session_state.pop("_wl_clear_ticker", False):
+                st.session_state["wl_unified_ticker"] = ""
+            # 티커는 폼 '바깥' 단일 입력 — '제안값 계산'과 'Watchlist 추가'가 같은 티커를 공유.
+            # (st.form 내부 위젯값은 제출 전까지 읽을 수 없어, 제안 계산용으로 폼 바깥에 둔다)
+            st.caption("💡 티커를 넣고 **제안값 계산**을 누르면 ATR·200일선 기준 손절/목표가가 표시됩니다. 같은 티커가 아래 추가에도 그대로 사용됩니다.")
             _sug_c1, _sug_c2 = st.columns([2, 1])
             with _sug_c1:
-                _sug_ticker = st.text_input(
-                    "제안 계산용 티커",
+                wl_ticker = st.text_input(
+                    "티커",
                     placeholder="예: NVDA",
-                    key="wl_suggest_ticker",
+                    key="wl_unified_ticker",
                 ).strip().upper()
             with _sug_c2:
                 _sug_go = st.button("📐 제안값 계산", key="wl_suggest_btn", use_container_width=True)
-            if _sug_go and _sug_ticker:
-                with st.spinner(f"{_sug_ticker} 손절/목표가 제안 계산 중..."):
-                    _sug = suggest_stop_and_target(_sug_ticker)
-                st.session_state["_wl_suggestion"] = {"ticker": _sug_ticker, **_sug}
+            if _sug_go and wl_ticker:
+                with st.spinner(f"{wl_ticker} 손절/목표가 제안 계산 중..."):
+                    _sug = suggest_stop_and_target(wl_ticker)
+                st.session_state["_wl_suggestion"] = {"ticker": wl_ticker, **_sug}
             _sug_state = st.session_state.get("_wl_suggestion")
             if _sug_state and _sug_state.get("ticker"):
                 _e = _sug_state.get("entry")
@@ -20681,20 +20687,17 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.warning(f"{_sug_state['ticker']} 가격 데이터를 불러오지 못해 제안값을 계산할 수 없습니다.")
 
             with st.form("watchlist_add_form", clear_on_submit=True):
-                wl_col1, wl_col2 = st.columns([1, 2])
-                with wl_col1:
-                    wl_ticker = st.text_input(
-                        "티커",
-                        placeholder="예: NVDA",
-                        key="wl_form_ticker",
-                    ).strip().upper()
-                with wl_col2:
-                    wl_memo = st.text_input(
-                        "메모 (매수 근거)",
-                        placeholder="예: AI Capex 수혜, 어닝 모멘텀",
-                        key="wl_form_memo",
-                    )
-                st.markdown("**Alert 조건 설정** (하나 이상 설정하세요)")
+                wl_memo = st.text_input(
+                    "메모 (매수 근거)",
+                    placeholder="예: AI Capex 수혜, 어닝 모멘텀",
+                    key="wl_form_memo",
+                )
+                st.markdown("**Alert 조건 설정** _(선택 — 비워두면 엔진의 매수 신호로만 알림)_")
+                st.caption(
+                    "여기 설정한 조건은 장 마감 후 **매매레이더 이메일**로도 발송됩니다 "
+                    "(2일 연속 확정 시 1회 · 깜빡임 방지). 비워두면 엔진이 판단한 "
+                    "🟢 매수 신호 / 🟡 줄이기 알림만 받습니다."
+                )
                 al_col1, al_col2, al_col3 = st.columns(3)
                 with al_col1:
                     wl_alert_price = st.number_input(
@@ -20704,7 +20707,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         step=0.5,
                         format="%.2f",
                         key="wl_form_alert_price",
-                        help="현재가가 이 가격 이하로 내려오면 알림",
+                        help="현재가가 이 가격 이하로 내려오면 알림(앱·이메일)",
                     )
                 with al_col2:
                     wl_alert_rsi = st.number_input(
@@ -20715,13 +20718,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         step=1.0,
                         format="%.0f",
                         key="wl_form_alert_rsi",
-                        help="RSI가 이 값 이하로 내려오면 알림 (예: 30 = 과매도)",
+                        help="RSI가 이 값 이하로 내려오면 알림(앱·이메일). 예: 30 = 과매도",
                     )
                 with al_col3:
                     wl_alert_ma200 = st.checkbox(
                         "📊 200일선 ±3% 근접 시",
                         key="wl_form_alert_ma200",
-                        help="현재가가 200일 이동평균선의 ±3% 이내에 들어오면 알림",
+                        help="현재가가 200일 이동평균선의 ±3% 이내에 들어오면 알림(앱·이메일)",
                     )
 
                 st.markdown("**손절 / 목표가** (진입 전 미리 정하면 감정적 보유를 막아줍니다)")
@@ -20788,6 +20791,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     _rr_msg = f" · 손익비 1:{_rr:.1f} 🔴 (위험이 보상보다 큼 — 재검토)"
                         st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!{_rr_msg}")
                         st.session_state.pop("_wl_suggestion", None)
+                        st.session_state["_wl_clear_ticker"] = True  # 다음 rerun에서 티커칸 비움
                         st.rerun()
                     else:
                         st.error(f"저장 실패: {err_wl}")
@@ -20942,9 +20946,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
                 # 상태 기반 알림: 활성 이벤트 목록 + '지금 활성 조건' 미리보기.
                 # (실제 발동/2일확정/저장은 장 마감 후 자동화가 담당 — 앱은 표시만)
-                _enabled_states = rc.resolve_alert_events(item.get("alert_states"))
+                _enabled_states = rc.resolve_alert_events(item.get("alert_states"), _WL_ALERT_DEFAULT)
                 _sl_item = pd.to_numeric(item.get("stop_loss"), errors="coerce")
                 _tp_item = pd.to_numeric(item.get("target_price"), errors="coerce")
+                _ap_item = pd.to_numeric(item.get("alert_price"), errors="coerce")
+                _ar_item = pd.to_numeric(item.get("alert_rsi"), errors="coerce")
+                _am_item = bool(item.get("alert_ma200"))
                 _an = regime_map_wl.get(tk)
                 _active_now = []
                 if _an and _an.get("regime", {}).get("enough_data"):
@@ -20953,8 +20960,11 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         price=float(current_price) if pd.notna(current_price) else None,
                         stop_loss=float(_sl_item) if pd.notna(_sl_item) else None,
                         target_price=float(_tp_item) if pd.notna(_tp_item) else None,
+                        alert_price=float(_ap_item) if pd.notna(_ap_item) else None,
+                        alert_rsi=float(_ar_item) if pd.notna(_ar_item) else None,
+                        alert_ma200=_am_item,
                     )
-                    _active_now = [e for e in ("entry", "risk", "exit", "price")
+                    _active_now = [e for e in ("entry", "risk", "exit", "price", "watch")
                                    if e in _enabled_states and _now_conds.get(e, (False, ""))[0]]
                 alert_badge = "⚡ 알림 조건 활성!" if _active_now else ""
 
@@ -21078,6 +21088,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             price=float(current_price) if pd.notna(current_price) else None,
                             stop_loss=float(_sl_item) if pd.notna(_sl_item) else None,
                             target_price=float(_tp_item) if pd.notna(_tp_item) else None,
+                            alert_price=float(_ap_item) if pd.notna(_ap_item) else None,
+                            alert_rsi=float(_ar_item) if pd.notna(_ar_item) else None,
+                            alert_ma200=_am_item,
                         )
                         for _e in _active_now:
                             _msg = _prev.get(_e, (False, ""))[1]
@@ -21085,7 +21098,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
                     # 알림·손절/목표 편집
                     with st.expander("✏️ 알림 · 손절/목표 편집", expanded=False):
-                        _cur_states = rc.resolve_alert_events(item.get("alert_states"))
+                        _cur_states = rc.resolve_alert_events(item.get("alert_states"), _WL_ALERT_DEFAULT)
                         _opts = list(_WL_ALERT_EVENTS)
                         new_states = st.multiselect(
                             "🔔 알림받을 상태",
@@ -21093,8 +21106,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             default=[s for s in _cur_states if s in _opts],
                             format_func=lambda c: rc.ALERT_EVENT_LABELS.get(c, c),
                             key=f"edit_states_{idx}_{tk}",
-                            help="🎯매수적기·🚫추세이탈이 기본. 선택한 상태가 2일 연속 확정될 때 1회 알림(깜빡임 방지). "
-                                 "📌가격은 아래 손절/목표가 도달 시 알림.",
+                            help="🟢매수신호·🟡줄이기가 기본. 선택한 상태가 2일 연속 확정될 때 1회 알림(깜빡임 방지). "
+                                 "📌손절/목표 도달, 🎯관심가(목표가·RSI·200일선)는 설정값 도달 시 알림.",
                         )
                         new_memo = st.text_input(
                             "📝 메모 수정",
