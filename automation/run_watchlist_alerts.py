@@ -58,7 +58,7 @@ _WL_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200",
             "Saved_Price", "Date_Added", "Stop_Loss", "Target_Price",
             "Alert_States", "Alert_LastState"]
 _WL_NCOL = len(_WL_COLS)
-_WL_ALERT_DEFAULT = "entry,risk"
+_WL_ALERT_DEFAULT = "entry,risk,watch"
 _COL_ALERT_STATES = 10      # 0-index
 _COL_ALERT_LASTSTATE = 11   # 0-index → 시트 L열
 
@@ -324,6 +324,9 @@ def eval_watchlist_eod(spy_close, hist_cache, today):
         enabled = rc.resolve_alert_events(r[_COL_ALERT_STATES], _WL_ALERT_DEFAULT)
         sl = pd.to_numeric(r[8], errors="coerce")
         tp = pd.to_numeric(r[9], errors="coerce")
+        ap = pd.to_numeric(r[3], errors="coerce")           # Alert_Price (목표 매수가)
+        ar = pd.to_numeric(r[4], errors="coerce")           # Alert_RSI
+        am = str(r[5]).strip().lower() == "true"            # Alert_MA200
         try:
             if tk not in hist_cache:
                 hist_cache[tk] = _fmp_price_history(tk)
@@ -335,6 +338,9 @@ def eval_watchlist_eod(spy_close, hist_cache, today):
                 an, enabled, prev_state, today_str=today, price=float(hist["Close"].iloc[-1]),
                 stop_loss=(float(sl) if pd.notna(sl) else None),
                 target_price=(float(tp) if pd.notna(tp) else None),
+                alert_price=(float(ap) if pd.notna(ap) else None),
+                alert_rsi=(float(ar) if pd.notna(ar) else None),
+                alert_ma200=am,
             )
             laststate_col.append([new_state]); n_eval += 1
             if fired:
@@ -449,7 +455,7 @@ def eval_watchlist_intraday(spy_close, hist_cache, quote_cache, today):
     vals = ws.get_all_values() or []
     if len(vals) < 2:
         return hits_by_user
-    ev = ("entry", "risk", "exit", "price")
+    ev = ("entry", "risk", "exit", "price", "watch")
     for r in vals[1:]:
         r = (list(r) + [""] * _WL_NCOL)[:_WL_NCOL]
         uid, tk = str(r[0]).strip(), str(r[1]).strip().upper()
@@ -460,6 +466,9 @@ def eval_watchlist_intraday(spy_close, hist_cache, quote_cache, today):
             continue
         sl = pd.to_numeric(r[8], errors="coerce")
         tp = pd.to_numeric(r[9], errors="coerce")
+        ap = pd.to_numeric(r[3], errors="coerce")
+        ar = pd.to_numeric(r[4], errors="coerce")
+        am = str(r[5]).strip().lower() == "true"
         try:
             if tk not in hist_cache:
                 hist_cache[tk] = _fmp_price_history(tk)
@@ -473,7 +482,10 @@ def eval_watchlist_intraday(spy_close, hist_cache, quote_cache, today):
             live = quote_cache[tk] if quote_cache[tk] is not None else float(hist["Close"].iloc[-1])
             conds = rc.alert_conditions(an, price=live,
                                         stop_loss=(float(sl) if pd.notna(sl) else None),
-                                        target_price=(float(tp) if pd.notna(tp) else None))
+                                        target_price=(float(tp) if pd.notna(tp) else None),
+                                        alert_price=(float(ap) if pd.notna(ap) else None),
+                                        alert_rsi=(float(ar) if pd.notna(ar) else None),
+                                        alert_ma200=am)
             active = [{"event": e, "label": rc.ALERT_EVENT_LABELS[e], "message": conds[e][1]}
                       for e in ev if e in enabled and conds.get(e, (False, ""))[0]]
             if active:
