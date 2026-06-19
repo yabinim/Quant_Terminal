@@ -316,6 +316,52 @@ def _fmp_close_series(ticker: str, limit: int = 130):
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
 
+def _fmp_profile(ticker: str) -> dict:
+    """FMP profile 단건 (isEtf/isFund 판별용) — app.py _fmp_profile와 동일 목적."""
+    if not FMP_API_KEY or not str(ticker).strip():
+        return {}
+    try:
+        r = requests.get(f"{_FMP_BASE}/profile",
+                         params={"symbol": str(ticker).strip().upper(), "apikey": FMP_API_KEY},
+                         timeout=8)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        return data[0] if isinstance(data, list) and data else {}
+    except Exception:
+        return {}
+
+
+def _classify_narrative_etfs(tickers_tuple: tuple) -> set:
+    """후보 티커 중 ETF/펀드(isEtf/isFund) 집합 반환 — app.py _classify_narrative_etfs와 동일.
+    Phase 1(개별주 픽)에 ETF가 섞여 들어온 경우 제거 대상 판별용."""
+    tickers = [str(t).upper().strip() for t in dict.fromkeys(tickers_tuple) if str(t).strip()]
+    if not tickers:
+        return set()
+    import concurrent.futures as _cf
+    etf = set()
+
+    def _one(tk):
+        try:
+            p = _fmp_profile(tk) or {}
+            return tk, bool(p.get("isEtf") or p.get("isFund"))
+        except Exception:
+            return tk, False
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+            for fut in _cf.as_completed([ex.submit(_one, t) for t in tickers]):
+                try:
+                    tk, is_etf = fut.result()
+                    if is_etf:
+                        etf.add(tk)
+                except Exception:
+                    pass
+    except Exception:
+        return set()
+    return etf
+
+
 def verify_emerging_with_quant(emerging_tickers: list) -> list[dict]:
     """app.py verify_emerging_with_quant와 동일한 판정 기준으로 Emerging 종목 검증."""
     if not emerging_tickers or not FMP_API_KEY:
@@ -338,22 +384,33 @@ def verify_emerging_with_quant(emerging_tickers: list) -> list[dict]:
         above_ma200 = bool(s.iloc[-1] > ma200) if pd.notna(ma200) else None
         vol_surge = float(vol.tail(5).mean() / vol.tail(21).mean()) if len(vol) >= 21 else np.nan
 
-        # app.py와 100% 동일한 판정 분기
+        # app.py verify_emerging_with_quant와 100% 동일한 판정 분기 + detail
         if pd.notna(rs_score) and rs_score < 0 and pd.notna(vol_surge) and vol_surge >= 1.5:
             verdict = "🎯 최적 매수 타이밍"
+            detail = f"RS {rs_score:+.1f}%p (아직 저평가) + 거래량 {vol_surge:.1f}x 급증"
         elif pd.notna(rs_score) and rs_score < 3 and above_ma200 and pd.notna(mom_1m) and mom_1m > 2:
             verdict = "🌱 얼리버드 기회"
+            detail = f"RS {rs_score:+.1f}%p + 200일선 위 + 1개월 {mom_1m:+.1f}%"
         elif pd.notna(rs_score) and rs_score > 5 and above_ma200:
             verdict = "✅ 이미 강세 (진입 시 고점 주의)"
+            detail = f"RS {rs_score:+.1f}%p + 200일선 위"
         elif above_ma200 is False:
             verdict = "❌ 하락 추세 (대기)"
+            detail = "200일선 아래 — 아직 때가 아님"
         else:
             verdict = "⏳ 신호 대기"
+            detail = f"RS {rs_score:+.1f}%p" if pd.notna(rs_score) else "데이터 부족"
 
+        # app.py와 동일한 8키 반환(앱이 _quant 렌더 시 동일 필드 사용)
         results.append({
             "ticker": tk,
             "rs_score": round(rs_score, 2) if pd.notna(rs_score) else None,
+            "mom_1m": round(mom_1m, 2) if pd.notna(mom_1m) else None,
+            "above_ma200": above_ma200,
+            "vol_surge": round(vol_surge, 2) if pd.notna(vol_surge) else None,
             "verdict": verdict,
+            "detail": detail,
+            "current_price": round(float(s.iloc[-1]), 4) if not s.empty and pd.notna(s.iloc[-1]) else None,
         })
         time.sleep(0.15)  # FMP rate-limit 완화
     return results
@@ -469,8 +526,59 @@ def run_emerging_tracking(analysis: dict) -> None:
 
 
 # ── HTML 이메일 생성 ───────────────────────────────────────────────────────────
+def _quant_verdict_emoji(verdict) -> str:
+    """verdict 문자열 → 선두 판정 이모지 1개 (app.py와 동일)."""
+    v = str(verdict or "")
+    for e in ("🎯", "🌱", "✅", "❌"):
+        if e in v:
+            return e
+    return "⏳"
+
+
+def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "", status_map=None) -> str:
+    """티커 CSV → 종목별 정량 요약 (app.py _fmt_quant_inline과 동일).
+      - winner : 풀 정보 (판정 + RS + 200일선 + ⚠️불일치 플래그)
+      - emerging: 판정 라벨만 / expand: 판정 이모지 1개만.
+    무지표 티커는 status_map으로 구분(new=🆕 / unchecked=🔁)."""
+    status_map = status_map or {}
+    parts = []
+    for t in [x.strip().upper() for x in str(tickers_csv or "").split(",") if x.strip()]:
+        if not t or t == "N/A":
+            continue
+        q = (quant_map or {}).get(t)
+        if not q:
+            stt = status_map.get(t)
+            ic = "🆕" if stt == "new" else ("🔁" if stt == "unchecked" else "⏳")
+            if tier == "expand":
+                parts.append(f"{t}{ic}")
+            elif tier == "emerging":
+                parts.append(f"{t} {ic}")
+            else:  # winner
+                full = {"new": "🆕신규(데이터 축적 전)",
+                        "unchecked": "🔁검증보류(재시도)"}.get(stt, "⏳정량부족")
+                parts.append(f"{t} {full}")
+            continue
+        verdict = str(q.get("verdict", "") or "").strip()
+        if tier == "expand":
+            parts.append(f"{t}{_quant_verdict_emoji(verdict)}")
+        elif tier == "emerging":
+            parts.append(f"{t} {verdict}")
+        else:  # winner: 풀 정보
+            rs = q.get("rs_score")
+            above = q.get("above_ma200")
+            rs_s = f"RS{rs:+.1f}%p" if isinstance(rs, (int, float)) else ""
+            ma_s = "200MA▲" if above else ("200MA▼" if above is False else "")
+            flag = ""
+            if above is False or (isinstance(rs, (int, float)) and rs < 0):
+                flag = " ⚠️정량미확인"
+            seg = " ".join(x for x in [verdict, rs_s, ma_s] if x)
+            parts.append(f"{t} {seg}{flag}".strip())
+    sep = "  " if tier == "expand" else " · "
+    return sep.join(parts)
+
+
 def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], is_market_day: bool,
-                     gate_report: dict = None) -> str:
+                     gate_report: dict = None, news_meta: dict = None) -> str:
     now_et  = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
     now_kst = datetime.now(_KST).strftime("%Y-%m-%d %H:%M KST")
     regime  = analysis.get("regime", {})
@@ -480,10 +588,17 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
     risk_color = "#16a34a" if "On" in risk else "#dc2626"
 
     # 테마 섹션
+    _qmap = analysis.get("_quant", {}) if isinstance(analysis, dict) else {}
+    _qstatus = analysis.get("_quant_status", {}) if isinstance(analysis, dict) else {}
     themes_html = ""
     for i, theme in enumerate(analysis.get("themes", []), 1):
         mom = str(theme.get("momentum_note", "보통"))
         mom_color = {"강함": "#16a34a", "보통": "#d97706", "약함": "#dc2626"}.get(mom, "#6b7280")
+        # 정량 뱃지 (앱과 동일: Winners=판정+RS+200MA / Emerging=판정 라벨만)
+        _wq = _fmt_quant_inline(theme.get("winners", ""), _qmap, "winner", _qstatus)
+        _eq = _fmt_quant_inline(theme.get("emerging", ""), _qmap, "emerging", _qstatus)
+        _wq_html = f'<div style="font-size:12px;color:#cbd5e1;margin-top:3px;">📊 정량: {_wq}</div>' if _wq else ""
+        _eq_html = f'<div style="font-size:12px;color:#cbd5e1;margin-top:3px;">📊 정량: {_eq}</div>' if _eq else ""
         themes_html += f"""
         <div style="background:#1e293b;border-radius:8px;padding:14px 16px;margin-bottom:12px;border-left:4px solid {mom_color};">
           <div style="font-size:15px;font-weight:700;color:#f1f5f9;">
@@ -492,8 +607,10 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
           </div>
           <div style="font-size:13px;color:#94a3b8;margin-top:6px;">📌 {theme.get('driver','')}</div>
           <div style="margin-top:8px;font-size:13px;">
-            <span style="color:#34d399;">✅ Winners: {theme.get('winners','')}</span><br>
-            <span style="color:#60a5fa;">🔍 Emerging: {theme.get('emerging','')}</span>
+            <div style="color:#34d399;">✅ Winners: {theme.get('winners','')}</div>
+            {_wq_html}
+            <div style="color:#60a5fa;margin-top:6px;">🔍 Emerging: {theme.get('emerging','')}</div>
+            {_eq_html}
           </div>
           <div style="font-size:12px;color:#f87171;margin-top:6px;">⚠️ Risk: {theme.get('risk','')}</div>
         </div>"""
@@ -515,22 +632,48 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
         '<span style="background:#6b7280;color:#fff;border-radius:4px;padding:2px 8px;font-size:12px;">🔒 장 닫힌 날</span>'
     )
 
-    # 티커 실거래 검증 게이트 배너
+    # 티커 정량 검증 게이트 배너 (verify_narrative_with_quant 리포트)
     gate_html = ""
     gr = gate_report or {}
-    if gr.get("verified_ok") and gr.get("removed"):
-        removed_txt = ", ".join(gr["removed"])
+    _removed = sorted(set(gr.get("removed_fake") or []) | set(gr.get("removed_etf") or []))
+    _new_ipo = gr.get("new_ipo") or []
+    if gr.get("verified_ok") and _removed:
+        removed_txt = ", ".join(_removed)
+        _ipo_line = (f'<div style="color:#fcd34d;font-size:12px;margin-top:6px;">🆕 신규 상장 {len(_new_ipo)}개: '
+                     f'{", ".join(_new_ipo)} (정량 데이터 부족 · 유지)</div>') if _new_ipo else ""
         gate_html = f"""
         <div style="background:#7f1d1d;border-radius:8px;padding:12px 16px;margin-bottom:16px;border:1px solid #ef4444;">
-          <div style="font-weight:700;color:#fecaca;">🛑 무효 티커 {len(gr['removed'])}개 자동 제거됨 (상장폐지·비상장·오타)</div>
+          <div style="font-weight:700;color:#fecaca;">🛑 무효·ETF 티커 {len(_removed)}개 자동 제거됨 (상장폐지·비상장·오타·ETF)</div>
           <div style="color:#fca5a5;font-size:13px;margin-top:6px;font-family:monospace;">{removed_txt}</div>
-          <div style="color:#f87171;font-size:12px;margin-top:6px;">실거래 검증 {gr.get('checked', 0)}개 중 · 아래 종목은 검증 통과분만 표시됩니다.</div>
+          <div style="color:#f87171;font-size:12px;margin-top:6px;">정량 검증 {gr.get('checked', 0)}개 중 · 아래 종목은 검증 통과분만 표시됩니다.</div>
+          {_ipo_line}
         </div>"""
     elif gr and not gr.get("verified_ok"):
         gate_html = """
         <div style="background:#422006;border-radius:8px;padding:10px 16px;margin-bottom:16px;border:1px solid #a16207;">
-          <div style="color:#fde68a;font-size:12px;">⚠️ 이번 리포트는 티커 실거래 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애).</div>
+          <div style="color:#fde68a;font-size:12px;">⚠️ 이번 리포트는 티커 정량 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애).</div>
         </div>"""
+
+    # 뉴스 신선도 메타 (있으면 표시)
+    nm = news_meta or {}
+    _top_used = nm.get("total")
+    top_str = f" \u2192 \uc0c1\uc704 {_top_used}\uac74 \ubd84\uc11d" if _top_used else ""
+    freshness_html = ""
+    _newest_min = nm.get("newest_min_ago")
+    if _newest_min is not None:
+        _is_rss = "RSS Fallback" in str(nm.get("source_log", ""))
+        _src_label = ("RSS \ud3f4\ubc31 \uae30\ubc18, \uc2e4\uc2dc\uac04 \uc544\ub2d8"
+                      if _is_rss else
+                      "FMP \ub274\uc2a4 API \uae30\ubc18, \uc2e4\uc2dc\uac04 \uc6f9\uac80\uc0c9 \uc544\ub2d8")
+        _n_src = len(nm.get("sources", []) or [])
+        _fresh6 = nm.get("fresh_6h", 0)
+        _tot = nm.get("total", 0)
+        freshness_html = (
+            '<div style="font-size:12px;color:#d97706;margin-top:4px;">'
+            f'\U0001f550 \ub274\uc2a4 \uc2e0\uc120\ub3c4: \ucd5c\uc2e0 {_newest_min}\ubd84 \uc804 \u00b7 '
+            f'6\uc2dc\uac04 \uc774\ub0b4 {_fresh6}/{_tot}\uac74 \u00b7 '
+            f'\uc18c\uc2a4 {_n_src}\uacf3 ({_src_label})</div>'
+        )
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
@@ -542,7 +685,8 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
     <div style="font-size:22px;font-weight:800;color:#60a5fa;">📰 Quant Terminal</div>
     <div style="font-size:14px;color:#94a3b8;margin-top:4px;">시장 내러티브 자동 분석 리포트</div>
     <div style="margin-top:8px;font-size:13px;color:#64748b;">{now_et} &nbsp;|&nbsp; {now_kst} &nbsp;|&nbsp; {market_badge}</div>
-    <div style="font-size:12px;color:#64748b;margin-top:4px;">뉴스 {news_count}건 수집 · Gemini 2.5 Flash 분석</div>
+    <div style="font-size:12px;color:#64748b;margin-top:4px;">뉴스 {news_count}건 수집{top_str} · Gemini 2.5 Flash 분석</div>
+    {freshness_html}
   </div>
 
   {gate_html}
@@ -661,7 +805,12 @@ def main():
 
     # ── 티커 실거래 검증 게이트 (app.py와 동일 SSOT) ──
     # 무효(상장폐지·비상장·오타) 티커를 Sheet 저장·이메일 전에 제거.
-    analysis, _gate_report = narrative_core.sanitize_narrative_tickers(analysis, FMP_API_KEY)
+    # 추천 티커 정량 검증 게이트 (SSOT, app.py 13086줄과 동일 경로)
+    # verify_narrative_with_quant: fake/ETF 제거 + 통과분에 RS·200일선·verdict 부착(analysis["_quant"]).
+    _cands = narrative_core._collect_output_tickers(analysis)
+    _etf_syms = _classify_narrative_etfs(tuple(_cands)) if _cands else set()
+    analysis, _gate_report = narrative_core.verify_narrative_with_quant(
+        analysis, verify_emerging_with_quant, fmp_key=FMP_API_KEY, etf_symbols=_etf_syms)
     print("[INFO]", narrative_core.format_ticker_gate_note(_gate_report))
 
     print(f"[INFO] 내러티브 생성 완료. 테마 수: {len(analysis.get('themes', []))}")
@@ -683,7 +832,7 @@ def main():
     fred_tag = " ⚠️FRED발표" if fred_releases else ""
     subject = f"📰 [{session_label}] 시장 내러티브 리포트 {now_et.strftime('%m/%d')}{fred_tag}"
 
-    html_body = build_email_html(analysis, raw_count, fred_releases, market_day, gate_report=_gate_report)
+    html_body = build_email_html(analysis, raw_count, fred_releases, market_day, gate_report=_gate_report, news_meta=_news_meta)
     send_email(subject, html_body)
 
     print(f"[DONE] 완료: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
