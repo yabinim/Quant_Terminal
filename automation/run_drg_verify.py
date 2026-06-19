@@ -24,6 +24,10 @@ from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types as genai_types
 
+# ── repo root 를 sys.path 에 추가 → 공유 SSOT 모듈(gemini_core) import ──
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import gemini_core
+
 # ── 환경변수 ──────────────────────────────────────────────────────────────────
 GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
@@ -159,28 +163,14 @@ def generate_review_comment(direction: str, actual_dir: str, actual_ret: float,
             "3~4문장 한국어 리뷰: 맞았다면 어떤 근거가 적중했는지, 틀렸다면 무엇을 놓쳤는지, 다음 예측 시 참고할 인사이트."
         )
         client = genai.Client(api_key=GOOGLE_API_KEY)
-        cfg = genai_types.GenerateContentConfig(
-            temperature=0.3,
-            # 1024는 thinking 잔여 소비 시 빈 응답(finish_reason=MAX_TOKENS) 위험 —
-            # 코드베이스 다른 Gemini 호출(4096~8192)과 동일하게 상향. (조용한 리뷰 누락 방지)
-            max_output_tokens=4096,
-            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        # 탄력적 생성(SSOT): 재시도+지터+폴백, thinking_budget=0. 리뷰는 비핵심 →
+        # 최종 실패해도 "" 반환(검증·스코어링은 계속 진행).
+        text = gemini_core.generate_text(
+            client, prompt,
+            temperature=0.3, max_output_tokens=4096, thinking_budget=0,
+            primary_attempts=5, fallback_attempts=3,
+            label="AI리뷰",
         )
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt, config=cfg
-        )
-        text = ""
-        try:
-            text = str(getattr(resp, "text", "") or "").strip()
-        except Exception:
-            text = ""
-        if not text:
-            # 빈 응답이면 원인(주로 MAX_TOKENS)을 로그로 노출 — 조용히 누락되는 것 방지
-            try:
-                fr = resp.candidates[0].finish_reason
-            except Exception:
-                fr = "unknown"
-            print(f"[WARN] AI 리뷰 비어있음 (finish_reason={fr})")
         return text
     except Exception as e:
         print(f"[WARN] AI 리뷰 생성 실패: {e}")

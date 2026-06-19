@@ -29,6 +29,7 @@ from fredapi import Fred
 # ── repo root 를 sys.path 에 추가 → narrative_core(app.py와 동일 SSOT 모듈) import ──
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import narrative_core
+import gemini_core
 
 # ── 환경변수 ──────────────────────────────────────────────────────────────────
 GOOGLE_API_KEY     = os.environ["GOOGLE_API_KEY"]
@@ -629,30 +630,18 @@ def generate_drg_prediction(rss_news_text: str, macro_summary: str,
         "*본 분석은 AI 참고용이며 투자 권유가 아닙니다.*"
     )
 
-    _RETRY_WAITS = [10, 30, 60, 120]
-    for attempt in range(5):
-        try:
-            # gemini-2.5-flash는 thinking이 기본 ON이고, 사고 토큰이 max_output_tokens
-            # 예산을 함께 깎는다 → 4096이면 본문이 문장 중간에 잘린다.
-            # 앱(app.py)과 동일하게 사고를 끄고(0) 출력 예산을 8192로 올린다.
-            cfg = genai_types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=8192,
-                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-            )
-            response = client.models.generate_content(
-                model="gemini-2.5-flash", contents=prompt, config=cfg
-            )
-            result = str(getattr(response, "text", "") or "").strip()
-            if result:
-                return result
-            raise ValueError("빈 응답")
-        except Exception as e:
-            wait = _RETRY_WAITS[min(attempt, len(_RETRY_WAITS)-1)]
-            print(f"[WARN] Gemini 시도 {attempt+1}/5 실패: {e} → {wait}초 대기")
-            if attempt < 4:
-                time.sleep(wait)
-    return ""
+    # 탄력적 생성(SSOT): 503 재시도+지터, 2.5-flash→2.5-flash-lite 폴백, thinking_budget=0.
+    # DRG 예측은 추론 민감 → 기본 모델(flash)에 더 무게(8회) 후 폴백(4회).
+    try:
+        return gemini_core.generate_text(
+            client, prompt,
+            temperature=0.7, max_output_tokens=8192, thinking_budget=0,
+            primary_attempts=8, fallback_attempts=4,
+            label="DRG예측",
+        )
+    except Exception as e:
+        print(f"[ERROR] DRG 예측 Gemini 생성 실패: {e}")
+        return ""
 
 
 def extract_direction(text: str) -> str:
@@ -846,25 +835,17 @@ def generate_drg_revision(orig_direction: str, orig_full_text: str,
         "**🎯 개장 대응** (1~2문장)\n\n"
         "*본 분석은 AI 참고용이며 투자 권유가 아닙니다.*"
     )
-    _RETRY = [10, 30, 60]
-    for attempt in range(3):
-        try:
-            cfg = genai_types.GenerateContentConfig(
-                temperature=0.3, max_output_tokens=4096,
-                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-            )
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash", contents=prompt, config=cfg)
-            t = str(getattr(resp, "text", "") or "").strip()
-            if t:
-                return t
-            raise ValueError("빈 응답")
-        except Exception as e:
-            wait = _RETRY[min(attempt, len(_RETRY) - 1)]
-            print(f"[WARN] 갱신 생성 시도 {attempt+1}/3 실패: {e} → {wait}초 대기")
-            if attempt < 2:
-                time.sleep(wait)
-    return ""
+    # 탄력적 생성(SSOT): 재시도+지터+폴백, thinking_budget=0.
+    try:
+        return gemini_core.generate_text(
+            client, prompt,
+            temperature=0.3, max_output_tokens=4096, thinking_budget=0,
+            primary_attempts=6, fallback_attempts=3,
+            label="DRG갱신",
+        )
+    except Exception as e:
+        print(f"[ERROR] DRG 갱신 Gemini 생성 실패: {e}")
+        return ""
 
 
 def _md_to_html(text: str) -> str:
