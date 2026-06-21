@@ -305,6 +305,11 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
 9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
 10) winners/emerging 선정 근거: 뉴스의 Tickers 태그 + 반복 등장 횟수 + 뉴스에 드러난 가격 모멘텀을 종합해 판단하세요.
     근거 없이 유명 대형주를 임의로 채워 넣는 것을 금지합니다. (가격 정량 검증은 다음 단계 스캐너가 수행)
+11) 티커 정확도 (매우 중요): winners/emerging/expected_tickers/top_quant_picks 에 쓰는 심볼은
+    뉴스의 "Tickers:" 태그 또는 위 정량 데이터에 **그대로 등장하는 정확한 거래 심볼**을 우선 사용하세요.
+    회사명만 알고 정확한 거래 심볼이 불확실하면, 추측·축약·변형으로 티커를 만들지 말고 그 종목을 **생략**하세요.
+    신규 상장(IPO)·사명 변경 종목은 정확한 심볼이 태그/정량 데이터에 있을 때만 포함하세요.
+    (존재하지 않거나 잘못된 심볼을 지어내면 다음 단계 검증에서 제거되어 해당 신호가 통째로 버려집니다.)
 {quant_section}
 {fred_section}
 [뉴스 데이터 — 소스 유형별 섹션 구분]
@@ -486,13 +491,18 @@ def format_ticker_gate_note(report) -> str:
         return ""
     if not report.get("verified_ok"):
         return "⚠️ 티커 정량 검증을 수행하지 못했습니다 (FMP 키 없음 또는 일시적 API 장애)."
-    removed = sorted(set(report.get("removed_fake") or []) | set(report.get("removed_etf") or [])) \
-              or (report.get("removed") or [])
+    # 신형: fake(무효·오타)와 ETF(개별주 아님·정상)를 분리 표기. 구형(removed)은 무효로 취급.
+    removed_fake = sorted(set(report.get("removed_fake") or []) or set(report.get("removed") or []))
+    removed_etf = sorted(set(report.get("removed_etf") or []))
     checked = report.get("checked", 0)
-    if not removed:
+    if not removed_fake and not removed_etf:
         return f"✅ 티커 정량 검증 완료 — {checked}개 모두 유효."
-    return (f"🛑 무효(상장폐지·비상장·오타·ETF) 티커 {len(removed)}개 제거: "
-            f"{', '.join(removed)} (검증 {checked}개 중)")
+    parts = []
+    if removed_fake:
+        parts.append(f"🛑 무효·오타 {len(removed_fake)}개 제거: {', '.join(removed_fake)}")
+    if removed_etf:
+        parts.append(f"ℹ️ ETF 제외(개별주 아님) {len(removed_etf)}개: {', '.join(removed_etf)}")
+    return " · ".join(parts) + f" (검증 {checked}개 중)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
