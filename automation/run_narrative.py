@@ -632,20 +632,30 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
         '<span style="background:#6b7280;color:#fff;border-radius:4px;padding:2px 8px;font-size:12px;">🔒 장 닫힌 날</span>'
     )
 
-    # 티커 정량 검증 게이트 배너 (verify_narrative_with_quant 리포트)
+    # 티커 정량 검증 게이트 배너 — 무효·오타(위험)와 ETF 제외(정상·개별주 아님)를 분리 표기
     gate_html = ""
     gr = gate_report or {}
-    _removed = sorted(set(gr.get("removed_fake") or []) | set(gr.get("removed_etf") or []))
+    _fake = sorted(set(gr.get("removed_fake") or []) or set(gr.get("removed") or []))
+    _etf = sorted(set(gr.get("removed_etf") or []))
     _new_ipo = gr.get("new_ipo") or []
-    if gr.get("verified_ok") and _removed:
-        removed_txt = ", ".join(_removed)
-        _ipo_line = (f'<div style="color:#fcd34d;font-size:12px;margin-top:6px;">🆕 신규 상장 {len(_new_ipo)}개: '
+    if gr.get("verified_ok") and (_fake or _etf):
+        _checked = gr.get("checked", 0)
+        # 무효·오타가 하나라도 있으면 경고(빨강), ETF 제외만이면 중립(회색)
+        _bg, _bd = ("#7f1d1d", "#ef4444") if _fake else ("#374151", "#6b7280")
+        _lines = ""
+        if _fake:
+            _lines += (f'<div style="font-weight:700;color:#fecaca;">🛑 무효·오타 티커 {len(_fake)}개 자동 제거됨 (상장폐지·비상장·오타)</div>'
+                       f'<div style="color:#fca5a5;font-size:13px;margin-top:4px;font-family:monospace;">{", ".join(_fake)}</div>')
+        if _etf:
+            _lines += (f'<div style="color:#cbd5e1;font-size:13px;margin-top:{"10px" if _fake else "0"};">'
+                       f'ℹ️ ETF 제외(개별주 아님) {len(_etf)}개: '
+                       f'<span style="font-family:monospace;">{", ".join(_etf)}</span></div>')
+        _ipo_line = (f'<div style="color:#fcd34d;font-size:12px;margin-top:10px;">🆕 신규 상장 {len(_new_ipo)}개: '
                      f'{", ".join(_new_ipo)} (정량 데이터 부족 · 유지)</div>') if _new_ipo else ""
         gate_html = f"""
-        <div style="background:#7f1d1d;border-radius:8px;padding:12px 16px;margin-bottom:16px;border:1px solid #ef4444;">
-          <div style="font-weight:700;color:#fecaca;">🛑 무효·ETF 티커 {len(_removed)}개 자동 제거됨 (상장폐지·비상장·오타·ETF)</div>
-          <div style="color:#fca5a5;font-size:13px;margin-top:6px;font-family:monospace;">{removed_txt}</div>
-          <div style="color:#f87171;font-size:12px;margin-top:6px;">정량 검증 {gr.get('checked', 0)}개 중 · 아래 종목은 검증 통과분만 표시됩니다.</div>
+        <div style="background:{_bg};border-radius:8px;padding:12px 16px;margin-bottom:16px;border:1px solid {_bd};">
+          {_lines}
+          <div style="color:#94a3b8;font-size:12px;margin-top:8px;">정량 검증 {_checked}개 중 · 아래 종목은 검증 통과분만 표시됩니다.</div>
           {_ipo_line}
         </div>"""
     elif gr and not gr.get("verified_ok"):
