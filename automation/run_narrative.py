@@ -599,6 +599,11 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
         _eq = _fmt_quant_inline(theme.get("emerging", ""), _qmap, "emerging", _qstatus)
         _wq_html = f'<div style="font-size:12px;color:#cbd5e1;margin-top:3px;">📊 정량: {_wq}</div>' if _wq else ""
         _eq_html = f'<div style="font-size:12px;color:#cbd5e1;margin-top:3px;">📊 정량: {_eq}</div>' if _eq else ""
+        # 빈 섹션 숨김: 실제 티커가 있을 때만 라벨 렌더 (빈 "✅ Winners:" 방지)
+        _w_str = theme.get("winners", "")
+        _e_str = theme.get("emerging", "")
+        _w_line = f'<div style="color:#34d399;">✅ Winners: {_w_str}</div>' if parse_tickers_from_csv(_w_str) else ""
+        _e_line = f'<div style="color:#60a5fa;margin-top:6px;">🔍 Emerging: {_e_str}</div>' if parse_tickers_from_csv(_e_str) else ""
         themes_html += f"""
         <div style="background:#1e293b;border-radius:8px;padding:14px 16px;margin-bottom:12px;border-left:4px solid {mom_color};">
           <div style="font-size:15px;font-weight:700;color:#f1f5f9;">
@@ -607,9 +612,9 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
           </div>
           <div style="font-size:13px;color:#94a3b8;margin-top:6px;">📌 {theme.get('driver','')}</div>
           <div style="margin-top:8px;font-size:13px;">
-            <div style="color:#34d399;">✅ Winners: {theme.get('winners','')}</div>
+            {_w_line}
             {_wq_html}
-            <div style="color:#60a5fa;margin-top:6px;">🔍 Emerging: {theme.get('emerging','')}</div>
+            {_e_line}
             {_eq_html}
           </div>
           <div style="font-size:12px;color:#f87171;margin-top:6px;">⚠️ Risk: {theme.get('risk','')}</div>
