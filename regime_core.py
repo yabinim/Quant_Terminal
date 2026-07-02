@@ -357,12 +357,18 @@ def evaluate_timing(hist: pd.DataFrame, regime_res: dict) -> dict:
             out.update({"verdict": "⏳ 조금 기다리기", "code": "wait", "reasons": reasons})
 
     elif regime == "sideways":
+        # 박스 하단 검증: 200일선 위에서만 "박스 저점"으로 인정 (하락 추세 위장 차단)
+        ma200 = c.get("ma200")
+        above_ma200 = pd.notna(ma200) and pd.notna(price) and price > ma200
         if regime_res.get("topping"):
             reasons.append("천장(Stage3) 신호 — 신규 진입 자제")
             out.update({"verdict": "🔺 고점 신호 주의", "code": "trend_break", "reasons": reasons})
-        elif pd.notna(rsi) and rsi <= SIDEWAYS_ENTRY_RSI:
-            reasons.append(f"RSI {rsi:.0f}(박스 하단 지지)")
+        elif pd.notna(rsi) and rsi <= SIDEWAYS_ENTRY_RSI and above_ma200:
+            reasons.append(f"RSI {rsi:.0f}(박스 하단 지지) · 200일선 위")
             out.update({"verdict": "🎯 지금 매수 구간 (횡보 저점)", "code": "entry", "reasons": reasons, "is_entry": True})
+        elif pd.notna(rsi) and rsi <= SIDEWAYS_ENTRY_RSI:
+            reasons.append(f"RSI {rsi:.0f} 저점이지만 200일선 아래 — 박스 하단 아님(하락 추세 의심)")
+            out.update({"verdict": "⚠️ 추세 흔들림", "code": "trend_break", "reasons": reasons})
         elif pd.notna(rsi) and rsi >= SIDEWAYS_OVERBOUGHT_RSI:
             reasons.append(f"RSI {rsi:.0f}(박스 상단)")
             out.update({"verdict": "🔴 박스 상단(비쌈)", "code": "overheat", "reasons": reasons})
@@ -527,6 +533,7 @@ ALERT_EVENT_LABELS = {
     "exit":   "🔴 청산",
     "price":  "📌 손절/목표 도달",
     "watch":  "🎯 관심가 도달 (목표가·RSI·200일선)",
+    "entry_invalid": "🚫 매수 신호 무효화",
 }
 _REGIME_KR = {"strong": "🟢 강세", "sideways": "🟡 횡보", "weak": "🔴 약세"}
 
@@ -657,6 +664,14 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
                     status, pending = "fired", 0
             # fired 면 유지(재발동 금지)
         else:
+            # D-2: 발동됐던 매수 신호의 조건 해제 → 무효화 알림 1회 (재무장 전환 시점에만)
+            if e == "entry" and status == "fired":
+                fired.append({
+                    "event": "entry_invalid",
+                    "label": ALERT_EVENT_LABELS["entry_invalid"],
+                    "message": (f"직전 매수 신호 조건 해제 — 현재 판정: {msg}"
+                                if msg else "직전 매수 신호 조건 해제 — 재평가 필요"),
+                })
             status, pending = "armed", 0  # 재무장
         events_state[e] = {"status": status, "pending": pending}
 
