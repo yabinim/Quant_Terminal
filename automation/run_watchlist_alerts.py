@@ -344,6 +344,19 @@ def eval_watchlist_eod(spy_close, hist_cache, today):
             )
             laststate_col.append([new_state]); n_eval += 1
             if fired:
+                # v2: entry 알림에 R:R 게이트 결과 반영 (앱 [7] 탭과 동일 판정 — regime_core SSOT)
+                for _ev in fired:
+                    if _ev.get("event") == "entry":
+                        try:
+                            _plan = rc.build_watchlist_plan(
+                                hist, an,
+                                manual_stop=(float(sl) if pd.notna(sl) else None),
+                                manual_target=(float(tp) if pd.notna(tp) else None),
+                            )
+                            rc.decorate_entry_alert(_ev, _plan,
+                                                    an.get("regime", {}).get("regime"))
+                        except Exception as _ge:
+                            print(f"  [WARN] {uid}/{tk} 게이트 산출 실패(신호는 유지): {_ge}")
                 fired_by_user.setdefault(uid, []).append({"ticker": tk, "fired": fired, "an": an})
                 print(f"  [FIRE-WL] {uid}/{tk}: {[e['event'] for e in fired]}")
         except Exception as e:
@@ -488,6 +501,20 @@ def eval_watchlist_intraday(spy_close, hist_cache, quote_cache, today):
                                         alert_ma200=am)
             active = [{"event": e, "label": rc.ALERT_EVENT_LABELS[e], "message": conds[e][1]}
                       for e in ev if e in enabled and conds.get(e, (False, ""))[0]]
+            # v2: 장중 entry 알림에도 동일 게이트 반영 (live 가격 기준)
+            for _ev in active:
+                if _ev.get("event") == "entry":
+                    try:
+                        _plan = rc.build_watchlist_plan(
+                            hist, an,
+                            manual_stop=(float(sl) if pd.notna(sl) else None),
+                            manual_target=(float(tp) if pd.notna(tp) else None),
+                            entry=float(live),
+                        )
+                        rc.decorate_entry_alert(_ev, _plan,
+                                                an.get("regime", {}).get("regime"))
+                    except Exception as _ge:
+                        print(f"  [WARN] {uid}/{tk} 장중 게이트 산출 실패(신호는 유지): {_ge}")
             if active:
                 hits_by_user.setdefault(uid, []).append({"ticker": tk, "fired": active, "an": an})
                 print(f"  [INTRADAY-WL] {uid}/{tk}: {[a['event'] for a in active]}")
