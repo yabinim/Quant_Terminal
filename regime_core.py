@@ -913,6 +913,148 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
     return plan
 
 
+def regime_params(drg: dict) -> dict:
+    """DRG risk_score(경고 개수 0~8) → 손절 ATR배수·손익비·라벨.
+    app.py _regime_params 에서 이관(SSOT, v2 게이트) — app 은 알리아스로 참조.
+    점수가 없으면 risk_level 텍스트(영문 HIGH/CAUTION/MODERATE/LOW 또는 한글)로 폴백.
+    """
+    d = drg or {}
+    s = None
+    try:
+        s = float(d.get("risk_score"))
+    except Exception:
+        s = None
+    if s is not None:
+        if s >= 6:
+            return {"atr_mult": 1.5, "rr": 1.5, "label": "🔴 위험 (방어)", "note": "손절 타이트 · 목표 짧게 · 신규 자제"}
+        if s >= 4:
+            return {"atr_mult": 1.8, "rr": 1.8, "label": "🟡 경계", "note": "보수적 운용"}
+        if s >= 2:
+            return {"atr_mult": 2.2, "rr": 2.5, "label": "🟢 양호", "note": "표준 운용"}
+        return {"atr_mult": 2.5, "rr": 3.0, "label": "🟢 안전 (공격)", "note": "손절 넓게 · 러너 허용"}
+    lvl = str(d.get("risk_level") or "").upper()
+    if "HIGH" in lvl or "위험" in lvl:
+        return {"atr_mult": 1.5, "rr": 1.5, "label": "🔴 위험 (방어)", "note": "손절 타이트 · 목표 짧게 · 신규 자제"}
+    if "CAUTION" in lvl or "경계" in lvl:
+        return {"atr_mult": 1.8, "rr": 1.8, "label": "🟡 경계", "note": "보수적 운용"}
+    if "MODERATE" in lvl:
+        return {"atr_mult": 2.2, "rr": 2.5, "label": "🟢 양호", "note": "표준 운용"}
+    if "LOW" in lvl or "안전" in lvl:
+        return {"atr_mult": 2.5, "rr": 3.0, "label": "🟢 안전 (공격)", "note": "손절 넓게 · 러너 허용"}
+    return {"atr_mult": 2.0, "rr": 2.0, "label": "⚪ 중립", "note": "기본 손익비 1:2"}
+
+
+_WL_RECENT_HIGH_WINDOW = 120  # app.py [7] 워치리스트 탭과 동일(lockstep)
+
+
+def build_watchlist_plan(hist, an: dict, manual_stop=None, manual_target=None,
+                         entry=None, atr_mult=None, rr_target=None,
+                         equity: float = 0.0, risk_pct: float = 1.0) -> dict:
+    """워치리스트 진입 게이트용 트레이드 플랜 조립 — app.py [7] 탭과 동일 입력 규약(lockstep).
+
+    app 조립부와의 대응: ATR=compute_atr(hist), ma200=analysis components,
+    recent_high=최근 120일 High 최대, stop_source=수동 손절 있으면 manual 아니면 atr.
+    entry 미지정 시 마지막 종가. atr_mult/rr_target 미지정 시 중립 국면(regime_params({})).
+    equity=0 이면 사이징(주수)은 0으로 나오지만 게이트/R:R 판정에는 영향 없음(순수 분리).
+    """
+    if atr_mult is None or rr_target is None:
+        _rp = regime_params({})
+        atr_mult = _rp["atr_mult"] if atr_mult is None else atr_mult
+        rr_target = _rp["rr"] if rr_target is None else rr_target
+    an = an or {}
+    code = (an.get("timing") or {}).get("code")
+    comp = (an.get("regime") or {}).get("components") or {}
+    ma200 = comp.get("ma200", np.nan)
+    e = entry
+    atr, recent_high = np.nan, None
+    try:
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+            if e is None and not close.empty:
+                e = float(close.iloc[-1])
+            atr = compute_atr(hist, ATR_WINDOW)
+            hi = (pd.to_numeric(hist["High"], errors="coerce")
+                  if "High" in hist.columns else close)
+            hi = hi.dropna().tail(_WL_RECENT_HIGH_WINDOW)
+            recent_high = float(hi.max()) if not hi.empty else None
+    except Exception:
+        pass
+    ms = None
+    try:
+        ms = float(manual_stop) if manual_stop is not None and pd.notna(manual_stop) else None
+    except (TypeError, ValueError):
+        ms = None
+    mt = None
+    try:
+        mt = float(manual_target) if manual_target is not None and pd.notna(manual_target) else None
+    except (TypeError, ValueError):
+        mt = None
+    return build_trade_plan(
+        verdict_code=code,
+        entry=e,
+        atr=atr,
+        ma200=float(ma200) if pd.notna(ma200) else np.nan,
+        equity=equity, risk_pct=risk_pct,
+        atr_mult=atr_mult, rr_target=rr_target,
+        stop_source=("manual" if ms is not None else "atr"),
+        manual_stop=ms, manual_target=mt,
+        recent_high=recent_high,
+    )
+
+
+def decorate_entry_alert(ev: dict, plan: dict, regime: str = "unknown") -> dict:
+    """entry 알림 dict 에 R:R 게이트 결과를 반영(v2 — 이메일도 앱과 동일 게이트 판정).
+
+    1B 방식: entry 이벤트/상태머신은 그대로 두고 라벨·메시지만 게이트로 구분.
+      통과   → 🟢 매수 신호 (✅ 게이트 통과) + 손절/목표/R:R 라인
+      미통과 → ⚠️ 매수 신호 — 게이트 미통과·건너뛰기 권고 + 사유
+    plan 산출 불가(gate=na)면 정직하게 '게이트 판단 보류'로 표기(신호 억제 없음).
+    """
+    ev = ev or {}
+    p = plan or {}
+    dec = buy_decision("entry", p.get("gate"), regime)
+    gate = str(p.get("gate") or "na")
+    base_msg = str(ev.get("message") or "")
+
+    def _f(v):
+        try:
+            f = float(v)
+            return f"${f:.2f}" if np.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+
+    stop_s, tgt_s = _f(p.get("stop")), _f(p.get("target"))
+    rr_s = p.get("rr_label") if p.get("rr_label") not in (None, "-") else None
+    plan_bits = []
+    if stop_s:
+        try:
+            plan_bits.append(f"손절 {stop_s}({float(p.get('stop_pct')):.1f}%)")
+        except (TypeError, ValueError):
+            plan_bits.append(f"손절 {stop_s}")
+    if tgt_s:
+        plan_bits.append(f"목표 {tgt_s}")
+    if rr_s:
+        plan_bits.append(f"R:R {rr_s}")
+    plan_line = " · ".join(plan_bits)
+
+    if dec.get("key") in ("buy", "buy_split") and gate == "fit":
+        ev["label"] = "🟢 매수 신호 (✅ R:R 게이트 통과)"
+        ev["message"] = base_msg + (f" · {plan_line}" if plan_line else "")
+        note = str(p.get("gate_reason") or "")
+        if "정보용" in note:
+            ev["message"] += " · 독립 목표 미설정(R:R 정보용)"
+    elif gate == "na":
+        ev["label"] = "🟢 매수 신호 (⚪ 게이트 판단 보류)"
+        ev["message"] = base_msg + f" · {p.get('gate_reason') or '플랜 산출 불가'}"
+    else:
+        ev["label"] = "⚠️ 매수 신호 — 게이트 미통과·건너뛰기 권고"
+        reason = str(p.get("gate_reason") or "손익비/구간 부적합")
+        ev["message"] = base_msg + f" · {reason}" + (f" · {plan_line}" if plan_line else "")
+    ev["gate"] = gate
+    ev["decision"] = dec.get("key")
+    return ev
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # 7) 근거 중첩도(Confluence) 점수 (#3) — 순수, app/scanner 공유 SSOT
 #    철학: '확신/예측'이 아니라 '확률을 높이는 근거의 합'. 보장 아님.

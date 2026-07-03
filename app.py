@@ -7661,34 +7661,9 @@ _SECTOR_TO_ETF = {
 }
 
 
-def _regime_params(drg: dict) -> dict:
-    """DRG risk_score(경고 개수 0~8) → 손절 ATR배수·손익비·라벨. (#3)
-    점수가 없으면 risk_level 텍스트(영문 HIGH/CAUTION/MODERATE/LOW 또는 한글)로 폴백.
-    """
-    d = drg or {}
-    s = None
-    try:
-        s = float(d.get("risk_score"))
-    except Exception:
-        s = None
-    if s is not None:
-        if s >= 6:
-            return {"atr_mult": 1.5, "rr": 1.5, "label": "🔴 위험 (방어)", "note": "손절 타이트 · 목표 짧게 · 신규 자제"}
-        if s >= 4:
-            return {"atr_mult": 1.8, "rr": 1.8, "label": "🟡 경계", "note": "보수적 운용"}
-        if s >= 2:
-            return {"atr_mult": 2.2, "rr": 2.5, "label": "🟢 양호", "note": "표준 운용"}
-        return {"atr_mult": 2.5, "rr": 3.0, "label": "🟢 안전 (공격)", "note": "손절 넓게 · 러너 허용"}
-    lvl = str(d.get("risk_level") or "").upper()
-    if "HIGH" in lvl or "위험" in lvl:
-        return {"atr_mult": 1.5, "rr": 1.5, "label": "🔴 위험 (방어)", "note": "손절 타이트 · 목표 짧게 · 신규 자제"}
-    if "CAUTION" in lvl or "경계" in lvl:
-        return {"atr_mult": 1.8, "rr": 1.8, "label": "🟡 경계", "note": "보수적 운용"}
-    if "MODERATE" in lvl:
-        return {"atr_mult": 2.2, "rr": 2.5, "label": "🟢 양호", "note": "표준 운용"}
-    if "LOW" in lvl or "안전" in lvl:
-        return {"atr_mult": 2.5, "rr": 3.0, "label": "🟢 안전 (공격)", "note": "손절 넓게 · 러너 허용"}
-    return {"atr_mult": 2.0, "rr": 2.0, "label": "⚪ 중립", "note": "기본 손익비 1:2"}
+# SSOT(v2 게이트): 국면 파라미터(_regime_params)는 regime_core.regime_params 로 이관.
+# app 은 알리아스만 유지 — 이메일 자동화(run_watchlist_alerts)와 동일 판정 보장(lockstep).
+_regime_params = rc.regime_params
 
 
 def _position_state(entry, cur, regime_stop) -> tuple:
