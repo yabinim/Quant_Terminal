@@ -2739,32 +2739,109 @@ def build_etf_universe_returns_table(pool_tickers):
     return result_df
 
 
-def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series = None) -> pd.DataFrame:
+_RS_SCAN_MISS_REASONS = {
+    "no_data":   "데이터 없음 — 상장폐지/티커 변경 추정 · ETF Universe 정리 대상",
+    "exhausted": "재시도 소진 — FMP 일시 장애 (재스캔 권장)",
+    "no_key":    "FMP API 키 미설정",
+    "short":     "히스토리 70거래일 미만 — 신규 상장 (RS 계산 불가)",
+}
+
+
+def render_scan_coverage_report(report: dict) -> None:
+    """RS 스캔(Early Signal·섹터 꺾임) 커버리지 + 미수집 사유 렌더링.
+    '전수 fetch + 투명 보고' 원칙: 311개면 311개 전부에 대해 답이 있거나, 왜 없는지 보여준다."""
+    if not report:
+        return
+    total = int(report.get("total") or 0)
+    missing = report.get("missing") or []
+    covered = total - len(missing)
+    if total <= 0:
+        return
+    if not missing:
+        st.caption(f"✅ 커버리지 **{covered}/{total}** — 전수 수집 완료")
+        return
+    st.caption(f"커버리지 **{covered}/{total}** · ⚠️ 미수집 {len(missing)}개 (아래 사유 확인)")
+    with st.expander(f"⚠️ 미수집 티커 {len(missing)}개 — 사유별 상세", expanded=False):
+        by_key: dict = {}
+        for m in missing:
+            by_key.setdefault(m.get("reason_key", "?"), []).append(m)
+        for key, items in by_key.items():
+            reason = items[0].get("reason", key)
+            tickers_str = ", ".join(i["ticker"] for i in items)
+            st.markdown(f"- **{reason}** ({len(items)}개): {tickers_str}")
+        if any(m.get("reason_key") == "no_data" for m in missing):
+            st.info(
+                "💡 '데이터 없음' 티커는 살아있는 종목이 아닐 가능성이 높아요. "
+                "「🆕 ETF Universe 관리」의 정리(cleanup) 기능으로 유니버스에서 제거하면 "
+                "다음 스캔부터 커버리지가 올라갑니다."
+            )
+        if any(m.get("reason_key") == "exhausted" for m in missing):
+            st.warning("🔁 '재시도 소진' 티커는 일시 장애입니다 — 잠시 후 재스캔하면 대부분 수집됩니다.")
+
+
+def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series = None):
     """
     1주 전 RS Score 대비 현재 RS Score 변화율 계산.
     - RS Score = 종목 3개월 수익률 - SPY 3개월 수익률
     - RS 변화 = (현재 RS) - (1주 전 RS) → 양수면 최근 1주간 시장 대비 강해짐
-    반환: DataFrame [Ticker, RS_Now, RS_1W_Ago, RS_Change, RS_Signal]
+
+    v2 (전수 fetch + 투명 보고):
+    - SPY 는 단독 robust fetch 로 최우선 확보 (단일 실패점 제거)
+    - 유니버스는 _fmp_robust_batch_history_report 로 재시도 포함 전수 수집
+    - 미수집 티커는 조용히 버리지 않고 사유와 함께 report 로 반환
+
+    반환: (DataFrame [Ticker, RS_Now, RS_1W_Ago, RS_Change, RS_Signal],
+           report {"total", "ok_count", "missing": [{"ticker","reason_key","reason"}], "spy_error"})
     """
+    empty = pd.DataFrame()
+    report = {"total": 0, "ok_count": 0, "missing": [], "spy_error": None}
     if not pool_tickers:
-        return pd.DataFrame()
+        return empty, report
     try:
         unique = list(dict.fromkeys(str(t).strip().upper() for t in pool_tickers if str(t).strip()))
-        all_tickers = list(dict.fromkeys(unique + ["SPY"]))
-        close_df = _fmp_batch_to_close_df(all_tickers, limit=130)
-        if close_df.empty:
-            return pd.DataFrame()
+        report["total"] = len(unique)
 
-        spy = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
+        # ── [1] SPY 기준 시리즈 최우선 확보 (실패 시 구체적 사유 반환) ──
+        spy_df, spy_status = _fmp_price_history_robust("SPY", limit=130, return_status=True)
+        spy = (
+            pd.to_numeric(spy_df["Close"], errors="coerce").dropna()
+            if (spy_df is not None and not spy_df.empty and "Close" in spy_df.columns)
+            else pd.Series(dtype=float)
+        )
         if len(spy) < 70:
-            return pd.DataFrame()
+            report["spy_error"] = (
+                "SPY 기준 데이터 확보 실패"
+                + (f" ({_RS_SCAN_MISS_REASONS.get(spy_status, spy_status)})" if spy_status != "ok"
+                   else " (히스토리 70거래일 미만)")
+            )
+            return empty, report
+
+        # ── [2] 유니버스 전수 fetch (재시도 포함 · 캐시 없음 · 상태 보고) ──
+        fetch_targets = [t for t in unique if t != "SPY"]
+        hist, status_map = _fmp_robust_batch_history_report(fetch_targets, limit=130)
+
+        def _mark_missing(tk, key):
+            report["missing"].append({
+                "ticker": tk, "reason_key": key,
+                "reason": _RS_SCAN_MISS_REASONS.get(key, key),
+            })
 
         rows = []
         for tk in unique:
-            if tk not in close_df.columns:
-                continue
-            s = pd.to_numeric(close_df[tk], errors="coerce").dropna()
+            if tk == "SPY":
+                s = spy  # SPY 가 유니버스에 포함된 경우: 기준 시리즈 재사용 (RS ≈ 0)
+            else:
+                status = status_map.get(tk, "exhausted")
+                if status != "ok":
+                    _mark_missing(tk, status)
+                    continue
+                df_tk = hist.get(tk)
+                if df_tk is None or df_tk.empty or "Close" not in df_tk.columns:
+                    _mark_missing(tk, "no_data")
+                    continue
+                s = pd.to_numeric(df_tk["Close"], errors="coerce").dropna()
             if len(s) < 70:
+                _mark_missing(tk, "short")
                 continue
             # 현재 RS (3개월 = 63거래일)
             rs_now = float((s.iloc[-1]/s.iloc[-64] - 1)*100 - (spy.iloc[-1]/spy.iloc[-64] - 1)*100) if len(s) >= 64 and len(spy) >= 64 else np.nan
@@ -2797,9 +2874,11 @@ def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series
         df = pd.DataFrame(rows)
         if not df.empty:
             df = df.sort_values("RS_Change", ascending=False, na_position="last")
-        return df
+        report["ok_count"] = len(df)
+        return df, report
     except Exception:
-        return pd.DataFrame()
+        report["spy_error"] = report.get("spy_error") or "예상치 못한 오류 — 재스캔 권장"
+        return pd.DataFrame(), report
 
 
 def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "") -> list[dict]:
@@ -2972,24 +3051,54 @@ def _fmt_quant_inline(tickers_csv, quant_map, tier: str = "", status_map=None) -
     return sep.join(parts)
 
 
-def detect_sector_momentum_reversal(universe_tickers: list) -> list[dict]:
+def detect_sector_momentum_reversal(universe_tickers: list):
     """
     섹터 꺾임 감지: 연속 2주 RS 하락 + 거래량 감소 + 가격 유지 패턴.
-    반환: [{"ticker", "signal", "rs_now", "rs_1w", "rs_change", "vol_change", "description"}]
-    """
-    if not universe_tickers:
-        return []
-    try:
-        all_tickers = list(dict.fromkeys([t.strip().upper() for t in universe_tickers if t.strip()] + ["SPY"]))
-        batch = _fmp_batch_price_history(all_tickers, limit=130)
-        close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch.items() if "Close" in df.columns}).sort_index()
-        vol_raw = pd.DataFrame({tk: df["Volume"] for tk, df in batch.items() if "Volume" in df.columns}).sort_index()
-        if close_df.empty:
-            return []
 
-        spy = pd.to_numeric(close_df.get("SPY", pd.Series(dtype=float)), errors="coerce").dropna()
+    v2 (전수 fetch + 투명 보고): Early Signal 과 동일한 robust 전수 수집으로 전환.
+    - SPY 단독 robust fetch 최우선 확보 · 유니버스는 재시도 포함 전수 수집
+    - 미수집 티커는 report 로 반환 (조용한 탈락 금지)
+
+    반환: (alerts: [{"ticker","signal","rs_now","rs_1w","rs_change","vol_change","description"}],
+           report {"total", "ok_count", "missing": [{"ticker","reason_key","reason"}], "spy_error"})
+    """
+    report = {"total": 0, "ok_count": 0, "missing": [], "spy_error": None}
+    if not universe_tickers:
+        return [], report
+    try:
+        unique = list(dict.fromkeys(t.strip().upper() for t in universe_tickers if t.strip()))
+        report["total"] = len(unique)
+
+        # ── SPY 기준 시리즈 최우선 확보 ──
+        spy_df, spy_status = _fmp_price_history_robust("SPY", limit=130, return_status=True)
+        spy = (
+            pd.to_numeric(spy_df["Close"], errors="coerce").dropna()
+            if (spy_df is not None and not spy_df.empty and "Close" in spy_df.columns)
+            else pd.Series(dtype=float)
+        )
         if len(spy) < 75:
-            return []
+            report["spy_error"] = (
+                "SPY 기준 데이터 확보 실패"
+                + (f" ({_RS_SCAN_MISS_REASONS.get(spy_status, spy_status)})" if spy_status != "ok"
+                   else " (히스토리 75거래일 미만)")
+            )
+            return [], report
+
+        # ── 유니버스 전수 fetch (재시도 포함 · 상태 보고) ──
+        fetch_targets = [t for t in unique if t != "SPY"]
+        hist, status_map = _fmp_robust_batch_history_report(fetch_targets, limit=130)
+        close_df = pd.DataFrame(
+            {tk: df["Close"] for tk, df in hist.items() if "Close" in df.columns}
+        ).sort_index()
+        vol_raw = pd.DataFrame(
+            {tk: df["Volume"] for tk, df in hist.items() if "Volume" in df.columns}
+        ).sort_index()
+
+        def _mark_missing(tk, key, reason=None):
+            report["missing"].append({
+                "ticker": tk, "reason_key": key,
+                "reason": reason or _RS_SCAN_MISS_REASONS.get(key, key),
+            })
 
         def calc_rs(s, spy, offset_start=0, offset_end=0):
             try:
@@ -3004,12 +3113,22 @@ def detect_sector_momentum_reversal(universe_tickers: list) -> list[dict]:
                 return np.nan
 
         alerts = []
-        for tk in all_tickers:
-            if tk == "SPY" or tk not in close_df.columns:
+        ok_count = 0
+        for tk in unique:
+            if tk == "SPY":
+                continue  # 기준 지수 자체는 꺾임 판정 대상 아님
+            status = status_map.get(tk, "exhausted")
+            if status != "ok":
+                _mark_missing(tk, status)
+                continue
+            if tk not in close_df.columns:
+                _mark_missing(tk, "no_data")
                 continue
             s = pd.to_numeric(close_df[tk], errors="coerce").dropna()
             if len(s) < 75:
+                _mark_missing(tk, "short", "히스토리 75거래일 미만 — 신규 상장 (RS 계산 불가)")
                 continue
+            ok_count += 1
 
             rs_now = calc_rs(s, spy, 0)        # 현재 RS
             rs_1w = calc_rs(s, spy, 5)         # 1주 전 RS
@@ -3057,9 +3176,11 @@ def detect_sector_momentum_reversal(universe_tickers: list) -> list[dict]:
             })
 
         alerts.sort(key=lambda x: x["rs_change"])
-        return alerts
+        report["ok_count"] = ok_count
+        return alerts, report
     except Exception:
-        return []
+        report["spy_error"] = report.get("spy_error") or "예상치 못한 오류 — 재스캔 권장"
+        return [], report
 
 
 def build_pool_monthly_returns_table(pool_tickers):
@@ -4486,13 +4607,23 @@ def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
 
 
 def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float = 0.0,
-                             max_retries: int = 5, base_delay: float = 2.0) -> pd.DataFrame:
+                             max_retries: int = 5, base_delay: float = 2.0,
+                             return_status: bool = False):
     """historical-price-eod/full 1종목 — 일시 실패(429·5xx·타임아웃)에만 지수 백오프 재시도.
     HTTP 200은 (빈 응답이라도) 확정 답으로 보고 즉시 반환(신규 상장주의 '데이터 없음'을 존중,
-    무의미한 재시도로 시간 낭비 방지). deadline_ts(epoch초) 도달 시 재시도 중단."""
+    무의미한 재시도로 시간 낭비 방지). deadline_ts(epoch초) 도달 시 재시도 중단.
+
+    return_status=True 이면 (df, status) 튜플 반환:
+      status ∈ {"ok", "no_data", "exhausted", "no_key"}
+      - "no_data":  HTTP 200 + 빈 응답 = 데이터가 존재하지 않음(상장폐지/티커 변경/신규)
+      - "exhausted": 재시도 소진 = 일시 장애(429/5xx/타임아웃)가 끝내 해소되지 않음
+    기본(return_status=False)은 기존과 동일하게 DataFrame 만 반환(기존 호출부 호환)."""
+    def _ret(df, status):
+        return (df, status) if return_status else df
+
     k = _fmp_key()
     if not k:
-        return pd.DataFrame()
+        return _ret(pd.DataFrame(), "no_key")
     url = f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={k}"
     for attempt in range(max_retries + 1):
         try:
@@ -4501,10 +4632,10 @@ def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float 
                 data = r.json()
                 rows = data.get("historical", data) if isinstance(data, dict) else data
                 if not isinstance(rows, list) or not rows:
-                    return pd.DataFrame()  # 200·빈 = 진짜 데이터 없음(신규) → 재시도 안 함
+                    return _ret(pd.DataFrame(), "no_data")  # 200·빈 = 진짜 데이터 없음 → 재시도 안 함
                 df = pd.DataFrame(rows)
                 if "date" not in df.columns:
-                    return pd.DataFrame()
+                    return _ret(pd.DataFrame(), "no_data")
                 df["date"] = pd.to_datetime(df["date"])
                 df = df.set_index("date").sort_index()
                 df = df.rename(columns={"close": "Close", "open": "Open", "high": "High",
@@ -4512,7 +4643,7 @@ def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float 
                 for col in ["Close", "Open", "High", "Low", "Volume"]:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
-                return df
+                return _ret(df, "ok")
             # 비-200(429/5xx) → 일시 실패로 보고 재시도
         except Exception:
             pass  # 타임아웃/커넥션 → 재시도
@@ -4520,7 +4651,50 @@ def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float 
             break
         # 지수 백오프(상한 20s) + 약간의 지터
         time.sleep(min(base_delay * (2 ** attempt), 20.0) + (0.1 * attempt))
-    return pd.DataFrame()  # 재시도 소진(일시 실패) — 호출자가 '검증 실패'로 처리
+    return _ret(pd.DataFrame(), "exhausted")  # 재시도 소진(일시 실패) — 호출자가 '검증 실패'로 처리
+
+
+def _fmp_robust_batch_history_report(tickers: list, limit: int = 130,
+                                     time_budget_sec: int = 420, max_workers: int = 3,
+                                     max_retries: int = 5):
+    """다수 티커의 OHLCV DataFrame 을 '느려도 확실하게 + 전수 결과 보고'로 수집.
+
+    _fmp_robust_batch_close 와 동일한 버스트 억제(동시 3)·재시도 철학에
+    티커별 상태 맵을 추가 — '조용한 탈락'을 없애고 미수집 사유를 호출자가 표시할 수 있게 한다.
+
+    반환: (hist: {ticker: DataFrame}, status_map: {ticker: "ok"|"no_data"|"exhausted"|"no_key"})
+    캐시 없음(실패가 30분 박제되는 문제 원천 차단) — 매 호출 신선."""
+    import concurrent.futures as _cf
+    syms = list(dict.fromkeys(str(t).upper().strip() for t in tickers if str(t).strip()))
+    hist, status_map = {}, {}
+    if not syms:
+        return hist, status_map
+    deadline = time.time() + max(30, time_budget_sec)
+
+    def _one(tk):
+        df, status = _fmp_price_history_robust(
+            tk, limit=limit, deadline_ts=deadline,
+            max_retries=max_retries, return_status=True,
+        )
+        return tk, df, status
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_one, t): t for t in syms}
+            for fut in _cf.as_completed(futs):
+                try:
+                    tk, df, status = fut.result()
+                    status_map[tk] = status
+                    if status == "ok" and df is not None and not df.empty:
+                        hist[tk] = df
+                except Exception:
+                    status_map[futs[fut]] = "exhausted"
+    except Exception:
+        pass
+    # 스레드풀 자체가 깨진 극단 케이스: 누락 티커를 exhausted 로 채워 전수 보고 보장
+    for t in syms:
+        status_map.setdefault(t, "exhausted")
+    return hist, status_map
 
 
 def _fmp_robust_batch_close(tickers: list, limit: int = 220,
@@ -16530,17 +16704,26 @@ if st.session_state.get("logged_in"):
             if not scan_target:
                 st.warning("스캔 대상 티커가 없어요. 필터를 변경하거나 포트폴리오/Watchlist에 종목을 추가해주세요.")
             else:
-                with st.spinner(f"RS Score 주간 변화율 계산 중... ({len(scan_target)}개 티커)"):
-                    _es_result = compute_rs_score_weekly_change(scan_target)
-                if _es_result.empty:
+                with st.spinner(
+                    f"RS Score 주간 변화율 계산 중... ({len(scan_target)}개 티커 · "
+                    "재시도 포함 전수 수집이라 유니버스가 크면 2~3분 걸릴 수 있어요)"
+                ):
+                    _es_result, _es_report = compute_rs_score_weekly_change(scan_target)
+                st.session_state["_early_signal_report"] = _es_report
+                if _es_report.get("spy_error"):
                     st.session_state["_early_signal_df"] = None
-                    st.warning("RS 변화율 데이터를 가져오지 못했습니다.")
+                    st.error(f"⛔ {_es_report['spy_error']} — 기준 지수 없이는 RS 계산이 불가합니다.")
+                elif _es_result.empty:
+                    st.session_state["_early_signal_df"] = None
+                    st.warning("RS 변화율을 계산할 수 있는 티커가 없습니다. 아래 미수집 사유를 확인하세요.")
+                    render_scan_coverage_report(_es_report)
                 else:
                     st.session_state["_early_signal_df"] = _es_result
 
         # 결과를 session_state에서 표시 (rerun 후에도 유지)
         _es_df = st.session_state.get("_early_signal_df")
         if _es_df is not None and not _es_df.empty:
+            render_scan_coverage_report(st.session_state.get("_early_signal_report"))
             rs_change_df = _es_df
             early_df = rs_change_df[rs_change_df["RS_Signal"] == "🌱 Early Signal"]
             surge_df = rs_change_df[rs_change_df["RS_Signal"] == "🚀 급부상"]
@@ -16592,13 +16775,22 @@ if st.session_state.get("logged_in"):
         )
 
         if st.button("🔍 섹터 꺾임 스캔", key="sector_reversal_btn", use_container_width=True):
+            reversal_alerts, _rev_report = [], {}
             if not scan_target:
                 st.warning("스캔 대상 티커가 없어요. 위 Early Signal 필터를 먼저 설정하세요.")
             else:
-                with st.spinner(f"섹터 모멘텀 반전 신호 분석 중... ({len(scan_target)}개)"):
-                    reversal_alerts = detect_sector_momentum_reversal(scan_target)
+                with st.spinner(
+                    f"섹터 모멘텀 반전 신호 분석 중... ({len(scan_target)}개 · "
+                    "재시도 포함 전수 수집이라 유니버스가 크면 2~3분 걸릴 수 있어요)"
+                ):
+                    reversal_alerts, _rev_report = detect_sector_momentum_reversal(scan_target)
+                if _rev_report.get("spy_error"):
+                    st.error(f"⛔ {_rev_report['spy_error']} — 기준 지수 없이는 RS 계산이 불가합니다.")
+                render_scan_coverage_report(_rev_report)
 
-            if not reversal_alerts:
+            if _rev_report.get("spy_error"):
+                pass  # 기준 지수 실패 — '신호 없음 ✅' 오판 메시지 방지 (위에서 이미 오류 표시)
+            elif not reversal_alerts:
                 st.success("✅ 현재 감지된 꺾임 신호 없음 — 전반적으로 모멘텀 유지 중입니다.")
             else:
                 # ── 보유 종목 섹터 ETF 우선 정렬 ───────────────────────────
