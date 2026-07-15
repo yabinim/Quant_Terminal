@@ -74,6 +74,8 @@ _PORTFOLIO_ALERT_STATE_TITLE = "Portfolio_Alert_State"
 _PORTFOLIO_ALERT_STATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At", "Stop_Loss", "Target_Price"]
 _PORTFOLIO_ALERT_DEFAULT = "exit,risk"   # 보유 기본 알림: 청산 + 추세 흔들림 (손절은 exit의 ATR 트레일링에 포함)
 _ETF_UNIVERSE_SHEET_TITLE = "ETF_Universe"
+_EARLY_SIGNAL_HISTORY_SHEET_TITLE = "EarlySignal_History"
+_EARLY_SIGNAL_HISTORY_COLS = ["Date", "Ticker", "RS_Now", "RS_1W_Ago", "RS_Change", "Signal", "Narr_Match", "Match_Detail"]
 _EMERGING_TRACKER_SHEET_TITLE = "Emerging_Tracker"
 _PORTFOLIO_HISTORY_SHEET_TITLE = "Portfolio_History"
 _SCANNER_HISTORY_SHEET_TITLE = "Scanner_History"
@@ -2747,6 +2749,68 @@ _RS_SCAN_MISS_REASONS = {
 }
 
 
+_ETF_INCUBATOR_MIN_DAYS = 110  # 유니버스 등록 후 110일(≈75거래일) 경과해야 RS 스캔 편입
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _etf_universe_added_date_map() -> dict:
+    """ETF_Universe 시트의 {Ticker: Added_Date(date)} 맵.
+    Added_Date 가 비어있거나 파싱 불가한 행은 제외(=성숙 취급, 스캔 유지)."""
+    try:
+        ws, err = open_etf_universe_worksheet()
+        if err or ws is None:
+            return {}
+        vals = ws.get_all_values() or []
+    except Exception:
+        return {}
+    out = {}
+    for r in vals[1:]:
+        if len(r) < 5:
+            continue
+        tk = str(r[0]).strip().upper()
+        ds = str(r[4]).strip()
+        if not tk or not ds:
+            continue
+        try:
+            out[tk] = datetime.strptime(ds[:10], "%Y-%m-%d").date()
+        except Exception:
+            continue
+    return out
+
+
+def split_incubator_tickers(tickers: list, min_days: int = _ETF_INCUBATOR_MIN_DAYS):
+    """🐣 인큐베이터 사전 분리 — 유니버스 등록 min_days 미경과 ETF는 스캔 대상에서 제외.
+
+    배경: 신규 ETF 자동 발굴(최근 90일 상장)은 정의상 70거래일 미달 ETF를 추가하므로,
+    등록~약 3.5개월 구간은 'RS 계산 불가인데 정리(6개월 룰)도 안 되는' 사각지대.
+    사전 분리로 헛 fetch 를 없애고(스캔 시간 단축) 경고 대신 중립 표시한다.
+    시간이 지나면 자동 졸업 → 스캔 편입, 6개월 시점 저품질이면 기존 정리 로직이 제거.
+
+    Added_Date 없는 티커(초기 시드 등)는 성숙으로 간주. 전원이 인큐베이터로 분류되는
+    이상 상황(시트 재생성 등)이면 분리를 포기하고 전체 스캔(안전 가드).
+    반환: (eligible, incubator)"""
+    syms = [str(t).strip().upper() for t in (tickers or []) if str(t).strip()]
+    if not syms:
+        return [], []
+    try:
+        date_map = _etf_universe_added_date_map()
+    except Exception:
+        date_map = {}
+    if not date_map:
+        return syms, []
+    today = datetime.now(_MARKET_ET_TZ).date()
+    eligible, incubator = [], []
+    for tk in syms:
+        d = date_map.get(tk)
+        if d is not None and (today - d).days < int(min_days):
+            incubator.append(tk)
+        else:
+            eligible.append(tk)
+    if not eligible and incubator:
+        return syms, []  # 안전 가드: 전원 인큐베이터 → 분리 포기
+    return eligible, incubator
+
+
 def render_scan_coverage_report(report: dict) -> None:
     """RS 스캔(Early Signal·섹터 꺾임) 커버리지 + 미수집 사유 렌더링.
     '전수 fetch + 투명 보고' 원칙: 311개면 311개 전부에 대해 답이 있거나, 왜 없는지 보여준다."""
@@ -2754,13 +2818,26 @@ def render_scan_coverage_report(report: dict) -> None:
         return
     total = int(report.get("total") or 0)
     missing = report.get("missing") or []
+    incubator = report.get("incubator") or []
     covered = total - len(missing)
-    if total <= 0:
+    if total <= 0 and not incubator:
         return
+    _inc_note = (
+        f" · 🐣 인큐베이터 **{len(incubator)}개**" if incubator else ""
+    )
     if not missing:
-        st.caption(f"✅ 커버리지 **{covered}/{total}** — 전수 수집 완료")
+        st.caption(f"✅ 커버리지 **{covered}/{total}** — 전수 수집 완료{_inc_note}")
+    else:
+        st.caption(f"커버리지 **{covered}/{total}** · ⚠️ 미수집 {len(missing)}개 (아래 사유 확인){_inc_note}")
+    if incubator:
+        with st.expander(f"🐣 인큐베이터 {len(incubator)}개 — 유니버스 등록 110일 미경과 (70거래일 도달 시 자동 편입)", expanded=False):
+            st.markdown(", ".join(incubator))
+            st.caption(
+                "신규 상장 ETF는 RS 계산에 필요한 히스토리(70거래일)가 쌓일 때까지 스캔에서 제외됩니다. "
+                "시간이 지나면 자동 편입되고, 등록 6개월 시점에 저품질이면 자동 정리 대상이 됩니다."
+            )
+    if not missing:
         return
-    st.caption(f"커버리지 **{covered}/{total}** · ⚠️ 미수집 {len(missing)}개 (아래 사유 확인)")
     with st.expander(f"⚠️ 미수집 티커 {len(missing)}개 — 사유별 상세", expanded=False):
         by_key: dict = {}
         for m in missing:
@@ -2777,6 +2854,228 @@ def render_scan_coverage_report(report: dict) -> None:
             )
         if any(m.get("reason_key") == "exhausted" for m in missing):
             st.warning("🔁 '재시도 소진' 티커는 일시 장애입니다 — 잠시 후 재스캔하면 대부분 수집됩니다.")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_etf_top30_holdings(etf_ticker: str):
+    """ETF 구성종목 상위 30 [(심볼, 비중%)] — 라이브(FMP /etf/holdings) 우선, 비면 _ETF_CONSTITUENTS 폴백.
+    반환: (holdings: [(sym, weight)], source: "live"|"fallback"|"none")
+    cached_etf_tier3_analysis 와 동일한 소스 우선순위 — 교차체크 전용 경량 버전."""
+    etf_u = str(etf_ticker or "").strip().upper()
+    if not etf_u:
+        return [], "none"
+    live = _fmp_etf_holdings(etf_u, top_n=30)
+    live = [(s, w) for s, w in live if "." not in s]
+    if len(live) >= 3:
+        return live, "live"
+    fb = [str(s).strip().upper() for s in _ETF_CONSTITUENTS.get(etf_u, []) if "." not in str(s)]
+    fb = list(dict.fromkeys(fb))[:30]
+    if fb:
+        return [(s, 0.0) for s in fb], "fallback"
+    return [], "none"
+
+
+def collect_recent_narrative_ticker_map(days: int = 7):
+    """최근 N일 내러티브(현재 user)에서 종목 → 등급 집합 맵 구성.
+    Winners = themes[].winners (주도주) · Emerging = themes[].expanding_to[].expected_tickers (2차 수혜).
+    반환: (ticker_map: {ticker: set[str]}, record_count: int)"""
+    ticker_map: dict = {}
+    try:
+        records = load_narrative_history_records() or []
+    except Exception:
+        return {}, 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+    n_recent = 0
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        dt_utc = _narrative_parse_saved_at_utc(rec.get("saved_at"))
+        if dt_utc is None or dt_utc < cutoff:
+            continue
+        analysis = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+        if not analysis:
+            continue
+        n_recent += 1
+        try:
+            for t in winners_tickers_from_theme_analysis(analysis):
+                ticker_map.setdefault(str(t).strip().upper(), set()).add("Winners")
+        except Exception:
+            pass
+        try:
+            for t in emerging_tickers_from_theme_analysis(analysis):
+                ticker_map.setdefault(str(t).strip().upper(), set()).add("Emerging")
+        except Exception:
+            pass
+    return ticker_map, n_recent
+
+
+def cross_check_early_signal_with_narratives(etf_tickers: list, days: int = 7, max_etfs: int = 10):
+    """Early Signal ETF ↔ 최근 N일 내러티브 종목 교차체크 (구성종목 전개 방식).
+
+    깔때기 역전 원칙의 기능화: '차트에서 찾고 → 뉴스로 확인한다'.
+    - 매치 있음 → 가격+스토리 동시 포착 (확신도 상승)
+    - 매치 없음 → 내러티브 미등장 = 아주 초기일 수 있음 (나쁜 신호 아님, 정밀검사 필수)
+
+    반환: {"narr_records": int, "narr_tickers": int, "days": int,
+           "results": {etf: {"matches": [(sym, "Winners/Emerging", weight%)], "source": str}}}
+    """
+    out = {"narr_records": 0, "narr_tickers": 0, "days": int(days), "results": {}}
+    etfs = [str(t).strip().upper() for t in (etf_tickers or []) if str(t).strip()][:max_etfs]
+    if not etfs:
+        return out
+    ticker_map, n_rec = collect_recent_narrative_ticker_map(days=days)
+    out["narr_records"] = n_rec
+    out["narr_tickers"] = len(ticker_map)
+    if not ticker_map:
+        return out
+    for etf in etfs:
+        try:
+            holdings, source = _cached_etf_top30_holdings(etf)
+        except Exception:
+            holdings, source = [], "none"
+        matches = []
+        for sym, w in holdings:
+            tiers = ticker_map.get(sym)
+            if tiers:
+                matches.append((sym, "/".join(sorted(tiers)), float(w or 0.0)))
+        matches.sort(key=lambda x: x[2], reverse=True)
+        out["results"][etf] = {"matches": matches, "source": source}
+    return out
+
+
+def save_early_signal_history(scan_df, xcheck: dict | None):
+    """Early Signal 스캔 결과를 EarlySignal_History 시트에 append.
+    '➡️ 유지'/'N/A' 는 제외(대부분을 차지하는 무신호 행으로 시트 비대화 방지) — 신호 행만 기록.
+    저장 실패는 스캔 표시를 막지 않는다(비차단). 반환: (성공여부, 메시지)"""
+    try:
+        if scan_df is None or scan_df.empty:
+            return False, "저장할 스캔 결과 없음"
+        sig_df = scan_df[~scan_df["RS_Signal"].isin(["➡️ 유지", "N/A"])].copy()
+        if sig_df.empty:
+            return True, "신호 행 없음 — 저장 생략"
+        ws, err = open_early_signal_history_worksheet()
+        if err:
+            return False, err
+        match_results = (xcheck or {}).get("results", {}) if isinstance(xcheck, dict) else {}
+        has_narr = bool((xcheck or {}).get("narr_tickers")) if isinstance(xcheck, dict) else False
+        now_str = _narrative_now_et_string(datetime.now(timezone.utc))
+        rows = []
+        for _, r in sig_df.iterrows():
+            tk = str(r.get("Ticker", "")).strip().upper()
+            res = match_results.get(tk)
+            if res is None:
+                narr_match, detail = "", ""  # 교차체크 대상 아님(약화/급하락 등) 또는 내러티브 없음
+            elif res.get("matches"):
+                narr_match = "Y"
+                detail = ", ".join(
+                    f"{s}({tier})" + (f" {w:.1f}%" if w > 0 else "")
+                    for s, tier, w in res["matches"][:5]
+                )
+            else:
+                narr_match = "N" if has_narr else ""
+                detail = ""
+            rows.append([
+                now_str, tk,
+                r.get("RS_Now", ""), r.get("RS_1W_Ago", ""), r.get("RS_Change", ""),
+                str(r.get("RS_Signal", "")), narr_match, detail,
+            ])
+        _safe_append_rows(ws, rows, value_input_option="USER_ENTERED")
+        return True, f"{len(rows)}행 저장"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def render_early_signal_xcheck(xcheck: dict | None) -> None:
+    """Early Signal × 내러티브 교차체크 결과 렌더링 (라이브/복원 겸용).
+    🔥 매치는 한 줄씩 강조, 미등장은 요약 한 줄 + expander 로 압축 (전수 교차체크 도배 방지)."""
+    if not isinstance(xcheck, dict) or not xcheck:
+        return
+    st.markdown("##### 🔗 내러티브 교차체크 — 가격이 먼저, 스토리로 확인")
+
+    # ── 복원 모드 (EarlySignal_History 시트에서 로드된 지난 스캔) ──
+    if xcheck.get("restored"):
+        for tk, detail in xcheck.get("match_lines", []):
+            st.markdown(f"🔥 **{tk}** — 가격+스토리 동시 포착: {detail} → 우선 검토 대상")
+        _nm = xcheck.get("nomatch_tickers", [])
+        if _nm:
+            st.markdown(f"🌱 내러티브 미등장 **{len(_nm)}개**: {', '.join(_nm)}")
+        if not xcheck.get("match_lines") and not _nm:
+            st.caption("지난 스캔에 교차체크 기록 없음 (당시 내러티브 부재 또는 교차체크 대상 아님)")
+        return
+
+    n_rec, n_tk, days = xcheck.get("narr_records", 0), xcheck.get("narr_tickers", 0), xcheck.get("days", 7)
+    if n_rec == 0 or n_tk == 0:
+        st.info(
+            f"최근 {days}일 내러티브가 없어 교차체크를 건너뛰었어요. "
+            "[1단계] 시장 내러티브를 먼저 생성하면 다음 스캔부터 자동 대조됩니다."
+        )
+        return
+    st.caption(f"대조 기준: 최근 {days}일 내러티브 **{n_rec}건** · 등장 종목 **{n_tk}개** (Winners+Emerging)")
+    results = xcheck.get("results", {})
+    no_match, no_hold = [], []
+    for etf, res in results.items():
+        matches = res.get("matches") or []
+        src_note = " *(대표종목 폴백 기준)*" if res.get("source") == "fallback" else ""
+        if matches:
+            detail = " · ".join(
+                f"**{s}**({tier}" + (f" {w:.1f}%" if w > 0 else "") + ")"
+                for s, tier, w in matches[:5]
+            )
+            st.markdown(f"🔥 **{etf}** — 가격+스토리 동시 포착: {detail}{src_note} → 우선 검토 대상")
+        elif res.get("source") == "none":
+            no_hold.append(etf)
+        else:
+            no_match.append(etf)
+    if no_match:
+        st.markdown(
+            f"🌱 **내러티브 미등장 {len(no_match)}개** — 아무도 얘기 안 하는데 자금이 먼저 움직임 "
+            f"(아주 초기일 수 있음 · 정밀검사 필수)"
+        )
+        with st.expander(f"미등장 목록 {len(no_match)}개", expanded=False):
+            st.markdown(", ".join(no_match))
+    if no_hold:
+        st.caption(f"❔ 구성종목 정보 없음(교차체크 불가) {len(no_hold)}개: {', '.join(no_hold[:15])}"
+                   + (" …" if len(no_hold) > 15 else ""))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_last_early_signal_scan():
+    """EarlySignal_History 시트에서 가장 최근 스캔 그룹 복원 (접속 시 영속 표시용).
+    반환: (df|None, xcheck_restored|None, date_str)
+    df 컬럼: Ticker, RS_Now, RS_1W_Ago, RS_Change, RS_Signal (신호 행만 — 저장 정책과 동일)."""
+    try:
+        ws, err = open_early_signal_history_worksheet()
+        if err or ws is None:
+            return None, None, ""
+        vals = ws.get_all_values() or []
+    except Exception:
+        return None, None, ""
+    if len(vals) < 2:
+        return None, None, ""
+    rows = [r for r in vals[1:] if len(r) >= 6 and str(r[0]).strip()]
+    if not rows:
+        return None, None, ""
+    last_date = max(str(r[0]).strip() for r in rows)
+    grp = [(r + [""] * 8)[:8] for r in rows if str(r[0]).strip() == last_date]
+    recs, match_lines, nomatch = [], [], []
+    for r in grp:
+        tk = str(r[1]).strip().upper()
+        if not tk:
+            continue
+        recs.append({
+            "Ticker": tk,
+            "RS_Now": to_float(r[2]), "RS_1W_Ago": to_float(r[3]), "RS_Change": to_float(r[4]),
+            "RS_Signal": str(r[5]).strip(),
+        })
+        if str(r[6]).strip().upper() == "Y":
+            match_lines.append((tk, str(r[7]).strip()))
+        elif str(r[6]).strip().upper() == "N":
+            nomatch.append(tk)
+    if not recs:
+        return None, None, ""
+    df = pd.DataFrame(recs).sort_values("RS_Change", ascending=False, na_position="last")
+    xcheck = {"restored": True, "date": last_date, "match_lines": match_lines, "nomatch_tickers": nomatch}
+    return df, xcheck, last_date
 
 
 def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series = None):
@@ -8305,6 +8604,24 @@ def build_portfolio_sell_radar_df(portfolio_df):
 
     out_df = pd.DataFrame(rows)
     return out_df
+
+
+def open_early_signal_history_worksheet():
+    """Quant_DB 스프레드시트의 EarlySignal_History 탭. 없으면 자동 생성.
+    Early Signal 스캔 결과 히스토리 — 쌓이면 'Early Signal 등장 후 N주 수익률' 자체 백테스트 재료."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if _EARLY_SIGNAL_HISTORY_SHEET_TITLE in existing_titles:
+            return sh.worksheet(_EARLY_SIGNAL_HISTORY_SHEET_TITLE), None
+        ws = sh.add_worksheet(title=_EARLY_SIGNAL_HISTORY_SHEET_TITLE, rows=5000, cols=8)
+        ws.update([_EARLY_SIGNAL_HISTORY_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc:
+        return None, f"EarlySignal_History 워크시트 열기/생성 실패: {exc}"
 
 
 def open_etf_universe_worksheet():
@@ -16704,11 +17021,15 @@ if st.session_state.get("logged_in"):
             if not scan_target:
                 st.warning("스캔 대상 티커가 없어요. 필터를 변경하거나 포트폴리오/Watchlist에 종목을 추가해주세요.")
             else:
+                _eligible, _incub = split_incubator_tickers(scan_target)
                 with st.spinner(
-                    f"RS Score 주간 변화율 계산 중... ({len(scan_target)}개 티커 · "
-                    "재시도 포함 전수 수집이라 유니버스가 크면 2~3분 걸릴 수 있어요)"
+                    f"RS Score 주간 변화율 계산 중... (계산 가능 {len(_eligible)}개"
+                    + (f" · 인큐베이터 {len(_incub)}개 제외" if _incub else "")
+                    + " · 재시도 포함 전수 수집)"
                 ):
-                    _es_result, _es_report = compute_rs_score_weekly_change(scan_target)
+                    _es_result, _es_report = compute_rs_score_weekly_change(_eligible)
+                if isinstance(_es_report, dict):
+                    _es_report["incubator"] = _incub
                 st.session_state["_early_signal_report"] = _es_report
                 if _es_report.get("spy_error"):
                     st.session_state["_early_signal_df"] = None
@@ -16719,11 +17040,48 @@ if st.session_state.get("logged_in"):
                     render_scan_coverage_report(_es_report)
                 else:
                     st.session_state["_early_signal_df"] = _es_result
+                    # ── 내러티브 교차체크 (🌱+🚀 전수 · 안전 상한 50 · RS_Change 순) ──
+                    _xc = None
+                    try:
+                        _cand = _es_result[
+                            _es_result["RS_Signal"].isin(["🌱 Early Signal", "🚀 급부상"])
+                        ]["Ticker"].tolist()
+                        if _cand:
+                            with st.spinner(f"내러티브 교차체크 중... ({min(len(_cand), 50)}개 ETF 구성종목 전개)"):
+                                _xc = cross_check_early_signal_with_narratives(_cand, days=7, max_etfs=50)
+                    except Exception:
+                        _xc = None
+                    st.session_state["_early_signal_xcheck"] = _xc
+                    # ── EarlySignal_History 저장 (비차단 — 실패해도 스캔 표시는 진행) ──
+                    try:
+                        _ok, _msg = save_early_signal_history(_es_result, _xc)
+                        st.session_state["_early_signal_saved_msg"] = (
+                            f"💾 EarlySignal_History: {_msg}" if _ok else f"⚠️ 히스토리 저장 실패: {_msg}"
+                        )
+                    except Exception as _exc:
+                        st.session_state["_early_signal_saved_msg"] = f"⚠️ 히스토리 저장 실패: {_exc}"
 
-        # 결과를 session_state에서 표시 (rerun 후에도 유지)
+        # 결과를 session_state에서 표시 (rerun 후에도 유지 · 세션 비면 시트에서 최근 스캔 복원)
         _es_df = st.session_state.get("_early_signal_df")
+        if _es_df is None or (hasattr(_es_df, "empty") and _es_df.empty):
+            try:
+                _df_r, _xc_r, _date_r = load_last_early_signal_scan()
+            except Exception:
+                _df_r, _xc_r, _date_r = None, None, ""
+            if _df_r is not None and not _df_r.empty:
+                st.session_state["_early_signal_df"] = _df_r
+                st.session_state["_early_signal_xcheck"] = _xc_r
+                st.session_state["_early_signal_report"] = None
+                st.session_state["_early_signal_saved_msg"] = (
+                    f"📅 마지막 스캔: {_date_r} — EarlySignal_History에서 복원 (신호 행만 · 새 스캔은 위 버튼)"
+                )
+                _es_df = _df_r
         if _es_df is not None and not _es_df.empty:
             render_scan_coverage_report(st.session_state.get("_early_signal_report"))
+            _saved_msg = st.session_state.get("_early_signal_saved_msg")
+            if _saved_msg:
+                st.caption(_saved_msg)
+            render_early_signal_xcheck(st.session_state.get("_early_signal_xcheck"))
             rs_change_df = _es_df
             early_df = rs_change_df[rs_change_df["RS_Signal"] == "🌱 Early Signal"]
             surge_df = rs_change_df[rs_change_df["RS_Signal"] == "🚀 급부상"]
@@ -16779,11 +17137,15 @@ if st.session_state.get("logged_in"):
             if not scan_target:
                 st.warning("스캔 대상 티커가 없어요. 위 Early Signal 필터를 먼저 설정하세요.")
             else:
+                _rev_eligible, _rev_incub = split_incubator_tickers(scan_target)
                 with st.spinner(
-                    f"섹터 모멘텀 반전 신호 분석 중... ({len(scan_target)}개 · "
-                    "재시도 포함 전수 수집이라 유니버스가 크면 2~3분 걸릴 수 있어요)"
+                    f"섹터 모멘텀 반전 신호 분석 중... (계산 가능 {len(_rev_eligible)}개"
+                    + (f" · 인큐베이터 {len(_rev_incub)}개 제외" if _rev_incub else "")
+                    + " · 재시도 포함 전수 수집)"
                 ):
-                    reversal_alerts, _rev_report = detect_sector_momentum_reversal(scan_target)
+                    reversal_alerts, _rev_report = detect_sector_momentum_reversal(_rev_eligible)
+                if isinstance(_rev_report, dict):
+                    _rev_report["incubator"] = _rev_incub
                 if _rev_report.get("spy_error"):
                     st.error(f"⛔ {_rev_report['spy_error']} — 기준 지수 없이는 RS 계산이 불가합니다.")
                 render_scan_coverage_report(_rev_report)
@@ -21862,318 +22224,266 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
     elif main_nav == _MAIN_NAV_OPTIONS[12]:
         # ─────────────────────────────────────────────────────────────────────
-        # 📖 사용 가이드
+        # 📖 사용 가이드 (v3 — 2026-07 전면 개정: 깔때기 워크플로우 + 전 탭 상세)
         # ─────────────────────────────────────────────────────────────────────
         st.title("📖 사용 가이드")
-        st.caption("Quant Investment Terminal — 전체 기능 및 워크플로우 안내")
+        st.caption("Quant Investment Terminal — 투자 철학 · 표준 워크플로우 · 전 탭 기능 상세")
 
-        _uid_guide = str(st.session_state.get("user_id") or "").strip()
-        _role_guide = st.session_state.get("user_role", "guest")
-
-        # ── 전체 워크플로우 개요 ──────────────────────────────────────────────
-        st.markdown("## 🗺️ 투자 의사결정 워크플로우 (Top-Down)")
+        # ── 투자 철학 ─────────────────────────────────────────────────────────
+        st.markdown("## 🧭 이 앱의 투자 철학")
         st.info(
-            "**권장 순서:** 🚨 Daily Risk → 🌐 거시경제 → 📰 내러티브 → 🎯 섹터 → "
-            "🚀 종목 스캐너 → 🔬 정밀 검사 → 🛡️ 포트폴리오 관리\n\n"
-            "매일 아침 ① Daily Risk Gauge 먼저 확인 → 위험이 낮으면 ② 내러티브 분석 실행 "
-            "→ AI가 추천한 섹터·종목을 ③ 스캐너로 검증 → ④ 정밀 검사 후 투자 결정"
+            "**1. 손실 방지 > 예측 정확도** — 천장과 바닥을 예측하지 않습니다. "
+            "추세의 끝이 **가격으로 확인되면** 따라 나갑니다 (Weinstein 4단계 국면 + 섹터 꺾임 + 순위 이탈).\n\n"
+            "**2. 가격이 먼저, 스토리는 검증** — 뉴스에 나올 정도면 이미 올라 있습니다. "
+            "소싱은 가격 기반(Early Signal·Hidden Alpha), 내러티브는 교차 확인용입니다.\n\n"
+            "**3. 타이밍이 좋아도 손익비가 나쁘면 안 삽니다** — 모든 매수 신호는 R:R 게이트(최소 1:2)를 통과해야 합니다.\n\n"
+            "**4. 집중은 입구에서 막습니다** — 같은 섹터/테마는 Watchlist 단계에서 2~3개로 제한하세요. "
+            "포트폴리오의 75%가 한 테마면 그건 분산이 아니라 단일 베팅입니다."
         )
+
+        # ── 표준 깔때기 워크플로우 ────────────────────────────────────────────
+        st.markdown("## 🗺️ 표준 워크플로우 — 발굴에서 청산까지")
+        st.markdown("""
+| 단계 | 탭 | 하는 일 |
+|---|---|---|
+| ① 시장 점검 | 🚨 Daily Risk Gauge | 오늘 위험도 확인 — 높으면 신규 진입 자체를 쉼 |
+| ② 가격 소싱 | 🎯 섹터 & 자금 흐름 | **Early Signal Radar + Hidden Alpha**로 "막 강해지기 시작한" 후보 발굴 |
+| ③ 스토리 검증 | (자동) 내러티브 교차체크 | 🔥 가격+스토리 동시 포착 = 확신도↑ · 🌱 미등장 = 초기일 수 있음 |
+| ④ 종목 정밀검사 | 🔬 정밀 검사 | 국면(4단계)·펀더멘털·기술적 신호 종합 판정 |
+| ⑤ Watchlist 등록 | 🔔 Buy Watchlist & Alert | 같은 섹터 2~3개 상한 · 신호 대기 (등록 후 눌림은 정상) |
+| ⑥ 신호 집행 | 📧 매매 레이더 이메일 | 🎯 매수 구간 + R:R 게이트 통과 시에만, **계산된 수량대로** 매수 |
+| ⑦ 보유 관리 | 🛡️ 매도 레이더 | 스윙/포지션 듀얼 호라이즌으로 청산 신호 추적 |
+| ⑧ 복기 | 📊 매매 복기 · 적중률 트래커 | 실제 체결 vs 엔진 신호 대조 — 갭이 곧 개선 지점 |
+""")
+        st.warning(
+            "⚠️ **가장 흔한 실수:** 신호는 앱이 내는데 매수는 파이프라인 밖에서 하는 것. "
+            "Watchlist가 비어 있으면 알림 엔진 전체가 공회전합니다. 그리고 전 종목 1주씩 사면 "
+            "비중은 신호가 아니라 주가가 결정합니다 — **소수점 매수로 앱이 계산한 금액을 그대로 집행하세요.**"
+        )
+
+        with st.expander("📅 일일·주간 루틴 + 자동 이메일 스케줄", expanded=False):
+            st.markdown("""
+**자동 이메일 (Cloud Scheduler → GitHub Actions):**
+
+| 시간(ET) | 내용 |
+|---|---|
+| 평일 8am | 내러티브 + DRG 거시 방향 예측 |
+| 평일 9am | 경제지표 발표 후 DRG 예측 수정 |
+| 평일 2pm | 매매 레이더 장중 체크 (intraday) |
+| 평일 5pm | 내러티브 + DRG 검증 + 매매 레이더 (장 마감 평가) |
+| 주말 5pm | 주간 내러티브 + Hidden Alpha 로테이션 |
+| 매월 1회 | Signal_Backtest 워크포워드 백테스트 |
+
+**손으로 하는 루틴:**
+- 매일 아침: Daily Risk Gauge 확인 → 이메일 신호 확인 → 신호 있으면 집행
+- 주 1~2회: Early Signal 스캔 → 🔥 매치 후보 정밀검사 → Watchlist 갱신
+- 주 1회: Hidden Alpha Top5 로테이션 확인 · 주간 포트폴리오 요약 생성
+- 월 1회: Signal_Backtest 버킷 테이블 확인 (엔진 엣지 검증) · 매매 복기
+""")
 
         # ── 섹션별 탭 구성 ────────────────────────────────────────────────────
         _g_tab0, _g_tab1, _g_tab2, _g_tab3, _g_tab4 = st.tabs([
             "🚀 시작하기",
             "📊 분석 도구",
-            "💼 포트폴리오",
-            "🤖 AI 인사이트",
+            "💼 포트폴리오 & 알림",
+            "🤖 AI & 자동화",
             "❓ FAQ",
         ])
 
         # ════════════════════════════════════════════════════════════════════
         with _g_tab0:
-            st.markdown("### 🚀 처음 시작하는 분들을 위한 2단계 셋업")
+            st.markdown("### 🚀 처음 시작하는 분들을 위한 3단계 셋업")
 
             with st.expander("**STEP 1 — 포트폴리오 종목 등록**", expanded=False):
                 st.markdown("""
 **[4단계] 포트폴리오 매도 레이더** 탭에서:
-1. `계좌명(Account)` 입력 (예: Robinhood, Fidelity, ISA)
-2. `티커(Ticker)` 입력 (예: AAPL, TSLA, 005930.KS)
-3. `매수가`, `수량` 입력 후 **"종목 추가"** 클릭
-4. Google Sheets `Portfolio` 탭에 자동 저장 — 모든 기기에서 실시간 동기화
+1. `계좌명(Account)` 입력 (예: Robinhood)
+2. `티커`, `매수가`, `수량` 입력 후 **"종목 추가"** 클릭
+3. Google Sheets `Portfolios` 탭에 자동 저장 — 모든 기기 동기화
 
-> 💡 국내 주식도 `.KS` 접미사로 지원합니다 (예: `005930.KS` = 삼성전자)
+> 💡 국내 주식은 `.KS` 접미사 (예: `005930.KS` = 삼성전자)
 """)
 
-            with st.expander("**STEP 2 — 첫 AI 내러티브 분석 실행**", expanded=False):
+            with st.expander("**STEP 2 — Watchlist 채우기 (가장 중요)**", expanded=False):
                 st.markdown("""
-**[1단계] 시장 내러티브** 탭에서:
-1. 분석 타입 선택: `오늘의 최신 내러티브` 또는 `주간 메가 트렌드`
-2. **"🤖 AI 내러티브 분석 실행"** 버튼 클릭
-3. AI가 Winners(주도주)·Emerging(급부상 종목)·Sector Rotation을 자동 분석
-4. 결과가 `Narratives` 시트에 자동 저장 → 이후 모든 AI 탭에서 활용
+Watchlist가 비어 있으면 매수 신호·알림 이메일이 **아무것도 나오지 않습니다.**
 
-> ⏱️ 최초 분석 소요 시간: 약 30~60초
+1. 🎯 섹터 & 자금 흐름 탭에서 **Early Signal 스캔** 실행
+2. 🔥 (가격+스토리 매치) ETF의 구성 주도주, 또는 ETF 자체를 [3단계] 정밀 검사
+3. 판정이 괜찮으면 사이드바에서 **Watchlist에 등록** — 같은 섹터 2~3개 상한
+4. 이후 매일 장 마감 후 매매 레이더 이메일이 등록 종목의 신호를 평가해 발송
 """)
 
-            st.divider()
-            with st.expander("### 📅 일일 루틴 추천", expanded=False):
+            with st.expander("**STEP 3 — 첫 AI 내러티브 분석 실행**", expanded=False):
                 st.markdown("""
-| 시간 | 탭 | 행동 |
-|---|---|---|
-| 장 열기 전 (오전 9시 이전) | 🚨 Daily Risk Gauge | 선행 신호 6개 + 시장 위험도 확인 |
-| 장 중 | 📰 [1단계] 시장 내러티브 | AI 내러티브 분석 → Winners/Emerging 파악 |
-| 장 중 | 🎯 [2단계] 섹터 & 자금 흐름 | 자금이 몰리는 섹터 확인 |
-| 관심 종목 발생 시 | 🔬 [3단계] 정밀 검사 | 개별 종목 펀더멘털 + 기술적 분석 |
-| 주 1회 | 📋 [AI] 주간 포트폴리오 요약 | 전체 포트폴리오 AI 리뷰 |
+**[1단계] 시장 내러티브** 탭에서 `오늘의 최신 내러티브` 또는 `주간 메가 트렌드` 실행.
+결과는 `Narratives` 시트에 저장되어 AI 스캐너·교차체크·적중률 트래커가 공유합니다.
+
+> ⏱️ 소요 약 30~60초. 자동화가 켜져 있으면 매일 8am/5pm ET에 자동 생성됩니다.
 """)
 
         # ════════════════════════════════════════════════════════════════════
         with _g_tab1:
-            st.markdown("### 📊 분석 도구 탭 상세 가이드")
+            st.markdown("### 📊 분석 도구 탭 상세")
 
             with st.expander("🚨 **Daily Risk Gauge** — 매일 첫 확인", expanded=False):
                 st.markdown("""
-**목적:** 당일 시장 진입 가능 여부를 빠르게 판단
+**목적:** 오늘 신규 진입해도 되는 날인지 판단.
 
-**선행 신호 6가지:**
-- 🌙 **VIX 공포지수** — 20 이하: 안전 / 30 이상: 위험
-- 📈 **선물 프리마켓** (S&P500·나스닥) — 장 열기 전 방향성 확인
-- 💵 **달러 인덱스(DXY)** — 강달러 = 신흥국·원자재 압박
-- 📉 **국채 수익률** — 10Y·2Y 스프레드로 경기침체 선행 신호 포착
-- 🌐 **글로벌 시장** — 전일 아시아·유럽 마감 분위기
-- 📅 **경제 이벤트 캘린더** — FOMC·CPI 등 고임팩트 발표 감지
+- 선행 신호 6종: VIX · 선물 프리마켓 · 달러 인덱스 · 국채 수익률(10Y-2Y) · 글로벌 마감 · 경제 이벤트
+- **"오늘 투자해도 될까?"** 버튼 — AI가 6신호 종합 판단
+- **DRG 예측/검증 자동화:** 평일 8am 거시 방향 예측 → 9am 지표 발표 후 수정 → 5pm 검증.
+  결과는 `DRG_Predictions` 시트에 누적되어 예측 적중률을 추적합니다.
 
-**오늘 투자해도 될까?** 버튼으로 AI가 6가지 신호를 종합해 매매 가능 여부 판단
-
-> ⚡ 데이터는 1시간 캐시. 강제 새로고침은 화면 상단 **🔄 데이터 새로고침** 버튼
+> ⚡ 데이터 1시간 캐시 · 위험도가 높은 날은 매수 신호가 와도 건너뛰는 것이 철학에 맞습니다.
 """)
 
             with st.expander("🌐 **[1단계] 거시경제 지표**", expanded=False):
                 st.markdown("""
-**미국 거시경제 8대 지표 자동 수집·판독**
+미국 거시 8대 지표 자동 수집·판독 (FRED + FMP): 기준금리 · 10Y/2Y 국채 · CPI · 실업률 · GDP · 소매판매 · VIX · 달러 인덱스.
 
-| 지표 | 데이터 소스 | 판독 기준 |
-|---|---|---|
-| 기준금리 (Fed Funds) | FRED / FMP | 5% 이상 = 고금리 레짐 |
-| 국채 수익률 (10Y, 2Y) | FRED / FMP | 역전 = 침체 선행 신호 |
-| CPI 인플레이션 | FRED / FMP | 3% 이상 = 위험 |
-| 실업률 | FRED / FMP | 4.5% 이상 = 경기 둔화 |
-| GDP 성장률 | FMP | 2% 이하 = 경기 둔화 |
-| 소매판매 | FMP | 전월 대비 감소 = 소비 위축 |
-| VIX 공포지수 | FRED / FMP | 25 이상 = 위험 선호 저하 |
-| 달러 인덱스 | FRED / FMP(UUP) | 52주 평균 대비 +5.5% 이상 = 달러 과강세 |
+- **Macro Score** — 8개 지표 합산 (Pass/Warning/Fail)
+- **2년 히스토리 차트** — 추이로 트렌드 파악
 
-**📊 Macro Score:** 8개 지표 합산 점수 (Pass/Warning/Fail)  
-**📈 2년 히스토리 차트:** 지표 추이를 시각화해 트렌드 파악
+> 개별 종목보다 "지금이 공격할 국면인가"를 정하는 배경 판입니다.
 """)
 
             with st.expander("📰 **[1단계] 시장 내러티브**", expanded=False):
                 st.markdown("""
-**AI가 뉴스·시장 데이터를 분석해 투자 테마를 추출**
+AI가 뉴스(FMP, RSS 폴백)를 분석해 투자 테마 추출. `오늘의 최신`(단기) / `주간 메가 트렌드`(스윙·중기).
 
-**분석 타입:**
-- `오늘의 최신 내러티브` — 당일 뉴스 기반 단기 모멘텀 분석
-- `주간 메가 트렌드` — 최근 7일 흐름 기반 스윙/중기 투자용
+**결과 구성:** Market Regime → 테마별 내러티브 → **Winners**(주도주) → **Emerging**(2차 수혜 후보) → Sector Rotation → 일관성 점수.
+Winners/Emerging은 티커 환각 검증 + 정량 교차검증(RSI·RS·거래량)을 거칩니다.
 
-**분석 결과 구성:**
-1. **Market Regime** — 현재 시장 국면 (Risk-On / Risk-Off / Neutral)
-2. **테마별 내러티브** — AI가 추출한 핵심 투자 테마 (2~5개)
-3. **Winners** — 각 테마에서 주목할 선도 종목
-4. **Emerging** — 급부상 중인 초기 단계 종목
-5. **Sector Rotation Map** — 자금이 이동하는 섹터 시각화
-6. **내러티브 일관성 점수** — 이전 분석과의 연속성 평가
-
-**Emerging 종목 정량 교차 검증:** Winners/Emerging 종목을 RSI·RS·거래량으로 자동 검증  
-**시계열 분석 엔진:** 특정 내러티브가 얼마나 지속됐는지 추적  
-
-> 💾 분석 결과는 `Narratives` 시트에 자동 저장 (최근 40개 보관)
+> 🎯 **역할 주의:** 내러티브는 **소싱이 아니라 검증** 레이어입니다. 뉴스에 반복 등장 = 이미 가격에 상당 반영.
+> Early Signal이 잡은 후보가 내러티브에도 있으면(🔥) 확신도가 오르는 구조로 쓰세요.
 """)
 
-            with st.expander("🎯 **[2단계] 섹터 & 자금 흐름**", expanded=False):
+            with st.expander("🎯 **[2단계] 섹터 & 자금 흐름** — 소싱의 본진", expanded=False):
                 st.markdown("""
-**11개 GICS 섹터 ETF 상대 강도 분석**
+**① 섹터 ETF 상대 강도** — GICS 11섹터 1주/1개월/3개월/1년 수익률 히트맵. 1개월+3개월 모두 진한 초록 = 장기 주도 섹터.
 
-- **섹터 ETF 강도 순위** — XLK·XLV·XLE 등 섹터별 1개월 수익률 비교
-- **섹터별 P/E Snapshot** — 고평가/저평가 섹터 한눈에 파악
-- **Alpha Leaders** — 선택 섹터 내 실제 주도주 발굴
-- **Laggards** — 낙폭과대 반등 후보
+**② 🚀 Hidden Alpha Radar** — 전체 ETF Universe에서 자금 유입 시작 ETF 발굴 + **주간 Top5 로테이션** (Top5 이탈 = 매도, 신규 진입 = 매수 후보). 주말 자동 이메일.
 
-**추가 레이더:**
-- 🚀 **Hidden Alpha Radar** — 새로운 주도 테마 발굴 (섹터 이탈 강세주)
-- 🌱 **Early Signal Radar** — 막 강해지기 시작한 섹터 선제 감지
-- 🛡️ **섹터 꺾임 감지** — 고점 이탈 섹터 → 매도 타이밍 포착
+**③ 🌱 Early Signal Radar** — 1주 전 대비 RS Score 변화율. RS는 아직 낮은데 변화율 급등 = 아무도 모를 때 강해지기 시작한 섹터.
+- **커버리지 표시:** "✅ 158/158 · 🐣 인큐베이터 153개" — 인큐베이터는 유니버스 등록 110일 미경과 신규 ETF (RS 계산에 70거래일 필요, 도달 시 자동 편입)
+- **🔗 내러티브 교차체크 (자동):** 🌱+🚀 ETF 전수를 구성종목 30개로 전개해 최근 7일 내러티브와 대조 — 🔥 매치 = 우선 검토 · 미등장 = 더 초기일 수 있음
+- **💾 EarlySignal_History:** 스캔마다 신호 행이 시트에 저장, 재접속 시 마지막 스캔 자동 복원. 쌓이면 "신호 후 N주 수익률" 자체 검증 재료.
+
+**④ 🛡️ 섹터 꺾임 감지** — 2주 연속 RS 하락 + 거래량 감소. **보유 종목의 섹터 ETF가 뜨면 선제 매도 고려** — "사이클이 끝나간다"의 가격 확인.
+
+**⑤ 🆕 ETF Universe 관리** — 신규 상장 ETF 7일마다 자동 추가(AUM $50M↑) · 저품질(6개월↑ & AUM<100M & 거래대금<1M) 자동 정리.
 """)
 
             with st.expander("🚀 **[2단계] AI 종목 스캐너**", expanded=False):
                 st.markdown("""
-**내러티브 DB의 Winners·Emerging 종목을 자동 스캔**
+내러티브 DB의 Winners·Emerging을 정량 스캔해 점수화 (Current Leaders / Emerging Opportunities).
+소스: 오늘의 내러티브 / 주간 트렌드 / 수동 입력. **X-Ray**(심층 분석)와 **팩트 체크**(과거 추천 수익률 검증) 포함.
 
-**데이터 소스 선택:**
-- `오늘의 최신 내러티브` — 당일 분석 결과의 Winners/Emerging
-- `주간 메가 트렌드` — 7일 누적 상위 종목
-- `수동 섹터/티커 입력` — 직접 종목 지정
-
-**듀얼 엔진 스캔 결과:**
-- **Current Leaders** — RSI·모멘텀·거래량 기반 현재 주도주
-- **Emerging Opportunities** — 초기 부상 중인 기회 종목
-
-**🔬 종목/테마 X-Ray:** 특정 종목·섹터에 대한 심층 AI 분석  
-**📊 내러티브 팩트 체크:** 과거 AI 추천 종목의 실제 수익률 검증
+> 스캐너 고득점 = 모멘텀·RSI 높음 = 단기 고점 근처일 수 있음. 점수는 후보 선별용,
+> 진입 타이밍은 반드시 [3단계] 정밀 검사 + Watchlist 신호로 결정하세요.
 """)
 
-            with st.expander("🔬 **[3단계] 개별 종목 정밀 검사**", expanded=False):
+            with st.expander("🔬 **[3단계] 개별 종목 정밀 검사** — 매수 전 관문", expanded=False):
                 st.markdown("""
-**사이드바에서 티커 입력 후 분석 실행**
+사이드바에 티커 입력 → 분석 실행.
 
-**펀더멘털 분석:**
-- 시가총액·P/E·P/B·PEG·ROE·부채비율 등 핵심 KPI
-- **투자 스타일 적합도** — 성장주/가치주/배당주/모멘텀 중 어디에 해당하는지
-- **DCF 내재가치 계산** — 현재가 대비 안전마진 산출
-- **어닝 서프라이즈 히스토리** — 최근 8분기 EPS 실제 vs 예상
+**국면(Regime) 판정 — 모든 신호의 뼈대 (Weinstein 4단계 + Cardwell RSI 밴드):**
 
-**기술적 분석:**
-- RSI(14), MACD, 볼린저밴드, 52주 고점/저점 대비
-- 200일선·50일선 위치 확인
-- 거래량 이상 감지
+| 국면 | 의미 | 기본 전략 |
+|---|---|---|
+| 🟢 강세(대장주) | Stage 2 상승 추세 | RSI 40~52 눌림에서 매수 (🎯 지금 매수 구간) |
+| 🟡 횡보 | Stage 1/3 박스권 | `price > MA200` 일 때만 상단 돌파 매수 |
+| ⚠️ 추세 흔들림 | Stage 3 천장 의심 | 신규 진입 금지 · 보유 시 축소 검토 |
+| 🔴 약세 회피 | Stage 4 하락 | 접근 금지 |
 
-**추가 데이터:**
-- 📞 어닝콜 트랜스크립트 AI 요약 (FMP)
-- 🏦 기관 투자자 보유 현황 변화
-- 🕵️ 인사이더 트레이딩 내역
-- 🎯 애널리스트 목표주가 컨센서스
-- 🏛️ 상원/하원 의원 거래 내역
-
-**🤖 AI 종합 진단:** 펀더멘털+기술적 신호를 종합한 매수/관망/매도 의견
+**펀더멘털:** P/E·PEG·ROE·DCF 안전마진·어닝 서프라이즈 8분기 **기술적:** RSI·MACD·볼린저·50/200일선·거래량 이상
+**추가:** 어닝콜 AI 요약 · 기관/인사이더 · 애널리스트 목표가 · 의원 거래
+**🤖 AI 종합 진단** + **손절/목표 플랜(R:R)** — Watchlist 등록 시 이 플랜이 알림 엔진에 연결됩니다.
 """)
 
         # ════════════════════════════════════════════════════════════════════
         with _g_tab2:
-            st.markdown("### 💼 포트폴리오 관리 탭 상세 가이드")
+            st.markdown("### 💼 포트폴리오 & 알림 탭 상세")
 
-            with st.expander("🛡️ **[4단계] 포트폴리오 매도 레이더**", expanded=False):
+            with st.expander("🛡️ **[4단계] 포트폴리오 매도 레이더** — 듀얼 호라이즌", expanded=False):
                 st.markdown("""
-**포트폴리오 전체 현황 + 매도 신호 자동 감지**
+계좌별 등록 · 실시간 손익 · 매도 기록 · Correlation Matrix(**한 테마 집중 여부를 여기서 확인**) · SPY/QQQ 벤치마크 비교 · 실적 발표 캘린더.
 
-#### 📋 포트폴리오 관리
-- **계좌별 등록** — Robinhood·Fidelity 등 여러 계좌를 분리 관리
-- **종목 추가/삭제** — 티커·매수가·수량 입력
-- **실시간 손익** — 현재가 자동 조회 → 투자 손익($) 및 수익률(%) 계산
-- **매도 기록** — 매도한 종목의 실현 손익 추적
+**매도 신호 — 두 개의 시계 (종목마다 어느 시계로 볼지 선택):**
 
-#### 📊 포트폴리오 분석 (고급)
-- **Correlation Matrix** — 보유 종목 간 상관관계 (분산투자 체크)
-- **수익률 히스토리** — 매수가 기준 누적 수익 추이
-- **Personal Benchmark 비교** — 내 포트폴리오 vs SPY·QQQ 성과 비교 (100 normalized)
-
-#### 📅 보유 종목 실적 발표 캘린더
-보유 종목의 다음 실적 발표일 자동 조회:
-- **빨간 🔴**: D-30일 이내 임박 → 변동성 대비 필요
-- **노란 🟡**: 예정 (30일 이후)
-- **초록 ✅**: 발표 완료
-- EPS 예상치 표시 (FMP 제공 시)
-
-#### 🎯 매도 타이밍 레이더
-RSI·MACD·52주 고점·200일선 4가지 기술적 신호로 **위험점수** 산출:
-
-| 신호 등급 | 기준 | 의미 |
+| 호라이즌 | 도구 | 용도 |
 |---|---|---|
-| 🔴 매도 검토 | 위험점수 3점+ | RSI 과매수 + 복수 기술적 경고 |
-| 🟡 주의 | 위험점수 1~2점 | 일부 신호 경고 |
-| 🟢 유지 | 위험점수 0점 | 이상 신호 없음 |
+| 🏃 스윙 | 50MA · ATR 트레일링 · RSI | 수주~수개월, 이익 보호 우선 |
+| 🧘 포지션 | 200MA · 고점 -15% 트레일링 · MACD | 수개월~, 추세 완주 |
 
-**🤖 AI 매도 우선순위:** 기술적 신호 + 펀더멘털을 AI가 종합해 매도 우선순위 제시
+> ⚠️ 모멘텀 로테이션의 엣지는 **눌림을 견디는 데서** 나옵니다. 소액 계좌에서 타이트한 장중 청산은
+> 휩쏘 비용이 이익 보호보다 큽니다 — 스윙 신호는 큰 수익 구간의 참고용, 시스템 트리거는 포지션 호라이즌 권장.
 """)
 
-            with st.expander("🔔 **Buy Watchlist & Alert**", expanded=False):
+            with st.expander("🔔 **Buy Watchlist & Alert** — 신호 파이프라인의 심장", expanded=False):
                 st.markdown("""
-**관심 종목 등록 + 매수 조건 자동 체크**
+**등록:** 사이드바 티커 입력 → 메모/조건 설정 → 저장. 정밀검사의 손절/목표 플랜이 함께 저장됩니다.
 
-#### 등록 방법
-1. 사이드바 티커 입력창에 종목 입력
-2. 투자 메모 작성 (선택)
-3. Alert 조건 설정:
-   - **목표 RSI** — RSI가 지정값 이하로 하락 시 알림 (예: 30 이하 → 과매도 매수 기회)
-   - **200일선 하향 돌파** — 200일선 아래로 내려갈 때 알림
-4. **"현재 티커 저장"** 클릭
+**알림 상태 머신 (매매 레이더 이메일의 규칙):**
+- **2일 연속 확정** — 하루 반짝 신호는 무시, 이틀 연속 유지된 상태 전환만 발송 (노이즈 차단)
+- **재무장(re-arm)** — 같은 신호는 반복 발송 안 함, 상태가 바뀌었다 돌아오면 다시 활성화
+- **등록 후 하락은 정상** — 강세 종목의 매수 신호는 RSI 40~52 눌림에서 발동하도록 설계됨. "등록 시 대비 -2%"는 셋업이 익는 과정
 
-#### Watchlist 탭에서
-- **Alert 조건 충족 시** — 🔴 자동 하이라이트
-- 각 종목 클릭 → 바로 [3단계] 정밀 검사로 이동
-- 목표가·메모 직접 편집 가능
+**이메일 라벨 해석표:**
 
-> 💡 정기적으로 Watchlist를 관리해 관심 종목이 매수 조건에 들어올 때 빠르게 대응하세요.
+| 라벨 | 뜻 | 행동 |
+|---|---|---|
+| 🎯 지금 매수 구간 (게이트 통과) | 타이밍 + 손익비 모두 충족 | 계산된 수량대로 매수 |
+| ⚠️ 게이트 미통과 · 건너뛰기 | 타이밍은 왔지만 R:R < 1:2 | **매수 금지** — 손익비 부족 |
+| 🚫 매수 신호 무효화 | 직전 매수 신호 조건 해제 | 매수 계획 취소 |
+| 🟡 줄이기 (추세 흔들림·리버설) | 고점 대비 눌림이 추세 위험 | 미보유 → 매수 금지 · 보유 → 축소 |
+| 🔴 청산 계열 | 추세 종료 확인 | 보유 시 청산 검토 |
+
+**포지션 사이징 원칙:** 앱이 ATR 기반 손절 거리로 수량을 계산합니다. 전 종목 1주씩 사면 이 계산이 무의미해집니다 —
+**소수점 매수로 금액을 그대로 집행**하거나 보유 종목 수를 3~4개로 줄이세요.
 """)
 
         # ════════════════════════════════════════════════════════════════════
         with _g_tab3:
-            st.markdown("### 🤖 AI 인사이트 탭 상세 가이드")
+            st.markdown("### 🤖 AI 인사이트 & 자동화·검증")
 
             with st.expander("📊 **[AI] 내러티브 적중률 트래커**", expanded=False):
                 st.markdown("""
-**AI 내러티브 분석의 실제 성과를 검증하는 팩트체크 시스템**
-
-#### 작동 방식
-1. 과거 내러티브 분석 시 기록된 Winners·Emerging 종목 불러오기
-2. 분석 시점으로부터 현재까지 실제 수익률 계산
-3. 종목별·테마별·월별 적중률 통계 제공
-
-#### 주요 지표
-- **평균 수익률** — AI가 추천한 종목들의 평균 성과
-- **적중률(%)** — 플러스 수익률을 기록한 비율
-- **Best 5 / Worst 5** — 가장 성공한/실패한 AI 추천 종목
-
-> 이 탭을 통해 어떤 내러티브 타입이 더 신뢰할 만한지, 어떤 섹터에서 AI가 강한지 파악할 수 있습니다.
+과거 내러티브의 Winners·Emerging이 실제로 어떻게 됐는지 수익률로 팩트체크.
+평균 수익률 · 적중률 · Best/Worst 5. 어떤 내러티브 타입·섹터에서 AI가 강한지 파악.
 """)
 
             with st.expander("💡 **[AI] Idea-to-Portfolio 추적**", expanded=False):
                 st.markdown("""
-**내러티브 분석에서 발굴한 아이디어가 실제 포트폴리오에 편입됐는지 추적**
-
-AI가 추천한 Winners·Emerging 종목 중:
-- 포트폴리오에 **이미 보유 중**인 종목 → ✅ 표시
-- 아직 **미편입** 종목 → 빠른 검사 버튼으로 바로 분석
-- **실현 손익**과 AI 추천 이후 수익률 비교
-
-> 💡 AI의 인사이트를 실제 투자로 연결하는 파이프라인을 관리합니다.
-""")
-
-            with st.expander("📋 **[AI] 주간 포트폴리오 요약**", expanded=False):
-                st.markdown("""
-**주 1회 실행 — 포트폴리오 전체에 대한 AI 주간 리뷰 리포트 자동 생성**
-
-#### 리포트 포함 내용
-- 현재 포트폴리오 전체 손익 현황
-- 최근 AI 내러티브와 보유 종목의 연관성 분석
-- 현재 거시경제 환경에서의 포트폴리오 리스크 평가
-- 주간 투자 전략 제언 (매도 검토 / 추가 매수 관심 / 유지)
-
-#### 사용 방법
-1. **[4단계] 포트폴리오 매도 레이더**를 먼저 열어 수익률 데이터 동기화
-2. **"🤖 주간 AI 리포트 생성"** 버튼 클릭
-3. 리포트가 `Narratives` 시트에 자동 저장 (이전 기록도 보관)
-
-> ⏱️ 생성 소요 시간: 약 20~30초
+AI 추천 종목의 포트폴리오 편입 여부 추적 — 보유 ✅ / 미편입 → 빠른 검사. 추천 이후 수익률 비교.
 """)
 
             with st.expander("📡 **[AI] Emerging 종목 추적기**", expanded=False):
                 st.markdown("""
-**Emerging 종목이 반복 등장할수록 신뢰도 높은 매수 신호**
+내러티브 Emerging(아직 안 오른 2차 수혜 후보)을 `Emerging_Tracker` 시트에 누적하고
+정량 검증(RS·1개월 모멘텀·MA200·거래량 급증)으로 "진짜로 움직이기 시작했는지" 추적합니다.
+Early Signal의 종목판 — 여기서 뜨기 시작한 종목이 Watchlist 후보입니다.
+""")
 
-#### 작동 방식
-- [1단계] 시장 내러티브 분석 후 **"Emerging 종목 검증 실행"** 클릭 시 자동 기록
-- 같은 종목이 여러 분석에서 반복 등장할 때 추적
+            with st.expander("📋 **[AI] 주간 포트폴리오 요약**", expanded=False):
+                st.markdown("""
+주 1회: 손익 현황 + 최근 내러티브와 보유 종목 연관성 + 거시 리스크 평가 + 전략 제언.
+[4단계] 탭을 먼저 열어 수익률 동기화 후 생성하세요.
+""")
 
-#### 신호 등급
-| 등장 횟수 | 의미 | 색상 |
-|---|---|---|
-| 1회 | 관심 후보 | 초록 |
-| 2~4회 | 반복 등장 — 관심 집중 | 주황 |
-| 5회+ | 강한 모멘텀 신호 | 빨강 |
+            with st.expander("📊 **매매 복기** — 엔진 vs 나", expanded=False):
+                st.markdown("""
+`Trade_History`의 실제 체결을 복기합니다. **핵심 질문: 그 매수일에 엔진은 뭐라고 했나?**
+- 엔진 신호대로 산 매매 vs 파이프라인 밖 매매의 성과 차이 = 실행 갭
+- 손실이 날 때 가장 먼저 볼 곳: 엔진이 문제인지, 집행이 문제인지 여기서 갈립니다.
+""")
 
-#### Best Verdict 분류
-- **최적 매수 타이밍** — RSI·RS 지표가 매수 구간에 있는 종목
-- **얼리버드 기회** — 아직 초기 단계지만 선취매 가능한 종목
-
-> 💡 [3단계] 개별 종목 정밀 검사 버튼으로 바로 심층 분석 진행 가능
+            with st.expander("🧪 **Signal_Backtest** — 엔진 자체 검증 (월간 자동)", expanded=False):
+                st.markdown("""
+매월 워크포워드 백테스트가 자동 실행되어 `Signal_Backtest` 시트에 기록됩니다.
+판정 버킷(entry/wait/overheat/avoid)별 20일 초과수익·초과승률 비교 —
+**entry가 wait/avoid보다 유의하게 좋아야 엔진에 엣지가 있는 것.** GitHub Actions에서 수동 실행도 가능.
 """)
 
         # ════════════════════════════════════════════════════════════════════
@@ -22182,70 +22492,50 @@ AI가 추천한 Winners·Emerging 종목 중:
 
             _faqs = [
                 (
+                    "Q. Early Signal 커버리지가 안 채워지거나 '미수집'이 나와요",
+                    """미수집 사유별 의미:
+- **🐣 인큐베이터** — 신규 ETF, 70거래일 히스토리 도달 시 자동 편입 (정상)
+- **데이터 없음** — 상장폐지/티커 변경 추정 → ETF Universe 정리 대상
+- **재시도 소진** — FMP 일시 장애 → 잠시 후 재스캔""",
+                ),
+                (
+                    "Q. Watchlist에 등록했는데 알림 이메일이 안 와요",
+                    """알림은 **2일 연속 확정된 상태 전환**만 발송됩니다 (노이즈 차단 설계).
+등록 직후엔 상태 기준선만 잡히고, 실제 신호 전환이 이틀 유지돼야 첫 메일이 옵니다.
+같은 상태가 지속되면 반복 발송하지 않습니다 (재무장 후 재발송).""",
+                ),
+                (
+                    "Q. 매수 신호가 왔는데 '건너뛰기 권고'래요. 사라는 건가요?",
+                    """**사지 말라는 뜻입니다.** 타이밍(눌림 구간)은 충족했지만 손절까지의 리스크 대비
+목표까지의 보상이 최소 기준(1:2)에 못 미친다는 뜻 — 손익비가 나쁘면 좋은 타이밍도 패스하는 것이 이 앱의 철학입니다.""",
+                ),
+                (
+                    "Q. 등록한 종목이 대부분 등록가보다 떨어져 있어요. 고장인가요?",
+                    """정상입니다. 강세 종목의 매수 신호는 **RSI 40~52 눌림**에서 발동하도록 설계되어,
+등록 후 몇 % 하락은 셋업이 익는 과정입니다. 문제는 하락이 아니라 **국면 강등**(⚠️/🔴 전환)입니다 —
+강등 비율이 높으면 너무 늦게(이미 오른 뒤) 담고 있다는 신호이니 소싱을 Early Signal 쪽으로 옮기세요.""",
+                ),
+                (
                     "Q. 실적 발표 캘린더에 데이터가 안 나와요",
-                    """**원인:** FMP API 키가 없거나 해당 종목의 다음 실적 발표일이 아직 확정되지 않은 경우입니다.
-
-**해결:**
-1. `FMP_API_KEY`가 Secrets에 설정되어 있는지 확인
-2. 실적 발표일이 확정된 종목만 표시됩니다 (보통 발표 3~4주 전부터 데이터 생성)
-3. 🔄 새로고침 후 재시도""",
+                    """FMP API 키 확인 + 발표일 확정 종목만 표시됩니다 (보통 3~4주 전 생성). 🔄 새로고침 후 재시도.""",
                 ),
                 (
                     "Q. AI 분석이 '생성 실패'로 뜹니다",
-                    """**원인:** Anthropic API 키 오류 또는 일시적 서버 부하
-
-**해결:**
-1. `ANTHROPIC_API_KEY`가 유효한지 확인
-2. 잠시 후(30초~1분) 재시도
-3. 분석 소요 시간은 최대 60초 — 네트워크 상태 확인""",
+                    """Gemini API 키 또는 일시 부하. 30초~1분 후 재시도. 장문 결과가 잘리면 자동으로 경고가 표시됩니다.""",
                 ),
                 (
-                    "Q. 포트폴리오에 추가했는데 다음에 들어오면 사라져요",
-                    """**원인:** Google Sheets 연결 오류로 저장 실패
-
-**해결:**
-1. 종목 추가 시 "✅ 저장 완료" 메시지가 나오는지 확인
-2. `SPREADSHEET_ID`와 서비스 계정 권한 확인
-3. Google Sheet에서 `Portfolio` 탭을 직접 열어 데이터 존재 여부 확인""",
+                    "Q. 포트폴리오/Watchlist가 다음 접속 때 사라져요",
+                    """Google Sheets 저장 실패입니다. 저장 시 "✅ 완료" 메시지 확인 + 서비스 계정 권한, `Quant_DB` 시트 존재 확인.""",
                 ),
                 (
-                    "Q. Daily Risk Gauge의 선물 가격이 안 나와요",
-                    """**원인:** 데이터 소스 Rate Limit 또는 장외 시간(데이터 없음)
-
-**해결:**
-1. 🔄 데이터 새로고침 버튼 클릭
-2. 미국 프리마켓 시간(오후 4시~오전 4시 ET) 이외에는 선물 데이터가 제한될 수 있습니다
-3. FMP_API_KEY 설정 시 FMP 선물 데이터로 자동 대체""",
+                    "Q. 한국 주식·ETF도 되나요?",
+                    """한국 주식: `005930.KS` 형식 지원 (기관·인사이더 등 미국 전용 데이터는 제외).
+ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지원, 펀더멘털은 N/A일 수 있음.""",
                 ),
                 (
-                    "Q. 한국 주식도 분석 가능한가요?",
-                    """**가능합니다.** 티커 형식: `종목코드.KS`
-
-예시:
-- 삼성전자: `005930.KS`
-- SK하이닉스: `000660.KS`
-- NAVER: `035420.KS`
-
-단, FMP 기반 데이터(기관 투자자·인사이더·어닝콜)는 한국 주식을 지원하지 않습니다.  
-FMP 기반 기술적 분석·차트는 정상 작동합니다.""",
-                ),
-                (
-                    "Q. ETF 분석도 되나요?",
-                    """**됩니다.** ETF 티커를 [3단계] 정밀 검사에서 직접 입력하면:
-- 섹터 배분·보유 종목 Top 10 자동 표시 (FMP `etf-holder` API)
-- 기술적 분석 (RSI·MACD·차트) 정상 작동
-- 펀더멘털(P/E 등)은 ETF 특성상 N/A로 표시될 수 있음
-
-[2단계] AI 종목 스캐너에서도 ETF 유니버스를 기반으로 스캔합니다.""",
-                ),
-                (
-                    "Q. 데이터는 얼마나 자주 업데이트되나요?",
-                    """**실시간 데이터가 아닙니다.** 캐시 기반 운영:
-- 주가 데이터: 1시간마다 갱신 (🔄 버튼으로 강제 갱신 가능)
-- AI 내러티브: 버튼 클릭 시마다 새로 생성
-- Google Sheets (포트폴리오·Watchlist): 즉시 동기화
-
-Streamlit Community Cloud 환경의 특성상 동시 접속자가 많으면 응답이 느려질 수 있습니다.""",
+                    "Q. 데이터는 실시간인가요?",
+                    """아니요. 주가 1시간 캐시(🔄 강제 갱신 가능) · AI 분석은 실행 시 생성 · Sheets는 즉시 동기화.
+모든 시세는 FMP stable API 단일 소스입니다.""",
                 ),
             ]
 
@@ -22256,12 +22546,10 @@ Streamlit Community Cloud 환경의 특성상 동시 접속자가 많으면 응�
             st.divider()
             st.markdown("### 📬 피드백 & 버그 리포트")
             st.info(
-                "기능 요청이나 버그는 포트폴리오 탭 하단 메모 기능 또는 "
-                "관리자에게 직접 문의해 주세요.\n\n"
-                "**앱 버전:** v2.0 (2025) | "
-                "**Tech Stack:** Streamlit · Google Sheets · FMP · Claude AI"
+                "기능 요청이나 버그는 관리자에게 직접 문의해 주세요.\n\n"
+                "**앱 버전:** v3.0 (2026-07) | "
+                "**Tech Stack:** Streamlit · Google Sheets · FMP stable · Gemini 2.5 Flash · GitHub Actions"
             )
-
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
         st.caption(
