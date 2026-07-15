@@ -2749,15 +2749,35 @@ _RS_SCAN_MISS_REASONS = {
 }
 
 
-_ETF_INCUBATOR_MIN_DAYS = 110  # 유니버스 등록 후 110일(≈75거래일) 경과해야 RS 스캔 편입
+_RS_INCUBATOR_SHEET_TITLE = "RS_Incubator"
+_RS_INCUBATOR_COLS = ["Ticker", "Bars_Seen", "Observed_Date"]
+_RS_MIN_BARS = 70  # RS 계산 최소 거래일
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _etf_universe_added_date_map() -> dict:
-    """ETF_Universe 시트의 {Ticker: Added_Date(date)} 맵.
-    Added_Date 가 비어있거나 파싱 불가한 행은 제외(=성숙 취급, 스캔 유지)."""
+def _open_rs_incubator_ws():
+    """Quant_DB의 RS_Incubator 탭 (없으면 생성).
+    스캔이 직접 관측한 '히스토리 부족' 티커의 봉 수를 기억 — 졸업 예상 시점까지 재fetch 를 건너뛴다.
+    (Added_Date 추정 방식은 유니버스 일괄 시드 시 전 종목이 같은 날짜가 되어 폐기 — 관측 기반이 정답)"""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        ws, err = open_etf_universe_worksheet()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        titles = [ws.title for ws in sh.worksheets()]
+        if _RS_INCUBATOR_SHEET_TITLE in titles:
+            return sh.worksheet(_RS_INCUBATOR_SHEET_TITLE), None
+        ws = sh.add_worksheet(title=_RS_INCUBATOR_SHEET_TITLE, rows=1000, cols=3)
+        ws.update([_RS_INCUBATOR_COLS], range_name="A1:C1", value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc:
+        return None, f"RS_Incubator 워크시트 열기/생성 실패: {exc}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_rs_incubator_map() -> dict:
+    """{Ticker: (bars_seen:int, observed_date:date)} — 관측 기록 로드."""
+    try:
+        ws, err = _open_rs_incubator_ws()
         if err or ws is None:
             return {}
         vals = ws.get_all_values() or []
@@ -2765,50 +2785,81 @@ def _etf_universe_added_date_map() -> dict:
         return {}
     out = {}
     for r in vals[1:]:
-        if len(r) < 5:
+        if len(r) < 3:
             continue
         tk = str(r[0]).strip().upper()
-        ds = str(r[4]).strip()
-        if not tk or not ds:
-            continue
         try:
-            out[tk] = datetime.strptime(ds[:10], "%Y-%m-%d").date()
+            bars = int(float(str(r[1]).strip()))
+            obs = datetime.strptime(str(r[2]).strip()[:10], "%Y-%m-%d").date()
         except Exception:
             continue
+        if tk:
+            out[tk] = (bars, obs)
     return out
 
 
-def split_incubator_tickers(tickers: list, min_days: int = _ETF_INCUBATOR_MIN_DAYS):
-    """🐣 인큐베이터 사전 분리 — 유니버스 등록 min_days 미경과 ETF는 스캔 대상에서 제외.
+def split_incubator_tickers(tickers: list):
+    """🐣 인큐베이터 v2 (관측 기반) — 지난 스캔에서 실측된 봉 수 + 경과 시간으로
+    현재 예상 봉 수를 추정, 70거래일 미달 예상 티커는 fetch 없이 사전 분리.
 
-    배경: 신규 ETF 자동 발굴(최근 90일 상장)은 정의상 70거래일 미달 ETF를 추가하므로,
-    등록~약 3.5개월 구간은 'RS 계산 불가인데 정리(6개월 룰)도 안 되는' 사각지대.
-    사전 분리로 헛 fetch 를 없애고(스캔 시간 단축) 경고 대신 중립 표시한다.
-    시간이 지나면 자동 졸업 → 스캔 편입, 6개월 시점 저품질이면 기존 정리 로직이 제거.
-
-    Added_Date 없는 티커(초기 시드 등)는 성숙으로 간주. 전원이 인큐베이터로 분류되는
-    이상 상황(시트 재생성 등)이면 분리를 포기하고 전체 스캔(안전 가드).
+    예상 봉 수 = 관측 봉 수 + 경과일 × 5/7 (거래일 환산). 예상치가 70에 도달하면
+    자동으로 스캔에 재편입(졸업 시도) — 실제로 아직 부족하면 재관측되어 자기 보정된다.
+    첫 스캔(기록 없음)은 전체 fetch 후 부족 티커가 기록되는 부트스트랩.
     반환: (eligible, incubator)"""
     syms = [str(t).strip().upper() for t in (tickers or []) if str(t).strip()]
     if not syms:
         return [], []
     try:
-        date_map = _etf_universe_added_date_map()
+        obs_map = load_rs_incubator_map()
     except Exception:
-        date_map = {}
-    if not date_map:
+        obs_map = {}
+    if not obs_map:
         return syms, []
     today = datetime.now(_MARKET_ET_TZ).date()
     eligible, incubator = [], []
     for tk in syms:
-        d = date_map.get(tk)
-        if d is not None and (today - d).days < int(min_days):
-            incubator.append(tk)
-        else:
+        rec = obs_map.get(tk)
+        if rec is None:
             eligible.append(tk)
-    if not eligible and incubator:
-        return syms, []  # 안전 가드: 전원 인큐베이터 → 분리 포기
+            continue
+        bars, obs = rec
+        est = bars + int(max(0, (today - obs).days) * 5 / 7)
+        (incubator if est < _RS_MIN_BARS else eligible).append(tk)
     return eligible, incubator
+
+
+def update_rs_incubator_observations(report: dict, ok_tickers) -> None:
+    """스캔 결과로 관측 기록 갱신 (비차단 — 실패해도 스캔 표시에 영향 없음).
+    - 이번 스캔에서 '히스토리 부족'으로 실측된 티커 → 봉 수와 함께 upsert
+    - 이번 스캔에서 정상 계산된 티커(졸업) → 기록 제거
+    - 이번 스캔에서 건너뛴(인큐베이터) 티커 → 기존 기록 유지"""
+    try:
+        prev = dict(load_rs_incubator_map())
+        ok_set = {str(t).strip().upper() for t in (ok_tickers or [])}
+        today_str = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+        changed = False
+        for m in (report or {}).get("missing", []):
+            if m.get("reason_key") == "short" and m.get("bars") is not None:
+                prev[str(m["ticker"]).strip().upper()] = (int(m["bars"]), None)  # None → 오늘로 기록
+                changed = True
+        graduated = [tk for tk in list(prev.keys()) if tk in ok_set]
+        for tk in graduated:
+            prev.pop(tk, None)
+            changed = True
+        if not changed:
+            return
+        ws, err = _open_rs_incubator_ws()
+        if err or ws is None:
+            return
+        rows = [_RS_INCUBATOR_COLS] + [
+            [tk, str(bars), (obs.strftime("%Y-%m-%d") if obs is not None else today_str)]
+            for tk, (bars, obs) in sorted(prev.items())
+        ]
+        ws.clear()
+        ws.update(rows, range_name=f"A1:C{len(rows)}", value_input_option="USER_ENTERED")
+        load_rs_incubator_map.clear()
+    except Exception:
+        pass
 
 
 def render_scan_coverage_report(report: dict) -> None:
@@ -2830,7 +2881,7 @@ def render_scan_coverage_report(report: dict) -> None:
     else:
         st.caption(f"커버리지 **{covered}/{total}** · ⚠️ 미수집 {len(missing)}개 (아래 사유 확인){_inc_note}")
     if incubator:
-        with st.expander(f"🐣 인큐베이터 {len(incubator)}개 — 유니버스 등록 110일 미경과 (70거래일 도달 시 자동 편입)", expanded=False):
+        with st.expander(f"🐣 인큐베이터 {len(incubator)}개 — 히스토리 70거래일 미달 관측 (도달 예상 시점에 자동 재편입)", expanded=False):
             st.markdown(", ".join(incubator))
             st.caption(
                 "신규 상장 ETF는 RS 계산에 필요한 히스토리(70거래일)가 쌓일 때까지 스캔에서 제외됩니다. "
@@ -2985,6 +3036,110 @@ def save_early_signal_history(scan_df, xcheck: dict | None):
         return False, str(exc)
 
 
+_ROTATION_BUCKET_MAP = {
+    # 방어 계열
+    "채권·현금성": ["BIL", "SGOV", "SHY", "IEF", "TLT", "TMF", "TBT", "AGG", "BND", "LQD", "HYG", "MUB", "GOVT", "VGSH", "VGIT"],
+    "달러·귀금속": ["UUP", "GLD", "IAU", "SLV", "GDX", "GDXJ", "UGLD"],
+    "인버스·변동성": ["SQQQ", "SH", "PSQ", "RWM", "SDOW", "SPXU", "UVXY", "VIXY", "FSTB"],
+    "방어섹터(유틸·필수소비)": ["XLU", "VPU", "XLP", "KXI"],
+    # 성장 계열
+    "반도체·AI": ["SMH", "SOXX", "SOXQ", "XSD", "SOXL", "DRAM", "AIQ", "CHAT", "IGPT", "BOTZ", "ROBO", "NVDL", "USD"],
+    "기술·성장": ["QQQ", "TQQQ", "XLK", "VGT", "FTEC", "IGV", "MTUM", "ARKK", "ARKW", "IWO", "IWM", "SPLG", "SPY", "VOO", "QQQM"],
+    "소프트·클라우드·사이버": ["WCLD", "CLOU", "SKYY", "CIBR", "HACK", "BUG", "WISE"],
+    # 그 외 자산군
+    "에너지·원자재": ["USO", "XLE", "XOP", "OIH", "AMLP", "UNG", "DBC", "PDBC", "DBA", "CORN", "WEAT", "SOYB", "CANE", "MOO", "URA", "COPX", "XME", "FCG"],
+    "금융·은행": ["XLF", "KBE", "KRE", "IAI", "KBWB", "IAT"],
+    "헬스케어·바이오": ["XLV", "XBI", "IBB", "ARKG", "LABU", "IHI"],
+    "해외·신흥국": ["EWH", "EWY", "EWC", "EWZ", "EWW", "EWJ", "EWG", "FXI", "KWEB", "MCHI", "CHIQ", "EEM", "VWO", "FM", "INDA", "EWT"],
+    "크립토": ["BITO", "IBIT", "FBTC", "GBTC", "ETHE", "BITQ", "BTCU"],
+    "소비·리테일": ["XRT", "XLY", "BETZ", "XHB", "ITB"],
+}
+_ROTATION_TICKER_TO_BUCKET = {tk: b for b, tks in _ROTATION_BUCKET_MAP.items() for tk in tks}
+_ROTATION_DEFENSE = {"채권·현금성", "달러·귀금속", "인버스·변동성", "방어섹터(유틸·필수소비)"}
+_ROTATION_GROWTH = {"반도체·AI", "기술·성장", "소프트·클라우드·사이버"}
+
+
+def render_rotation_diagnosis(scan_df) -> None:
+    """🧭 로테이션 진단 — Early Signal 결과의 부상/약화 리스트를 자산군 버킷으로 집계해
+    큰 그림(리스크온/오프/섹터 로테이션)을 한 줄로 판정하고, 보유 종목과의 겹침을 경고.
+    규칙 기반(LLM 미사용·결정적) · 추가 API 0콜 — 스캔 결과만으로 계산."""
+    try:
+        if scan_df is None or scan_df.empty or "RS_Signal" not in scan_df.columns:
+            return
+        rising_tks = scan_df[scan_df["RS_Signal"].isin(["🌱 Early Signal", "🚀 급부상"])]["Ticker"].tolist()
+        weak_tks = scan_df[scan_df["RS_Signal"].isin(["⚠️ 모멘텀 약화", "🔴 급하락"])]["Ticker"].tolist()
+
+        def _bucketize(tks):
+            out = {}
+            for t in tks:
+                b = _ROTATION_TICKER_TO_BUCKET.get(str(t).strip().upper())
+                if b:
+                    out.setdefault(b, []).append(t)
+            return out
+
+        rise_b, weak_b = _bucketize(rising_tks), _bucketize(weak_tks)
+        d_up = sum(len(v) for b, v in rise_b.items() if b in _ROTATION_DEFENSE)
+        g_up = sum(len(v) for b, v in rise_b.items() if b in _ROTATION_GROWTH)
+        d_down = sum(len(v) for b, v in weak_b.items() if b in _ROTATION_DEFENSE)
+        g_down = sum(len(v) for b, v in weak_b.items() if b in _ROTATION_GROWTH)
+
+        st.markdown("##### 🧭 로테이션 진단 — 세 리스트를 겹쳐 읽은 큰 그림")
+        if d_up >= 3 and g_down >= 3:
+            st.warning(
+                f"⚠️ **리스크오프 로테이션 감지** — 방어자산(채권·현금성·달러·인버스) **{d_up}개 부상** · "
+                f"기술/반도체/성장 **{g_down}개 약화**. 신규 성장주 진입은 보수적으로, 보유 성장 포지션은 청산 신호 주시."
+            )
+        elif g_up >= 3 and d_down >= 2 and d_up <= 1:
+            st.success(
+                f"🟢 **리스크온 로테이션 감지** — 성장 계열 **{g_up}개 부상** · 방어자산 **{d_down}개 약화**. "
+                f"공격적 국면 — 단, 진입은 여전히 개별 종목 신호와 R:R 게이트 기준."
+            )
+        else:
+            top_rise = max(rise_b.items(), key=lambda kv: len(kv[1]), default=(None, []))
+            top_weak = max(weak_b.items(), key=lambda kv: len(kv[1]), default=(None, []))
+            if top_rise[0] and top_weak[0] and top_rise[0] != top_weak[0]:
+                st.info(
+                    f"🔄 **섹터 로테이션 진행 중** — 자금 유입: **{top_rise[0]}** ({len(top_rise[1])}개) ← "
+                    f"자금 이탈: **{top_weak[0]}** ({len(top_weak[1])}개)"
+                )
+            else:
+                st.info("➡️ 뚜렷한 자산군 쏠림 없음 — 판단 유보 (개별 신호 기준으로 대응)")
+
+        with st.expander("자산군별 상세 분포", expanded=False):
+            if rise_b:
+                st.markdown("**부상 (🌱+🚀):** " + " · ".join(
+                    f"{b} {len(v)}개({', '.join(v[:6])}{'…' if len(v) > 6 else ''})"
+                    for b, v in sorted(rise_b.items(), key=lambda kv: -len(kv[1]))
+                ))
+            if weak_b:
+                st.markdown("**약화 (⚠️+🔴):** " + " · ".join(
+                    f"{b} {len(v)}개({', '.join(v[:6])}{'…' if len(v) > 6 else ''})"
+                    for b, v in sorted(weak_b.items(), key=lambda kv: -len(kv[1]))
+                ))
+            _unmapped = [t for t in rising_tks + weak_tks
+                         if str(t).strip().upper() not in _ROTATION_TICKER_TO_BUCKET]
+            if _unmapped:
+                st.caption(f"버킷 미분류 {len(_unmapped)}개: {', '.join(_unmapped[:20])}"
+                           + (" …" if len(_unmapped) > 20 else ""))
+
+        # ── 보유 종목 겹침 경고 (핵심) ──
+        try:
+            _pf = load_portfolio()
+            held = {str(t).strip().upper() for t in _pf.get("Ticker", pd.Series(dtype=str)).tolist()}
+        except Exception:
+            held = set()
+        if held:
+            overlap = [t for t in weak_tks if str(t).strip().upper() in held]
+            if overlap:
+                st.error(
+                    f"🚨 **보유 종목이 약화 리스트에 {len(overlap)}개 겹칩니다: {', '.join(overlap)}** — "
+                    f"아래 🛡️ 섹터 꺾임 스캔으로 확정 여부를 확인하고, 확정 시 [4단계] 매도 레이더에서 축소를 검토하세요. "
+                    f"(개별주 보유분은 섹터 꺾임 감지가 해당 섹터 ETF로 커버)"
+                )
+    except Exception:
+        pass  # 진단은 부가 정보 — 실패해도 스캔 표시를 막지 않음
+
+
 def render_early_signal_xcheck(xcheck: dict | None) -> None:
     """Early Signal × 내러티브 교차체크 결과 렌더링 (라이브/복원 겸용).
     🔥 매치는 한 줄씩 강조, 미등장은 요약 한 줄 + expander 로 압축 (전수 교차체크 도배 방지)."""
@@ -3119,11 +3274,14 @@ def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series
         fetch_targets = [t for t in unique if t != "SPY"]
         hist, status_map = _fmp_robust_batch_history_report(fetch_targets, limit=130)
 
-        def _mark_missing(tk, key):
-            report["missing"].append({
+        def _mark_missing(tk, key, bars=None):
+            entry = {
                 "ticker": tk, "reason_key": key,
                 "reason": _RS_SCAN_MISS_REASONS.get(key, key),
-            })
+            }
+            if bars is not None:
+                entry["bars"] = int(bars)
+            report["missing"].append(entry)
 
         rows = []
         for tk in unique:
@@ -3140,7 +3298,7 @@ def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series
                     continue
                 s = pd.to_numeric(df_tk["Close"], errors="coerce").dropna()
             if len(s) < 70:
-                _mark_missing(tk, "short")
+                _mark_missing(tk, "short", bars=len(s))
                 continue
             # 현재 RS (3개월 = 63거래일)
             rs_now = float((s.iloc[-1]/s.iloc[-64] - 1)*100 - (spy.iloc[-1]/spy.iloc[-64] - 1)*100) if len(s) >= 64 and len(spy) >= 64 else np.nan
@@ -3393,11 +3551,14 @@ def detect_sector_momentum_reversal(universe_tickers: list):
             {tk: df["Volume"] for tk, df in hist.items() if "Volume" in df.columns}
         ).sort_index()
 
-        def _mark_missing(tk, key, reason=None):
-            report["missing"].append({
+        def _mark_missing(tk, key, reason=None, bars=None):
+            entry = {
                 "ticker": tk, "reason_key": key,
                 "reason": reason or _RS_SCAN_MISS_REASONS.get(key, key),
-            })
+            }
+            if bars is not None:
+                entry["bars"] = int(bars)
+            report["missing"].append(entry)
 
         def calc_rs(s, spy, offset_start=0, offset_end=0):
             try:
@@ -3425,9 +3586,10 @@ def detect_sector_momentum_reversal(universe_tickers: list):
                 continue
             s = pd.to_numeric(close_df[tk], errors="coerce").dropna()
             if len(s) < 75:
-                _mark_missing(tk, "short", "히스토리 75거래일 미만 — 신규 상장 (RS 계산 불가)")
+                _mark_missing(tk, "short", "히스토리 75거래일 미만 — 신규 상장 (RS 계산 불가)", bars=len(s))
                 continue
             ok_count += 1
+            report.setdefault("ok_tickers", []).append(tk)
 
             rs_now = calc_rs(s, spy, 0)        # 현재 RS
             rs_1w = calc_rs(s, spy, 5)         # 1주 전 RS
@@ -17031,6 +17193,12 @@ if st.session_state.get("logged_in"):
                 if isinstance(_es_report, dict):
                     _es_report["incubator"] = _incub
                 st.session_state["_early_signal_report"] = _es_report
+                # ── 인큐베이터 관측 갱신 (short 실측 기록 + 졸업 제거 · 비차단) ──
+                try:
+                    _ok_tks = set(_es_result["Ticker"]) if not _es_result.empty else set()
+                    update_rs_incubator_observations(_es_report, _ok_tks)
+                except Exception:
+                    pass
                 if _es_report.get("spy_error"):
                     st.session_state["_early_signal_df"] = None
                     st.error(f"⛔ {_es_report['spy_error']} — 기준 지수 없이는 RS 계산이 불가합니다.")
@@ -17078,6 +17246,7 @@ if st.session_state.get("logged_in"):
                 _es_df = _df_r
         if _es_df is not None and not _es_df.empty:
             render_scan_coverage_report(st.session_state.get("_early_signal_report"))
+            render_rotation_diagnosis(_es_df)
             _saved_msg = st.session_state.get("_early_signal_saved_msg")
             if _saved_msg:
                 st.caption(_saved_msg)
@@ -17146,6 +17315,10 @@ if st.session_state.get("logged_in"):
                     reversal_alerts, _rev_report = detect_sector_momentum_reversal(_rev_eligible)
                 if isinstance(_rev_report, dict):
                     _rev_report["incubator"] = _rev_incub
+                try:
+                    update_rs_incubator_observations(_rev_report, _rev_report.get("ok_tickers", []))
+                except Exception:
+                    pass
                 if _rev_report.get("spy_error"):
                     st.error(f"⛔ {_rev_report['spy_error']} — 기준 지수 없이는 RS 계산이 불가합니다.")
                 render_scan_coverage_report(_rev_report)
@@ -22366,7 +22539,7 @@ Winners/Emerging은 티커 환각 검증 + 정량 교차검증(RSI·RS·거래�
 **② 🚀 Hidden Alpha Radar** — 전체 ETF Universe에서 자금 유입 시작 ETF 발굴 + **주간 Top5 로테이션** (Top5 이탈 = 매도, 신규 진입 = 매수 후보). 주말 자동 이메일.
 
 **③ 🌱 Early Signal Radar** — 1주 전 대비 RS Score 변화율. RS는 아직 낮은데 변화율 급등 = 아무도 모를 때 강해지기 시작한 섹터.
-- **커버리지 표시:** "✅ 158/158 · 🐣 인큐베이터 153개" — 인큐베이터는 유니버스 등록 110일 미경과 신규 ETF (RS 계산에 70거래일 필요, 도달 시 자동 편입)
+- **커버리지 표시:** "✅ 158/158 · 🐣 인큐베이터 153개" — 인큐베이터는 히스토리 70거래일 미달로 실측된 신규 ETF — 스캔이 봉 수를 기억해 도달 예상 시점까지 건너뛰고 자동 재편입
 - **🔗 내러티브 교차체크 (자동):** 🌱+🚀 ETF 전수를 구성종목 30개로 전개해 최근 7일 내러티브와 대조 — 🔥 매치 = 우선 검토 · 미등장 = 더 초기일 수 있음
 - **💾 EarlySignal_History:** 스캔마다 신호 행이 시트에 저장, 재접속 시 마지막 스캔 자동 복원. 쌓이면 "신호 후 N주 수익률" 자체 검증 재료.
 
