@@ -3333,8 +3333,8 @@ def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series
             df = df.sort_values("RS_Change", ascending=False, na_position="last")
         report["ok_count"] = len(df)
         return df, report
-    except Exception:
-        report["spy_error"] = report.get("spy_error") or "예상치 못한 오류 — 재스캔 권장"
+    except Exception as exc:
+        report["spy_error"] = report.get("spy_error") or f"예상치 못한 오류({type(exc).__name__}: {exc}) — 재스캔 권장"
         return pd.DataFrame(), report
 
 
@@ -3542,14 +3542,12 @@ def detect_sector_momentum_reversal(universe_tickers: list):
             return [], report
 
         # ── 유니버스 전수 fetch (재시도 포함 · 상태 보고) ──
+        # 주의: 티커별 시리즈를 하나의 DataFrame 으로 결합하지 않는다 —
+        # FMP 가 간헐적으로 중복 날짜 행을 반환하면 결합 시 duplicate-axis 예외로 전체가 죽는다.
+        # compute_rs_score_weekly_change 와 동일하게 티커별 개별 처리(+중복 인덱스 방어).
         fetch_targets = [t for t in unique if t != "SPY"]
         hist, status_map = _fmp_robust_batch_history_report(fetch_targets, limit=130)
-        close_df = pd.DataFrame(
-            {tk: df["Close"] for tk, df in hist.items() if "Close" in df.columns}
-        ).sort_index()
-        vol_raw = pd.DataFrame(
-            {tk: df["Volume"] for tk, df in hist.items() if "Volume" in df.columns}
-        ).sort_index()
+        spy = spy[~spy.index.duplicated(keep="last")]
 
         def _mark_missing(tk, key, reason=None, bars=None):
             entry = {
@@ -3581,10 +3579,12 @@ def detect_sector_momentum_reversal(universe_tickers: list):
             if status != "ok":
                 _mark_missing(tk, status)
                 continue
-            if tk not in close_df.columns:
+            df_tk = hist.get(tk)
+            if df_tk is None or df_tk.empty or "Close" not in df_tk.columns:
                 _mark_missing(tk, "no_data")
                 continue
-            s = pd.to_numeric(close_df[tk], errors="coerce").dropna()
+            s = pd.to_numeric(df_tk["Close"], errors="coerce").dropna()
+            s = s[~s.index.duplicated(keep="last")]
             if len(s) < 75:
                 _mark_missing(tk, "short", "히스토리 75거래일 미만 — 신규 상장 (RS 계산 불가)", bars=len(s))
                 continue
@@ -3602,10 +3602,11 @@ def detect_sector_momentum_reversal(universe_tickers: list):
             rs_change_2w = rs_1w - rs_2w
             consecutive_drop = rs_change_1w < -1.5 and rs_change_2w < -1.5
 
-            # 거래량 변화
+            # 거래량 변화 (티커별 개별 시리즈 · 중복 인덱스 방어)
             vol_change = np.nan
-            if not vol_raw.empty and tk in vol_raw.columns:
-                vol = pd.to_numeric(vol_raw[tk], errors="coerce").dropna()
+            if "Volume" in df_tk.columns:
+                vol = pd.to_numeric(df_tk["Volume"], errors="coerce").dropna()
+                vol = vol[~vol.index.duplicated(keep="last")]
                 if len(vol) >= 21:
                     recent_avg = float(vol.tail(5).mean())
                     baseline_avg = float(vol.tail(21).mean())
@@ -3639,8 +3640,8 @@ def detect_sector_momentum_reversal(universe_tickers: list):
         alerts.sort(key=lambda x: x["rs_change"])
         report["ok_count"] = ok_count
         return alerts, report
-    except Exception:
-        report["spy_error"] = report.get("spy_error") or "예상치 못한 오류 — 재스캔 권장"
+    except Exception as exc:
+        report["spy_error"] = report.get("spy_error") or f"예상치 못한 오류({type(exc).__name__}: {exc}) — 재스캔 권장"
         return [], report
 
 
