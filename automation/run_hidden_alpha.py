@@ -39,6 +39,19 @@ import pytz
 import gspread
 from google.oauth2.service_account import Credentials
 
+# ── 🛰️ 위성 섹터 Top10 SSOT (fmp_extras) — 리포지토리 루트에서 임포트 ──
+# 실행 위치와 무관하게 동작하도록 스크립트의 부모(리포 루트)와 자기 폴더를 sys.path 에 추가.
+# 임포트 실패 시 위성 섹션만 생략하고 메일 발송은 계속한다(비차단).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.dirname(_HERE), _HERE):
+    if _p and _p not in sys.path:
+        sys.path.insert(0, _p)
+try:
+    import fmp_extras as fx
+except Exception as _fx_exc:  # pragma: no cover
+    fx = None
+    print(f"[WARN] fmp_extras 임포트 실패 — 위성 섹터 섹션 생략: {_fx_exc}")
+
 # ── 환경변수 (기존 run_*.py와 동일 시크릿) ────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
 GMAIL_USER         = os.environ["GMAIL_USER"]
@@ -437,8 +450,62 @@ def _delta_badge(tk: str, cur_rank: int, prev_map: dict) -> str:
     return '<span style="color:#64748b;">=</span>'
 
 
+def build_satellite_html(sat: dict | None) -> str:
+    """🛰️ 위성 섹터 Top10 이메일 섹션 — app.py 탭과 동일 데이터(SSOT: fmp_extras).
+    행마다 중복 상대 전부(10%↑) 표시 — 이메일만으로 위성 리밸런싱이 가능해야 한다."""
+    if not sat or not sat.get("rows"):
+        return ""
+    mf = sat.get("market_filter")
+    if mf and mf.get("risk_on"):
+        mf_html = (f'<div style="background:#0b1f17;border:1px solid #16a34a;border-radius:8px;'
+                   f'padding:10px 14px;margin-bottom:12px;font-size:13px;color:#86efac;">'
+                   f'🚦 SPY ${mf["spy"]:,} &gt; 200일선 ${mf["ma200"]:,} — <b>위성 정상 운용 구간</b></div>')
+    elif mf:
+        mf_html = (f'<div style="background:#2a1214;border:1px solid #dc2626;border-radius:8px;'
+                   f'padding:10px 14px;margin-bottom:12px;font-size:13px;color:#fca5a5;">'
+                   f'🚦 SPY ${mf["spy"]:,} &lt; 200일선 ${mf["ma200"]:,} — '
+                   f'<b>⛔ 위성 신규 매수 중단·비중 축소 룰 발동</b></div>')
+    else:
+        mf_html = ('<div style="font-size:12px;color:#94a3b8;margin-bottom:12px;">'
+                   '🚦 시장 필터: SPY 데이터 미확보 — 판단 유보</div>')
+
+    def _grade(p):
+        return "🔴" if p >= 40 else ("🟡" if p >= 25 else "🟢")
+
+    rows_html = ""
+    for r in sat["rows"]:
+        theme = f" · {r['theme_label']}" if r.get("theme_label") else ""
+        r1w = f" (1W {r['r1w']:+.1f}%)" if r.get("r1w") is not None else ""
+        if r.get("overlaps"):
+            ov = " &nbsp;·&nbsp; ".join(f"{_grade(p)} {t} {p:.0f}%" for t, p in r["overlaps"])
+        else:
+            ov = "🟢 없음 (10%↑ 기준)"
+        rows_html += (
+            f'<div style="border-bottom:1px solid #1f2937;padding:8px 0;">'
+            f'<div style="font-size:14px;color:#e2e8f0;"><b>{r["rank"]}위 {r["ticker"]}</b>'
+            f' <span style="color:#94a3b8;">— {r["sector_label"]}{theme}</span>'
+            f' &nbsp;<span style="color:#fbbf24;font-weight:700;">점수 {r["score"]:+.1f}</span></div>'
+            f'<div style="font-size:12px;color:#94a3b8;margin-top:2px;">'
+            f'1M {r["r1m"]:+.1f}% · 3M {r["r3m"]:+.1f}% · 6M {r["r6m"]:+.1f}%{r1w}</div>'
+            f'<div style="font-size:12px;color:#cbd5e1;margin-top:2px;">중복: {ov}</div>'
+            f'</div>'
+        )
+    return (
+        '<div style="background:#1e293b;border-radius:10px;padding:14px 16px;margin-bottom:16px;">'
+        '<div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:4px;">'
+        '🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보</div>'
+        '<div style="font-size:11px;color:#64748b;margin-bottom:10px;">'
+        '점수 = 1M×40% + 3M×40% + 6M×20% (1주는 표시만) · GICS 섹터당 1개 · '
+        '중복 % = 구성종목 상위 15개 교집합 · 🟢&lt;25 🟡25~40 🔴40+</div>'
+        f'{mf_html}{rows_html}'
+        f'<div style="font-size:11px;color:#64748b;margin-top:8px;">기준: {sat.get("as_of", "")}'
+        ' · 상세 매트릭스는 앱 [2단계] 섹터 &amp; 자금 흐름 탭</div>'
+        '</div>'
+    )
+
+
 def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
-                     prev_date: str, new_added: int) -> str:
+                     prev_date: str, new_added: int, satellite: dict | None = None) -> str:
     now_et  = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
     now_kst = datetime.now(_KST).strftime("%Y-%m-%d %H:%M KST")
 
@@ -497,6 +564,7 @@ def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
 
     discovery_note = (f' · 신규 ETF {new_added}개 추가됨' if new_added else "")
     prev_note = f"지난주 스냅샷: {prev_date}" if prev_date else "지난주 스냅샷 없음(첫 실행)"
+    satellite_html = build_satellite_html(satellite)
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
@@ -531,6 +599,8 @@ def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
       점수 = 0.7×(1개월 백분위) + 0.3×(1주 백분위) · 데이터 부족 ETF는 순위 제외
     </div>
   </div>
+
+  {satellite_html}
 
   <div style="background:#1c1917;border:1px solid #44403c;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
     <div style="font-size:12px;color:#d6d3d1;line-height:1.7;">
@@ -607,6 +677,21 @@ def main():
     print("[STEP 5] 스냅샷 비교 중...")
     actions = compute_actions(ranked, prev_map)
 
+    # [STEP 5.5] 🛰️ 위성 섹터 Top10 (SSOT: fmp_extras · 실패 시 섹션 생략, 발송은 계속)
+    satellite = None
+    if fx is not None:
+        print("[STEP 5.5] 위성 섹터 Top10 계산 중... (약 60개 ETF)")
+        try:
+            satellite = fx.compute_satellite_top10()
+            print(f"[INFO] 위성 Top10: {[r['ticker'] for r in satellite.get('rows', [])]}")
+            mf = satellite.get("market_filter")
+            if mf:
+                print(f"[INFO] 시장 필터: SPY {mf['spy']} vs MA200 {mf['ma200']} → "
+                      f"{'정상 운용' if mf['risk_on'] else '⛔ 위성 축소 룰'}")
+        except Exception as exc:
+            print(f"[WARN] 위성 Top10 계산 실패 — 섹션 생략: {exc}")
+            satellite = None
+
     # [STEP 6] 이메일 발송
     print("[STEP 6] 이메일 발송 중...")
     top5_str = ", ".join(ranked.head(5)["Ticker"].tolist())
@@ -615,7 +700,7 @@ def main():
     if actions["has_prev"] and (n_buy or n_sell):
         tag = f" · 🔁 매수{n_buy}/매도{n_sell}"
     subject = f"💰 [Hidden Alpha] Top5: {top5_str}{tag} · {datetime.now(_ET).strftime('%m/%d')}"
-    html_body = build_email_html(ranked, actions, prev_map, prev_date, new_added)
+    html_body = build_email_html(ranked, actions, prev_map, prev_date, new_added, satellite=satellite)
     send_email(subject, html_body)
 
     # [STEP 7] 이번 주 스냅샷 저장 (Top 30만 — Δ 계산엔 충분)
