@@ -16,12 +16,28 @@ app.py 상단에 다음 한 줄만 추가하면 됩니다:
 from __future__ import annotations
 
 import datetime as _dt
+import os as _os
+import time as _time
 
 import numpy as np
 import pandas as pd
 import pytz
 import requests
-import streamlit as st
+
+# streamlit 은 앱 환경에서만 존재 — 자동화(GitHub Actions)에서도 이 모듈을
+# import 할 수 있도록 선택적 임포트 + 무해한 심(shim)으로 대체한다.
+# (심: cache_data 는 no-op 데코레이터, secrets 는 빈 dict → _key 가 환경변수로 폴백)
+try:
+    import streamlit as st  # type: ignore
+except Exception:  # pragma: no cover — 자동화 환경
+    class _StShim:
+        secrets: dict = {}
+        @staticmethod
+        def cache_data(*a, **k):
+            def _wrap(fn):
+                return fn
+            return _wrap
+    st = _StShim()  # type: ignore
 
 _FMP_BASE = "https://financialmodelingprep.com/stable"
 _FMP_TIMEOUT = 7
@@ -29,11 +45,14 @@ _ET_TZ = pytz.timezone("America/New_York")
 
 
 def _key() -> str:
-    """app.py의 _fmp_key()와 동일. secrets 미설정 시 빈 문자열."""
+    """app.py의 _fmp_key()와 동일 + 자동화 폴백: st.secrets 미설정 시 환경변수 FMP_API_KEY."""
     try:
-        return str(st.secrets.get("FMP_API_KEY", "") or "").strip()
+        k = str(st.secrets.get("FMP_API_KEY", "") or "").strip()
+        if k:
+            return k
     except Exception:
-        return ""
+        pass
+    return str(_os.environ.get("FMP_API_KEY", "") or "").strip()
 
 
 def _get_json(path: str):
@@ -475,3 +494,233 @@ def compute_sector_signals(snapshot: list) -> dict:
         "cyc_avg": cyc_avg,
         "rotation": rotation,  # 양수 = 방어주가 경기민감주보다 강함 = 리스크오프 경향
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🛰️ 위성 섹터 Top10 — SSOT (app.py 탭 표시 + run_hidden_alpha 주간 이메일 공유)
+# ══════════════════════════════════════════════════════════════════════════
+
+SECTOR_THEME_ETFS = {
+    "XLK":  [("SOXX", "반도체"), ("IGV", "소프트웨어"), ("CIBR", "사이버보안"), ("SKYY", "클라우드"), ("BOTZ", "AI·로봇")],
+    "XLV":  [("XBI", "바이오테크"), ("IHI", "의료기기"), ("IHF", "의료서비스"), ("PPH", "제약"), ("GNOM", "유전체")],
+    "XLE":  [("XOP", "탐사·생산"), ("OIH", "오일서비스"), ("URA", "우라늄/원자력"), ("TAN", "태양광"), ("AMLP", "미드스트림")],
+    "XLI":  [("ITA", "방산·항공"), ("JETS", "항공"), ("IYT", "운송"), ("PAVE", "인프라"), ("UFO", "우주")],
+    "XLF":  [("KRE", "지방은행"), ("KBE", "은행"), ("KIE", "보험"), ("IAI", "증권·브로커"), ("FINX", "핀테크")],
+    "XLY":  [("XRT", "소매"), ("ITB", "주택건설"), ("IBUY", "온라인소매"), ("PEJ", "레저·여행"), ("BETZ", "게이밍·베팅")],
+    "XLB":  [("GDX", "금광"), ("COPX", "구리광"), ("LIT", "리튬·배터리"), ("SLX", "철강"), ("WOOD", "목재")],
+    "XLRE": [("VNQ", "리츠 광범위"), ("REZ", "주거 리츠"), ("SRVR", "데이터센터 리츠"), ("INDS", "산업 리츠"), ("REM", "모기지 리츠")],
+    "XLC":  [("FDN", "인터넷"), ("SOCL", "소셜미디어"), ("ESPO", "게임·e스포츠")],
+    "XLU":  [("GRID", "스마트그리드"), ("NLR", "원자력")],
+    "XLP":  [],
+}
+
+# 라이브(FMP /etf/holdings)가 비어 있을 때 사용하는 대표 보유종목 폴백.
+# (요금제에 ETF Holdings 엔드포인트가 없을 때를 대비 — 라이브가 오면 라이브 우선)
+ETF_CONSTITUENTS = {
+    # GICS 11개 대형 섹터
+    "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "ADBE", "CRM", "AMD", "CSCO", "INTU", "QCOM", "AMAT", "TXN", "NOW", "IBM"],
+    "XLC": ["GOOGL", "META", "NFLX", "TMUS", "DIS", "VZ", "T", "CHTR", "CMCSA", "EA", "TTWO", "FOXA", "WBD", "DASH", "SPOT"],
+    "XLY": ["AMZN", "TSLA", "HD", "MCD", "BKNG", "LOW", "NKE", "SBUX", "TJX", "CMG", "RCL", "MAR", "GM", "F", "ORLY"],
+    "XLP": ["COST", "WMT", "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL", "TGT", "KMB", "GIS", "KVUE", "KHC", "STZ"],
+    "XLV": ["LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE", "TMO", "DHR", "AMGN", "GILD", "BMY", "ISRG", "VRTX", "SYK", "CVS"],
+    "XLF": ["JPM", "BRK-B", "V", "MA", "BAC", "WFC", "GS", "MS", "SCHW", "BLK", "AXP", "C", "PGR", "AIG", "USB"],
+    "XLE": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "KMI", "HAL", "BKR", "DVN", "FANG", "WMB"],
+    "XLI": ["GE", "CAT", "RTX", "HON", "UNP", "LMT", "DE", "ETN", "BA", "NOC", "UPS", "FDX", "WM", "EMR", "ITW"],
+    "XLB": ["LIN", "APD", "SHW", "ECL", "NUE", "FCX", "DOW", "DD", "CTVA", "NEM", "MLM", "VMC", "PPG", "LYB", "MOS"],
+    "XLRE": ["AMT", "PLD", "EQIX", "SPG", "O", "WELL", "PSA", "DLR", "CCI", "CBRE", "VICI", "AVB", "EQR", "ESS", "EXR"],
+    "XLU": ["NEE", "SO", "DUK", "CEG", "AEP", "EXC", "SRE", "XEL", "D", "PCG", "PEG", "ED", "EIX", "WEC", "ETR"],
+    # 테마/세부산업 ETF
+    "SOXX": ["NVDA", "AVGO", "AMD", "MU", "TXN", "AMAT", "QCOM", "INTC", "LRCX", "KLAC", "ADI", "MCHP", "MRVL", "NXPI", "ON"],
+    "IGV": ["MSFT", "ORCL", "CRM", "ADBE", "NOW", "PLTR", "PANW", "CRWD", "SNOW", "INTU", "FTNT", "DDOG", "WDAY", "TEAM", "ANSS"],
+    "CIBR": ["CRWD", "PANW", "FTNT", "ZS", "CSCO", "GEN", "CYBR", "OKTA", "CHKP", "NET", "TENB", "S", "QLYS", "RPD", "AKAM"],
+    "SKYY": ["ORCL", "MSFT", "GOOGL", "AMZN", "NOW", "CRM", "SNOW", "NET", "DDOG", "MDB", "ANET", "IBM", "ZS", "AKAM", "FTNT"],
+    "BOTZ": ["NVDA", "ABB", "ISRG", "PATH", "SYM", "ROK", "FANUY", "TER", "OMCL", "CGNX", "IRBT", "UI", "NARI", "MDT", "KEYS"],
+    "XBI": ["GILD", "BIIB", "REGN", "VRTX", "ALNY", "MRNA", "BNTX", "AMGN", "ILMN", "SRPT", "CRSP", "EXEL", "NBIX", "INCY", "ARGX"],
+    "IHI": ["ISRG", "ABT", "BSX", "MDT", "SYK", "BDX", "EW", "DXCM", "ZBH", "RMD", "STE", "GEHC", "PODD", "BAX", "COO"],
+    "IHF": ["UNH", "ELV", "CI", "HCA", "CVS", "CNC", "HUM", "MCK", "COR", "DVA", "MOH", "EHC", "UHS", "THC", "ENSG"],
+    "PPH": ["LLY", "JNJ", "ABBV", "MRK", "NVS", "NVO", "AZN", "PFE", "BMY", "ZTS", "GSK", "AMGN", "TAK", "HLN", "VTRS"],
+    "GNOM": ["CRSP", "NTLA", "BEAM", "TWST", "EXAS", "ARWR", "IONS", "PACB", "EDIT", "FATE", "RXRX", "DNA", "VCYT", "SDGR", "NVCR"],
+    "XOP": ["COP", "EOG", "FANG", "DVN", "OXY", "HES", "MPC", "VLO", "PSX", "APA", "CTRA", "OVV", "EQT", "AR", "MUR"],
+    "OIH": ["SLB", "HAL", "BKR", "TS", "FTI", "NOV", "CHX", "WFRD", "RIG", "LBRT", "HP", "NBR", "OII", "PTEN", "VAL"],
+    "URA": ["CCJ", "BWXT", "NXE", "UEC", "DNN", "LEU", "UUUU", "SMR", "OKLO", "LTBR", "URG", "EU", "UROY"],
+    "TAN": ["FSLR", "ENPH", "NXT", "SEDG", "RUN", "SHLS", "ARRY", "MAXN", "CSIQ", "FLNC", "NOVA", "DQ", "JKS", "SPWR", "CSLR"],
+    "AMLP": ["MPLX", "ET", "EPD", "PAA", "WES", "ENLC", "HESM", "DTM", "SUN", "NS", "CQP", "DMLP", "GLP"],
+    "ITA": ["RTX", "LMT", "NOC", "GD", "BA", "HII", "TXT", "TDG", "HEI", "KTOS", "AVAV", "LDOS", "LHX", "CW", "MRCY"],
+    "JETS": ["DAL", "UAL", "LUV", "AAL", "ALK", "BA", "RYAAY", "ALGT", "SKYW", "HA", "GD", "CPA", "JBLU", "MESA", "HXL"],
+    "IYT": ["UBER", "UPS", "UNP", "FDX", "CSX", "NSC", "ODFL", "JBHT", "CHRW", "EXPD", "R", "KNX", "LSTR", "WERN", "SAIA"],
+    "PAVE": ["PWR", "ETN", "URI", "NUE", "EMR", "JCI", "FAST", "DE", "CARR", "MLM", "VMC", "HUBB", "AME", "TT", "WAB"],
+    "UFO": ["PLTR", "RKLB", "LHX", "RTX", "NOC", "BA", "IRDM", "ASTS", "SPIR", "SATL", "VSAT", "GSAT", "TDY", "HEI", "CACI"],
+    "KRE": ["TFC", "USB", "FITB", "RF", "HBAN", "MTB", "KEY", "CFG", "FCNCA", "ZION", "CMA", "WAL", "WBS", "EWBC", "SNV"],
+    "KBE": ["COF", "GS", "MS", "BK", "STT", "JPM", "BAC", "WFC", "C", "USB", "PNC", "TFC", "FITB", "RF", "HBAN"],
+    "KIE": ["PGR", "ALL", "MET", "PRU", "TRV", "AIG", "HIG", "CB", "AFL", "CINF", "L", "GL", "AIZ", "ACGL", "RGA"],
+    "IAI": ["GS", "MS", "SCHW", "ICE", "CME", "SPGI", "MCO", "COIN", "IBKR", "MKTX", "NDAQ", "CBOE", "RJF", "LPLA", "TROW"],
+    "FINX": ["PYPL", "COIN", "FI", "GPN", "AFRM", "SOFI", "NU", "FIS", "MELI", "TOST", "BILL", "HOOD", "FOUR", "FLYW", "MQ"],
+    "XRT": ["ANF", "GAP", "W", "RH", "CVNA", "BBY", "DKS", "ULTA", "ROST", "TJX", "BURL", "FL", "KSS", "M", "GME"],
+    "ITB": ["DHI", "LEN", "PHM", "NVR", "TOL", "KBH", "TPH", "MTH", "BLDR", "MAS", "SHW", "LOW", "HD", "MHK", "FBIN"],
+    "IBUY": ["CHWY", "CVNA", "ETSY", "W", "AMZN", "EBAY", "MELI", "SE", "SHOP", "DASH", "ABNB", "EXPE", "PINS", "RVLV", "WSM"],
+    "PEJ": ["BKNG", "MAR", "HLT", "RCL", "CCL", "NCLH", "LVS", "WYNN", "MGM", "DAL", "UAL", "CMG", "SBUX", "YUM", "DPZ"],
+    "BETZ": ["DKNG", "FLUT", "PENN", "CZR", "MGM", "LVS", "WYNN", "BYD", "RSI", "GENI", "SGHC", "LNW", "GDEN", "CHDN", "ACEL"],
+    "GDX": ["NEM", "AEM", "GOLD", "WPM", "FNV", "KGC", "GFI", "AU", "RGLD", "PAAS", "BVN", "HMY", "SSRM", "EGO", "OR"],
+    "COPX": ["FCX", "SCCO", "TECK", "ERO", "HBM", "IVN", "FM", "LUN", "TGB", "CMMC", "AGI", "WRN", "CS", "ANTO", "GLEN"],
+    "LIT": ["ALB", "SQM", "TSLA", "BYDDY", "PCRFY", "LAC", "PLL", "SLI", "MP", "FREY", "ENVX", "AMPX", "QS", "SES", "LICY"],
+    "SLX": ["VALE", "NUE", "RIO", "STLD", "RS", "TX", "CLF", "MT", "GGB", "X", "CMC", "ATI", "WOR", "TMST", "SID"],
+    "WOOD": ["WY", "PCH", "RYN", "WFG", "IP", "PKG", "SW", "SON", "LPX", "UFPI", "BCC", "OSB", "MERC", "SLVM", "DTC"],
+    "VNQ": ["PLD", "AMT", "EQIX", "WELL", "SPG", "PSA", "O", "DLR", "CCI", "CBRE", "EXR", "AVB", "VICI", "IRM", "EQR"],
+    "REZ": ["WELL", "AVB", "EQR", "INVH", "VTR", "ESS", "MAA", "UDR", "AMH", "ELS", "SUI", "CPT", "DOC", "NNN", "STAG"],
+    "SRVR": ["EQIX", "DLR", "AMT", "CCI", "SBAC", "IRM", "UNIT", "DBRG", "GLPI", "LAMR", "FYBR", "T", "VZ", "CSGP", "WY"],
+    "INDS": ["PLD", "EXR", "PSA", "CUBE", "EGP", "FR", "REXR", "STAG", "TRNO", "NSA", "ILPT", "PLYM", "LXP", "GTY", "COLD"],
+    "REM": ["AGNC", "NLY", "STWD", "RITM", "BXMT", "ABR", "CIM", "TWO", "RC", "ARI", "PMT", "NYMT", "DX", "EFC", "MFA"],
+    "FDN": ["AMZN", "META", "GOOGL", "NFLX", "CRM", "UBER", "ABNB", "PYPL", "SHOP", "SNOW", "COIN", "DASH", "PINS", "SPOT", "Z"],
+    "SOCL": ["META", "GOOGL", "PINS", "SNAP", "RDDT", "MTCH", "BIDU", "YELP", "BMBL", "NTES", "Z", "CARG", "DJT", "CARS", "TTGT"],
+    "ESPO": ["NVDA", "NTES", "EA", "RBLX", "TTWO", "SE", "BILI", "U", "AMD", "LOGI", "CRSR", "PLTK", "SCPL", "GRVY", "SLGG"],
+    "GRID": ["ABB", "ETN", "GEV", "PWR", "AME", "HUBB", "JCI", "EMR", "SU", "APH", "GLW", "ENPH", "BMI", "ITRI", "POWL"],
+    "NLR": ["CEG", "CCJ", "BWXT", "PEG", "DUK", "SO", "EXC", "PWR", "GEV", "OKLO", "SMR", "NRG", "VST", "TLN", "LEU"],
+}
+
+
+GICS_SECTOR_LABELS = {
+    "XLK": "기술", "XLC": "통신", "XLY": "자유소비재", "XLP": "필수소비재",
+    "XLV": "헬스케어", "XLF": "금융", "XLE": "에너지", "XLI": "산업재",
+    "XLB": "소재", "XLRE": "부동산", "XLU": "유틸리티",
+}
+
+# 위성 후보 풀: GICS 섹터 대표 ETF + 각 섹터의 테마 ETF (레버리지·인버스 없음)
+def satellite_candidate_pool() -> dict:
+    """{GICS 섹터티커: [후보 ETF들(섹터 대표 포함)]}"""
+    pool = {}
+    for sec in GICS_SECTOR_LABELS:
+        pool[sec] = [sec] + [t for t, _ in SECTOR_THEME_ETFS.get(sec, [])]
+    return pool
+
+
+def _closes(ticker: str, limit: int = 170) -> pd.Series:
+    """일별 종가 시리즈(오름차순·중복 날짜 제거). 일시 실패 2회 재시도."""
+    for attempt in range(3):
+        data = _get_json(f"historical-price-eod/full?symbol={ticker}&limit={limit}")
+        rows = data.get("historical", data) if isinstance(data, dict) else data
+        if isinstance(rows, list) and rows:
+            df = pd.DataFrame(rows)
+            if "date" in df.columns and "close" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                s = (pd.Series(pd.to_numeric(df["close"], errors="coerce").values, index=df["date"])
+                     .dropna().sort_index())
+                return s[~s.index.duplicated(keep="last")]
+            return pd.Series(dtype=float)  # 형식 이상 = 확정 실패
+        if data is not None:
+            return pd.Series(dtype=float)  # 200·빈 응답 = 데이터 없음(재시도 무의미)
+        _time.sleep(1.5 * (attempt + 1))   # None = 네트워크/429 → 재시도
+    return pd.Series(dtype=float)
+
+
+def _trailing_return(s: pd.Series, bars: int):
+    if len(s) <= bars:
+        return np.nan
+    try:
+        return float((s.iloc[-1] / s.iloc[-1 - bars] - 1) * 100)
+    except Exception:
+        return np.nan
+
+
+def _top_holdings_set(ticker: str, fallback_map: dict, top_n: int = 15) -> set:
+    """중복 계산용 구성종목 집합 — 라이브(/etf/holdings) 우선, 폴백 맵 차선."""
+    try:
+        live = fmp_etf_holdings(ticker)
+        if live is not None and not live.empty and "symbol" in live.columns:
+            syms = [str(x).strip().upper() for x in live["symbol"].head(top_n) if str(x).strip()]
+            syms = [x for x in syms if "." not in x]
+            if len(syms) >= 3:
+                return set(syms)
+    except Exception:
+        pass
+    fb = [str(x).strip().upper() for x in (fallback_map or {}).get(ticker, []) if "." not in str(x)]
+    return set(fb[:top_n])
+
+
+def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
+                            pause_sec: float = 0.12) -> dict:
+    """🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보 리스트 (SSOT).
+
+    점수 = 1M×0.40 + 3M×0.40 + 6M×0.20  (1주 수익률은 노이즈 — 점수 제외, 표시만)
+    GICS 섹터당 최고점 후보 1개만 → 상위 top_n. 같은 섹터 중복이 구조적으로 차단된다.
+
+    시장 필터: SPY 종가 vs 200일선 — 아래면 '위성 신규 중단·축소' 수동 룰 발동 신호.
+    후보 간 중복: 구성종목 상위 15개 집합의 교집합 비율(작은 쪽 기준 %),
+                 overlap_floor 미만은 생략(전체는 matrix 에 보존).
+
+    반환 dict:
+      as_of, market_filter {spy, ma200, risk_on} | None,
+      rows [{rank, ticker, sector, sector_label, theme_label, score, r1w, r1m, r3m, r6m,
+             overlaps [(other, pct)]}],
+      matrix {"A|B": pct}(전체 쌍), skipped [(ticker, 이유)]
+    """
+    out = {"as_of": _dt.datetime.now(_ET_TZ).strftime("%Y-%m-%d %H:%M ET"),
+           "market_filter": None, "rows": [], "matrix": {}, "skipped": []}
+
+    # ── 🚦 시장 필터 (SPY vs 200일선) ──
+    spy = _closes("SPY", limit=260)
+    if len(spy) >= 200:
+        ma200 = float(spy.tail(200).mean())
+        last = float(spy.iloc[-1])
+        out["market_filter"] = {"spy": round(last, 2), "ma200": round(ma200, 2),
+                                "risk_on": bool(last > ma200)}
+
+    # ── 섹터별 챔피언 선발 ──
+    theme_label_map = {t: lbl for lst in SECTOR_THEME_ETFS.values() for t, lbl in lst}
+    champions = []
+    for sec, cands in satellite_candidate_pool().items():
+        best = None
+        for tk in cands:
+            s = _closes(tk, limit=170)
+            _time.sleep(pause_sec)
+            if len(s) < 127:  # 6M(126봉) 계산 불가
+                out["skipped"].append((tk, f"히스토리 부족({len(s)}봉)"))
+                continue
+            r1w, r1m = _trailing_return(s, 5), _trailing_return(s, 21)
+            r3m, r6m = _trailing_return(s, 63), _trailing_return(s, 126)
+            if any(pd.isna(x) for x in (r1m, r3m, r6m)):
+                out["skipped"].append((tk, "수익률 계산 실패"))
+                continue
+            score = 0.40 * r1m + 0.40 * r3m + 0.20 * r6m
+            row = {"ticker": tk, "sector": sec,
+                   "sector_label": GICS_SECTOR_LABELS.get(sec, sec),
+                   "theme_label": ("섹터 대표" if tk == sec else theme_label_map.get(tk, "")),
+                   "score": round(score, 2),
+                   "r1w": round(r1w, 2) if pd.notna(r1w) else None,
+                   "r1m": round(r1m, 2), "r3m": round(r3m, 2), "r6m": round(r6m, 2)}
+            if best is None or row["score"] > best["score"]:
+                best = row
+        if best is not None:
+            champions.append(best)
+
+    champions.sort(key=lambda r: r["score"], reverse=True)
+    rows = champions[:max(1, int(top_n))]
+    for i, r in enumerate(rows, 1):
+        r["rank"] = i
+
+    # ── 후보 간 구성종목 중복 (전체 쌍 matrix + 행별 10%↑ 나열) ──
+    hold = {r["ticker"]: _top_holdings_set(r["ticker"], ETF_CONSTITUENTS) for r in rows}
+    for i, a in enumerate(rows):
+        for b in rows[i + 1:]:
+            sa, sb = hold.get(a["ticker"], set()), hold.get(b["ticker"], set())
+            pct = (len(sa & sb) / min(len(sa), len(sb)) * 100.0) if (sa and sb) else 0.0
+            out["matrix"][f"{a['ticker']}|{b['ticker']}"] = round(pct, 1)
+    for r in rows:
+        partners = []
+        for key, pct in out["matrix"].items():
+            x, y = key.split("|")
+            if r["ticker"] in (x, y) and pct >= overlap_floor:
+                partners.append((y if x == r["ticker"] else x, pct))
+        partners.sort(key=lambda p: -p[1])
+        r["overlaps"] = partners
+
+    out["rows"] = rows
+    return out
+
+
+def overlap_grade(pct: float) -> str:
+    """중복 % → 색 등급 이모지 (🟢<25 · 🟡25~40 · 🔴40+)."""
+    if pct >= 40:
+        return "🔴"
+    if pct >= 25:
+        return "🟡"
+    return "🟢"

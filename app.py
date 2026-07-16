@@ -2862,6 +2862,13 @@ def update_rs_incubator_observations(report: dict, ok_tickers) -> None:
         pass
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_satellite_top10() -> dict:
+    """🛰️ 위성 섹터 Top10 — SSOT 는 fmp_extras.compute_satellite_top10 (주간 이메일과 동일 로직).
+    탭 진입 시 자동 계산 · 1시간 캐시 (버튼 불필요)."""
+    return fx.compute_satellite_top10()
+
+
 def render_scan_coverage_report(report: dict) -> None:
     """RS 스캔(Early Signal·섹터 꺾임) 커버리지 + 미수집 사유 렌더링.
     '전수 fetch + 투명 보고' 원칙: 311개면 311개 전부에 대해 답이 있거나, 왜 없는지 보여준다."""
@@ -5353,82 +5360,11 @@ _FMP_SECTOR_NAME_TO_TICKER = {
 
 # 부모 GICS 섹터 ETF → 하위 테마/세부산업 ETF [(티커, 한글라벨)]. 수익률 순 정렬은 호출부에서.
 # (테마가 3개 미만이면 테마 표는 생략하고 부모 ETF로 바로 종목 분석)
-_SECTOR_THEME_ETFS = {
-    "XLK":  [("SOXX", "반도체"), ("IGV", "소프트웨어"), ("CIBR", "사이버보안"), ("SKYY", "클라우드"), ("BOTZ", "AI·로봇")],
-    "XLV":  [("XBI", "바이오테크"), ("IHI", "의료기기"), ("IHF", "의료서비스"), ("PPH", "제약"), ("GNOM", "유전체")],
-    "XLE":  [("XOP", "탐사·생산"), ("OIH", "오일서비스"), ("URA", "우라늄/원자력"), ("TAN", "태양광"), ("AMLP", "미드스트림")],
-    "XLI":  [("ITA", "방산·항공"), ("JETS", "항공"), ("IYT", "운송"), ("PAVE", "인프라"), ("UFO", "우주")],
-    "XLF":  [("KRE", "지방은행"), ("KBE", "은행"), ("KIE", "보험"), ("IAI", "증권·브로커"), ("FINX", "핀테크")],
-    "XLY":  [("XRT", "소매"), ("ITB", "주택건설"), ("IBUY", "온라인소매"), ("PEJ", "레저·여행"), ("BETZ", "게이밍·베팅")],
-    "XLB":  [("GDX", "금광"), ("COPX", "구리광"), ("LIT", "리튬·배터리"), ("SLX", "철강"), ("WOOD", "목재")],
-    "XLRE": [("VNQ", "리츠 광범위"), ("REZ", "주거 리츠"), ("SRVR", "데이터센터 리츠"), ("INDS", "산업 리츠"), ("REM", "모기지 리츠")],
-    "XLC":  [("FDN", "인터넷"), ("SOCL", "소셜미디어"), ("ESPO", "게임·e스포츠")],
-    "XLU":  [("GRID", "스마트그리드"), ("NLR", "원자력")],
-    "XLP":  [],
-}
+# ── SSOT 이동: 아래 두 맵은 fmp_extras 로 이전 (위성 섹터 Top10과 공유) ──
+# 앱 내 기존 참조 호환을 위한 별칭 — 내용 수정은 fmp_extras.py 에서만.
+_SECTOR_THEME_ETFS = fx.SECTOR_THEME_ETFS
+_ETF_CONSTITUENTS = fx.ETF_CONSTITUENTS
 
-# 라이브(FMP /etf/holdings)가 비어 있을 때 사용하는 대표 보유종목 폴백.
-# (요금제에 ETF Holdings 엔드포인트가 없을 때를 대비 — 라이브가 오면 라이브 우선)
-_ETF_CONSTITUENTS = {
-    # GICS 11개 대형 섹터
-    "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "ADBE", "CRM", "AMD", "CSCO", "INTU", "QCOM", "AMAT", "TXN", "NOW", "IBM"],
-    "XLC": ["GOOGL", "META", "NFLX", "TMUS", "DIS", "VZ", "T", "CHTR", "CMCSA", "EA", "TTWO", "FOXA", "WBD", "DASH", "SPOT"],
-    "XLY": ["AMZN", "TSLA", "HD", "MCD", "BKNG", "LOW", "NKE", "SBUX", "TJX", "CMG", "RCL", "MAR", "GM", "F", "ORLY"],
-    "XLP": ["COST", "WMT", "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL", "TGT", "KMB", "GIS", "KVUE", "KHC", "STZ"],
-    "XLV": ["LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE", "TMO", "DHR", "AMGN", "GILD", "BMY", "ISRG", "VRTX", "SYK", "CVS"],
-    "XLF": ["JPM", "BRK-B", "V", "MA", "BAC", "WFC", "GS", "MS", "SCHW", "BLK", "AXP", "C", "PGR", "AIG", "USB"],
-    "XLE": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "KMI", "HAL", "BKR", "DVN", "FANG", "WMB"],
-    "XLI": ["GE", "CAT", "RTX", "HON", "UNP", "LMT", "DE", "ETN", "BA", "NOC", "UPS", "FDX", "WM", "EMR", "ITW"],
-    "XLB": ["LIN", "APD", "SHW", "ECL", "NUE", "FCX", "DOW", "DD", "CTVA", "NEM", "MLM", "VMC", "PPG", "LYB", "MOS"],
-    "XLRE": ["AMT", "PLD", "EQIX", "SPG", "O", "WELL", "PSA", "DLR", "CCI", "CBRE", "VICI", "AVB", "EQR", "ESS", "EXR"],
-    "XLU": ["NEE", "SO", "DUK", "CEG", "AEP", "EXC", "SRE", "XEL", "D", "PCG", "PEG", "ED", "EIX", "WEC", "ETR"],
-    # 테마/세부산업 ETF
-    "SOXX": ["NVDA", "AVGO", "AMD", "MU", "TXN", "AMAT", "QCOM", "INTC", "LRCX", "KLAC", "ADI", "MCHP", "MRVL", "NXPI", "ON"],
-    "IGV": ["MSFT", "ORCL", "CRM", "ADBE", "NOW", "PLTR", "PANW", "CRWD", "SNOW", "INTU", "FTNT", "DDOG", "WDAY", "TEAM", "ANSS"],
-    "CIBR": ["CRWD", "PANW", "FTNT", "ZS", "CSCO", "GEN", "CYBR", "OKTA", "CHKP", "NET", "TENB", "S", "QLYS", "RPD", "AKAM"],
-    "SKYY": ["ORCL", "MSFT", "GOOGL", "AMZN", "NOW", "CRM", "SNOW", "NET", "DDOG", "MDB", "ANET", "IBM", "ZS", "AKAM", "FTNT"],
-    "BOTZ": ["NVDA", "ABB", "ISRG", "PATH", "SYM", "ROK", "FANUY", "TER", "OMCL", "CGNX", "IRBT", "UI", "NARI", "MDT", "KEYS"],
-    "XBI": ["GILD", "BIIB", "REGN", "VRTX", "ALNY", "MRNA", "BNTX", "AMGN", "ILMN", "SRPT", "CRSP", "EXEL", "NBIX", "INCY", "ARGX"],
-    "IHI": ["ISRG", "ABT", "BSX", "MDT", "SYK", "BDX", "EW", "DXCM", "ZBH", "RMD", "STE", "GEHC", "PODD", "BAX", "COO"],
-    "IHF": ["UNH", "ELV", "CI", "HCA", "CVS", "CNC", "HUM", "MCK", "COR", "DVA", "MOH", "EHC", "UHS", "THC", "ENSG"],
-    "PPH": ["LLY", "JNJ", "ABBV", "MRK", "NVS", "NVO", "AZN", "PFE", "BMY", "ZTS", "GSK", "AMGN", "TAK", "HLN", "VTRS"],
-    "GNOM": ["CRSP", "NTLA", "BEAM", "TWST", "EXAS", "ARWR", "IONS", "PACB", "EDIT", "FATE", "RXRX", "DNA", "VCYT", "SDGR", "NVCR"],
-    "XOP": ["COP", "EOG", "FANG", "DVN", "OXY", "HES", "MPC", "VLO", "PSX", "APA", "CTRA", "OVV", "EQT", "AR", "MUR"],
-    "OIH": ["SLB", "HAL", "BKR", "TS", "FTI", "NOV", "CHX", "WFRD", "RIG", "LBRT", "HP", "NBR", "OII", "PTEN", "VAL"],
-    "URA": ["CCJ", "BWXT", "NXE", "UEC", "DNN", "LEU", "UUUU", "SMR", "OKLO", "LTBR", "URG", "EU", "UROY"],
-    "TAN": ["FSLR", "ENPH", "NXT", "SEDG", "RUN", "SHLS", "ARRY", "MAXN", "CSIQ", "FLNC", "NOVA", "DQ", "JKS", "SPWR", "CSLR"],
-    "AMLP": ["MPLX", "ET", "EPD", "PAA", "WES", "ENLC", "HESM", "DTM", "SUN", "NS", "CQP", "DMLP", "GLP"],
-    "ITA": ["RTX", "LMT", "NOC", "GD", "BA", "HII", "TXT", "TDG", "HEI", "KTOS", "AVAV", "LDOS", "LHX", "CW", "MRCY"],
-    "JETS": ["DAL", "UAL", "LUV", "AAL", "ALK", "BA", "RYAAY", "ALGT", "SKYW", "HA", "GD", "CPA", "JBLU", "MESA", "HXL"],
-    "IYT": ["UBER", "UPS", "UNP", "FDX", "CSX", "NSC", "ODFL", "JBHT", "CHRW", "EXPD", "R", "KNX", "LSTR", "WERN", "SAIA"],
-    "PAVE": ["PWR", "ETN", "URI", "NUE", "EMR", "JCI", "FAST", "DE", "CARR", "MLM", "VMC", "HUBB", "AME", "TT", "WAB"],
-    "UFO": ["PLTR", "RKLB", "LHX", "RTX", "NOC", "BA", "IRDM", "ASTS", "SPIR", "SATL", "VSAT", "GSAT", "TDY", "HEI", "CACI"],
-    "KRE": ["TFC", "USB", "FITB", "RF", "HBAN", "MTB", "KEY", "CFG", "FCNCA", "ZION", "CMA", "WAL", "WBS", "EWBC", "SNV"],
-    "KBE": ["COF", "GS", "MS", "BK", "STT", "JPM", "BAC", "WFC", "C", "USB", "PNC", "TFC", "FITB", "RF", "HBAN"],
-    "KIE": ["PGR", "ALL", "MET", "PRU", "TRV", "AIG", "HIG", "CB", "AFL", "CINF", "L", "GL", "AIZ", "ACGL", "RGA"],
-    "IAI": ["GS", "MS", "SCHW", "ICE", "CME", "SPGI", "MCO", "COIN", "IBKR", "MKTX", "NDAQ", "CBOE", "RJF", "LPLA", "TROW"],
-    "FINX": ["PYPL", "COIN", "FI", "GPN", "AFRM", "SOFI", "NU", "FIS", "MELI", "TOST", "BILL", "HOOD", "FOUR", "FLYW", "MQ"],
-    "XRT": ["ANF", "GAP", "W", "RH", "CVNA", "BBY", "DKS", "ULTA", "ROST", "TJX", "BURL", "FL", "KSS", "M", "GME"],
-    "ITB": ["DHI", "LEN", "PHM", "NVR", "TOL", "KBH", "TPH", "MTH", "BLDR", "MAS", "SHW", "LOW", "HD", "MHK", "FBIN"],
-    "IBUY": ["CHWY", "CVNA", "ETSY", "W", "AMZN", "EBAY", "MELI", "SE", "SHOP", "DASH", "ABNB", "EXPE", "PINS", "RVLV", "WSM"],
-    "PEJ": ["BKNG", "MAR", "HLT", "RCL", "CCL", "NCLH", "LVS", "WYNN", "MGM", "DAL", "UAL", "CMG", "SBUX", "YUM", "DPZ"],
-    "BETZ": ["DKNG", "FLUT", "PENN", "CZR", "MGM", "LVS", "WYNN", "BYD", "RSI", "GENI", "SGHC", "LNW", "GDEN", "CHDN", "ACEL"],
-    "GDX": ["NEM", "AEM", "GOLD", "WPM", "FNV", "KGC", "GFI", "AU", "RGLD", "PAAS", "BVN", "HMY", "SSRM", "EGO", "OR"],
-    "COPX": ["FCX", "SCCO", "TECK", "ERO", "HBM", "IVN", "FM", "LUN", "TGB", "CMMC", "AGI", "WRN", "CS", "ANTO", "GLEN"],
-    "LIT": ["ALB", "SQM", "TSLA", "BYDDY", "PCRFY", "LAC", "PLL", "SLI", "MP", "FREY", "ENVX", "AMPX", "QS", "SES", "LICY"],
-    "SLX": ["VALE", "NUE", "RIO", "STLD", "RS", "TX", "CLF", "MT", "GGB", "X", "CMC", "ATI", "WOR", "TMST", "SID"],
-    "WOOD": ["WY", "PCH", "RYN", "WFG", "IP", "PKG", "SW", "SON", "LPX", "UFPI", "BCC", "OSB", "MERC", "SLVM", "DTC"],
-    "VNQ": ["PLD", "AMT", "EQIX", "WELL", "SPG", "PSA", "O", "DLR", "CCI", "CBRE", "EXR", "AVB", "VICI", "IRM", "EQR"],
-    "REZ": ["WELL", "AVB", "EQR", "INVH", "VTR", "ESS", "MAA", "UDR", "AMH", "ELS", "SUI", "CPT", "DOC", "NNN", "STAG"],
-    "SRVR": ["EQIX", "DLR", "AMT", "CCI", "SBAC", "IRM", "UNIT", "DBRG", "GLPI", "LAMR", "FYBR", "T", "VZ", "CSGP", "WY"],
-    "INDS": ["PLD", "EXR", "PSA", "CUBE", "EGP", "FR", "REXR", "STAG", "TRNO", "NSA", "ILPT", "PLYM", "LXP", "GTY", "COLD"],
-    "REM": ["AGNC", "NLY", "STWD", "RITM", "BXMT", "ABR", "CIM", "TWO", "RC", "ARI", "PMT", "NYMT", "DX", "EFC", "MFA"],
-    "FDN": ["AMZN", "META", "GOOGL", "NFLX", "CRM", "UBER", "ABNB", "PYPL", "SHOP", "SNOW", "COIN", "DASH", "PINS", "SPOT", "Z"],
-    "SOCL": ["META", "GOOGL", "PINS", "SNAP", "RDDT", "MTCH", "BIDU", "YELP", "BMBL", "NTES", "Z", "CARG", "DJT", "CARS", "TTGT"],
-    "ESPO": ["NVDA", "NTES", "EA", "RBLX", "TTWO", "SE", "BILI", "U", "AMD", "LOGI", "CRSR", "PLTK", "SCPL", "GRVY", "SLGG"],
-    "GRID": ["ABB", "ETN", "GEV", "PWR", "AME", "HUBB", "JCI", "EMR", "SU", "APH", "GLW", "ENPH", "BMI", "ITRI", "POWL"],
-    "NLR": ["CEG", "CCJ", "BWXT", "PEG", "DUK", "SO", "EXC", "PWR", "GEV", "OKLO", "SMR", "NRG", "VST", "TLN", "LEU"],
-}
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -16956,6 +16892,72 @@ if st.session_state.get("logged_in"):
                 missing_cells = int(sector_returns_df[perf_cols].isna().sum().sum())
                 if missing_cells > 0:
                     st.caption("일부 ETF는 거래일 부족 또는 데이터 누락으로 일부 기간 수익률이 N/A로 표시됩니다.")
+
+                # ── 🛰️ 위성 섹터 Top10 (월간 리밸런싱 후보 · SSOT: fmp_extras) ──
+                st.divider()
+                st.markdown("#### 🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보")
+                st.caption(
+                    "점수 = 1M×40% + 3M×40% + 6M×20% (1주는 노이즈 — 표시만) · GICS 섹터당 1개 · "
+                    "중복 % = 구성종목 상위 15개 교집합 · 주말 Hidden Alpha 이메일에도 동일 리스트 포함"
+                )
+                _sat = None
+                try:
+                    with st.spinner("위성 후보 풀 수익률 계산 중... (약 60개 ETF · 첫 계산은 1~2분, 이후 1시간 캐시)"):
+                        _sat = cached_satellite_top10()
+                except Exception as _sat_exc:
+                    st.warning(f"위성 Top10 계산 실패: {_sat_exc} — 잠시 후 새로고침해 주세요.")
+                if _sat and _sat.get("rows"):
+                    _mf = _sat.get("market_filter")
+                    if _mf:
+                        if _mf.get("risk_on"):
+                            st.success(
+                                f"🚦 시장 필터: SPY ${_mf['spy']:,} > 200일선 ${_mf['ma200']:,} — "
+                                f"**위성 정상 운용 구간** (월간 리밸런싱 룰 유지)"
+                            )
+                        else:
+                            st.error(
+                                f"🚦 시장 필터: SPY ${_mf['spy']:,} < 200일선 ${_mf['ma200']:,} — "
+                                f"**⛔ 위성 신규 매수 중단·비중 축소 룰 발동** (합의된 수동 급락장 필터)"
+                            )
+                    else:
+                        st.caption("🚦 시장 필터: SPY 데이터 미확보 — 판단 유보")
+                    for _r in _sat["rows"]:
+                        _theme = f" · {_r['theme_label']}" if _r.get("theme_label") else ""
+                        _r1w = f" (1W {_r['r1w']:+.1f}%)" if _r.get("r1w") is not None else ""
+                        st.markdown(
+                            f"**{_r['rank']}위 {_r['ticker']}** — {_r['sector_label']}{_theme} · "
+                            f"점수 **{_r['score']:+.1f}** | 1M {_r['r1m']:+.1f}% · 3M {_r['r3m']:+.1f}% · "
+                            f"6M {_r['r6m']:+.1f}%{_r1w}"
+                        )
+                        if _r.get("overlaps"):
+                            _ov = " · ".join(
+                                f"{fx.overlap_grade(p)} {t} {p:.0f}%" for t, p in _r["overlaps"]
+                            )
+                            st.caption(f"　중복: {_ov}")
+                        else:
+                            st.caption("　중복: 🟢 없음 (10%↑ 기준)")
+                    with st.expander("전체 중복 매트릭스 (모든 쌍)", expanded=False):
+                        _tks = [r["ticker"] for r in _sat["rows"]]
+                        _mx = pd.DataFrame(index=_tks, columns=_tks, dtype=float)
+                        for _k, _v in (_sat.get("matrix") or {}).items():
+                            _a, _b = _k.split("|")
+                            if _a in _mx.index and _b in _mx.columns:
+                                _mx.loc[_a, _b] = _v
+                                _mx.loc[_b, _a] = _v
+                        st.dataframe(
+                            _mx.style.format("{:.0f}%", na_rep="—")
+                            .background_gradient(cmap="RdYlGn_r", vmin=0, vmax=60),
+                            use_container_width=True,
+                        )
+                    if _sat.get("skipped"):
+                        st.caption(
+                            "제외된 후보 "
+                            + ", ".join(f"{t}({why})" for t, why in _sat["skipped"][:8])
+                            + (" …" if len(_sat["skipped"]) > 8 else "")
+                        )
+                    st.caption(f"기준 시각: {_sat.get('as_of', '')}")
+                elif _sat is not None:
+                    st.warning("위성 후보 데이터를 산출하지 못했습니다 — FMP 키/네트워크 확인 후 재시도.")
 
                 # ── 드릴다운: 섹터 → 테마 ETF → 주도주·저평가 후발주 ──
                 st.divider()
