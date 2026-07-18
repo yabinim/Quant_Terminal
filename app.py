@@ -5307,7 +5307,10 @@ def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
     close_dict = {}
     for tk, df in batch.items():
         if "Close" in df.columns:
-            close_dict[tk] = df["Close"]
+            _s = df["Close"]
+            # FMP가 간혹 같은 날짜를 중복 반환 — 중복 라벨은 DataFrame 조립 시
+            # "cannot reindex on an axis with duplicate labels" 오류를 유발하므로 최신값만 유지
+            close_dict[tk] = _s[~_s.index.duplicated(keep="last")]
     if not close_dict:
         return pd.DataFrame()
     return pd.DataFrame(close_dict).sort_index()
