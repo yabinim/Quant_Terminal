@@ -266,7 +266,7 @@ def _pf_alert_key(user_id: str, account: str, ticker: str) -> str:
     return f"{str(user_id).strip()}|{str(account).strip()}|{str(ticker).strip().upper()}"
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_portfolio_alert_states() -> dict:
     """Portfolio_Alert_State 전체 → {key: {"states": "...", "last_state": "..."}}."""
     ws, err = open_portfolio_alert_state_worksheet()
@@ -808,7 +808,7 @@ def _sheet_row_to_narrative_record(row: list) -> dict | None:
     return None
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def _narratives_sheet_all_values_cached():
     try:
         ws, err = open_narratives_worksheet()
@@ -1101,13 +1101,22 @@ def _trigger_background_warmup():
         except Exception:
             pass
         try:
-            # DRG (전체 섹터 기본값으로 프리워밍)
-            compute_daily_risk_gauge(sector_filter="전체")
+            # DRG (전체 섹터 기본값으로 프리워밍) + 워밍 플래그/스냅샷 저장
+            _d_warm = compute_daily_risk_gauge(sector_filter="전체")
+            _drg_mark_warm("전체", _d_warm)
         except Exception:
             pass
         try:
             # 거시경제 대시보드
             cached_analyze_us_macro_dashboard()
+        except Exception:
+            pass
+        try:
+            # 섹터 & 자금 흐름 탭 프리워밍 (11개 섹터 ETF 종가 테이블)
+            cached_sector_etf_closes(
+                ("XLK", "XLC", "XLY", "XLP", "XLV", "XLF",
+                 "XLE", "XLI", "XLB", "XLRE", "XLU")
+            )
         except Exception:
             pass
 
@@ -1181,6 +1190,77 @@ if "_scanner_last_result_restored" not in st.session_state:
     st.session_state["_scanner_last_result_restored"] = False
 if "narrative_timeseries_briefing" not in st.session_state:
     st.session_state["narrative_timeseries_briefing"] = None
+
+def _render_guest_guide():
+    """게스트(비관리자) 전용 사용 가이드 — 자유 사용 탭 / 열람 전용 탭 / 알림 설정 안내."""
+    st.markdown(
+        """
+이 앱은 **모멘텀 + 초기 수혜주 발굴** 관점의 개인 퀀트 분석 터미널입니다.
+핵심 철학은 **예측 적중이 아니라 손실 방지** — 시장의 사이클/추세가 꺾이는 것을
+가격 행동으로 *확인*하고 반응하는 것을 목표로 합니다.
+
+---
+
+## 🗺️ 추천 워크플로우 (깔때기)
+
+**① 시장 읽기 → ② 후보 발굴 → ③ 정밀 검증 → ④ 워치리스트 등록 → ⑤ 매수 후 포트폴리오 등록 → ⑥ 매도 레이더 관리 → ⑦ 매매 복기**
+
+1. **🚨 Daily Risk Gauge / 📰 시장 내러티브**로 오늘 시장의 리스크와 주도 테마를 읽습니다.
+2. **🎯 섹터 & 자금 흐름 / 🚀 AI 종목 스캐너**로 자금이 몰리는 곳과 후보 종목을 찾습니다.
+3. **🔬 개별 종목 정밀 검사**로 레짐(4단계)·타이밍·매수/매도 신호를 확인합니다.
+4. 괜찮은 종목은 **🔔 Buy Watchlist**에 저장 — 손절/목표가와 알림 조건을 함께 설정하세요.
+5. 매수했다면 **🛡️ 포트폴리오 매도 레이더**에 계좌·평단·수량을 등록합니다.
+6. 이후 매도 신호는 앱과 **이메일 알림**이 알려줍니다 (아래 알림 설정 참고).
+7. 청산한 거래는 **📊 매매 복기**에 기록해 패턴을 학습합니다.
+
+---
+
+## 🟢 자유롭게 사용하는 탭 (내 데이터로 저장됨)
+
+| 탭 | 용도 |
+|---|---|
+| 🚀 AI 종목 스캐너 | 최신 내러티브 기반 AI 종목 발굴 (결과는 내 계정에 저장) |
+| 🔬 개별 종목 정밀 검사 | 티커 하나를 레짐·신호·재무로 심층 분석 |
+| 🛡️ 포트폴리오 매도 레이더 | 내 보유 종목의 스윙/포지션 매도 신호 추적 |
+| 🔔 Buy Watchlist & Alert | 매수 후보 저장 + 진입/이탈 알림 조건 관리 |
+| 💡 Idea-to-Portfolio 추적 | 투자 아이디어(Thesis)를 기록하고 실제 성과와 대조 |
+| 📋 주간 포트폴리오 요약 | 내 포트폴리오의 AI 주간 리뷰 생성 |
+| 📊 매매 복기 | 청산 거래 기록 · 수익률/알파 자동 계산 |
+
+포트폴리오·워치리스트·복기 기록은 전부 **본인 계정에만** 저장되며 다른 사용자에게 보이지 않습니다.
+
+---
+
+## 🔵 열람 전용 탭 (자동으로 매일 갱신)
+
+🚨 Daily Risk Gauge · 🌐 거시경제 지표 · 📰 시장 내러티브 · 🎯 섹터 & 자금 흐름 ·
+📊 적중률 트래커 · 📡 Emerging 종목 추적기
+
+이 탭들의 분석은 **자동화가 주중 아침/저녁, 주말 1회** 생성해 두므로 직접 실행할 필요가 없습니다.
+실행/스캔 버튼이 비활성화되어 있는 것은 정상이며, 히스토리를 포함해 모든 결과를 열람할 수 있습니다.
+
+---
+
+## 📬 이메일 알림 (⚙️ 내 설정)
+
+사이드바 맨 아래 **⚙️ 내 설정**에서 언제든 켜고 끌 수 있습니다. 저장하면 다음 발송분부터 반영됩니다.
+
+- **📡 매매 레이더** — *내* 워치리스트/보유 종목에서 신호가 발동했을 때만, 내 종목만 담아 발송
+- **🌐 시장 브리핑** — AI 시장 내러티브(주중 아침·저녁) + 거시 방향 예측/검증(8AM·5PM ET), 전 사용자 공통 내용
+
+비밀번호 변경도 ⚙️ 내 설정에서 가능합니다. **비밀번호를 잊었다면 관리자에게 연락** —
+임시 비밀번호를 발급받아 로그인 후 직접 변경하면 됩니다.
+
+---
+
+## 💡 팁
+
+- 각 탭의 **🔄 데이터 동기화** 버튼은 화면이 최신이 아닐 때 캐시를 강제로 새로고침합니다.
+- Daily Risk Gauge에 "⏱️ 직전 계산 결과" 배지가 보이면 잠시 후 자동으로 실시간 값으로 갱신됩니다.
+- 알림의 손절/목표가는 **제안이 아니라 내가 설정한 값**입니다 — 워치리스트/레이더에서 직접 관리하세요.
+"""
+    )
+
 
 # 사이드바 메인 내비게이션 (탑다운: 단일 radio, 옵션 문자열로 분기)
 _MAIN_NAV_OPTIONS = (
@@ -4526,6 +4606,117 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     }
 
 
+# ── DRG 스냅샷 (콜드 스타트 즉시 표시용 — app.py 단독, 자동화 무관) ────────────
+# 앱이 스스로 계산에 성공할 때마다 결과를 시트에 저장해 두고, 프로세스 재시작 후
+# 첫 진입 시 직전 결과를 1초 안에 먼저 렌더 + 백그라운드로 라이브 재계산한다.
+# 시트 쓰기/읽기 실패는 전부 무해 폴백(라이브 계산) — 스냅샷이 죽어도 기존과 동일 동작.
+_DRG_SNAPSHOT_WORKSHEET = "DRG_Snapshot"
+_DRG_WARM: dict = {}            # {sector_filter: True} — 이 프로세스에서 라이브 계산 완료
+_DRG_BG_RUNNING: set = set()    # 백그라운드 재계산 중복 방지
+_DRG_SNAP_STATE = {"last_write_ts": 0.0}
+_DRG_SNAP_WRITE_MIN_SEC = 600   # 시트 쓰기 스로틀 (10분)
+
+
+def _open_drg_snapshot_ws():
+    gc = get_gspread_client()
+    if gc is None:
+        return None
+    sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+    try:
+        return sh.worksheet(_DRG_SNAPSHOT_WORKSHEET)
+    except Exception:
+        try:
+            ws = sh.add_worksheet(title=_DRG_SNAPSHOT_WORKSHEET, rows=10, cols=3)
+            ws.update([["updated_at_et", "payload_json"]], range_name="A1:B1",
+                      value_input_option="RAW")
+            return ws
+        except Exception:
+            return None
+
+
+def _drg_save_snapshot(drg: dict) -> None:
+    """'전체' 섹터 DRG 결과를 시트에 저장 (10분 스로틀, 실패 무해)."""
+    try:
+        now_ts = time.time()
+        if now_ts - _DRG_SNAP_STATE["last_write_ts"] < _DRG_SNAP_WRITE_MIN_SEC:
+            return
+        ws = _open_drg_snapshot_ws()
+        if ws is None:
+            return
+        _et_now = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M")
+        payload = json.dumps(drg, ensure_ascii=False, default=str)
+        ws.update([[_et_now, payload]], range_name="A2:B2", value_input_option="RAW")
+        _DRG_SNAP_STATE["last_write_ts"] = now_ts
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _drg_load_snapshot() -> tuple[dict | None, str]:
+    """시트 스냅샷 로드 → (drg_dict | None, 기준시각 ET). 실패 시 (None, '')."""
+    try:
+        ws = _open_drg_snapshot_ws()
+        if ws is None:
+            return None, ""
+        vals = ws.get_all_values()
+        if len(vals) < 2 or len(vals[1]) < 2 or not str(vals[1][1]).strip():
+            return None, ""
+        d = json.loads(vals[1][1])
+        if not isinstance(d, dict) or "risk_score" not in d:
+            return None, ""
+        return d, str(vals[1][0]).strip()
+    except Exception:
+        return None, ""
+
+
+def _drg_mark_warm(sector_filter: str, drg: dict) -> None:
+    """라이브 계산 성공 표시 + '전체'는 스냅샷 저장."""
+    _DRG_WARM[sector_filter] = True
+    if sector_filter == "전체" and isinstance(drg, dict) and drg.get("risk_score") is not None:
+        _drg_save_snapshot(drg)
+
+
+def _drg_background_refresh(sector_filter: str) -> None:
+    """백그라운드 스레드로 라이브 계산 시동 (중복 방지)."""
+    if sector_filter in _DRG_BG_RUNNING or _DRG_WARM.get(sector_filter):
+        return
+    _DRG_BG_RUNNING.add(sector_filter)
+    import threading as _threading
+
+    def _bg():
+        try:
+            d = compute_daily_risk_gauge(sector_filter=sector_filter)
+            _drg_mark_warm(sector_filter, d)
+        except Exception:
+            pass
+        finally:
+            _DRG_BG_RUNNING.discard(sector_filter)
+
+    _threading.Thread(target=_bg, daemon=True).start()
+
+
+def _drg_get(sector_filter: str = "전체") -> tuple[dict, bool, str]:
+    """DRG 결과 비블로킹 취득 → (drg, is_live, snapshot_기준시각).
+
+    - 이 프로세스에서 이미 계산된 적 있으면(워밍) 라이브 반환 (캐시라 즉시).
+    - 콜드 + '전체' 스냅샷이 있으면 스냅샷 즉시 반환 + 백그라운드 재계산 시동.
+    - 그 외에는 기존과 동일하게 라이브 계산(블로킹) 후 워밍/스냅샷 처리.
+    """
+    if _DRG_WARM.get(sector_filter):
+        d = compute_daily_risk_gauge(sector_filter=sector_filter)
+        if sector_filter == "전체":
+            _drg_save_snapshot(d)  # 스로틀 내장 — 주기적 최신화
+        return d, True, ""
+    if sector_filter == "전체":
+        snap, snap_ts = _drg_load_snapshot()
+        if snap:
+            _drg_background_refresh(sector_filter)
+            return snap, False, snap_ts
+    d = compute_daily_risk_gauge(sector_filter=sector_filter)
+    _drg_mark_warm(sector_filter, d)
+    return d, True, ""
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
     """
@@ -7055,7 +7246,7 @@ def one_month_total_return_pct(close_series):
     return (float(clean.iloc[-1]) / float(clean.iloc[0]) - 1.0) * 100.0
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def _portfolio_sheet_all_values_cached():
     try:
         ws, err = open_portfolios_worksheet()
@@ -7541,7 +7732,7 @@ def open_trade_history_worksheet():
         return None, f"Trade_History 시트를 열 수 없습니다: {exc}"
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def _trade_history_all_values_cached():
     ws, err = open_trade_history_worksheet()
     if err or ws is None:
@@ -10029,7 +10220,7 @@ def open_watchlist_worksheet():
         return None, f"Watchlist 워크시트를 열거나 생성할 수 없습니다: {exc}"
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_watchlist_sheet(user_id: str) -> list[dict]:
     """Watchlist 시트에서 현재 user_id 기록 로드. 60초 캐시."""
     ws, err = open_watchlist_worksheet()
@@ -14569,9 +14760,17 @@ if st.session_state.get("logged_in"):
             compute_daily_risk_gauge.clear()
             fetch_vix_latest_and_history.clear()
             fetch_fmp_economic_calendar_risk.clear()
+            _drg_load_snapshot.clear()
+            _DRG_WARM[sector_choice] = True  # 스냅샷 우회 → 즉시 라이브 재계산
 
-        with st.spinner("📡 선행 신호 8가지 동시 분석 중... (약 5~10초)"):
-            drg = compute_daily_risk_gauge(sector_filter=sector_choice)
+        with st.spinner("📡 선행 신호 8가지 분석 중..."):
+            drg, _drg_is_live, _drg_snap_ts = _drg_get(sector_choice)
+        if not _drg_is_live:
+            st.info(
+                f"⏱️ **직전 계산 결과 표시 중** (기준 {_drg_snap_ts} ET) — "
+                "백그라운드에서 최신 계산이 진행 중입니다. "
+                "잠시 후 페이지를 다시 열거나 '🔄 지금 스캔'을 누르면 실시간 값으로 갱신됩니다."
+            )
 
         risk_score = drg["risk_score"]
         risk_total = drg.get("risk_total", 8)
@@ -18138,7 +18337,7 @@ if st.session_state.get("logged_in"):
                 if _regime_res.get("enough_data") and pd.notna(current_price) and float(current_price) > 0:
                     _exit_card = rc.compute_exit_signals(timing_history)
                     try:
-                        _rp_card = _regime_params(compute_daily_risk_gauge("전체"))
+                        _rp_card = _regime_params(_drg_get("전체")[0])
                     except Exception:
                         _rp_card = _regime_params({})
                     _atr_card = rc.compute_atr(timing_history)
@@ -18384,7 +18583,7 @@ if st.session_state.get("logged_in"):
 
                         # 국면 적응 배수/손익비 (이미 있는 _regime_params + 캐시된 DRG 재사용)
                         try:
-                            _drg_plan = compute_daily_risk_gauge("전체")
+                            _drg_plan = _drg_get("전체")[0]
                         except Exception:
                             _drg_plan = {}
                         _rp = _regime_params(_drg_plan)
@@ -19219,7 +19418,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     st.error(f"저장 실패: {_e}")
                         if pd.notna(_cur_px) and _cur_px > 0:
                             try:
-                                _rp_pf = _regime_params(compute_daily_risk_gauge("전체"))
+                                _rp_pf = _regime_params(_drg_get("전체")[0])
                             except Exception:
                                 _rp_pf = _regime_params({})
                             _atr_pf = rc.compute_atr(_pf_hist_cache[_tk])
@@ -19731,7 +19930,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 if st.session_state.get(_intel_flag):
                     with st.spinner("국면·변동성·상대강도 계산 중..."):
                         try:
-                            _drg = compute_daily_risk_gauge("전체")
+                            _drg = _drg_get("전체")[0]
                         except Exception:
                             _drg = {}
                         try:
@@ -21645,7 +21844,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             _wl_equity = float(st.session_state.get("_size_equity", 10000.0))
             _wl_risk_pct = float(st.session_state.get("_size_risk_pct", 1.0))
             try:
-                _wl_rp = _regime_params(compute_daily_risk_gauge("전체"))
+                _wl_rp = _regime_params(_drg_get("전체")[0])
             except Exception:
                 _wl_rp = _regime_params({})
             if wl_items:
@@ -22447,6 +22646,10 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         # ─────────────────────────────────────────────────────────────────────
         st.title("📖 사용 가이드")
         st.caption("Quant Investment Terminal — 투자 철학 · 표준 워크플로우 · 전 탭 기능 상세")
+
+        if not _is_admin():
+            _render_guest_guide()
+            st.stop()
 
         # ── 투자 철학 ─────────────────────────────────────────────────────────
         st.markdown("## 🧭 이 앱의 투자 철학")
