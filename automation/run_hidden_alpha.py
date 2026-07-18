@@ -174,6 +174,9 @@ def _fmp_price_history_close(ticker: str, limit: int = 130) -> pd.Series:
             return pd.Series(dtype=float)
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
+        # FMP가 간혹 같은 날짜를 중복 반환 — 중복 라벨은 DataFrame 조립 시
+        # "cannot reindex on an axis with duplicate labels" 오류를 유발하므로 최신값만 유지
+        df = df[~df.index.duplicated(keep="last")]
         return pd.to_numeric(df["close"], errors="coerce").dropna()
     except Exception:
         return pd.Series(dtype=float)
