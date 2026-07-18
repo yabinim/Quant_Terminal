@@ -31,6 +31,7 @@ from fredapi import Fred
 import fmp_extras as fx
 import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_narrative)와 동일 모듈
 import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화와 동일 모듈
+import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
 
 
 st.set_page_config(page_title="장기 투자 주식 분석", layout="wide")
@@ -51,7 +52,7 @@ if "user_id" not in st.session_state:
 
 _QUANT_DB_SPREADSHEET_TITLE = "Quant_DB"
 _USERS_WORKSHEET_TITLE = "Users"
-_USER_SHEET_COLS = ["ID", "Password", "Reason", "Source", "Status"]
+_USER_SHEET_COLS = list(uc.USER_SHEET_COLS)  # v2 8열: +Email, Alert_Radar, Alert_Global (users_core SSOT)
 _NARRATIVES_WORKSHEET_TITLE = "Narratives"
 _NARRATIVES_SHEET_COLS = ["ID", "Date", "Category", "Title", "Content", "Winners", "Emerging"]
 _PORTFOLIOS_WORKSHEET_TITLE = "Portfolios"
@@ -922,32 +923,23 @@ def save_narrative_history_records(records):
 
 
 def ensure_users_header_row(ws):
-    vals = ws.get_all_values()
-    if not vals or not any(str(c).strip() for c in vals[0]):
-        ws.update([_USER_SHEET_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
+    """Users 시트 헤더를 v2(8열)로 보장. 구버전(5열) 헤더는 확장 (데이터 행 보존)."""
+    uc.ensure_users_header_v2(ws)
 
 
 def fetch_users_dataframe(ws) -> pd.DataFrame:
-    vals = ws.get_all_values()
-    if not vals:
-        return pd.DataFrame(columns=_USER_SHEET_COLS)
-    hdr = [str(h).strip() for h in vals[0][:5]]
-    body = []
-    for r in vals[1:]:
-        row = (r + [""] * 5)[:5]
-        body.append(row)
-    if not hdr or not any(hdr):
-        return pd.DataFrame(columns=_USER_SHEET_COLS)
-    df = pd.DataFrame(body, columns=hdr[:5])
-    for col in _USER_SHEET_COLS:
-        if col not in df.columns:
-            df[col] = ""
-    return df[_USER_SHEET_COLS]
+    """Users 시트 → v2 스키마(8열) DataFrame (users_core SSOT)."""
+    return uc.fetch_users_df(ws)
 
 
-def register_pending_user(user_id: str, password: str, reason: str, source: str) -> tuple[bool, str]:
+def register_pending_user(user_id: str, password: str, reason: str, source: str,
+                          email: str = "", alert_radar: bool = False,
+                          alert_global: bool = False) -> tuple[bool, str]:
     if not user_id or not password:
         return False, "ID와 Password는 필수입니다."
+    email = str(email or "").strip()
+    if (alert_radar or alert_global) and (not email or "@" not in email):
+        return False, "이메일 알림을 받으려면 올바른 이메일 주소를 입력하세요."
     ws, err = open_users_worksheet()
     if err:
         return False, err
@@ -957,7 +949,12 @@ def register_pending_user(user_id: str, password: str, reason: str, source: str)
         existing = df["ID"].astype(str).str.strip().str.upper()
         if user_id.strip().upper() in set(existing):
             return False, "이미 등록된 ID입니다."
-    _safe_append_rows(ws, [user_id.strip(), password, reason, source, "pending"], value_input_option="USER_ENTERED")
+    _safe_append_rows(
+        ws,
+        [user_id.strip(), uc.hash_password(password), reason, source, "pending",
+         email, "Y" if alert_radar else "N", "Y" if alert_global else "N"],
+        value_input_option="USER_ENTERED",
+    )
     return True, ""
 
 
@@ -972,7 +969,7 @@ def save_users_worksheet_from_df(df: pd.DataFrame) -> tuple[bool, str]:
     df = df[_USER_SHEET_COLS]
     values = [_USER_SHEET_COLS] + df.astype(str).values.tolist()
     ws.clear()
-    rng = f"A1:E{len(values)}"
+    rng = f"A1:{uc.LAST_COL}{len(values)}"
     ws.update(values, range_name=rng, value_input_option="USER_ENTERED")
     return True, ""
 
@@ -1042,10 +1039,17 @@ def try_sheet_login():
         st.session_state["login_feedback"] = "접근이 거부되었습니다."
         return
     if status == "approved":
-        if str(row.get("Password", "")) == pw:
+        _pw_ok, _needs_upgrade = uc.verify_password(pw, str(row.get("Password", "")))
+        if _pw_ok:
+            lid = str(row.get("ID", "")).strip()
+            if _needs_upgrade:
+                # 레거시 평문 비번 → 해시로 투명 승격 (실패해도 로그인은 진행)
+                try:
+                    uc.update_user_fields(ws, lid, {"Password": uc.hash_password(pw)})
+                except Exception:
+                    pass
             st.session_state["logged_in"] = True
             st.session_state["user_role"] = "guest"
-            lid = str(row.get("ID", "")).strip()
             st.session_state["login_user_id"] = lid
             st.session_state["user_id"] = lid
             st.session_state["login_error"] = False
@@ -1058,6 +1062,22 @@ def try_sheet_login():
         return
     st.session_state["login_error"] = True
     st.session_state["login_feedback"] = f"알 수 없는 계정 상태입니다: {row.get('Status', '')}"
+
+
+def _is_admin() -> bool:
+    """현재 세션이 관리자 권한인지 여부."""
+    return st.session_state.get("user_role") == "admin"
+
+
+def _shared_owner_uid() -> str:
+    """전역(자동화) 콘텐츠 — 내러티브·DRG·적중률·Emerging — 의 소유자 uid.
+
+    관리자는 본인 uid(=자동화 소유자 yab), 게스트는 항상 관리자 데이터를 읽는다.
+    게스트 세션에서는 이 uid 로 읽기만 하고 절대 쓰지 않는다 (버튼 게이팅으로 보장).
+    """
+    if _is_admin():
+        return str(st.session_state.get("user_id") or "").strip() or uc.ADMIN_CONTENT_OWNER_ID
+    return uc.ADMIN_CONTENT_OWNER_ID
 
 
 def _trigger_background_warmup():
@@ -1111,8 +1131,14 @@ def _render_login_screen():
         with st.form("signup_form", clear_on_submit=True):
             su_id = st.text_input("ID", key="signup_form_id")
             su_pw = st.text_input("Password", type="password", key="signup_form_pw")
+            su_email = st.text_input("이메일 (알림 수신용)", key="signup_form_email")
             su_reason = st.text_area("이 앱을 쓰려는 이유", key="signup_form_reason")
             su_source = st.text_input("어떻게 알았는지 (Source)", key="signup_form_source")
+            su_radar = st.checkbox("📡 매매 레이더 이메일 수신 (내 Watchlist·보유 종목 알림)",
+                                   value=True, key="signup_form_alert_radar")
+            su_global = st.checkbox("🌐 시장 브리핑 이메일 수신 (내러티브·거시 예측)",
+                                    value=True, key="signup_form_alert_global")
+            st.caption("수신 설정은 가입 후 ⚙️ 내 설정에서 언제든 변경할 수 있어요.")
             submitted = st.form_submit_button("가입 신청 제출", use_container_width=True, type="primary")
         if submitted:
             ok, msg = register_pending_user(
@@ -1120,6 +1146,9 @@ def _render_login_screen():
                 str(st.session_state.get("signup_form_pw", "") or "").strip(),
                 str(st.session_state.get("signup_form_reason", "") or "").strip(),
                 str(st.session_state.get("signup_form_source", "") or "").strip(),
+                email=str(st.session_state.get("signup_form_email", "") or "").strip(),
+                alert_radar=bool(st.session_state.get("signup_form_alert_radar")),
+                alert_global=bool(st.session_state.get("signup_form_alert_global")),
             )
             if ok:
                 st.success("가입 신청이 완료되었습니다. 관리자 승인을 기다려주세요.")
@@ -1175,6 +1204,8 @@ _MAIN_NAV_OPTIONS = (
     "📖 사용 가이드",
     # ── 복기 (index 13: 인덱스 분기 호환 위해 맨 끝에 append) ────────────────
     "📊 매매 복기",
+    # ── 계정 (index 14: 맨 끝 append — 기존 인덱스 분기 불변) ────────────────
+    "⚙️ 내 설정",
 )
 
 
@@ -1187,15 +1218,31 @@ _OPPORTUNITY_SCANNER_DATA_SOURCE_OPTIONS = (
 )
 
 _APP_DIR = Path(__file__).resolve().parent
-_WATCHLIST_FILE = _APP_DIR / "watchlist.json"
-_PORTFOLIO_FILE = _APP_DIR / "portfolio.csv"
 _SAN_ANTONIO_TZ = pytz.timezone("America/Chicago")
 _MARKET_ET_TZ = pytz.timezone("America/New_York")
 _NARRATIVE_HISTORY_MAX_RECORDS = 40
 _NARRATIVE_HISTORY_RETENTION_DAYS = 14
 _DATA_CACHE_TTL = 3600
 
-fred = Fred(api_key="5983699636e17c1ed733456106d51940")
+def _fred_api_key() -> str:
+    """FRED API 키 — st.secrets 우선 (flat 또는 [fred] 섹션), env 폴백."""
+    try:
+        v = str(st.secrets.get("FRED_API_KEY", "") or "").strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        v = str(st.secrets["fred"]["api_key"]).strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    import os as _os
+    return _os.environ.get("FRED_API_KEY", "").strip()
+
+
+fred = Fred(api_key=_fred_api_key() or None)
 
 # Google GenAI: 로그인 이후 첫 호출 시 secrets에서 키를 읽어 클라이언트를 생성한다.
 _genai_client = None
@@ -10193,28 +10240,6 @@ def check_watchlist_alerts(items: list[dict], price_map: dict, rsi_map: dict, ma
     return triggered
 
 
-def load_watchlist():
-    if not _WATCHLIST_FILE.exists():
-        save_watchlist([])
-        return []
-    try:
-        with open(_WATCHLIST_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if isinstance(raw, list):
-            return raw
-        return []
-    except Exception:
-        return []
-
-
-def save_watchlist(items):
-    try:
-        with open(_WATCHLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
 def _narrative_parse_saved_at_utc(saved_at_str):
     if not saved_at_str:
         return None
@@ -10378,12 +10403,28 @@ def prune_narrative_history_records(records):
 
 
 def load_narrative_history_records():
-    """Narratives 시트에서 현재 user_id 행만 로드. prune 후 해당 사용자 구간만 시트와 동기화."""
+    """Narratives 시트에서 현재 user_id 행만 로드. prune 후 해당 사용자 구간만 시트와 동기화.
+
+    게스트(role != admin)는 관리자(yab) 소유 행을 **읽기 전용**으로 반환한다 —
+    prune/merge-save 경로를 타지 않으므로 게스트 세션이 관리자 데이터를 절대 쓰지 않는다.
+    """
     st.session_state.pop("_narratives_last_sheet_error", None)
     base, err = fetch_narrative_records_from_sheet()
     if err:
         st.session_state["_narratives_last_sheet_error"] = err
         return []
+    if not _is_admin():
+        owner_u = uc.ADMIN_CONTENT_OWNER_ID.upper()
+        theirs = [
+            rec for rec in base
+            if isinstance(rec, dict)
+            and str(rec.get("_sheet_user_id") or "").strip().upper() == owner_u
+        ]
+        # 표시 일관성을 위해 prune 은 메모리에서만 수행 (시트 재기록 없음)
+        try:
+            return prune_narrative_history_records(theirs)
+        except Exception:
+            return theirs
     uid = str(st.session_state.get("user_id") or "").strip()
     uid_u = uid.upper()
     mine = []
@@ -14756,7 +14797,7 @@ if st.session_state.get("logged_in"):
         st.markdown("### 🤖 AI 내일 시장 예측")
         st.caption("선행 신호 8가지(선물·달러·금·섹터 포함) + RSS 최신 뉴스(최대 30개) + 거시지표를 종합해 분석합니다. 장 열리기 전(8AM ET / 한국 밤 10시) 실행 권장.")
 
-        if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True):
+        if st.button("🤖 AI 내일 시장 예측 실행", key="drg_ai_btn", type="primary", use_container_width=True, disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
             with st.spinner("최신 데이터 수집 중..."):
                 # 1) DRG 캐시 강제 갱신 → 신호/뉴스 최신화
                 compute_daily_risk_gauge.clear()
@@ -14928,7 +14969,7 @@ if st.session_state.get("logged_in"):
         st.markdown("## 📊 AI 예측 히스토리 & 적중률")
         st.caption("과거 AI 예측과 실제 시장 결과를 비교합니다. 예측 다음날 이후 '결과 검증' 버튼으로 실제 결과를 확인하세요.")
 
-        _puid_hist = str(st.session_state.get("user_id") or "").strip()
+        _puid_hist = _shared_owner_uid()  # DRG 히스토리는 전역(자동화) 콘텐츠 — 게스트는 관리자 데이터 열람
 
         if st.button("🔄 히스토리 새로고침", key="drg_hist_refresh_btn"):
             st.rerun()
@@ -14974,7 +15015,7 @@ if st.session_state.get("logged_in"):
                     uc1.write(f"📅 **{urow.get('pred_date','')}** | {_u_dir}{_u_tag}")
                     uc2.write(f"벤치마크: {urow.get('benchmark_etf','SPY')} | 섹터: {urow.get('sector_filter','전체')}")
                     with uc3:
-                        if st.button("결과 검증", key=f"verify_{urow.get('pred_date','')}_{_uidx}"):
+                        if st.button("결과 검증", key=f"verify_{urow.get('pred_date','')}_{_uidx}", disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
                             with st.spinner("실제 결과 조회 중..."):
                                 _ad, _ar, _ic = verify_drg_prediction(urow)
                             if _ad:
@@ -15079,7 +15120,7 @@ if st.session_state.get("logged_in"):
 
         _itb_session_key = "invest_today_briefing"
         _itb_ts_key = "invest_today_briefing_ts"
-        _itb_uid = str(st.session_state.get("user_id") or "").strip()
+        _itb_uid = _shared_owner_uid()  # 오늘 아침 예측은 자동화(관리자 소유) 데이터
 
         # ── 입력 데이터 수집 ────────────────────────────────────────────────
         # 1) 오늘 아침 예측
@@ -15122,6 +15163,7 @@ if st.session_state.get("logged_in"):
                 key="invest_today_briefing_btn",
                 use_container_width=True,
                 type="primary",
+                disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다",
             )
         with _itb_reset_col:
             if st.button("🗑️ 초기화", key="invest_today_briefing_reset", use_container_width=True):
@@ -15464,7 +15506,7 @@ if st.session_state.get("logged_in"):
             )
         selected_language = "ko" if language_option == "🇰🇷 한국어" else "en"
     
-        if st.button("🚀 AI 내러티브 엔진 가동 (실시간 뉴스 분석)"):
+        if st.button("🚀 AI 내러티브 엔진 가동 (실시간 뉴스 분석)", disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
             try:
                 with st.status("🚀 AI 내러티브 엔진 가동 프로세스 시작...", expanded=True) as status:
                     st.write("📥 1단계: FMP 멀티레이어 뉴스 파이프라인 수집 중... (Stock News · Press Releases · FMP Articles · General News)")
@@ -15751,7 +15793,7 @@ if st.session_state.get("logged_in"):
         st.divider()
         st.markdown("### 🎯 내러티브 일관성 점수")
         st.caption("최근 14일간 같은 테마/종목이 반복 등장할수록 신뢰도가 높아요. 일관성이 높은 테마에 집중 투자하세요.")
-        _nc_uid = str(st.session_state.get("user_id") or "").strip()
+        _nc_uid = _shared_owner_uid()  # 내러티브 일관성 점수는 전역 내러티브 기준
         nc_data = calculate_narrative_consistency_score(_nc_uid, lookback_days=14)
         if not nc_data:
             st.info("아직 내러티브 기록이 부족해요. 분석을 더 진행하면 일관성 점수가 계산됩니다.")
@@ -15822,7 +15864,7 @@ if st.session_state.get("logged_in"):
                     f"AI가 제시한 **Emerging 종목 {len(all_emerging)}개**를 실제 가격/거래량 데이터로 검증합니다. "
                     "'아직 안 오른 2차 수혜주'를 자동으로 분류해요."
                 )
-                if st.button("🔍 Emerging 종목 검증 실행", key="emerging_verify_btn", type="primary", use_container_width=True):
+                if st.button("🔍 Emerging 종목 검증 실행", key="emerging_verify_btn", type="primary", use_container_width=True, disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
                     with st.spinner(f"Emerging {len(all_emerging)}개 종목 정량 검증 중..."):
                         _v_result = verify_emerging_with_quant(all_emerging)
                     if _v_result:
@@ -15946,11 +15988,11 @@ if st.session_state.get("logged_in"):
         )
         ts_b1, ts_b2, ts_b3 = st.columns(3)
         with ts_b1:
-            btn_daily = st.button("📅 일일 분석 요약 (오늘)", key="narrative_ts_daily", use_container_width=True)
+            btn_daily = st.button("📅 일일 분석 요약 (오늘)", key="narrative_ts_daily", use_container_width=True, disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다")
         with ts_b2:
-            btn_weekly = st.button("📊 주간 트렌드 추출 (최근 7일)", key="narrative_ts_weekly", use_container_width=True)
+            btn_weekly = st.button("📊 주간 트렌드 추출 (최근 7일)", key="narrative_ts_weekly", use_container_width=True, disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다")
         with ts_b3:
-            btn_wow = st.button("⚖️ 트렌드 변곡점 분석 (이번 주 vs 저번 주)", key="narrative_ts_wow", use_container_width=True)
+            btn_wow = st.button("⚖️ 트렌드 변곡점 분석 (이번 주 vs 저번 주)", key="narrative_ts_wow", use_container_width=True, disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다")
     
         def _pack_ts_records(recs, cap=30):
             out = []
@@ -16122,7 +16164,7 @@ if st.session_state.get("logged_in"):
             "심층 분석할 티커 또는 테마를 입력하세요 (예: PLTR, AMD, AI Infrastructure)",
             key="deep_dive_query_input",
         )
-        if st.button("X-Ray 가동", key="deep_dive_run_button"):
+        if st.button("X-Ray 가동", key="deep_dive_run_button", disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
             query = str(deep_dive_query or "").strip()
             if not query:
                 st.warning("티커 또는 키워드를 입력해주세요.")
@@ -16777,7 +16819,7 @@ if st.session_state.get("logged_in"):
 
             manual_col1, manual_col2 = st.columns(2)
             with manual_col1:
-                if st.button("🔍 신규 ETF 지금 스캔", key="etf_manual_scan_btn", use_container_width=True, type="primary"):
+                if st.button("🔍 신규 ETF 지금 스캔", key="etf_manual_scan_btn", use_container_width=True, type="primary", disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
                     with st.spinner("FMP API로 신규 ETF 스캔 중... (약 30초 소요)"):
                         st.session_state["_etf_auto_update_last_run"] = None  # 강제 재실행
                         _m_added, _m_err = run_etf_auto_update_if_needed(silent=False)
@@ -16802,7 +16844,7 @@ if st.session_state.get("logged_in"):
                         st.info("Sheets에 자동 추가된 ETF가 없어요.")
 
             st.caption("🧹 저품질 ETF 자동 정리 조건: 상장 6개월 이상 & AUM $100M 미만 & 30일 평균 거래대금 $1M 미만")
-            if st.button("🧹 저품질 ETF 정리 실행", key="etf_cleanup_btn", use_container_width=True):
+            if st.button("🧹 저품질 ETF 정리 실행", key="etf_cleanup_btn", use_container_width=True, disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
                 with st.spinner("유동성/AUM 기준으로 저품질 ETF 정리 중..."):
                     removed_n, clean_err = cleanup_low_quality_etfs_from_sheet(
                         min_avg_volume_m=1.0, min_aum_m=100.0
@@ -17060,7 +17102,7 @@ if st.session_state.get("logged_in"):
             "⚙️ 추적 ETF 추가·정리는 위의 「🆕 ETF Universe 관리」에서 하세요. "
             "Google Sheets `ETF_Universe` 탭이 기준 소스입니다."
         )
-        if st.button("지금 돈이 몰리는 미지의 ETF 찾기", key="hidden_alpha_radar_btn"):
+        if st.button("지금 돈이 몰리는 미지의 ETF 찾기", key="hidden_alpha_radar_btn", disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
             if not etf_radar_universe:
                 st.warning(
                     "Google Sheets `ETF_Universe` 탭에 등록된 ETF가 없습니다. "
@@ -20640,7 +20682,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             "적중 기준: 내러티브 생성 후 해당 기간 내 **+5% 이상** 상승."
         )
 
-        uid_tracker = str(st.session_state.get("user_id") or "").strip()
+        uid_tracker = _shared_owner_uid()  # 적중률 트래커는 전역 내러티브 기반 — 게스트는 관리자 결과 열람
 
         # 세션 최초 진입 시 Quant_DB 에서 마지막 적중률 분석 결과 복원
         if not st.session_state.get("_accuracy_tracker_restored"):
@@ -20692,6 +20734,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             key="run_accuracy_tracker_btn",
             type="primary",
             use_container_width=True,
+            disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다",
         )
 
         if run_tracker:
@@ -21211,7 +21254,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         st.caption(f"{status_icon} {k}: {v['value']}")
 
             st.markdown("**최근 내러티브 테마**")
-            narr_preview = _build_narrative_context_for_summary(uid_weekly)
+            narr_preview = _build_narrative_context_for_summary(_shared_owner_uid())
             if not narr_preview:
                 st.caption("내러티브 기록 없음")
             else:
@@ -21245,7 +21288,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     portfolio_ctx = _build_portfolio_context_for_summary(sell_radar_weekly)
 
                     st.write("🧠 내러티브 데이터 수집 중...")
-                    narrative_ctx = _build_narrative_context_for_summary(uid_weekly)
+                    narrative_ctx = _build_narrative_context_for_summary(_shared_owner_uid())
 
                     st.write("🌐 거시경제 지표 수집 중...")
                     macro_ctx = _build_macro_context_for_summary()
@@ -21951,7 +21994,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             "같은 종목이 반복 등장할수록 신뢰도 높은 신호예요."
         )
 
-        uid_et = str(st.session_state.get("user_id") or "").strip()
+        uid_et = _shared_owner_uid()  # Emerging 추적은 자동화(관리자 소유) 누적 데이터 열람
 
         with st.spinner("Emerging 추적 기록 불러오는 중..."):
             et_df = load_emerging_tracker(uid_et)
@@ -22083,7 +22126,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 options=[""] + et_df["Ticker"].tolist(),
                 key="et_del_select"
             )
-            if del_ticker and st.button("🗑️ 선택 종목 삭제", key="et_del_btn"):
+            if del_ticker and st.button("🗑️ 선택 종목 삭제", key="et_del_btn", disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
                 ok_del, err_del = delete_emerging_tracker_row(uid_et, del_ticker)
                 if ok_del:
                     st.success(f"✅ {del_ticker} 삭제 완료")
@@ -22726,6 +22769,113 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                 "**앱 버전:** v3.0 (2026-07) | "
                 "**Tech Stack:** Streamlit · Google Sheets · FMP stable · Gemini 2.5 Flash · GitHub Actions"
             )
+    elif main_nav == _MAIN_NAV_OPTIONS[14]:
+        # ─────────────────────────────────────────────────────────────────────
+        # ⚙️ 내 설정 — 이메일/알림 수신/비밀번호를 본인이 직접 관리
+        # 자동화 스크립트는 매 실행 시 Users 시트를 새로 읽으므로,
+        # 여기서 저장하면 다음 발송분부터 자동 반영된다.
+        # ─────────────────────────────────────────────────────────────────────
+        st.subheader("⚙️ 내 설정")
+        _set_uid = str(st.session_state.get("user_id") or "").strip()
+        _truthy_set = lambda v: str(v or "").strip().lower() in ("y", "yes", "true", "1", "on")
+        ws_set, err_set = open_users_worksheet()
+        if err_set:
+            st.error(err_set)
+        elif not _set_uid:
+            st.warning("로그인 정보가 없습니다.")
+        else:
+            ensure_users_header_row(ws_set)
+            df_set = fetch_users_dataframe(ws_set)
+            _row_set = None
+            if not df_set.empty:
+                _m_set = df_set[df_set["ID"].astype(str).str.strip().str.upper() == _set_uid.upper()]
+                if not _m_set.empty:
+                    _row_set = _m_set.iloc[0]
+
+            if _row_set is None:
+                st.info(f"Users 시트에 **{_set_uid}** 계정 행이 없습니다. (admin 백도어 로그인 상태)")
+                if _is_admin():
+                    st.caption("아래에서 계정 행을 생성하면 이메일 알림 설정을 사용할 수 있습니다.")
+                    with st.form("create_my_row_form", clear_on_submit=True):
+                        mk_email = st.text_input("이메일 주소")
+                        mk_pw = st.text_input("비밀번호 (시트 로그인용)", type="password")
+                        mk_submit = st.form_submit_button("내 계정 행 생성", type="primary", use_container_width=True)
+                    if mk_submit:
+                        _mk_email = str(mk_email or "").strip()
+                        _mk_pw = str(mk_pw or "").strip()
+                        if not _mk_pw or len(_mk_pw) < 6:
+                            st.error("비밀번호는 6자 이상이어야 합니다.")
+                        elif not _mk_email or "@" not in _mk_email:
+                            st.error("올바른 이메일 주소를 입력하세요.")
+                        else:
+                            _safe_append_rows(
+                                ws_set,
+                                [_set_uid, uc.hash_password(_mk_pw), "admin", "self", "approved",
+                                 _mk_email, "Y", "Y"],
+                                value_input_option="USER_ENTERED",
+                            )
+                            st.success("계정 행이 생성되었습니다. 페이지를 새로고침하세요.")
+                            st.rerun()
+            else:
+                st.caption(f"로그인 계정: **{_set_uid}**")
+
+                # ── 이메일 알림 설정 ─────────────────────────────────────────
+                st.markdown("### 📬 이메일 알림")
+                with st.form("my_settings_form"):
+                    ns_email = st.text_input("이메일 주소", value=str(_row_set.get("Email", "")).strip())
+                    ns_radar = st.checkbox(
+                        "📡 매매 레이더 수신 — 내 Watchlist·보유 종목의 매수/매도 신호",
+                        value=_truthy_set(_row_set.get("Alert_Radar", "")),
+                    )
+                    ns_global = st.checkbox(
+                        "🌐 시장 브리핑 수신 — AI 시장 내러티브 · 거시 방향 예측(DRG)",
+                        value=_truthy_set(_row_set.get("Alert_Global", "")),
+                    )
+                    ns_submit = st.form_submit_button("알림 설정 저장", type="primary", use_container_width=True)
+                if ns_submit:
+                    _ns_email = str(ns_email or "").strip()
+                    if (ns_radar or ns_global) and (not _ns_email or "@" not in _ns_email):
+                        st.error("이메일 알림을 받으려면 올바른 이메일 주소를 입력하세요.")
+                    else:
+                        ok_ns, err_ns = uc.update_user_fields(ws_set, _set_uid, {
+                            "Email": _ns_email,
+                            "Alert_Radar": "Y" if ns_radar else "N",
+                            "Alert_Global": "Y" if ns_global else "N",
+                        })
+                        if ok_ns:
+                            st.success("저장되었습니다. 다음 발송분부터 반영됩니다.")
+                        else:
+                            st.error(err_ns)
+
+                st.divider()
+
+                # ── 비밀번호 변경 ────────────────────────────────────────────
+                st.markdown("### 🔑 비밀번호 변경")
+                with st.form("my_pw_form", clear_on_submit=True):
+                    pw_cur = st.text_input("현재 비밀번호", type="password")
+                    pw_new = st.text_input("새 비밀번호 (6자 이상)", type="password")
+                    pw_new2 = st.text_input("새 비밀번호 확인", type="password")
+                    pw_submit = st.form_submit_button("비밀번호 변경", use_container_width=True)
+                if pw_submit:
+                    _cur = str(pw_cur or "").strip()
+                    _new = str(pw_new or "").strip()
+                    _new2 = str(pw_new2 or "").strip()
+                    _cur_ok, _ = uc.verify_password(_cur, str(_row_set.get("Password", "")))
+                    if not _cur_ok:
+                        st.error("현재 비밀번호가 올바르지 않습니다.")
+                    elif len(_new) < 6:
+                        st.error("새 비밀번호는 6자 이상이어야 합니다.")
+                    elif _new != _new2:
+                        st.error("새 비밀번호가 서로 일치하지 않습니다.")
+                    else:
+                        ok_pw, err_pw = uc.update_user_fields(
+                            ws_set, _set_uid, {"Password": uc.hash_password(_new)}
+                        )
+                        if ok_pw:
+                            st.success("비밀번호가 변경되었습니다. 다음 로그인부터 적용됩니다.")
+                        else:
+                            st.error(err_pw)
+
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
         st.caption(
@@ -22735,6 +22885,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
         if err:
             st.error(err)
         else:
+            ensure_users_header_row(ws)
             df_users = fetch_users_dataframe(ws)
             _status_opts = ["pending", "approved", "rejected"]
             if "Status" in df_users.columns:
@@ -22751,8 +22902,10 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                 else 0
             )
             st.caption(f"현재 **{len(df_users)}**명 행 · pending **{_pending_n}**")
+            # Password(해시)는 편집 화면에서 숨김 — 저장 시 원본 값을 그대로 되살린다.
+            _display_cols = [c for c in _USER_SHEET_COLS if c != "Password"]
             edited_df = st.data_editor(
-                df_users,
+                df_users[_display_cols],
                 num_rows="fixed",
                 use_container_width=True,
                 hide_index=True,
@@ -22767,9 +22920,33 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                 },
             )
             if st.button("변경사항 DB에 저장", key="admin_save_users_sheet_btn", type="primary", use_container_width=True):
-                ok_save, msg_save = save_users_worksheet_from_df(edited_df)
+                _full_df = edited_df.copy()
+                _full_df.insert(1, "Password", df_users["Password"].astype(str).values)
+                ok_save, msg_save = save_users_worksheet_from_df(_full_df)
                 if ok_save:
                     st.success("Users 시트가 업데이트되었습니다.")
                     st.rerun()
                 else:
                     st.error(msg_save)
+
+            # ── 🔑 임시 비밀번호 발급 (비번 분실 대응) ─────────────────────────
+            st.divider()
+            st.markdown("### 🔑 임시 비밀번호 발급")
+            st.caption(
+                "비밀번호를 잊은 사용자를 위해 임시 비밀번호를 발급합니다. "
+                "발급 즉시 해당 계정의 비밀번호가 교체되며(시트에는 해시만 저장), "
+                "임시 비밀번호를 본인에게 전달한 뒤 ⚙️ 내 설정에서 변경하도록 안내하세요."
+            )
+            _tp_ids = df_users["ID"].astype(str).str.strip().tolist() if not df_users.empty else []
+            if _tp_ids:
+                _tp_sel = st.selectbox("대상 계정", _tp_ids, key="admin_temp_pw_user_sel")
+                if st.button("임시 비밀번호 발급", key="admin_temp_pw_btn", use_container_width=True):
+                    _tp_new = uc.gen_temp_password()
+                    ok_tp, err_tp = uc.update_user_fields(ws, _tp_sel, {"Password": uc.hash_password(_tp_new)})
+                    if ok_tp:
+                        st.success(f"**{_tp_sel}** 임시 비밀번호: `{_tp_new}`")
+                        st.warning("이 값은 지금 한 번만 표시됩니다. 본인에게 전달 후 즉시 변경을 안내하세요.")
+                    else:
+                        st.error(err_tp)
+            else:
+                st.caption("등록된 사용자가 없습니다.")
