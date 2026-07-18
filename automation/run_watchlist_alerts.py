@@ -36,6 +36,7 @@ from google.oauth2.service_account import Credentials
 # ── repo root 를 sys.path 에 추가 → regime_core(app.py와 동일 모듈) import ──────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import regime_core as rc  # noqa: E402
+import users_core as uc   # noqa: E402  — Users 시트/수신자 SSOT (app.py와 동일 모듈)
 
 # ── 환경변수 ───────────────────────────────────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -164,21 +165,76 @@ def _with_intraday_price(hist: pd.DataFrame, live_price) -> pd.DataFrame:
 
 
 # ── 이메일 ─────────────────────────────────────────────────────────────────────
-def send_email(subject: str, html_body: str) -> bool:
+def send_email(subject: str, html_body: str, to_addr: str | None = None) -> bool:
+    """단일 수신자 발송. to_addr 미지정 시 GMAIL_TO(관리자)."""
+    _to = str(to_addr or GMAIL_TO).strip()
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = GMAIL_USER
-        msg["To"] = GMAIL_TO
+        msg["To"] = _to
         msg.attach(MIMEText(html_body, "html", "utf-8"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, GMAIL_TO, msg.as_string())
-        print(f"[OK] 이메일 발송 완료 → {GMAIL_TO}")
+            server.sendmail(GMAIL_USER, _to, msg.as_string())
+        print(f"[OK] 이메일 발송 완료 → {_to}")
         return True
     except Exception as e:
-        print(f"[ERROR] 이메일 발송 실패: {e}")
+        print(f"[ERROR] 이메일 발송 실패({_to}): {e}")
         return False
+
+
+def _radar_recipients() -> list[tuple[str, str]]:
+    """Users 시트에서 매매 레이더 수신자 [(uid, email)] 조회. 실패 시 빈 목록(관리자 발송은 영향 없음)."""
+    try:
+        gc = get_gspread_client()
+        ws = gc.open(_SPREADSHEET_TITLE).worksheet("Users")
+        return uc.get_recipients(ws, "radar")
+    except Exception as e:
+        print(f"[WARN] Users 수신자 조회 실패 — 관리자 메일만 발송: {e}")
+        return []
+
+
+def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
+                          subject_emoji: str, subject_label: str,
+                          banner_html: str = "") -> None:
+    """레이더 이메일 발송 오케스트레이션.
+
+    1) 관리자(GMAIL_TO): 전 유저 합본 — 기존 동작 유지 (모니터링 목적).
+    2) 유저별: 본인 섹션만 담은 개별 메일. 실패는 유저 단위 격리(다음 유저 진행).
+       관리자 소유 uid / GMAIL_TO 와 동일한 이메일은 합본과 중복이므로 건너뜀.
+    """
+    wl_res = wl_res or {}
+    pf_res = pf_res or {}
+    total = (sum(len(v) for v in wl_res.values())
+             + sum(len(v) for v in pf_res.values()))
+    if not total:
+        print("[INFO] 발동/활성 건 없음 — 이메일 생략.")
+        return
+
+    # 1) 관리자 합본
+    send_email(f"{subject_emoji} {subject_label} — {total}건 ({today} ET)",
+               banner_html + build_email_html(wl_res, pf_res, today))
+
+    # 2) 유저별 개별 발송
+    _admin_uid_u = str(uc.ADMIN_CONTENT_OWNER_ID).strip().upper()
+    _admin_email_l = str(GMAIL_TO).strip().lower()
+    for _uid, _email in _radar_recipients():
+        try:
+            _uid_s = str(_uid).strip()
+            if _uid_s.upper() == _admin_uid_u or str(_email).strip().lower() == _admin_email_l:
+                continue  # 관리자는 합본으로 이미 수신
+            _wl_u = {_uid_s: wl_res[_uid_s]} if wl_res.get(_uid_s) else {}
+            _pf_u = {_uid_s: pf_res[_uid_s]} if pf_res.get(_uid_s) else {}
+            _n_u = (sum(len(v) for v in _wl_u.values())
+                    + sum(len(v) for v in _pf_u.values()))
+            if not _n_u:
+                continue  # 이 유저에게 발동된 건 없음
+            send_email(f"{subject_emoji} {subject_label} — {_n_u}건 ({today} ET)",
+                       banner_html + build_email_html(_wl_u, _pf_u, today),
+                       to_addr=_email)
+        except Exception as e:
+            print(f"[WARN] {_uid} 개별 발송 실패(다음 유저 진행): {e}")
 
 
 _REGIME_KR = {"strong": "🟢 강세(대장주)", "sideways": "🟡 횡보", "weak": "🔴 약세"}
@@ -615,10 +671,11 @@ def main():
             total = (sum(len(v) for v in wl_res.values())
                      + sum(len(v) for v in pf_res.values()))
             if total:
-                html = ("<p style='background:#fff8e1;padding:8px;border-radius:6px;color:#8a6d00'>"
-                        "⏱️ <b>장중 잠정 신호</b> — 진행 중인 봉 기준이라 마감까지 바뀔 수 있습니다. "
-                        "분할 매수/청산 참고용.</p>") + build_email_html(wl_res, pf_res, today)
-                send_email(f"⏱️ [장중] 후보 — {total}건 ({today} ET)", html)
+                _banner = ("<p style='background:#fff8e1;padding:8px;border-radius:6px;color:#8a6d00'>"
+                           "⏱️ <b>장중 잠정 신호</b> — 진행 중인 봉 기준이라 마감까지 바뀔 수 있습니다. "
+                           "분할 매수/청산 참고용.</p>")
+                dispatch_radar_emails(wl_res, pf_res, today,
+                                      "⏱️", "[장중] 후보", banner_html=_banner)
             else:
                 print("[INFO] 장중 활성 후보 없음 — 이메일 생략.")
         else:
@@ -630,8 +687,7 @@ def main():
             total = (sum(len(v) for v in wl_res.values())
                      + sum(len(v) for v in pf_res.values()))
             if total:
-                send_email(f"🔔 매매 레이더 — {total}건 ({today} ET)",
-                           build_email_html(wl_res, pf_res, today))
+                dispatch_radar_emails(wl_res, pf_res, today, "🔔", "매매 레이더")
             else:
                 print("[INFO] 발동된 알림 없음 — 이메일 생략.")
     except Exception as e:

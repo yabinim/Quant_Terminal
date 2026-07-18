@@ -30,6 +30,7 @@ from fredapi import Fred
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import narrative_core
 import gemini_core
+import users_core as uc  # Users 시트/수신자 SSOT
 
 # ── 환경변수 로드 ──────────────────────────────────────────────────────────────
 GOOGLE_API_KEY   = os.environ["GOOGLE_API_KEY"]
@@ -763,23 +764,50 @@ def build_email_html(analysis: dict, news_count: int, fred_releases: list[str], 
 </body></html>"""
 
 
-def send_email(subject: str, html_body: str) -> bool:
-    """Gmail SMTP로 HTML 이메일 발송."""
+def _send_email_one(subject: str, html_body: str, to_addr: str) -> bool:
+    """단일 수신자 발송."""
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = GMAIL_USER
-        msg["To"]      = GMAIL_TO
+        msg["To"]      = to_addr
         msg.attach(MIMEText(html_body, "html", "utf-8"))
-
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, GMAIL_TO, msg.as_string())
-        print(f"[OK] 이메일 발송 완료 → {GMAIL_TO}")
+            server.sendmail(GMAIL_USER, to_addr, msg.as_string())
+        print(f"[OK] 이메일 발송 완료 → {to_addr}")
         return True
     except Exception as e:
-        print(f"[ERROR] 이메일 발송 실패: {e}")
+        print(f"[ERROR] 이메일 발송 실패({to_addr}): {e}")
         return False
+
+
+def _global_recipients() -> list[tuple[str, str]]:
+    """Users 시트에서 시장 브리핑(Alert_Global) 수신자 조회. 실패 시 빈 목록."""
+    try:
+        gc = get_gspread_client()
+        ws = gc.open(_SPREADSHEET_TITLE).worksheet("Users")
+        return uc.get_recipients(ws, "global")
+    except Exception as e:
+        print(f"[WARN] Users 수신자 조회 실패 — 관리자 메일만 발송: {e}")
+        return []
+
+
+def send_email(subject: str, html_body: str) -> bool:
+    """전역 브리핑 브로드캐스트: 관리자(GMAIL_TO) + Alert_Global ON 유저 전원에게 동일 본문 발송.
+
+    관리자 발송이 기준 성공값이며, 유저별 실패는 격리(다음 수신자 진행).
+    """
+    ok_admin = _send_email_one(subject, html_body, GMAIL_TO)
+    _admin_l = str(GMAIL_TO).strip().lower()
+    for _uid, _email in _global_recipients():
+        try:
+            if str(_email).strip().lower() == _admin_l:
+                continue  # 관리자 중복 방지
+            _send_email_one(subject, html_body, str(_email).strip())
+        except Exception as e:
+            print(f"[WARN] {_uid} 발송 실패(다음 수신자 진행): {e}")
+    return ok_admin
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
