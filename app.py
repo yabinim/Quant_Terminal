@@ -17093,72 +17093,6 @@ if st.session_state.get("logged_in"):
                 if missing_cells > 0:
                     st.caption("일부 ETF는 거래일 부족 또는 데이터 누락으로 일부 기간 수익률이 N/A로 표시됩니다.")
 
-                # ── 🛰️ 위성 섹터 Top10 (월간 리밸런싱 후보 · SSOT: fmp_extras) ──
-                st.divider()
-                st.markdown("#### 🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보")
-                st.caption(
-                    "점수 = 1M×40% + 3M×40% + 6M×20% (1주는 노이즈 — 표시만) · GICS 섹터당 1개 · "
-                    "중복 % = 구성종목 상위 15개 교집합 · 주말 Hidden Alpha 이메일에도 동일 리스트 포함"
-                )
-                _sat = None
-                try:
-                    with st.spinner("위성 후보 풀 수익률 계산 중... (약 60개 ETF · 첫 계산은 1~2분, 이후 1시간 캐시)"):
-                        _sat = cached_satellite_top10()
-                except Exception as _sat_exc:
-                    st.warning(f"위성 Top10 계산 실패: {_sat_exc} — 잠시 후 새로고침해 주세요.")
-                if _sat and _sat.get("rows"):
-                    _mf = _sat.get("market_filter")
-                    if _mf:
-                        if _mf.get("risk_on"):
-                            st.success(
-                                f"🚦 시장 필터: SPY ${_mf['spy']:,} > 200일선 ${_mf['ma200']:,} — "
-                                f"**위성 정상 운용 구간** (월간 리밸런싱 룰 유지)"
-                            )
-                        else:
-                            st.error(
-                                f"🚦 시장 필터: SPY ${_mf['spy']:,} < 200일선 ${_mf['ma200']:,} — "
-                                f"**⛔ 위성 신규 매수 중단·비중 축소 룰 발동** (합의된 수동 급락장 필터)"
-                            )
-                    else:
-                        st.caption("🚦 시장 필터: SPY 데이터 미확보 — 판단 유보")
-                    for _r in _sat["rows"]:
-                        _theme = f" · {_r['theme_label']}" if _r.get("theme_label") else ""
-                        _r1w = f" (1W {_r['r1w']:+.1f}%)" if _r.get("r1w") is not None else ""
-                        st.markdown(
-                            f"**{_r['rank']}위 {_r['ticker']}** — {_r['sector_label']}{_theme} · "
-                            f"점수 **{_r['score']:+.1f}** | 1M {_r['r1m']:+.1f}% · 3M {_r['r3m']:+.1f}% · "
-                            f"6M {_r['r6m']:+.1f}%{_r1w}"
-                        )
-                        if _r.get("overlaps"):
-                            _ov = " · ".join(
-                                f"{fx.overlap_grade(p)} {t} {p:.0f}%" for t, p in _r["overlaps"]
-                            )
-                            st.caption(f"　중복: {_ov}")
-                        else:
-                            st.caption("　중복: 🟢 없음 (10%↑ 기준)")
-                    with st.expander("전체 중복 매트릭스 (모든 쌍)", expanded=False):
-                        _tks = [r["ticker"] for r in _sat["rows"]]
-                        _mx = pd.DataFrame(index=_tks, columns=_tks, dtype=float)
-                        for _k, _v in (_sat.get("matrix") or {}).items():
-                            _a, _b = _k.split("|")
-                            if _a in _mx.index and _b in _mx.columns:
-                                _mx.loc[_a, _b] = _v
-                                _mx.loc[_b, _a] = _v
-                        st.dataframe(
-                            _mx.style.format("{:.0f}%", na_rep="—")
-                            .background_gradient(cmap="RdYlGn_r", vmin=0, vmax=60),
-                            use_container_width=True,
-                        )
-                    if _sat.get("skipped"):
-                        st.caption(
-                            "제외된 후보 "
-                            + ", ".join(f"{t}({why})" for t, why in _sat["skipped"][:8])
-                            + (" …" if len(_sat["skipped"]) > 8 else "")
-                        )
-                    st.caption(f"기준 시각: {_sat.get('as_of', '')}")
-                elif _sat is not None:
-                    st.warning("위성 후보 데이터를 산출하지 못했습니다 — FMP 키/네트워크 확인 후 재시도.")
-
                 # ── 드릴다운: 섹터 → 테마 ETF → 주도주·저평가 후발주 ──
                 st.divider()
                 st.markdown("#### 🔬 섹터 → 테마 ETF → 종목 드릴다운")
@@ -17244,6 +17178,72 @@ if st.session_state.get("logged_in"):
                     "🚀 주도주는 추세에 올라타고, 💎 저평가 후발주는 2·3차 수혜를 노리는 종목입니다. "
                     f"티커를 사이드바에 입력한 뒤 「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털·매수 타점을 확인하세요."
                 )
+
+                # ── 🛰️ 위성 섹터 Top10 (월간 리밸런싱 후보 · SSOT: fmp_extras) ──
+                st.divider()
+                st.markdown("#### 🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보")
+                st.caption(
+                    "점수 = 1M×40% + 3M×40% + 6M×20% (1주는 노이즈 — 표시만) · GICS 섹터당 1개 · "
+                    "중복 % = 구성종목 상위 15개 교집합 · 주말 Hidden Alpha 이메일에도 동일 리스트 포함"
+                )
+                _sat = None
+                try:
+                    with st.spinner("위성 후보 풀 수익률 계산 중... (약 60개 ETF · 첫 계산은 1~2분, 이후 1시간 캐시)"):
+                        _sat = cached_satellite_top10()
+                except Exception as _sat_exc:
+                    st.warning(f"위성 Top10 계산 실패: {_sat_exc} — 잠시 후 새로고침해 주세요.")
+                if _sat and _sat.get("rows"):
+                    _mf = _sat.get("market_filter")
+                    if _mf:
+                        if _mf.get("risk_on"):
+                            st.success(
+                                f"🚦 시장 필터: SPY ${_mf['spy']:,} > 200일선 ${_mf['ma200']:,} — "
+                                f"**위성 정상 운용 구간** (월간 리밸런싱 룰 유지)"
+                            )
+                        else:
+                            st.error(
+                                f"🚦 시장 필터: SPY ${_mf['spy']:,} < 200일선 ${_mf['ma200']:,} — "
+                                f"**⛔ 위성 신규 매수 중단·비중 축소 룰 발동** (합의된 수동 급락장 필터)"
+                            )
+                    else:
+                        st.caption("🚦 시장 필터: SPY 데이터 미확보 — 판단 유보")
+                    for _r in _sat["rows"]:
+                        _theme = f" · {_r['theme_label']}" if _r.get("theme_label") else ""
+                        _r1w = f" (1W {_r['r1w']:+.1f}%)" if _r.get("r1w") is not None else ""
+                        st.markdown(
+                            f"**{_r['rank']}위 {_r['ticker']}** — {_r['sector_label']}{_theme} · "
+                            f"점수 **{_r['score']:+.1f}** | 1M {_r['r1m']:+.1f}% · 3M {_r['r3m']:+.1f}% · "
+                            f"6M {_r['r6m']:+.1f}%{_r1w}"
+                        )
+                        if _r.get("overlaps"):
+                            _ov = " · ".join(
+                                f"{fx.overlap_grade(p)} {t} {p:.0f}%" for t, p in _r["overlaps"]
+                            )
+                            st.caption(f"　중복: {_ov}")
+                        else:
+                            st.caption("　중복: 🟢 없음 (10%↑ 기준)")
+                    with st.expander("전체 중복 매트릭스 (모든 쌍)", expanded=False):
+                        _tks = [r["ticker"] for r in _sat["rows"]]
+                        _mx = pd.DataFrame(index=_tks, columns=_tks, dtype=float)
+                        for _k, _v in (_sat.get("matrix") or {}).items():
+                            _a, _b = _k.split("|")
+                            if _a in _mx.index and _b in _mx.columns:
+                                _mx.loc[_a, _b] = _v
+                                _mx.loc[_b, _a] = _v
+                        st.dataframe(
+                            _mx.style.format("{:.0f}%", na_rep="—")
+                            .background_gradient(cmap="RdYlGn_r", vmin=0, vmax=60),
+                            use_container_width=True,
+                        )
+                    if _sat.get("skipped"):
+                        st.caption(
+                            "제외된 후보 "
+                            + ", ".join(f"{t}({why})" for t, why in _sat["skipped"][:8])
+                            + (" …" if len(_sat["skipped"]) > 8 else "")
+                        )
+                    st.caption(f"기준 시각: {_sat.get('as_of', '')}")
+                elif _sat is not None:
+                    st.warning("위성 후보 데이터를 산출하지 못했습니다 — FMP 키/네트워크 확인 후 재시도.")
 
         except Exception as e:
             st.error("섹터 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
