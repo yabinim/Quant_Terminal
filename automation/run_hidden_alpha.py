@@ -139,18 +139,32 @@ def open_etf_universe_worksheet(gc):
 
 
 def load_universe_tickers(ws) -> list[str]:
-    """ETF_Universe 시트 A열에서 누적 티커 전체 로드 (헤더 제외, 중복 제거)."""
+    """ETF_Universe 시트에서 누적 티커 로드 (헤더 제외, 중복 제거)
+    + 로테이션 정책 필터 (fmp_extras SSOT: 인버스/레버리지 제외).
+
+    필터 후 남는 티커로만 랭킹하므로 Top 5 는 자동으로 다음 순위가 채운다.
+    app.py 의 [2단계] 유니버스 랭킹도 동일 필터 — 이메일과 앱 화면이 항상 일치.
+    """
     try:
         vals = ws.get_all_values()
         if not vals or len(vals) < 2:
             return []
-        tickers, seen = [], set()
+        pairs, seen = [], set()
         for r in vals[1:]:
-            tk = str((r + [""])[0]).strip().upper()
+            row = r + ["", ""]
+            tk = str(row[0]).strip().upper()
+            nm = str(row[1]).strip()
             if tk and tk not in seen:
                 seen.add(tk)
-                tickers.append(tk)
-        return tickers
+                pairs.append((tk, nm))
+        if fx is not None:
+            kept, excluded = fx.filter_rotation_universe(pairs)
+            if excluded:
+                print(f"[INFO] 로테이션 정책 제외 {len(excluded)}개 (인버스/레버리지): "
+                      + ", ".join(excluded[:12])
+                      + (" ..." if len(excluded) > 12 else ""))
+            return kept
+        return [tk for tk, _ in pairs]
     except Exception:
         return []
 
@@ -317,6 +331,10 @@ def discover_and_add_new_etfs(ws) -> int:
         for etf in filtered:
             tk = etf["ticker"]
             if tk in existing_tickers:
+                continue
+            # 로테이션 정책 (fmp_extras SSOT): 인버스/레버리지는 애초에 유니버스에 추가하지 않음
+            if fx is not None and fx.is_rotation_excluded(tk, etf.get("name", "")):
+                print(f"[INFO] 신규 발견 스킵 (인버스/레버리지): {tk} — {etf.get('name','')[:50]}")
                 continue
             rows_to_add.append([tk, etf.get("name", ""), etf.get("category", ""),
                                 etf.get("aum_m", ""), added_date, "FMP_AUTO"])
