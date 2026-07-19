@@ -724,3 +724,103 @@ def overlap_grade(pct: float) -> str:
     if pct >= 25:
         return "🟡"
     return "🟢"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 레버리지/인버스 ETF 판별 SSOT — app.py · run_hidden_alpha.py 공용
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hidden Alpha 로테이션 유니버스 필터 정책 (2026-07 확정):
+#   - 인버스(음수 배수)  : 제외 확정 — 롱 모멘텀 로테이션과 구조적으로 상충
+#   - 레버리지 롱(>1배)  : 제외가 디폴트 — 실전 운용 관행 코드화.
+#                          Signal_Backtest 플래그 on/off 비교로 최종 판정 예정.
+# 두 플래그는 app.py 랭킹과 run_hidden_alpha.py 이메일이 반드시 같은 값을 공유한다.
+EXCLUDE_INVERSE: bool = True          # 인버스(-1x 포함) 로테이션 제외
+EXCLUDE_LEVERAGED_LONG: bool = True   # 레버리지 롱(2x/3x/1.5x) 로테이션 제외
+
+import re as _re
+
+# 알려진 레버리지/인버스 ETF → 배수 매핑. 양수=레버리지 롱, 음수=인버스.
+# 유니버스(미국 상장 ETF) 위주라 이 매핑이 이름 파싱보다 정확하다.
+LEVERAGED_ETF_MAP = {
+    # ── 3x 롱 ──
+    "TQQQ": 3, "UPRO": 3, "SPXL": 3, "SOXL": 3, "TECL": 3, "FAS": 3,
+    "TNA": 3, "LABU": 3, "UDOW": 3, "WEBL": 3, "FNGU": 3, "BULZ": 3,
+    "NAIL": 3, "DPST": 3, "RETL": 3, "DFEN": 3, "CURE": 3, "DRN": 3,
+    "GUSH": 3, "ERX": 3, "YINN": 3, "TPOR": 3, "UTSL": 3, "MIDU": 3,
+    "URTY": 3, "TMF": 3, "DUST": 3, "JNUG": 3, "NUGT": 3, "USD": 3,
+    # ── 2x 롱 ──
+    "QLD": 2, "SSO": 2, "DDM": 2, "ROM": 2, "UWM": 2, "SAA": 2,
+    "USD2X": 2, "NVDL": 2, "TSLL": 2, "AAPU": 2, "MSFU": 2, "GGLL": 2,
+    "AMZU": 2, "FBL": 2, "NVDU": 2, "CONL": 2, "UYG": 2, "ROKT": 2,
+    "BITX": 2, "BITU": 2, "ETHT": 2, "AGQ": 2, "UGL": 2, "BOIL": 2,
+    "UCO": 2,
+    # ── 1.5x ──
+    "TSLR": 1.5,
+    # ── 인버스 ──
+    "SQQQ": -3, "SPXU": -3, "SOXS": -3, "TECS": -3, "FAZ": -3,
+    "TZA": -3, "LABD": -3, "SDOW": -3, "WEBS": -3, "YANG": -3,
+    "DRV": -3, "ERY": -3, "JDST": -3, "DGAZ": -3, "KOLD": -3, "SCO": -3,
+    "SDS": -2, "QID": -2, "DXD": -2, "TWM": -2, "SKF": -2,
+    "SH": -1, "PSQ": -1, "DOG": -1, "RWM": -1, "EUM": -1,
+}
+
+# 이름 문자열 보조 추정용 (매핑에 없을 때만): 배수 크기와 인버스 방향을 따로 판별.
+_LEV_MAG_3X = _re.compile(r"\b3X\b|ULTRAPRO|TRIPLE", _re.I)
+_LEV_MAG_2X = _re.compile(r"\b2X\b|\bULTRA\b|DOUBLE", _re.I)
+_LEV_MAG_15 = _re.compile(r"\b1\.5X\b", _re.I)
+_LEV_INVERSE = _re.compile(r"INVERSE|SHORT|BEAR", _re.I)
+# 'SHORT'의 채권 만기 표현 오탐 방지 (Short-Term Treasury 등)
+_LEV_SHORT_FALSE_POS = _re.compile(r"SHORT[\s\-]?(TERM|DURATION|MATURITY)", _re.I)
+
+
+def get_leverage_multiplier(ticker: str, name: str = "") -> float | None:
+    """티커(필요시 이름)로 레버리지 배수를 반환. 일반 ETF/주식이면 None.
+    양수=레버리지 롱, 음수=인버스."""
+    t = str(ticker).strip().upper()
+    if t in LEVERAGED_ETF_MAP:
+        return LEVERAGED_ETF_MAP[t]
+    if name:
+        n = str(name)
+        if _LEV_MAG_3X.search(n):
+            mag = 3.0
+        elif _LEV_MAG_2X.search(n):
+            mag = 2.0
+        elif _LEV_MAG_15.search(n):
+            mag = 1.5
+        else:
+            mag = None
+        is_inverse = bool(_LEV_INVERSE.search(n)) and not _LEV_SHORT_FALSE_POS.search(n)
+        if mag is not None:
+            return -mag if is_inverse else mag
+        if is_inverse:
+            return -1.0  # 배수 명시 없는 단순 인버스(-1x)
+    return None
+
+
+def is_rotation_excluded(ticker: str, name: str = "") -> bool:
+    """Hidden Alpha 로테이션 유니버스에서 제외 대상인지 (플래그 정책 적용)."""
+    m = get_leverage_multiplier(ticker, name)
+    if m is None:
+        return False
+    if m < 0:
+        return EXCLUDE_INVERSE
+    if m > 1:
+        return EXCLUDE_LEVERAGED_LONG
+    return False
+
+
+def filter_rotation_universe(pairs: list) -> tuple[list, list]:
+    """(ticker, name) 쌍 목록 → (유지 티커 목록, 제외 티커 목록).
+
+    name 이 없는 항목은 빈 문자열로 취급 (티커 매핑만으로 판별).
+    """
+    kept, excluded = [], []
+    for item in pairs:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            tk, nm = str(item[0]).strip().upper(), str(item[1] or "")
+        else:
+            tk, nm = str(item).strip().upper(), ""
+        if not tk:
+            continue
+        (excluded if is_rotation_excluded(tk, nm) else kept).append(tk)
+    return kept, excluded

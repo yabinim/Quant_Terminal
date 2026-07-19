@@ -9275,65 +9275,21 @@ def load_etf_universe_tickers_merged() -> list[str]:
         if tk and tk not in seen:
             seen.add(tk)
             merged.append(tk)
-    return merged
+    # 로테이션 정책 필터 (fmp_extras SSOT): 인버스/레버리지 제외 —
+    # run_hidden_alpha.py 이메일 랭킹과 동일한 유니버스 보장
+    try:
+        _nm_map = _fmp_etf_symbol_name_map()
+    except Exception:
+        _nm_map = {}
+    kept, _excluded = fx.filter_rotation_universe([(t, _nm_map.get(t, "")) for t in merged])
+    return kept
 
 
-# 알려진 레버리지/인버스 ETF → 배수 매핑. 양수=레버리지, 음수=인버스.
-# 유니버스(미국 상장 ETF) 위주라 이 매핑이 이름 파싱보다 정확하다.
-_LEVERAGED_ETF_MAP = {
-    # ── 3x 롱 ──
-    "TQQQ": 3, "UPRO": 3, "SPXL": 3, "SOXL": 3, "TECL": 3, "FAS": 3,
-    "TNA": 3, "LABU": 3, "UDOW": 3, "WEBL": 3, "FNGU": 3, "BULZ": 3,
-    "NAIL": 3, "DPST": 3, "RETL": 3, "DFEN": 3, "CURE": 3, "DRN": 3,
-    "GUSH": 3, "ERX": 3, "YINN": 3, "TPOR": 3, "UTSL": 3, "MIDU": 3,
-    "URTY": 3, "TMF": 3, "DUST": 3, "JNUG": 3, "NUGT": 3, "USD": 3,
-    # ── 2x 롱 ──
-    "QLD": 2, "SSO": 2, "DDM": 2, "ROM": 2, "UWM": 2, "SAA": 2,
-    "USD2X": 2, "NVDL": 2, "TSLL": 2, "AAPU": 2, "MSFU": 2, "GGLL": 2,
-    "AMZU": 2, "FBL": 2, "NVDU": 2, "CONL": 2, "UYG": 2, "ROKT": 2,
-    "BITX": 2, "BITU": 2, "ETHT": 2, "AGQ": 2, "UGL": 2, "BOIL": 2,
-    "UCO": 2, "QID": -2,
-    # ── 1.5x ──
-    "TSLR": 1.5,
-    # ── 인버스 ──
-    "SQQQ": -3, "SPXU": -3, "SOXS": -3, "TECS": -3, "FAZ": -3,
-    "TZA": -3, "LABD": -3, "SDOW": -3, "WEBS": -3, "YANG": -3,
-    "DRV": -3, "ERY": -3, "JDST": -3, "DGAZ": -3, "KOLD": -3, "SCO": -3,
-    "SDS": -2, "QID": -2, "DXD": -2, "TWM": -2, "SKF": -2,
-    "SH": -1, "PSQ": -1, "DOG": -1, "RWM": -1, "EUM": -1,
-}
-
-# 이름 문자열 보조 추정용 (매핑에 없을 때만). (정규식, 배수)
-# 이름 문자열 보조 추정용 (매핑에 없을 때만): 배수 크기와 인버스 방향을 따로 판별.
-_LEV_MAG_3X = re.compile(r"\b3X\b|ULTRAPRO|TRIPLE", re.I)
-_LEV_MAG_2X = re.compile(r"\b2X\b|\bULTRA\b|DOUBLE", re.I)
-_LEV_MAG_15 = re.compile(r"\b1\.5X\b", re.I)
-_LEV_INVERSE = re.compile(r"INVERSE|SHORT|BEAR", re.I)
-
-
+# 레버리지/인버스 판별은 fmp_extras 로 이동 (SSOT) — run_hidden_alpha.py 와 공용.
+# 기존 호출부 호환을 위한 얇은 위임 래퍼.
 def get_leverage_multiplier(ticker: str, name: str = "") -> float | None:
-    """티커(필요시 이름)로 레버리지 배수를 반환. 일반 ETF/주식이면 None.
-    양수=레버리지 롱, 음수=인버스."""
-    t = str(ticker).strip().upper()
-    if t in _LEVERAGED_ETF_MAP:
-        return _LEVERAGED_ETF_MAP[t]
-    if name:
-        n = str(name)
-        # 배수 크기와 인버스 방향을 독립적으로 판별한 뒤 결합
-        if _LEV_MAG_3X.search(n):
-            mag = 3.0
-        elif _LEV_MAG_2X.search(n):
-            mag = 2.0
-        elif _LEV_MAG_15.search(n):
-            mag = 1.5
-        else:
-            mag = None
-        is_inverse = bool(_LEV_INVERSE.search(n))
-        if mag is not None:
-            return -mag if is_inverse else mag
-        if is_inverse:
-            return -1.0  # 배수 명시 없는 단순 인버스(-1x)
-    return None
+    """티커(필요시 이름)로 레버리지 배수를 반환. 일반 ETF/주식이면 None. (fmp_extras SSOT 위임)"""
+    return fx.get_leverage_multiplier(ticker, name)
 
 
 def leverage_badge(ticker: str, name: str = "") -> str:
