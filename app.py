@@ -352,6 +352,76 @@ def save_portfolio_plan_setting(user_id: str, account: str, ticker: str,
         return False, str(exc)
 
 
+def compute_auto_plan_for_holding(ticker: str, entry_price=None):
+    """보유 등록용 자동 플랜 — 이메일 진입 알림과 동일 SSOT(rc.build_watchlist_plan) 계산.
+
+    entry_price(매수가/평단) 기준으로 ATR 손절·R:R 목표를 산출. 미지정 시 최근 종가.
+    반환: plan dict (stop/target/rr_label/gate 포함) | None(데이터 부족·계산 불가).
+    """
+    try:
+        tk = str(ticker).strip().upper()
+        if not tk:
+            return None
+        hist = cached_timing_price_history(tk)
+        if hist is None or hist.empty:
+            return None
+        an = rc.analyze_ticker(hist)
+        if not an.get("regime", {}).get("enough_data"):
+            return None
+        try:
+            e = float(entry_price) if (entry_price is not None and float(entry_price) > 0) else None
+        except (TypeError, ValueError):
+            e = None
+        plan = rc.build_watchlist_plan(hist, an, entry=e)
+        if not plan or str(plan.get("gate")) == "na":
+            return None
+        stop = plan.get("stop")
+        try:
+            if stop is None or not np.isfinite(float(stop)) or float(stop) <= 0:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return plan
+    except Exception:
+        return None
+
+
+def auto_save_plan_after_add(user_id: str, account: str, ticker: str, entry_price) -> str:
+    """종목 추가 직후 제안 플랜 자동 저장. 기존 플랜이 있으면 보존(덮어쓰지 않음).
+
+    반환: 성공/건너뜀/실패 안내 문구(성공 메시지 뒤에 이어붙일 조각).
+    """
+    try:
+        _key = _pf_alert_key(user_id, account, ticker)
+        _st_row = (load_portfolio_alert_states() or {}).get(_key, {})
+        _ex_sl = _st_row.get("stop_loss")
+        _ex_tp = _st_row.get("target_price")
+        if (_ex_sl is not None and _ex_sl > 0) or (_ex_tp is not None and _ex_tp > 0):
+            return " · 📐 기존 플랜 유지(자동 저장 건너뜀)"
+        plan = compute_auto_plan_for_holding(ticker, entry_price)
+        if not plan:
+            return " · 📐 플랜 자동 계산 불가(데이터 부족) — 매도 레이더에서 수동 설정하세요"
+        _tp_v = plan.get("target")
+        _tp_f = None
+        try:
+            if _tp_v is not None and pd.notna(_tp_v) and np.isfinite(float(_tp_v)) and float(_tp_v) > 0:
+                _tp_f = float(_tp_v)
+        except (TypeError, ValueError):
+            _tp_f = None
+        ok, err = save_portfolio_plan_setting(user_id, account, ticker, float(plan["stop"]), _tp_f)
+        if not ok:
+            return f" · 📐 플랜 자동 저장 실패: {err}"
+        _bits = f" · 📐 플랜 자동 저장: 손절 ${float(plan['stop']):.2f}"
+        if _tp_f is not None:
+            _bits += f" · 목표 ${_tp_f:.2f}"
+        _rr = plan.get("rr_label")
+        if _rr and _rr != "-":
+            _bits += f" · R:R {_rr}"
+        return _bits
+    except Exception as exc:
+        return f" · 📐 플랜 자동 저장 실패: {exc}"
+
+
 def save_thesis_row(user_id: str, ticker: str, account: str, thesis_title: str, narrative_category: str, narrative_date: str) -> tuple[bool, str]:
     """Thesis 시트에 한 행 저장."""
     ws, err = open_thesis_worksheet()
@@ -19407,6 +19477,30 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 _bits.append(f"R:R {_plan_pf['rr_label']}")
                                 _src_kr = {"manual": "내 설정", "atr": "ATR 기본", "ma200": "200MA"}.get(str(_plan_pf["stop_source"]), "")
                                 st.caption("🧮 보유 플랜: " + " · ".join(_bits) + (f"  (손절 {_src_kr})" if _src_kr else ""))
+                                # 플랜 미저장 보유에 한해 제안값 원클릭 저장 (기존 플랜은 절대 덮어쓰지 않음)
+                                _has_saved_plan = bool((_saved_sl and _saved_sl > 0) or (_saved_tp and _saved_tp > 0))
+                                _sug_stop_ok = False
+                                try:
+                                    _sug_stop_ok = np.isfinite(float(_plan_pf.get("stop"))) and float(_plan_pf.get("stop")) > 0
+                                except (TypeError, ValueError):
+                                    _sug_stop_ok = False
+                                if (not _has_saved_plan) and _sug_stop_ok:
+                                    if st.button("📐 이 제안값 저장", key=f"pf_plan_suggest_save_{acct}_{_tk}",
+                                                 help="위 🧮 제안 손절/목표를 그대로 플랜으로 저장 → 장중(2pm) 가격 도달 알림 활성화"):
+                                        _sv_tp = _plan_pf.get("target")
+                                        _sv_tp_f = None
+                                        try:
+                                            if _sv_tp is not None and pd.notna(_sv_tp) and np.isfinite(float(_sv_tp)) and float(_sv_tp) > 0:
+                                                _sv_tp_f = float(_sv_tp)
+                                        except (TypeError, ValueError):
+                                            _sv_tp_f = None
+                                        _ok_sug, _e_sug = save_portfolio_plan_setting(
+                                            puid, acct, _tk, float(_plan_pf["stop"]), _sv_tp_f)
+                                        if _ok_sug:
+                                            st.toast(f"{_tk} 플랜 저장됨 (제안값)")
+                                            st.rerun()
+                                        else:
+                                            st.error(f"저장 실패: {_e_sug}")
                         st.divider()
 
         st.markdown("### 계좌 필터 (매도 레이더)")
@@ -19515,6 +19609,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     help="실제로 매수한 날짜. 트레일링 스톱은 이 날짜 이후의 고점을 기준으로 계산합니다. "
                          "오늘 추가하더라도 실제 매수일로 지정하세요.",
                 )
+                auto_plan_on_add = st.checkbox(
+                    "📐 제안 플랜 자동 저장 (손절/목표 → 가격 도달 알림 활성화)",
+                    value=True,
+                    key="form_portfolio_add_auto_plan",
+                    help="매수가 기준으로 이메일 매수 알림과 동일한 계산법(ATR 손절 · R:R 목표)의 플랜을 자동 저장합니다. "
+                         "이미 플랜이 저장된 종목은 덮어쓰지 않아요. 저장 후 '✏️ 알림·손절/목표 편집'에서 언제든 수정 가능.",
+                )
                 submitted_add = st.form_submit_button("포트폴리오에 추가", use_container_width=True, type="primary")
                 if submitted_add:
                     if not puid:
@@ -19565,9 +19666,10 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                         # Trade_History에 BUY 기록
                                         _buy_date = new_buy_date.strftime("%Y-%m-%d")
                                         append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, _build_entry_memo(selected_entry_reason, "추가 매수"))
+                                        _plan_msg = auto_save_plan_after_add(puid, account_name, new_ticker, new_avg) if auto_plan_on_add else ""
                                         st.success(
                                             f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
-                                            f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
+                                            f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}.{_plan_msg}"
                                         )
                                         st.rerun()
                                 else:
@@ -19616,7 +19718,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                                 auto["thesis_title"], auto["narrative_category"], auto["narrative_date"],
                                             )
                                             _thesis_msg = f" · 🔗 자동 연결: [{auto['narrative_date']}] {auto['thesis_title']} ({auto['where']})"
-                                    st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다.{_thesis_msg}")
+                                    _plan_msg = auto_save_plan_after_add(puid, account_name, new_ticker, price_v) if auto_plan_on_add else ""
+                                    st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다.{_thesis_msg}{_plan_msg}")
                                     st.rerun()
 
         with st.expander("데이터 수정하기", expanded=False):
