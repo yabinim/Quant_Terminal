@@ -14551,15 +14551,8 @@ if st.session_state.get("logged_in"):
         except Exception:
             pass
 
-    # Alert 발동 시 상단에 배너 표시
-    _triggered_alerts = st.session_state.get("_watchlist_triggered_alerts", [])
-    if _triggered_alerts:
-        with st.container():
-            _tk_list = ", ".join(_triggered_alerts[:8]) + (" 외" if len(_triggered_alerts) > 8 else "")
-            st.warning(
-                f"🔔 **Watchlist 알림** — {len(_triggered_alerts)}개 종목에서 알림 조건이 활성 상태입니다 "
-                f"({_tk_list}). `🔔 Buy Watchlist & Alert` 메뉴에서 확인하세요."
-            )
+    # (전역 Watchlist 배너 제거 — 알림 표시는 Watchlist 탭 내부 배너가 담당.
+    #  세션 체크 로직(_watchlist_triggered_alerts)은 탭 내부 배너의 데이터 소스라 유지)
 
     # 신규 ETF 자동 발견 알림
     _etf_new_cnt = st.session_state.pop("_etf_new_added_count", 0)
