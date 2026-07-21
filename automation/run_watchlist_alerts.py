@@ -198,11 +198,13 @@ def _radar_recipients() -> list[tuple[str, str]]:
 def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
                           subject_emoji: str, subject_label: str,
                           banner_html: str = "") -> None:
-    """레이더 이메일 발송 오케스트레이션.
+    """레이더 이메일 발송 오케스트레이션 — 완전 유저 격리.
 
-    1) 관리자(GMAIL_TO): 전 유저 합본 — 기존 동작 유지 (모니터링 목적).
-    2) 유저별: 본인 섹션만 담은 개별 메일. 실패는 유저 단위 격리(다음 유저 진행).
-       관리자 소유 uid / GMAIL_TO 와 동일한 이메일은 합본과 중복이므로 건너뜀.
+    각 유저는 '본인 섹션만' 담은 개별 메일을 받는다. 유저 간 데이터는 절대 섞이지 않는다.
+      - 관리자(yab): 본인 데이터만 → GMAIL_TO. Users 시트의 radar 토글/이메일 상태와
+        무관하게 항상 발송(관리자가 자기 알림을 놓치지 않도록 하는 안전장치).
+      - 나머지 유저: 본인 데이터만 → Users 시트의 본인 이메일. 실패는 유저 단위
+        격리(다음 유저 진행). 관리자 uid/이메일과 겹치면 위에서 이미 보냈으므로 건너뜀.
     """
     wl_res = wl_res or {}
     pf_res = pf_res or {}
@@ -212,27 +214,35 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
         print("[INFO] 발동/활성 건 없음 — 이메일 생략.")
         return
 
-    # 1) 관리자 합본
-    send_email(f"{subject_emoji} {subject_label} — {total}건 ({today} ET)",
-               banner_html + build_email_html(wl_res, pf_res, today))
+    def _send_one_user(uid_s: str, to_addr: str | None) -> None:
+        """단일 유저의 본인 섹션만 담아 발송. 발동 0건이면 생략."""
+        _wl_u = {uid_s: wl_res[uid_s]} if wl_res.get(uid_s) else {}
+        _pf_u = {uid_s: pf_res[uid_s]} if pf_res.get(uid_s) else {}
+        _n_u = (sum(len(v) for v in _wl_u.values())
+                + sum(len(v) for v in _pf_u.values()))
+        if not _n_u:
+            return
+        send_email(f"{subject_emoji} {subject_label} — {_n_u}건 ({today} ET)",
+                   banner_html + build_email_html(_wl_u, _pf_u, today),
+                   to_addr=to_addr)
 
-    # 2) 유저별 개별 발송
-    _admin_uid_u = str(uc.ADMIN_CONTENT_OWNER_ID).strip().upper()
+    _admin_uid = str(uc.ADMIN_CONTENT_OWNER_ID).strip()
+    _admin_uid_u = _admin_uid.upper()
     _admin_email_l = str(GMAIL_TO).strip().lower()
+
+    # 1) 관리자(yab): 본인 데이터만 → GMAIL_TO (to_addr=None → send_email 기본값)
+    try:
+        _send_one_user(_admin_uid, None)
+    except Exception as e:
+        print(f"[WARN] 관리자({_admin_uid}) 개별 발송 실패: {e}")
+
+    # 2) 나머지 유저: 본인 데이터만 → 본인 이메일
     for _uid, _email in _radar_recipients():
         try:
             _uid_s = str(_uid).strip()
             if _uid_s.upper() == _admin_uid_u or str(_email).strip().lower() == _admin_email_l:
-                continue  # 관리자는 합본으로 이미 수신
-            _wl_u = {_uid_s: wl_res[_uid_s]} if wl_res.get(_uid_s) else {}
-            _pf_u = {_uid_s: pf_res[_uid_s]} if pf_res.get(_uid_s) else {}
-            _n_u = (sum(len(v) for v in _wl_u.values())
-                    + sum(len(v) for v in _pf_u.values()))
-            if not _n_u:
-                continue  # 이 유저에게 발동된 건 없음
-            send_email(f"{subject_emoji} {subject_label} — {_n_u}건 ({today} ET)",
-                       banner_html + build_email_html(_wl_u, _pf_u, today),
-                       to_addr=_email)
+                continue  # 관리자는 위에서 이미 발송
+            _send_one_user(_uid_s, _email)
         except Exception as e:
             print(f"[WARN] {_uid} 개별 발송 실패(다음 유저 진행): {e}")
 
