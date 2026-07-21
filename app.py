@@ -34,7 +34,7 @@ import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화�
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
 
 
-st.set_page_config(page_title="장기 투자 주식 분석", layout="wide")
+st.set_page_config(page_title="STOCKER", layout="wide")
 
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
@@ -1195,7 +1195,8 @@ def _trigger_background_warmup():
 
 
 def _render_login_screen():
-    st.title("Quant Stock Analyzer")
+    st.title("🎯 STOCKER")
+    st.markdown("**Follow the Signal. Stalk the Stock.** — 주식을 집요하게 쫓는 개인 퀀트 터미널")
     st.caption("Google Sheets(Quant_DB / Users) 기반 회원 · 관리자 승인제입니다.")
     tab_login, tab_signup = st.tabs(["로그인", "Sign Up (가입 신청)"])
 
@@ -1306,8 +1307,17 @@ def _render_guest_guide():
 🚨 Daily Risk Gauge · 🌐 거시경제 지표 · 📰 시장 내러티브 · 🎯 섹터 & 자금 흐름 ·
 📊 적중률 트래커 · 📡 Emerging 종목 추적기
 
-이 탭들의 분석은 **자동화가 주중 아침/저녁, 주말 1회** 생성해 두므로 직접 실행할 필요가 없습니다.
-실행/스캔 버튼이 비활성화되어 있는 것은 정상이며, 히스토리를 포함해 모든 결과를 열람할 수 있습니다.
+**AI 분석 생성 버튼**(내러티브 엔진·예측·검증·리포트 등)은 관리자 전용으로 비활성화되어 있습니다 —
+**자동화가 주중 아침/저녁, 주말 1회** 생성해 두므로 직접 실행할 필요 없이 최신 결과와 히스토리를 열람하면 됩니다.
+
+단, **가격 데이터 기반 스캔은 직접 실행할 수 있습니다**:
+
+- 🚨 Daily Risk Gauge의 「🔄 지금 스캔」 — 선행 신호 8가지를 실시간 값으로 갱신
+- 🎯 섹터 & 자금 흐름의 「🔍 Early Signal 스캔」 — 막 강해지기 시작한 섹터/ETF 발굴, 결과 아래 **🧭 로테이션 진단**이 자산군 큰 그림을 요약
+- 🛰️ **위성 섹터 Top10** (섹터 & 자금 흐름 탭) — GICS 섹터당 1개 ETF 월간 리밸런싱 후보 (점수 = 1M×40% + 3M×40% + 6M×20%, 자동 계산 · 1시간 캐시)
+
+스캔 결과의 **🐣 인큐베이터 N개** 표시는 상장 이력이 짧아(70거래일 미만) 이번 계산에서 제외된 신규 ETF라는 뜻이며,
+이력이 쌓이면 자동으로 재편입되므로 오류가 아닙니다.
 
 ---
 
@@ -1326,7 +1336,7 @@ def _render_guest_guide():
 ## 💡 팁
 
 - 각 탭의 **🔄 데이터 동기화** 버튼은 화면이 최신이 아닐 때 캐시를 강제로 새로고침합니다.
-- Daily Risk Gauge에 "⏱️ 직전 계산 결과" 배지가 보이면 잠시 후 자동으로 실시간 값으로 갱신됩니다.
+- Daily Risk Gauge에 "⏱️ 직전 계산 결과" 배지가 보이면 페이지를 다시 열거나 「🔄 지금 스캔」을 누르면 실시간 값으로 갱신됩니다.
 - 알림의 손절/목표가는 **제안이 아니라 내가 설정한 값**입니다 — 워치리스트/레이더에서 직접 관리하세요.
 """
     )
@@ -14550,9 +14560,10 @@ D) 🚀 Weekly Expanding To (주간 후발/확장 수혜주):
 
 
 if st.session_state.get("logged_in"):
-    st.title("장기 투자 주식 분석 대시보드")
+    st.title("🎯 STOCKER — 시장 추적 터미널")
     st.caption(
-        "[1단계] 거시·내러티브 → [2단계] 섹터·스캐너 → [3단계] 종목 정밀 → [4단계] 포트폴리오. "
+        "Follow the Signal. Stalk the Stock. · "
+        "[1단계] 거시·내러티브 → [2단계] 섹터·스캐너 → [3단계] 종목 정밀 → [4단계] 포트폴리오 — "
         "왼쪽 사이드바 라디오에서 단계를 선택하세요."
     )
     
@@ -22700,7 +22711,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         # 📖 사용 가이드 (v3 — 2026-07 전면 개정: 깔때기 워크플로우 + 전 탭 상세)
         # ─────────────────────────────────────────────────────────────────────
         st.title("📖 사용 가이드")
-        st.caption("Quant Investment Terminal — 투자 철학 · 표준 워크플로우 · 전 탭 기능 상세")
+        st.caption("STOCKER — Follow the Signal. Stalk the Stock. · 투자 철학 · 표준 워크플로우 · 전 탭 기능 상세")
 
         if not _is_admin():
             _render_guest_guide()
