@@ -189,7 +189,14 @@ def _radar_recipients() -> list[tuple[str, str]]:
     try:
         gc = get_gspread_client()
         ws = gc.open(_SPREADSHEET_TITLE).worksheet("Users")
-        return uc.get_recipients(ws, "radar")
+        _rcpts = uc.get_recipients(ws, "radar")
+        if _rcpts:
+            print(f"[RADAR] 수신자 {len(_rcpts)}명: "
+                  + ", ".join(str(u).strip() for u, _ in _rcpts))
+        else:
+            print("[WARN] 레이더 수신자 0명 — Users 시트 확인 필요 "
+                  "(Status=approved / Alert_Radar=Y / Email 유효 3가지 모두 충족해야 함).")
+        return _rcpts
     except Exception as e:
         print(f"[WARN] Users 수신자 조회 실패 — 관리자 메일만 발송: {e}")
         return []
@@ -214,21 +221,42 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
         print("[INFO] 발동/활성 건 없음 — 이메일 생략.")
         return
 
+    # 데이터 키(uid)를 소문자로 인덱싱 — Users 시트 ID 와 Watchlist/Portfolio 시트 uid 의
+    # 대소문자가 달라도 매칭되도록(대소문자 불일치로 인한 조용한 미발송 방지).
+    _wl_key = {str(k).strip().lower(): k for k in wl_res}
+    _pf_key = {str(k).strip().lower(): k for k in pf_res}
+
+    # 발동 건이 실제로 존재하는 uid 집합(소문자 기준) — 배달 누락 진단용
+    _fired = {str(k).strip().lower() for k, v in wl_res.items() if v}
+    _fired |= {str(k).strip().lower() for k, v in pf_res.items() if v}
+    _delivered: set[str] = set()
+
     def _send_one_user(uid_s: str, to_addr: str | None) -> None:
         """단일 유저의 본인 섹션만 담아 발송. 발동 0건이면 생략."""
-        _wl_u = {uid_s: wl_res[uid_s]} if wl_res.get(uid_s) else {}
-        _pf_u = {uid_s: pf_res[uid_s]} if pf_res.get(uid_s) else {}
+        _u_l = str(uid_s).strip().lower()
+        _k_wl = _wl_key.get(_u_l)
+        _k_pf = _pf_key.get(_u_l)
+        _wl_u = {uid_s: wl_res[_k_wl]} if (_k_wl and wl_res.get(_k_wl)) else {}
+        _pf_u = {uid_s: pf_res[_k_pf]} if (_k_pf and pf_res.get(_k_pf)) else {}
         _n_u = (sum(len(v) for v in _wl_u.values())
                 + sum(len(v) for v in _pf_u.values()))
         if not _n_u:
+            print(f"[RADAR] '{uid_s}' 발동 0건 — 발송 생략.")
             return
-        send_email(f"{subject_emoji} {subject_label} — {_n_u}건 ({today} ET)",
-                   banner_html + build_email_html(_wl_u, _pf_u, today),
-                   to_addr=to_addr)
+        _ok = send_email(f"{subject_emoji} {subject_label} — {_n_u}건 ({today} ET)",
+                         banner_html + build_email_html(_wl_u, _pf_u, today),
+                         to_addr=to_addr)
+        if _ok:
+            _delivered.add(_u_l)
+            print(f"[RADAR] '{uid_s}' {_n_u}건 발송 완료 → {to_addr or GMAIL_TO}")
+        else:
+            print(f"[WARN] '{uid_s}' {_n_u}건 발송 실패 → {to_addr or GMAIL_TO}")
 
     _admin_uid = str(uc.ADMIN_CONTENT_OWNER_ID).strip()
     _admin_uid_u = _admin_uid.upper()
     _admin_email_l = str(GMAIL_TO).strip().lower()
+
+    print(f"[RADAR] 발동 uid: {sorted(_fired) or '없음'} (총 {total}건)")
 
     # 1) 관리자(yab): 본인 데이터만 → GMAIL_TO (to_addr=None → send_email 기본값)
     try:
@@ -237,14 +265,24 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
         print(f"[WARN] 관리자({_admin_uid}) 개별 발송 실패: {e}")
 
     # 2) 나머지 유저: 본인 데이터만 → 본인 이메일
+    _rcpt_uids = set()
     for _uid, _email in _radar_recipients():
         try:
             _uid_s = str(_uid).strip()
+            _rcpt_uids.add(_uid_s.lower())
             if _uid_s.upper() == _admin_uid_u or str(_email).strip().lower() == _admin_email_l:
                 continue  # 관리자는 위에서 이미 발송
             _send_one_user(_uid_s, _email)
         except Exception as e:
             print(f"[WARN] {_uid} 개별 발송 실패(다음 유저 진행): {e}")
+
+    # 3) 배달 누락 진단 — 발동 건은 있는데 메일이 나가지 않은 uid 명시
+    for _u in sorted(_fired - _delivered - {_admin_uid.lower()}):
+        if _u not in _rcpt_uids:
+            print(f"[WARN] '{_u}' 발동 건이 있으나 수신자 목록에 없음 — "
+                  "Users 시트 확인(Status=approved / Alert_Radar=Y / Email 유효).")
+        else:
+            print(f"[WARN] '{_u}' 수신자이나 메일 미발송 — 발송 실패 또는 데이터 키 불일치 확인.")
 
 
 _REGIME_KR = {"strong": "🟢 강세(대장주)", "sideways": "🟡 횡보", "weak": "🔴 약세"}
