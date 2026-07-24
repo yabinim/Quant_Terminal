@@ -32,6 +32,7 @@ import fmp_extras as fx
 import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_narrative)와 동일 모듈
 import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화와 동일 모듈
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
+import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 자동화와 동일 모듈
 
 
 st.set_page_config(page_title="STOCKER", layout="wide")
@@ -75,26 +76,11 @@ _PORTFOLIO_ALERT_STATE_TITLE = "Portfolio_Alert_State"
 _PORTFOLIO_ALERT_STATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At", "Stop_Loss", "Target_Price"]
 
 # ── 계좌 프로필 (포지션 사이징 파라미터) — 계좌별 SSOT ────────────────
-_ACCOUNT_PROFILE_WORKSHEET_TITLE = "Account_Profile"
-_ACCOUNT_PROFILE_SHEET_COLS = [
-    "ID", "Account", "Cash", "Sizing_Mode", "Risk_Pct", "Max_Position_Pct",
-    "Max_Positions", "Cash_Reserve_Pct", "Min_Trade_Dollars", "Updated_At",
-]
-# 행이 없는 계좌는 아래 기본값으로 동작한다 = 프로필 미설정 시 기존 동작과 동일.
-_ACCOUNT_PROFILE_DEFAULTS = {
-    "Cash": 0.0,
-    "Sizing_Mode": "risk_based",
-    "Risk_Pct": rc.DEFAULT_RISK_PCT,
-    "Max_Position_Pct": rc.DEFAULT_MAX_POSITION_PCT,
-    "Max_Positions": rc.DEFAULT_MAX_POSITIONS,
-    "Cash_Reserve_Pct": rc.DEFAULT_RESERVE_PCT,
-    "Min_Trade_Dollars": rc.DEFAULT_MIN_TRADE_DOLLARS,
-}
-_SIZING_MODE_LABELS = {
-    "risk_based": "리스크 기반 (신호별 진입)",
-    "equal_weight": "균등 배분 (기계적 회전)",
-    "off": "사용 안 함",
-}
+# 계좌 프로필 스키마·기본값·라벨은 accounts_core(SSOT)에 위임 — 자동화와 단일 정의 공유
+_ACCOUNT_PROFILE_WORKSHEET_TITLE = ac.WORKSHEET_TITLE
+_ACCOUNT_PROFILE_SHEET_COLS = ac.COLS
+_ACCOUNT_PROFILE_DEFAULTS = ac.DEFAULTS
+_SIZING_MODE_LABELS = ac.SIZING_MODE_LABELS
 _PORTFOLIO_ALERT_DEFAULT = "exit,risk"   # 보유 기본 알림: 청산 + 추세 흔들림 (손절은 exit의 ATR 트레일링에 포함)
 _ETF_UNIVERSE_SHEET_TITLE = "ETF_Universe"
 _EARLY_SIGNAL_HISTORY_SHEET_TITLE = "EarlySignal_History"
@@ -793,36 +779,18 @@ def load_account_profiles(user_id: str) -> pd.DataFrame:
 
 
 def get_account_profile(user_id: str, account: str) -> dict:
-    """계좌 프로필 조회. 저장된 행이 없으면 기본값(_exists=False)."""
-    prof = dict(_ACCOUNT_PROFILE_DEFAULTS)
-    prof["Account"] = str(account or "").strip()
-    prof["Updated_At"] = ""
-    prof["_exists"] = False
-    if not prof["Account"]:
-        return prof
+    """계좌 프로필 조회. 저장된 행이 없으면 기본값(_exists=False).
+    파싱 규칙은 accounts_core(SSOT)에 위임 — 자동화와 동일 해석 보장."""
+    if not str(account or "").strip():
+        return ac.default_profile(account)
     try:
-        df = load_account_profiles(user_id)
+        vals, err = _account_profile_all_values_cached()
+        if err:
+            return ac.default_profile(account)
+        profiles = ac.parse_profiles(vals, user_id)
+        return ac.get_profile(profiles, account)
     except Exception:
-        return prof
-    if df.empty:
-        return prof
-    hit = df[df["Account"].astype(str).str.strip().str.lower() == prof["Account"].lower()]
-    if hit.empty:
-        return prof
-    row = hit.iloc[-1]
-    for k in ("Cash", "Risk_Pct", "Max_Position_Pct", "Cash_Reserve_Pct", "Min_Trade_Dollars"):
-        v = pd.to_numeric(row.get(k), errors="coerce")
-        if pd.notna(v) and float(v) >= 0:
-            prof[k] = float(v)
-    v = pd.to_numeric(row.get("Max_Positions"), errors="coerce")
-    if pd.notna(v) and int(v) > 0:
-        prof["Max_Positions"] = int(v)
-    m = str(row.get("Sizing_Mode") or "").strip()
-    if m in _SIZING_MODE_LABELS:
-        prof["Sizing_Mode"] = m
-    prof["Updated_At"] = str(row.get("Updated_At") or "").strip()
-    prof["_exists"] = True
-    return prof
+        return ac.default_profile(account)
 
 
 def save_account_profile(user_id: str, account: str, prof: dict):
@@ -846,17 +814,7 @@ def save_account_profile(user_id: str, account: str, prof: dict):
                     and str(r[1]).strip().lower() == acct.lower()):
                 continue
             keep.append(r)
-        new_row = [
-            uid, acct,
-            float(prof.get("Cash", 0.0) or 0.0),
-            str(prof.get("Sizing_Mode", "risk_based")),
-            float(prof.get("Risk_Pct", rc.DEFAULT_RISK_PCT)),
-            float(prof.get("Max_Position_Pct", rc.DEFAULT_MAX_POSITION_PCT)),
-            int(prof.get("Max_Positions", rc.DEFAULT_MAX_POSITIONS)),
-            float(prof.get("Cash_Reserve_Pct", 0.0) or 0.0),
-            float(prof.get("Min_Trade_Dollars", 0.0) or 0.0),
-            _narrative_now_et_string(),
-        ]
+        new_row = ac.to_row(uid, acct, prof, _narrative_now_et_string())
         rows = [_ACCOUNT_PROFILE_SHEET_COLS] + keep + [new_row]
         ws.clear()
         ws.update(rows, range_name=f"A1:J{len(rows)}", value_input_option="USER_ENTERED")

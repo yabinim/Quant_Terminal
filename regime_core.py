@@ -1108,7 +1108,13 @@ _WL_RECENT_HIGH_WINDOW = 120  # app.py [7] 워치리스트 탭과 동일(lockste
 
 def build_watchlist_plan(hist, an: dict, manual_stop=None, manual_target=None,
                          entry=None, atr_mult=None, rr_target=None,
-                         equity: float = 0.0, risk_pct: float = 1.0) -> dict:
+                         equity: float = 0.0, risk_pct: float = 1.0,
+                         max_position_pct: float = DEFAULT_MAX_POSITION_PCT,
+                         cash=None, reserve_pct: float = DEFAULT_RESERVE_PCT,
+                         invested_value: float = 0.0,
+                         slots_used=None, max_positions=None,
+                         min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS,
+                         sizing_mode: str = SIZING_MODE_DEFAULT) -> dict:
     """워치리스트 진입 게이트용 트레이드 플랜 조립 — app.py [7] 탭과 동일 입력 규약(lockstep).
 
     app 조립부와의 대응: ATR=compute_atr(hist), ma200=analysis components,
@@ -1158,6 +1164,10 @@ def build_watchlist_plan(hist, an: dict, manual_stop=None, manual_target=None,
         stop_source=("manual" if ms is not None else "atr"),
         manual_stop=ms, manual_target=mt,
         recent_high=recent_high,
+        max_position_pct=max_position_pct,
+        cash=cash, reserve_pct=reserve_pct, invested_value=invested_value,
+        slots_used=slots_used, max_positions=max_positions,
+        min_trade_dollars=min_trade_dollars, sizing_mode=sizing_mode,
     )
 
 
