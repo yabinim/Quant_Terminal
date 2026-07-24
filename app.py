@@ -116,8 +116,12 @@ _PORTFOLIO_HISTORY_COLS = ["ID", "Date", "Total_Value", "Total_Cost", "Return_Pc
 _EMERGING_TRACKER_COLS = ["ID", "Ticker", "Theme", "First_Seen", "Last_Seen", "Count", "Best_Verdict", "RS_Score", "Status"]
 _ETF_UNIVERSE_SHEET_COLS = ["Ticker", "Name", "Category", "AUM_M", "Added_Date", "Source"]
 _ETF_AUTO_UPDATE_INTERVAL_DAYS = 7  # 자동 업데이트 주기
-_WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added", "Stop_Loss", "Target_Price", "Alert_States", "Alert_LastState"]
-_WL_NCOL = len(_WATCHLIST_SHEET_COLS)  # =12. 과거 8/10열 시트는 읽을 때 빈 칸으로 패딩되어 자동 마이그레이션됨.
+# ⚠️ Account 는 반드시 맨 뒤(13번째 = M열)에 둔다.
+#    run_watchlist_alerts.py 가 Alert_LastState 를 `L2:L{n}` 로 하드코딩 기록하므로
+#    중간에 삽입하면 알림 상태가 엉뚱한 열에 써진다.
+_WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added", "Stop_Loss", "Target_Price", "Alert_States", "Alert_LastState", "Account"]
+_WL_NCOL = len(_WATCHLIST_SHEET_COLS)  # =13. 과거 8/10/12열 시트는 읽을 때 빈 칸으로 패딩되어 자동 마이그레이션됨.
+_WL_COL_ACCOUNT = 12  # 0-index
 # 상태 기반 알림 이벤트 코드 (Alert_States 콤마 플래그). 기본 ON = entry + risk.
 _WL_ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price", "watch")
 _WL_ALERT_DEFAULT = "entry,risk,watch"
@@ -10595,6 +10599,8 @@ def load_watchlist_sheet(user_id: str) -> list[dict]:
                 # 상태 기반 알림: 활성 이벤트 리스트 + 깜빡임 방지용 마지막 상태(JSON 문자열)
                 "alert_states": [s.strip() for s in _states_raw.split(",") if s.strip()] if _states_raw else [],
                 "alert_last_state": str(r[11]).strip(),
+                # 계좌 귀속(빈 문자열 = 미지정 → 활성 계좌 기준으로 사이징)
+                "account": str(r[_WL_COL_ACCOUNT]).strip(),
             })
         return items
     except Exception:
@@ -10650,6 +10656,7 @@ def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
                 target_price_str,
                 alert_states_str,
                 alert_last_state_str,
+                str(item.get("account", "") or "").strip(),
             ])
         all_rows = [_WATCHLIST_SHEET_COLS] + other_rows + new_rows
         ws.clear()
@@ -10694,8 +10701,11 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
                      saved_price: float = None,
                      stop_loss: float = None,
                      target_price: float = None,
-                     alert_states: str = None) -> tuple[bool, str]:
+                     alert_states: str = None,
+                     account: str = None) -> tuple[bool, str]:
     """Watchlist에 단일 종목 추가. append_row 방식.
+    account=None 이면 현재 활성 계좌를 사용한다(스캐너·내러티브 원클릭 추가 대응).
+    명시적으로 ""를 넘기면 '미지정'으로 저장된다.
     saved_price를 직접 넘기면 가격 재조회 생략 (빠름).
     없으면 @st.cache_data 캐시 활용 조회.
     stop_loss/target_price는 진입 시 손절·목표가(선택).
@@ -10743,6 +10753,8 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
             str(round(float(target_price), 4)) if (target_price is not None and pd.notna(target_price)) else "",
             str(_states_val).strip(),
             "",  # Alert_LastState 초기값(빈) — 첫 평가 시 채워짐
+            (str(st.session_state.get("_active_account") or "").strip()
+             if account is None else str(account).strip()),
         ], value_input_option="USER_ENTERED")
         # 캐시 초기화
         load_watchlist_sheet.clear()
@@ -19040,6 +19052,7 @@ if st.session_state.get("logged_in"):
                             slots_used=(_ctx_size["slots_used"] if _ctx_size else None),
                             max_positions=(int(_pf_s["Max_Positions"]) if _ctx_size else None),
                             min_trade_dollars=float(_pf_s["Min_Trade_Dollars"]),
+                            sizing_mode=str(_pf_s.get("Sizing_Mode", rc.SIZING_MODE_DEFAULT)),
                         )
 
                         _gate = _plan["gate"]
@@ -19061,16 +19074,24 @@ if st.session_state.get("logged_in"):
                                 f"{_plan['target_pct']:.1f}% · {_basis_kr}" if pd.notna(_plan["target_pct"]) else _basis_kr,
                             )
                             _m3.metric("손익비 (R:R)", _plan["rr_label"], f"목표 1:{_rp['rr']:.1f} (국면적응)")
+                            _mode_now = str(_plan.get("sizing_mode", rc.SIZING_MODE_DEFAULT))
+                            if _mode_now == "off":
+                                st.info("🚫 이 계좌는 **사이징 미사용**(`off`)으로 설정되어 있어 투입 금액을 제안하지 않습니다. "
+                                        "손절가·목표가·R:R 게이트만 참고하세요.")
+                            elif _mode_now == "equal_weight":
+                                st.caption(f"⚖️ **균등 배분** 계좌 — 투입 금액 = 투자가능액 ÷ {int(_pf_s['Max_Positions'])}슬롯. "
+                                           "손절폭은 금액에 영향을 주지 않습니다(손절가는 청산 기준으로만 사용).")
                             # 금액(dollars)이 불변량 — 수량은 파생값으로 보조 표기
                             _s1, _s2, _s3 = st.columns(3)
-                            _s1.metric("투입 금액", f"${_plan['dollars']:,.2f}",
-                                       f"비중 {_plan['position_pct']:.1f}% · 제한: {_plan['binding_label']}")
-                            _s2.metric("수량 (소수점)", f"{_plan['shares_exact']:,.3f}주",
-                                       f"정수주 {_plan['shares_whole']:,}주")
-                            _s3.metric("최대 손실(1R)", f"-${_plan['risk_dollars']:,.2f}",
-                                       f"자본의 {_risk_pct:.1f}%")
+                            if _mode_now != "off":
+                                _s1.metric("투입 금액", f"${_plan['dollars']:,.2f}",
+                                           f"비중 {_plan['position_pct']:.1f}% · 제한: {_plan['binding_label']}")
+                                _s2.metric("수량 (소수점)", f"{_plan['shares_exact']:,.3f}주",
+                                           f"정수주 {_plan['shares_whole']:,}주")
+                                _s3.metric("최대 손실(1R)", f"-${_plan['risk_dollars']:,.2f}",
+                                           f"자본의 {_risk_pct:.1f}%" if _mode_now == "risk_based" else "손절 도달 시")
 
-                            if _plan["dollars"] > 0 and not _plan["whole_share_ok"]:
+                            if _mode_now != "off" and _plan["dollars"] > 0 and not _plan["whole_share_ok"]:
                                 _px_pct = (float(_plan["entry"]) / _equity * 100.0) if _equity > 0 else 0.0
                                 st.warning(_esc_md(
                                     f"⛔ **정수주로는 진입 불가** — 1주 ${_plan['entry']:,.2f} = 자본의 {_px_pct:.1f}%. "
@@ -19088,12 +19109,13 @@ if st.session_state.get("logged_in"):
                             if not _plan["enter_ok"]:
                                 st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 금액은 참고용이며, 회피/건너뛰기/신중 구간에서는 신규 진입을 권하지 않습니다.")
                             _cap_pct_eff = float(_pf_s["Max_Position_Pct"])
+                            _turn_note = ("" if _mode_now == "risk_based" else "  (균등 배분 계좌에는 전환점이 적용되지 않습니다)")
                             _turn_pct = (_risk_pct / _cap_pct_eff * 100.0) if _cap_pct_eff > 0 else float("nan")
                             st.caption(_esc_md(
                                 f"국면 적응: {_rp['label']} (ATR×{_rp['atr_mult']}, 목표 1:{_rp['rr']}). "
                                 f"전환점 — 손절폭이 **{_turn_pct:.1f}%** 를 넘으면 리스크 기준이, 그 이하면 "
                                 f"비중 상한({_cap_pct_eff:.0f}%)이 금액을 결정합니다. "
-                                "손익비는 독립 목표가 있을 때만 게이트 필터로 작동합니다."
+                                "손익비는 독립 목표가 있을 때만 게이트 필터로 작동합니다." + _turn_note
                             ))
 
                 # ── 차트 탭 ───────────────────────────────────────────────
@@ -22169,6 +22191,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
         # ── Watchlist 로드 ─────────────────────────────────────────────────
         wl_items = load_watchlist_sheet(uid_wl)
+        try:
+            _wl_pf_df = load_portfolio()
+            _wl_acct_opts = (sorted(_wl_pf_df["Account"].dropna().astype(str).str.strip().unique().tolist())
+                             if (_wl_pf_df is not None and not _wl_pf_df.empty and "Account" in _wl_pf_df.columns)
+                             else [])
+        except Exception:
+            _wl_acct_opts = []
+        _wl_acct_opts = [a for a in _wl_acct_opts if a]
 
         # ── 종목 추가 폼 ───────────────────────────────────────────────────
         with st.expander("➕ 관심 종목 추가", expanded=not wl_items):
@@ -22297,6 +22327,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         key="wl_form_target_price",
                         help="익절 목표. 손익비 1:2 이상이면 기대값이 좋습니다.",
                     )
+                _add_acct_now = str(st.session_state.get("_active_account") or "").strip()
+                st.caption(
+                    (f"🏦 귀속 계좌: **{_add_acct_now}** (사이드바 활성 계좌) — 각 종목의 "
+                     "'✏️ 알림 · 손절/목표 편집'에서 언제든 바꿀 수 있습니다."
+                     ) if _add_acct_now else
+                    "🏦 귀속 계좌: 미지정 — 포트폴리오에 계좌를 등록하면 자동 지정됩니다."
+                )
                 submitted_wl = st.form_submit_button("Watchlist에 추가", type="primary", use_container_width=True)
 
             if submitted_wl:
@@ -22623,6 +22660,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             st.caption("🛑🎯 손절/목표가 미설정 — 편집에서 추가하면 도달 시 알림을 줍니다.")
 
                         # ── 포지션 플랜 (사이징·R:R 게이트) — regime_core SSOT (#2) ──
+                        # 종목별 귀속 계좌 → 없으면 활성 계좌 폴백
+                        _it_acct = str(item.get("account", "") or "").strip()
+                        _use_acct = _it_acct or _wl_acct
+                        if _use_acct and _use_acct != _wl_acct:
+                            try:
+                                _it_ctx = account_context_memo(_wl_uid, _use_acct)
+                            except Exception:
+                                _it_ctx = _wl_ctx
+                        else:
+                            _it_ctx = _wl_ctx
+                        if _it_ctx:
+                            _it_prof = _it_ctx["profile"]
+                            _it_eq, _it_cash = float(_it_ctx["equity"]), float(_it_ctx["cash"])
+                        else:
+                            _it_prof, _it_eq, _it_cash = _wl_prof, _wl_equity, float(_wl_cash_in)
+                        if _it_acct:
+                            st.caption(f"🏦 귀속 계좌: **{_it_acct}**")
+                        elif _use_acct:
+                            st.caption(f"🏦 계좌 미지정 — 활성 계좌 **{_use_acct}** 기준으로 계산")
+                        _it_mode = str(_it_prof.get("Sizing_Mode", rc.SIZING_MODE_DEFAULT))
                         if _an and _an.get("regime", {}).get("enough_data") and pd.notna(current_price) and float(current_price) > 0:
                             _wl_atr = pd.to_numeric(atr_map_wl.get(tk), errors="coerce")
                             _wl_hi = pd.to_numeric(high_map_wl.get(tk), errors="coerce")
@@ -22631,32 +22688,40 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 entry=float(current_price),
                                 atr=float(_wl_atr) if pd.notna(_wl_atr) else float("nan"),
                                 ma200=float(ma200_val) if pd.notna(ma200_val) else float("nan"),
-                                equity=_wl_equity, risk_pct=_wl_risk_pct,
+                                equity=_it_eq, risk_pct=float(_it_prof["Risk_Pct"]),
                                 atr_mult=_wl_rp["atr_mult"], rr_target=_wl_rp["rr"],
                                 stop_source=("manual" if pd.notna(_sl_item) else "atr"),
                                 manual_stop=float(_sl_item) if pd.notna(_sl_item) else None,
                                 manual_target=float(_tp_item) if pd.notna(_tp_item) else None,
                                 recent_high=float(_wl_hi) if pd.notna(_wl_hi) else None,
-                                max_position_pct=float(_wl_prof["Max_Position_Pct"]),
-                                cash=(float(_wl_cash_in) if float(_wl_cash_in) > 0 else None),
-                                reserve_pct=float(_wl_prof["Cash_Reserve_Pct"]),
-                                invested_value=(_wl_ctx["invested_value"] if _wl_ctx else 0.0),
-                                slots_used=(_wl_ctx["slots_used"] if _wl_ctx else None),
-                                max_positions=(int(_wl_prof["Max_Positions"]) if _wl_ctx else None),
-                                min_trade_dollars=float(_wl_prof["Min_Trade_Dollars"]),
+                                max_position_pct=float(_it_prof["Max_Position_Pct"]),
+                                cash=(_it_cash if _it_cash > 0 else None),
+                                reserve_pct=float(_it_prof["Cash_Reserve_Pct"]),
+                                invested_value=(_it_ctx["invested_value"] if _it_ctx else 0.0),
+                                slots_used=(_it_ctx["slots_used"] if _it_ctx else None),
+                                max_positions=(int(_it_prof["Max_Positions"]) if _it_ctx else None),
+                                min_trade_dollars=float(_it_prof["Min_Trade_Dollars"]),
+                                sizing_mode=_it_mode,
                             )
                             _bc = rc.build_buy_card(hist_map_wl.get(tk), _an, _wl_plan, confluence=None)
                             st.markdown(f"**🎯 {_bc['badge']}** · {_bc['glance_num']}")
                             if _wl_plan["gate"] == "na":
                                 st.caption(f"🧮 플랜: {_wl_plan['gate_label']} — {_wl_plan['gate_reason']}")
                             else:
-                                st.markdown(_esc_md(
-                                    f"**🧮 플랜: {_wl_plan['gate_label']}** · "
-                                    f"${_wl_plan['dollars']:,.2f} ({_wl_plan['shares_exact']:.3f}주 · 정수 {_wl_plan['shares_whole']:,}주 · "
-                                    f"비중 {_wl_plan['position_pct']:.1f}% · 제한 {_wl_plan['binding_label']}) · "
-                                    f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
-                                    f"R:R {_wl_plan['rr_label']} · 1R -${_wl_plan['risk_dollars']:,.0f}"
-                                ))
+                                if _wl_plan.get("sizing_mode") == "off":
+                                    st.markdown(_esc_md(
+                                        f"**🧮 플랜: {_wl_plan['gate_label']}** · "
+                                        f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
+                                        f"R:R {_wl_plan['rr_label']}  ·  _사이징 미사용 계좌_"
+                                    ))
+                                else:
+                                    st.markdown(_esc_md(
+                                        f"**🧮 플랜: {_wl_plan['gate_label']}** · "
+                                        f"${_wl_plan['dollars']:,.2f} ({_wl_plan['shares_exact']:.3f}주 · 정수 {_wl_plan['shares_whole']:,}주 · "
+                                        f"비중 {_wl_plan['position_pct']:.1f}% · 제한 {_wl_plan['binding_label']}) · "
+                                        f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
+                                        f"R:R {_wl_plan['rr_label']} · 1R -${_wl_plan['risk_dollars']:,.0f}"
+                                    ))
                                 if _wl_plan.get("blocked"):
                                     st.caption(_esc_md(f"↳ 🚧 {_wl_plan['block_reason']}"))
                                 if not _wl_plan.get("rr_measured", False):
@@ -22709,6 +22774,15 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             value=str(item.get("memo", "") or ""),
                             key=f"edit_memo_{idx}_{tk}",
                         )
+                        _acct_choices = ["(미지정)"] + list(_wl_acct_opts)
+                        _cur_acct = str(item.get("account", "") or "").strip()
+                        _acct_idx = _acct_choices.index(_cur_acct) if _cur_acct in _acct_choices else 0
+                        new_account = st.selectbox(
+                            "🏦 귀속 계좌", _acct_choices, index=_acct_idx,
+                            key=f"edit_acct_{idx}_{tk}",
+                            help="이 종목을 어느 계좌에서 매수할지. 사이징(자본금·현금·슬롯)이 이 계좌 기준으로 계산됩니다. "
+                                 "미지정이면 사이드바의 활성 계좌를 씁니다.",
+                        )
 
                         _sl_cur = float(_sl) if pd.notna(_sl) else 0.0
                         _tp_cur = float(_tp) if pd.notna(_tp) else 0.0
@@ -22740,6 +22814,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     stop_loss=float(new_sl) if new_sl > 0 else None,
                                     target_price=float(new_tp) if new_tp > 0 else None,
                                     alert_states=(",".join(new_states) if new_states else "none"),  # 전부 해제=none
+                                    account=("" if new_account == "(미지정)" else new_account),
                                 )
                                 if _ok_add:
                                     st.rerun()

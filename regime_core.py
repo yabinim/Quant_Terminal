@@ -728,8 +728,14 @@ BINDING_LABELS = {
     "cap":     "비중 상한",
     "reserve": "투자 여유",
     "cash":    "가용 현금",
+    "equal":   "균등 배분",
+    "off":     "사이징 미사용",
     "none":    "-",
 }
+
+# 계좌별 사이징 모드 — Account_Profile.Sizing_Mode 와 동일 코드계 (SSOT)
+SIZING_MODES = ("risk_based", "equal_weight", "off")
+SIZING_MODE_DEFAULT = "risk_based"
 
 
 def evaluate_rr(entry, stop, target) -> dict:
@@ -757,7 +763,8 @@ def position_size(equity, risk_pct, entry, stop,
                   cash=None, reserve_pct: float = DEFAULT_RESERVE_PCT,
                   invested_value: float = 0.0,
                   slots_used=None, max_positions=None,
-                  min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS) -> dict:
+                  min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS,
+                  sizing_mode: str = SIZING_MODE_DEFAULT) -> dict:
     """고정 분율 리스크 사이징 — **금액(dollars)이 불변량, 주(shares)는 파생값**.
 
     설계 원칙(중요):
@@ -777,6 +784,12 @@ def position_size(equity, risk_pct, entry, stop,
     슬롯(max_positions/slots_used)과 min_trade_dollars 는 금액을 깎지 않고 blocked 플래그로만
     알린다 — 금액은 그대로 보여주되 "지금 집행하면 안 되는 이유"를 함께 준다.
 
+    sizing_mode (계좌 전략별 분기):
+      risk_based   : 위 4종 제약 (신호별 진입 계좌)
+      equal_weight : 투자가능액 ÷ 슬롯 = 균등 몫. 비중 상한·현금 제약은 그대로 적용.
+                     기계적 회전 계좌용 — 손절폭이 금액에 영향을 주지 않는다.
+      off          : 사이징 미사용. dollars=0, binding="off" 로 반환하고 소비처가 표시를 생략한다.
+
     반환 키(기존 5개는 하위호환 유지):
       shares(=shares_whole) · dollars · risk_dollars · position_pct · capped(=binding=='cap')
       shares_whole · shares_exact · binding · binding_label · limits
@@ -788,7 +801,7 @@ def position_size(equity, risk_pct, entry, stop,
         "capped": False, "binding": "none", "binding_label": BINDING_LABELS["none"],
         "limits": {}, "slots_used": slots_used, "max_positions": max_positions,
         "slots_full": False, "below_min": False, "whole_share_ok": False,
-        "blocked": False, "block_reason": "",
+        "blocked": False, "block_reason": "", "sizing_mode": SIZING_MODE_DEFAULT,
     }
     try:
         eq, rp, e, s = float(equity), float(risk_pct), float(entry), float(stop)
@@ -805,15 +818,38 @@ def position_size(equity, risk_pct, entry, stop,
     if not (np.isfinite(stop_frac) and stop_frac > 0):
         return out
 
+    mode = str(sizing_mode or SIZING_MODE_DEFAULT).strip().lower()
+    if mode not in SIZING_MODES:
+        mode = SIZING_MODE_DEFAULT
+    out["sizing_mode"] = mode
+    if mode == "off":
+        out.update({"binding": "off", "binding_label": BINDING_LABELS["off"]})
+        return out
+
     # ── 제약 후보 산출 (삽입 순서 = 동점 시 우선순위) ────────────────────
-    limits = {"risk": (eq * (rp / 100.0)) / stop_frac}
+    if mode == "equal_weight":
+        try:
+            _slots = int(max_positions) if max_positions else int(DEFAULT_MAX_POSITIONS)
+        except (TypeError, ValueError):
+            _slots = int(DEFAULT_MAX_POSITIONS)
+        _slots = max(_slots, 1)
+        try:
+            _rv0 = float(reserve_pct)
+        except (TypeError, ValueError):
+            _rv0 = 0.0
+        if not (np.isfinite(_rv0) and _rv0 >= 0):
+            _rv0 = 0.0
+        limits = {"equal": max(eq * (1.0 - _rv0 / 100.0), 0.0) / _slots}
+    else:
+        limits = {"risk": (eq * (rp / 100.0)) / stop_frac}
     if np.isfinite(mp) and mp > 0:
         limits["cap"] = eq * (mp / 100.0)
     try:
         rv = float(reserve_pct)
     except (TypeError, ValueError):
         rv = 0.0
-    if np.isfinite(rv) and rv > 0:
+    if np.isfinite(rv) and rv > 0 and mode != "equal_weight":
+        # equal_weight 는 균등 몫에서 예비금을 이미 차감 → 중복 적용 금지
         try:
             iv = float(invested_value)
         except (TypeError, ValueError):
@@ -948,7 +984,8 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
                      cash=None, reserve_pct: float = DEFAULT_RESERVE_PCT,
                      invested_value: float = 0.0,
                      slots_used=None, max_positions=None,
-                     min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS) -> dict:
+                     min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS,
+                     sizing_mode: str = SIZING_MODE_DEFAULT) -> dict:
     """verdict + 손절/목표 + 자본 → 게이트 판정 + 사이즈 일괄. 순수 조합 함수.
 
     게이트(백테스트 반영):
@@ -965,6 +1002,7 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
         "slots_used": slots_used, "max_positions": max_positions,
         "slots_full": False, "below_min": False, "whole_share_ok": False,
         "blocked": False, "block_reason": "", "rr_measured": False,
+        "sizing_mode": SIZING_MODE_DEFAULT,
         "gate": "na", "gate_label": GATE_LABELS["na"], "gate_reason": "",
         "atr_mult": atr_mult, "rr_target": rr_target, "enter_ok": False,
     }
@@ -995,12 +1033,12 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
     sz = position_size(equity, risk_pct, e, stop, max_position_pct,
                        cash=cash, reserve_pct=reserve_pct, invested_value=invested_value,
                        slots_used=slots_used, max_positions=max_positions,
-                       min_trade_dollars=min_trade_dollars)
+                       min_trade_dollars=min_trade_dollars, sizing_mode=sizing_mode)
     plan.update({k: sz[k] for k in (
         "shares", "shares_whole", "shares_exact", "dollars", "risk_dollars",
         "position_pct", "capped", "binding", "binding_label", "limits",
         "slots_used", "max_positions", "slots_full", "below_min",
-        "whole_share_ok", "blocked", "block_reason")})
+        "whole_share_ok", "blocked", "block_reason", "sizing_mode")})
 
     # ── 게이트 판정 ──────────────────────────────────────────────────────
     code = str(verdict_code or "")
