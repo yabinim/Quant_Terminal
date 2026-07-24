@@ -718,6 +718,18 @@ GATE_LABELS = {
 }
 DEFAULT_RISK_PCT = 1.0       # 거래당 자본 대비 리스크 %
 DEFAULT_MAX_POSITION_PCT = 20.0  # 단일 종목 최대 비중 %
+DEFAULT_MAX_POSITIONS = 5        # 계좌 동시 보유 종목 수(슬롯) 기본값
+DEFAULT_RESERVE_PCT = 0.0        # 예비 현금 비율 % (0 = 미사용)
+DEFAULT_MIN_TRADE_DOLLARS = 0.0  # 이 금액 미만이면 집행 무의미 (0 = 미사용)
+
+# 투입 금액을 최종적으로 결정한 제약(=binding constraint) 라벨
+BINDING_LABELS = {
+    "risk":    "리스크 기준",
+    "cap":     "비중 상한",
+    "reserve": "투자 여유",
+    "cash":    "가용 현금",
+    "none":    "-",
+}
 
 
 def evaluate_rr(entry, stop, target) -> dict:
@@ -741,12 +753,43 @@ def evaluate_rr(entry, stop, target) -> dict:
 
 
 def position_size(equity, risk_pct, entry, stop,
-                  max_position_pct: float = DEFAULT_MAX_POSITION_PCT) -> dict:
-    """고정 분율 리스크 사이징. 거래당 잃을 금액을 자본의 risk_pct% 로 고정.
-    shares = floor((equity*risk_pct%) / (entry-stop)), 단일 종목 max_position_pct% 상한.
-    반환: {shares, dollars, risk_dollars, position_pct, capped}."""
-    out = {"shares": 0, "dollars": 0.0, "risk_dollars": 0.0,
-           "position_pct": 0.0, "capped": False}
+                  max_position_pct: float = DEFAULT_MAX_POSITION_PCT,
+                  cash=None, reserve_pct: float = DEFAULT_RESERVE_PCT,
+                  invested_value: float = 0.0,
+                  slots_used=None, max_positions=None,
+                  min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS) -> dict:
+    """고정 분율 리스크 사이징 — **금액(dollars)이 불변량, 주(shares)는 파생값**.
+
+    설계 원칙(중요):
+      floor() 를 계산 마지막이 아니라 *표시 직전*에만 적용한다. 소수점 매수 사용자는
+      dollars/shares_exact 를, 정수주만 가능한 사용자는 shares_whole 을 쓴다.
+      먼저 floor 하면 금액을 복원할 수 없어 소액 계좌에서 결과가 0으로 파괴된다.
+
+    제약 4종 중 가장 작은 값이 투입 금액을 결정하고, 무엇이 결정했는지를 binding 으로 돌려준다.
+      risk    : equity × risk_pct% ÷ 손절폭%      (리스크 고정)
+      cap     : equity × max_position_pct%        (단일 종목 집중도)
+      reserve : equity × (1-reserve_pct%) - invested_value  (예비 현금 확보)
+      cash    : cash                              (실제 집행 가능액)
+
+    전환점: 손절폭% > risk_pct ÷ max_position_pct 이면 risk 가, 아니면 cap 이 결정한다.
+      예) 3%/20% → 15% · 1%/20% → 5%
+
+    슬롯(max_positions/slots_used)과 min_trade_dollars 는 금액을 깎지 않고 blocked 플래그로만
+    알린다 — 금액은 그대로 보여주되 "지금 집행하면 안 되는 이유"를 함께 준다.
+
+    반환 키(기존 5개는 하위호환 유지):
+      shares(=shares_whole) · dollars · risk_dollars · position_pct · capped(=binding=='cap')
+      shares_whole · shares_exact · binding · binding_label · limits
+      slots_used · max_positions · slots_full · below_min · whole_share_ok · blocked · block_reason
+    """
+    out = {
+        "shares": 0, "shares_whole": 0, "shares_exact": 0.0,
+        "dollars": 0.0, "risk_dollars": 0.0, "position_pct": 0.0,
+        "capped": False, "binding": "none", "binding_label": BINDING_LABELS["none"],
+        "limits": {}, "slots_used": slots_used, "max_positions": max_positions,
+        "slots_full": False, "below_min": False, "whole_share_ok": False,
+        "blocked": False, "block_reason": "",
+    }
     try:
         eq, rp, e, s = float(equity), float(risk_pct), float(entry), float(stop)
         mp = float(max_position_pct)
@@ -756,23 +799,84 @@ def position_size(equity, risk_pct, entry, stop,
         return out
     if eq <= 0 or rp <= 0 or e <= 0 or s >= e:
         return out
+
     risk_per_share = e - s
-    risk_budget = eq * (rp / 100.0)
-    shares = int(np.floor(risk_budget / risk_per_share))
-    if shares < 0:
-        shares = 0
-    capped = False
-    max_dollars = eq * (mp / 100.0)
-    if shares * e > max_dollars and e > 0:
-        shares = int(np.floor(max_dollars / e))
-        capped = True
-    dollars = shares * e
+    stop_frac = risk_per_share / e            # 손절폭 (0 < frac < 1)
+    if not (np.isfinite(stop_frac) and stop_frac > 0):
+        return out
+
+    # ── 제약 후보 산출 (삽입 순서 = 동점 시 우선순위) ────────────────────
+    limits = {"risk": (eq * (rp / 100.0)) / stop_frac}
+    if np.isfinite(mp) and mp > 0:
+        limits["cap"] = eq * (mp / 100.0)
+    try:
+        rv = float(reserve_pct)
+    except (TypeError, ValueError):
+        rv = 0.0
+    if np.isfinite(rv) and rv > 0:
+        try:
+            iv = float(invested_value)
+        except (TypeError, ValueError):
+            iv = 0.0
+        if not (np.isfinite(iv) and iv >= 0):
+            iv = 0.0
+        limits["reserve"] = max(eq * (1.0 - rv / 100.0) - iv, 0.0)
+    if cash is not None:
+        try:
+            cv = float(cash)
+        except (TypeError, ValueError):
+            cv = np.nan
+        if np.isfinite(cv) and cv >= 0:
+            limits["cash"] = cv
+
+    binding = min(limits, key=lambda k: limits[k])
+    dollars = max(float(limits[binding]), 0.0)
+
+    shares_exact = dollars / e
+    shares_whole = int(np.floor(shares_exact))
+    if shares_whole < 0:
+        shares_whole = 0
+    risk_dollars = dollars * stop_frac
+
+    # ── 슬롯 / 최소금액 (금액은 깎지 않고 플래그만) ───────────────────────
+    slots_full = False
+    try:
+        if max_positions is not None and slots_used is not None:
+            _mx, _us = int(max_positions), int(slots_used)
+            if _mx > 0 and _us >= _mx:
+                slots_full = True
+    except (TypeError, ValueError):
+        slots_full = False
+    try:
+        _min = float(min_trade_dollars)
+    except (TypeError, ValueError):
+        _min = 0.0
+    below_min = bool(np.isfinite(_min) and _min > 0 and 0.0 < dollars < _min)
+
+    reasons = []
+    if slots_full:
+        reasons.append(f"슬롯 만석 ({slots_used}/{max_positions}) — 최약 보유와 교체 검토")
+    if dollars <= 0:
+        reasons.append(f"{BINDING_LABELS.get(binding, binding)} 여유 없음")
+    if below_min:
+        reasons.append(f"최소 거래금액 ${_min:,.0f} 미만")
+
     out.update({
-        "shares": shares,
+        "shares": shares_whole,          # 하위호환 (기존 소비처는 정수주를 기대)
+        "shares_whole": shares_whole,
+        "shares_exact": round(shares_exact, 4),
         "dollars": round(dollars, 2),
-        "risk_dollars": round(shares * risk_per_share, 2),
-        "position_pct": round((dollars / eq * 100.0) if eq > 0 else 0.0, 2),
-        "capped": capped,
+        "risk_dollars": round(risk_dollars, 2),
+        "position_pct": round(dollars / eq * 100.0, 2),
+        "capped": (binding == "cap"),
+        "binding": binding,
+        "binding_label": BINDING_LABELS.get(binding, binding),
+        "limits": {k: round(float(v), 2) for k, v in limits.items()},
+        "slots_full": slots_full,
+        "below_min": below_min,
+        "whole_share_ok": shares_whole >= 1,
+        "blocked": bool(reasons),
+        "block_reason": " · ".join(reasons),
     })
     return out
 
@@ -840,7 +944,11 @@ def resolve_target(entry, risk_per_share, rr_target, recent_high=None, manual_ta
 
 def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult, rr_target,
                      stop_source: str = "atr", manual_stop=None, manual_target=None,
-                     recent_high=None, max_position_pct: float = DEFAULT_MAX_POSITION_PCT) -> dict:
+                     recent_high=None, max_position_pct: float = DEFAULT_MAX_POSITION_PCT,
+                     cash=None, reserve_pct: float = DEFAULT_RESERVE_PCT,
+                     invested_value: float = 0.0,
+                     slots_used=None, max_positions=None,
+                     min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS) -> dict:
     """verdict + 손절/목표 + 자본 → 게이트 판정 + 사이즈 일괄. 순수 조합 함수.
 
     게이트(백테스트 반영):
@@ -852,6 +960,11 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
         "target": np.nan, "target_basis": "na", "target_pct": np.nan,
         "risk_per_share": np.nan, "r_multiple": np.nan, "rr_label": "-",
         "shares": 0, "dollars": 0.0, "risk_dollars": 0.0, "position_pct": 0.0, "capped": False,
+        "shares_whole": 0, "shares_exact": 0.0, "binding": "none",
+        "binding_label": BINDING_LABELS["none"], "limits": {},
+        "slots_used": slots_used, "max_positions": max_positions,
+        "slots_full": False, "below_min": False, "whole_share_ok": False,
+        "blocked": False, "block_reason": "", "rr_measured": False,
         "gate": "na", "gate_label": GATE_LABELS["na"], "gate_reason": "",
         "atr_mult": atr_mult, "rr_target": rr_target, "enter_ok": False,
     }
@@ -879,13 +992,21 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
     rr = evaluate_rr(e, stop, target)
     plan["r_multiple"], plan["rr_label"] = rr["r_multiple"], rr["label"]
 
-    sz = position_size(equity, risk_pct, e, stop, max_position_pct)
-    plan.update({k: sz[k] for k in ("shares", "dollars", "risk_dollars", "position_pct", "capped")})
+    sz = position_size(equity, risk_pct, e, stop, max_position_pct,
+                       cash=cash, reserve_pct=reserve_pct, invested_value=invested_value,
+                       slots_used=slots_used, max_positions=max_positions,
+                       min_trade_dollars=min_trade_dollars)
+    plan.update({k: sz[k] for k in (
+        "shares", "shares_whole", "shares_exact", "dollars", "risk_dollars",
+        "position_pct", "capped", "binding", "binding_label", "limits",
+        "slots_used", "max_positions", "slots_full", "below_min",
+        "whole_share_ok", "blocked", "block_reason")})
 
     # ── 게이트 판정 ──────────────────────────────────────────────────────
     code = str(verdict_code or "")
     rr_val = plan["r_multiple"]
     rr_is_real = (basis in ("manual", "structural_high")) and np.isfinite(rr_val)
+    plan["rr_measured"] = bool(rr_is_real)   # 신호 품질 바: 독립 목표 기반 R:R 실측 여부
 
     if code == "avoid":
         plan.update({"gate": "avoid", "gate_label": GATE_LABELS["avoid"],
@@ -1311,6 +1432,10 @@ def build_buy_card(hist, analysis: dict, plan: dict, confluence=None,
     rr = (plan or {}).get("rr_label", "-")
     shares = (plan or {}).get("shares", 0)
     pos_pct = (plan or {}).get("position_pct", 0.0)
+    _dollars = float((plan or {}).get("dollars", 0.0) or 0.0)
+    # 금액 불변량: 소수점 매수 기준 금액을 우선 표기하고, 정수주는 괄호로 보조 표기
+    _size_txt = (f"${_dollars:,.0f} (비중 {pos_pct:.0f}% · 정수주 {shares:,}주)"
+                 if _dollars > 0 else f"{shares:,}주 (비중 {pos_pct:.0f}%)")
     stop_pct = (plan or {}).get("stop_pct")
     target_pct = (plan or {}).get("target_pct")
 
@@ -1319,14 +1444,14 @@ def build_buy_card(hist, analysis: dict, plan: dict, confluence=None,
 
     if key == "buy":
         headline = "진입 확인됨 — R:R·근거 충족."
-        plan_line = (f"진입 {_fmt(price)} · {shares:,}주 (비중 {pos_pct:.0f}%) · "
+        plan_line = (f"진입 {_fmt(price)} · {_size_txt} · "
                      f"손절 {_fmt(stop)} ({stop_pct:.1f}%) · 목표 {_fmt(target)} · R:R {rr}")
         invalidation = f"{_fmt(stop)} ({stop_pct:.1f}%)" if stop_pct is not None else _fmt(stop)
     elif key == "buy_split":
         headline = "강세지만 과열 — 일괄은 고점 위험, 관망은 놓칠 위험. 분할 권장."
         add_lv = ma20 if (np.isfinite(ma20) and ma20 < price) else (ma50 if np.isfinite(ma50) else np.nan)
         trigger = f"1차 지금 (목표의 절반) · 2차 추가 {_fmt(add_lv)} 눌림 회복 시 (나머지)"
-        plan_line = f"진입 시 총 {shares:,}주 · 손절 {_fmt(stop)} · R:R {rr}"
+        plan_line = f"진입 시 총 {_size_txt} · 손절 {_fmt(stop)} · R:R {rr}"
         invalidation = f"{_fmt(stop)} ({stop_pct:.1f}%)" if stop_pct is not None else _fmt(stop)
         trigger_price = price
     elif key == "wait_pullback":

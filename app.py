@@ -18570,12 +18570,13 @@ if st.session_state.get("logged_in"):
                     if not _regime_res.get("enough_data") or not (pd.notna(current_price) and current_price > 0):
                         st.info("사이징에 필요한 가격/레짐 데이터가 부족합니다.")
                     else:
-                        _c1, _c2, _c3 = st.columns([1.2, 1, 1.2])
+                        _c1, _c2, _c3, _c4 = st.columns([1.15, 1, 1.15, 1.2])
                         with _c1:
                             _equity = st.number_input(
                                 "계좌 자본금 ($)", min_value=0.0, step=1000.0,
                                 value=float(st.session_state.get("_size_equity", 10000.0)),
                                 key="_size_equity_input",
+                                help="현금 + 보유주식 평가액 (계좌 총액). 현금만 넣으면 사이즈가 과소 산출됩니다.",
                             )
                             st.session_state["_size_equity"] = _equity
                         with _c2:
@@ -18586,6 +18587,15 @@ if st.session_state.get("logged_in"):
                             )
                             st.session_state["_size_risk_pct"] = _risk_pct
                         with _c3:
+                            _cash_in = st.number_input(
+                                "가용 현금 ($)", min_value=0.0, step=50.0,
+                                value=float(st.session_state.get("_size_cash", 0.0)),
+                                key="_size_cash_input",
+                                help="실제 집행 가능한 현금. 0 = 제한 없음(현금 게이트 미적용).",
+                            )
+                            st.session_state["_size_cash"] = _cash_in
+                        _cash_val = float(_cash_in) if _cash_in > 0 else None
+                        with _c4:
                             _stop_src = st.selectbox(
                                 "손절 기준", ["ATR(변동성)", "200일선", "직접 입력"],
                                 index=0, key=f"_size_stopsrc_{selected_ticker}",
@@ -18650,6 +18660,7 @@ if st.session_state.get("logged_in"):
                             stop_source=_src_map[_stop_src],
                             manual_stop=_manual_stop, manual_target=_manual_target,
                             recent_high=_recent_high,
+                            cash=_cash_val,
                         )
 
                         _gate = _plan["gate"]
@@ -18671,16 +18682,38 @@ if st.session_state.get("logged_in"):
                                 f"{_plan['target_pct']:.1f}% · {_basis_kr}" if pd.notna(_plan["target_pct"]) else _basis_kr,
                             )
                             _m3.metric("손익비 (R:R)", _plan["rr_label"], f"목표 1:{_rp['rr']:.1f} (국면적응)")
+                            # 금액(dollars)이 불변량 — 수량은 파생값으로 보조 표기
                             _s1, _s2, _s3 = st.columns(3)
-                            _s1.metric("제안 수량", f"{_plan['shares']:,}주")
-                            _s2.metric("투입 금액", f"${_plan['dollars']:,.0f}",
-                                       f"비중 {_plan['position_pct']:.1f}%" + (" · 상한적용" if _plan["capped"] else ""))
-                            _s3.metric("최대 손실(1R)", f"-${_plan['risk_dollars']:,.0f}", f"자본의 {_risk_pct:.1f}%")
+                            _s1.metric("투입 금액", f"${_plan['dollars']:,.2f}",
+                                       f"비중 {_plan['position_pct']:.1f}% · 제한: {_plan['binding_label']}")
+                            _s2.metric("수량 (소수점)", f"{_plan['shares_exact']:,.3f}주",
+                                       f"정수주 {_plan['shares_whole']:,}주")
+                            _s3.metric("최대 손실(1R)", f"-${_plan['risk_dollars']:,.2f}",
+                                       f"자본의 {_risk_pct:.1f}%")
+
+                            if _plan["dollars"] > 0 and not _plan["whole_share_ok"]:
+                                _px_pct = (float(_plan["entry"]) / _equity * 100.0) if _equity > 0 else 0.0
+                                st.warning(
+                                    f"⛔ **정수주로는 진입 불가** — 1주 ${_plan['entry']:,.2f} = 자본의 {_px_pct:.1f}%. "
+                                    f"소수점 매수 시 **${_plan['dollars']:,.2f} ({_plan['shares_exact']:.3f}주)** 를 그대로 집행하세요."
+                                )
+                            if _plan["blocked"]:
+                                st.warning(f"🚧 {_plan['block_reason']}")
+                            if _plan["binding"] == "cash":
+                                st.caption("💵 가용 현금이 사이즈를 결정했습니다 — 부분 집행입니다. 현금 보충 후 재검토하세요.")
+                            if not _plan["rr_measured"]:
+                                st.caption(
+                                    "⚠️ 신호 품질: 독립 목표(직접 입력·최근 고점)가 없어 **R:R이 실측되지 않았습니다** — "
+                                    "자금이 빠듯하면 R:R 실측 신호를 우선하세요."
+                                )
                             if not _plan["enter_ok"]:
-                                st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 수량은 참고용이며, 회피/건너뛰기/신중 구간에서는 신규 진입을 권하지 않습니다.")
+                                st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 금액은 참고용이며, 회피/건너뛰기/신중 구간에서는 신규 진입을 권하지 않습니다.")
+                            _turn_pct = (_risk_pct / rc.DEFAULT_MAX_POSITION_PCT * 100.0) if rc.DEFAULT_MAX_POSITION_PCT > 0 else float("nan")
                             st.caption(
                                 f"국면 적응: {_rp['label']} (ATR×{_rp['atr_mult']}, 목표 1:{_rp['rr']}). "
-                                "손익비는 독립 목표(직접 입력·최근 고점)가 있을 때만 게이트 필터로 작동합니다."
+                                f"전환점 — 손절폭이 **{_turn_pct:.1f}%** 를 넘으면 리스크 기준이, 그 이하면 "
+                                f"비중 상한({rc.DEFAULT_MAX_POSITION_PCT:.0f}%)이 금액을 결정합니다. "
+                                "손익비는 독립 목표가 있을 때만 게이트 필터로 작동합니다."
                             )
 
                 # ── 차트 탭 ───────────────────────────────────────────────
@@ -22075,10 +22108,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             else:
                                 st.markdown(
                                     f"**🧮 플랜: {_wl_plan['gate_label']}** · "
-                                    f"{_wl_plan['shares']:,}주 (${_wl_plan['dollars']:,.0f} · 비중 {_wl_plan['position_pct']:.1f}%) · "
+                                    f"${_wl_plan['dollars']:,.2f} ({_wl_plan['shares_exact']:.3f}주 · 정수 {_wl_plan['shares_whole']:,}주 · "
+                                    f"비중 {_wl_plan['position_pct']:.1f}% · 제한 {_wl_plan['binding_label']}) · "
                                     f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
                                     f"R:R {_wl_plan['rr_label']} · 1R -${_wl_plan['risk_dollars']:,.0f}"
                                 )
+                                if not _wl_plan.get("rr_measured", False):
+                                    st.caption("↳ ⚠️ R:R 미실측(독립 목표 없음) — 자금 빠듯하면 후순위")
                                 if not _wl_plan["enter_ok"]:
                                     st.caption(f"↳ {_wl_plan['gate_reason']} — 신규 진입 비권장")
 
