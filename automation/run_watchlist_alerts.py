@@ -37,6 +37,7 @@ from google.oauth2.service_account import Credentials
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import regime_core as rc  # noqa: E402
 import users_core as uc   # noqa: E402  — Users 시트/수신자 SSOT (app.py와 동일 모듈)
+import accounts_core as ac  # noqa: E402  — 계좌 프로필/자본금 순수 로직 SSOT (app.py와 동일 모듈)
 
 # ── 환경변수 ───────────────────────────────────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -54,11 +55,13 @@ _FMP_TIMEOUT = 15
 _SPREADSHEET_TITLE   = "Quant_DB"
 _WATCHLIST_WORKSHEET = "Watchlist"
 
-# app.py _WATCHLIST_SHEET_COLS 와 동일 (12열) — lockstep
+# app.py _WATCHLIST_SHEET_COLS 와 동일 (13열) — lockstep
+# ⚠️ Account 는 맨 뒤(M열). Alert_LastState(L열) 하드코딩 기록 위치를 깨지 않기 위함.
 _WL_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200",
             "Saved_Price", "Date_Added", "Stop_Loss", "Target_Price",
-            "Alert_States", "Alert_LastState"]
+            "Alert_States", "Alert_LastState", "Account"]
 _WL_NCOL = len(_WL_COLS)
+_WL_COL_ACCOUNT = 12  # 0-index
 _WL_ALERT_DEFAULT = "entry,risk,watch"
 _COL_ALERT_STATES = 10      # 0-index
 _COL_ALERT_LASTSTATE = 11   # 0-index → 시트 L열
@@ -182,6 +185,71 @@ def send_email(subject: str, html_body: str, to_addr: str | None = None) -> bool
     except Exception as e:
         print(f"[ERROR] 이메일 발송 실패({_to}): {e}")
         return False
+
+
+_ACCOUNT_PROFILE_CACHE = {"loaded": False, "values": []}
+
+
+def _load_account_profile_values():
+    """Account_Profile 시트 전체값 로드(1회 캐시). 실패 시 빈 리스트(기본값 동작)."""
+    if _ACCOUNT_PROFILE_CACHE["loaded"]:
+        return _ACCOUNT_PROFILE_CACHE["values"]
+    vals = []
+    try:
+        gc = get_gspread_client()
+        ws = gc.open(_SPREADSHEET_TITLE).worksheet(ac.WORKSHEET_TITLE)
+        vals = ws.get_all_values() or []
+    except Exception as e:
+        print(f"[INFO] Account_Profile 시트 없음/실패 — 기본값으로 사이징: {e}")
+    _ACCOUNT_PROFILE_CACHE["loaded"] = True
+    _ACCOUNT_PROFILE_CACHE["values"] = vals
+    return vals
+
+
+def _account_context_for(uid: str, account: str, hist_cache: dict) -> dict:
+    """유저·계좌의 자본금 컨텍스트 + 프로필. Portfolios 에서 보유를 모아 자본금 산출.
+
+    자본금 시세는 hist_cache 의 마지막 종가를 재사용(추가 FMP 호출 없음).
+    반환: {profile, equity, invested_value, cash, slots_used, ok}
+    """
+    profs = ac.parse_profiles(_load_account_profile_values(), uid)
+    prof = ac.get_profile(profs, account)
+    ctx = {"profile": prof, "equity": float(prof.get("Cash", 0.0) or 0.0),
+           "invested_value": 0.0, "cash": float(prof.get("Cash", 0.0) or 0.0),
+           "slots_used": 0, "ok": bool(str(account or "").strip())}
+    acct = str(account or "").strip()
+    if not acct:
+        return ctx
+    try:
+        _sh, pf_ws = _open_ws(_PF_WORKSHEET)
+        pf_vals = pf_ws.get_all_values() or []
+    except Exception:
+        pf_vals = []
+    holdings = []
+    price_map = {}
+    for r in pf_vals[1:] if len(pf_vals) > 1 else []:
+        r = (list(r) + [""] * 6)[:6]
+        if str(r[0]).strip().upper() != str(uid).strip().upper():
+            continue
+        if str(r[1]).strip().lower() != acct.lower():
+            continue
+        tk = str(r[2]).strip().upper()
+        if not tk:
+            continue
+        avg = pd.to_numeric(r[3], errors="coerce")
+        qty = pd.to_numeric(r[4], errors="coerce")
+        holdings.append((tk, qty, float(avg) if pd.notna(avg) else None))
+        # 자본금용 현재가: hist_cache 종가 재사용
+        try:
+            h = hist_cache.get(tk)
+            if h is not None and not h.empty:
+                price_map[tk] = float(pd.to_numeric(h["Close"], errors="coerce").dropna().iloc[-1])
+        except Exception:
+            pass
+    eqinfo = ac.compute_equity(holdings, price_map, prof.get("Cash", 0.0))
+    ctx.update({"equity": eqinfo["equity"], "invested_value": eqinfo["invested_value"],
+                "cash": eqinfo["cash"], "slots_used": eqinfo["slots_used"]})
+    return ctx
 
 
 def _radar_recipients() -> list[tuple[str, str]]:
@@ -308,6 +376,9 @@ def _render_hit_card(h) -> str:
             f"<div style='margin-top:6px'><b>{ev.get('label','')}</b> — "
             f"{ev.get('message','')}</div>"
         )
+        _plan = ev.get("plan")
+        if isinstance(_plan, dict):
+            html += _render_sizing_line(_plan, ev.get("account"))
     if h.get("swing") or h.get("position"):
         def _vcolor(_l):
             if "SELL" in _l or "청산" in _l:
@@ -329,6 +400,36 @@ def _render_hit_card(h) -> str:
                      + (f" — {po[1]}" if po[1] else "") + "</div>")
         html += "</div>"
     return html + "</div>"
+
+
+def _render_sizing_line(plan: dict, account=None) -> str:
+    """entry 알림용 사이징 요약(금액 우선 + 제한 사유 + 차단). c안."""
+    _acct = str(account or "").strip()
+    _acct_tag = (f"<span style='color:#888'>🏦 {_acct}</span> · " if _acct else "")
+    mode = str(plan.get("sizing_mode", "risk_based"))
+    if mode == "off":
+        return ("<div style='margin-top:4px;font-size:13px;color:#666'>"
+                f"{_acct_tag}💰 <i>사이징 미사용 계좌</i></div>")
+    dollars = float(plan.get("dollars", 0.0) or 0.0)
+    if dollars <= 0 and not plan.get("blocked"):
+        return ""   # 자본금 미상(계좌 미지정) → 금액 생략, 게이트/R:R 은 위에 이미 표시됨
+    _sh_ex = float(plan.get("shares_exact", 0.0) or 0.0)
+    _whole = int(plan.get("shares_whole", 0) or 0)
+    _pos = float(plan.get("position_pct", 0.0) or 0.0)
+    _bind = str(plan.get("binding_label", "-"))
+    _1r = float(plan.get("risk_dollars", 0.0) or 0.0)
+    line = (f"<div style='margin-top:4px;font-size:13px;color:#24292e'>"
+            f"{_acct_tag}💰 <b>${dollars:,.2f}</b> "
+            f"<span style='color:#888'>({_sh_ex:.3f}주 · 정수 {_whole}주 · "
+            f"비중 {_pos:.1f}% · 제한 {_bind})</span>"
+            f" · 1R -${_1r:,.2f}</div>")
+    if plan.get("blocked"):
+        line += ("<div style='margin-top:2px;font-size:13px;color:#b08800'>"
+                 f"🚧 {plan.get('block_reason','')}</div>")
+    if not plan.get("rr_measured", True):
+        line += ("<div style='margin-top:2px;font-size:12px;color:#999'>"
+                 "⚠️ R:R 미실측(독립 목표 없음) — 자금 빠듯하면 후순위</div>")
+    return line
 
 
 def build_email_html(wl_by_user: dict, pf_by_user: dict, today: str) -> str:
@@ -354,8 +455,14 @@ def build_email_html(wl_by_user: dict, pf_by_user: dict, today: str) -> str:
         )
         for uid, hits in wl_by_user.items():
             parts.append(f"<h3 style='border-bottom:1px solid #eee;padding-bottom:6px'>👤 {uid}</h3>")
+            _wl_by_acct = {}
             for h in hits:
-                parts.append(_render_hit_card(h))
+                _wl_by_acct.setdefault(str(h.get("account") or "미지정"), []).append(h)
+            for acct, ah in _wl_by_acct.items():
+                if len(_wl_by_acct) > 1 or acct != "미지정":
+                    parts.append(f"<h4 style='margin:14px 0 4px;color:#444'>🏦 {acct}</h4>")
+                for h in ah:
+                    parts.append(_render_hit_card(h))
 
     # 💼 Portfolio (보유 · 매도/관리) — account별 그룹
     if pf_total:
@@ -405,6 +512,36 @@ def _merge_fired(a, b):
     return out
 
 
+def _sizing_kwargs_for(uid: str, account: str, hist_cache: dict) -> dict:
+    """계좌 컨텍스트 → build_watchlist_plan 사이징 kwargs.
+
+    d안: 계좌 미지정/프로필 없으면 사이징 생략(equity=0 → 금액 0, 게이트/R:R만).
+    off 모드도 마찬가지로 금액이 0으로 나오되 mode 로 이메일 표시가 갈린다.
+    """
+    acct = str(account or "").strip()
+    if not acct:
+        return {}   # 계좌 미지정 → 사이징 생략(자본금 미상)
+    try:
+        ctx = _account_context_for(uid, acct, hist_cache)
+    except Exception:
+        return {}
+    if not ctx.get("ok") or float(ctx.get("equity", 0.0)) <= 0:
+        return {}
+    p = ctx["profile"]
+    return {
+        "equity": float(ctx["equity"]),
+        "risk_pct": float(p["Risk_Pct"]),
+        "max_position_pct": float(p["Max_Position_Pct"]),
+        "cash": (float(ctx["cash"]) if float(ctx["cash"]) > 0 else None),
+        "reserve_pct": float(p["Cash_Reserve_Pct"]),
+        "invested_value": float(ctx["invested_value"]),
+        "slots_used": int(ctx["slots_used"]),
+        "max_positions": int(p["Max_Positions"]),
+        "min_trade_dollars": float(p["Min_Trade_Dollars"]),
+        "sizing_mode": str(p["Sizing_Mode"]),
+    }
+
+
 def eval_watchlist_eod(spy_close, hist_cache, today):
     """워치리스트: 상태 전환 2일 확정 + Alert_LastState(L열) 저장. → fired_by_user"""
     fired_by_user = {}
@@ -422,6 +559,7 @@ def eval_watchlist_eod(spy_close, hist_cache, today):
     for r in data_rows:
         r = (list(r) + [""] * _WL_NCOL)[:_WL_NCOL]
         uid, tk = str(r[0]).strip(), str(r[1]).strip().upper()
+        acct = str(r[_WL_COL_ACCOUNT]).strip()
         prev_state = str(r[_COL_ALERT_LASTSTATE]).strip()
         if not uid or not tk:
             laststate_col.append([prev_state]); continue
@@ -452,17 +590,21 @@ def eval_watchlist_eod(spy_close, hist_cache, today):
                 for _ev in fired:
                     if _ev.get("event") == "entry":
                         try:
+                            _sz = _sizing_kwargs_for(uid, acct, hist_cache)
                             _plan = rc.build_watchlist_plan(
                                 hist, an,
                                 manual_stop=(float(sl) if pd.notna(sl) else None),
                                 manual_target=(float(tp) if pd.notna(tp) else None),
+                                **_sz,
                             )
                             rc.decorate_entry_alert(_ev, _plan,
                                                     an.get("regime", {}).get("regime"))
+                            _ev["plan"] = _plan          # 이메일 표시용
+                            _ev["account"] = acct
                         except Exception as _ge:
                             print(f"  [WARN] {uid}/{tk} 게이트 산출 실패(신호는 유지): {_ge}")
-                fired_by_user.setdefault(uid, []).append({"ticker": tk, "fired": fired, "an": an})
-                print(f"  [FIRE-WL] {uid}/{tk}: {[e['event'] for e in fired]}")
+                fired_by_user.setdefault(uid, []).append({"ticker": tk, "fired": fired, "an": an, "account": acct})
+                print(f"  [FIRE-WL] {uid}/{acct or '미지정'}/{tk}: {[e['event'] for e in fired]}")
         except Exception as e:
             print(f"  [WARN] {uid}/{tk} 평가 실패: {e}")
             laststate_col.append([prev_state])
@@ -576,6 +718,7 @@ def eval_watchlist_intraday(spy_close, hist_cache, quote_cache, today):
     for r in vals[1:]:
         r = (list(r) + [""] * _WL_NCOL)[:_WL_NCOL]
         uid, tk = str(r[0]).strip(), str(r[1]).strip().upper()
+        acct = str(r[_WL_COL_ACCOUNT]).strip()
         if not uid or not tk:
             continue
         enabled = rc.resolve_alert_events(r[_COL_ALERT_STATES], _WL_ALERT_DEFAULT)
@@ -609,19 +752,23 @@ def eval_watchlist_intraday(spy_close, hist_cache, quote_cache, today):
             for _ev in active:
                 if _ev.get("event") == "entry":
                     try:
+                        _sz = _sizing_kwargs_for(uid, acct, hist_cache)
                         _plan = rc.build_watchlist_plan(
                             hist, an,
                             manual_stop=(float(sl) if pd.notna(sl) else None),
                             manual_target=(float(tp) if pd.notna(tp) else None),
                             entry=float(live),
+                            **_sz,
                         )
                         rc.decorate_entry_alert(_ev, _plan,
                                                 an.get("regime", {}).get("regime"))
+                        _ev["plan"] = _plan
+                        _ev["account"] = acct
                     except Exception as _ge:
                         print(f"  [WARN] {uid}/{tk} 장중 게이트 산출 실패(신호는 유지): {_ge}")
             if active:
-                hits_by_user.setdefault(uid, []).append({"ticker": tk, "fired": active, "an": an})
-                print(f"  [INTRADAY-WL] {uid}/{tk}: {[a['event'] for a in active]}")
+                hits_by_user.setdefault(uid, []).append({"ticker": tk, "fired": active, "an": an, "account": acct})
+                print(f"  [INTRADAY-WL] {uid}/{acct or '미지정'}/{tk}: {[a['event'] for a in active]}")
         except Exception as e:
             print(f"  [WARN] {uid}/{tk} 장중 평가 실패: {e}")
     return hits_by_user
