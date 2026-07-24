@@ -647,6 +647,82 @@ def ensure_portfolios_header_row(ws):
         ws.update([_PORTFOLIOS_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
 
 
+_ACCT_CTX_MEMO_TTL = 60.0   # 초. 사이드바가 매 rerun 마다 재계산되는 비용 차단
+
+
+def _acct_ctx_memo_key(user_id: str, account: str) -> str:
+    return f"_acctctx::{str(user_id or '').strip()}::{str(account or '').strip()}"
+
+
+def _invalidate_account_context_memo():
+    """계좌 컨텍스트 세션 메모 전체 무효화 (현금/보유 변경 직후 호출)."""
+    for k in [k for k in list(st.session_state.keys()) if str(k).startswith("_acctctx::")]:
+        st.session_state.pop(k, None)
+
+
+def account_context_memo(user_id: str, account: str, ttl: float = _ACCT_CTX_MEMO_TTL) -> dict:
+    """compute_account_context 의 세션 메모 래퍼. 같은 세션에서 ttl 초 동안 재계산하지 않는다."""
+    key = _acct_ctx_memo_key(user_id, account)
+    now = time.time()
+    hit = st.session_state.get(key)
+    if isinstance(hit, tuple) and len(hit) == 2 and (now - hit[0]) < float(ttl):
+        return hit[1]
+    ctx = compute_account_context(user_id, account)
+    st.session_state[key] = (now, ctx)
+    return ctx
+
+
+def adjust_account_cash(user_id: str, account: str, delta: float, note: str = ""):
+    """계좌 현금 잔고를 delta 만큼 증감하고 저장. (ok, new_cash|err_msg)
+
+    매수 → 음수, 매도 → 양수. 프로필 행이 없으면 기본값에서 시작해 새로 만든다.
+    현금이 음수가 되면 0 으로 클램프하고 경고 문자열을 함께 돌려준다.
+    """
+    uid = str(user_id or "").strip()
+    acct = str(account or "").strip()
+    if not uid or not acct:
+        return False, "user_id / 계좌명이 비어 있습니다."
+    try:
+        d = float(delta)
+    except (TypeError, ValueError):
+        return False, "금액이 올바르지 않습니다."
+    if not np.isfinite(d) or abs(d) < 1e-9:
+        return True, None
+    try:
+        prof = get_account_profile(uid, acct)
+        old_cash = float(prof.get("Cash", 0.0) or 0.0)
+        new_cash = old_cash + d
+        clamped = False
+        if new_cash < 0:
+            new_cash, clamped = 0.0, True
+        payload = {
+            "Cash": new_cash,
+            "Sizing_Mode": prof.get("Sizing_Mode", "risk_based"),
+            "Risk_Pct": prof.get("Risk_Pct", rc.DEFAULT_RISK_PCT),
+            "Max_Position_Pct": prof.get("Max_Position_Pct", rc.DEFAULT_MAX_POSITION_PCT),
+            "Max_Positions": prof.get("Max_Positions", rc.DEFAULT_MAX_POSITIONS),
+            "Cash_Reserve_Pct": prof.get("Cash_Reserve_Pct", 0.0),
+            "Min_Trade_Dollars": prof.get("Min_Trade_Dollars", 0.0),
+        }
+        ok, err = save_account_profile(uid, acct, payload)
+        if not ok:
+            return False, err
+        _invalidate_account_context_memo()
+        st.session_state["_cash_autoadjust_msg"] = {
+            "account": acct, "old": old_cash, "new": new_cash,
+            "delta": d, "clamped": clamped, "note": note,
+        }
+        return True, new_cash
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _esc_md(s) -> str:
+    """Streamlit 마크다운에서 `$...$` 가 LaTeX 수식으로 해석돼 텍스트가 사라지는 것을 막는다.
+    금액이 2개 이상 들어가는 caption/warning/markdown 문자열은 반드시 이 함수로 감싼다."""
+    return str(s).replace("$", "\\$")
+
+
 def open_account_profile_worksheet():
     """Quant_DB / Account_Profile 탭. 없으면 자동 생성. (worksheet|None, err|None)"""
     gc = get_gspread_client()
@@ -7559,6 +7635,11 @@ def _invalidate_portfolio_sheet_cache():
         _portfolio_sheet_all_values_cached.clear()
     except Exception:
         pass
+    # 보유가 바뀌면 계좌 컨텍스트(자본금·슬롯)도 즉시 다시 계산되어야 한다
+    try:
+        _invalidate_account_context_memo()
+    except Exception:
+        pass
 
 
 def distinct_portfolio_accounts_for_user_id(user_id: str) -> list[str]:
@@ -8107,6 +8188,17 @@ def append_trade_history_row(user_id: str, account: str, ticker: str, action: st
         ]
         _safe_append_rows(ws, row, value_input_option="USER_ENTERED")
         _invalidate_trade_history_cache()
+        # ── 현금 자동 반영: 기록된 거래만 (BUY 차감 / SELL 증가) ──
+        # 기록 없는 포지션 삭제는 여기를 타지 않으므로 현금이 움직이지 않는다(의도).
+        try:
+            _act = str(action).strip().upper()
+            _amt = float(shares) * float(price)
+            if _act == "BUY" and _amt > 0:
+                adjust_account_cash(user_id, account, -_amt, note=f"{ticker} 매수")
+            elif _act == "SELL" and _amt > 0:
+                adjust_account_cash(user_id, account, +_amt, note=f"{ticker} 매도")
+        except Exception:
+            pass   # 현금 반영 실패가 거래 기록 자체를 무효화하지 않는다
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -14905,15 +14997,15 @@ if st.session_state.get("logged_in"):
         )
         st.session_state["_active_account"] = _active_acct
         try:
-            _ctx_side = compute_account_context(_uid_side, _active_acct)
+            _ctx_side = account_context_memo(_uid_side, _active_acct)
             _psd = _ctx_side["profile"]
-            st.sidebar.caption(
+            st.sidebar.caption(_esc_md(
                 f"자본 ${_ctx_side['equity']:,.0f} "
                 f"(현금 ${_ctx_side['cash']:,.0f} + 보유 ${_ctx_side['invested_value']:,.0f}) · "
                 f"슬롯 {_ctx_side['slots_used']}/{int(_psd['Max_Positions'])} · "
                 f"리스크 {float(_psd['Risk_Pct']):.1f}%"
                 + ("" if _psd.get("_exists") else "  ·  ⚙️ 기본값")
-            )
+            ))
             if _ctx_side["slots_used"] >= int(_psd["Max_Positions"]):
                 st.sidebar.caption("🔄 슬롯 만석 — 신규 진입 시 최약 보유와 교체 검토")
         except Exception:
@@ -18826,7 +18918,7 @@ if st.session_state.get("logged_in"):
                         _ctx_size = None
                         if _act_acct:
                             try:
-                                _ctx_size = compute_account_context(_uid_size, _act_acct)
+                                _ctx_size = account_context_memo(_uid_size, _act_acct)
                             except Exception:
                                 _ctx_size = None
                         if _ctx_size:
@@ -18835,13 +18927,16 @@ if st.session_state.get("logged_in"):
                             _def_risk = float(_pf_s["Risk_Pct"])
                             _def_cash = float(_ctx_size["cash"])
                             _kx = _act_acct
-                            st.caption(
+                            st.caption(_esc_md(
                                 f"📍 **{_act_acct}** 기준 · 자본 ${_ctx_size['equity']:,.2f} "
                                 f"(현금 ${_ctx_size['cash']:,.2f} + 보유 ${_ctx_size['invested_value']:,.2f}) · "
                                 f"슬롯 {_ctx_size['slots_used']}/{int(_pf_s['Max_Positions'])} · "
                                 f"상한 {float(_pf_s['Max_Position_Pct']):.0f}%"
                                 + ("" if _pf_s.get("_exists") else "  ·  ⚙️ 기본값 (포트폴리오 탭에서 프로필 저장 가능)")
-                            )
+                            ))
+                            if not _ctx_size["priced_ok"]:
+                                st.caption("⚠️ 일부 보유 종목 시세 미수신 — 매수 평단으로 대체 계산: "
+                                           + ", ".join(_ctx_size["missing"][:8]))
                         else:
                             _pf_s = dict(_ACCOUNT_PROFILE_DEFAULTS)
                             _pf_s["_exists"] = False
@@ -18977,12 +19072,12 @@ if st.session_state.get("logged_in"):
 
                             if _plan["dollars"] > 0 and not _plan["whole_share_ok"]:
                                 _px_pct = (float(_plan["entry"]) / _equity * 100.0) if _equity > 0 else 0.0
-                                st.warning(
+                                st.warning(_esc_md(
                                     f"⛔ **정수주로는 진입 불가** — 1주 ${_plan['entry']:,.2f} = 자본의 {_px_pct:.1f}%. "
                                     f"소수점 매수 시 **${_plan['dollars']:,.2f} ({_plan['shares_exact']:.3f}주)** 를 그대로 집행하세요."
-                                )
+                                ))
                             if _plan["blocked"]:
-                                st.warning(f"🚧 {_plan['block_reason']}")
+                                st.warning(_esc_md(f"🚧 {_plan['block_reason']}"))
                             if _plan["binding"] == "cash":
                                 st.caption("💵 가용 현금이 사이즈를 결정했습니다 — 부분 집행입니다. 현금 보충 후 재검토하세요.")
                             if not _plan["rr_measured"]:
@@ -18994,12 +19089,12 @@ if st.session_state.get("logged_in"):
                                 st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 금액은 참고용이며, 회피/건너뛰기/신중 구간에서는 신규 진입을 권하지 않습니다.")
                             _cap_pct_eff = float(_pf_s["Max_Position_Pct"])
                             _turn_pct = (_risk_pct / _cap_pct_eff * 100.0) if _cap_pct_eff > 0 else float("nan")
-                            st.caption(
+                            st.caption(_esc_md(
                                 f"국면 적응: {_rp['label']} (ATR×{_rp['atr_mult']}, 목표 1:{_rp['rr']}). "
                                 f"전환점 — 손절폭이 **{_turn_pct:.1f}%** 를 넘으면 리스크 기준이, 그 이하면 "
                                 f"비중 상한({_cap_pct_eff:.0f}%)이 금액을 결정합니다. "
                                 "손익비는 독립 목표가 있을 때만 게이트 필터로 작동합니다."
-                            )
+                            ))
 
                 # ── 차트 탭 ───────────────────────────────────────────────
                 chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📈 가격 + 이평선 + 볼린저밴드", "📊 MACD", "📦 거래량"])
@@ -19805,7 +19900,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     _bits.append(f"목표 ${_plan_pf['target']:.2f} ({_plan_pf['target_pct']:+.1f}%, {_tb})")
                                 _bits.append(f"R:R {_plan_pf['rr_label']}")
                                 _src_kr = {"manual": "내 설정", "atr": "ATR 기본", "ma200": "200MA"}.get(str(_plan_pf["stop_source"]), "")
-                                st.caption("🧮 보유 플랜: " + " · ".join(_bits) + (f"  (손절 {_src_kr})" if _src_kr else ""))
+                                st.caption(_esc_md("🧮 보유 플랜: " + " · ".join(_bits) + (f"  (손절 {_src_kr})" if _src_kr else "")))
                                 # 플랜 미저장 보유에 한해 제안값 원클릭 저장 (기존 플랜은 절대 덮어쓰지 않음)
                                 _has_saved_plan = bool((_saved_sl and _saved_sl > 0) or (_saved_tp and _saved_tp > 0))
                                 _sug_stop_ok = False
@@ -19845,36 +19940,56 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 _pa = st.selectbox("설정할 계좌", _prof_accts, index=_pa_idx, key="_prof_edit_acct")
                 _p = get_account_profile(puid, _pa)
                 _ctx_p = compute_account_context(puid, _pa)
-                st.caption(
+                st.caption(_esc_md(
                     f"자본 ${_ctx_p['equity']:,.2f} = 현금 ${_ctx_p['cash']:,.2f} + "
                     f"보유 ${_ctx_p['invested_value']:,.2f} · 보유 {_ctx_p['slots_used']}종목"
                     + ("" if _p.get("_exists") else "  ·  ⚙️ 저장된 프로필 없음 (아래는 기본값)")
-                )
+                ))
+                if str(_p.get("Updated_At") or "").strip():
+                    st.caption(f"현금 최종 갱신: {_p['Updated_At']} (ET) — 매수/매도 기록 시 자동 반영됩니다. 입금은 직접 수정하세요.")
+                _cash_msg = st.session_state.pop("_cash_autoadjust_msg", None)
+                if isinstance(_cash_msg, dict) and str(_cash_msg.get("account", "")).lower() == _pa.lower():
+                    st.info(_esc_md(
+                        f"💵 현금 자동 반영 — {_cash_msg.get('note', '')}: "
+                        f"${_cash_msg['old']:,.2f} → ${_cash_msg['new']:,.2f} ({_cash_msg['delta']:+,.2f})"
+                        + ("  ⚠️ 잔고가 음수가 되어 0으로 보정했습니다 — 실제 현금을 확인하세요." if _cash_msg.get("clamped") else "")
+                    ))
                 if not _ctx_p["priced_ok"]:
                     st.caption("⚠️ 일부 종목 시세 미수신 — 매수 평단으로 대체 계산했습니다: "
                                + ", ".join(_ctx_p["missing"][:8]))
 
-                _e1, _e2, _e3 = st.columns(3)
-                with _e1:
-                    _v_cash = st.number_input("가용 현금 ($)", min_value=0.0, step=50.0,
-                                              value=float(_p["Cash"]), key=f"_prof_cash_{_pa}",
-                                              help="증권사 계좌의 실제 현금 잔고. 입금/매매 후 갱신하세요.")
-                    _v_mode = st.selectbox("사이징 모드", list(_SIZING_MODE_LABELS),
-                                           index=list(_SIZING_MODE_LABELS).index(str(_p["Sizing_Mode"])),
-                                           format_func=lambda m: _SIZING_MODE_LABELS[m],
-                                           key=f"_prof_mode_{_pa}")
-                with _e2:
-                    _v_risk = st.number_input("거래당 리스크 (%)", min_value=0.1, max_value=10.0, step=0.1,
-                                              value=float(_p["Risk_Pct"]), key=f"_prof_risk_{_pa}")
-                    _v_cap = st.number_input("단일 종목 상한 (%)", min_value=1.0, max_value=100.0, step=1.0,
-                                             value=float(_p["Max_Position_Pct"]), key=f"_prof_cap_{_pa}")
-                with _e3:
-                    _v_slots = st.number_input("동시 보유 상한 (슬롯)", min_value=1, max_value=50, step=1,
-                                               value=int(_p["Max_Positions"]), key=f"_prof_slots_{_pa}")
-                    _v_res = st.number_input("예비 현금 (%)", min_value=0.0, max_value=90.0, step=5.0,
-                                             value=float(_p["Cash_Reserve_Pct"]), key=f"_prof_res_{_pa}")
-                _v_min = st.number_input("최소 거래금액 ($ · 0 = 미사용)", min_value=0.0, step=5.0,
-                                         value=float(_p["Min_Trade_Dollars"]), key=f"_prof_min_{_pa}")
+                st.caption("입력값은 아래 버튼을 눌러야 반영됩니다 — 숫자를 고칠 때마다 화면이 재계산되지 않도록 폼으로 묶었습니다.")
+                with st.form(f"account_profile_form_{_pa}", clear_on_submit=False):
+                    _e1, _e2, _e3 = st.columns(3)
+                    with _e1:
+                        _v_cash = st.number_input("가용 현금 ($)", min_value=0.0, step=50.0,
+                                                  value=float(_p["Cash"]), key=f"_prof_cash_{_pa}",
+                                                  help="증권사 계좌의 실제 현금 잔고. 매수/매도 기록 시 자동 반영되며, 입금 시에만 직접 수정하세요.")
+                        _v_mode = st.selectbox("사이징 모드", list(_SIZING_MODE_LABELS),
+                                               index=list(_SIZING_MODE_LABELS).index(str(_p["Sizing_Mode"])),
+                                               format_func=lambda m: _SIZING_MODE_LABELS[m],
+                                               key=f"_prof_mode_{_pa}",
+                                               help="현재는 저장만 되고 계산 분기에는 아직 쓰이지 않습니다.")
+                    with _e2:
+                        _v_risk = st.number_input("거래당 리스크 (%)", min_value=0.1, max_value=10.0, step=0.1,
+                                                  value=float(_p["Risk_Pct"]), key=f"_prof_risk_{_pa}")
+                        _v_cap = st.number_input("단일 종목 상한 (%)", min_value=1.0, max_value=100.0, step=1.0,
+                                                 value=float(_p["Max_Position_Pct"]), key=f"_prof_cap_{_pa}")
+                    with _e3:
+                        _v_slots = st.number_input("동시 보유 상한 (슬롯)", min_value=1, max_value=50, step=1,
+                                                   value=int(_p["Max_Positions"]), key=f"_prof_slots_{_pa}")
+                        _v_res = st.number_input("예비 현금 (%)", min_value=0.0, max_value=90.0, step=5.0,
+                                                 value=float(_p["Cash_Reserve_Pct"]), key=f"_prof_res_{_pa}")
+                    _v_min = st.number_input("최소 거래금액 ($ · 0 = 미사용)", min_value=0.0, step=5.0,
+                                             value=float(_p["Min_Trade_Dollars"]), key=f"_prof_min_{_pa}")
+                    _fb1, _fb2 = st.columns(2)
+                    with _fb1:
+                        _preview_clicked = st.form_submit_button("🔄 미리보기 갱신", use_container_width=True)
+                    with _fb2:
+                        _save_clicked = st.form_submit_button("💾 프로필 저장", use_container_width=True, type="primary")
+
+                if _preview_clicked:
+                    st.caption("🔄 아래 검증·미리보기를 현재 입력값으로 갱신했습니다 (저장되지 않음).")
 
                 # ── 조합 검증: 개별 값이 멀쩡해도 조합이 파괴적일 수 있다 ──
                 _tot_risk = float(_v_risk) * int(_v_slots)
@@ -19891,9 +20006,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     if _room <= 0:
                         _warns.append(f"예비 현금 {_v_res:.0f}% 기준 투자 여유가 ${_room:,.0f} — 신규 진입이 차단됩니다.")
                 for _m in _errs:
-                    st.error("⛔ " + _m)
+                    st.error(_esc_md("⛔ " + _m))
                 for _m in _warns:
-                    st.warning("⚠️ " + _m)
+                    st.warning(_esc_md("⚠️ " + _m))
                 st.caption(f"총 리스크 노출: {_v_risk:.1f}% × {int(_v_slots)}슬롯 = **최대 {_tot_risk:.1f}%**")
 
                 # ── 실시간 미리보기: 손절폭별 투입 금액 ──
@@ -19914,18 +20029,19 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     })
                 st.dataframe(pd.DataFrame(_prev_rows), use_container_width=True, hide_index=True)
                 _turn = (float(_v_risk) / float(_v_cap) * 100.0) if float(_v_cap) > 0 else float("nan")
-                st.caption(
+                st.caption(_esc_md(
                     f"전환점 — 손절폭이 **{_turn:.1f}%** 를 넘으면 리스크 기준이, 그 이하면 비중 상한이 금액을 결정합니다. "
                     f"(자본 ${_ctx_p['equity']:,.0f} 기준)"
-                )
+                ))
 
-                if st.button("💾 프로필 저장", key=f"_prof_save_{_pa}", type="primary"):
+                if _save_clicked:
                     _ok_p, _err_p = save_account_profile(puid, _pa, {
                         "Cash": float(_v_cash), "Sizing_Mode": _v_mode, "Risk_Pct": float(_v_risk),
                         "Max_Position_Pct": float(_v_cap), "Max_Positions": int(_v_slots),
                         "Cash_Reserve_Pct": float(_v_res), "Min_Trade_Dollars": float(_v_min),
                     })
                     if _ok_p:
+                        _invalidate_account_context_memo()
                         st.success(f"{_pa} 프로필 저장 완료")
                         st.rerun()
                     else:
@@ -20249,6 +20365,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
         with st.expander("🗑️ 종목 삭제 (매도 기록 없이 포지션 제거)", expanded=False):
             st.caption("매도 기록 없이 포지션만 제거합니다. 실현 손익 추적이 필요하면 아래 '매도 기록'을 이용하세요.")
+            st.warning("⚠️ 이 경로는 **현금 잔고가 자동 반영되지 않습니다** (매도가를 모르기 때문). "
+                       "실제로 판 것이라면 아래 '💸 매도 기록'을 쓰세요 — 현금이 자동으로 늘어나고 복기 데이터도 남습니다.")
             if portfolio_df.empty:
                 st.info("삭제할 종목이 없습니다.")
             else:
@@ -22329,7 +22447,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             _wl_ctx = None
             if _wl_acct:
                 try:
-                    _wl_ctx = compute_account_context(_wl_uid, _wl_acct)
+                    _wl_ctx = account_context_memo(_wl_uid, _wl_acct)
                 except Exception:
                     _wl_ctx = None
             if _wl_ctx:
@@ -22352,12 +22470,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 _wl_rp = _regime_params({})
             if wl_items:
                 if _wl_ctx:
-                    st.caption(
+                    st.caption(_esc_md(
                         f"📍 **{_wl_acct}** 기준 · 자본 ${_wl_ctx['equity']:,.2f} "
                         f"(현금 ${_wl_ctx['cash']:,.2f} + 보유 ${_wl_ctx['invested_value']:,.2f}) · "
                         f"슬롯 {_wl_ctx['slots_used']}/{int(_wl_prof['Max_Positions'])}"
                         + ("" if _wl_prof.get("_exists") else "  ·  ⚙️ 기본값")
-                    )
+                    ))
                 else:
                     st.caption("📍 활성 계좌 없음 — 수동 입력으로 계산합니다.")
                 _pc1, _pc2, _pc2b, _pc3 = st.columns([1.1, 0.95, 1.05, 1.4])
@@ -22532,15 +22650,15 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             if _wl_plan["gate"] == "na":
                                 st.caption(f"🧮 플랜: {_wl_plan['gate_label']} — {_wl_plan['gate_reason']}")
                             else:
-                                st.markdown(
+                                st.markdown(_esc_md(
                                     f"**🧮 플랜: {_wl_plan['gate_label']}** · "
                                     f"${_wl_plan['dollars']:,.2f} ({_wl_plan['shares_exact']:.3f}주 · 정수 {_wl_plan['shares_whole']:,}주 · "
                                     f"비중 {_wl_plan['position_pct']:.1f}% · 제한 {_wl_plan['binding_label']}) · "
                                     f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
                                     f"R:R {_wl_plan['rr_label']} · 1R -${_wl_plan['risk_dollars']:,.0f}"
-                                )
+                                ))
                                 if _wl_plan.get("blocked"):
-                                    st.caption(f"↳ 🚧 {_wl_plan['block_reason']}")
+                                    st.caption(_esc_md(f"↳ 🚧 {_wl_plan['block_reason']}"))
                                 if not _wl_plan.get("rr_measured", False):
                                     st.caption("↳ ⚠️ R:R 미실측(독립 목표 없음) — 자금 빠듯하면 후순위")
                                 if not _wl_plan["enter_ok"]:
