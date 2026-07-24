@@ -19971,6 +19971,16 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 if _preview_clicked:
                     st.caption("🔄 아래 검증·미리보기를 현재 입력값으로 갱신했습니다 (저장되지 않음).")
 
+                # 미리보기 자본금 = 폼에 입력한 현금 + 실제 보유 평가액
+                # (저장 전이라도 입력값이 즉시 반영되도록 — _ctx_p["equity"] 는 '저장된' 현금 기준)
+                _inv_p = float(_ctx_p["invested_value"])
+                _eq_prev = float(_v_cash) + _inv_p
+                if abs(_eq_prev - float(_ctx_p["equity"])) > 0.01:
+                    st.caption(_esc_md(
+                        f"🔎 미리보기 기준 자본 ${_eq_prev:,.2f} = 입력 현금 ${float(_v_cash):,.2f} + 보유 ${_inv_p:,.2f} "
+                        f"(저장된 현금 기준 ${_ctx_p['equity']:,.2f} 와 다름 — 저장 시 반영됩니다)"
+                    ))
+
                 # ── 조합 검증: 개별 값이 멀쩡해도 조합이 파괴적일 수 있다 ──
                 _tot_risk = float(_v_risk) * int(_v_slots)
                 _errs, _warns = [], []
@@ -19978,13 +19988,17 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     _errs.append(f"총 리스크 노출 {_tot_risk:.1f}% — 전 종목 손절 시 자본의 {_tot_risk:.0f}% 손실입니다.")
                 if float(_v_cap) * int(_v_slots) > 100.0:
                     _warns.append(f"상한 {_v_cap:.0f}% × {int(_v_slots)}슬롯 = {_v_cap*_v_slots:.0f}% — 물리적으로 채울 수 없습니다(현금이 먼저 소진).")
-                _cap_dollars = _ctx_p["equity"] * float(_v_cap) / 100.0
+                _cap_dollars = _eq_prev * float(_v_cap) / 100.0
                 if float(_v_min) > 0 and _cap_dollars > 0 and float(_v_min) > _cap_dollars:
                     _errs.append(f"최소 거래금액 ${_v_min:,.0f} > 상한 금액 ${_cap_dollars:,.0f} — 어떤 종목도 집행되지 않습니다.")
-                if float(_v_res) > 0:
-                    _room = _ctx_p["equity"] * (1.0 - float(_v_res) / 100.0) - _ctx_p["invested_value"]
+                if float(_v_res) > 0 and _v_mode != "equal_weight":
+                    _room = _eq_prev * (1.0 - float(_v_res) / 100.0) - _inv_p
                     if _room <= 0:
-                        _warns.append(f"예비 현금 {_v_res:.0f}% 기준 투자 여유가 ${_room:,.0f} — 신규 진입이 차단됩니다.")
+                        _warns.append(
+                            f"예비 현금 {_v_res:.0f}% 기준 투자 여유가 ${_room:,.0f} — 신규 진입이 차단됩니다. "
+                            f"(보유 ${_inv_p:,.0f} 가 이미 자본의 {(_inv_p/_eq_prev*100.0 if _eq_prev > 0 else 0):.0f}% "
+                            f"— 현금을 늘리거나 예비 현금 %를 낮추세요.)"
+                        )
                 for _m in _errs:
                     st.error(_esc_md("⛔ " + _m))
                 for _m in _warns:
@@ -19995,11 +20009,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 _prev_rows = []
                 for _sp in (5.0, 10.0, 15.0, 20.0, 30.0):
                     _pr = rc.position_size(
-                        _ctx_p["equity"], float(_v_risk), 100.0, 100.0 * (1.0 - _sp / 100.0),
+                        _eq_prev, float(_v_risk), 100.0, 100.0 * (1.0 - _sp / 100.0),
                         max_position_pct=float(_v_cap),
                         cash=(float(_v_cash) if float(_v_cash) > 0 else None),
-                        reserve_pct=float(_v_res), invested_value=_ctx_p["invested_value"],
-                        min_trade_dollars=float(_v_min),
+                        reserve_pct=float(_v_res), invested_value=_inv_p,
+                        slots_used=int(_ctx_p["slots_used"]), max_positions=int(_v_slots),
+                        min_trade_dollars=float(_v_min), sizing_mode=str(_v_mode),
                     )
                     _prev_rows.append({
                         "손절폭": f"{_sp:.0f}%", "투입 금액": f"${_pr['dollars']:,.2f}",
@@ -20010,8 +20025,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 st.dataframe(pd.DataFrame(_prev_rows), use_container_width=True, hide_index=True)
                 _turn = (float(_v_risk) / float(_v_cap) * 100.0) if float(_v_cap) > 0 else float("nan")
                 st.caption(_esc_md(
-                    f"전환점 — 손절폭이 **{_turn:.1f}%** 를 넘으면 리스크 기준이, 그 이하면 비중 상한이 금액을 결정합니다. "
-                    f"(자본 ${_ctx_p['equity']:,.0f} 기준)"
+                    (f"전환점 — 손절폭이 **{_turn:.1f}%** 를 넘으면 리스크 기준이, 그 이하면 비중 상한이 금액을 결정합니다. "
+                     f"(자본 ${_eq_prev:,.0f} 기준)")
+                    if _v_mode == "risk_based" else
+                    (f"균등 배분 모드 — 투입 금액 = 투자가능액 ÷ {int(_v_slots)}슬롯. 손절폭은 금액에 영향을 주지 않습니다. "
+                     f"(자본 ${_eq_prev:,.0f} 기준)")
+                    if _v_mode == "equal_weight" else
+                    "사이징 미사용 모드 — 투입 금액을 제안하지 않습니다(손절·목표·R:R 게이트만 표시)."
                 ))
 
                 if _save_clicked:
