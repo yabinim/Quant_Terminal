@@ -18,12 +18,16 @@ import json
 import html
 import time
 import traceback
+import base64
+import hashlib
+import hmac
 
 import numpy as np
 import pandas as pd
 import pytz
 import requests
 import streamlit as st
+import streamlit.components.v1 as st_components  # 인증 쿠키 JS 주입용(height=0, 비가시)
 import gspread
 from google.oauth2.service_account import Credentials
 from fredapi import Fred
@@ -1330,6 +1334,8 @@ def try_sheet_login():
         st.session_state["user_id"] = uid
         st.session_state["login_error"] = False
         st.session_state["login_feedback"] = ""
+        # 자동 로그인 쿠키 발급 (admin_pw 교체 시 자동 무효화)
+        _auth_queue_cookie(uid, "admin", _auth_admin_fingerprint())
         # 로그인 직후 DRG·VIX·거시지표 백그라운드 워밍업
         _trigger_background_warmup()
         return
@@ -1364,10 +1370,14 @@ def try_sheet_login():
         _pw_ok, _needs_upgrade = uc.verify_password(pw, str(row.get("Password", "")))
         if _pw_ok:
             lid = str(row.get("ID", "")).strip()
+            _stored_pw = str(row.get("Password", ""))
             if _needs_upgrade:
                 # 레거시 평문 비번 → 해시로 투명 승격 (실패해도 로그인은 진행)
                 try:
-                    uc.update_user_fields(ws, lid, {"Password": uc.hash_password(pw)})
+                    _new_hash = uc.hash_password(pw)
+                    uc.update_user_fields(ws, lid, {"Password": _new_hash})
+                    _stored_pw = _new_hash  # 쿠키 지문은 승격 후 값 기준
+                    _auth_lookup_user.clear()
                 except Exception:
                     pass
             st.session_state["logged_in"] = True
@@ -1376,6 +1386,8 @@ def try_sheet_login():
             st.session_state["user_id"] = lid
             st.session_state["login_error"] = False
             st.session_state["login_feedback"] = ""
+            # 자동 로그인 쿠키 발급 (비번 변경 시 지문 불일치로 자동 무효화)
+            _auth_queue_cookie(lid, "guest", _auth_pw_fingerprint(_stored_pw))
             # 로그인 직후 DRG·VIX·거시지표 백그라운드 워밍업
             _trigger_background_warmup()
         else:
@@ -1446,6 +1458,226 @@ def _trigger_background_warmup():
     t.start()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 🍪 세션 영속화 — 자동 로그인 쿠키
+# ──────────────────────────────────────────────────────────────────────────────
+# 배경: st.session_state 는 브라우저 탭 ↔ 서버 웹소켓 연결에 묶여 있다. 모바일에서
+#       다른 앱/탭으로 이동하면 브라우저가 페이지를 메모리에서 파기하고, 돌아왔을 때
+#       "새 세션"으로 접속하므로 session_state 가 비어 있어 로그인 화면으로 떨어진다.
+#       (.streamlit/config.toml 의 server.disconnectedSessionTTL 은 '웹소켓 재연결'
+#        케이스만 커버하므로 페이지 파기 케이스는 못 막는다 → 쿠키가 본 해결책)
+#
+# 설계: 로그인 성공 시 HMAC-SHA256 서명 토큰을 브라우저 쿠키에 저장하고,
+#       페이지 진입 시 쿠키를 검증해 세션을 복원한다.
+#       토큰 = v1|uid|role|pw_fp|exp|sig  (base64url)
+#       · pw_fp = 저장된 비밀번호 해시의 지문 → 비번 변경/임시비번 발급 시 자동 무효화
+#       · exp   = 7일 (iOS Safari 의 JS 쿠키 수명 상한과 동일)
+#       · 복원 시 Users 시트에서 Status=approved 를 재확인 → 승인 취소 즉시 차단
+#
+# 읽기: st.context.cookies (Streamlit >= 1.38)
+# 쓰기/삭제: components.v1.html JS 주입 (컴포넌트 iframe 은 allow-same-origin 보유)
+#
+# ⚠️ 한계
+#  - iOS Safari 는 JS 로 설정한 쿠키 수명을 최대 7일로 강제 → 주 1회 재로그인 필요
+#  - 쿠키 차단/시크릿 모드에서는 조용히 기존 동작(매번 로그인)으로 폴백
+#  - Secure 속성 때문에 http 로컬 실행(localhost)에서는 쿠키가 저장되지 않는다
+#  - 기기 공유 시 7일간 자동 로그인이 유지되므로 로그아웃 버튼 사용 권장
+# ══════════════════════════════════════════════════════════════════════════════
+
+_AUTH_COOKIE_NAME = "stk_auth"
+_AUTH_COOKIE_MAX_AGE = 7 * 24 * 3600      # 7일
+_AUTH_TOKEN_VERSION = "v1"
+
+
+@st.cache_resource
+def _auth_secret_key() -> bytes:
+    """토큰 서명 키. `st.secrets['auth']['session_secret']` 우선, 없으면 서비스 계정에서 파생.
+
+    폴백 경로는 재부팅해도 값이 동일하고 외부로 노출되지 않으므로 zero-config 로 동작한다.
+    둘 다 없으면 b"" 를 반환하여 쿠키 인증 기능 자체를 비활성화한다(기존 동작 유지).
+    """
+    try:
+        s = str(st.secrets["auth"]["session_secret"] or "").strip()
+        if s:
+            return hashlib.sha256(s.encode("utf-8")).digest()
+    except (KeyError, FileNotFoundError, TypeError):
+        pass
+    try:
+        pk = str(st.secrets["gcp_service_account"]["private_key"] or "")
+        if pk:
+            return hashlib.sha256(("stocker-auth|" + pk).encode("utf-8")).digest()
+    except (KeyError, FileNotFoundError, TypeError):
+        pass
+    return b""
+
+
+def _auth_pw_fingerprint(stored_pw: str) -> str:
+    """저장된 비밀번호 해시의 지문(12자). 비번이 바뀌면 기존 토큰이 자동 무효화된다."""
+    return hashlib.sha256(str(stored_pw or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _auth_admin_fingerprint() -> str:
+    """admin_pw 백도어용 지문. Users 시트 조회 없이 admin 토큰을 검증한다.
+    admin_pw 를 교체하면 기존 admin 토큰이 자동 무효화된다."""
+    try:
+        apw = str(st.secrets["passwords"]["admin_pw"] or "")
+    except (KeyError, FileNotFoundError, TypeError):
+        apw = ""
+    return _auth_pw_fingerprint("ADMIN|" + apw) if apw else ""
+
+
+def _auth_make_token(uid: str, role: str, pw_fp: str,
+                     ttl: int = _AUTH_COOKIE_MAX_AGE) -> str:
+    """서명 토큰 생성. 키 미설정이거나 uid 에 구분자가 섞이면 빈 문자열."""
+    key = _auth_secret_key()
+    uid = str(uid or "").strip()
+    role = str(role or "").strip()
+    pw_fp = str(pw_fp or "").strip()
+    if not key or not uid or not pw_fp or "|" in uid or "|" in role:
+        return ""
+    exp = int(time.time()) + int(ttl)
+    payload = f"{_AUTH_TOKEN_VERSION}|{uid}|{role}|{pw_fp}|{exp}"
+    sig = hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    raw = f"{payload}|{sig}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _auth_parse_token(token: str) -> dict | None:
+    """토큰 검증 → {'uid','role','pw_fp','exp'} 또는 None(위조·만료·키없음)."""
+    key = _auth_secret_key()
+    token = str(token or "").strip()
+    if not key or not token:
+        return None
+    try:
+        pad = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode(token + pad).decode("utf-8")
+        ver, uid, role, pw_fp, exp_s, sig = raw.split("|", 5)
+    except Exception:
+        return None
+    if ver != _AUTH_TOKEN_VERSION:
+        return None
+    payload = f"{ver}|{uid}|{role}|{pw_fp}|{exp_s}"
+    expect = hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expect, sig):
+        return None
+    try:
+        exp = int(exp_s)
+    except (TypeError, ValueError):
+        return None
+    if exp < int(time.time()):
+        return None
+    return {"uid": uid, "role": role, "pw_fp": pw_fp, "exp": exp}
+
+
+def _auth_read_cookie() -> str:
+    """현재 페이지 로드 요청에 실려 온 인증 쿠키 값."""
+    try:
+        return str(st.context.cookies.get(_AUTH_COOKIE_NAME, "") or "")
+    except Exception:
+        return ""
+
+
+def _auth_cookie_js(value: str, max_age: int) -> None:
+    """height=0 iframe 안에서 부모 문서 쿠키를 조작한다(화면에 보이지 않음)."""
+    js_val = json.dumps(str(value))
+    st_components.html(
+        "<script>try{"
+        "var d=(window.parent&&window.parent.document)?window.parent.document:document;"
+        f'd.cookie="{_AUTH_COOKIE_NAME}="+{js_val}+'
+        f'"; path=/; max-age={int(max_age)}; SameSite=Lax; Secure";'
+        "}catch(e){}</script>",
+        height=0,
+    )
+
+
+def _auth_queue_cookie(uid: str, role: str, pw_fp: str) -> None:
+    """로그인 성공 시 호출. on_click 콜백에서는 컴포넌트를 렌더할 수 없으므로
+    토큰만 만들어 두고 실제 JS 주입은 다음 렌더 최상단에서 수행한다."""
+    tok = _auth_make_token(uid, role, pw_fp)
+    if tok:
+        st.session_state["_auth_pending_cookie"] = tok
+
+
+def _auth_flush_pending_cookie() -> None:
+    """대기 중인 쿠키 저장/삭제 요청을 실제 JS 주입으로 반영. 매 렌더 최상단 1회."""
+    tok = st.session_state.pop("_auth_pending_cookie", None)
+    if tok:
+        _auth_cookie_js(tok, _AUTH_COOKIE_MAX_AGE)
+    if st.session_state.pop("_auth_pending_clear", False):
+        _auth_cookie_js("", 0)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _auth_lookup_user(uid_upper: str) -> dict | None:
+    """복원 검증용 Users 조회(5분 캐시). {'id','status','pw_fp'} 또는 None."""
+    ws, err = open_users_worksheet()
+    if err or ws is None:
+        return None
+    try:
+        df = fetch_users_dataframe(ws)
+    except Exception:
+        return None
+    if df is None or df.empty or "ID" not in df.columns:
+        return None
+    id_col = df["ID"].astype(str).str.strip().str.upper()
+    match = df[id_col == str(uid_upper).strip().upper()]
+    if match.empty:
+        return None
+    row = match.iloc[0]
+    return {
+        "id": str(row.get("ID", "")).strip(),
+        "status": str(row.get("Status", "")).strip().lower(),
+        "pw_fp": _auth_pw_fingerprint(str(row.get("Password", ""))),
+    }
+
+
+def _auth_restore_session() -> None:
+    """페이지 진입 시 1회: 쿠키 → 세션 복원. 실패는 조용히 무시(로그인 화면으로)."""
+    if st.session_state.get("_auth_restore_tried"):
+        return
+    st.session_state["_auth_restore_tried"] = True
+    if st.session_state.get("logged_in"):
+        return
+
+    data = _auth_parse_token(_auth_read_cookie())
+    if not data:
+        return
+
+    uid = str(data.get("uid", "")).strip()
+    role = str(data.get("role", "")).strip()
+    tok_fp = str(data.get("pw_fp", ""))
+
+    if role == "admin":
+        # admin_pw 백도어 계정은 Users 시트에 없을 수 있다 → 시크릿 지문으로만 검증
+        cur_fp = _auth_admin_fingerprint()
+        if not cur_fp or not hmac.compare_digest(cur_fp, tok_fp):
+            st.session_state["_auth_pending_clear"] = True
+            return
+    else:
+        info = _auth_lookup_user(uid.upper())
+        if (info is None) or info["status"] != "approved" or info["pw_fp"] != tok_fp:
+            # 캐시가 오래돼 오탐일 수 있으므로 1회 무효화 후 재조회
+            try:
+                _auth_lookup_user.clear()
+            except Exception:
+                pass
+            info = _auth_lookup_user(uid.upper())
+        if (info is None) or info["status"] != "approved" or info["pw_fp"] != tok_fp:
+            # 계정 삭제·승인 취소·비밀번호 변경 → 토큰 폐기
+            st.session_state["_auth_pending_clear"] = True
+            return
+        uid = info["id"]
+        role = "guest"
+
+    st.session_state["logged_in"] = True
+    st.session_state["user_role"] = role
+    st.session_state["login_user_id"] = uid
+    st.session_state["user_id"] = uid
+    st.session_state["login_error"] = False
+    st.session_state["login_feedback"] = ""
+    _trigger_background_warmup()
+
+
 def _render_login_screen():
     st.title("🎯 STOCKER")
     st.markdown("**Follow the Signal. Stalk the Stock.** — 주식을 집요하게 쫓는 개인 퀀트 터미널")
@@ -1487,6 +1719,10 @@ def _render_login_screen():
             else:
                 st.error(msg)
 
+
+# 쿠키 → 세션 복원 (탭 전환·앱 이탈 후 재진입 시 자동 로그인). 이어서 쿠키 저장/삭제 반영.
+_auth_restore_session()
+_auth_flush_pending_cookie()
 
 if not st.session_state.get("logged_in"):
     _render_login_screen()
@@ -15079,6 +15315,9 @@ if st.session_state.get("logged_in"):
         st.session_state["login_feedback"] = ""
         st.session_state["login_user_id"] = ""
         st.session_state["user_id"] = ""
+        # 자동 로그인 쿠키 삭제 (다음 렌더 최상단에서 JS 주입)
+        st.session_state.pop("_auth_pending_cookie", None)
+        st.session_state["_auth_pending_clear"] = True
         st.rerun()
     
     quote_type, selected_ticker_obj, selected_ticker_info = detect_quote_type(selected_ticker)
@@ -23776,7 +24015,12 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                             ws_set, _set_uid, {"Password": uc.hash_password(_new)}
                         )
                         if ok_pw:
-                            st.success("비밀번호가 변경되었습니다. 다음 로그인부터 적용됩니다.")
+                            # 자동 로그인 쿠키 검증 캐시 무효화 → 기존 토큰 즉시 폐기
+                            try:
+                                _auth_lookup_user.clear()
+                            except Exception:
+                                pass
+                            st.success("비밀번호가 변경되었습니다. 기존 자동 로그인은 해제되며, 다음 로그인부터 적용됩니다.")
                         else:
                             st.error(err_pw)
 
@@ -23828,6 +24072,10 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                 _full_df.insert(1, "Password", df_users["Password"].astype(str).values)
                 ok_save, msg_save = save_users_worksheet_from_df(_full_df)
                 if ok_save:
+                    try:
+                        _auth_lookup_user.clear()  # 승인/거부 변경을 자동 로그인 검증에 즉시 반영
+                    except Exception:
+                        pass
                     st.success("Users 시트가 업데이트되었습니다.")
                     st.rerun()
                 else:
@@ -23848,6 +24096,10 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                     _tp_new = uc.gen_temp_password()
                     ok_tp, err_tp = uc.update_user_fields(ws, _tp_sel, {"Password": uc.hash_password(_tp_new)})
                     if ok_tp:
+                        try:
+                            _auth_lookup_user.clear()  # 해당 계정의 자동 로그인 즉시 해제
+                        except Exception:
+                            pass
                         st.success(f"**{_tp_sel}** 임시 비밀번호: `{_tp_new}`")
                         st.warning("이 값은 지금 한 번만 표시됩니다. 본인에게 전달 후 즉시 변경을 안내하세요.")
                     else:

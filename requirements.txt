@@ -10,4 +10,4 @@ numpy
 pandas
 pytz
 requests
-streamlit
+streamlit>=1.42  # st.context.cookies (>=1.38) & 자동 로그인 쿠키 복원에 필요
