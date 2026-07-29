@@ -22773,6 +22773,20 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 if not wl_items:
                     st.caption("해당 결정에 맞는 종목이 없습니다.")
 
+            # ── '매수 완료 → 포트폴리오 등록' 공용 준비값 (루프 밖 1회) ─────
+            _wl_plan_map = {}                      # ticker → build_trade_plan 결과(수량·금액 프리필용)
+            _WL_THESIS_NONE = "(Thesis 없음 - 자동 연결 시도)"
+            _WL_THESIS_CORE = "📈 코어/정기적립 (인덱스 DCA)"
+            try:
+                _wl_thesis_options = get_thesis_options_from_narratives(uid_wl)
+            except Exception:
+                _wl_thesis_options = []
+            _wl_thesis_labels = [_WL_THESIS_NONE, _WL_THESIS_CORE] + [o["label"] for o in _wl_thesis_options]
+            try:
+                _WL_BUY_REASON_IDX = _ENTRY_REASON_OPTIONS.index("🎯 최적 매수 타이밍 (눌림목·RS반전)")
+            except ValueError:
+                _WL_BUY_REASON_IDX = 0
+
             for idx, item in enumerate(wl_items):
                 tk = item["ticker"]
                 current_price = pd.to_numeric(price_map_wl.get(tk), errors="coerce")
@@ -22920,6 +22934,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 min_trade_dollars=float(_it_prof["Min_Trade_Dollars"]),
                                 sizing_mode=_it_mode,
                             )
+                            _wl_plan_map[tk] = _wl_plan   # ✅ 매수 등록 폼 수량/금액 프리필용
                             _bc = rc.build_buy_card(hist_map_wl.get(tk), _an, _wl_plan, confluence=None)
                             st.markdown(f"**🎯 {_bc['badge']}** · {_bc['glance_num']}")
                             if _wl_plan["gate"] == "na":
@@ -23039,6 +23054,260 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     st.error(f"저장 실패: {_err_add}")
                             else:
                                 st.error("기존 항목 삭제 실패")
+
+                    # ── ✅ 매수 완료 → 포트폴리오 등록 (Watchlist 원클릭) ──────────
+                    #   이메일 알림 → 실제 매수 → 여기서 즉시 등록. 포트폴리오 탭 이동 불필요.
+                    #   Trade_History·Thesis·손절/목표 플랜까지 한 번에 기록하고,
+                    #   Watchlist 제거는 항상 '마지막'에 수행(앞 단계 실패 시 재시도 가능).
+                    with st.expander("✅ 매수 완료 → 포트폴리오 등록", expanded=False):
+                        st.caption(
+                            "알림을 보고 실제로 매수했다면 여기서 바로 등록하세요. "
+                            "포트폴리오 탭으로 이동할 필요 없이 매매기록·플랜까지 함께 저장됩니다."
+                        )
+                        _bp_plan = _wl_plan_map.get(tk) or {}
+                        _bp_d = pd.to_numeric(_bp_plan.get("dollars"), errors="coerce")
+                        _bp_s = pd.to_numeric(_bp_plan.get("shares_exact"), errors="coerce")
+                        _bp_dollars_def = float(_bp_d) if (pd.notna(_bp_d) and float(_bp_d) > 0) else 0.0
+                        _bp_shares_def = round(float(_bp_s), 4) if (pd.notna(_bp_s) and float(_bp_s) > 0) else 0.0
+                        if _bp_dollars_def > 0 or _bp_shares_def > 0:
+                            st.caption(
+                                f"🧮 사이징 제안: ${_bp_dollars_def:,.2f} · {_bp_shares_def:g}주 "
+                                "— 실제 체결 수량으로 수정하세요."
+                            )
+
+                        _bp_acct_cur = str(item.get("account", "") or "").strip() or _wl_acct
+                        _bp_acct_opts = list(_wl_acct_opts) + ["직접 입력"]
+                        _bp_acct_idx = (_bp_acct_opts.index(_bp_acct_cur)
+                                        if _bp_acct_cur in _bp_acct_opts else len(_bp_acct_opts) - 1)
+                        _bp_acct_sel = st.selectbox(
+                            "🏦 매수한 계좌", _bp_acct_opts, index=_bp_acct_idx,
+                            key=f"wl_buy_acct_{idx}_{tk}",
+                            help="워치리스트 귀속 계좌가 기본값입니다.",
+                        )
+                        _bp_mode = st.radio(
+                            "입력 방식", ["수량으로", "금액($)으로"], horizontal=True,
+                            key=f"wl_buy_mode_{idx}_{tk}",
+                            help="금액 방식: 매수가 + 투입 금액($)을 넣으면 수량을 자동 계산합니다.",
+                        )
+
+                        with st.form(f"wl_buy_form_{idx}_{tk}", clear_on_submit=False):
+                            if _bp_acct_sel == "직접 입력":
+                                _bp_acct_custom = st.text_input(
+                                    "계좌명 직접 입력", value="",
+                                    placeholder="예: robinhood, Fidelity Roth",
+                                    key=f"wl_buy_acct_custom_{idx}_{tk}",
+                                )
+                            else:
+                                _bp_acct_custom = ""
+                            _bp_price = st.number_input(
+                                "💵 실제 매수가", min_value=0.0,
+                                value=(float(current_price) if pd.notna(current_price) else 0.0),
+                                step=0.01, format="%.2f", key=f"wl_buy_px_{idx}_{tk}",
+                                help="현재가가 기본값입니다. 실제 체결가로 수정하세요.",
+                            )
+                            if _bp_mode == "금액($)으로":
+                                _bp_amt = st.number_input(
+                                    "투입 금액 ($)", min_value=0.0, value=_bp_dollars_def,
+                                    step=10.0, format="%.2f", key=f"wl_buy_amt_{idx}_{tk}",
+                                )
+                                _bp_qty = 0.0
+                            else:
+                                _bp_amt = 0.0
+                                _bp_qty = st.number_input(
+                                    "수량", min_value=0.0, value=_bp_shares_def,
+                                    step=1.0, format="%.4f", key=f"wl_buy_qty_{idx}_{tk}",
+                                )
+                            _bp_thesis = st.selectbox(
+                                "📌 투자 Thesis", options=_wl_thesis_labels, index=0,
+                                key=f"wl_buy_thesis_{idx}_{tk}",
+                                help="그대로 두면 최근 내러티브에서 이 티커를 추천한 테마를 자동 연결합니다.",
+                            )
+                            _bp_reason = st.selectbox(
+                                "🎬 진입 사유", options=_ENTRY_REASON_OPTIONS,
+                                index=_WL_BUY_REASON_IDX, key=f"wl_buy_reason_{idx}_{tk}",
+                                help="워치리스트 알림으로 매수했다면 기본값이 맞습니다. 매매 복기의 진입신호별 성과 분석에 쓰입니다.",
+                            )
+                            _bp_date = st.date_input(
+                                "📅 매수일 (실제 산 날짜)",
+                                value=datetime.now(_MARKET_ET_TZ).date(),
+                                key=f"wl_buy_date_{idx}_{tk}",
+                                help="트레일링 스톱은 이 날짜 이후의 고점을 기준으로 계산합니다.",
+                            )
+                            _inh_sl = float(_sl_item) if (pd.notna(_sl_item) and float(_sl_item) > 0) else None
+                            _inh_tp = float(_tp_item) if (pd.notna(_tp_item) and float(_tp_item) > 0) else None
+                            _bp_inherit = st.checkbox(
+                                "📐 Watchlist 손절/목표를 포트폴리오 플랜으로 승계",
+                                value=True, key=f"wl_buy_inherit_{idx}_{tk}",
+                                help="해제하면 매수가 기준 ATR 플랜을 새로 계산합니다. "
+                                     "워치리스트에서 직접 설정한 기준을 유지하려면 켜두세요.",
+                            )
+                            if _inh_sl is not None or _inh_tp is not None:
+                                _inh_bits = []
+                                if _inh_sl is not None:
+                                    _inh_bits.append(f"손절 ${_inh_sl:.2f}")
+                                if _inh_tp is not None:
+                                    _inh_bits.append(f"목표 ${_inh_tp:.2f}")
+                                st.caption("↳ 승계할 값: " + " · ".join(_inh_bits))
+                            else:
+                                st.caption("↳ Watchlist에 손절/목표가 없음 — 승계 대신 ATR 플랜을 자동 계산합니다.")
+                            _bp_remove = st.checkbox(
+                                "🗑️ 등록 후 Watchlist에서 제거",
+                                value=(wl_dec_key.get(tk) != "buy_split"),
+                                key=f"wl_buy_remove_{idx}_{tk}",
+                                help="분할 매수 중이면 해제하세요 — 남겨두면 다음 분할 진입 신호를 계속 받습니다.",
+                            )
+                            _bp_submit = st.form_submit_button(
+                                "✅ 포트폴리오에 등록", type="primary", use_container_width=True
+                            )
+
+                            if _bp_submit:
+                                _bp_acct = (str(_bp_acct_custom or "").strip()
+                                            if _bp_acct_sel == "직접 입력"
+                                            else str(_bp_acct_sel or "").strip())
+                                if not uid_wl:
+                                    st.error("로그인 user_id가 없습니다. 다시 로그인해 주세요.")
+                                elif not _bp_acct:
+                                    st.warning("계좌명을 선택하거나 직접 입력해주세요.")
+                                else:
+                                    _ok_px, _px_v, _err_px = _validate_positive_portfolio_number("매수가", _bp_price)
+                                    if _bp_mode == "금액($)으로":
+                                        _ok_amt, _amt_v, _err_amt = _validate_positive_portfolio_number("금액", _bp_amt)
+                                        if _ok_px and _ok_amt:
+                                            _ok_q, _qty_v, _err_q = True, (_amt_v / _px_v), ""
+                                        else:
+                                            _ok_q, _qty_v, _err_q = _ok_amt, 0.0, _err_amt
+                                    else:
+                                        _ok_q, _qty_v, _err_q = _validate_positive_portfolio_number("수량", _bp_qty)
+                                    if not _ok_px:
+                                        st.error(_err_px)
+                                    elif not _ok_q:
+                                        st.error(_err_q)
+                                    else:
+                                        _pf_now = load_portfolio()
+                                        if not isinstance(_pf_now, pd.DataFrame):
+                                            _pf_now = pd.DataFrame()
+                                        _pf_now = _pf_now.copy()
+                                        for _c in ("Account", "Ticker", "Date_Added"):
+                                            if _c not in _pf_now.columns:
+                                                _pf_now[_c] = ""
+                                        for _c in ("Purchase_Price", "Quantity"):
+                                            if _c not in _pf_now.columns:
+                                                _pf_now[_c] = np.nan
+                                        _bp_date_s = _bp_date.strftime("%Y-%m-%d")
+
+                                        # 워치리스트 등록 정보 → 매매 복기용으로 메모에 박제
+                                        # (Watchlist 행이 삭제돼도 '등록가 → 실제 매수가' 추적 가능)
+                                        _wl_sp = pd.to_numeric(item.get("saved_price"), errors="coerce")
+                                        _wl_da = str(item.get("date_added", "") or "").strip()
+                                        _wl_tag_bits = []
+                                        if pd.notna(_wl_sp) and float(_wl_sp) > 0:
+                                            _wl_tag_bits.append(f"WL등록가 ${float(_wl_sp):.2f}")
+                                        if _wl_da:
+                                            _wl_tag_bits.append(f"WL등록일 {_wl_da[:10]}")
+                                        _wl_tag = (" · " + " · ".join(_wl_tag_bits)) if _wl_tag_bits else ""
+
+                                        _proceed, _base_memo, _plan_entry = False, "신규 매수", _px_v
+                                        _mask_bp = (
+                                            _pf_now["Account"].astype(str).str.strip().eq(_bp_acct)
+                                            & _pf_now["Ticker"].astype(str).str.strip().str.upper().eq(tk)
+                                        ) if not _pf_now.empty else None
+                                        if _mask_bp is not None and bool(_mask_bp.any()):
+                                            _mi = _pf_now.index[_mask_bp][0]
+                                            _old_q = pd.to_numeric(_pf_now.loc[_mi, "Quantity"], errors="coerce")
+                                            _old_p = pd.to_numeric(_pf_now.loc[_mi, "Purchase_Price"], errors="coerce")
+                                            _ok_oq, _, _err_oq = _validate_positive_portfolio_number("기존 수량", _old_q)
+                                            _ok_op, _, _err_op = _validate_positive_portfolio_number("기존 평단가", _old_p)
+                                            if not (_ok_oq and _ok_op):
+                                                st.error(
+                                                    f"저장된 데이터 오류: {_err_oq or _err_op} "
+                                                    "포트폴리오 [데이터 수정하기]에서 바로잡아 주세요."
+                                                )
+                                            else:
+                                                _new_q = float(_old_q) + float(_qty_v)
+                                                _new_avg = ((float(_old_p) * float(_old_q))
+                                                            + (float(_px_v) * float(_qty_v))) / _new_q
+                                                _pf_now.loc[_mi, "Quantity"] = _new_q
+                                                _pf_now.loc[_mi, "Purchase_Price"] = _new_avg
+                                                _proceed, _base_memo, _plan_entry = True, "추가 매수", _new_avg
+                                        else:
+                                            _pf_now = pd.concat(
+                                                [_pf_now, pd.DataFrame([{
+                                                    "Account": _bp_acct,
+                                                    "Ticker": tk,
+                                                    "Purchase_Price": _px_v,
+                                                    "Quantity": _qty_v,
+                                                    "Date_Added": _bp_date_s,
+                                                }])],
+                                                ignore_index=True,
+                                            )
+                                            _proceed, _base_memo, _plan_entry = True, "신규 매수", _px_v
+
+                                        if _proceed:
+                                            save_portfolio(_pf_now)
+                                            append_trade_history_row(
+                                                uid_wl, _bp_acct, tk, "BUY",
+                                                float(_qty_v), float(_px_v), _bp_date_s,
+                                                _build_entry_memo(_bp_reason, f"{_base_memo}{_wl_tag}"),
+                                            )
+                                            # ── Thesis 연결 (포트폴리오 탭과 동일 규칙) ──
+                                            _th_msg = ""
+                                            try:
+                                                if _bp_thesis == _WL_THESIS_CORE:
+                                                    save_thesis_row(uid_wl, tk, _bp_acct,
+                                                                    "코어/정기적립 (DCA)", "core_dca", "")
+                                                    _th_msg = " · 📈 코어/정기적립으로 기록"
+                                                elif _bp_thesis != _WL_THESIS_NONE:
+                                                    _m = next((o for o in _wl_thesis_options
+                                                               if o["label"] == _bp_thesis), None)
+                                                    if _m:
+                                                        save_thesis_row(uid_wl, tk, _bp_acct,
+                                                                        _m["thesis_title"],
+                                                                        _m["narrative_category"],
+                                                                        _m["narrative_date"])
+                                                        _th_msg = f" · Thesis: {_m['thesis_title']}"
+                                                else:
+                                                    _auto = find_thesis_for_ticker(uid_wl, tk)
+                                                    if _auto:
+                                                        save_thesis_row(uid_wl, tk, _bp_acct,
+                                                                        _auto["thesis_title"],
+                                                                        _auto["narrative_category"],
+                                                                        _auto["narrative_date"])
+                                                        _th_msg = f" · 🔗 자동 연결: {_auto['thesis_title']}"
+                                            except Exception as _exc_th:
+                                                _th_msg = f" · ⚠️ Thesis 연결 실패: {_exc_th}"
+
+                                            # ── 플랜: Watchlist 손절/목표 승계 우선 ──
+                                            if _bp_inherit and (_inh_sl is not None or _inh_tp is not None):
+                                                _ok_pl, _err_pl = save_portfolio_plan_setting(
+                                                    uid_wl, _bp_acct, tk, _inh_sl, _inh_tp
+                                                )
+                                                if _ok_pl:
+                                                    _pl_bits = []
+                                                    if _inh_sl is not None:
+                                                        _pl_bits.append(f"손절 ${_inh_sl:.2f}")
+                                                    if _inh_tp is not None:
+                                                        _pl_bits.append(f"목표 ${_inh_tp:.2f}")
+                                                    _pl_msg = " · 📐 Watchlist 플랜 승계 (" + " · ".join(_pl_bits) + ")"
+                                                else:
+                                                    _pl_msg = f" · ⚠️ 플랜 승계 실패: {_err_pl}"
+                                            else:
+                                                _pl_msg = auto_save_plan_after_add(
+                                                    uid_wl, _bp_acct, tk, _plan_entry
+                                                )
+
+                                            # ⚠️ Watchlist 제거는 항상 마지막 — 앞 단계 실패 시 재시도 가능
+                                            if _bp_remove:
+                                                _ok_rm, _err_rm = delete_from_watchlist(uid_wl, tk)
+                                                _rm_msg = (" · 🗑️ Watchlist에서 제거"
+                                                           if _ok_rm else f" · ⚠️ Watchlist 제거 실패: {_err_rm}")
+                                            else:
+                                                _rm_msg = " · 🔔 Watchlist 유지"
+
+                                            st.success(
+                                                f"✅ {_bp_acct} / {tk} — {float(_qty_v):g}주 @ "
+                                                f"${float(_px_v):.2f} 등록 완료{_th_msg}{_pl_msg}{_rm_msg}"
+                                            )
+                                            st.rerun()
 
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
