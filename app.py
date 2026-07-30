@@ -22006,7 +22006,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 # 같은 Run_Date 에 여러 번 실행된 경우(동일 날짜 재실행) 중복 방지:
                 # append 순서가 시간순이므로 버킷별 마지막 행(=최신 실행)만 유지
                 if "Verdict" in _sb_df.columns:
-                    _sb_df = _sb_df.drop_duplicates(subset=["Verdict"], keep="last")
+                    _sb_dedup = (["Mode", "Verdict"] if "Mode" in _sb_df.columns
+                                 else ["Verdict"])
+                    _sb_df = _sb_df.drop_duplicates(subset=_sb_dedup, keep="last")
 
             if _sb_df.empty:
                 st.info("표시할 백테스트 결과가 없습니다.")
@@ -22033,71 +22035,122 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         "백테스트를 다시 실행하면 `close[t+1]` 기준으로 갱신됩니다."
                     )
 
-                _sb_order = ["entry", "wait", "overheat", "trend_break", "avoid"]
-                _sb_df["_o"] = _sb_df["Verdict"].map({c: i for i, c in enumerate(_sb_order)})
-                _sb_df = _sb_df.sort_values("_o", na_position="last")
+                # v1.4: Mode 별 분리 — alert(실제 이메일 기준) / verdict(화면 판정 기준)
+                _SB_ALERT_LABELS = {
+                    "alert_entry_pass":    "🟢 매수 메일 (게이트 통과)",
+                    "alert_entry_skip":    "🟡 매수 메일 (게이트 미통과)",
+                    "alert_entry_na":      "⚪ 매수 메일 (게이트 보류)",
+                    "alert_risk":          "⚠️ 위험 알림",
+                    "alert_entry_invalid": "🔄 매수 신호 무효화",
+                }
+                _SB_ALERT_ORDER = list(_SB_ALERT_LABELS.keys())
+                _SB_VERDICT_ORDER = ["entry", "wait", "overheat", "trend_break", "avoid"]
 
-                _sb_disp = _sb_df.copy()
-                _sb_disp["판정"] = _sb_disp["Verdict"].map(
-                    lambda c: rc.TIMING_BADGE.get(str(c), str(c))
-                )
-                _sb_numcols = ["Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean",
-                               "Ret_20d_Median", "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean",
-                               "Excess_20d_Mean", "ExcessWin_20d"]  # v1.1: SPY 대비 알파
-                for _c in _sb_numcols:
-                    if _c in _sb_disp.columns:
-                        _sb_disp[_c] = pd.to_numeric(_sb_disp[_c], errors="coerce")
-                _sb_disp = _sb_disp.rename(columns={
-                    "Event_Count": "이벤트수", "WinRate_20d": "승률20d(%)",
-                    "Ret_5d_Mean": "평균5d(%)", "Ret_20d_Mean": "평균20d(%)",
-                    "Ret_20d_Median": "중앙20d(%)", "Ret_60d_Mean": "평균60d(%)",
-                    "MFE_20d_Mean": "MFE20d(%)", "MAE_20d_Mean": "MAE20d(%)",
-                    "Excess_20d_Mean": "초과20d(%)", "ExcessWin_20d": "초과승률20d(%)",
-                })
-                _sb_ret_cols = ["평균5d(%)", "평균20d(%)", "중앙20d(%)", "평균60d(%)",
-                                "MFE20d(%)", "MAE20d(%)"]
-                # 초과수익 컬럼은 v1.1 백테스트 이후에만 존재 → 있을 때만 표시(구버전 시트 호환)
-                if "초과20d(%)" in _sb_disp.columns:
-                    _sb_ret_cols = _sb_ret_cols + ["초과20d(%)"]   # 초과수익도 색상 적용
-                _sb_show = ["판정", "이벤트수", "승률20d(%)"] + _sb_ret_cols
-                if "초과승률20d(%)" in _sb_disp.columns:
-                    _sb_show = _sb_show + ["초과승률20d(%)"]
+                if "Mode" in _sb_df.columns:
+                    _sb_mode_col = _sb_df["Mode"].astype(str).str.strip()
+                    _sb_groups = [
+                        ("alert", _sb_df[_sb_mode_col == "alert"]),
+                        ("verdict", _sb_df[_sb_mode_col != "alert"]),
+                    ]
+                else:
+                    _sb_groups = [("verdict", _sb_df)]   # 구버전 시트 호환
 
-                def _sb_color(v):
-                    try:
-                        x = float(v)
-                    except (TypeError, ValueError):
-                        return ""
-                    if x > 0:
-                        return "color:#16a34a;font-weight:600;"
-                    if x < 0:
-                        return "color:#dc2626;font-weight:600;"
-                    return ""
-
-                _sb_fmt = {}
-                for _c in _sb_show:
-                    if _c == "판정":
+                for _sb_mode, _sb_g in _sb_groups:
+                    if _sb_g is None or _sb_g.empty:
                         continue
-                    elif _c == "이벤트수":
-                        _sb_fmt[_c] = "{:,.0f}"
-                    elif _c in ("승률20d(%)", "초과승률20d(%)"):
-                        _sb_fmt[_c] = "{:,.1f}"
+                    if _sb_mode == "alert":
+                        st.markdown("#### 📧 실제 이메일 알림 기준 — 실전 성적표")
+                        st.caption(
+                            "라이브와 **동일한 상태머신**(2일 확정 + 발동 후 재무장)을 통과해 "
+                            "**실제로 메일이 나갔을 날**만 집계합니다. 같은 매수 구간이 30일 이어져도 메일은 1통이므로 "
+                            "아래 '화면 판정' 표보다 이벤트 수가 훨씬 적은 게 정상입니다. "
+                            "**게이트 통과 vs 미통과**를 비교하면 R:R 게이트가 실제로 걸러주는지 알 수 있습니다."
+                        )
+                        _sb_order, _sb_labels = _SB_ALERT_ORDER, _SB_ALERT_LABELS
                     else:
-                        _sb_fmt[_c] = "{:,.2f}"
+                        st.markdown("#### 🖥️ 화면 판정 기준 — 엔진 판별력 진단")
+                        st.caption(
+                            "앱 화면에 판정이 표시된 **모든 날**을 집계합니다(2일 확정 + 5일 쿨다운). "
+                            "메일 발송 여부와 무관하며, 판정 자체에 예측력이 있는지 보는 용도입니다."
+                        )
+                        _sb_order, _sb_labels = _SB_VERDICT_ORDER, None
 
-                st.dataframe(
-                    _sb_disp[_sb_show].style
-                    .format(_sb_fmt, na_rep="-")
-                    .map(_sb_color, subset=_sb_ret_cols),
-                    use_container_width=True, hide_index=True,
-                )
-                st.caption(
-                    "**읽는 법:** **초과20d(%)**·**초과승률**은 SPY를 같은 기간 보유한 것 대비 성과(=**알파**, 베타 제거)입니다. "
-                    "0보다 클수록 시장 표류가 아닌 **타이밍이 더한 진짜 수익**을 뜻합니다. `🎯 지금 매수 구간`의 +20일·초과수익이 "
-                    "`대기/과열/회피`보다 높을수록 엔진의 **판별력**이 유효하다는 신호입니다. **MFE/MAE**(최대 상승/하락 여력)는 "
-                    "다음 단계인 **사이징·손익비(R:R)** 설계에서 손절·목표 거리 산정의 입력으로 쓰입니다. "
-                    "이벤트는 **2일 확정 + 5일 쿨다운**으로 경계 진동(중복)을 걸러냈고, 이벤트수가 적은 버킷은 통계가 불안정할 수 있습니다."
-                )
+                    _sb_g = _sb_g.copy()
+                    _sb_g["_o"] = _sb_g["Verdict"].map({c: i for i, c in enumerate(_sb_order)})
+                    _sb_g = _sb_g.sort_values("_o", na_position="last")
+
+                    _sb_disp = _sb_g.copy()
+                    _sb_disp["판정"] = _sb_disp["Verdict"].map(
+                        lambda c: (_sb_labels.get(str(c), str(c)) if _sb_labels
+                                   else rc.TIMING_BADGE.get(str(c), str(c)))
+                    )
+                    _sb_numcols = ["Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean",
+                                   "Ret_20d_Median", "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean",
+                                   "Excess_20d_Mean", "ExcessWin_20d"]  # v1.1: SPY 대비 알파
+                    for _c in _sb_numcols:
+                        if _c in _sb_disp.columns:
+                            _sb_disp[_c] = pd.to_numeric(_sb_disp[_c], errors="coerce")
+                    _sb_disp = _sb_disp.rename(columns={
+                        "Event_Count": "이벤트수", "WinRate_20d": "승률20d(%)",
+                        "Ret_5d_Mean": "평균5d(%)", "Ret_20d_Mean": "평균20d(%)",
+                        "Ret_20d_Median": "중앙20d(%)", "Ret_60d_Mean": "평균60d(%)",
+                        "MFE_20d_Mean": "MFE20d(%)", "MAE_20d_Mean": "MAE20d(%)",
+                        "Excess_20d_Mean": "초과20d(%)", "ExcessWin_20d": "초과승률20d(%)",
+                    })
+                    _sb_ret_cols = ["평균5d(%)", "평균20d(%)", "중앙20d(%)", "평균60d(%)",
+                                    "MFE20d(%)", "MAE20d(%)"]
+                    # 초과수익 컬럼은 v1.1 백테스트 이후에만 존재 → 있을 때만 표시(구버전 시트 호환)
+                    if "초과20d(%)" in _sb_disp.columns:
+                        _sb_ret_cols = _sb_ret_cols + ["초과20d(%)"]   # 초과수익도 색상 적용
+                    _sb_show = ["판정", "이벤트수", "승률20d(%)"] + _sb_ret_cols
+                    if "초과승률20d(%)" in _sb_disp.columns:
+                        _sb_show = _sb_show + ["초과승률20d(%)"]
+
+                    def _sb_color(v):
+                        try:
+                            x = float(v)
+                        except (TypeError, ValueError):
+                            return ""
+                        if x > 0:
+                            return "color:#16a34a;font-weight:600;"
+                        if x < 0:
+                            return "color:#dc2626;font-weight:600;"
+                        return ""
+
+                    _sb_fmt = {}
+                    for _c in _sb_show:
+                        if _c == "판정":
+                            continue
+                        elif _c == "이벤트수":
+                            _sb_fmt[_c] = "{:,.0f}"
+                        elif _c in ("승률20d(%)", "초과승률20d(%)"):
+                            _sb_fmt[_c] = "{:,.1f}"
+                        else:
+                            _sb_fmt[_c] = "{:,.2f}"
+
+                    st.dataframe(
+                        _sb_disp[_sb_show].style
+                        .format(_sb_fmt, na_rep="-")
+                        .map(_sb_color, subset=_sb_ret_cols),
+                        use_container_width=True, hide_index=True,
+                    )
+                    if _sb_mode == "alert":
+                        st.caption(
+                            "**읽는 법:** `🟢 게이트 통과` 행이 형님이 실제로 매수하는 신호입니다. "
+                            "이 행의 **초과20d(%)**(SPY 대비 알파)가 0보다 크고 `🟡 미통과`보다 높아야 "
+                            "R:R 게이트가 제 역할을 한다는 뜻입니다. 게이트는 메일을 막지 않고 라벨만 바꾸므로 "
+                            "두 행 모두 실제로 발송된 메일입니다. "
+                            "※ 워치리스트 행별 사용자 설정(목표 매수가·RSI·200일선)은 과거 재현이 불가능해 "
+                            "`watch` 알림은 집계에서 빠져 있습니다."
+                        )
+                    else:
+                        st.caption(
+                        "**읽는 법:** **초과20d(%)**·**초과승률**은 SPY를 같은 기간 보유한 것 대비 성과(=**알파**, 베타 제거)입니다. "
+                        "0보다 클수록 시장 표류가 아닌 **타이밍이 더한 진짜 수익**을 뜻합니다. `🎯 지금 매수 구간`의 +20일·초과수익이 "
+                        "`대기/과열/회피`보다 높을수록 엔진의 **판별력**이 유효하다는 신호입니다. **MFE/MAE**(최대 상승/하락 여력)는 "
+                        "다음 단계인 **사이징·손익비(R:R)** 설계에서 손절·목표 거리 산정의 입력으로 쓰입니다. "
+                        "이벤트는 **2일 확정 + 5일 쿨다운**으로 경계 진동(중복)을 걸러냈고, 이벤트수가 적은 버킷은 통계가 불안정할 수 있습니다."
+                    )
 
     elif main_nav == _MAIN_NAV_OPTIONS[9]:
         render_sync_button("sync_tab_idea", [], "Idea-to-Portfolio 데이터를 다시 불러옵니다.")
