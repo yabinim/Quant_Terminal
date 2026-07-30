@@ -21994,7 +21994,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         elif _sb_err:
             st.warning(f"백테스트 결과 로드 실패: {_sb_err}")
         else:
-            _sb_df = pd.DataFrame(_sb_rows[1:], columns=_sb_rows[0])
+            # 헤더/데이터 열 수 불일치 방어 — run_signal_backtest v1.2 에서 Entry_Rule 열이
+            # 추가되어, 그 이전에 적재된 구 행은 열이 하나 적을 수 있다(래그드 → DataFrame 예외).
+            _sb_hdr = [str(c).strip() for c in (_sb_rows[0] or [])]
+            _sb_ncol = len(_sb_hdr)
+            _sb_body = [(list(r) + [""] * _sb_ncol)[:_sb_ncol] for r in _sb_rows[1:]]
+            _sb_df = pd.DataFrame(_sb_body, columns=_sb_hdr)
             if "Run_Date" in _sb_df.columns and not _sb_df.empty:
                 _sb_latest = _sb_df["Run_Date"].astype(str).max()
                 _sb_df = _sb_df[_sb_df["Run_Date"].astype(str) == _sb_latest]
@@ -22007,11 +22012,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 st.info("표시할 백테스트 결과가 없습니다.")
             else:
                 _sb_meta = _sb_df.iloc[0]
+                # 진입가 규칙(v1.2~) — 구/신 실행이 시트에 섞여도 어떤 기준인지 즉시 구분
+                _sb_rule = str(_sb_meta.get("Entry_Rule", "") or "").strip()
                 st.success(
                     f"📅 최신 실행: **{_sb_meta.get('Run_Date', '')}** · "
                     f"검증 구간 {_sb_meta.get('History_Start', '')} ~ {_sb_meta.get('History_End', '')} · "
                     f"유니버스 {_sb_meta.get('Universe_Size', '')}종목"
+                    + (f" · 진입가 **{_sb_rule}**" if _sb_rule else "")
                 )
+                if _sb_rule:
+                    st.caption(
+                        "진입가는 신호 확정일이 아니라 **그 다음 거래일 종가** 기준입니다 — "
+                        "알림 메일이 장 마감 후 발송되므로 실제로 체결 가능한 최초 가격이에요."
+                    )
+                else:
+                    st.warning(
+                        "⚠️ 이 결과는 **신호 확정일 종가**를 진입가로 계산한 구버전 실행입니다. "
+                        "알림은 종가 확정 *후* 발송되므로 그 가격은 체결할 수 없습니다 — "
+                        "실현 불가능한 성과이니 기준 조정의 근거로 쓰지 마세요. "
+                        "백테스트를 다시 실행하면 `close[t+1]` 기준으로 갱신됩니다."
+                    )
 
                 _sb_order = ["entry", "wait", "overheat", "trend_break", "avoid"]
                 _sb_df["_o"] = _sb_df["Verdict"].map({c: i for i, c in enumerate(_sb_order)})
