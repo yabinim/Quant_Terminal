@@ -12,6 +12,16 @@ verdict(entry/wait/overheat/trend_break/avoid)가 켜진 시점 이후 실제로
 
   → "🎯 entry 가 정말 돈이 됐나? 시장(SPY) 대비 알파가 있나? entry>wait>overheat>avoid 로 갈리나?"
 
+v1.2 변경 (진입 시점 현실화)
+---------------------------
+- **진입가를 신호일 종가 → 신호일 +ENTRY_LAG_DAYS(=1) 거래일 종가로 이동.**
+  이유: 신호는 장 마감 종가로 확정되고 알림 메일은 그 *후* 16:00 ET 에 발송된다.
+  즉 `close[t]` 는 구조적으로 체결 불가능한 가격이라 기존 집계는 실현 불가능한
+  성과를 측정했다. 이제 실제로 잡을 수 있는 최초 가격으로 측정한다.
+- forward-return / MFE·MAE / SPY 초과수익 모두 '진입 봉' 기준으로 재정렬
+  (보유 h거래일 = 진입일로부터 h일). SPY 진입가도 같은 봉의 종가 → 알파 비교 정합.
+- 결과 시트에 `Entry_Rule` 열 추가 → 구/신 규칙 행이 한 시트에 섞여도 구분 가능.
+
 v1.1 변경
 ---------
 - 초과수익(excess): 각 이벤트 +Nd 수익에서 SPY 동일 캘린더창 수익을 빼 베타 제거 → 알파 측정.
@@ -30,6 +40,8 @@ v1.1 변경
 설계 메모
 ---------
 - 무결성: 분류엔 D 이전 데이터만(엄격 슬라이스). 최소 220봉 선행. 미래 부족분 NaN.
+- 실행 가능성: 분류일(t)과 진입일(t+ENTRY_LAG_DAYS)을 분리. 분류는 t 까지 데이터만 쓰고,
+  진입가는 t 이후 봉 → 미래 훔쳐보기 없이 '메일 받고 다음날 매수' 흐름을 그대로 재현.
 - SSOT: regime_core 를 '소비'만(재구현 금지). app.py·run_watchlist_alerts 와 동일 판정.
 - 순수 엔진(_forward_metrics / walk_forward_events / aggregate_events)은 numpy/pandas 만 의존 →
   FMP·시트 없이 단위 테스트 가능(analyze_fn 주입). I/O·main 은 하단 분리.
@@ -81,6 +93,7 @@ _RESULT_COLS = [
     "Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean", "Ret_20d_Median",
     "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean",
     "Excess_20d_Mean", "ExcessWin_20d",   # v1.1: SPY 대비 알파
+    "Entry_Rule",                          # v1.2: 진입가 규칙(close[t+N]) — 구/신 행 구분
 ]
 
 _FMP_BASE    = "https://financialmodelingprep.com/stable"
@@ -94,7 +107,13 @@ MIN_PRIOR_BARS = 220           # 200일선 산출 위한 최소 선행 봉수
 TEST_LOOKBACK  = 756           # 평가 구간(거래일 ≈ 3년)
 CONFIRM_DAYS   = 2             # v1.1: raw code 가 N일 연속 유지돼야 이벤트 확정(라이브 알림과 동일 철학)
 COOLDOWN_DAYS  = 5             # v1.1: 같은 code 재기록 최소 간격(경계 진동 압축)
-HISTORY_LIMIT  = MIN_PRIOR_BARS + TEST_LOOKBACK + max(HORIZONS) + 40
+ENTRY_LAG_DAYS = 1             # v1.2: 신호일(t) 대비 실제 진입 거래일 지연.
+                               #   1 = 메일(16:00 ET) 받고 '다음 거래일' 매수 = 라이브 구조.
+                               #   0 = 구버전(신호일 종가 진입) — 체결 불가능. 비교용으로만.
+HISTORY_LIMIT  = MIN_PRIOR_BARS + TEST_LOOKBACK + max(HORIZONS) + ENTRY_LAG_DAYS + 40
+
+# 결과 시트 provenance — 어떤 진입 규칙으로 잰 행인지 표시(구/신 혼재 방지)
+_ENTRY_RULE_LABEL = f"close[t+{ENTRY_LAG_DAYS}]"
 
 # 집계 대상 버킷 (regime_core evaluate_timing code 와 일치, unknown 제외)
 BUCKETS = ("entry", "wait", "overheat", "trend_break", "avoid")
@@ -105,41 +124,53 @@ BUCKETS = ("entry", "wait", "overheat", "trend_break", "avoid")
 # ════════════════════════════════════════════════════════════════════════════
 
 def _forward_metrics(close, high, low, pos: int, horizons=HORIZONS,
-                     mfe_window: int = MFE_WINDOW, spy_arr=None) -> dict:
-    """pos 시점 종가를 진입가로 보고 forward-return / 초과수익 / MFE·MAE 산출.
+                     mfe_window: int = MFE_WINDOW, spy_arr=None,
+                     entry_lag: int = ENTRY_LAG_DAYS) -> dict:
+    """신호일 pos → 진입봉 epos(=pos+entry_lag) 종가 기준 forward-return / 초과수익 / MFE·MAE.
 
-    - ret_{h}d    : pos+h 종가 / 진입가 - 1            (미래 부족 시 NaN)
+    - entry_price : close[epos] — 실제로 체결 가능한 최초 종가 (미래 부족 시 NaN)
+    - ret_{h}d    : epos+h 종가 / 진입가 - 1            (보유 h거래일; 미래 부족 시 NaN)
     - excess_{h}d : ret_{h}d - (SPY 동일창 수익)        (spy_arr 정렬 제공 시; 베타 제거 알파)
-    - mfe / mae   : [pos+1, pos+mfe_window] 최고/최저 / 진입가 - 1  (절대값, 사이징 입력)
+    - mfe / mae   : [epos+1, epos+mfe_window] 최고/최저 / 진입가 - 1 (절대값, 사이징 입력)
     spy_arr: 종목 거래일에 정렬(ffill)된 SPY 종가 배열(없으면 초과수익 NaN).
+             SPY 진입가도 epos 종가를 써서 종목과 같은 봉에서 출발 → 알파 비교 정합.
+    entry_lag: 신호일 대비 진입 지연 거래일수. 0 이면 구버전(신호일 종가 진입).
     """
     n = len(close)
     out = {f"ret_{h}d": np.nan for h in horizons}
     out.update({f"excess_{h}d": np.nan for h in horizons})
     out["mfe"] = np.nan
     out["mae"] = np.nan
+    out["entry_price"] = np.nan
+    out["entry_pos"] = -1
     if pos < 0 or pos >= n:
         return out
-    entry = float(close[pos])
+    # 진입봉: 신호일 종가로 판정 → 메일 발송 → entry_lag 거래일 뒤 체결
+    epos = pos + int(max(0, entry_lag))
+    if epos >= n:
+        return out          # 진입할 미래 봉이 없음 → 측정 불가(호출부에서 이벤트 제외)
+    entry = float(close[epos])
     if not np.isfinite(entry) or entry <= 0:
         return out
+    out["entry_price"] = entry
+    out["entry_pos"] = epos
 
     spy_entry = None
-    if spy_arr is not None and pos < len(spy_arr) and np.isfinite(spy_arr[pos]) and spy_arr[pos] > 0:
-        spy_entry = float(spy_arr[pos])
+    if spy_arr is not None and epos < len(spy_arr) and np.isfinite(spy_arr[epos]) and spy_arr[epos] > 0:
+        spy_entry = float(spy_arr[epos])
 
     for h in horizons:
-        j = pos + h
+        j = epos + h
         if j < n and np.isfinite(close[j]):
             r = float(close[j]) / entry - 1.0
             out[f"ret_{h}d"] = r
             if spy_entry is not None and j < len(spy_arr) and np.isfinite(spy_arr[j]):
                 out[f"excess_{h}d"] = r - (float(spy_arr[j]) / spy_entry - 1.0)
 
-    end = min(pos + mfe_window, n - 1)
-    if end > pos:
-        hwin = high[pos + 1:end + 1]
-        lwin = low[pos + 1:end + 1]
+    end = min(epos + mfe_window, n - 1)
+    if end > epos:
+        hwin = high[epos + 1:end + 1]
+        lwin = low[epos + 1:end + 1]
         if np.any(np.isfinite(hwin)):
             out["mfe"] = float(np.nanmax(hwin)) / entry - 1.0
         if np.any(np.isfinite(lwin)):
@@ -153,12 +184,16 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                         horizons=HORIZONS, mfe_window: int = MFE_WINDOW,
                         confirm_days: int = CONFIRM_DAYS,
                         cooldown_days: int = COOLDOWN_DAYS,
+                        entry_lag: int = ENTRY_LAG_DAYS,
                         analyze_fn=None):
     """한 티커의 워크포워드 평가 (v1.1: 2일 확정 + 쿨다운 디플랩).
 
     각 평가일 i 에서 hist[:i+1] → analyze_fn → raw code. 분류는 i 까지 데이터만(미래 차단).
     raw code 가 confirm_days 연속 유지된 '그날' 1회 확정 → 직전 기록과 다르거나(또는 같아도
     cooldown_days 경과 시) 이벤트로 기록. forward 측정만 미래 종가 참조.
+
+    v1.2: 확정일(t)과 진입일(t+entry_lag)을 분리한다. 진입 봉이 데이터 끝을 넘어가
+    체결 자체가 불가능한 이벤트는 기록하지 않는다(측정 불가 이벤트로 카운트 오염 방지).
 
     반환: (events: list[dict], first_eval_date, last_eval_date)
     """
@@ -231,9 +266,15 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
             continue
         # de-dup: 직전 기록과 다른 code 이거나, 같아도 쿨다운 경과 시에만 기록
         if (code != last_rec_code) or (i - last_rec_pos >= cooldown_days):
-            fm = _forward_metrics(close, high, low, i, horizons, mfe_window, spy_arr=spy_arr)
-            ev = {"date": str(pd.Timestamp(date_i).date()),
-                  "code": code, "entry_price": float(close[i])}
+            fm = _forward_metrics(close, high, low, i, horizons, mfe_window,
+                                  spy_arr=spy_arr, entry_lag=entry_lag)
+            _ep = fm.get("entry_price", np.nan)
+            if not np.isfinite(_ep):
+                continue        # 진입 봉 없음 → 체결 불가. 기록/쿨다운 모두 건드리지 않음
+            _epos = int(fm.get("entry_pos", i))
+            ev = {"date": str(pd.Timestamp(date_i).date()),          # 신호 확정일
+                  "entry_date": str(pd.Timestamp(dates[_epos]).date()),  # 실제 진입일
+                  "code": code}
             ev.update(fm)
             events.append(ev)
             last_rec_code = code
@@ -292,6 +333,7 @@ def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
             _cell(a.get("ret_20d_median")), _cell(a.get("ret_60d_mean")),
             _cell(a.get("mfe_20d_mean")), _cell(a.get("mae_20d_mean")),
             _cell(a.get("excess_20d_mean")), _cell(a.get("excess_win_20d")),
+            _ENTRY_RULE_LABEL,
         ])
     return rows
 
