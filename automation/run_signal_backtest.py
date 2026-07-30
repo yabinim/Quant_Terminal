@@ -12,6 +12,14 @@ verdict(entry/wait/overheat/trend_break/avoid)가 켜진 시점 이후 실제로
 
   → "🎯 entry 가 정말 돈이 됐나? 시장(SPY) 대비 알파가 있나? entry>wait>overheat>avoid 로 갈리나?"
 
+v1.3 변경 (Sheets 일시 장애 내성)
+--------------------------------
+- gspread 호출 전부를 지수 백오프 재시도(`_gs`)로 감쌌다. 503/500/502/504/429 및
+  네트워크 예외는 최대 6회(2·4·8·16·32·60초 + 지터, 누적 ~2분) 재시도한다.
+  이유: 월 1회 무인 실행이라 일시적 503 한 번에 한 달치 결과가 통째로 날아간다.
+  일간 워크플로는 다음날 자기복구되지만 이 잡은 그렇지 않다.
+- 401/403(인증)·404(시트 없음) 같은 영구 오류는 재시도하지 않고 즉시 실패한다.
+
 v1.2 변경 (진입 시점 현실화)
 ---------------------------
 - **진입가를 신호일 종가 → 신호일 +ENTRY_LAG_DAYS(=1) 거래일 종가로 이동.**
@@ -56,6 +64,7 @@ import os
 import sys
 import json
 import time
+import random
 import concurrent.futures
 from datetime import datetime
 
@@ -342,6 +351,62 @@ def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
 # I/O — FMP 데이터 / Google Sheets (자동화 전용)
 # ════════════════════════════════════════════════════════════════════════════
 
+# ── Sheets 일시 장애 재시도 (v1.3) ────────────────────────────────────────────
+_GS_MAX_ATTEMPTS = 6
+_GS_BACKOFF      = (2, 4, 8, 16, 32, 60)   # 초 — 누적 최대 약 2분
+_GS_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+def _gs_is_transient(exc) -> bool:
+    """재시도할 가치가 있는 예외인가? (인증/권한/부재 오류는 재시도 무의미)"""
+    import requests
+    if isinstance(exc, (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ChunkedEncodingError)):
+        return True
+    code = None
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+    if code is None:
+        # gspread APIError 는 args[0] 에 dict 를 담기도 한다
+        try:
+            a0 = exc.args[0]
+            if isinstance(a0, dict):
+                code = int((a0.get("error") or {}).get("code") or a0.get("code"))
+        except Exception:
+            code = None
+    if code is None:
+        return False
+    return int(code) in _GS_RETRY_STATUS
+
+
+def _gs(fn, *args, **kwargs):
+    """gspread 호출 재시도 래퍼. 일시 오류만 지수 백오프 + 지터로 재시도.
+
+    사용: _gs(gc.open, TITLE) / _gs(ws.get_all_values) / _gs(ws.update, rows, range_name=...)
+    """
+    import gspread
+    last = None
+    for attempt in range(_GS_MAX_ATTEMPTS):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.SpreadsheetNotFound:
+            raise                                  # 영구 오류 — 재시도 무의미
+        except gspread.exceptions.WorksheetNotFound:
+            raise
+        except Exception as exc:                   # noqa: BLE001
+            if not _gs_is_transient(exc) or attempt == _GS_MAX_ATTEMPTS - 1:
+                raise
+            last = exc
+            wait = _GS_BACKOFF[min(attempt, len(_GS_BACKOFF) - 1)]
+            wait += random.uniform(0, wait * 0.25)  # 지터 — 동시 재시도 충돌 완화
+            print(f"[WARN] Sheets 일시 오류({type(exc).__name__}) — "
+                  f"{wait:.1f}초 후 재시도 {attempt + 1}/{_GS_MAX_ATTEMPTS - 1}: {exc}", flush=True)
+            time.sleep(wait)
+    raise last  # 도달 불가(방어)
+
+
 def get_gspread_client():
     import gspread
     from google.oauth2.service_account import Credentials
@@ -405,7 +470,7 @@ def _batch_fetch_history(tickers: list, limit: int = HISTORY_LIMIT) -> dict:
 
 def _read_col(ws, col_idx: int) -> list:
     """워크시트 헤더 제외 특정 컬럼의 비어있지 않은 값들(대문자 정리)."""
-    vals = ws.get_all_values() or []
+    vals = _gs(ws.get_all_values) or []
     out = []
     for row in vals[1:]:
         if len(row) > col_idx:
@@ -417,8 +482,8 @@ def _read_col(ws, col_idx: int) -> list:
 
 def load_universe(gc) -> list:
     """ETF_Universe + Watchlist + Portfolios 합집합(중복 제거). 시트 없으면 해당 소스만 스킵."""
-    sh = gc.open(_SPREADSHEET_TITLE)
-    titles = {ws.title for ws in sh.worksheets()}
+    sh = _gs(gc.open, _SPREADSHEET_TITLE)
+    titles = {ws.title for ws in _gs(sh.worksheets)}
     tickers: set[str] = set()
 
     sources = [
@@ -431,7 +496,7 @@ def load_universe(gc) -> list:
             print(f"[INFO] '{title}' 시트 없음 — 스킵")
             continue
         try:
-            ws = sh.worksheet(title)
+            ws = _gs(sh.worksheet, title)
             got = _read_col(ws, col_idx)
             tickers.update(got)
             print(f"[OK] '{title}' 에서 {len(got)}개 로드")
@@ -444,21 +509,21 @@ def load_universe(gc) -> list:
 
 def open_result_worksheet(gc):
     """Signal_Backtest 탭. 없으면 생성 + 헤더. 헤더가 현재 스키마와 다르면 헤더만 갱신(마이그레이션)."""
-    sh = gc.open(_SPREADSHEET_TITLE)
-    titles = [ws.title for ws in sh.worksheets()]
+    sh = _gs(gc.open, _SPREADSHEET_TITLE)
+    titles = [ws.title for ws in _gs(sh.worksheets)]
     last_col = chr(ord("A") + len(_RESULT_COLS) - 1)
     if _RESULT_WORKSHEET in titles:
-        ws = sh.worksheet(_RESULT_WORKSHEET)
+        ws = _gs(sh.worksheet, _RESULT_WORKSHEET)
         try:
-            if (ws.row_values(1) or []) != _RESULT_COLS:
-                ws.update([_RESULT_COLS], range_name=f"A1:{last_col}1",
+            if (_gs(ws.row_values, 1) or []) != _RESULT_COLS:
+                _gs(ws.update, [_RESULT_COLS], range_name=f"A1:{last_col}1",
                           value_input_option="USER_ENTERED")
                 print("[INFO] Signal_Backtest 헤더 갱신(스키마 변경 반영)")
         except Exception:
             pass
         return ws
-    ws = sh.add_worksheet(title=_RESULT_WORKSHEET, rows=2000, cols=len(_RESULT_COLS))
-    ws.update([_RESULT_COLS], range_name=f"A1:{last_col}1", value_input_option="USER_ENTERED")
+    ws = _gs(sh.add_worksheet, title=_RESULT_WORKSHEET, rows=2000, cols=len(_RESULT_COLS))
+    _gs(ws.update, [_RESULT_COLS], range_name=f"A1:{last_col}1", value_input_option="USER_ENTERED")
     return ws
 
 
@@ -471,7 +536,7 @@ def _safe_append_rows(ws, rows, ncols: int, value_input_option: str = "USER_ENTE
     rows = [list(r) for r in rows if r is not None]
     if not rows:
         return
-    existing = ws.get_all_values() or []
+    existing = _gs(ws.get_all_values) or []
     last_row = 0
     for idx, r in enumerate(existing, start=1):
         if any(str(c).strip() != "" for c in r):
@@ -480,11 +545,11 @@ def _safe_append_rows(ws, rows, ncols: int, value_input_option: str = "USER_ENTE
     end_row = start_row + len(rows) - 1
     try:
         if end_row > ws.row_count:
-            ws.add_rows(end_row - ws.row_count + 50)
+            _gs(ws.add_rows, end_row - ws.row_count + 50)
     except Exception:
         pass
     last_col = chr(ord("A") + max(0, ncols - 1))
-    ws.update(rows, range_name=f"A{start_row}:{last_col}{end_row}",
+    _gs(ws.update, rows, range_name=f"A{start_row}:{last_col}{end_row}",
               value_input_option=value_input_option)
 
 
