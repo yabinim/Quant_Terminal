@@ -12,6 +12,22 @@ verdict(entry/wait/overheat/trend_break/avoid)가 켜진 시점 이후 실제로
 
   → "🎯 entry 가 정말 돈이 됐나? 시장(SPY) 대비 알파가 있나? entry>wait>overheat>avoid 로 갈리나?"
 
+v1.4 변경 (실제 알림 기준 모드 추가)
+------------------------------------
+기존 집계는 화면 판정(timing.code)이 확정된 '모든 날'을 셌다. 그러나 실제 이메일은
+regime_core.evaluate_alert_transitions 상태머신(2일 확정 + 발동 후 재무장)을 통과한
+날에만 나간다. 같은 entry 구간이 30일 이어져도 메일은 1통이다 → 두 모집단은 다르다.
+
+이제 한 번의 워크포워드에서 두 모드를 동시에 집계한다:
+  - Mode="verdict" : 화면 판정 기준 (기존 v1.1~1.3 로직 그대로 — 판별력 진단용)
+  - Mode="alert"   : 라이브 알림과 *동일한* 상태머신 기준 (실전 성적표)
+                     entry 발동 시 build_watchlist_plan 으로 R:R 게이트까지 재현해
+                     alert_entry_pass / alert_entry_skip 으로 분리 → 게이트 효용 측정.
+분석(analyze_ticker) 호출은 날짜당 1회로 공유하므로 실행 시간은 거의 늘지 않는다.
+
+주의: 워치리스트 행별 사용자 설정(목표 매수가·RSI·200일선)은 과거 재현이 불가능하므로
+watch 이벤트는 발동하지 않는다. 즉 alert 모드는 '시스템이 만드는 알림'만 측정한다.
+
 v1.3 변경 (Sheets 일시 장애 내성)
 --------------------------------
 - gspread 호출 전부를 지수 백오프 재시도(`_gs`)로 감쌌다. 503/500/502/504/429 및
@@ -103,6 +119,7 @@ _RESULT_COLS = [
     "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean",
     "Excess_20d_Mean", "ExcessWin_20d",   # v1.1: SPY 대비 알파
     "Entry_Rule",                          # v1.2: 진입가 규칙(close[t+N]) — 구/신 행 구분
+    "Mode",                                # v1.4: verdict(화면 판정) | alert(실제 이메일)
 ]
 
 _FMP_BASE    = "https://financialmodelingprep.com/stable"
@@ -126,6 +143,16 @@ _ENTRY_RULE_LABEL = f"close[t+{ENTRY_LAG_DAYS}]"
 
 # 집계 대상 버킷 (regime_core evaluate_timing code 와 일치, unknown 제외)
 BUCKETS = ("entry", "wait", "overheat", "trend_break", "avoid")
+
+# v1.4 — 실제 이메일 알림 기준 버킷 (run_watchlist_alerts.py 와 동일 상태머신)
+ALERT_ENABLED_EVENTS = ("entry", "risk", "watch")   # _WL_ALERT_DEFAULT 와 동일
+ALERT_BUCKETS = (
+    "alert_entry_pass",     # 매수 메일 발송 + R:R 게이트 통과 → 실제로 사는 신호
+    "alert_entry_skip",     # 매수 메일 발송 + 게이트 미통과(건너뛰기 권고)
+    "alert_entry_na",       # 매수 메일 발송 + 게이트 판단 보류(플랜 산출 불가)
+    "alert_risk",           # 위험 알림
+    "alert_entry_invalid",  # 직전 매수 신호 조건 해제(무효화)
+)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -187,6 +214,31 @@ def _forward_metrics(close, high, low, pos: int, horizons=HORIZONS,
     return out
 
 
+def _alert_bucket(ev: dict, hist_slice, analysis: dict):
+    """발동된 알림 1건 → 집계 버킷. entry 는 R:R 게이트로 pass/skip/na 분리.
+
+    라이브에서 게이트는 메일을 '막지' 않고 라벨만 바꾼다(decorate_entry_alert).
+    따라서 여기서도 억제하지 않고 버킷만 나눠, 게이트가 실제로 걸러주는지 측정한다.
+    """
+    e = str((ev or {}).get("event") or "")
+    if e == "risk":
+        return "alert_risk"
+    if e == "entry_invalid":
+        return "alert_entry_invalid"
+    if e != "entry":
+        return None                      # watch/exit/price/regime 은 집계 대상 아님
+    try:
+        plan = rc.build_watchlist_plan(hist_slice, analysis)
+        gate = str((plan or {}).get("gate") or "na")
+    except Exception:
+        gate = "na"
+    if gate == "na":
+        return "alert_entry_na"
+    if gate in ("skip", "avoid"):
+        return "alert_entry_skip"
+    return "alert_entry_pass"
+
+
 def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                         min_prior: int = MIN_PRIOR_BARS,
                         test_lookback: int = TEST_LOOKBACK,
@@ -194,6 +246,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                         confirm_days: int = CONFIRM_DAYS,
                         cooldown_days: int = COOLDOWN_DAYS,
                         entry_lag: int = ENTRY_LAG_DAYS,
+                        alert_enabled=ALERT_ENABLED_EVENTS,
                         analyze_fn=None):
     """한 티커의 워크포워드 평가 (v1.1: 2일 확정 + 쿨다운 디플랩).
 
@@ -204,14 +257,19 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     v1.2: 확정일(t)과 진입일(t+entry_lag)을 분리한다. 진입 봉이 데이터 끝을 넘어가
     체결 자체가 불가능한 이벤트는 기록하지 않는다(측정 불가 이벤트로 카운트 오염 방지).
 
-    반환: (events: list[dict], first_eval_date, last_eval_date)
+    v1.4: 같은 루프에서 라이브 알림 상태머신(evaluate_alert_transitions)도 함께 돌려
+    '실제로 메일이 나갔을 날'만 뽑은 alert 이벤트를 별도로 반환한다. analyze 호출은
+    날짜당 1회를 두 모드가 공유하므로 추가 비용이 거의 없다.
+
+    반환: (events, alert_events, first_eval_date, last_eval_date)
     """
     if analyze_fn is None:
         analyze_fn = rc.analyze_ticker
 
     events: list[dict] = []
+    alert_events: list[dict] = []
     if hist is None or hist.empty or "Close" not in hist.columns:
-        return events, None, None
+        return events, alert_events, None, None
 
     h = hist.sort_index()
     close = pd.to_numeric(h["Close"], errors="coerce").to_numpy(dtype=float)
@@ -222,7 +280,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     dates = h.index
     n = len(close)
     if n < min_prior + 2:
-        return events, None, None
+        return events, alert_events, None, None
 
     # SPY 를 종목 거래일에 정렬(ffill) → 같은 캘린더창 초과수익 계산
     spy_arr = None
@@ -237,6 +295,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     first_eval_date = None
     last_eval_date = None
 
+    _alert_state = ""       # v1.4: 알림 상태머신 누적 상태(JSON) — 티커별로 이어짐
     pending_code = None     # 현재 연속 유지 중인 raw code
     pending_count = 0       # 연속 유지 일수
     last_rec_code = None    # 마지막으로 '기록'된 code
@@ -255,7 +314,31 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
             res = analyze_fn(slice_, spy_close=spy_slice)
             code = (res.get("timing") or {}).get("code", "unknown")
         except Exception:
-            code = "unknown"
+            res, code = None, "unknown"
+
+        # ── [모드 B] 실제 이메일 알림 재현 (상태머신 SSOT 그대로 호출) ──
+        if res is not None and alert_enabled:
+            try:
+                _fired, _alert_state = rc.evaluate_alert_transitions(
+                    res, alert_enabled, _alert_state,
+                    today_str=str(pd.Timestamp(date_i).date()),
+                    price=float(close[i]) if np.isfinite(close[i]) else None,
+                )
+            except Exception:
+                _fired = []
+            for _ev_a in (_fired or []):
+                _bucket = _alert_bucket(_ev_a, slice_, res)
+                if _bucket is None:
+                    continue
+                _fma = _forward_metrics(close, high, low, i, horizons, mfe_window,
+                                        spy_arr=spy_arr, entry_lag=entry_lag)
+                if not np.isfinite(_fma.get("entry_price", np.nan)):
+                    continue
+                _ea = {"date": str(pd.Timestamp(date_i).date()),
+                       "entry_date": str(pd.Timestamp(dates[int(_fma["entry_pos"])]).date()),
+                       "code": _bucket}
+                _ea.update(_fma)
+                alert_events.append(_ea)
 
         if first_eval_date is None:
             first_eval_date = date_i
@@ -289,7 +372,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
             last_rec_code = code
             last_rec_pos = i
 
-    return events, first_eval_date, last_eval_date
+    return events, alert_events, first_eval_date, last_eval_date
 
 
 def _nan_pct(arr, fn) -> float:
@@ -301,10 +384,10 @@ def _nan_pct(arr, fn) -> float:
     return round(float(fn(a)) * 100.0, 2)
 
 
-def aggregate_events(events: list[dict]) -> dict:
-    """이벤트 리스트 → 버킷별 통계 dict."""
+def aggregate_events(events: list[dict], buckets=BUCKETS) -> dict:
+    """이벤트 리스트 → 버킷별 통계 dict. buckets 로 verdict/alert 모드 공용."""
     agg = {}
-    for code in BUCKETS:
+    for code in buckets:
         evs = [e for e in events if e.get("code") == code]
         r20 = np.array([e.get("ret_20d", np.nan) for e in evs], dtype=float)
         valid20 = r20[np.isfinite(r20)]
@@ -328,12 +411,16 @@ def aggregate_events(events: list[dict]) -> dict:
 
 
 def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
-                      universe_size: int) -> list[list]:
-    """집계 dict → Signal_Backtest 시트 행들(_RESULT_COLS 순서)."""
+                      universe_size: int, buckets=BUCKETS,
+                      mode: str = "verdict") -> list[list]:
+    """집계 dict → Signal_Backtest 시트 행들(_RESULT_COLS 순서).
+
+    mode: "verdict"(화면 판정) | "alert"(실제 이메일 발송 기준) — 시트 Mode 열로 구분.
+    """
     def _cell(v):
         return "" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else v
     rows = []
-    for code in BUCKETS:
+    for code in buckets:
         a = agg.get(code, {})
         rows.append([
             run_date, hist_start, hist_end, universe_size, code,
@@ -342,7 +429,7 @@ def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
             _cell(a.get("ret_20d_median")), _cell(a.get("ret_60d_mean")),
             _cell(a.get("mfe_20d_mean")), _cell(a.get("mae_20d_mean")),
             _cell(a.get("excess_20d_mean")), _cell(a.get("excess_win_20d")),
-            _ENTRY_RULE_LABEL,
+            _ENTRY_RULE_LABEL, mode,
         ])
     return rows
 
@@ -562,6 +649,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict):
     spy_close = spy_hist["Close"] if (spy_hist is not None and "Close" in spy_hist.columns) else None
 
     all_events: list[dict] = []
+    all_alerts: list[dict] = []
     eval_starts, eval_ends = [], []
     n_with_data = 0
 
@@ -569,37 +657,48 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict):
         hist = hist_cache.get(tk)
         if hist is None or hist.empty:
             continue
-        events, d0, d1 = walk_forward_events(hist, spy_close=spy_close)
+        events, alerts, d0, d1 = walk_forward_events(hist, spy_close=spy_close)
         if d0 is not None:
             n_with_data += 1
             eval_starts.append(pd.Timestamp(d0))
             eval_ends.append(pd.Timestamp(d1))
         all_events.extend(events)
+        all_alerts.extend(alerts)
 
     agg = aggregate_events(all_events)
+    agg_alert = aggregate_events(all_alerts, buckets=ALERT_BUCKETS)
     meta = {
         "universe_size": n_with_data,
         "hist_start": str(min(eval_starts).date()) if eval_starts else "",
         "hist_end": str(max(eval_ends).date()) if eval_ends else "",
         "total_events": len(all_events),
+        "total_alerts": len(all_alerts),
     }
     return agg, meta
 
 
-def _print_summary(agg: dict, meta: dict) -> None:
+def _print_summary(agg: dict, agg_alert: dict, meta: dict) -> None:
     print(f"\n[백테스트 요약] 유니버스 {meta['universe_size']}종목 · "
-          f"구간 {meta['hist_start']}~{meta['hist_end']} · 총 이벤트 {meta['total_events']}")
-    hdr = (f"{'버킷':<12}{'N':>6}{'승률20d':>9}{'평균5d':>8}{'평균20d':>8}{'중앙20d':>8}"
-           f"{'평균60d':>8}{'MFE20':>7}{'MAE20':>7}{'초과20d':>8}{'초과승률':>9}")
-    print(hdr)
-    for code in BUCKETS:
-        a = agg[code]
-        def s(v):
-            return "-" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else f"{v}"
-        print(f"{code:<12}{a['count']:>6}{s(a['winrate_20d']):>9}{s(a['ret_5d_mean']):>8}"
-              f"{s(a['ret_20d_mean']):>8}{s(a['ret_20d_median']):>8}{s(a['ret_60d_mean']):>8}"
-              f"{s(a['mfe_20d_mean']):>7}{s(a['mae_20d_mean']):>7}"
-              f"{s(a['excess_20d_mean']):>8}{s(a['excess_win_20d']):>9}")
+          f"구간 {meta['hist_start']}~{meta['hist_end']} · "
+          f"판정 이벤트 {meta['total_events']} · 알림 이벤트 {meta.get('total_alerts', 0)}")
+
+    def _s(v):
+        return "-" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else f"{v}"
+
+    def _table(title, agg_d, buckets):
+        print(f"\n── {title} ──")
+        print(f"{'버킷':<20}{'N':>6}{'승률20d':>9}{'평균5d':>8}{'평균20d':>8}{'중앙20d':>8}"
+              f"{'평균60d':>8}{'MFE20':>7}{'MAE20':>7}{'초과20d':>8}{'초과승률':>9}")
+        for code in buckets:
+            a = agg_d.get(code, {})
+            print(f"{code:<20}{a.get('count', 0):>6}{_s(a.get('winrate_20d')):>9}"
+                  f"{_s(a.get('ret_5d_mean')):>8}{_s(a.get('ret_20d_mean')):>8}"
+                  f"{_s(a.get('ret_20d_median')):>8}{_s(a.get('ret_60d_mean')):>8}"
+                  f"{_s(a.get('mfe_20d_mean')):>7}{_s(a.get('mae_20d_mean')):>7}"
+                  f"{_s(a.get('excess_20d_mean')):>8}{_s(a.get('excess_win_20d')):>9}")
+
+    _table("[alert] 실제 이메일 발송 기준 — 실전 성적표", agg_alert, ALERT_BUCKETS)
+    _table("[verdict] 화면 판정 기준 — 판별력 진단", agg, BUCKETS)
 
 
 def main():
@@ -627,9 +726,11 @@ def main():
           f"(SPY {'OK' if not spy_hist.empty else '실패'})")
 
     agg, meta = run_backtest(universe, spy_hist, hist_cache)
-    _print_summary(agg, meta)
+    _print_summary(agg, agg_alert, meta)
 
-    rows = build_result_rows(agg, run_date, meta["hist_start"], meta["hist_end"],
+    rows = build_result_rows(agg_alert, run_date, meta["hist_start"], meta["hist_end"],
+                             meta["universe_size"], buckets=ALERT_BUCKETS, mode="alert")
+    rows += build_result_rows(agg, run_date, meta["hist_start"], meta["hist_end"],
                              meta["universe_size"])
     try:
         ws = open_result_worksheet(gc)
