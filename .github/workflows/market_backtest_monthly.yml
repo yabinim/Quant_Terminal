@@ -10,7 +10,10 @@ on:
 jobs:
   run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # 유니버스 ~40종목 × 3년 워크포워드 여유
+    # v1.7: 유니버스 ~160종목 × 5년(TEST_LOOKBACK=1260) × 왕복 5모드.
+    #   실측 기준 약 45분 소요 → 기존 30분은 강제 종료된다(시트에 아무것도 안 남음).
+    #   여유 포함 120분. 조기 종료되면 로그 끝에 [DONE] 초 단위가 안 찍히므로 그걸로 판별.
+    timeout-minutes: 120
 
     steps:
       - name: 📥 코드 체크아웃
@@ -32,7 +35,7 @@ jobs:
             pandas \
             pytz
 
-      - name: 🔬 신호 백테스트 실행 (워크포워드 → Signal_Backtest 시트)
+      - name: 🔬 신호 백테스트 실행 (워크포워드 → Signal_Backtest / Signal_Backtest_RT 시트)
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
