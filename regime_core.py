@@ -1628,6 +1628,95 @@ def integrated_sell_verdict(*, above_ma200, one_month_return, rsi, macd_signal,
     return label, " · ".join(reasons)
 
 
+_DD_FALLBACK_WINDOW = 252     # 매수가·매수일 둘 다 없을 때 폴백 고점 룩백(약 1년)
+
+
+def compute_position_drawdown(close_series, purchase_price, current_price, date_added: str = ""):
+    """포지션의 '고점 대비 하락'을 보수적으로 계산 + 데이터 오류 플래그.
+
+    ※ app.py 에서 이관(SSOT). 앱 표·이메일·백테스트가 이 한 곳을 공유한다.
+      이관 전에는 자동화(position_sell_verdict)가 매수가·매수일을 무시하고
+      `close.tail(120).max()` 를 썼기 때문에, 눌린 종목을 매수하면 진입 즉시
+      트레일링 스톱이 걸리는 허위 청산 신호가 발생했다.
+
+    (a) 매수일 이후 고점, (b) 매수가를 바닥선으로 본 고점 중
+    더 보수적인(=덜 깊은 하락) 쪽을 채택해 허수 낙폭을 줄인다.
+    비현실적 낙폭(스플릿 미조정·스파이크)으로 의심되면 data_error=True.
+
+    반환: (drawdown_pct, data_error: bool)
+      - drawdown_pct: 보통 0 이하의 % (예: -12.3). 계산 불가 시 np.nan.
+                      진입 후 상승 중이면 양수가 될 수 있으나 판정 조건이
+                      `<= -trailing_stop_pct` 라 오발하지 않는다.
+      - data_error:   True면 트레일링 경보/판정에서 낙폭을 신뢰하지 않음
+    """
+    try:
+        if close_series is None or len(close_series) == 0 or pd.isna(current_price) or current_price <= 0:
+            return np.nan, False
+
+        # (a) 매수일 이후 고점
+        high_since_buy = np.nan
+        if date_added:
+            try:
+                buy_dt = pd.to_datetime(str(date_added)[:10], errors="coerce")
+                if pd.notna(buy_dt) and isinstance(close_series.index, pd.DatetimeIndex):
+                    idx = close_series.index
+                    tz = getattr(idx, "tz", None)
+                    if tz is not None and buy_dt.tzinfo is None:
+                        buy_dt = buy_dt.tz_localize(tz)
+                    sliced = close_series[close_series.index >= buy_dt]
+                    if not sliced.empty:
+                        high_since_buy = float(sliced.max())
+            except Exception:
+                high_since_buy = np.nan
+
+        # (b) 폴백 고점 — 입력 길이에 무관하게 최근 1년으로 고정.
+        #     (앱/이메일은 252봉을 넘기지만 백테스트는 훨씬 긴 hist 를 넘기므로
+        #      명시 고정하지 않으면 다년 고점이 되어 소비자마다 답이 갈린다.)
+        _tail = close_series.tail(_DD_FALLBACK_WINDOW)
+        high_1y = float(_tail.max()) if len(_tail) else np.nan
+
+        # 매수가 바닥선: 고점이 적어도 매수가보다는 높아야 '하락'이 의미 있음
+        pp = float(purchase_price) if (purchase_price is not None and pd.notna(purchase_price) and purchase_price > 0) else np.nan
+
+        # 트레일링 스톱 고점: 매수가를 바닥선으로, 매수일 이후 실제 고점이 있으면 래칫업.
+        # 매수일 이후 데이터가 없어도(매수일이 최신 가격일 이후 등) 52주 최고가(=매수 전
+        # 고점)로 새지 않도록 매수가를 고점으로 본다 → 본전 부근 종목의 허위 경보 방지.
+        # 매수가·매수일 둘 다 없을 때만 1년 고점으로 폴백.
+        _high_cands = [v for v in (high_since_buy, pp) if pd.notna(v)]
+        ref_high = max(_high_cands) if _high_cands else high_1y
+        if pd.isna(ref_high) or ref_high <= 0:
+            return np.nan, False
+
+        # '매수일 이후 고점' 대비 낙폭을 기본으로 사용(트레일링 스톱의 본래 의미).
+        # 단, 고점이 비현실적으로 높으면(스플릿 미조정 등) 매수가 기준으로 보정.
+        dd_from_high = (float(current_price) / ref_high - 1.0) * 100.0
+        drawdown_pct = dd_from_high
+
+        # 데이터 오류 의심 — 낙폭이 -70%보다 깊은데 현재 수익이 플러스면 모순,
+        # 또는 참조고점이 현재가의 5배를 초과하면(스플릿 미조정 전형) 오류로 간주
+        data_error = False
+        if pd.notna(pp):
+            in_profit = float(current_price) >= pp
+            if dd_from_high <= -70.0 and in_profit:
+                data_error = True
+        if ref_high > float(current_price) * 5:
+            data_error = True
+
+        if data_error:
+            # 오류 시 고점을 신뢰하지 않고 매수가 기준 낙폭만 사용(없으면 NaN)
+            if pd.notna(pp):
+                drawdown_pct = min(0.0, (float(current_price) / pp - 1.0) * 100.0)
+            else:
+                drawdown_pct = np.nan
+
+        return drawdown_pct, data_error
+    except Exception:
+        return np.nan, False
+
+
+DD_DATA_ERROR_NOTE = "⚠️ 가격데이터 확인 필요(스플릿/이상치 의심)"
+
+
 def _macd_state(close: pd.Series) -> str:
     """MACD(12/26/9) 상태: DEAD_CROSS / BELOW_SIGNAL / ABOVE_SIGNAL / N/A."""
     c = pd.to_numeric(close, errors="coerce").dropna()
@@ -1644,11 +1733,15 @@ def _macd_state(close: pd.Series) -> str:
     return "ABOVE_SIGNAL"
 
 
-def position_sell_verdict(hist, entry_price=None,
+def position_sell_verdict(hist, entry_price=None, entry_date=None,
                           trailing_stop_pct: float = _DEFAULT_TRAILING_STOP_PCT):
     """raw 시세(hist)에서 포지션(중장기) 매도 판정을 직접 계산 → integrated_sell_verdict.
-    자동화/이메일용. 반환: (label, reason). (앱 표는 자체 입력으로 같은 함수를 호출하므로
-    경계값에서 미세 차이가 날 수 있으나 동일 로직 계열.)"""
+    자동화/이메일용. 반환: (label, reason).
+
+    entry_price / entry_date: 보유 기준 낙폭 산출용(Portfolios 평단·Date_Added).
+      둘 다 없으면 최근 1년 고점으로 폴백한다(이관 전 동작에 근접).
+    앱 표는 compute_position_drawdown → integrated_sell_verdict 를 같은 순서로 호출하므로
+    동일 입력이면 동일 판정이 나온다(SSOT)."""
     try:
         close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
     except Exception:
@@ -1668,10 +1761,18 @@ def position_sell_verdict(hist, entry_price=None,
     macd_signal = _macd_state(close)
     hi52 = float(close.tail(252).max())
     pct_from_52w_high = (price / hi52 - 1.0) * 100.0 if hi52 > 0 else np.nan
-    peak = float(close.tail(NEG_REV_LOOKBACK).max())  # 보유 고점 근사(최근 구간 고점)
-    drawdown_from_high_pct = (price / peak - 1.0) * 100.0 if peak > 0 else np.nan
-    return integrated_sell_verdict(
+
+    # 보유 고점 = max(매수일 이후 고점, 매수가) — app.py Sell Radar 와 동일 SSOT.
+    # (이전에는 매수가·매수일을 버리고 종목의 120일 고점을 썼기 때문에,
+    #  눌린 종목을 매수하면 진입 즉시 트레일링 청산이 뜨는 허위 신호가 있었다.)
+    dd_pct, dd_err = compute_position_drawdown(close, entry_price, price, entry_date)
+    drawdown_from_high_pct = np.nan if dd_err else dd_pct
+
+    label, reason = integrated_sell_verdict(
         above_ma200=above_ma200, one_month_return=one_month_return, rsi=rsi,
         macd_signal=macd_signal, pct_from_52w_high=pct_from_52w_high,
         drawdown_from_high_pct=drawdown_from_high_pct, trailing_stop_pct=trailing_stop_pct,
     )
+    if dd_err:
+        reason = (reason + " · " + DD_DATA_ERROR_NOTE).strip(" ·")
+    return label, reason
