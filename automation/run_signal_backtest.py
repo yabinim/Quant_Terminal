@@ -12,6 +12,16 @@ verdict(entry/wait/overheat/trend_break/avoid)가 켜진 시점 이후 실제로
 
   → "🎯 entry 가 정말 돈이 됐나? 시장(SPY) 대비 알파가 있나? entry>wait>overheat>avoid 로 갈리나?"
 
+v1.5 변경 (ETF / 개별주 분리 집계)
+----------------------------------
+유니버스 413종목 중 ETF_Universe 가 343개(83%)라 기존 집계는 사실상 'ETF 성적표'였다.
+그러나 워치리스트 알림은 주로 개별주에 쓰인다 → 두 모집단을 섞으면 결론이 오염된다.
+
+이제 Segment 열로 all / etf / stock 을 분리 집계한다(모드 × 세그먼트 = 6개 표).
+분류 기준: ETF_Universe 시트에 있으면 etf, 아니면 stock.
+  ※ 워치리스트/포트폴리오에만 있고 ETF_Universe 에 없는 ETF(예: 계좌 코어 ETF)는
+    stock 으로 잡힐 수 있다. 정확도를 높이려면 해당 티커를 ETF_Universe 에 넣으면 된다.
+
 v1.4 변경 (실제 알림 기준 모드 추가)
 ------------------------------------
 기존 집계는 화면 판정(timing.code)이 확정된 '모든 날'을 셌다. 그러나 실제 이메일은
@@ -120,6 +130,7 @@ _RESULT_COLS = [
     "Excess_20d_Mean", "ExcessWin_20d",   # v1.1: SPY 대비 알파
     "Entry_Rule",                          # v1.2: 진입가 규칙(close[t+N]) — 구/신 행 구분
     "Mode",                                # v1.4: verdict(화면 판정) | alert(실제 이메일)
+    "Segment",                             # v1.5: all | etf | stock
 ]
 
 _FMP_BASE    = "https://financialmodelingprep.com/stable"
@@ -412,7 +423,7 @@ def aggregate_events(events: list[dict], buckets=BUCKETS) -> dict:
 
 def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
                       universe_size: int, buckets=BUCKETS,
-                      mode: str = "verdict") -> list[list]:
+                      mode: str = "verdict", segment: str = "all") -> list[list]:
     """집계 dict → Signal_Backtest 시트 행들(_RESULT_COLS 순서).
 
     mode: "verdict"(화면 판정) | "alert"(실제 이메일 발송 기준) — 시트 Mode 열로 구분.
@@ -429,7 +440,7 @@ def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
             _cell(a.get("ret_20d_median")), _cell(a.get("ret_60d_mean")),
             _cell(a.get("mfe_20d_mean")), _cell(a.get("mae_20d_mean")),
             _cell(a.get("excess_20d_mean")), _cell(a.get("excess_win_20d")),
-            _ENTRY_RULE_LABEL, mode,
+            _ENTRY_RULE_LABEL, mode, segment,
         ])
     return rows
 
@@ -567,11 +578,16 @@ def _read_col(ws, col_idx: int) -> list:
     return out
 
 
-def load_universe(gc) -> list:
-    """ETF_Universe + Watchlist + Portfolios 합집합(중복 제거). 시트 없으면 해당 소스만 스킵."""
+def load_universe(gc):
+    """ETF_Universe + Watchlist + Portfolios 합집합(중복 제거).
+
+    v1.5: (tickers, segment_map) 반환. segment_map[ticker] ∈ {"etf", "stock"} —
+    ETF_Universe 시트 소속이면 etf, 아니면 stock.
+    """
     sh = _gs(gc.open, _SPREADSHEET_TITLE)
     titles = {ws.title for ws in _gs(sh.worksheets)}
     tickers: set[str] = set()
+    etf_set: set[str] = set()
 
     sources = [
         (_ETF_UNIVERSE_WORKSHEET, 0),
@@ -586,12 +602,19 @@ def load_universe(gc) -> list:
             ws = _gs(sh.worksheet, title)
             got = _read_col(ws, col_idx)
             tickers.update(got)
+            if title == _ETF_UNIVERSE_WORKSHEET:
+                etf_set.update(got)
             print(f"[OK] '{title}' 에서 {len(got)}개 로드")
         except Exception as e:
             print(f"[WARN] '{title}' 로드 실패 — 스킵: {e}")
 
     tickers.discard("SPY")  # SPY 는 벤치마크로 별도 fetch
-    return sorted(tickers)
+    etf_set.discard("SPY")
+    uni = sorted(tickers)
+    seg = {t: ("etf" if t in etf_set else "stock") for t in uni}
+    print(f"[INFO] 세그먼트: ETF {sum(1 for v in seg.values() if v == 'etf')}종목 · "
+          f"개별주 {sum(1 for v in seg.values() if v == 'stock')}종목")
+    return uni, seg
 
 
 def open_result_worksheet(gc):
@@ -644,8 +667,16 @@ def _safe_append_rows(ws, rows, ncols: int, value_input_option: str = "USER_ENTE
 # 오케스트레이션
 # ════════════════════════════════════════════════════════════════════════════
 
-def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict):
-    """유니버스 전체 워크포워드 → (verdict 집계, alert 집계, meta). hist_cache: {ticker: DataFrame}."""
+SEGMENTS = ("all", "etf", "stock")
+
+
+def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
+                 segment_map: dict | None = None):
+    """유니버스 전체 워크포워드 → (aggs, meta).
+
+    v1.5: aggs[(mode, segment)] = 집계 dict. mode ∈ {verdict, alert},
+    segment ∈ SEGMENTS. segment_map 미제공 시 전부 stock 으로 간주.
+    """
     spy_close = spy_hist["Close"] if (spy_hist is not None and "Close" in spy_hist.columns) else None
 
     all_events: list[dict] = []
@@ -662,25 +693,40 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict):
             n_with_data += 1
             eval_starts.append(pd.Timestamp(d0))
             eval_ends.append(pd.Timestamp(d1))
+        _seg = (segment_map or {}).get(tk, "stock")
+        for _e in events:
+            _e["segment"] = _seg
+        for _a in alerts:
+            _a["segment"] = _seg
         all_events.extend(events)
         all_alerts.extend(alerts)
 
-    agg = aggregate_events(all_events)
-    agg_alert = aggregate_events(all_alerts, buckets=ALERT_BUCKETS)
+    def _seg_filter(evs, seg):
+        return evs if seg == "all" else [e for e in evs if e.get("segment") == seg]
+
+    aggs = {}
+    for seg in SEGMENTS:
+        aggs[("verdict", seg)] = aggregate_events(_seg_filter(all_events, seg))
+        aggs[("alert", seg)] = aggregate_events(_seg_filter(all_alerts, seg),
+                                                buckets=ALERT_BUCKETS)
+    _n_etf = sum(1 for t in universe if (segment_map or {}).get(t) == "etf")
     meta = {
         "universe_size": n_with_data,
         "hist_start": str(min(eval_starts).date()) if eval_starts else "",
         "hist_end": str(max(eval_ends).date()) if eval_ends else "",
         "total_events": len(all_events),
         "total_alerts": len(all_alerts),
+        "n_etf": _n_etf,
+        "n_stock": len(universe) - _n_etf,
     }
-    return agg, agg_alert, meta
+    return aggs, meta
 
 
-def _print_summary(agg: dict, agg_alert: dict, meta: dict) -> None:
+def _print_summary(aggs: dict, meta: dict) -> None:
     print(f"\n[백테스트 요약] 유니버스 {meta['universe_size']}종목 · "
           f"구간 {meta['hist_start']}~{meta['hist_end']} · "
-          f"판정 이벤트 {meta['total_events']} · 알림 이벤트 {meta.get('total_alerts', 0)}")
+          f"판정 이벤트 {meta['total_events']} · 알림 이벤트 {meta.get('total_alerts', 0)} · "
+          f"ETF {meta.get('n_etf', 0)} / 개별주 {meta.get('n_stock', 0)}")
 
     def _s(v):
         return "-" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else f"{v}"
@@ -697,8 +743,12 @@ def _print_summary(agg: dict, agg_alert: dict, meta: dict) -> None:
                   f"{_s(a.get('mfe_20d_mean')):>7}{_s(a.get('mae_20d_mean')):>7}"
                   f"{_s(a.get('excess_20d_mean')):>8}{_s(a.get('excess_win_20d')):>9}")
 
-    _table("[alert] 실제 이메일 발송 기준 — 실전 성적표", agg_alert, ALERT_BUCKETS)
-    _table("[verdict] 화면 판정 기준 — 판별력 진단", agg, BUCKETS)
+    _seg_kr = {"all": "전체", "etf": "ETF만", "stock": "개별주만"}
+    for seg in SEGMENTS:
+        for mode, buckets in (("alert", ALERT_BUCKETS), ("verdict", BUCKETS)):
+            _t = "실제 이메일 발송 기준" if mode == "alert" else "화면 판정 기준"
+            _table(f"[{mode}/{seg}] {_t} — {_seg_kr.get(seg, seg)}",
+                   aggs.get((mode, seg), {}), buckets)
 
 
 def main():
@@ -712,7 +762,7 @@ def main():
 
     gc = get_gspread_client()
 
-    universe = load_universe(gc)
+    universe, segment_map = load_universe(gc)
     print(f"[STEP1] 유니버스 {len(universe)}종목")
     if not universe:
         print("[INFO] 유니버스 비어 있음 — 중단")
@@ -725,13 +775,18 @@ def main():
     print(f"[STEP2] 이력 확보 {len(hist_cache)}/{len(universe)}종목 "
           f"(SPY {'OK' if not spy_hist.empty else '실패'})")
 
-    agg, agg_alert, meta = run_backtest(universe, spy_hist, hist_cache)
-    _print_summary(agg, agg_alert, meta)
+    aggs, meta = run_backtest(universe, spy_hist, hist_cache, segment_map=segment_map)
+    _print_summary(aggs, meta)
 
-    rows = build_result_rows(agg_alert, run_date, meta["hist_start"], meta["hist_end"],
-                             meta["universe_size"], buckets=ALERT_BUCKETS, mode="alert")
-    rows += build_result_rows(agg, run_date, meta["hist_start"], meta["hist_end"],
-                             meta["universe_size"])
+    rows = []
+    for seg in SEGMENTS:
+        rows += build_result_rows(aggs.get(("alert", seg), {}), run_date,
+                                  meta["hist_start"], meta["hist_end"],
+                                  meta["universe_size"], buckets=ALERT_BUCKETS,
+                                  mode="alert", segment=seg)
+        rows += build_result_rows(aggs.get(("verdict", seg), {}), run_date,
+                                  meta["hist_start"], meta["hist_end"],
+                                  meta["universe_size"], mode="verdict", segment=seg)
     try:
         ws = open_result_worksheet(gc)
         _safe_append_rows(ws, rows, ncols=len(_RESULT_COLS))
