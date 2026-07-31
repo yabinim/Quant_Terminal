@@ -72,6 +72,10 @@ _PFSTATE_WORKSHEET = "Portfolio_Alert_State"  # [Key, Alert_States, Alert_LastSt
 _PFSTATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At", "Stop_Loss", "Target_Price"]
 _PF_ALERT_DEFAULT = "exit,risk"               # 보유 기본 알림 (손절은 exit의 ATR 트레일링에 포함)
 _PF_INTRADAY_EVENTS = ("exit", "risk")        # 장중 보유 행동 가능 이벤트
+# Portfolios 시트 열 인덱스(0-base). D=평단, F=Date_Added.
+# Date_Added 는 포지션(중장기) 트레일링 스톱의 '보유 고점' 기준일 → 매도 판정에 직접 영향.
+_PF_COL_AVG = 3
+_PF_COL_DATE_ADDED = 5
 
 # NYSE 휴장일 (run_narrative.py 와 동일 목록)
 _NYSE_HOLIDAYS = {
@@ -644,7 +648,8 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
         uid, account, tk = str(r[0]).strip(), str(r[1]).strip(), str(r[2]).strip().upper()
         if not uid or not tk:
             continue
-        avg = pd.to_numeric(r[3], errors="coerce")
+        avg = pd.to_numeric(r[_PF_COL_AVG], errors="coerce")
+        date_added = str(r[_PF_COL_DATE_ADDED]).strip()
         key = f"{uid}|{account}|{tk}"
         states_csv = state_map.get(key, {}).get("states", "")
         enabled = rc.resolve_alert_events(states_csv, _PF_ALERT_DEFAULT)
@@ -663,7 +668,8 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
             new_rows.append([key, states_csv, new_state, today]); n_eval += 1
             if fired:
                 _swc = rc.build_sell_card(an, None)
-                _posv = rc.position_sell_verdict(hist, float(avg) if pd.notna(avg) else None)
+                _posv = rc.position_sell_verdict(
+                    hist, float(avg) if pd.notna(avg) else None, entry_date=date_added)
                 fired_by_user.setdefault(uid, []).append(
                     {"ticker": tk, "account": account, "fired": fired, "an": an,
                      "swing": (_swc["label"], _swc["detail"] or _swc["headline"]),
@@ -789,7 +795,8 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
         uid, account, tk = str(r[0]).strip(), str(r[1]).strip(), str(r[2]).strip().upper()
         if not uid or not tk:
             continue
-        avg = pd.to_numeric(r[3], errors="coerce")
+        avg = pd.to_numeric(r[_PF_COL_AVG], errors="coerce")
+        date_added = str(r[_PF_COL_DATE_ADDED]).strip()
         key = f"{uid}|{account}|{tk}"
         _pf_st = state_map.get(key, {})
         enabled = rc.resolve_alert_events(_pf_st.get("states"), _PF_ALERT_DEFAULT)
@@ -820,7 +827,8 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
                                "message": conds["price"][1]})
             if active:
                 _swc = rc.build_sell_card(an, None)
-                _posv = rc.position_sell_verdict(hist, float(avg) if pd.notna(avg) else None)
+                _posv = rc.position_sell_verdict(
+                    hist, float(avg) if pd.notna(avg) else None, entry_date=date_added)
                 hits_by_user.setdefault(uid, []).append(
                     {"ticker": tk, "account": account, "fired": active, "an": an,
                      "swing": (_swc["label"], _swc["detail"] or _swc["headline"]),
