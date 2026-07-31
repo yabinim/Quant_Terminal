@@ -308,6 +308,43 @@ def load_portfolio_alert_states() -> dict:
     return out
 
 
+def save_portfolio_alert_states_bulk(user_id: str, account: str, tickers, states_csv: str) -> tuple[int, list]:
+    """계좌의 여러 보유 종목 Alert_States 를 한 번에 upsert. last_state(C열)는 보존.
+
+    개별 저장을 N번 반복하면 get_all_values 도 N번 발생한다(시트 API 낭비 + 레이트리밋).
+    읽기 1회 + batch_update 1회 + 신규분 append 1회로 처리한다.
+    반환: (성공 건수, 실패 티커 리스트)
+    """
+    ws, err = open_portfolio_alert_state_worksheet()
+    if ws is None:
+        return 0, list(tickers)
+    try:
+        vals = ws.get_all_values() or []
+        row_of = {}
+        for i, r in enumerate(vals[1:], start=2):
+            if r and str(r[0]).strip():
+                row_of[str(r[0]).strip()] = i
+        now_str = _narrative_now_et_string()
+        updates, new_rows, done = [], [], []
+        for tk in tickers:
+            key = _pf_alert_key(user_id, account, tk)
+            idx = row_of.get(key)
+            if idx:
+                updates.append({"range": f"B{idx}", "values": [[states_csv]]})
+                updates.append({"range": f"D{idx}", "values": [[now_str]]})
+            else:
+                new_rows.append([key, states_csv, "", now_str])
+            done.append(tk)
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        for r in new_rows:
+            _safe_append_rows(ws, r, value_input_option="RAW")
+        load_portfolio_alert_states.clear()
+        return len(done), []
+    except Exception:
+        return 0, list(tickers)
+
+
 def save_portfolio_alert_states_setting(user_id: str, account: str, ticker: str, states_csv: str) -> tuple[bool, str]:
     """보유 종목의 알림 이벤트 설정(Alert_States)만 upsert. last_state 는 보존."""
     ws, err = open_portfolio_alert_state_worksheet()
@@ -19940,6 +19977,33 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     _hdr += " · ✅ 양호"
 
                 with st.expander(_hdr, expanded=bool(_n_exit)):
+                    # ── 계좌 일괄 알림 설정 (호라이즌 전환용) ──────────────────
+                    #   스윙(exit) ↔ 포지션(pexit/ptrim) 을 보유 전체에 한 번에 적용.
+                    _bulk_opts = ["exit", "risk", "pexit", "ptrim", "regime"]
+                    _bc1, _bc2 = st.columns([4, 1])
+                    with _bc1:
+                        _bulk_sel = st.multiselect(
+                            "🔔 계좌 전체 일괄 적용", options=_bulk_opts,
+                            default=["pexit", "risk"],
+                            format_func=lambda c: rc.ALERT_EVENT_LABELS.get(c, c),
+                            key=f"pf_alert_bulk_{acct}",
+                            label_visibility="collapsed",
+                            help="이 계좌의 모든 보유 종목 알림 설정을 선택값으로 덮어씁니다. "
+                                 "중장기로 운용하면 🛡 포지션 청산, 스윙이면 🔴 청산을 선택하세요.",
+                        )
+                    with _bc2:
+                        if st.button("일괄 적용", key=f"pf_alert_bulk_save_{acct}",
+                                     use_container_width=True):
+                            _bcsv = ",".join(_bulk_sel) if _bulk_sel else "none"
+                            _tks = [t for t, _a, _q, _x in _acct_rows]
+                            _n_ok, _n_fail = save_portfolio_alert_states_bulk(puid, acct, _tks, _bcsv)
+                            if _n_fail:
+                                st.error(f"저장 실패: {', '.join(_n_fail)}")
+                            else:
+                                st.success(f"{acct} 보유 {_n_ok}건 → `{_bcsv}` 적용됨")
+                                st.rerun()
+                    st.divider()
+
                     for _tk, _avg, _qty, _an in _acct_rows:
                         _avg_s = f"${float(_avg):.2f}" if pd.notna(_avg) else "N/A"
                         _qty_s = f"{float(_qty):g}주" if pd.notna(pd.to_numeric(_qty, errors='coerce')) else ""
