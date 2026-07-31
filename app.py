@@ -22006,8 +22006,10 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 # 같은 Run_Date 에 여러 번 실행된 경우(동일 날짜 재실행) 중복 방지:
                 # append 순서가 시간순이므로 버킷별 마지막 행(=최신 실행)만 유지
                 if "Verdict" in _sb_df.columns:
-                    _sb_dedup = (["Mode", "Verdict"] if "Mode" in _sb_df.columns
-                                 else ["Verdict"])
+                    _sb_dedup = ["Verdict"]
+                    for _k in ("Mode", "Segment"):
+                        if _k in _sb_df.columns:
+                            _sb_dedup.insert(0, _k)
                     _sb_df = _sb_df.drop_duplicates(subset=_sb_dedup, keep="last")
 
             if _sb_df.empty:
@@ -22034,6 +22036,31 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         "실현 불가능한 성과이니 기준 조정의 근거로 쓰지 마세요. "
                         "백테스트를 다시 실행하면 `close[t+1]` 기준으로 갱신됩니다."
                     )
+
+                # v1.5: 세그먼트 선택 — ETF 가 유니버스의 대부분이라 섞으면 결론이 오염된다
+                if "Segment" in _sb_df.columns:
+                    _sb_seg_col = _sb_df["Segment"].astype(str).str.strip()
+                    _SB_SEG_KR = {"stock": "📈 개별주만", "etf": "🧺 ETF만", "all": "🌐 전체"}
+                    _sb_seg_avail = [k for k in ("stock", "etf", "all")
+                                     if (_sb_seg_col == k).any()]
+                    if _sb_seg_avail:
+                        _sb_seg_pick = st.radio(
+                            "집계 대상", _sb_seg_avail, horizontal=True,
+                            format_func=lambda k: _SB_SEG_KR.get(k, k),
+                            key="sb_segment_pick",
+                            help="워치리스트 알림은 주로 개별주에 쓰입니다. ETF 가 유니버스의 대부분이라 "
+                                 "'전체'는 사실상 ETF 성적표에 가깝습니다.",
+                        )
+                        _sb_df = _sb_df[_sb_seg_col == _sb_seg_pick]
+                        if _sb_seg_pick == "all":
+                            st.caption(
+                                "⚠️ '전체'는 ETF와 개별주를 섞은 값입니다. 유니버스의 다수가 ETF라 "
+                                "개별주 신호의 성적을 대표하지 않습니다."
+                            )
+                if _sb_df.empty:
+                    # st.stop() 은 페이지 전체를 중단시키므로 사용하지 않는다.
+                    # 아래 렌더 루프는 빈 그룹을 자동으로 건너뛴다.
+                    st.info("선택한 집계 대상에 해당하는 결과가 없습니다.")
 
                 # v1.4: Mode 별 분리 — alert(실제 이메일 기준) / verdict(화면 판정 기준)
                 _SB_ALERT_LABELS = {
