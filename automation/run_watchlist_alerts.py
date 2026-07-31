@@ -662,14 +662,18 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
                 new_rows.append([key, states_csv, prev, today]); continue
             an = rc.analyze_ticker(hist, spy_close=spy_close,
                                    entry_price=float(avg) if pd.notna(avg) else None)
+            # 포지션(중장기) 판정은 상태머신 '입력'이다 — pexit/ptrim 이벤트의 트리거이므로
+            # 발동 여부와 무관하게 먼저 계산해서 넘긴다. (이전에는 fired 이후에만 계산돼
+            #  스윙이 울려야만 포지션 판정이 사용자에게 도달했다.)
+            _posv = rc.position_sell_verdict(
+                hist, float(avg) if pd.notna(avg) else None, entry_date=date_added)
             fired, new_state = rc.evaluate_alert_transitions(
                 an, enabled, prev, today_str=today, price=float(hist["Close"].iloc[-1]),
+                pos_verdict=_posv,
             )
             new_rows.append([key, states_csv, new_state, today]); n_eval += 1
             if fired:
                 _swc = rc.build_sell_card(an, None)
-                _posv = rc.position_sell_verdict(
-                    hist, float(avg) if pd.notna(avg) else None, entry_date=date_added)
                 fired_by_user.setdefault(uid, []).append(
                     {"ticker": tk, "account": account, "fired": fired, "an": an,
                      "swing": (_swc["label"], _swc["detail"] or _swc["headline"]),
@@ -818,7 +822,10 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
             if not an.get("regime", {}).get("enough_data"):
                 continue
             live = quote_cache[tk] if quote_cache[tk] is not None else float(hist["Close"].iloc[-1])
-            conds = rc.alert_conditions(an, price=live, stop_loss=_sl, target_price=_tp)
+            _posv = rc.position_sell_verdict(
+                hist, float(avg) if pd.notna(avg) else None, entry_date=date_added)
+            conds = rc.alert_conditions(an, price=live, stop_loss=_sl, target_price=_tp,
+                                        pos_verdict=_posv)
             active = [{"event": e, "label": rc.ALERT_EVENT_LABELS[e], "message": conds[e][1]}
                       for e in _PF_INTRADAY_EVENTS if e in enabled and conds.get(e, (False, ""))[0]]
             # 손절/목표 도달(price)은 플랜이 설정된 보유에서 항상 발화
@@ -827,8 +834,6 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
                                "message": conds["price"][1]})
             if active:
                 _swc = rc.build_sell_card(an, None)
-                _posv = rc.position_sell_verdict(
-                    hist, float(avg) if pd.notna(avg) else None, entry_date=date_added)
                 hits_by_user.setdefault(uid, []).append(
                     {"ticker": tk, "account": account, "fired": active, "an": an,
                      "swing": (_swc["label"], _swc["detail"] or _swc["headline"]),
