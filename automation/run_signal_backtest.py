@@ -123,6 +123,14 @@ _PORTFOLIO_WORKSHEET    = "Portfolios"     # col idx 2 = Ticker  ([ID,Account,Ti
 
 # 결과 시트
 _RESULT_WORKSHEET = "Signal_Backtest"
+# v1.6: 왕복(round-trip) 결과는 열 구조가 달라 별도 시트로 분리(기존 행 보존)
+_RT_WORKSHEET = "Signal_Backtest_RT"
+_RT_COLS = [
+    "Run_Date", "History_Start", "History_End", "Universe_Size", "Mode", "Segment",
+    "Trades", "Closed", "OpenAtEnd_Pct", "WinRate", "Avg_R", "Median_R",
+    "Avg_Ret_Pct", "Median_Ret_Pct", "Avg_Hold_Days", "EarlyExit_Pct",
+    "Excess_vs_SPY_Pct", "Top_Exit_Reason",
+]
 _RESULT_COLS = [
     "Run_Date", "History_Start", "History_End", "Universe_Size", "Verdict",
     "Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean", "Ret_20d_Median",
@@ -141,7 +149,8 @@ _FETCH_WORKERS = 8           # FMP Starter 300 req/min 여유
 HORIZONS       = (5, 20, 60)   # forward-return 측정 거래일
 MFE_WINDOW     = 20            # MFE/MAE 측정 창(거래일)
 MIN_PRIOR_BARS = 220           # 200일선 산출 위한 최소 선행 봉수
-TEST_LOOKBACK  = 756           # 평가 구간(거래일 ≈ 3년)
+TEST_LOOKBACK  = 1260          # v1.6: 평가 구간(거래일 ≈ 5년). 3년(756)은 강세장에
+                               #   치우쳐 청산 규칙 비교가 반쪽이 된다 → 2022 약세장 포함.
 CONFIRM_DAYS   = 2             # v1.1: raw code 가 N일 연속 유지돼야 이벤트 확정(라이브 알림과 동일 철학)
 COOLDOWN_DAYS  = 5             # v1.1: 같은 code 재기록 최소 간격(경계 진동 압축)
 ENTRY_LAG_DAYS = 1             # v1.2: 신호일(t) 대비 실제 진입 거래일 지연.
@@ -157,6 +166,19 @@ BUCKETS = ("entry", "wait", "overheat", "trend_break", "avoid")
 
 # v1.4 — 실제 이메일 알림 기준 버킷 (run_watchlist_alerts.py 와 동일 상태머신)
 ALERT_ENABLED_EVENTS = ("entry", "risk", "watch")   # _WL_ALERT_DEFAULT 와 동일
+
+# ── v1.6 왕복 백테스트 ────────────────────────────────────────────────────────
+#   진입은 3개 모드 공통(entry 알림 발동일 → close[t+1]). 청산 규칙만 다르다.
+#     swing      : 라이브 스윙 청산 — exit 알림 상태머신 (MA50/RSI80/샹들리에)
+#     pos_ideal  : 포지션 판정(integrated_sell_verdict ≥4)이 뜨는 즉시 — 자체 트리거가 있었다면
+#     pos_actual : 알림(exit/risk)이 실제 발동한 날에만 포지션 카드를 볼 수 있었다 — 현 워크플로 재현
+#   pos_ideal - pos_actual 차이 = '포지션 엔진에 트리거가 없었던 비용'.
+RT_MODES = ("swing", "pos_ideal", "pos_actual")
+RT_MODE_KR = {"swing": "스윙 청산(실제 실행)", "pos_ideal": "포지션 청산(자체 트리거)",
+              "pos_actual": "포지션 청산(알림 게이팅)"}
+RT_PF_EVENTS = {"swing": ("exit",), "pos_actual": ("exit", "risk")}
+RT_STOP_ATR_MULT = 2.0    # R 분모용 플랜 손절 배수. 백테스트에는 DRG 이력이 없어 고정값 사용
+RT_EARLY_EXIT_DAYS = 10   # 진입 후 N거래일 이내 청산 = 휩소로 집계
 ALERT_BUCKETS = (
     "alert_entry_pass",     # 매수 메일 발송 + R:R 게이트 통과 → 실제로 사는 신호
     "alert_entry_skip",     # 매수 메일 발송 + 게이트 미통과(건너뛰기 권고)
@@ -250,6 +272,87 @@ def _alert_bucket(ev: dict, hist_slice, analysis: dict):
     return "alert_entry_pass"
 
 
+# ── v1.6: 포지션 판정 입력 사전계산 (벡터화) ─────────────────────────────────
+def _position_features(h: pd.DataFrame) -> dict:
+    """integrated_sell_verdict 에 필요한 일별 입력을 한 번에 벡터화 계산.
+
+    보유 중 매일 position_sell_verdict 를 호출하면 같은 RSI/MACD/이평을 반복 계산해
+    O(n^2) 가 된다. 무거운 부분은 티커당 1회만 만들고, 포지션별로 달라지는 것은
+    '진입 이후 고점'뿐이므로 러닝 맥스로 O(1) 처리한다.
+    """
+    c = pd.to_numeric(h["Close"], errors="coerce")
+    n = len(c)
+    ma200 = c.rolling(200).mean()
+    rsi = rc.compute_rsi(c)
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    sig = macd.ewm(span=9, adjust=False).mean()
+    m, sg = macd.to_numpy(float), sig.to_numpy(float)
+    st = np.full(n, "N/A", dtype=object)
+    for i in range(1, n):
+        if i < 34 or not (np.isfinite(m[i]) and np.isfinite(sg[i])):
+            continue
+        if m[i - 1] >= sg[i - 1] and m[i] < sg[i]:
+            st[i] = "DEAD_CROSS"
+        elif m[i] < sg[i]:
+            st[i] = "BELOW_SIGNAL"
+        else:
+            st[i] = "ABOVE_SIGNAL"
+    hi52 = c.rolling(252, min_periods=20).max()
+    # ATR(Wilder 근사: TR 단순 롤링평균) — R 분모용 플랜 손절 계산에 사용
+    hi = pd.to_numeric(h["High"], errors="coerce") if "High" in h.columns else c
+    lo = pd.to_numeric(h["Low"], errors="coerce") if "Low" in h.columns else c
+    pc = c.shift(1)
+    tr = pd.concat([(hi - lo).abs(), (hi - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(getattr(rc, "ATR_WINDOW", 14)).mean()
+    return {
+        "above_ma200": (c > ma200).to_numpy(bool),
+        "ret_1m": (c / c.shift(22) - 1.0).mul(100.0).to_numpy(float),
+        "rsi": rsi.to_numpy(float),
+        "macd": st,
+        "pct52": (c / hi52 - 1.0).mul(100.0).to_numpy(float),
+        "atr": atr.to_numpy(float),
+    }
+
+
+def _pos_label_at(feats: dict, price: float, ref_high: float, i: int):
+    """사전계산 입력 + 진입 이후 고점 → integrated_sell_verdict (SSOT 그대로)."""
+    dd = (price / ref_high - 1.0) * 100.0 if (ref_high and np.isfinite(ref_high) and ref_high > 0) else np.nan
+    return rc.integrated_sell_verdict(
+        above_ma200=bool(feats["above_ma200"][i]),
+        one_month_return=float(feats["ret_1m"][i]),
+        rsi=float(feats["rsi"][i]),
+        macd_signal=feats["macd"][i],
+        pct_from_52w_high=float(feats["pct52"][i]),
+        drawdown_from_high_pct=dd,
+    )
+
+
+def _close_trade(p: dict, mode: str, close, dates, exit_pos: int,
+                 reason: str, spy_arr=None, open_at_end: bool = False) -> dict:
+    """왕복 1건 확정. R = 실현손익 ÷ (진입가 − 플랜 손절가)."""
+    ep, xp = float(p["entry_price"]), float(close[exit_pos])
+    ret_pct = (xp / ep - 1.0) * 100.0 if ep > 0 else np.nan
+    risk = ep - float(p["stop"]) if np.isfinite(p.get("stop", np.nan)) else np.nan
+    r_mult = (xp - ep) / risk if (np.isfinite(risk) and risk > 0) else np.nan
+    excess = np.nan
+    if spy_arr is not None:
+        try:
+            s0, s1 = spy_arr[p["entry_pos"]], spy_arr[exit_pos]
+            if np.isfinite(s0) and np.isfinite(s1) and s0 > 0:
+                excess = ret_pct - (s1 / s0 - 1.0) * 100.0
+        except Exception:
+            excess = np.nan
+    hold = int(exit_pos - p["entry_pos"])
+    return {"mode": mode, "entry_date": p["entry_date"],
+            "exit_date": str(pd.Timestamp(dates[exit_pos]).date()),
+            "entry_price": ep, "exit_price": xp, "ret_pct": ret_pct,
+            "r_mult": r_mult, "hold_days": hold, "excess_pct": excess,
+            "exit_reason": reason, "open_at_end": bool(open_at_end),
+            "early_exit": bool(hold <= RT_EARLY_EXIT_DAYS and not open_at_end)}
+
+
 def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                         min_prior: int = MIN_PRIOR_BARS,
                         test_lookback: int = TEST_LOOKBACK,
@@ -258,7 +361,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                         cooldown_days: int = COOLDOWN_DAYS,
                         entry_lag: int = ENTRY_LAG_DAYS,
                         alert_enabled=ALERT_ENABLED_EVENTS,
-                        analyze_fn=None):
+                        analyze_fn=None, roundtrip: bool = True):
     """한 티커의 워크포워드 평가 (v1.1: 2일 확정 + 쿨다운 디플랩).
 
     각 평가일 i 에서 hist[:i+1] → analyze_fn → raw code. 분류는 i 까지 데이터만(미래 차단).
@@ -272,15 +375,20 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     '실제로 메일이 나갔을 날'만 뽑은 alert 이벤트를 별도로 반환한다. analyze 호출은
     날짜당 1회를 두 모드가 공유하므로 추가 비용이 거의 없다.
 
-    반환: (events, alert_events, first_eval_date, last_eval_date)
+    v1.6: 같은 루프에서 왕복(round-trip) 매매도 추적한다. 진입은 3개 모드 공통
+    (entry 알림 발동일 → close[t+lag]), 청산 규칙만 RT_MODES 별로 다르다. 모드마다
+    청산 시점이 달라 이후 보유 상태가 갈리므로 포지션/상태머신을 모드별로 유지한다.
+
+    반환: (events, alert_events, trades, first_eval_date, last_eval_date)
     """
     if analyze_fn is None:
         analyze_fn = rc.analyze_ticker
 
     events: list[dict] = []
     alert_events: list[dict] = []
+    trades: list[dict] = []
     if hist is None or hist.empty or "Close" not in hist.columns:
-        return events, alert_events, None, None
+        return events, alert_events, trades, None, None
 
     h = hist.sort_index()
     close = pd.to_numeric(h["Close"], errors="coerce").to_numpy(dtype=float)
@@ -291,7 +399,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     dates = h.index
     n = len(close)
     if n < min_prior + 2:
-        return events, alert_events, None, None
+        return events, alert_events, trades, None, None
 
     # SPY 를 종목 거래일에 정렬(ffill) → 같은 캘린더창 초과수익 계산
     spy_arr = None
@@ -305,6 +413,11 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     start_i = max(min_prior, n - test_lookback)
     first_eval_date = None
     last_eval_date = None
+
+    # v1.6 왕복 추적 상태
+    _feats = _position_features(h) if roundtrip else None
+    _rt_pos = {m: None for m in RT_MODES}
+    _rt_pf = {m: "" for m in RT_MODES}   # 보유 중 포트폴리오 알림 상태머신(모드별)
 
     _alert_state = ""       # v1.4: 알림 상태머신 누적 상태(JSON) — 티커별로 이어짐
     pending_code = None     # 현재 연속 유지 중인 raw code
@@ -351,6 +464,60 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                 _ea.update(_fma)
                 alert_events.append(_ea)
 
+        # ── [v1.6] 왕복 추적 — 진입 공통 / 청산 모드별 ──
+        if roundtrip and res is not None:
+            _today_s = str(pd.Timestamp(date_i).date())
+            _entry_fired = any(f.get("event") == "entry" for f in (_fired or []))
+            for _m in RT_MODES:
+                _p = _rt_pos[_m]
+                if _p is None:
+                    if _entry_fired:
+                        _ei = i + entry_lag
+                        if _ei < n and np.isfinite(close[_ei]) and close[_ei] > 0:
+                            _atr = _feats["atr"][i]
+                            _stop = (close[_ei] - RT_STOP_ATR_MULT * _atr) if np.isfinite(_atr) else np.nan
+                            _rt_pos[_m] = {
+                                "entry_pos": _ei, "entry_price": float(close[_ei]),
+                                "entry_date": str(pd.Timestamp(dates[_ei]).date()),
+                                "stop": float(_stop) if np.isfinite(_stop) else np.nan,
+                                "peak": float(close[_ei]),
+                            }
+                            _rt_pf[_m] = ""
+                    continue
+                if i <= _p["entry_pos"]:
+                    continue
+                _p["peak"] = max(_p["peak"], float(close[i]))
+                _hit, _why = False, ""
+                if _m == "swing":
+                    try:
+                        _pf_fired, _rt_pf[_m] = rc.evaluate_alert_transitions(
+                            res, RT_PF_EVENTS["swing"], _rt_pf[_m], today_str=_today_s,
+                            price=float(close[i]))
+                    except Exception:
+                        _pf_fired = []
+                    _hit = any(f.get("event") == "exit" for f in (_pf_fired or []))
+                    if _hit:
+                        _why = " · ".join((res.get("exit") or {}).get("codes") or ["exit"])
+                else:
+                    _lab, _rsn = _pos_label_at(_feats, float(close[i]),
+                                               max(_p["peak"], _p["entry_price"]), i)
+                    _is_sell = "청산" in str(_lab)
+                    if _m == "pos_ideal":
+                        _hit, _why = _is_sell, _rsn
+                    else:   # pos_actual — 메일이 실제로 온 날에만 카드를 볼 수 있었다
+                        try:
+                            _pf_fired, _rt_pf[_m] = rc.evaluate_alert_transitions(
+                                res, RT_PF_EVENTS["pos_actual"], _rt_pf[_m],
+                                today_str=_today_s, price=float(close[i]))
+                        except Exception:
+                            _pf_fired = []
+                        _hit = bool(_pf_fired) and _is_sell
+                        _why = _rsn
+                if _hit:
+                    _xi = min(i + entry_lag, n - 1)
+                    trades.append(_close_trade(_p, _m, close, dates, _xi, _why, spy_arr))
+                    _rt_pos[_m] = None
+
         if first_eval_date is None:
             first_eval_date = date_i
         last_eval_date = date_i
@@ -383,7 +550,14 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
             last_rec_code = code
             last_rec_pos = i
 
-    return events, alert_events, first_eval_date, last_eval_date
+    # 구간 끝에 열려 있는 포지션은 마지막 종가로 강제 마감 + 별도 표기
+    if roundtrip:
+        for _m, _p in _rt_pos.items():
+            if _p is not None and n - 1 > _p["entry_pos"]:
+                trades.append(_close_trade(_p, _m, close, dates, n - 1,
+                                           "구간 종료(미청산)", spy_arr, open_at_end=True))
+
+    return events, alert_events, trades, first_eval_date, last_eval_date
 
 
 def _nan_pct(arr, fn) -> float:
@@ -419,6 +593,56 @@ def aggregate_events(events: list[dict], buckets=BUCKETS) -> dict:
             "excess_win_20d": excess_win,
         }
     return agg
+
+
+def aggregate_trades(trades: list[dict]) -> dict:
+    """왕복 거래 → 모드별 집계. RT_MODES 키."""
+    out = {}
+    for m in RT_MODES:
+        ts = [t for t in trades if t.get("mode") == m]
+        closed = [t for t in ts if not t.get("open_at_end")]
+        n_all, n_cl = len(ts), len(closed)
+        if n_all == 0:
+            out[m] = {"trades": 0, "closed": 0, "open_pct": np.nan, "winrate": np.nan,
+                      "avg_r": np.nan, "median_r": np.nan, "avg_ret": np.nan,
+                      "median_ret": np.nan, "avg_hold": np.nan, "early_pct": np.nan,
+                      "excess": np.nan, "top_reason": ""}
+            continue
+        _r = np.array([t["r_mult"] for t in ts], dtype=float)
+        _ret = np.array([t["ret_pct"] for t in ts], dtype=float)
+        _ex = np.array([t["excess_pct"] for t in ts], dtype=float)
+        _hold = np.array([t["hold_days"] for t in ts], dtype=float)
+        _reasons = {}
+        for t in closed:
+            k = str(t.get("exit_reason") or "-")[:40]
+            _reasons[k] = _reasons.get(k, 0) + 1
+        _top = max(_reasons.items(), key=lambda kv: kv[1])[0] if _reasons else ""
+        out[m] = {
+            "trades": n_all, "closed": n_cl,
+            "open_pct": round((n_all - n_cl) / n_all * 100.0, 1),
+            "winrate": _nan_pct(_ret, lambda a: float(np.mean(a > 0))),
+            "avg_r": round(float(np.nanmean(_r)), 2) if np.isfinite(_r).any() else np.nan,
+            "median_r": round(float(np.nanmedian(_r)), 2) if np.isfinite(_r).any() else np.nan,
+            "avg_ret": round(float(np.nanmean(_ret)), 2) if np.isfinite(_ret).any() else np.nan,
+            "median_ret": round(float(np.nanmedian(_ret)), 2) if np.isfinite(_ret).any() else np.nan,
+            "avg_hold": round(float(np.nanmean(_hold)), 1) if np.isfinite(_hold).any() else np.nan,
+            "early_pct": round(sum(1 for t in closed if t.get("early_exit")) / n_cl * 100.0, 1) if n_cl else np.nan,
+            "excess": round(float(np.nanmean(_ex)), 2) if np.isfinite(_ex).any() else np.nan,
+            "top_reason": _top,
+        }
+    return out
+
+
+def build_rt_rows(rt_aggs: dict, run_date: str, hist_start: str, hist_end: str,
+                  universe_size: int) -> list:
+    rows = []
+    for (m, seg), a in rt_aggs.items():
+        rows.append([run_date, hist_start, hist_end, universe_size, m, seg,
+                     a.get("trades", 0), a.get("closed", 0), a.get("open_pct"),
+                     a.get("winrate"), a.get("avg_r"), a.get("median_r"),
+                     a.get("avg_ret"), a.get("median_ret"), a.get("avg_hold"),
+                     a.get("early_pct"), a.get("excess"), a.get("top_reason", "")])
+    return rows
 
 
 def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
@@ -617,23 +841,28 @@ def load_universe(gc):
     return uni, seg
 
 
-def open_result_worksheet(gc):
-    """Signal_Backtest 탭. 없으면 생성 + 헤더. 헤더가 현재 스키마와 다르면 헤더만 갱신(마이그레이션)."""
+def open_result_worksheet(gc, title: str = None, cols: list = None):
+    """결과 탭. 없으면 생성 + 헤더. 헤더가 현재 스키마와 다르면 헤더만 갱신(마이그레이션).
+
+    v1.6: title/cols 를 받아 왕복 결과 시트(_RT_WORKSHEET)도 같은 경로로 처리한다.
+    """
+    title = title or _RESULT_WORKSHEET
+    cols = cols or _RESULT_COLS
     sh = _gs(gc.open, _SPREADSHEET_TITLE)
     titles = [ws.title for ws in _gs(sh.worksheets)]
-    last_col = chr(ord("A") + len(_RESULT_COLS) - 1)
-    if _RESULT_WORKSHEET in titles:
-        ws = _gs(sh.worksheet, _RESULT_WORKSHEET)
+    last_col = chr(ord("A") + len(cols) - 1)
+    if title in titles:
+        ws = _gs(sh.worksheet, title)
         try:
-            if (_gs(ws.row_values, 1) or []) != _RESULT_COLS:
-                _gs(ws.update, [_RESULT_COLS], range_name=f"A1:{last_col}1",
+            if (_gs(ws.row_values, 1) or []) != cols:
+                _gs(ws.update, [cols], range_name=f"A1:{last_col}1",
                           value_input_option="USER_ENTERED")
-                print("[INFO] Signal_Backtest 헤더 갱신(스키마 변경 반영)")
+                print(f"[INFO] {title} 헤더 갱신(스키마 변경 반영)")
         except Exception:
             pass
         return ws
-    ws = _gs(sh.add_worksheet, title=_RESULT_WORKSHEET, rows=2000, cols=len(_RESULT_COLS))
-    _gs(ws.update, [_RESULT_COLS], range_name=f"A1:{last_col}1", value_input_option="USER_ENTERED")
+    ws = _gs(sh.add_worksheet, title=title, rows=2000, cols=len(cols))
+    _gs(ws.update, [cols], range_name=f"A1:{last_col}1", value_input_option="USER_ENTERED")
     return ws
 
 
@@ -681,6 +910,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
 
     all_events: list[dict] = []
     all_alerts: list[dict] = []
+    all_trades: list[dict] = []
     eval_starts, eval_ends = [], []
     n_with_data = 0
 
@@ -688,7 +918,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         hist = hist_cache.get(tk)
         if hist is None or hist.empty:
             continue
-        events, alerts, d0, d1 = walk_forward_events(hist, spy_close=spy_close)
+        events, alerts, tds, d0, d1 = walk_forward_events(hist, spy_close=spy_close)
         if d0 is not None:
             n_with_data += 1
             eval_starts.append(pd.Timestamp(d0))
@@ -698,8 +928,12 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
             _e["segment"] = _seg
         for _a in alerts:
             _a["segment"] = _seg
+        for _t in tds:
+            _t["segment"] = _seg
+            _t["ticker"] = tk
         all_events.extend(events)
         all_alerts.extend(alerts)
+        all_trades.extend(tds)
 
     def _seg_filter(evs, seg):
         return evs if seg == "all" else [e for e in evs if e.get("segment") == seg]
@@ -709,6 +943,11 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         aggs[("verdict", seg)] = aggregate_events(_seg_filter(all_events, seg))
         aggs[("alert", seg)] = aggregate_events(_seg_filter(all_alerts, seg),
                                                 buckets=ALERT_BUCKETS)
+    rt_aggs = {}
+    for seg in SEGMENTS:
+        for m, a in aggregate_trades(_seg_filter(all_trades, seg)).items():
+            rt_aggs[(m, seg)] = a
+
     _n_etf = sum(1 for t in universe if (segment_map or {}).get(t) == "etf")
     meta = {
         "universe_size": n_with_data,
@@ -716,10 +955,11 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         "hist_end": str(max(eval_ends).date()) if eval_ends else "",
         "total_events": len(all_events),
         "total_alerts": len(all_alerts),
+        "total_trades": len(all_trades),
         "n_etf": _n_etf,
         "n_stock": len(universe) - _n_etf,
     }
-    return aggs, meta
+    return aggs, rt_aggs, meta
 
 
 def _print_summary(aggs: dict, meta: dict) -> None:
@@ -751,6 +991,30 @@ def _print_summary(aggs: dict, meta: dict) -> None:
                    aggs.get((mode, seg), {}), buckets)
 
 
+def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
+    print(f"\n[왕복(round-trip) 요약] 진입 규칙 공통 = entry 알림 발동일 → close[t+{ENTRY_LAG_DAYS}] · "
+          f"총 거래 {meta.get('total_trades', 0)}건")
+
+    def _s(v):
+        return "-" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else f"{v}"
+
+    _seg_kr = {"all": "전체", "etf": "ETF만", "stock": "개별주만"}
+    for seg in SEGMENTS:
+        print(f"\n── 왕복 / {_seg_kr.get(seg, seg)} ──")
+        print(f"{'모드':<26}{'N':>5}{'완결':>6}{'미청산%':>8}{'승률':>7}{'평균R':>7}"
+              f"{'중앙R':>7}{'평균%':>8}{'평균보유':>9}{'조기청산%':>10}{'초과%':>8}")
+        for m in RT_MODES:
+            a = rt_aggs.get((m, seg), {})
+            print(f"{RT_MODE_KR.get(m, m):<26}{a.get('trades', 0):>5}{a.get('closed', 0):>6}"
+                  f"{_s(a.get('open_pct')):>8}{_s(a.get('winrate')):>7}{_s(a.get('avg_r')):>7}"
+                  f"{_s(a.get('median_r')):>7}{_s(a.get('avg_ret')):>8}{_s(a.get('avg_hold')):>9}"
+                  f"{_s(a.get('early_pct')):>10}{_s(a.get('excess')):>8}")
+        _i, _a = rt_aggs.get(("pos_ideal", seg), {}), rt_aggs.get(("pos_actual", seg), {})
+        if np.isfinite(_i.get("avg_r", np.nan)) and np.isfinite(_a.get("avg_r", np.nan)):
+            print(f"   → 트리거 부재 비용(ideal − actual): 평균 R {_i['avg_r'] - _a['avg_r']:+.2f} · "
+                  f"평균수익률 {_i['avg_ret'] - _a['avg_ret']:+.2f}%p")
+
+
 def main():
     if not FMP_API_KEY or not GSPREAD_KEY_JSON:
         print("[ERROR] FMP_API_KEY / GSPREAD_KEY 환경변수 필요 — 중단")
@@ -775,8 +1039,9 @@ def main():
     print(f"[STEP2] 이력 확보 {len(hist_cache)}/{len(universe)}종목 "
           f"(SPY {'OK' if not spy_hist.empty else '실패'})")
 
-    aggs, meta = run_backtest(universe, spy_hist, hist_cache, segment_map=segment_map)
+    aggs, rt_aggs, meta = run_backtest(universe, spy_hist, hist_cache, segment_map=segment_map)
     _print_summary(aggs, meta)
+    _print_rt_summary(rt_aggs, meta)
 
     rows = []
     for seg in SEGMENTS:
@@ -794,6 +1059,15 @@ def main():
     except Exception as e:
         print(f"[ERROR] 결과 저장 실패: {e}")
         return 1
+
+    try:
+        _rt_rows = build_rt_rows(rt_aggs, run_date, meta["hist_start"], meta["hist_end"],
+                                 meta["universe_size"])
+        _rtws = open_result_worksheet(gc, title=_RT_WORKSHEET, cols=_RT_COLS)
+        _safe_append_rows(_rtws, _rt_rows, ncols=len(_RT_COLS))
+        print(f"[OK] '{_RT_WORKSHEET}' 에 {len(_rt_rows)}행 저장")
+    except Exception as e:
+        print(f"[WARN] 왕복 결과 저장 실패(본 결과는 저장됨): {e}")
 
     print(f"[DONE] {time.time() - t0:.1f}s")
     return 0
