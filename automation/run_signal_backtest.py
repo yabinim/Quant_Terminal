@@ -173,10 +173,16 @@ ALERT_ENABLED_EVENTS = ("entry", "risk", "watch")   # _WL_ALERT_DEFAULT 와 동�
 #     pos_ideal  : 포지션 판정(integrated_sell_verdict ≥4)이 뜨는 즉시 — 자체 트리거가 있었다면
 #     pos_actual : 알림(exit/risk)이 실제 발동한 날에만 포지션 카드를 볼 수 있었다 — 현 워크플로 재현
 #   pos_ideal - pos_actual 차이 = '포지션 엔진에 트리거가 없었던 비용'.
-RT_MODES = ("swing", "pos_ideal", "pos_actual")
-RT_MODE_KR = {"swing": "스윙 청산(실제 실행)", "pos_ideal": "포지션 청산(자체 트리거)",
-              "pos_actual": "포지션 청산(알림 게이팅)"}
+#     pos_slow   : 포지션 판정이 N일 연속 유지돼야 청산 — '지연이 이득인가' 직접 검증
+#     buy_hold   : 진입 후 무청산(구간 끝까지) — 통제군. 청산 규칙이 가치를 더하는지의 기준선.
+#                  ※ 한 번 진입하면 끝까지 들고 있어 재진입이 없다 → N이 종목 수 수준으로
+#                    작아진다. 절대 R 비교보다 Excess_vs_SPY(베타 제거) 로 읽을 것.
+RT_MODES = ("swing", "pos_ideal", "pos_slow", "pos_actual", "buy_hold")
+RT_MODE_KR = {"swing": "스윙 청산(실제 실행)", "pos_ideal": "포지션 청산(즉시)",
+              "pos_slow": "포지션 청산(5일 확정)", "pos_actual": "포지션 청산(알림 게이팅)",
+              "buy_hold": "무청산(통제군)"}
 RT_PF_EVENTS = {"swing": ("exit",), "pos_actual": ("exit", "risk")}
+RT_SLOW_CONFIRM_DAYS = 5  # pos_slow: 청산 판정이 이만큼 연속 유지돼야 실행
 RT_STOP_ATR_MULT = 2.0    # R 분모용 플랜 손절 배수. 백테스트에는 DRG 이력이 없어 고정값 사용
 RT_EARLY_EXIT_DAYS = 10   # 진입 후 N거래일 이내 청산 = 휩소로 집계
 ALERT_BUCKETS = (
@@ -481,6 +487,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                                 "entry_date": str(pd.Timestamp(dates[_ei]).date()),
                                 "stop": float(_stop) if np.isfinite(_stop) else np.nan,
                                 "peak": float(close[_ei]),
+                                "slow_n": 0,
                             }
                             _rt_pf[_m] = ""
                     continue
@@ -488,6 +495,8 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                     continue
                 _p["peak"] = max(_p["peak"], float(close[i]))
                 _hit, _why = False, ""
+                if _m == "buy_hold":
+                    continue            # 통제군 — 청산하지 않음(구간 끝에서 강제 마감)
                 if _m == "swing":
                     try:
                         _pf_fired, _rt_pf[_m] = rc.evaluate_alert_transitions(
@@ -504,6 +513,11 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                     _is_sell = "청산" in str(_lab)
                     if _m == "pos_ideal":
                         _hit, _why = _is_sell, _rsn
+                    elif _m == "pos_slow":
+                        # 같은 판정이 N일 연속 유지돼야 실행(끊기면 리셋)
+                        _p["slow_n"] = _p["slow_n"] + 1 if _is_sell else 0
+                        _hit = _p["slow_n"] >= RT_SLOW_CONFIRM_DAYS
+                        _why = _rsn
                     else:   # pos_actual — 메일이 실제로 온 날에만 카드를 볼 수 있었다
                         try:
                             _pf_fired, _rt_pf[_m] = rc.evaluate_alert_transitions(
@@ -1009,10 +1023,16 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
                   f"{_s(a.get('open_pct')):>8}{_s(a.get('winrate')):>7}{_s(a.get('avg_r')):>7}"
                   f"{_s(a.get('median_r')):>7}{_s(a.get('avg_ret')):>8}{_s(a.get('avg_hold')):>9}"
                   f"{_s(a.get('early_pct')):>10}{_s(a.get('excess')):>8}")
-        _i, _a = rt_aggs.get(("pos_ideal", seg), {}), rt_aggs.get(("pos_actual", seg), {})
-        if np.isfinite(_i.get("avg_r", np.nan)) and np.isfinite(_a.get("avg_r", np.nan)):
-            print(f"   → 트리거 부재 비용(ideal − actual): 평균 R {_i['avg_r'] - _a['avg_r']:+.2f} · "
-                  f"평균수익률 {_i['avg_ret'] - _a['avg_ret']:+.2f}%p")
+        def _g(m, k):
+            return rt_aggs.get((m, seg), {}).get(k, np.nan)
+
+        def _cmp(lhs, rhs, tag):
+            a, b = _g(lhs, "excess"), _g(rhs, "excess")
+            if np.isfinite(a) and np.isfinite(b):
+                print(f"   → {tag}: SPY초과 {a - b:+.2f}%p (평균R {_g(lhs, 'avg_r') - _g(rhs, 'avg_r'):+.2f})")
+        _cmp("pos_ideal", "pos_actual", "즉시청산 − 알림게이팅")
+        _cmp("pos_slow", "pos_ideal", "5일확정 − 즉시청산  (지연 효과)")
+        _cmp("pos_actual", "buy_hold", "알림게이팅 − 무청산 (청산의 순가치)")
 
 
 def main():
