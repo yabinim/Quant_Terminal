@@ -19967,7 +19967,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         # 종목별 알림 토글 (Portfolio_Alert_State 에 저장)
                         _key = _pf_alert_key(puid, acct, _tk)
                         _cur = rc.resolve_alert_events(_pf_states.get(_key, {}).get("states"), _PORTFOLIO_ALERT_DEFAULT)
-                        _opts = ["exit", "risk", "regime"]
+                        # 스윙(exit) / 포지션(pexit·ptrim) 호라이즌을 보유별로 선택.
+                        # 기본값은 기존 그대로 exit,risk — 중장기로 운용하면 pexit 로 교체.
+                        _opts = ["exit", "risk", "pexit", "ptrim", "regime"]
                         _ac1, _ac2 = st.columns([4, 1])
                         with _ac1:
                             _sel = st.multiselect(

@@ -469,14 +469,18 @@ def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -
     atr = compute_atr(hist, ATR_WINDOW)
 
     reasons: list[str] = []
+    # codes: 숫자가 섞이지 않는 안정 코드. 상태머신이 '지속'과 '악화'를 구분하는 데 사용.
+    codes: list[str] = []
 
     # 1) RSI 강세 과열
     if pd.notna(rsi_last) and rsi_last >= STRONG_OVERHEAT_RSI:
         reasons.append(f"RSI {rsi_last:.0f} ≥ {STRONG_OVERHEAT_RSI:.0f}(과열)")
+        codes.append("rsi_overheat")
 
     # 2) 50일선 종가 이탈
     if pd.notna(ma50) and price < ma50:
         reasons.append(f"50일선(${ma50:.2f}) 종가 이탈")
+        codes.append("ma50_break")
 
     # 3) 샹들리에(ATR 트레일링) 스톱
     chandelier = np.nan
@@ -491,6 +495,7 @@ def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -
         chandelier = ref_high - CHANDELIER_ATR_MULT * atr
         if price < chandelier:
             reasons.append(f"ATR 트레일링 스톱(${chandelier:.2f}) 하회")
+            codes.append("chandelier")
 
     # --- v2: 네거티브 리버설 (조기 경고 — is_exit 미반영, 거짓 청산 방지) ---
     warnings: list[str] = []
@@ -500,6 +505,7 @@ def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -
 
     out["is_exit"] = len(reasons) > 0
     out["reasons"] = reasons
+    out["codes"] = codes
     out["warnings"] = warnings
     out["detail"] = {"price": price, "ma50": ma50, "rsi": rsi_last,
                      "atr": atr, "chandelier": chandelier,
@@ -525,12 +531,17 @@ def analyze_ticker(hist: pd.DataFrame, spy_close=None, entry_price: float | None
 import json as _json
 
 ALERT_CONFIRM_DAYS = 2
-ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price", "watch")
+# pexit/ptrim = 포지션(중장기) 호라이즌. 스윙(exit/risk)과 별개 상태 슬롯을 가진다.
+#   → resolve_alert_events 가 자동으로 필터를 통과시키므로 보유별 호라이즌 선택
+#     (swing / position / both)이 기존 Alert_States 인프라로 그대로 동작한다.
+ALERT_EVENTS = ("entry", "regime", "risk", "exit", "pexit", "ptrim", "price", "watch")
 ALERT_EVENT_LABELS = {
     "entry":  "🟢 매수 신호",
     "regime": "🔄 레짐 전환",
     "risk":   "🟡 줄이기 (추세 흔들림·리버설)",
     "exit":   "🔴 청산",
+    "pexit":  "🛡 포지션 청산 (중장기)",
+    "ptrim":  "🛡 포지션 줄이기 (중장기)",
     "price":  "📌 손절/목표 도달",
     "watch":  "🎯 관심가 도달 (목표가·RSI·200일선)",
     "entry_invalid": "🚫 매수 신호 무효화",
@@ -587,8 +598,13 @@ def watch_condition_msgs(price=None, rsi=None, ma200=None,
 
 
 def alert_conditions(analysis: dict, price=None, stop_loss=None, target_price=None,
-                     alert_price=None, alert_rsi=None, alert_ma200=False) -> dict:
-    """현재 시점의 이벤트별 (조건 bool, 설명) 산출. regime 은 별도 처리."""
+                     alert_price=None, alert_rsi=None, alert_ma200=False,
+                     pos_verdict=None) -> dict:
+    """현재 시점의 이벤트별 (조건 bool, 설명) 산출. regime 은 별도 처리.
+
+    pos_verdict: position_sell_verdict() 반환값 (label, reason). 주어지면 포지션
+      호라이즌 이벤트(pexit/ptrim)를 함께 산출한다. 미지정 시 두 이벤트는 항상 False
+      → 기존 소비자 동작 불변."""
     reg = analysis.get("regime", {}) or {}
     tim = analysis.get("timing", {}) or {}
     exi = analysis.get("exit", {}) or {}
@@ -616,13 +632,58 @@ def alert_conditions(analysis: dict, price=None, stop_loss=None, target_price=No
         alert_price=alert_price, alert_rsi=alert_rsi, alert_ma200=alert_ma200,
     )
     conds["watch"] = (bool(_wmsgs), " · ".join(_wmsgs))
+    # 포지션(중장기) 호라이즌 — 스윙 exit 과 독립된 트리거
+    _plab, _pwhy = "", ""
+    if pos_verdict:
+        try:
+            _plab, _pwhy = str(pos_verdict[0] or ""), str(pos_verdict[1] or "")
+        except Exception:
+            _plab, _pwhy = "", ""
+    conds["pexit"] = ("청산" in _plab, _pwhy)
+    conds["ptrim"] = ("줄이기" in _plab, _pwhy)
     return conds
+
+
+def alert_severity_keys(analysis: dict, pos_verdict=None) -> dict:
+    """이벤트별 '심각도 서명' — 숫자가 섞이지 않는 저카디널리티 안정 코드 집합.
+
+    상태머신이 '조건 지속'과 '상황 악화'를 구분하는 데 쓴다. 발동(fired) 이후에도
+    새 코드가 추가되면 1회 재발동한다. 예: 50일선만 이탈했던 종목이 이후 ATR 트레일링
+    스톱까지 뚫으면, 기존 규칙에서는 cond 가 계속 True 라 영원히 침묵했다.
+    """
+    reg = analysis.get("regime", {}) or {}
+    tim = analysis.get("timing", {}) or {}
+    exi = analysis.get("exit", {}) or {}
+    out = {e: [] for e in ALERT_EVENTS}
+    out["exit"] = list(exi.get("codes") or [])
+    _rk = []
+    if tim.get("code") == "trend_break":
+        _rk.append("trend_break")
+    if reg.get("topping"):
+        _rk.append("topping")
+    if reg.get("regime") == "weak":
+        _rk.append("weak")
+    if bool((exi.get("detail") or {}).get("negative_reversal")) or bool(exi.get("warnings")):
+        _rk.append("neg_reversal")
+    out["risk"] = _rk
+    if pos_verdict:
+        try:
+            _lab = str(pos_verdict[0] or "")
+        except Exception:
+            _lab = ""
+        if "청산" in _lab:
+            out["pexit"] = ["sell"]
+        elif "줄이기" in _lab:
+            out["ptrim"] = ["trim"]
+    # entry/price/watch 는 하위 사유가 없어 서명 없음 → 악화 재발동 대상 아님
+    return out
 
 
 def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: str = "",
                                today_str: str = "", price=None, stop_loss=None,
                                target_price=None, confirm_days: int = ALERT_CONFIRM_DAYS,
-                               alert_price=None, alert_rsi=None, alert_ma200=False):
+                               alert_price=None, alert_rsi=None, alert_ma200=False,
+                               pos_verdict=None):
     """상태 전환 기반 알림 평가 (2일 확정 + 재무장). 순수 함수.
 
     ※ 하루 1회 호출 전제(자동화). 호출 1회 = 평가 1회로 pending 카운터가 1 진행된다.
@@ -644,25 +705,39 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
 
     enabled = set(enabled_events or [])
     conds = alert_conditions(analysis, price, stop_loss, target_price,
-                             alert_price=alert_price, alert_rsi=alert_rsi, alert_ma200=alert_ma200)
+                             alert_price=alert_price, alert_rsi=alert_rsi, alert_ma200=alert_ma200,
+                             pos_verdict=pos_verdict)
+    sev = alert_severity_keys(analysis, pos_verdict=pos_verdict)
     fired = []
 
     # 일반 이벤트: 조건 지속 + confirm_days 확정 + 재무장(조건 해제 시)
-    for e in ("entry", "risk", "exit", "price", "watch"):
+    #   + 발동 이후에도 '새 사유'가 추가되면 1회 재발동(악화 감지).
+    for e in ("entry", "risk", "exit", "pexit", "ptrim", "price", "watch"):
         if e not in enabled:
-            events_state[e] = {"status": "armed", "pending": 0}
+            events_state[e] = {"status": "armed", "pending": 0, "keys": []}
             continue
         cond, msg = conds.get(e, (False, ""))
         s = events_state.get(e) or {"status": "armed", "pending": 0}
         status = s.get("status", "armed")
         pending = int(s.get("pending", 0) or 0)
+        seen = set(s.get("keys") or [])
+        now_keys = set(sev.get(e) or [])
         if cond:
             if status == "armed":
                 pending += 1
                 if pending >= confirm_days:
                     fired.append({"event": e, "label": ALERT_EVENT_LABELS.get(e, e), "message": msg})
                     status, pending = "fired", 0
-            # fired 면 유지(재발동 금지)
+                    seen = set(now_keys)
+            else:
+                # 이미 발동 상태 — 조건이 '지속'만 하면 침묵, '악화'하면 1회 재발동.
+                # seen 이 비어 있으면 구버전 state(키 미보유) → 이번 회차는 기록만 하고 억제
+                # (배포 직후 보유 종목 전체가 한꺼번에 재발동하는 것을 막는다).
+                new_keys = now_keys - seen
+                if new_keys and seen:
+                    fired.append({"event": e, "label": ALERT_EVENT_LABELS.get(e, e),
+                                  "message": f"🔺 상황 악화 — {msg}" if msg else "🔺 상황 악화"})
+                seen |= now_keys
         else:
             # D-2: 발동됐던 매수 신호의 조건 해제 → 무효화 알림 1회 (재무장 전환 시점에만)
             if e == "entry" and status == "fired":
@@ -673,7 +748,8 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
                                 if msg else "직전 매수 신호 조건 해제 — 재평가 필요"),
                 })
             status, pending = "armed", 0  # 재무장
-        events_state[e] = {"status": status, "pending": pending}
+            seen = set()
+        events_state[e] = {"status": status, "pending": pending, "keys": sorted(seen)}
 
     # 레짐 전환: baseline 대비 변경 + 확정 → 발동 후 baseline 갱신(자동 재무장)
     if cur_regime is not None:
