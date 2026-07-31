@@ -645,7 +645,7 @@ def _safe_append_rows(ws, rows, ncols: int, value_input_option: str = "USER_ENTE
 # ════════════════════════════════════════════════════════════════════════════
 
 def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict):
-    """유니버스 전체 워크포워드 → (집계 dict, meta). hist_cache: {ticker: DataFrame}."""
+    """유니버스 전체 워크포워드 → (verdict 집계, alert 집계, meta). hist_cache: {ticker: DataFrame}."""
     spy_close = spy_hist["Close"] if (spy_hist is not None and "Close" in spy_hist.columns) else None
 
     all_events: list[dict] = []
@@ -674,7 +674,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict):
         "total_events": len(all_events),
         "total_alerts": len(all_alerts),
     }
-    return agg, meta
+    return agg, agg_alert, meta
 
 
 def _print_summary(agg: dict, agg_alert: dict, meta: dict) -> None:
@@ -725,7 +725,7 @@ def main():
     print(f"[STEP2] 이력 확보 {len(hist_cache)}/{len(universe)}종목 "
           f"(SPY {'OK' if not spy_hist.empty else '실패'})")
 
-    agg, meta = run_backtest(universe, spy_hist, hist_cache)
+    agg, agg_alert, meta = run_backtest(universe, spy_hist, hist_cache)
     _print_summary(agg, agg_alert, meta)
 
     rows = build_result_rows(agg_alert, run_date, meta["hist_start"], meta["hist_end"],
