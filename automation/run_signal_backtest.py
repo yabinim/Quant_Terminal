@@ -176,7 +176,11 @@ ALERT_ENABLED_EVENTS = ("entry", "risk", "watch")   # _WL_ALERT_DEFAULT 와 동�
 #     pos_slowN  : 포지션 판정이 N일 연속 유지돼야 청산(N=3/5/10/20) — v1.9 확정일수 스윕.
 #                  진입·재진입 규칙이 완전히 동일하고 지연만 다르므로 조건이 통제된다.
 #                  곡선이 계속 우상향하면 '느릴수록 좋다=청산이 노이즈', 꺾이면 그 점이 최적값.
-RT_SLOW_SWEEP = (3, 5, 10, 20)   # v1.9: pos_slow 확정일수 스윕
+RT_SLOW_SWEEP = (3, 5, 10, 20, 30, 45, 60, 90)   # v2.1: 스윕 연장
+# v1.9(3~20일)에서 곡선이 20일까지 단조 증가하고 꺾이지 않았다 → 최적점이 그 너머이거나
+#   아예 없다(=팔지 마라)는 뜻. 90일까지 늘려 변곡점이 실재하는지 확정한다.
+#   ※ 확정일수가 길수록 보유가 길어져 코호트(1년 컷) 안에서도 미청산이 다시 늘어난다.
+#     60/90일 행은 미청산% 를 반드시 함께 볼 것.
 _SLOW_MODES = tuple(f"pos_slow{n}" for n in RT_SLOW_SWEEP)
 RT_SLOW_N = {f"pos_slow{n}": n for n in RT_SLOW_SWEEP}
 # buy_hold 는 v1.9에서 제외: 청산 모드는 보유 중 오는 진입 신호를 놓치는데 buy_hold 는
