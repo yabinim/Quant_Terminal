@@ -126,7 +126,7 @@ _RESULT_WORKSHEET = "Signal_Backtest"
 # v1.6: 왕복(round-trip) 결과는 열 구조가 달라 별도 시트로 분리(기존 행 보존)
 _RT_WORKSHEET = "Signal_Backtest_RT"
 _RT_COLS = [
-    "Run_Date", "History_Start", "History_End", "Universe_Size", "Mode", "Segment",
+    "Run_Date", "History_Start", "History_End", "Universe_Size", "Mode", "Segment", "Year",
     "Trades", "Closed", "OpenAtEnd_Pct", "WinRate", "Avg_R", "Median_R",
     "Avg_Ret_Pct", "Median_Ret_Pct", "Avg_Hold_Days", "EarlyExit_Pct",
     "Excess_vs_SPY_Pct", "Top_Exit_Reason",
@@ -174,9 +174,11 @@ ALERT_ENABLED_EVENTS = ("entry", "risk", "watch")   # _WL_ALERT_DEFAULT 와 동�
 #     pos_actual : 알림(exit/risk)이 실제 발동한 날에만 포지션 카드를 볼 수 있었다 — 현 워크플로 재현
 #   pos_ideal - pos_actual 차이 = '포지션 엔진에 트리거가 없었던 비용'.
 #     pos_slow   : 포지션 판정이 N일 연속 유지돼야 청산 — '지연이 이득인가' 직접 검증
-#     buy_hold   : 진입 후 무청산(구간 끝까지) — 통제군. 청산 규칙이 가치를 더하는지의 기준선.
-#                  ※ 한 번 진입하면 끝까지 들고 있어 재진입이 없다 → N이 종목 수 수준으로
-#                    작아진다. 절대 R 비교보다 Excess_vs_SPY(베타 제거) 로 읽을 것.
+#     buy_hold   : 모든 entry 신호마다 진입 · 청산 없이 데이터 끝까지 — 통제군.
+#                  v1.8: 중복 보유를 허용한다. 이전처럼 종목당 1건만 잡으면 진입이 창 초반에
+#                    몰려 연도별 분해가 성립하지 않는다(2024·2025 칸이 빈다).
+#                  ※ 보유기간이 진입 시점에 따라 4년~1개월로 제각각 → 전체 평균은 무의미.
+#                    반드시 진입연도별로, Excess_vs_SPY(베타 제거) 기준으로 읽을 것.
 RT_MODES = ("swing", "pos_ideal", "pos_slow", "pos_actual", "buy_hold")
 RT_MODE_KR = {"swing": "스윙 청산(실제 실행)", "pos_ideal": "포지션 청산(즉시)",
               "pos_slow": "포지션 청산(5일 확정)", "pos_actual": "포지션 청산(알림 게이팅)",
@@ -351,7 +353,7 @@ def _close_trade(p: dict, mode: str, close, dates, exit_pos: int,
         except Exception:
             excess = np.nan
     hold = int(exit_pos - p["entry_pos"])
-    return {"mode": mode, "entry_date": p["entry_date"],
+    return {"mode": mode, "entry_date": p["entry_date"], "entry_year": p["entry_date"][:4], "entry_year": p["entry_date"][:4],
             "exit_date": str(pd.Timestamp(dates[exit_pos]).date()),
             "entry_price": ep, "exit_price": xp, "ret_pct": ret_pct,
             "r_mult": r_mult, "hold_days": hold, "excess_pct": excess,
@@ -423,6 +425,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     # v1.6 왕복 추적 상태
     _feats = _position_features(h) if roundtrip else None
     _rt_pos = {m: None for m in RT_MODES}
+    _bh_open: list[dict] = []            # buy_hold 는 중복 보유 → 리스트로 관리
     _rt_pf = {m: "" for m in RT_MODES}   # 보유 중 포트폴리오 알림 상태머신(모드별)
 
     _alert_state = ""       # v1.4: 알림 상태머신 누적 상태(JSON) — 티커별로 이어짐
@@ -474,7 +477,22 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
         if roundtrip and res is not None:
             _today_s = str(pd.Timestamp(date_i).date())
             _entry_fired = any(f.get("event") == "entry" for f in (_fired or []))
+            # buy_hold: 신호마다 독립 포지션을 열고 청산하지 않는다(중복 보유)
+            if _entry_fired:
+                _ei = i + entry_lag
+                if _ei < n and np.isfinite(close[_ei]) and close[_ei] > 0:
+                    _atr = _feats["atr"][i]
+                    _stop = (close[_ei] - RT_STOP_ATR_MULT * _atr) if np.isfinite(_atr) else np.nan
+                    _bh_open.append({
+                        "entry_pos": _ei, "entry_price": float(close[_ei]),
+                        "entry_date": str(pd.Timestamp(dates[_ei]).date()),
+                        "stop": float(_stop) if np.isfinite(_stop) else np.nan,
+                        "peak": float(close[_ei]),
+                    })
+
             for _m in RT_MODES:
+                if _m == "buy_hold":
+                    continue            # 위에서 별도 처리(중복 보유·무청산)
                 _p = _rt_pos[_m]
                 if _p is None:
                     if _entry_fired:
@@ -495,8 +513,6 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                     continue
                 _p["peak"] = max(_p["peak"], float(close[i]))
                 _hit, _why = False, ""
-                if _m == "buy_hold":
-                    continue            # 통제군 — 청산하지 않음(구간 끝에서 강제 마감)
                 if _m == "swing":
                     try:
                         _pf_fired, _rt_pf[_m] = rc.evaluate_alert_transitions(
@@ -567,9 +583,15 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     # 구간 끝에 열려 있는 포지션은 마지막 종가로 강제 마감 + 별도 표기
     if roundtrip:
         for _m, _p in _rt_pos.items():
+            if _m == "buy_hold":
+                continue
             if _p is not None and n - 1 > _p["entry_pos"]:
                 trades.append(_close_trade(_p, _m, close, dates, n - 1,
                                            "구간 종료(미청산)", spy_arr, open_at_end=True))
+        for _p in _bh_open:
+            if n - 1 > _p["entry_pos"]:
+                trades.append(_close_trade(_p, "buy_hold", close, dates, n - 1,
+                                           "구간 종료(무청산)", spy_arr, open_at_end=True))
 
     return events, alert_events, trades, first_eval_date, last_eval_date
 
@@ -660,12 +682,29 @@ def _jsonable(v):
     return v
 
 
+def aggregate_trades_by_year(trades: list[dict]) -> dict:
+    """(mode, year) → 집계. 진입 연도 기준.
+
+    buy_hold 는 청산이 없어 '2022년 진입 = 4년 보유 / 2026년 진입 = 수개월' 이 된다.
+    따라서 buy_hold 행은 연도 간 비교가 아니라 '같은 연도 안에서 청산 규칙이
+    무청산 대비 얼마나 더/덜 벌었나' 를 읽는 용도다.
+    """
+    years = sorted({str(t.get("entry_year") or "") for t in trades} - {""})
+    out = {}
+    for y in years:
+        sub = [t for t in trades if str(t.get("entry_year")) == y]
+        for m, a in aggregate_trades(sub).items():
+            out[(m, y)] = a
+    return out, years
+
+
 def build_rt_rows(rt_aggs: dict, run_date: str, hist_start: str, hist_end: str,
                   universe_size: int) -> list:
     rows = []
-    for (m, seg), a in rt_aggs.items():
+    for _k, a in rt_aggs.items():
+        m, seg, yr = (_k + ("all",))[:3] if len(_k) == 2 else _k
         rows.append([_jsonable(x) for x in
-                     [run_date, hist_start, hist_end, universe_size, m, seg,
+                     [run_date, hist_start, hist_end, universe_size, m, seg, yr,
                       a.get("trades", 0), a.get("closed", 0), a.get("open_pct"),
                       a.get("winrate"), a.get("avg_r"), a.get("median_r"),
                       a.get("avg_ret"), a.get("median_ret"), a.get("avg_hold"),
@@ -974,7 +1013,16 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
     rt_aggs = {}
     for seg in SEGMENTS:
         for m, a in aggregate_trades(_seg_filter(all_trades, seg)).items():
-            rt_aggs[(m, seg)] = a
+            rt_aggs[(m, seg, "all")] = a
+    # v1.8: 진입연도별 분해 — 개별주 한정(ETF 는 알파가 없어 배제).
+    #   buy_hold 우위가 청산 규칙의 문제인지, 2022 바닥에서 시작한 창(window) 때문인지
+    #   구분하려면 하락 구간과 상승 구간을 나눠 봐야 한다.
+    _stock_trades = _seg_filter(all_trades, "stock")
+    rt_years = sorted({str(t.get("entry_year") or "") for t in _stock_trades} - {""})
+    for yr in rt_years:
+        _yt = [t for t in _stock_trades if str(t.get("entry_year")) == yr]
+        for m, a in aggregate_trades(_yt).items():
+            rt_aggs[(m, "stock", yr)] = a
 
     _n_etf = sum(1 for t in universe if (segment_map or {}).get(t) == "etf")
     meta = {
@@ -987,7 +1035,8 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         "n_etf": _n_etf,
         "n_stock": len(universe) - _n_etf,
     }
-    return aggs, rt_aggs, meta
+    meta["rt_years"] = rt_years
+    return aggs, rt_aggs, rt_year, meta
 
 
 def _print_summary(aggs: dict, meta: dict) -> None:
@@ -1032,13 +1081,13 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
         print(f"{'모드':<26}{'N':>5}{'완결':>6}{'미청산%':>8}{'승률':>7}{'평균R':>7}"
               f"{'중앙R':>7}{'평균%':>8}{'평균보유':>9}{'조기청산%':>10}{'초과%':>8}")
         for m in RT_MODES:
-            a = rt_aggs.get((m, seg), {})
+            a = rt_aggs.get((m, seg, "all"), {})
             print(f"{RT_MODE_KR.get(m, m):<26}{a.get('trades', 0):>5}{a.get('closed', 0):>6}"
                   f"{_s(a.get('open_pct')):>8}{_s(a.get('winrate')):>7}{_s(a.get('avg_r')):>7}"
                   f"{_s(a.get('median_r')):>7}{_s(a.get('avg_ret')):>8}{_s(a.get('avg_hold')):>9}"
                   f"{_s(a.get('early_pct')):>10}{_s(a.get('excess')):>8}")
         def _g(m, k):
-            return rt_aggs.get((m, seg), {}).get(k, np.nan)
+            return rt_aggs.get((m, seg, "all"), {}).get(k, np.nan)
 
         def _cmp(lhs, rhs, tag):
             a, b = _g(lhs, "excess"), _g(rhs, "excess")
@@ -1047,6 +1096,55 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
         _cmp("pos_ideal", "pos_actual", "즉시청산 − 알림게이팅")
         _cmp("pos_slow", "pos_ideal", "5일확정 − 즉시청산  (지연 효과)")
         _cmp("pos_actual", "buy_hold", "알림게이팅 − 무청산 (청산의 순가치)")
+
+    _years = meta.get("rt_years") or []
+    if _years:
+        print(f"\n\n[진입연도별 / 개별주만] — SPY초과%(베타 제거) · 괄호는 거래수")
+        print("   buy_hold 는 진입 시점에 따라 보유기간이 4년~1개월로 달라 연도 간 직접 비교 불가.")
+        print("   같은 연도 안에서 모드끼리만 비교할 것.\n")
+        print(f"{'모드':<26}" + "".join(f"{y:>16}" for y in _years))
+        for m in RT_MODES:
+            _cells = []
+            for y in _years:
+                a = rt_aggs.get((m, "stock", y), {})
+                _e, _n = a.get("excess", np.nan), a.get("trades", 0)
+                _cells.append(f"{('-' if not np.isfinite(_e) else f'{_e:+.2f}')} ({_n})".rjust(16))
+            print(f"{RT_MODE_KR.get(m, m):<26}" + "".join(_cells))
+        print(f"\n{'모드':<26}" + "".join(f"{y:>16}" for y in _years) + "   ← 평균 R")
+        for m in RT_MODES:
+            _cells = []
+            for y in _years:
+                _r = rt_aggs.get((m, "stock", y), {}).get("avg_r", np.nan)
+                _cells.append(("-" if not np.isfinite(_r) else f"{_r:+.2f}").rjust(16))
+            print(f"{RT_MODE_KR.get(m, m):<26}" + "".join(_cells))
+
+
+def _print_rt_year_summary(rt_year: dict) -> None:
+    """진입 연도별 분해(개별주). '무청산 우위가 구간(상승장) 때문인가' 를 가르는 표."""
+    years = sorted({y for (_m, y) in rt_year.keys()})
+    if not years:
+        return
+    print("\n[진입 연도별 분해 — 개별주] 표시값 = SPY초과%(N). 무청산 대비 차이가 핵심.")
+    print(f"{'모드':<24}" + "".join(f"{y:>16}" for y in years))
+    for m in RT_MODES:
+        cells = []
+        for y in years:
+            a = rt_year.get((m, y), {})
+            ex, n = a.get("excess", np.nan), a.get("trades", 0)
+            cells.append(f"{'-' if not np.isfinite(ex) else f'{ex:+.1f}'}({n}){'':>2}"[:16].rjust(16))
+        print(f"{RT_MODE_KR.get(m, m):<24}" + "".join(cells))
+    print(f"\n{'  → 최선모드 − 무청산 (청산의 순가치)':<24}", end="")
+    for y in years:
+        _bh = rt_year.get(("buy_hold", y), {}).get("excess", np.nan)
+        _best = max(((rt_year.get((m, y), {}).get("excess", np.nan), m)
+                     for m in RT_MODES if m != "buy_hold"),
+                    key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
+        if np.isfinite(_bh) and np.isfinite(_best[0]):
+            print(f"{_best[0] - _bh:+.1f}({_best[1][:9]})".rjust(16), end="")
+        else:
+            print("-".rjust(16), end="")
+    print("\n  ※ 진입 연도가 최근일수록 보유기간이 짧아 무청산 수치가 작아진다. "
+          "연도 간이 아니라 같은 열(연도) 안에서 비교할 것.")
 
 
 def main():
@@ -1073,9 +1171,11 @@ def main():
     print(f"[STEP2] 이력 확보 {len(hist_cache)}/{len(universe)}종목 "
           f"(SPY {'OK' if not spy_hist.empty else '실패'})")
 
-    aggs, rt_aggs, meta = run_backtest(universe, spy_hist, hist_cache, segment_map=segment_map)
+    aggs, rt_aggs, rt_year, meta = run_backtest(universe, spy_hist, hist_cache,
+                                                segment_map=segment_map)
     _print_summary(aggs, meta)
     _print_rt_summary(rt_aggs, meta)
+    _print_rt_year_summary(rt_year)
 
     rows = []
     for seg in SEGMENTS:
@@ -1097,6 +1197,9 @@ def main():
     try:
         _rt_rows = build_rt_rows(rt_aggs, run_date, meta["hist_start"], meta["hist_end"],
                                  meta["universe_size"])
+        _rt_rows += build_rt_rows({(m, f"stock:{y}"): a for (m, y), a in rt_year.items()},
+                                  run_date, meta["hist_start"], meta["hist_end"],
+                                  meta["universe_size"])
         _rtws = open_result_worksheet(gc, title=_RT_WORKSHEET, cols=_RT_COLS)
         _safe_append_rows(_rtws, _rt_rows, ncols=len(_RT_COLS))
         print(f"[OK] '{_RT_WORKSHEET}' 에 {len(_rt_rows)}행 저장")
