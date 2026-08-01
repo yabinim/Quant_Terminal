@@ -682,22 +682,6 @@ def _jsonable(v):
     return v
 
 
-def aggregate_trades_by_year(trades: list[dict]) -> dict:
-    """(mode, year) → 집계. 진입 연도 기준.
-
-    buy_hold 는 청산이 없어 '2022년 진입 = 4년 보유 / 2026년 진입 = 수개월' 이 된다.
-    따라서 buy_hold 행은 연도 간 비교가 아니라 '같은 연도 안에서 청산 규칙이
-    무청산 대비 얼마나 더/덜 벌었나' 를 읽는 용도다.
-    """
-    years = sorted({str(t.get("entry_year") or "") for t in trades} - {""})
-    out = {}
-    for y in years:
-        sub = [t for t in trades if str(t.get("entry_year")) == y]
-        for m, a in aggregate_trades(sub).items():
-            out[(m, y)] = a
-    return out, years
-
-
 def build_rt_rows(rt_aggs: dict, run_date: str, hist_start: str, hist_end: str,
                   universe_size: int) -> list:
     rows = []
@@ -1036,7 +1020,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         "n_stock": len(universe) - _n_etf,
     }
     meta["rt_years"] = rt_years
-    return aggs, rt_aggs, rt_year, meta
+    return aggs, rt_aggs, meta
 
 
 def _print_summary(aggs: dict, meta: dict) -> None:
@@ -1119,34 +1103,6 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
             print(f"{RT_MODE_KR.get(m, m):<26}" + "".join(_cells))
 
 
-def _print_rt_year_summary(rt_year: dict) -> None:
-    """진입 연도별 분해(개별주). '무청산 우위가 구간(상승장) 때문인가' 를 가르는 표."""
-    years = sorted({y for (_m, y) in rt_year.keys()})
-    if not years:
-        return
-    print("\n[진입 연도별 분해 — 개별주] 표시값 = SPY초과%(N). 무청산 대비 차이가 핵심.")
-    print(f"{'모드':<24}" + "".join(f"{y:>16}" for y in years))
-    for m in RT_MODES:
-        cells = []
-        for y in years:
-            a = rt_year.get((m, y), {})
-            ex, n = a.get("excess", np.nan), a.get("trades", 0)
-            cells.append(f"{'-' if not np.isfinite(ex) else f'{ex:+.1f}'}({n}){'':>2}"[:16].rjust(16))
-        print(f"{RT_MODE_KR.get(m, m):<24}" + "".join(cells))
-    print(f"\n{'  → 최선모드 − 무청산 (청산의 순가치)':<24}", end="")
-    for y in years:
-        _bh = rt_year.get(("buy_hold", y), {}).get("excess", np.nan)
-        _best = max(((rt_year.get((m, y), {}).get("excess", np.nan), m)
-                     for m in RT_MODES if m != "buy_hold"),
-                    key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
-        if np.isfinite(_bh) and np.isfinite(_best[0]):
-            print(f"{_best[0] - _bh:+.1f}({_best[1][:9]})".rjust(16), end="")
-        else:
-            print("-".rjust(16), end="")
-    print("\n  ※ 진입 연도가 최근일수록 보유기간이 짧아 무청산 수치가 작아진다. "
-          "연도 간이 아니라 같은 열(연도) 안에서 비교할 것.")
-
-
 def main():
     if not FMP_API_KEY or not GSPREAD_KEY_JSON:
         print("[ERROR] FMP_API_KEY / GSPREAD_KEY 환경변수 필요 — 중단")
@@ -1171,11 +1127,10 @@ def main():
     print(f"[STEP2] 이력 확보 {len(hist_cache)}/{len(universe)}종목 "
           f"(SPY {'OK' if not spy_hist.empty else '실패'})")
 
-    aggs, rt_aggs, rt_year, meta = run_backtest(universe, spy_hist, hist_cache,
-                                                segment_map=segment_map)
+    aggs, rt_aggs, meta = run_backtest(universe, spy_hist, hist_cache,
+                                       segment_map=segment_map)
     _print_summary(aggs, meta)
     _print_rt_summary(rt_aggs, meta)
-    _print_rt_year_summary(rt_year)
 
     rows = []
     for seg in SEGMENTS:
@@ -1197,9 +1152,6 @@ def main():
     try:
         _rt_rows = build_rt_rows(rt_aggs, run_date, meta["hist_start"], meta["hist_end"],
                                  meta["universe_size"])
-        _rt_rows += build_rt_rows({(m, f"stock:{y}"): a for (m, y), a in rt_year.items()},
-                                  run_date, meta["hist_start"], meta["hist_end"],
-                                  meta["universe_size"])
         _rtws = open_result_worksheet(gc, title=_RT_WORKSHEET, cols=_RT_COLS)
         _safe_append_rows(_rtws, _rt_rows, ncols=len(_RT_COLS))
         print(f"[OK] '{_RT_WORKSHEET}' 에 {len(_rt_rows)}행 저장")
