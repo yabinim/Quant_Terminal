@@ -173,18 +173,20 @@ ALERT_ENABLED_EVENTS = ("entry", "risk", "watch")   # _WL_ALERT_DEFAULT 와 동�
 #     pos_ideal  : 포지션 판정(integrated_sell_verdict ≥4)이 뜨는 즉시 — 자체 트리거가 있었다면
 #     pos_actual : 알림(exit/risk)이 실제 발동한 날에만 포지션 카드를 볼 수 있었다 — 현 워크플로 재현
 #   pos_ideal - pos_actual 차이 = '포지션 엔진에 트리거가 없었던 비용'.
-#     pos_slow   : 포지션 판정이 N일 연속 유지돼야 청산 — '지연이 이득인가' 직접 검증
-#     buy_hold   : 모든 entry 신호마다 진입 · 청산 없이 데이터 끝까지 — 통제군.
-#                  v1.8: 중복 보유를 허용한다. 이전처럼 종목당 1건만 잡으면 진입이 창 초반에
-#                    몰려 연도별 분해가 성립하지 않는다(2024·2025 칸이 빈다).
-#                  ※ 보유기간이 진입 시점에 따라 4년~1개월로 제각각 → 전체 평균은 무의미.
-#                    반드시 진입연도별로, Excess_vs_SPY(베타 제거) 기준으로 읽을 것.
-RT_MODES = ("swing", "pos_ideal", "pos_slow", "pos_actual", "buy_hold")
-RT_MODE_KR = {"swing": "스윙 청산(실제 실행)", "pos_ideal": "포지션 청산(즉시)",
-              "pos_slow": "포지션 청산(5일 확정)", "pos_actual": "포지션 청산(알림 게이팅)",
-              "buy_hold": "무청산(통제군)"}
+#     pos_slowN  : 포지션 판정이 N일 연속 유지돼야 청산(N=3/5/10/20) — v1.9 확정일수 스윕.
+#                  진입·재진입 규칙이 완전히 동일하고 지연만 다르므로 조건이 통제된다.
+#                  곡선이 계속 우상향하면 '느릴수록 좋다=청산이 노이즈', 꺾이면 그 점이 최적값.
+RT_SLOW_SWEEP = (3, 5, 10, 20)   # v1.9: pos_slow 확정일수 스윕
+_SLOW_MODES = tuple(f"pos_slow{n}" for n in RT_SLOW_SWEEP)
+RT_SLOW_N = {f"pos_slow{n}": n for n in RT_SLOW_SWEEP}
+# buy_hold 는 v1.9에서 제외: 청산 모드는 보유 중 오는 진입 신호를 놓치는데 buy_hold 는
+#   전부 먹어 거래 집합이 달라진다(N 205~384 vs 43~87) → 순수 비교가 아니다.
+#   같은 질문(청산이 가치를 더하는가)은 확정일수 스윕이 조건 통제 하에 더 깨끗하게 답한다.
+RT_MODES = ("swing", "pos_ideal") + _SLOW_MODES + ("pos_actual",)
+RT_MODE_KR = {"swing": "스윙 청산(실제 실행)", "pos_ideal": "포지션 청산(즉시=0일)",
+              "pos_actual": "포지션 청산(알림 게이팅)"}
+RT_MODE_KR.update({m: f"포지션 청산({RT_SLOW_N[m]}일 확정)" for m in _SLOW_MODES})
 RT_PF_EVENTS = {"swing": ("exit",), "pos_actual": ("exit", "risk")}
-RT_SLOW_CONFIRM_DAYS = 5  # pos_slow: 청산 판정이 이만큼 연속 유지돼야 실행
 RT_STOP_ATR_MULT = 2.0    # R 분모용 플랜 손절 배수. 백테스트에는 DRG 이력이 없어 고정값 사용
 RT_EARLY_EXIT_DAYS = 10   # 진입 후 N거래일 이내 청산 = 휩소로 집계
 ALERT_BUCKETS = (
@@ -425,7 +427,6 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     # v1.6 왕복 추적 상태
     _feats = _position_features(h) if roundtrip else None
     _rt_pos = {m: None for m in RT_MODES}
-    _bh_open: list[dict] = []            # buy_hold 는 중복 보유 → 리스트로 관리
     _rt_pf = {m: "" for m in RT_MODES}   # 보유 중 포트폴리오 알림 상태머신(모드별)
 
     _alert_state = ""       # v1.4: 알림 상태머신 누적 상태(JSON) — 티커별로 이어짐
@@ -477,22 +478,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
         if roundtrip and res is not None:
             _today_s = str(pd.Timestamp(date_i).date())
             _entry_fired = any(f.get("event") == "entry" for f in (_fired or []))
-            # buy_hold: 신호마다 독립 포지션을 열고 청산하지 않는다(중복 보유)
-            if _entry_fired:
-                _ei = i + entry_lag
-                if _ei < n and np.isfinite(close[_ei]) and close[_ei] > 0:
-                    _atr = _feats["atr"][i]
-                    _stop = (close[_ei] - RT_STOP_ATR_MULT * _atr) if np.isfinite(_atr) else np.nan
-                    _bh_open.append({
-                        "entry_pos": _ei, "entry_price": float(close[_ei]),
-                        "entry_date": str(pd.Timestamp(dates[_ei]).date()),
-                        "stop": float(_stop) if np.isfinite(_stop) else np.nan,
-                        "peak": float(close[_ei]),
-                    })
-
             for _m in RT_MODES:
-                if _m == "buy_hold":
-                    continue            # 위에서 별도 처리(중복 보유·무청산)
                 _p = _rt_pos[_m]
                 if _p is None:
                     if _entry_fired:
@@ -529,10 +515,10 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                     _is_sell = "청산" in str(_lab)
                     if _m == "pos_ideal":
                         _hit, _why = _is_sell, _rsn
-                    elif _m == "pos_slow":
+                    elif _m in RT_SLOW_N:
                         # 같은 판정이 N일 연속 유지돼야 실행(끊기면 리셋)
                         _p["slow_n"] = _p["slow_n"] + 1 if _is_sell else 0
-                        _hit = _p["slow_n"] >= RT_SLOW_CONFIRM_DAYS
+                        _hit = _p["slow_n"] >= RT_SLOW_N[_m]
                         _why = _rsn
                     else:   # pos_actual — 메일이 실제로 온 날에만 카드를 볼 수 있었다
                         try:
@@ -583,15 +569,9 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
     # 구간 끝에 열려 있는 포지션은 마지막 종가로 강제 마감 + 별도 표기
     if roundtrip:
         for _m, _p in _rt_pos.items():
-            if _m == "buy_hold":
-                continue
             if _p is not None and n - 1 > _p["entry_pos"]:
                 trades.append(_close_trade(_p, _m, close, dates, n - 1,
                                            "구간 종료(미청산)", spy_arr, open_at_end=True))
-        for _p in _bh_open:
-            if n - 1 > _p["entry_pos"]:
-                trades.append(_close_trade(_p, "buy_hold", close, dates, n - 1,
-                                           "구간 종료(무청산)", spy_arr, open_at_end=True))
 
     return events, alert_events, trades, first_eval_date, last_eval_date
 
@@ -672,7 +652,7 @@ def aggregate_trades(trades: list[dict]) -> dict:
 def _jsonable(v):
     """NaN/Inf → "" (gspread 는 JSON 비준수 float 를 거부한다).
 
-    buy_hold 처럼 완결 거래가 0건인 모드는 EarlyExit_Pct 등이 NaN 이라
+완결 거래가 0건인 모드는 EarlyExit_Pct 등이 NaN 이라
     이 정리를 거치지 않으면 시트 저장 전체가 실패한다.
     """
     if isinstance(v, (float, np.floating)):
@@ -999,8 +979,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         for m, a in aggregate_trades(_seg_filter(all_trades, seg)).items():
             rt_aggs[(m, seg, "all")] = a
     # v1.8: 진입연도별 분해 — 개별주 한정(ETF 는 알파가 없어 배제).
-    #   buy_hold 우위가 청산 규칙의 문제인지, 2022 바닥에서 시작한 창(window) 때문인지
-    #   구분하려면 하락 구간과 상승 구간을 나눠 봐야 한다.
+    #   2022 하락 구간과 2023~ 상승 구간에서 최적 확정일수가 다른지 확인한다.
     _stock_trades = _seg_filter(all_trades, "stock")
     rt_years = sorted({str(t.get("entry_year") or "") for t in _stock_trades} - {""})
     for yr in rt_years:
@@ -1078,14 +1057,18 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
             if np.isfinite(a) and np.isfinite(b):
                 print(f"   → {tag}: SPY초과 {a - b:+.2f}%p (평균R {_g(lhs, 'avg_r') - _g(rhs, 'avg_r'):+.2f})")
         _cmp("pos_ideal", "pos_actual", "즉시청산 − 알림게이팅")
-        _cmp("pos_slow", "pos_ideal", "5일확정 − 즉시청산  (지연 효과)")
-        _cmp("pos_actual", "buy_hold", "알림게이팅 − 무청산 (청산의 순가치)")
+        for _n in RT_SLOW_SWEEP:
+            _cmp(f"pos_slow{_n}", "pos_ideal", f"{_n:>2}일확정 − 즉시청산 (지연 효과)")
+        _best = max(((_g(m, "excess"), m) for m in RT_MODES),
+                    key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
+        if np.isfinite(_best[0]):
+            print(f"   ★ 최선: {RT_MODE_KR.get(_best[1], _best[1])} (SPY초과 {_best[0]:+.2f}%)")
 
     _years = meta.get("rt_years") or []
     if _years:
         print(f"\n\n[진입연도별 / 개별주만] — SPY초과%(베타 제거) · 괄호는 거래수")
-        print("   buy_hold 는 진입 시점에 따라 보유기간이 4년~1개월로 달라 연도 간 직접 비교 불가.")
-        print("   같은 연도 안에서 모드끼리만 비교할 것.\n")
+        print("   진입 연도가 최근일수록 관측 가능한 보유기간이 짧다 → 연도 간이 아니라")
+        print("   같은 연도(열) 안에서 모드끼리만 비교할 것.\n")
         print(f"{'모드':<26}" + "".join(f"{y:>16}" for y in _years))
         for m in RT_MODES:
             _cells = []
