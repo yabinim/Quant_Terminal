@@ -647,15 +647,29 @@ def aggregate_trades(trades: list[dict]) -> dict:
     return out
 
 
+def _jsonable(v):
+    """NaN/Inf → "" (gspread 는 JSON 비준수 float 를 거부한다).
+
+    buy_hold 처럼 완결 거래가 0건인 모드는 EarlyExit_Pct 등이 NaN 이라
+    이 정리를 거치지 않으면 시트 저장 전체가 실패한다.
+    """
+    if isinstance(v, (float, np.floating)):
+        return "" if not np.isfinite(v) else float(v)
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    return v
+
+
 def build_rt_rows(rt_aggs: dict, run_date: str, hist_start: str, hist_end: str,
                   universe_size: int) -> list:
     rows = []
     for (m, seg), a in rt_aggs.items():
-        rows.append([run_date, hist_start, hist_end, universe_size, m, seg,
-                     a.get("trades", 0), a.get("closed", 0), a.get("open_pct"),
-                     a.get("winrate"), a.get("avg_r"), a.get("median_r"),
-                     a.get("avg_ret"), a.get("median_ret"), a.get("avg_hold"),
-                     a.get("early_pct"), a.get("excess"), a.get("top_reason", "")])
+        rows.append([_jsonable(x) for x in
+                     [run_date, hist_start, hist_end, universe_size, m, seg,
+                      a.get("trades", 0), a.get("closed", 0), a.get("open_pct"),
+                      a.get("winrate"), a.get("avg_r"), a.get("median_r"),
+                      a.get("avg_ret"), a.get("median_ret"), a.get("avg_hold"),
+                      a.get("early_pct"), a.get("excess"), a.get("top_reason", "")]])
     return rows
 
 
