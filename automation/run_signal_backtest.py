@@ -201,12 +201,25 @@ RT_REGIME_MAPS = {
 }
 _ADAPT_MODES = tuple(RT_REGIME_MAPS)
 
-RT_MODES = ("swing", "pos_ideal") + _SLOW_MODES + _ADAPT_MODES + ("pos_actual",)
+# ── v2.3 진입 게이팅 ─────────────────────────────────────────────────────────
+#   v2.2 결론: 13개 청산 모드 중 어느 것도 하락 연도(2022/2024)에서 SPY 를 이기지
+#   못했다. 확정일수를 0일~90일 어디로 두든, 레짐 적응을 걸어도 마찬가지였다.
+#   → 하락장 손실의 원인은 '언제 파느냐'가 아니라 '그때 샀다'는 데 있다.
+#     청산은 20일 고정으로 통일하고 진입 게이트만 변수로 두어 이를 검증한다.
+#     게이트 값 = 이 경고 개수 이상이면 entry 신호를 무시(신규 진입 금지).
+RT_ENTRY_GATES = {"entry_gate3": 3, "entry_gate2": 2}
+_GATE_MODES = tuple(RT_ENTRY_GATES)
+RT_GATE_EXIT_CONFIRM = 20   # 게이트 모드의 청산 규칙(고정) — 비교 기준선과 동일
+
+RT_MODES = (("swing", "pos_ideal") + _SLOW_MODES + _ADAPT_MODES
+            + _GATE_MODES + ("pos_actual",))
 RT_MODE_KR = {"swing": "스윙 청산(실제 실행)", "pos_ideal": "포지션 청산(즉시=0일)",
               "pos_actual": "포지션 청산(알림 게이팅)"}
 RT_MODE_KR.update({m: f"포지션 청산({RT_SLOW_N[m]}일 확정)" for m in _SLOW_MODES})
 RT_MODE_KR.update({"pos_adapt_a": "레짐적응A(20/20/5/0/0/0)",
                    "pos_adapt_b": "레짐적응B(30/20/10/3/0/0)"})
+RT_MODE_KR.update({m: f"진입게이트(경고≥{RT_ENTRY_GATES[m]} 차단)+20일청산"
+                   for m in _GATE_MODES})
 RT_PF_EVENTS = {"swing": ("exit",), "pos_actual": ("exit", "risk")}
 RT_STOP_ATR_MULT = 2.0    # R 분모용 플랜 손절 배수. 백테스트에는 DRG 이력이 없어 고정값 사용
 RT_EARLY_EXIT_DAYS = 10   # 진입 후 N거래일 이내 청산 = 휩소로 집계
@@ -540,6 +553,10 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
             for _m in RT_MODES:
                 _p = _rt_pos[_m]
                 if _p is None:
+                    # 진입 게이트: 시장 경고가 임계 이상이면 신규 진입을 건너뛴다.
+                    _gate = RT_ENTRY_GATES.get(_m)
+                    if _gate is not None and _warn is not None and _warn[i] >= _gate:
+                        continue
                     if _entry_fired:
                         _ei = i + entry_lag
                         if _ei < n and np.isfinite(close[_ei]) and close[_ei] > 0:
@@ -574,6 +591,11 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                     _is_sell = "청산" in str(_lab)
                     if _m == "pos_ideal":
                         _hit, _why = _is_sell, _rsn
+                    elif _m in RT_ENTRY_GATES:
+                        # 게이트 모드는 청산 규칙을 고정한다(20일 확정) → 진입 게이트만 변수
+                        _p["slow_n"] = _p["slow_n"] + 1 if _is_sell else 0
+                        _hit = _p["slow_n"] >= RT_GATE_EXIT_CONFIRM
+                        _why = _rsn
                     elif _m in RT_REGIME_MAPS:
                         # 시장 국면(경고 개수)에 따라 필요한 확정일수가 매일 달라진다.
                         # 위험 국면으로 바뀌면 요구일수가 줄어 즉시 청산될 수 있다(빠른 방어).
@@ -1142,6 +1164,8 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
             _cmp(f"pos_slow{_n}", "pos_ideal", f"{_n:>2}일확정 − 즉시청산 (지연 효과)")
         for _am in _ADAPT_MODES:
             _cmp(_am, "pos_slow20", f"{RT_MODE_KR[_am][:6]} − 20일고정 (레짐적응 효과)")
+        for _gm in _GATE_MODES:
+            _cmp(_gm, "pos_slow20", f"경고≥{RT_ENTRY_GATES[_gm]} 진입차단 − 게이트없음 (진입 게이팅 효과)")
         _best = max(((_g(m, "excess"), m) for m in RT_MODES),
                     key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
         if np.isfinite(_best[0]):
