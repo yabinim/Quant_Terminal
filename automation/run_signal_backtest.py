@@ -189,6 +189,13 @@ RT_MODE_KR.update({m: f"포지션 청산({RT_SLOW_N[m]}일 확정)" for m in _SL
 RT_PF_EVENTS = {"swing": ("exit",), "pos_actual": ("exit", "risk")}
 RT_STOP_ATR_MULT = 2.0    # R 분모용 플랜 손절 배수. 백테스트에는 DRG 이력이 없어 고정값 사용
 RT_EARLY_EXIT_DAYS = 10   # 진입 후 N거래일 이내 청산 = 휩소로 집계
+# v2.0 미청산 편향 통제(코호트):
+#   확정일수를 늘릴수록 N 이 줄고 미청산(구간 종료 강제 마감)이 늘어난다(9%→22%).
+#   오래 버티는 모드일수록 나쁜 거래가 실현 손실로 잡히지 않고 열린 채 끝나므로,
+#   상승 구간에서는 성적이 부풀려진다. 평가 구간 끝 RT_COHORT_DAYS 이내 진입 건을
+#   잘라내면 모든 모드가 청산될 시간을 동등하게 확보한 상태에서 비교할 수 있다.
+#   (20일 확정의 평균 보유가 167거래일 ≈ 8개월 → 1년이면 대부분 결말이 난다)
+RT_COHORT_DAYS = 365      # 캘린더 일수. 이보다 늦게 진입한 건은 코호트에서 제외
 ALERT_BUCKETS = (
     "alert_entry_pass",     # 매수 메일 발송 + R:R 게이트 통과 → 실제로 사는 신호
     "alert_entry_skip",     # 매수 메일 발송 + 게이트 미통과(건너뛰기 권고)
@@ -355,7 +362,7 @@ def _close_trade(p: dict, mode: str, close, dates, exit_pos: int,
         except Exception:
             excess = np.nan
     hold = int(exit_pos - p["entry_pos"])
-    return {"mode": mode, "entry_date": p["entry_date"], "entry_year": p["entry_date"][:4], "entry_year": p["entry_date"][:4],
+    return {"mode": mode, "entry_date": p["entry_date"], "entry_year": p["entry_date"][:4],
             "exit_date": str(pd.Timestamp(dates[exit_pos]).date()),
             "entry_price": ep, "exit_price": xp, "ret_pct": ret_pct,
             "r_mult": r_mult, "hold_days": hold, "excess_pct": excess,
@@ -987,6 +994,19 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         for m, a in aggregate_trades(_yt).items():
             rt_aggs[(m, "stock", yr)] = a
 
+    # v2.0: 미청산 편향 통제 코호트 — 구간 끝 1년 이내 진입 건 제외(개별주)
+    _cutoff = ""
+    try:
+        if eval_ends:
+            _cutoff = str((pd.Timestamp(max(eval_ends)) -
+                           pd.Timedelta(days=RT_COHORT_DAYS)).date())
+    except Exception:
+        _cutoff = ""
+    if _cutoff:
+        _cohort = [t for t in _stock_trades if str(t.get("entry_date") or "") <= _cutoff]
+        for m, a in aggregate_trades(_cohort).items():
+            rt_aggs[(m, "stock", "cohort")] = a
+
     _n_etf = sum(1 for t in universe if (segment_map or {}).get(t) == "etf")
     meta = {
         "universe_size": n_with_data,
@@ -999,6 +1019,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         "n_stock": len(universe) - _n_etf,
     }
     meta["rt_years"] = rt_years
+    meta["rt_cohort_cutoff"] = _cutoff
     return aggs, rt_aggs, meta
 
 
@@ -1063,6 +1084,28 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
                     key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
         if np.isfinite(_best[0]):
             print(f"   ★ 최선: {RT_MODE_KR.get(_best[1], _best[1])} (SPY초과 {_best[0]:+.2f}%)")
+
+    # ── v2.0: 미청산 편향 통제 코호트 (개별주) ──
+    _cut = meta.get("rt_cohort_cutoff") or ""
+    if _cut and any(k[2] == "cohort" for k in rt_aggs):
+        print(f"\n\n[미청산 편향 통제 / 개별주만] {_cut} 이전 진입분만 집계")
+        print("   확정일수가 길수록 나쁜 거래가 '구간 종료(미청산)'로 빠져 성적이 부풀려진다.")
+        print("   모든 모드에 청산될 시간을 동등하게 준 뒤 비교한 결과.\n")
+        print(f"{'모드':<26}{'N':>6}{'미청산%':>9}{'초과%':>9}{'평균R':>8}"
+              f"{'  |':>4}{'전체N':>7}{'전체미청산%':>12}{'전체초과%':>10}{'차이':>8}")
+        for m in RT_MODES:
+            c = rt_aggs.get((m, "stock", "cohort"), {})
+            a = rt_aggs.get((m, "stock", "all"), {})
+            _d = (c.get("excess", np.nan) - a.get("excess", np.nan))
+            print(f"{RT_MODE_KR.get(m, m):<26}{c.get('trades', 0):>6}{_s(c.get('open_pct')):>9}"
+                  f"{_s(c.get('excess')):>9}{_s(c.get('avg_r')):>8}{'  |':>4}"
+                  f"{a.get('trades', 0):>7}{_s(a.get('open_pct')):>12}{_s(a.get('excess')):>10}"
+                  f"{('-' if not np.isfinite(_d) else f'{_d:+.2f}'):>8}")
+        _cb = max(((rt_aggs.get((m, "stock", "cohort"), {}).get("excess", np.nan), m)
+                   for m in RT_MODES), key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
+        if np.isfinite(_cb[0]):
+            print(f"   ★ 편향 통제 후 최선: {RT_MODE_KR.get(_cb[1], _cb[1])} "
+                  f"(SPY초과 {_cb[0]:+.2f}%)")
 
     _years = meta.get("rt_years") or []
     if _years:
