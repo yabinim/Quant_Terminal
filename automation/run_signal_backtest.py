@@ -149,14 +149,14 @@ _FETCH_WORKERS = 8           # FMP Starter 300 req/min 여유
 HORIZONS       = (5, 20, 60)   # forward-return 측정 거래일
 MFE_WINDOW     = 20            # MFE/MAE 측정 창(거래일)
 MIN_PRIOR_BARS = 220           # 200일선 산출 위한 최소 선행 봉수
-TEST_LOOKBACK  = 2140          # v2.4: 평가 구간(거래일 ≈ 8.5년, 2018~). 아웃오브샘플 검증용.
-#   v2.3 까지의 결론(확정일수 단조 증가 · 진입 게이팅 +효과 · 레짐 적응 실패)은 전부
-#   2022-06~2026-07 한 구간에서 나왔고, 그 안의 하락 표본은 2022 반년 + 2024 조정뿐이다.
-#   15개 모드를 같은 데이터에 돌려 최고를 고른 것이므로 과최적화 위험이 크다.
-#   → 2018 Q4 급락 · 2020 코로나 폭락을 포함하도록 창을 넓히고, 파라미터는 하나도
-#     바꾸지 않은 채 전반부(구)/후반부(신)로 나눠 같은 결론이 재현되는지 본다.
-#   (구 값: 1260 ≈ 5년)
-                               #   치우쳐 청산 규칙 비교가 반쪽이 된다 → 2022 약세장 포함.
+TEST_LOOKBACK  = 934           # v2.5: 평가 구간(거래일 ≈ 3.7년) — FMP 이력 한도에 맞춘 상한.
+#   진단(diag_fmp_depth) 결과: FMP 계정은 limit 값과 무관하게 항상 1255봉(정확히 5년,
+#   롤링)만 반환한다. 500 을 요청하든 5000 을 요청하든 시작일이 동일했다.
+#   → 2018 Q4·2020 코로나 폭락은 데이터 자체가 없어 아웃오브샘플 검증이 불가능하다.
+#   가능한 최대 = 1255 − MIN_PRIOR_BARS(220) − 꼬리(101) = 934.
+#   v2.4 의 2140 은 이 한도를 넘어서 종목 대부분이 조건 미달 탈락 → 유니버스가
+#   227→159 로 줄었다(진단상 0/60 충족). 한도에 맞춰 되돌린다.
+
 CONFIRM_DAYS   = 2             # v1.1: raw code 가 N일 연속 유지돼야 이벤트 확정(라이브 알림과 동일 철학)
 COOLDOWN_DAYS  = 5             # v1.1: 같은 code 재기록 최소 간격(경계 진동 압축)
 ENTRY_LAG_DAYS = 1             # v1.2: 신호일(t) 대비 실제 진입 거래일 지연.
@@ -236,9 +236,12 @@ RT_EARLY_EXIT_DAYS = 10   # 진입 후 N거래일 이내 청산 = 휩소로 집�
 #   잘라내면 모든 모드가 청산될 시간을 동등하게 확보한 상태에서 비교할 수 있다.
 #   (20일 확정의 평균 보유가 167거래일 ≈ 8개월 → 1년이면 대부분 결말이 난다)
 RT_COHORT_DAYS = 365      # 캘린더 일수. 이보다 늦게 진입한 건은 코호트에서 제외
-# v2.4 아웃오브샘플 분할: 이 날짜 이전 진입 = OOS(구간), 이후 = IS(기존 결론이 나온 구간).
-#   두 구간에서 같은 순위/부호가 나오면 진짜 발견, 갈리면 구간 특화(과최적화)다.
-RT_OOS_SPLIT_DATE = "2022-06-10"
+# v2.5 전·후반 분할: FMP 5년 한도로 진짜 아웃오브샘플(2018/2020)은 불가능하다.
+#   차선책으로 평가 구간을 반으로 갈라 같은 결론이 양쪽에서 재현되는지만 본다.
+#   ※ 각 구간 1.85년, 하락 표본은 전반=2022 후반=2024 조정뿐이라 근거는 약하다.
+#     양쪽이 갈리면 '구간 특화'로 확정할 수 있지만, 일치해도 '검증됨'까지는 아니다.
+#   빈 문자열이면 실행 시점의 평가 구간 중앙값으로 자동 설정한다.
+RT_OOS_SPLIT_DATE = ""
 
 ALERT_BUCKETS = (
     "alert_entry_pass",     # 매수 메일 발송 + R:R 게이트 통과 → 실제로 사는 신호
@@ -1086,11 +1089,20 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
             rt_aggs[(m, "stock", yr)] = a
 
     # v2.4: 아웃오브샘플 분할 — 파라미터를 바꾸지 않고 두 구간에서 결론이 재현되는지
-    for _tag, _sel in (("oos", lambda d: d < RT_OOS_SPLIT_DATE),
-                       ("is", lambda d: d >= RT_OOS_SPLIT_DATE)):
-        _sub = [t for t in _stock_trades if _sel(str(t.get("entry_date") or ""))]
-        for m, a in aggregate_trades(_sub).items():
-            rt_aggs[(m, "stock", _tag)] = a
+    _split = RT_OOS_SPLIT_DATE
+    if not _split:
+        try:
+            _ds = sorted(str(t.get("entry_date") or "") for t in _stock_trades
+                         if t.get("entry_date"))
+            _split = _ds[len(_ds) // 2] if _ds else ""
+        except Exception:
+            _split = ""
+    if _split:
+        for _tag, _sel in (("half1", lambda d: d < _split),
+                           ("half2", lambda d: d >= _split)):
+            _sub = [t for t in _stock_trades if _sel(str(t.get("entry_date") or ""))]
+            for m, a in aggregate_trades(_sub).items():
+                rt_aggs[(m, "stock", _tag)] = a
 
     # v2.0: 미청산 편향 통제 코호트 — 구간 끝 1년 이내 진입 건 제외(개별주)
     _cutoff = ""
@@ -1118,6 +1130,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
     }
     meta["rt_years"] = rt_years
     meta["rt_cohort_cutoff"] = _cutoff
+    meta["rt_split_date"] = _split
     return aggs, rt_aggs, meta
 
 
@@ -1188,28 +1201,28 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
             print(f"   ★ 최선: {RT_MODE_KR.get(_best[1], _best[1])} (SPY초과 {_best[0]:+.2f}%)")
 
     # ── v2.4: 아웃오브샘플 검증 (개별주) ──
-    if any(k[2] == "oos" for k in rt_aggs):
-        print(f"\n\n[아웃오브샘플 검증 / 개별주만] 분할 기준 진입일 {RT_OOS_SPLIT_DATE}")
-        print("   OOS = 이 날짜 이전 진입(2018~2022상반기, 결론 도출에 쓰이지 않은 구간)")
-        print("   IS  = 이후 진입(기존 결론이 나온 구간).")
-        print("   두 구간에서 부호와 순위가 같아야 진짜 발견이다. 갈리면 구간 특화(과최적화).\n")
-        print(f"{'모드':<34}{'OOS N':>7}{'OOS초과%':>10}{'OOS평균R':>10}"
-              f"{'  |':>4}{'IS N':>6}{'IS초과%':>9}{'IS평균R':>9}{'부호일치':>10}")
+    if any(k[2] == "half1" for k in rt_aggs):
+        print(f"\n\n[전·후반 재현성 / 개별주만] 분할 진입일 {meta.get('rt_split_date', '')}")
+        print("   FMP 계정 이력이 5년(롤링)으로 제한돼 2018·2020 하락장 데이터가 없다.")
+        print("   → 진짜 아웃오브샘플은 불가. 평가 구간을 반으로 갈라 재현성만 본다.")
+        print("   양쪽이 갈리면 '구간 특화'로 확정할 수 있으나, 일치해도 '검증됨'은 아니다.\n")
+        print(f"{'모드':<34}{'전반 N':>7}{'전반초과%':>10}{'전반평균R':>10}"
+              f"{'  |':>4}{'후반N':>6}{'후반초과%':>9}{'후반평균R':>9}{'부호일치':>10}")
         for m in RT_MODES:
-            o = rt_aggs.get((m, "stock", "oos"), {})
-            v = rt_aggs.get((m, "stock", "is"), {})
+            o = rt_aggs.get((m, "stock", "half1"), {})
+            v = rt_aggs.get((m, "stock", "half2"), {})
             _oe, _ie = o.get("excess", np.nan), v.get("excess", np.nan)
             _agree = ("-" if not (np.isfinite(_oe) and np.isfinite(_ie))
                       else ("○" if (_oe >= 0) == (_ie >= 0) else "✗"))
             print(f"{RT_MODE_KR.get(m, m):<34}{o.get('trades', 0):>7}{_s(_oe):>10}"
                   f"{_s(o.get('avg_r')):>10}{'  |':>4}{v.get('trades', 0):>6}{_s(_ie):>9}"
                   f"{_s(v.get('avg_r')):>9}{_agree:>10}")
-        _ob = max(((rt_aggs.get((m, "stock", "oos"), {}).get("excess", np.nan), m)
+        _ob = max(((rt_aggs.get((m, "stock", "half1"), {}).get("excess", np.nan), m)
                    for m in RT_MODES), key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
-        _ib = max(((rt_aggs.get((m, "stock", "is"), {}).get("excess", np.nan), m)
+        _ib = max(((rt_aggs.get((m, "stock", "half2"), {}).get("excess", np.nan), m)
                    for m in RT_MODES), key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
-        print(f"   ★ OOS 최선: {RT_MODE_KR.get(_ob[1], _ob[1])} ({_ob[0]:+.2f}%)")
-        print(f"   ★ IS  최선: {RT_MODE_KR.get(_ib[1], _ib[1])} ({_ib[0]:+.2f}%)")
+        print(f"   ★ 전반 최선: {RT_MODE_KR.get(_ob[1], _ob[1])} ({_ob[0]:+.2f}%)")
+        print(f"   ★ 후반 최선: {RT_MODE_KR.get(_ib[1], _ib[1])} ({_ib[0]:+.2f}%)")
         print(f"   → 두 최선이 {'같다(재현됨)' if _ob[1] == _ib[1] else '다르다(구간 특화 의심)'}")
 
     # ── v2.0: 미청산 편향 통제 코호트 (개별주) ──
