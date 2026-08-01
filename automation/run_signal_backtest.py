@@ -186,10 +186,27 @@ RT_SLOW_N = {f"pos_slow{n}": n for n in RT_SLOW_SWEEP}
 # buy_hold 는 v1.9에서 제외: 청산 모드는 보유 중 오는 진입 신호를 놓치는데 buy_hold 는
 #   전부 먹어 거래 집합이 달라진다(N 205~384 vs 43~87) → 순수 비교가 아니다.
 #   같은 질문(청산이 가치를 더하는가)은 확정일수 스윕이 조건 통제 하에 더 깨끗하게 답한다.
-RT_MODES = ("swing", "pos_ideal") + _SLOW_MODES + ("pos_actual",)
+# ── v2.2 레짐 조건부 확정일수 ────────────────────────────────────────────────
+#   v2.1 결론: 확정일수를 늘리면 상승장(2023/25/26)에선 크게 이득, 하락장(2022/24)에선
+#   더 손해였다. 즉 '고정 확정일수'는 알파가 아니라 '시장이 오른다'에 거는 베팅이다.
+#   → 국면에 따라 확정일수를 바꾼다. 위험 국면엔 빠르게 손절, 안전 국면엔 러너를 태운다.
+#     (regime_core.regime_params 가 DRG 점수로 손절 ATR배수를 조정하는 것과 같은 발상)
+#   백테스트에는 DRG 이력이 없으므로 SPY 만으로 계산되는 경고 개수를 대용 지표로 쓴다.
+#   경고(0~5): MA200 이탈 · MA50 이탈 · 20일 수익률 음수 · 52주 고점 대비 -10% 초과 ·
+#              20일 실현변동성이 1년 중앙값의 1.5배 초과
+#   ※ 모두 당일까지의 정보만 사용한다(lookahead 없음).
+RT_REGIME_MAPS = {
+    "pos_adapt_a": {0: 20, 1: 20, 2: 5, 3: 0, 4: 0, 5: 0},    # 보수적: 경고 2개부터 단축
+    "pos_adapt_b": {0: 30, 1: 20, 2: 10, 3: 3, 4: 0, 5: 0},   # 완만: 단계적 단축
+}
+_ADAPT_MODES = tuple(RT_REGIME_MAPS)
+
+RT_MODES = ("swing", "pos_ideal") + _SLOW_MODES + _ADAPT_MODES + ("pos_actual",)
 RT_MODE_KR = {"swing": "스윙 청산(실제 실행)", "pos_ideal": "포지션 청산(즉시=0일)",
               "pos_actual": "포지션 청산(알림 게이팅)"}
 RT_MODE_KR.update({m: f"포지션 청산({RT_SLOW_N[m]}일 확정)" for m in _SLOW_MODES})
+RT_MODE_KR.update({"pos_adapt_a": "레짐적응A(20/20/5/0/0/0)",
+                   "pos_adapt_b": "레짐적응B(30/20/10/3/0/0)"})
 RT_PF_EVENTS = {"swing": ("exit",), "pos_actual": ("exit", "risk")}
 RT_STOP_ATR_MULT = 2.0    # R 분모용 플랜 손절 배수. 백테스트에는 DRG 이력이 없어 고정값 사용
 RT_EARLY_EXIT_DAYS = 10   # 진입 후 N거래일 이내 청산 = 휩소로 집계
@@ -200,6 +217,7 @@ RT_EARLY_EXIT_DAYS = 10   # 진입 후 N거래일 이내 청산 = 휩소로 집�
 #   잘라내면 모든 모드가 청산될 시간을 동등하게 확보한 상태에서 비교할 수 있다.
 #   (20일 확정의 평균 보유가 167거래일 ≈ 8개월 → 1년이면 대부분 결말이 난다)
 RT_COHORT_DAYS = 365      # 캘린더 일수. 이보다 늦게 진입한 건은 코호트에서 제외
+
 ALERT_BUCKETS = (
     "alert_entry_pass",     # 매수 메일 발송 + R:R 게이트 통과 → 실제로 사는 신호
     "alert_entry_skip",     # 매수 메일 발송 + 게이트 미통과(건너뛰기 권고)
@@ -337,6 +355,34 @@ def _position_features(h: pd.DataFrame) -> dict:
     }
 
 
+def _market_warnings(spy_arr) -> np.ndarray:
+    """SPY 정렬 배열 → 일자별 시장 경고 개수(0~5). DRG risk_score 의 백테스트 대용.
+
+    당일까지의 정보만 사용하며(rolling, shift 없음 → 당일 종가 포함), 전 종목이 같은
+    시장 국면을 공유하므로 티커마다 재계산해도 결과는 동일하다.
+    """
+    if spy_arr is None:
+        return None
+    c = pd.Series(spy_arr, dtype=float)
+    if c.notna().sum() < 260:
+        return None
+    ma200 = c.rolling(200, min_periods=200).mean()
+    ma50 = c.rolling(50, min_periods=50).mean()
+    ret20 = c / c.shift(20) - 1.0
+    dd = c / c.rolling(252, min_periods=60).max() - 1.0
+    vol20 = (c.pct_change().rolling(20).std())
+    vol_med = vol20.rolling(252, min_periods=60).median()
+    w = (
+        (c < ma200).astype(float)
+        + (c < ma50).astype(float)
+        + (ret20 < 0).astype(float)
+        + (dd < -0.10).astype(float)
+        + (vol20 > vol_med * 1.5).astype(float)
+    )
+    # 지표 산출 전 구간(NaN)은 중립(2)으로 둔다 — 극단으로 치우치지 않게
+    return w.fillna(2.0).to_numpy(dtype=float)
+
+
 def _pos_label_at(feats: dict, price: float, ref_high: float, i: int):
     """사전계산 입력 + 진입 이후 고점 → integrated_sell_verdict (SSOT 그대로)."""
     dd = (price / ref_high - 1.0) * 100.0 if (ref_high and np.isfinite(ref_high) and ref_high > 0) else np.nan
@@ -431,6 +477,8 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
         except Exception:
             spy_arr = None
 
+    _warn = _market_warnings(spy_arr) if roundtrip else None
+
     start_i = max(min_prior, n - test_lookback)
     first_eval_date = None
     last_eval_date = None
@@ -502,7 +550,7 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                                 "entry_date": str(pd.Timestamp(dates[_ei]).date()),
                                 "stop": float(_stop) if np.isfinite(_stop) else np.nan,
                                 "peak": float(close[_ei]),
-                                "slow_n": 0,
+                                "slow_n": 0, "adapt_n": 0,
                             }
                             _rt_pf[_m] = ""
                     continue
@@ -526,6 +574,14 @@ def walk_forward_events(hist: pd.DataFrame, spy_close=None,
                     _is_sell = "청산" in str(_lab)
                     if _m == "pos_ideal":
                         _hit, _why = _is_sell, _rsn
+                    elif _m in RT_REGIME_MAPS:
+                        # 시장 국면(경고 개수)에 따라 필요한 확정일수가 매일 달라진다.
+                        # 위험 국면으로 바뀌면 요구일수가 줄어 즉시 청산될 수 있다(빠른 방어).
+                        _need = RT_REGIME_MAPS[_m].get(
+                            int(_warn[i]) if _warn is not None else 2, 5)
+                        _p["adapt_n"] = _p["adapt_n"] + 1 if _is_sell else 0
+                        _hit = _is_sell and _p["adapt_n"] > _need
+                        _why = _rsn
                     elif _m in RT_SLOW_N:
                         # 같은 판정이 N일 연속 유지돼야 실행(끊기면 리셋)
                         _p["slow_n"] = _p["slow_n"] + 1 if _is_sell else 0
@@ -1084,6 +1140,8 @@ def _print_rt_summary(rt_aggs: dict, meta: dict) -> None:
         _cmp("pos_ideal", "pos_actual", "즉시청산 − 알림게이팅")
         for _n in RT_SLOW_SWEEP:
             _cmp(f"pos_slow{_n}", "pos_ideal", f"{_n:>2}일확정 − 즉시청산 (지연 효과)")
+        for _am in _ADAPT_MODES:
+            _cmp(_am, "pos_slow20", f"{RT_MODE_KR[_am][:6]} − 20일고정 (레짐적응 효과)")
         _best = max(((_g(m, "excess"), m) for m in RT_MODES),
                     key=lambda t: (t[0] if np.isfinite(t[0]) else -1e9))
         if np.isfinite(_best[0]):
