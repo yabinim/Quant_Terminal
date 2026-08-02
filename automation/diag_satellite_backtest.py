@@ -404,13 +404,16 @@ def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.
                     each = cash / len(buys)
                     for tk in buys:
                         buy(tk, i, each)
-            else:  # rebal — 목표 종목 균등 재조정
+            else:  # rebal — 슬롯 균등 재조정
                 targets = keep + buys
                 if targets:
                     held_val = sum(shares.get(t, 0.0) * px(t, i) for t in targets
                                    if np.isfinite(px(t, i)))
                     equity = cash + held_val
-                    tgt = equity / len(targets)
+                    # 분모는 '생존 종목 수'가 아니라 항상 슬롯 5개.
+                    # risk-off 로 슬롯이 비면 그만큼 현금으로 남아야 한다.
+                    # (len(targets) 로 나누면 남은 종목에 몰빵되어 필터 의도가 뒤집힌다)
+                    tgt = equity / SLOTS
                     for tk in targets:                      # 초과분 먼저 매도
                         p = px(tk, i)
                         if not np.isfinite(p):
@@ -958,13 +961,44 @@ def _selftest() -> int:
     if m_up and m_free2 and m_up["final"] <= m_free2["final"]:
         fails.append("성과 패널(adj)이 최종 자산에 반영되지 않음")
 
+    # 10) [회귀] risk-off 로 슬롯이 비어도 균등재조정이 몰빵하지 않는가
+    #     버그 이력: tgt = equity/len(targets) 였을 때 생존 1종목이면 비중 100% 가 됐다.
+    #     ⚠️ 랭킹이 실제로 교체돼야 슬롯이 비므로, 이 케이스만 랜덤워크 패널을 쓴다.
+    rng2 = np.random.default_rng(1234)
+    close_ro = pd.DataFrame(index=idx)
+    for tk in tickers:
+        close_ro[tk] = 100.0 * np.exp(np.cumsum(
+            rng2.normal(rng2.normal(0.0, 0.0006), 0.018, n)))
+    # SPY 는 전반 상승(risk_on → 포지션 구축) 후 하락(risk_off → 슬롯 공백)이어야
+    # 문제 경로를 밟는다. 처음부터 하락시키면 아예 매수가 없어 테스트가 무효가 된다.
+    turn = int(n * 0.67)
+    close_ro["SPY"] = 100.0 * np.exp(np.cumsum(np.concatenate(
+        [np.full(turn, 0.0012), np.full(n - turn, -0.0025)])))
+    adj_ro = close_ro.copy()
+    eng_ro = RankEngine(close_ro)
+    exercised = False
+    for mf in ("no_new", "all_cash"):
+        m_ro = simulate(("weekly", "rebal", "top5", mf), eng_ro, close_ro, adj_ro,
+                        250, n - 1)
+        if not m_ro:
+            continue
+        # 슬롯이 실제로 비는 구간이 발생했는지 확인 (테스트가 경로를 밟았는지 검증)
+        if any(len(r["held"]) < SLOTS for r in (m_ro.get("log") or [])):
+            exercised = True
+        peak = m_ro.get("maxw_peak", np.nan)
+        if np.isfinite(peak) and peak > 40.0:
+            fails.append(f"risk-off 균등재조정 최대비중 과다({mf}): "
+                         f"{peak:.1f}% — 슬롯 분모가 깨졌다")
+    if not exercised:
+        fails.append("회귀 테스트가 risk-off 슬롯 공백 경로를 밟지 못함 — 테스트 자체가 무효")
+
     if fails:
         print("❌ 실패:")
         for f in fails:
             print("   -", f)
         return 1
     print("✅ 전 항목 통과 (수익률·섹터제약·무비용정합·슬리피지방향·신호일·"
-          "구간분해·수수료방향·배당패널반영)")
+          "구간분해·수수료방향·배당패널반영·risk-off슬롯비중)")
     return 0
 
 
