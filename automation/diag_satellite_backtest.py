@@ -372,6 +372,7 @@ def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.
         basis[tk] = basis.get(tk, 0.0) + dollars
 
     prev_held: set = set()
+    maxw_track: list = []
     risk_on = True
     for i in range(sim_start, end_i + 1):
         if i in exec_map:
@@ -429,6 +430,10 @@ def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.
                          if np.isfinite(px(tk, i)))
         equity_dates.append(index[i])
         equity_vals.append(val)
+        if val > 0 and shares:
+            top_w = max((q * px(tk, i) for tk, q in shares.items()
+                         if np.isfinite(px(tk, i))), default=0.0) / val
+            maxw_track.append(top_w)
 
         if i in exec_map:
             rebal_log.append({
@@ -443,6 +448,8 @@ def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.
     m = _metrics(curve, trades, slip_cost, traded_notional, capital)
     if m:
         m["log"] = rebal_log
+        m["maxw_mean"] = float(np.mean(maxw_track)) * 100.0 if maxw_track else float("nan")
+        m["maxw_peak"] = float(np.max(maxw_track)) * 100.0 if maxw_track else float("nan")
     return m
 
 
@@ -581,6 +588,127 @@ def print_segments(rows: list) -> None:
           f"(SPY 대비 {_fmt(best['excess'], 1, 'pp')})")
     print("→ 구간별 편차가 크면 3년 평균은 '전략의 실력'이 아니라 '구간 운'에 가깝다.")
     return worst
+
+
+def run_segment_matrix(engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.DataFrame,
+                       segs: list) -> dict:
+    """구간 × 설정 전체 매트릭스 — 나쁜 구간을 방어한 설정이 무엇인지 격리한다."""
+    out = {}
+    for freq in FREQS:
+        for swap in SWAPS:
+            for sr in SELLRULES:
+                for mf in MKTFILTERS:
+                    cfg = (freq, swap, sr, mf)
+                    row = []
+                    for lo, hi in segs:
+                        try:
+                            row.append(simulate(cfg, engine, close_df, adj_df, lo, hi))
+                        except Exception:
+                            row.append({})
+                    out[cfg] = row
+    return out
+
+
+def print_segment_matrix(matrix: dict, seg_rows: list, bad_k: int = 2) -> list:
+    """설정별 구간 수익률 표. 최악 구간 성과 순으로 정렬 — 손실 방지 관점의 랭킹."""
+    if not matrix or not seg_rows:
+        return []
+    labels = [f"{r['from'].strftime('%y/%m')}~{r['to'].strftime('%y/%m')}" for r in seg_rows]
+    spy_rets = [(r.get("SPY") or {}).get("total_ret", float("nan")) for r in seg_rows]
+    # SPY 대비 열위가 큰 구간 = '나쁜 구간'
+    order = sorted(range(len(seg_rows)),
+                   key=lambda k: seg_rows[k]["excess"] if np.isfinite(seg_rows[k]["excess"])
+                   else 1e9)
+    bad_idx = order[:bad_k]
+
+    rows = []
+    for cfg, ms in matrix.items():
+        rets = [(m or {}).get("total_ret", float("nan")) for m in ms]
+        trades = sum((m or {}).get("trades", 0) for m in ms)
+        valid = [x for x in rets if np.isfinite(x)]
+        if not valid:
+            continue
+        bad = [rets[k] for k in bad_idx if np.isfinite(rets[k])]
+        rows.append({
+            "cfg": cfg, "rets": rets, "trades": trades,
+            "mean": float(np.mean(valid)), "worst": float(np.min(valid)),
+            "bad_mean": float(np.mean(bad)) if bad else float("nan"),
+        })
+    rows.sort(key=lambda r: -r["worst"])
+
+    print(f"\n{'=' * 118}")
+    print("■ 구간 × 설정 매트릭스 — 각 12개월 구간 총수익률(%) · 최악 구간 성과 내림차순")
+    print("=" * 118)
+    hdr = f"{'주기':<5}{'교체':<11}{'매도룰':<10}{'시장필터':<10}"
+    for lb in labels:
+        hdr += f"{lb:>14}"
+    hdr += f"{'평균':>8}{'최악':>8}{'나쁜2평균':>11}{'총거래':>7}"
+    print(hdr)
+    print("-" * 118)
+    for r in rows:
+        cfg = r["cfg"]
+        line = f"{_LBL[cfg[0]]:<5}{_LBL[cfg[1]]:<11}{_LBL[cfg[2]]:<10}{_LBL[cfg[3]]:<10}"
+        for x in r["rets"]:
+            line += f"{_fmt(x, 1):>14}"
+        line += (f"{_fmt(r['mean'], 1):>8}{_fmt(r['worst'], 1):>8}"
+                 f"{_fmt(r['bad_mean'], 1):>11}{r['trades']:>7}")
+        if cfg == BASELINE:
+            line += "  ◀ 실제운용"
+        print(line)
+    print("-" * 118)
+    line = f"{'[SPY]':<36}"
+    for x in spy_rets:
+        line += f"{_fmt(x, 1):>14}"
+    print(line)
+    print(f"→ '나쁜2평균' = SPY 대비 열위가 컸던 구간 {bad_k}개의 평균. "
+          f"여기서 살아남는 설정이 진짜 방어력이 있는 설정이다.")
+    print("→ 최근 1구간만 좋고 나머지가 나쁜 설정은 '구간 운'이지 실력이 아니다.")
+    return rows
+
+
+def print_reset_vs_continuous(engine: RankEngine, close_df: pd.DataFrame,
+                              adj_df: pd.DataFrame, segs: list, matrix: dict,
+                              n_years: int = 3) -> None:
+    """매년 $5,000 리셋 vs 연속 운용 — 14pp 격차의 원인이 집중도 드리프트인지 확인."""
+    use = segs[-n_years:]
+    if len(use) < n_years:
+        return
+    lo, hi = use[0][0], use[-1][1]
+    print(f"\n{'=' * 118}")
+    print(f"■ 매년 리셋 vs 연속 운용 ({n_years}년) — 경로 차이의 원인 진단")
+    print("=" * 118)
+    print(f"{'주기':<5}{'교체':<11}{'매도룰':<10}{'시장필터':<10}"
+          f"{'연속%':>9}{'리셋체이닝%':>13}{'격차pp':>9}"
+          f"{'연속 평균최대비중%':>20}{'연속 최대비중피크%':>20}")
+    print("-" * 118)
+    targets = [BASELINE,
+               ("weekly", "rebal", "top5", "none"),
+               ("monthly", "rebal", "top5", "no_new")]
+    for cfg in targets:
+        cont = simulate(cfg, engine, close_df, adj_df, lo, hi)
+        if not cont:
+            continue
+        seg_ms = matrix.get(cfg) or []
+        chain = 1.0
+        ok = True
+        for (slo, shi) in use:
+            k = next((j for j, (a, b) in enumerate(segs) if (a, b) == (slo, shi)), None)
+            m = seg_ms[k] if (k is not None and k < len(seg_ms)) else None
+            if not m:
+                ok = False
+                break
+            chain *= (1.0 + m["total_ret"] / 100.0)
+        if not ok:
+            continue
+        chain_ret = (chain - 1.0) * 100.0
+        print(f"{_LBL[cfg[0]]:<5}{_LBL[cfg[1]]:<11}{_LBL[cfg[2]]:<10}{_LBL[cfg[3]]:<10}"
+              f"{_fmt(cont['total_ret'], 1):>9}{_fmt(chain_ret, 1):>13}"
+              f"{_fmt(chain_ret - cont['total_ret'], 1):>9}"
+              f"{_fmt(cont.get('maxw_mean'), 1):>20}{_fmt(cont.get('maxw_peak'), 1):>20}")
+    print("-" * 118)
+    print("→ '교체분만' 은 승자를 계속 태우므로 시간이 갈수록 한 종목 비중이 커진다.")
+    print("   평균/피크 최대비중이 20%(=1/5 균등)를 크게 넘으면 격차의 원인은 집중도 드리프트다.")
+    print("   '균등재조정' 의 격차가 훨씬 작다면 그 해석이 맞다는 확증이다.")
 
 
 def print_rebalance_log(m: dict, last_n: int | None = 12, title: str | None = None) -> None:
@@ -987,6 +1115,28 @@ def main() -> None:
                 round(m["cagr"] - spy_c, 2) if np.isfinite(spy_c) else "",
                 div_basis,
             ])
+
+        # ── STEP 4: 구간 × 설정 매트릭스 ────────────────────────────────────
+        print(f"\n[STEP 4] 구간 {len(segs)}개 × 설정 24개 매트릭스 계산 중...")
+        matrix = run_segment_matrix(engine, close_df, adj_df, segs)
+        mrows = print_segment_matrix(matrix, seg_rows)
+        print_reset_vs_continuous(engine, close_df, adj_df, segs, matrix)
+
+        for r in (mrows or []):
+            cfg = r["cfg"]
+            for (lo, hi), m in zip(segs, matrix[cfg]):
+                if not m:
+                    continue
+                all_rows.append([
+                    run_date, f"매트릭스 {idx[lo].date()}~{idx[hi].date()}",
+                    _LBL[cfg[0]], _LBL[cfg[1]], _LBL[cfg[2]], _LBL[cfg[3]],
+                    str(m["start"].date()), str(m["end"].date()),
+                    round(CAPITAL, 2), round(m["final"], 2), round(m["total_ret"], 2),
+                    round(m["cagr"], 2), round(m["mdd"], 2),
+                    round(m["sharpe"], 3) if np.isfinite(m["sharpe"]) else "",
+                    m["trades"], round(m["win"], 1) if np.isfinite(m["win"]) else "",
+                    round(m["turnover"], 2), round(m["slip"], 2), "", div_basis,
+                ])
 
     write_results(all_rows)
 
