@@ -85,8 +85,15 @@ CAPITAL        = 5_000.0      # 시작 자본
 SLOTS          = 5            # 보유 슬롯 (Top5)
 BAND_SLOTS     = 7            # 3B 밴드 룰: Top7 안이면 계속 보유
 SLIPPAGE       = 0.0005       # 편도 0.05%
+COMMISSION_PER_TRADE = 0.0    # Fidelity HSA: 미국 주식·ETF 온라인 매매 $0 (확인 완료).
+#   ⚠️ 단, 일부 소수 ETF 는 건당 $100 서비스 수수료 대상 — 후보 풀에 해당 종목이
+#   있는지는 Fidelity 목록에서 직접 확인해야 한다. 민감도 테스트용 노브로 남겨둔다.
+SELL_ASSESSMENT = 0.00002     # 매도 시 SEC 부과금 ≈ 원금 $1,000당 $0.02
 ENTRY_LAG_DAYS = 1            # 신호일 → 체결일 (금 종가 신호 → 월 종가 체결)
 HISTORY_LIMIT  = 1300         # FMP 실제 상한 1255봉 — 여유 요청
+
+SEG_BARS       = 252          # 연도별 분해 단위(12개월)
+SEG_MAX        = 6            # 최대 분해 구간 수
 
 WARMUP_BARS    = 127          # 6M(126봉) 계산 최소 — compute_satellite_top10 과 동일
 MA200_BARS     = 200          # 시장 필터
@@ -117,15 +124,19 @@ _RESULT_COLS = [
 # ══════════════════════════════════════════════════════════════════════════════
 # 데이터 수집
 # ══════════════════════════════════════════════════════════════════════════════
-def _fmp_price_history(ticker: str, limit: int = HISTORY_LIMIT) -> pd.DataFrame:
-    """/stable historical-price-eod/full — app.py·run_signal_backtest 와 동일 엔드포인트."""
+def _fmp_eod(ticker: str, endpoint: str, limit: int = HISTORY_LIMIT) -> pd.DataFrame:
+    """/stable/historical-price-eod/{endpoint} → DatetimeIndex + 'px' 컬럼.
+
+    endpoint='full'              : 원 종가 (랭킹용 — 라이브 compute_satellite_top10 과 동일)
+    endpoint='dividend-adjusted' : 배당 재투자 반영 종가 (성과 측정용)
+    """
     import requests
     if not FMP_API_KEY:
         return pd.DataFrame()
     for attempt in range(3):
         try:
             r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full"
+                f"{_FMP_BASE}/historical-price-eod/{endpoint}"
                 f"?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
                 timeout=_FMP_TIMEOUT,
             )
@@ -139,52 +150,63 @@ def _fmp_price_history(ticker: str, limit: int = HISTORY_LIMIT) -> pd.DataFrame:
             if not isinstance(rows, list) or not rows:
                 return pd.DataFrame()
             df = pd.DataFrame(rows)
-            if "date" not in df.columns or "close" not in df.columns:
+            if "date" not in df.columns:
+                return pd.DataFrame()
+            # dividend-adjusted 는 adjClose 로 오기도 하고 close 가 이미 조정치이기도 하다
+            col = "adjClose" if "adjClose" in df.columns else "close"
+            if col not in df.columns:
                 return pd.DataFrame()
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
             df = df.dropna(subset=["date"]).set_index("date").sort_index()
             df = df[~df.index.duplicated(keep="last")]
             out = pd.DataFrame(index=df.index)
-            out["close"] = pd.to_numeric(df["close"], errors="coerce")
-            adj = df["adjClose"] if "adjClose" in df.columns else df["close"]
-            out["adj"] = pd.to_numeric(adj, errors="coerce")
-            out["adj"] = out["adj"].fillna(out["close"])
-            return out.dropna(subset=["close"])
+            out["px"] = pd.to_numeric(df[col], errors="coerce")
+            return out.dropna(subset=["px"])
         except Exception:
             if attempt < 2:
                 time.sleep(1.5 * (attempt + 1))
     return pd.DataFrame()
 
 
-def _batch_fetch(tickers: list) -> dict:
-    out = {}
+def _batch_fetch(tickers: list) -> tuple:
+    """(raw_close{}, div_adj{}, fallback_list) — 두 엔드포인트를 병렬로 수집."""
+    raw, adj = {}, {}
+    jobs = [(tk, "full") for tk in tickers] + [(tk, "dividend-adjusted") for tk in tickers]
     with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
-        futs = {ex.submit(_fmp_price_history, tk): tk for tk in tickers}
+        futs = {ex.submit(_fmp_eod, tk, ep): (tk, ep) for tk, ep in jobs}
         for fut in concurrent.futures.as_completed(futs):
-            tk = futs[fut]
+            tk, ep = futs[fut]
             try:
                 df = fut.result()
-                if not df.empty:
-                    out[tk] = df
             except Exception:
-                pass
-    return out
+                df = pd.DataFrame()
+            if df.empty:
+                continue
+            (raw if ep == "full" else adj)[tk] = df["px"]
+    fallback = []
+    for tk in list(raw):
+        if tk not in adj:
+            adj[tk] = raw[tk]          # 배당조정 실패 → 원 종가로 폴백
+            fallback.append(tk)
+    return raw, adj, fallback
 
 
-def build_panels(hist: dict, calendar_ticker: str = "SPY"):
-    """{ticker: df} → (close_df, adj_df) — SPY 거래일 캘린더에 정렬."""
-    if calendar_ticker not in hist:
+def build_panels(raw: dict, adj: dict, calendar_ticker: str = "SPY"):
+    """{ticker: Series} 2벌 → (close_df, adj_df) — SPY 거래일 캘린더에 정렬."""
+    if calendar_ticker not in raw:
         raise RuntimeError(f"{calendar_ticker} 히스토리 확보 실패 — 캘린더 기준을 만들 수 없다")
-    cal = hist[calendar_ticker].index
+    cal = raw[calendar_ticker].index
     close = pd.DataFrame(index=cal)
-    adj = pd.DataFrame(index=cal)
-    for tk, df in hist.items():
-        close[tk] = df["close"].reindex(cal)
-        adj[tk] = df["adj"].reindex(cal)
+    adjp = pd.DataFrame(index=cal)
+    for tk, s in raw.items():
+        close[tk] = s.reindex(cal)
+        a = adj.get(tk)
+        adjp[tk] = (a.reindex(cal) if a is not None else s.reindex(cal))
     # 산발적 결측(휴장 차이 등)만 최대 3봉 보간 — 상장 이전 구간은 NaN 유지
     close = close.ffill(limit=3)
-    adj = adj.ffill(limit=3)
-    return close, adj
+    adjp = adjp.ffill(limit=3)
+    adjp = adjp.where(adjp > 0)
+    return close, adjp
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -316,7 +338,9 @@ def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.
             return
         qty = shares[tk] * frac
         gross = qty * p
-        cost = gross * SLIPPAGE
+        if gross <= 0:
+            return
+        cost = gross * (SLIPPAGE + SELL_ASSESSMENT) + COMMISSION_PER_TRADE
         cash += gross - cost
         slip_cost += cost
         traded_notional += gross
@@ -335,8 +359,12 @@ def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.
         if not np.isfinite(p) or dollars <= 0.01:
             return
         dollars = min(dollars, cash)
-        cost = dollars * SLIPPAGE
+        if dollars <= COMMISSION_PER_TRADE:
+            return
+        cost = dollars * SLIPPAGE + COMMISSION_PER_TRADE
         qty = (dollars - cost) / p
+        if qty <= 0:
+            return
         cash -= dollars
         slip_cost += cost
         traded_notional += dollars
@@ -496,17 +524,78 @@ def print_window_table(win_label: str, results: dict, benches: dict) -> None:
               f"{_fmt(m['mdd'], 1):>8}{_fmt(m['sharpe'], 2):>7}{'-':>6}{'-':>7}{'-':>7}")
 
 
-def print_rebalance_log(m: dict, last_n: int = 12) -> None:
-    """실제 운용(기준선)의 최근 리밸런싱 내역 — 네가 받은 이메일과 대조해 검증하는 용도."""
+def build_segments(idx: pd.DatetimeIndex, end_i: int) -> list:
+    """끝에서부터 252봉(12개월) 단위로 자른다. 앞쪽 자투리(<252봉)는 버린다."""
+    segs = []
+    hi = end_i
+    while len(segs) < SEG_MAX:
+        lo = hi - SEG_BARS + 1
+        if lo < WARMUP_BARS:
+            break
+        segs.append((lo, hi))
+        hi = lo - 1
+    return list(reversed(segs))
+
+
+def run_segments(engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.DataFrame,
+                 segs: list) -> list:
+    """구간별 기준선 vs SPY vs QQQ — 3년 성과가 어느 해에서 갈렸는지 격리한다."""
+    idx = adj_df.index
+    out = []
+    for lo, hi in segs:
+        m = simulate(BASELINE, engine, close_df, adj_df, lo, hi)
+        if not m:
+            continue
+        row = {"lo": lo, "hi": hi, "from": idx[lo], "to": idx[hi], "m": m}
+        for b in BENCH_TICKERS:
+            row[b] = buy_hold([b], adj_df, lo, hi)
+        spy_ret = (row.get("SPY") or {}).get("total_ret", float("nan"))
+        row["excess"] = m["total_ret"] - spy_ret
+        out.append(row)
+    return out
+
+
+def print_segments(rows: list) -> None:
+    if not rows:
+        return
+    print(f"\n{'=' * 108}")
+    print("■ 12개월 구간별 분해 — 기준선(실제 운용 방식) vs 벤치마크")
+    print("=" * 108)
+    print(f"{'구간':<26}{'기준선%':>9}{'MDD%':>8}{'거래':>6}{'승률%':>7}"
+          f"{'SPY%':>9}{'QQQ%':>9}{'vsSPY':>10}")
+    print("-" * 108)
+    for r in rows:
+        m = r["m"]
+        spy = (r.get("SPY") or {}).get("total_ret", float("nan"))
+        qqq = (r.get("QQQ") or {}).get("total_ret", float("nan"))
+        label = f"{r['from'].date()} ~ {r['to'].date()}"
+        print(f"{label:<26}{_fmt(m['total_ret'], 1):>9}{_fmt(m['mdd'], 1):>8}"
+              f"{m['trades']:>6}{_fmt(m['win'], 0):>7}"
+              f"{_fmt(spy, 1):>9}{_fmt(qqq, 1):>9}{_fmt(r['excess'], 1, 'pp'):>10}")
+    print("-" * 108)
+    worst = min(rows, key=lambda r: r["excess"] if np.isfinite(r["excess"]) else 1e9)
+    best = max(rows, key=lambda r: r["excess"] if np.isfinite(r["excess"]) else -1e9)
+    print(f"최악 구간: {worst['from'].date()} ~ {worst['to'].date()} "
+          f"(SPY 대비 {_fmt(worst['excess'], 1, 'pp')})")
+    print(f"최고 구간: {best['from'].date()} ~ {best['to'].date()} "
+          f"(SPY 대비 {_fmt(best['excess'], 1, 'pp')})")
+    print("→ 구간별 편차가 크면 3년 평균은 '전략의 실력'이 아니라 '구간 운'에 가깝다.")
+    return worst
+
+
+def print_rebalance_log(m: dict, last_n: int | None = 12, title: str | None = None) -> None:
+    """리밸런싱 내역 — last_n=None 이면 전체 출력."""
     log = (m or {}).get("log") or []
     if not log:
         return
-    print(f"\n▶ 기준선 최근 {min(last_n, len(log))}회 리밸런싱 (네 이메일과 대조 검증용)")
-    print(f"   {'신호일':<12}{'체결일':<12}{'매도':<16}{'매수':<16}{'보유 Top5':<34}{'자산$':>9}")
-    for r in log[-last_n:]:
+    shown = log if last_n is None else log[-last_n:]
+    head = title or f"기준선 최근 {len(shown)}회 리밸런싱 (네 이메일과 대조 검증용)"
+    print(f"\n▶ {head}")
+    print(f"   {'신호일':<12}{'체결일':<12}{'매도':<28}{'매수':<28}{'보유 Top5':<30}{'자산$':>10}")
+    for r in shown:
         print(f"   {str(r['sig'].date()):<12}{str(r['exec'].date()):<12}"
-              f"{(','.join(r['sold']) or '-'):<16}{(','.join(r['bought']) or '-'):<16}"
-              f"{(','.join(r['held']) or '(전량현금)'):<34}{r['equity']:>9,.0f}")
+              f"{(','.join(r['sold']) or '-'):<28}{(','.join(r['bought']) or '-'):<28}"
+              f"{(','.join(r['held']) or '(전량현금)'):<30}{r['equity']:>10,.0f}")
 
 
 def print_factor_summary(win_label: str, results: dict) -> None:
@@ -710,12 +799,44 @@ def _selftest() -> int:
     if any(pd.Timestamp(d).weekday() != 4 for d in sd[1:-1]):
         fails.append("주간 신호일이 금요일이 아님")
 
+    # 7) 12개월 구간 분해 — 겹치지 않고 워밍업 침범 없이 끝에서부터 잘리는가
+    segs = build_segments(idx, n - 1)
+    if not segs:
+        fails.append("구간 분해 결과가 비어 있음")
+    else:
+        if segs[-1][1] != n - 1:
+            fails.append("마지막 구간이 데이터 끝에 붙어 있지 않음")
+        if any(hi - lo + 1 != SEG_BARS for lo, hi in segs):
+            fails.append("구간 길이가 252봉이 아님")
+        if any(segs[k][1] >= segs[k + 1][0] for k in range(len(segs) - 1)):
+            fails.append("구간이 서로 겹침")
+        if segs[0][0] < WARMUP_BARS:
+            fails.append("구간이 워밍업 영역을 침범함")
+
+    # 8) 수수료를 키우면 성과가 나빠지는가
+    global COMMISSION_PER_TRADE
+    old_c = COMMISSION_PER_TRADE
+    m_free2 = simulate(BASELINE, eng, close, adj, 200, n - 1)
+    COMMISSION_PER_TRADE = 20.0
+    m_fee = simulate(BASELINE, eng, close, adj, 200, n - 1)
+    COMMISSION_PER_TRADE = old_c
+    if m_free2 and m_fee and m_fee["final"] >= m_free2["final"]:
+        fails.append("건당 수수료를 $20 로 올렸는데 성과가 나빠지지 않음")
+
+    # 9) 배당조정 패널이 성과에 반영되는가 (adj 를 1% 더 올리면 최종자산도 올라야)
+    adj_up = adj * 1.0
+    adj_up.iloc[-1] = adj_up.iloc[-1] * 1.01
+    m_up = simulate(BASELINE, eng, close, adj_up, 200, n - 1)
+    if m_up and m_free2 and m_up["final"] <= m_free2["final"]:
+        fails.append("성과 패널(adj)이 최종 자산에 반영되지 않음")
+
     if fails:
         print("❌ 실패:")
         for f in fails:
             print("   -", f)
         return 1
-    print("✅ 전 항목 통과 (수익률·섹터제약·무비용정합·슬리피지방향·신호일)")
+    print("✅ 전 항목 통과 (수익률·섹터제약·무비용정합·슬리피지방향·신호일·"
+          "구간분해·수수료방향·배당패널반영)")
     return 0
 
 
@@ -732,31 +853,48 @@ def main() -> None:
     universe = sorted({t for lst in pool.values() for t in lst})
     fetch_list = sorted(set(universe) | set(BENCH_TICKERS))
     print(f"[STEP 1] 후보 풀 {len(universe)}개 + 벤치 {len(BENCH_TICKERS)}개 = "
-          f"{len(fetch_list)}종목 이력 수집 중...")
-    hist = _batch_fetch(fetch_list)
-    print(f"[INFO] 확보 {len(hist)}/{len(fetch_list)}종목")
-    missing = sorted(set(fetch_list) - set(hist))
+          f"{len(fetch_list)}종목 × 2엔드포인트(원종가·배당조정) 수집 중...")
+    raw, adjmap, fallback = _batch_fetch(fetch_list)
+    print(f"[INFO] 확보 {len(raw)}/{len(fetch_list)}종목")
+    missing = sorted(set(fetch_list) - set(raw))
     if missing:
         print(f"[WARN] 이력 미확보: {missing}")
-    if "SPY" not in hist:
+    if fallback:
+        print(f"[WARN] 배당조정 실패 → 원 종가 폴백 {len(fallback)}종목: {fallback[:15]}")
+    if "SPY" not in raw:
         print("[ERROR] SPY 이력 확보 실패 — 중단")
         sys.exit(1)
 
-    close_df, adj_df = build_panels(hist)
+    close_df, adj_df = build_panels(raw, adjmap)
     idx = close_df.index
     print(f"[INFO] 캘린더 {len(idx)}봉 · {idx[0].date()} ~ {idx[-1].date()}")
 
-    # 배당 반영 여부 판정
-    same = 0
-    for tk in list(hist)[:20]:
-        a, c = hist[tk]["adj"], hist[tk]["close"]
-        if float((a - c).abs().max()) < 1e-6:
-            same += 1
-    div_basis = "close(배당미반영)" if same >= 18 else "adjClose(배당반영)"
-    print(f"[INFO] 성과 기준: {div_basis}")
-    if div_basis.startswith("close"):
-        print("[WARN] FMP adjClose 가 close 와 동일 — 배당 재투자가 반영되지 않는다.")
-        print("       XLE·XLRE·AMLP·REM 등 고배당 ETF 비중이 커질수록 성과가 과소평가된다.")
+    # 배당 반영이 실제로 작동했는지 검증 — 총수익/가격수익 괴리를 연율로 환산
+    gaps = []
+    for tk in sorted(raw):
+        c, a = close_df[tk].dropna(), adj_df[tk].dropna()
+        if len(c) < 260 or len(a) < 260:
+            continue
+        n = min(len(c), len(a))
+        cr = float(c.iloc[-1] / c.iloc[-n])
+        ar = float(a.iloc[-1] / a.iloc[-n])
+        if cr > 0 and ar > 0:
+            gaps.append((ar / cr) ** (252.0 / n) - 1.0)
+    med_gap = float(np.median(gaps)) * 100.0 if gaps else 0.0
+    div_basis = "dividend-adjusted(배당재투자)" if med_gap > 0.15 else "close(배당미반영)"
+    print(f"[INFO] 성과 기준: {div_basis} · 배당 기여 중앙값 ≈ 연 {med_gap:.2f}%p")
+    if med_gap <= 0.15:
+        print("[WARN] 배당조정 시리즈가 원 종가와 사실상 동일 — 배당이 반영되지 않았다.")
+    spy_gap = 0.0
+    try:
+        c, a = close_df["SPY"].dropna(), adj_df["SPY"].dropna()
+        n = min(len(c), len(a))
+        spy_gap = (((float(a.iloc[-1] / a.iloc[-n])) / (float(c.iloc[-1] / c.iloc[-n])))
+                   ** (252.0 / n) - 1.0) * 100.0
+        print(f"[INFO] 참고 — SPY 배당 기여 연 {spy_gap:.2f}%p "
+              f"(위성 풀 중앙값 {med_gap:.2f}%p 와의 차이가 상대비교에 미치는 영향)")
+    except Exception:
+        pass
 
     max_eval = len(idx) - WARMUP_BARS - ENTRY_LAG_DAYS
     print(f"[INFO] 워밍업 {WARMUP_BARS}봉 제외 후 평가 가능 최대 {max_eval}거래일 "
@@ -823,12 +961,41 @@ def main() -> None:
                 div_basis,
             ])
 
+    # ── STEP 3: 12개월 구간별 분해 — 3년 성과가 어느 해에서 갈렸는지 격리 ──────
+    segs = build_segments(idx, end_i)
+    if segs:
+        print(f"\n[STEP 3] 12개월 구간 {len(segs)}개 분해 중...")
+        seg_rows = run_segments(engine, close_df, adj_df, segs)
+        worst = print_segments(seg_rows)
+        if worst:
+            print_rebalance_log(
+                worst["m"], last_n=None,
+                title=f"최악 구간 전체 리밸런싱 내역 "
+                      f"({worst['from'].date()} ~ {worst['to'].date()}) — 실패 모드 진단")
+        for r in seg_rows:
+            m = r["m"]
+            spy_c = (r.get("SPY") or {}).get("cagr", float("nan"))
+            all_rows.append([
+                run_date, f"구간 {r['from'].date()}~{r['to'].date()}",
+                _LBL[BASELINE[0]], _LBL[BASELINE[1]], _LBL[BASELINE[2]], _LBL[BASELINE[3]],
+                str(m["start"].date()), str(m["end"].date()),
+                round(CAPITAL, 2), round(m["final"], 2), round(m["total_ret"], 2),
+                round(m["cagr"], 2), round(m["mdd"], 2),
+                round(m["sharpe"], 3) if np.isfinite(m["sharpe"]) else "",
+                m["trades"], round(m["win"], 1) if np.isfinite(m["win"]) else "",
+                round(m["turnover"], 2), round(m["slip"], 2),
+                round(m["cagr"] - spy_c, 2) if np.isfinite(spy_c) else "",
+                div_basis,
+            ])
+
     write_results(all_rows)
 
     print("\n" + "=" * 108)
     print("⚠️  해석 주의 — 이 숫자는 상한선이다")
     print("   1) 후보 풀 56개는 2026년 현재 시점에 고른 목록 → 미래를 아는 풀(선택 편향).")
     print("   2) FMP 이력 5년 한도로 2020 코로나·2022 초입 하락장이 데이터에 없다.")
+    print("   3) 이 룰의 실거래 기록은 아직 없다 — 리밸런싱 로그가 과거 실계좌와 겹쳐 보여도")
+    print("      그건 검증이 아니다. 진짜 대조는 앞으로 쌓일 주차 기록으로만 가능하다.")
     print("   → 절대 수익률이 아니라 '조건 간 상대 비교'만 신뢰할 것.")
     print(f"[DONE] {time.time() - t0:.0f}초 소요")
     print("=" * 108)
