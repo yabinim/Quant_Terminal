@@ -1,0 +1,41 @@
+name: 🔍 진단 — 매도 판정 점수 (수동 전용)
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/repository_dispatch 트리거 없음.
+    inputs:
+      probe_ticker:
+        description: '[0] 데이터 소스 검증에 쓸 종목'
+        required: false
+        default: 'NEE'
+      only_uid:
+        description: '특정 사용자만 진단 (비우면 전체)'
+        required: false
+        default: 'yab'
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20     # 읽기 전용 진단 — 보통 2~4분
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install google-auth gspread requests numpy pandas pytz
+
+      - name: 🔍 매도 판정 진단 (읽기 전용 · 시트 기록 없음 · 이메일 없음)
+        env:
+          FMP_API_KEY:       ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
+          DIAG_PROBE_TICKER: ${{ inputs.probe_ticker }}
+          DIAG_ONLY_UID:     ${{ inputs.only_uid }}
+        run: |
+          python automation/diag_sell_verdict.py
