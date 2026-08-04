@@ -61,6 +61,7 @@ def generate_text(client, prompt, *,
                   max_output_tokens: int = 8192,
                   top_p=None,
                   thinking_budget=0,
+                  response_mime_type=None,
                   validate=None,
                   primary_attempts: int = 5,
                   fallback_attempts: int = 5,
@@ -73,6 +74,8 @@ def generate_text(client, prompt, *,
         client: genai.Client 인스턴스
         prompt: 프롬프트 문자열
         thinking_budget: 0=사고 끔(기본, 잘림 방지). None 이면 thinking_config 미설정(사고 기본 ON).
+        response_mime_type: 예) "application/json". 미지정(None)이면 설정하지 않아 기존 동작 유지.
+                  scanner_core 의 배치 채점이 JSON 배열 강제를 위해 사용한다.
         validate: 선택. callable(text)->bool. False/예외면 그 시도를 실패(재시도 대상)로 처리.
                   예) 내러티브: lambda t: narrative_core.parse_narrative_json(t) is not None
         primary_attempts / fallback_attempts: 모델별 최대 시도 횟수.
@@ -91,6 +94,9 @@ def generate_text(client, prompt, *,
     cfg_kwargs = dict(temperature=temperature, max_output_tokens=max_output_tokens)
     if top_p is not None:
         cfg_kwargs["top_p"] = top_p
+    if response_mime_type is not None:
+        # 스캐너 배치 채점처럼 JSON 배열만 받아야 하는 호출용. 미지정 시 기존 동작 그대로.
+        cfg_kwargs["response_mime_type"] = response_mime_type
     if thinking_budget is not None:
         cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=thinking_budget)
     cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
