@@ -700,3 +700,457 @@ def format_quant_gate_note(report) -> str:
     if not parts:
         return f"✅ 추천 티커 정량 검증 완료 — {report.get('checked', 0)}개 모두 유효."
     return f"정량 검증 {report.get('checked', 0)}개 중 · " + " · ".join(parts)
+
+
+# =============================================================================
+# 주간 트렌드(1.5) SSOT — 2C 설계
+#
+# app.py 의 「📊 주간 트렌드 추출(최근 7일)」 버튼과 automation/run_weekly_report.py 가
+# **이 섹션의 함수들만** 호출한다. 프롬프트가 한 글자라도 갈라지면 브리핑이 달라지고,
+# 그러면 3버킷 스캐너 유니버스 자체가 달라지므로 여기 단일 정의를 유지해야 한다.
+#
+# 2C 핵심: 주간 레코드에 **7일 병합 themes(driver/stage/linkage 포함)** 를 담는다.
+#   - Winners 열      = themes[].winners 합집합      → 주도주·대기주 라우팅 풀
+#   - Emerging 열     = themes[].expanding_to 합집합 → 확산주 유니버스
+#   - analysis.themes = 확산주 Structural(가중치 0.40) 채점 근거
+# =============================================================================
+
+NARRATIVE_SOURCE_WEEKLY_7D = "weekly_trend_7d"
+
+# 7일치 themes 를 제목 기준으로 병합한 뒤 유지할 최대 테마 수 (설계 확정: 12)
+WEEKLY_THEME_MERGE_LIMIT = 12
+
+# Google Sheets 셀 한도 50,000자에 대한 안전 예산
+SHEET_CELL_BUDGET = 49000
+
+_WEEKLY_TICKER_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9.\-]{0,9}\b")
+
+
+def parse_theme_tickers(text) -> list:
+    """테마 필드 텍스트에서 티커 후보를 순서 보존·중복 제거로 추출.
+
+    ⚠️ 블랙리스트 최종 필터는 scanner_core.filter_scanner_ticker_list 가 담당한다
+       (run_three_bucket_scan 진입부에서 일괄 적용 — 중복 정의 방지).
+    """
+    out, seen = [], set()
+    for tk in _WEEKLY_TICKER_TOKEN_RE.findall(str(text or "").upper()):
+        tk = tk.strip(".-")
+        if tk and tk not in seen:
+            seen.add(tk)
+            out.append(tk)
+    return out
+
+
+def theme_expanding_tickers(theme) -> list:
+    """theme.expanding_to[].expected_tickers 합집합."""
+    theme = theme if isinstance(theme, dict) else {}
+    flows = theme.get("expanding_to")
+    if not isinstance(flows, list):
+        return []
+    out, seen = [], set()
+    for flow in flows:
+        flow = flow if isinstance(flow, dict) else {}
+        for tk in parse_theme_tickers(flow.get("expected_tickers", "")):
+            if tk not in seen:
+                seen.add(tk)
+                out.append(tk)
+    return out
+
+
+def _norm_theme_title(title) -> str:
+    """테마 제목 정규화 — 대소문자·공백·구두점 차이를 흡수해 같은 테마로 묶는다."""
+    s = str(title or "").strip().lower()
+    s = re.sub(r"[^\w가-힣]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def compact_record_for_timeseries(rec):
+    """`Narratives` 한 건을 시계열 LLM 입력용으로 축약.
+
+    ⚠️ 2C 변경점: 기존 축약은 title/winners/risk 만 남기고 **driver 와 expanding_to 를
+       통째로 버려서**, 주간 브리핑이 2·3차 공급망 분석을 한 번도 못 보고 있었다.
+       확산주 유니버스가 이 구조에서 나오는 만큼 driver 와 확장 티커를 함께 넘긴다.
+    """
+    if not isinstance(rec, dict):
+        return None
+    a = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+    themes = a.get("themes") if isinstance(a.get("themes"), list) else []
+    theme_rows = []
+    for th in themes[:12]:
+        th = th if isinstance(th, dict) else {}
+        exp = theme_expanding_tickers(th)
+        theme_rows.append({
+            "title": str(th.get("title", "") or "")[:200],
+            "driver": str(th.get("driver", "") or "")[:200],
+            "winners": str(th.get("winners", "") or "")[:400],
+            "expanding": ", ".join(exp)[:300],
+            "risk": str(th.get("risk", "") or "")[:300],
+        })
+    regime = a.get("regime") if isinstance(a.get("regime"), dict) else {}
+    return {
+        "saved_at": rec.get("saved_at"),
+        "session_label": rec.get("session_label"),
+        "language": rec.get("language"),
+        "regime": regime,
+        "themes": theme_rows,
+        "rotation": str(a.get("rotation") or "")[:800],
+        "summary": str(a.get("summary") or "")[:2000],
+    }
+
+
+def merge_weekly_themes(week_recs, limit: int = WEEKLY_THEME_MERGE_LIMIT) -> list:
+    """7일치 스냅샷의 themes 를 제목 기준으로 병합한다 (2C 핵심).
+
+    병합 규칙:
+      - 같은(정규화) 제목의 테마는 하나로 묶고 winners·expanding_to 티커는 **합집합**
+      - driver / risk / linkage 는 **가장 최근** 스냅샷의 값을 채택
+      - 등장 빈도(occurrences) 내림차순 → 동률이면 최신순 → 상위 `limit` 개만 유지
+
+    Returns:
+        app.py themes 스키마와 호환되는 list[dict]
+        (title, driver, winners, emerging, expanding_to[{stage,expected_tickers,linkage}],
+         risk, occurrences)
+    """
+    buckets = {}
+    order = []
+    for seq, rec in enumerate(week_recs or []):
+        if not isinstance(rec, dict):
+            continue
+        a = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+        if str(a.get("source") or "") == NARRATIVE_SOURCE_WEEKLY_7D:
+            continue  # 주간 레코드끼리 재귀 병합 방지
+        themes = a.get("themes") if isinstance(a.get("themes"), list) else []
+        for th in themes:
+            th = th if isinstance(th, dict) else {}
+            key = _norm_theme_title(th.get("title"))
+            if not key:
+                continue
+            b = buckets.get(key)
+            if b is None:
+                b = {
+                    "title": str(th.get("title", "") or "").strip(),
+                    "driver": "", "risk": "",
+                    "winners": [], "emerging": [],
+                    "stages": {},          # stage명 -> {"tickers": [...], "linkage": str}
+                    "occurrences": 0, "last_seq": -1,
+                }
+                buckets[key] = b
+                order.append(key)
+            b["occurrences"] += 1
+            # 최신 레코드일수록 seq 가 크다는 전제(호출부에서 시간 오름차순 정렬)
+            if seq >= b["last_seq"]:
+                b["last_seq"] = seq
+                if str(th.get("driver", "") or "").strip():
+                    b["driver"] = str(th.get("driver")).strip()[:400]
+                if str(th.get("risk", "") or "").strip():
+                    b["risk"] = str(th.get("risk")).strip()[:300]
+                if str(th.get("title", "") or "").strip():
+                    b["title"] = str(th.get("title")).strip()
+
+            for tk in parse_theme_tickers(th.get("winners", "")):
+                if tk not in b["winners"]:
+                    b["winners"].append(tk)
+            for tk in parse_theme_tickers(th.get("emerging", "")):
+                if tk not in b["emerging"]:
+                    b["emerging"].append(tk)
+
+            flows = th.get("expanding_to")
+            if isinstance(flows, list):
+                for flow in flows:
+                    flow = flow if isinstance(flow, dict) else {}
+                    stage = str(flow.get("stage", "") or "").strip() or "확장"
+                    slot = b["stages"].setdefault(stage, {"tickers": [], "linkage": ""})
+                    for tk in parse_theme_tickers(flow.get("expected_tickers", "")):
+                        if tk not in slot["tickers"]:
+                            slot["tickers"].append(tk)
+                    lk = str(flow.get("linkage", "") or "").strip()
+                    if lk and seq >= b["last_seq"] - 1:
+                        slot["linkage"] = lk[:300]
+
+    ranked = sorted(
+        (buckets[k] for k in order),
+        key=lambda b: (b["occurrences"], b["last_seq"]),
+        reverse=True,
+    )[: max(1, int(limit))]
+
+    out = []
+    for b in ranked:
+        out.append({
+            "title": b["title"],
+            "driver": b["driver"],
+            "winners": ", ".join(b["winners"]),
+            "emerging": ", ".join(b["emerging"]),
+            "expanding_to": [
+                {"stage": st, "expected_tickers": ", ".join(v["tickers"]), "linkage": v["linkage"]}
+                for st, v in b["stages"].items() if v["tickers"]
+            ],
+            "risk": b["risk"],
+            "occurrences": b["occurrences"],
+        })
+    return out
+
+
+def weekly_scan_pools(analysis) -> dict:
+    """주간 레코드 analysis 에서 3버킷 입력 풀을 뽑는다 (2C).
+
+    Returns:
+        {"winners": [...],   # 주도주·대기주 라우팅 후보
+         "expanding": [...]} # 확산주 유니버스
+    """
+    a = analysis if isinstance(analysis, dict) else {}
+    themes = a.get("themes") if isinstance(a.get("themes"), list) else []
+
+    winners, seen_w = [], set()
+    expanding, seen_x = [], set()
+    for th in themes:
+        th = th if isinstance(th, dict) else {}
+        for tk in parse_theme_tickers(th.get("winners", "")):
+            if tk not in seen_w:
+                seen_w.add(tk)
+                winners.append(tk)
+        for tk in parse_theme_tickers(th.get("emerging", "")):
+            if tk not in seen_w:
+                seen_w.add(tk)
+                winners.append(tk)
+        for tk in theme_expanding_tickers(th):
+            if tk not in seen_x:
+                seen_x.add(tk)
+                expanding.append(tk)
+
+    # themes 가 비어 있는 옛 주간 레코드 폴백 — precomputed_universe 를 winners 로 사용
+    if not winners and not expanding:
+        pre = a.get("precomputed_universe")
+        if isinstance(pre, list):
+            for tk in pre:
+                tk = str(tk).strip().upper()
+                if tk and tk not in seen_w:
+                    seen_w.add(tk)
+                    winners.append(tk)
+    return {"winners": winners, "expanding": expanding}
+
+
+def build_weekly_trend_record(briefing_markdown: str, language: str, week_recs: list,
+                              theme_limit: int = WEEKLY_THEME_MERGE_LIMIT) -> dict:
+    """주간 트렌드 레코드(analysis 포함)를 만든다. 앱 버튼·자동화가 공유한다."""
+    md = str(briefing_markdown or "").strip()
+    merged = merge_weekly_themes(week_recs, limit=theme_limit)
+
+    ordered, seen = [], set()
+    for th in merged:
+        for tk in parse_theme_tickers(th.get("winners", "")) + \
+                  parse_theme_tickers(th.get("emerging", "")) + \
+                  theme_expanding_tickers(th):
+            if tk not in seen:
+                seen.add(tk)
+                ordered.append(tk)
+    for tk in parse_theme_tickers(md):
+        if tk not in seen:
+            seen.add(tk)
+            ordered.append(tk)
+
+    analysis = {
+        "source": NARRATIVE_SOURCE_WEEKLY_7D,
+        "themes": merged,
+        "regime": {},
+        "rotation": (f"최근 7일 롤링 윈도우 · 스냅샷 {len(week_recs or [])}건 기반 주간 트렌드 브리핑 "
+                     f"(테마 {len(merged)}개 병합)"),
+        "summary": md,
+        "weekly_briefing_markdown": md,
+        "precomputed_universe": ordered,
+    }
+    return {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "session_label": "📊 주간 트렌드 (최근 7일 교집합)",
+        "language": str(language or "ko"),
+        "analysis": analysis,
+    }
+
+
+def trim_weekly_analysis_for_cell(analysis, budget: int = SHEET_CELL_BUDGET) -> dict:
+    """시트 셀 한도에 맞게 analysis 를 단계적으로 줄인다.
+
+    ⚠️ 하드컷(`content[:49000]`)은 JSON 을 깨뜨려 레코드를 통째로 소실시킨다
+       (`_sheet_row_to_narrative_record` 가 파싱 실패 시 None 반환).
+       7일 병합 themes 는 무압축 시 10만 자를 넘길 수 있으므로 **하드컷 전에**
+       여기서 반드시 줄여야 한다.
+
+    축소 순서(가치가 낮은 것부터):
+       1) weekly_briefing_markdown 20,000자
+       2) 각 테마의 linkage/driver/risk 절삭
+       3) 테마 수 절반씩 감축 (최소 3개)
+       4) summary 5,000자
+    """
+    a = dict(analysis if isinstance(analysis, dict) else {})
+
+    def size(d):
+        try:
+            return len(json.dumps(d, ensure_ascii=False))
+        except Exception:
+            return budget + 1
+
+    if size(a) <= budget:
+        return a
+
+    md = str(a.get("weekly_briefing_markdown") or "")
+    if len(md) > 20000:
+        a["weekly_briefing_markdown"] = md[:20000] + "\n\n…(truncated)"
+    if size(a) <= budget:
+        return a
+
+    themes = list(a.get("themes") or [])
+    for th in themes:
+        if not isinstance(th, dict):
+            continue
+        th["driver"] = str(th.get("driver") or "")[:150]
+        th["risk"] = str(th.get("risk") or "")[:120]
+        for flow in (th.get("expanding_to") or []):
+            if isinstance(flow, dict):
+                flow["linkage"] = str(flow.get("linkage") or "")[:120]
+    a["themes"] = themes
+    if size(a) <= budget:
+        return a
+
+    while len(a.get("themes") or []) > 3:
+        a["themes"] = list(a["themes"])[: max(3, len(a["themes"]) // 2)]
+        if size(a) <= budget:
+            return a
+
+    a["summary"] = str(a.get("summary") or "")[:5000]
+    return a
+
+
+def build_timeseries_prompt(kind: str, records_payload, target_language: str = "ko") -> str:
+    """시계열 브리핑 프롬프트 SSOT (daily / weekly / wow).
+
+    app.py `run_narrative_timeseries_gemini` 와 automation/run_weekly_report.py 가
+    **이 함수만** 호출한다. weekly 분기의 `## 🏆 Weekly Winners` /
+    `## 🚀 Weekly Expanding To` 고정 헤더 규칙이 여기 단일 정의로 존재한다.
+
+    Args:
+        kind: 'daily' | 'weekly' | 'wow'
+        records_payload: compact_record_for_timeseries 로 축약된 스냅샷 묶음(dict)
+        target_language: 'ko' | 'en'
+
+    Returns:
+        완성된 프롬프트 문자열.
+    """
+    language_label = "한국어" if target_language == "ko" else "English"
+    payload_json = json.dumps(records_payload, ensure_ascii=False)
+    if kind == "daily":
+        task = """
+당신은 월가 매크로 스트래티지스트입니다.
+입력은 **미국 동부(ET) 달력 기준 오늘 하루**에 저장된 시장 내러티브 스냅샷들입니다(시간순).
+
+다음을 **마크다운**으로 간결하지만 밀도 있게 작성하세요:
+1) 오늘 하루 내러티브가 어떻게 **흘러갔는지**(시간대/세션 라벨이 있으면 활용)
+2) 반복 등장한 **공통 승자(티커)·테마**
+3) 레짐(regime) 변화가 있었다면 한 줄로
+4) 투자자가 오늘 밤 준비할 **한 가지 체크포인트**
+
+데이터에 없는 내용은 추측하지 마세요. 출력은 반드시 {lang}입니다.
+""".format(
+            lang=language_label
+        )
+    elif kind == "weekly":
+        task = """
+당신은 월가 매크로 스트래티지스트이자 액티브 트레이딩 데스크의 운영 파트너입니다.
+입력은 **최근 7일(롤링)** 동안 저장된 시장 내러티브 스냅샷입니다(시간순).
+
+[Part 1] 시장 요약 본문 (서술부)
+다음을 **마크다운**으로 작성하세요:
+1) 일주일 동안 **가장 강하게 유지된 메가 트렌드** 2~4개
+2) **지속적으로 언급된 티커**(빈도·일관성 관점에서 상위)
+3) rotation / 테마 확장 흐름에서 보이는 **자본 이동 가설**(보수적으로)
+4) 다음 주 초반 **모니터링 우선순위** 3개
+
+근거 없는 확정은 피하고, 데이터에 기반해 서술하세요. 본문은 반드시 {lang}로 작성합니다.
+
+[Part 2] 실전 매매 연동 섹션 — 매우 중요 (1.6 Opportunity Scanner 자동 연동용)
+전체적인 시장 요약 외에, 리포트 **하단에 반드시 다음 두 가지 섹션을 별도로 분리하여 작성**하라.
+이 두 섹션은 1.6 스캐너가 정규식으로 자동 파싱하여 유니버스로 사용하므로,
+아래 포맷을 **단 한 글자도** 어기지 마라.
+
+A) 두 섹션의 **헤더 문자열은 고정**이며 그대로 사용한다(번역 금지, 이모지 포함, ## 레벨):
+   ## 🏆 Weekly Winners (주간 대장주)
+   ## 🚀 Weekly Expanding To (주간 후발/확장 수혜주)
+
+B) 각 섹션은 아래 구성을 따른다:
+   - 첫 줄: `테마: ...` — 해당 섹션의 핵심 테마/카테고리 1~3개를 쉼표로 구분
+   - 그 다음 줄부터 **불릿 리스트**. 각 라인은 **정확히 티커 1개**만 담는다.
+     라인 포맷(엄격):
+       - **TICKER** — 한 줄 이유(약 20자, {lang})
+     예: `- **NVDA** — AI 가속기 수요 가속`
+
+C) 🏆 Weekly Winners (주간 대장주):
+   - 일주일 내내 강한 모멘텀을 유지한 **핵심 주도 테마와 그 대표 티커**.
+   - 5~10개 종목, **강한 순서**로 정렬.
+
+D) 🚀 Weekly Expanding To (주간 후발/확장 수혜주):
+   - 위 1차 대장주에서 **자금이 이동(Sector Rotation)** 중이거나, 공급망/인프라/2차 파생 수혜로
+     다음 주 초반에 부상할 가능성이 높은 **순환매 후보 티커**.
+   - 5~10개 종목, **기대도 높은 순**으로 정렬.
+   - 🏆 Weekly Winners와의 **중복은 최소화**(가급적 0~1개).
+
+[티커 표기 규칙 — 절대 준수]
+- 본문 서술부와 두 섹션 모두에서, **모든 티커는 반드시 영문 대문자(UPPERCASE)** 로 표기한다.
+  허용 문자: `[A-Z0-9.-]`, 길이 1~10자. 예) NVDA, MSFT, AVGO, BRK.B, MOG-A
+- 두 섹션의 불릿 라인에는 **티커 1개만** 둔다.
+  · 잘못된 예: `- **NVDA, AMD** — AI 칩 수혜`
+  · 올바른 예: `- **NVDA** — AI 가속기 1위`  /  `- **AMD** — MI300 점유율 확대`
+- 회사명·괄호·여러 티커 나열·소문자·풀네임은 금지(서술부에서도 동일).
+- 일반 영어 약어(AI, ETF, US, FED, GDP, CEO 등 — 실제 상장 티커가 아닌 단어)는
+  티커로 오인되지 않도록 **가급적 한국어로 풀어 쓰거나 소문자**로 적어라.
+  (예: `AI` → `인공지능`, `FED` → `연준`)
+
+[환각 방지]
+- 입력 7일 데이터에 한 번도 등장하지 않은 **새 티커를 도입하지 말 것**.
+- 근거가 약하면 해당 섹션을 비우지 말고, 가장 보수적인 후보 1~2개라도 제시하되
+  이유 칸에 `데이터 부족 — 모니터링 후보` 와 같이 명시한다.
+""".format(
+            lang=language_label
+        )
+    else:
+        task = """
+당신은 월가 매크로 스트래티지스트입니다.
+입력에는 **이번 주(최근 7일)** 스냅샷과 **저번 주(그 이전 7일)** 스냅샷이 구분되어 있습니다.
+
+다음을 **마크다운**으로 작성하세요 (WoW = week-over-week):
+1) **교집합**: 두 주 모두에서 살아남은 테마·티커
+2) **차집합 / Narrative Drift**: 저번 주에는 A였는데 이번 주에는 B로 **돈·관심이 이동**한 흔적
+3) **Fading**(사그라지는 내러티브)과 **Emerging**(부상하는 내러티브)을 명시적으로 구분
+4) 한 문단 **Executive Summary** (투자 회의 브리핑 톤)
+
+데이터 밖 환각 금지. 출력은 반드시 {lang}입니다.
+
+[필수 — 자동 파싱 섹션: 아래 4개 헤더는 번역·수정 금지, 이모지 포함, ## 레벨 그대로 유지]
+리포트 **하단**에 반드시 다음 4개 섹션을 추가하라. 시스템이 정규식으로 파싱하므로 헤더 문자열을 단 한 글자도 바꾸지 마라.
+
+## 🏆 Weekly Winners (주간 대장주)
+- 이번 주와 저번 주 **모두에서 강했던** 핵심 티커 (교집합 + 지속 모멘텀)
+- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 5~10개)
+
+## 🚀 Weekly Expanding To (주간 후발/확장 수혜주)
+- 이번 주 새로 부상하거나 다음 주 초반 순환매 수혜 예상 티커
+- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 5~10개)
+
+## 🌱 Emerging (이번 주 새로 부상)
+- 저번 주에는 없었고 이번 주에 새로 등장한 티커·테마
+- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 3~7개)
+
+## 🥀 Fading (저번 주 대비 약화)
+- 저번 주에는 강했지만 이번 주에 사그라든 티커·테마
+- 각 라인: `- **TICKER** — 한 줄 이유` (티커 1개/라인, 3~7개)
+
+[티커 표기 규칙 — 절대 준수]
+- 모든 티커는 반드시 영문 대문자(UPPERCASE). 예) NVDA, MSFT, AVGO
+- 각 불릿 라인에 티커 1개만. 잘못된 예: `- **NVDA, AMD** — ...`
+- 일반 약어(AI, ETF, FED, GDP 등)는 티커로 표기 금지.
+""".format(
+            lang=language_label
+        )
+    return f"""
+{task}
+
+[입력 JSON]
+{payload_json}
+"""
