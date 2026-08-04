@@ -9426,6 +9426,8 @@ def build_portfolio_sell_radar_df(portfolio_df):
         else:
             # 데이터 오류면 낙폭을 판정에 넣지 않는다(허수 매도신호 방지)
             dd_for_verdict = np.nan if dd_data_error else drawdown_pct
+            _gap200 = ((float(current_price) / float(ma200) - 1.0) * 100.0
+                       if (pd.notna(ma200) and float(ma200) > 0) else np.nan)
             status, status_reason = integrated_sell_verdict(
                 above_ma200=above_ma200_flag,
                 one_month_return=one_month_return,
@@ -9433,6 +9435,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
                 macd_signal=sig.get("macd_signal", "N/A"),
                 pct_from_52w_high=sig.get("pct_from_52w_high", np.nan),
                 drawdown_from_high_pct=dd_for_verdict,
+                gap_ma200_pct=_gap200,
             )
             if dd_data_error:
                 status_reason = (status_reason + " · " + rc.DD_DATA_ERROR_NOTE).strip(" ·")
@@ -19953,12 +19956,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 for _, _h in sub.iterrows():
                     _tk = str(_h["Ticker"]).strip().upper()
                     _avg = pd.to_numeric(_h.get("Purchase_Price"), errors="coerce")
+                    _dadd = str(_h.get("Date_Added", "") or "")
                     try:
                         if _tk not in _pf_hist_cache:
-                            _pf_hist_cache[_tk] = _fmp_price_history(_tk, limit=252)
+                            _pf_hist_cache[_tk] = _fmp_price_history(_tk, limit=600)
                         _an = rc.analyze_ticker(
                             _pf_hist_cache[_tk], spy_close=_spy_pf_close,
                             entry_price=float(_avg) if pd.notna(_avg) else None,
+                            entry_date=_dadd,
                         )
                     except Exception:
                         _an = None

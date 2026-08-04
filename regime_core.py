@@ -450,8 +450,14 @@ def _detect_negative_reversal(close, rsi, pivot_n: int = NEG_REV_PIVOT_N,
     return out
 
 
-def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -> dict:
+def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None,
+                         entry_date=None) -> dict:
     """보유 종목 청산 신호. 강세 추세가 꺾이는지 점검.
+
+    entry_date: 보유 시작일(Portfolios Date_Added). 주어지면 ATR 트레일링(샹들리에)의
+      기준고점을 '보유 기간 내 고점'으로 제한한다. 이전에는 종목의 최근 22일 고점을
+      썼기 때문에, 눌린 종목을 매수하면 매수 전 고점에 앵커된 스톱이 진입 즉시
+      위반 상태가 되어 허위 청산이 발생했다(포지션 엔진의 동일 버그와 같은 원인).
 
     반환 dict: {is_exit: bool, reasons: [...], detail: {...}}
     """
@@ -483,15 +489,21 @@ def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -
         codes.append("ma50_break")
 
     # 3) 샹들리에(ATR 트레일링) 스톱
+    hold_days = _holding_bars(close, entry_date)
     chandelier = np.nan
     if pd.notna(atr) and atr > 0:
-        if entry_price is not None and pd.notna(entry_price):
-            # 진입 이후 최고가 추적 (entry_price 이후 구간 근사: 전체 룩백 최고가와 진입가 중 큰 값)
+        post = _post_entry_closes(close, entry_date)
+        if post is not None and not post.empty:
+            # 보유 기간 고점 기준 — 매수 전 고점은 트레일링 앵커가 될 수 없다.
+            ref_high = float(post.max())
+            if entry_price is not None and pd.notna(entry_price):
+                ref_high = max(ref_high, float(entry_price))
+        elif entry_price is not None and pd.notna(entry_price):
+            # entry_date 없음 → 구동작 유지(하위 호환)
             hh = float(close.tail(max(CHANDELIER_LOOKBACK, 22)).max())
             ref_high = max(hh, float(entry_price))
         else:
-            hh = float(close.tail(CHANDELIER_LOOKBACK).max())
-            ref_high = hh
+            ref_high = float(close.tail(CHANDELIER_LOOKBACK).max())
         chandelier = ref_high - CHANDELIER_ATR_MULT * atr
         if price < chandelier:
             reasons.append(f"ATR 트레일링 스톱(${chandelier:.2f}) 하회")
@@ -509,7 +521,110 @@ def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -
     out["warnings"] = warnings
     out["detail"] = {"price": price, "ma50": ma50, "rsi": rsi_last,
                      "atr": atr, "chandelier": chandelier,
+                     "hold_days": hold_days,
                      "negative_reversal": bool(neg_rev["detected"])}
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3-b) 진입 시점 baseline (2A) — 매 실행 시 Date_Added 로 재구성
+#      시트 스키마 변경 없음. 신규/기존 보유가 동일 규칙을 따르므로 백필 불필요.
+# ──────────────────────────────────────────────────────────────────────────
+
+# 스윙(단기) 호라이즌 = 며칠~수주. 그 상단(약 4주)을 넘기면 '진입 시점에 이미
+# 참이던 조건'을 더는 면제하지 않는다. 4주째 회복 못 한 스윙은 실패한 스윙이다.
+SWING_BASELINE_EXPIRY_BARS = 20
+
+
+def _parse_entry_dt(entry_date):
+    if entry_date is None or entry_date == "":
+        return None
+    try:
+        dt = pd.to_datetime(str(entry_date)[:10], errors="coerce")
+    except Exception:
+        return None
+    return None if pd.isna(dt) else dt
+
+
+def _post_entry_closes(close: pd.Series, entry_date):
+    """보유 시작일 이후 종가(진입일 포함). entry_date 없거나 파싱 실패 시 None."""
+    dt = _parse_entry_dt(entry_date)
+    if dt is None:
+        return None
+    try:
+        return close[close.index >= dt]
+    except Exception:
+        return None
+
+
+def _holding_bars(close: pd.Series, entry_date) -> int:
+    """보유 거래일 수(진입일 제외). 산출 불가 시 -1."""
+    post = _post_entry_closes(close, entry_date)
+    if post is None or post.empty:
+        return -1
+    return max(0, len(post) - 1)
+
+
+def compute_entry_baseline(hist: pd.DataFrame, entry_price=None, entry_date=None,
+                           spy_close=None,
+                           expiry_bars: int = SWING_BASELINE_EXPIRY_BARS) -> dict:
+    """진입 시점에 이미 참이던 스윙 코드 집합을 재구성한다(2A).
+
+    반환 {"ok", "codes": {"exit": [...], "risk": [...]}, "hold_days", "expired"}
+      ok=False  → 억제 판단 불가(= 억제하지 않음). 보수적 기본값.
+      expired=True → 보유 기간이 스윙 호라이즌을 넘겨 baseline 을 폐기(정상 판정 복귀).
+
+    ⚠️ 억제는 스윙(exit/risk)에만 적용한다. 포지션(pexit/ptrim)은 중장기 호라이즌이라
+       진입 시점 상태로 면제하면 '매수 시점에 이미 망가진 종목'이 영구 침묵한다.
+    """
+    out = {"ok": False, "codes": {"exit": [], "risk": []}, "hold_days": -1, "expired": False}
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return out
+    try:
+        close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+    except Exception:
+        return out
+
+    dt = _parse_entry_dt(entry_date)
+    if dt is None:
+        return out
+
+    hold = _holding_bars(close, entry_date)
+    out["hold_days"] = hold
+    if hold < 0:
+        return out
+
+    try:
+        sliced = hist[hist.index <= dt]
+    except Exception:
+        return out
+    if sliced is None or len(sliced) < 50:
+        return out   # 진입 시점 재구성 불가 → 억제하지 않음
+
+    try:
+        ex_then = compute_exit_signals(sliced, entry_price=entry_price, entry_date=entry_date)
+        out["codes"]["exit"] = sorted(set(ex_then.get("codes") or []))
+    except Exception:
+        return out
+
+    # risk 코드는 레짐/타이밍이 필요 — 데이터 부족 시 빈 집합(억제 없음)으로 둔다.
+    try:
+        sc = None
+        if spy_close is not None:
+            try:
+                sc = spy_close[spy_close.index <= dt]
+            except Exception:
+                sc = None
+        reg_then = classify_regime(sliced, spy_close=sc)
+        tim_then = evaluate_timing(sliced, reg_then)
+        sev_then = alert_severity_keys(
+            {"regime": reg_then, "timing": tim_then, "exit": ex_then})
+        out["codes"]["risk"] = sorted(set(sev_then.get("risk") or []))
+    except Exception:
+        out["codes"]["risk"] = []
+
+    out["ok"] = True
+    out["expired"] = bool(hold >= int(expiry_bars))
     return out
 
 
@@ -517,10 +632,11 @@ def compute_exit_signals(hist: pd.DataFrame, entry_price: float | None = None) -
 # 4) 편의 오케스트레이터 — app/automation 한 방 호출용
 # ──────────────────────────────────────────────────────────────────────────
 
-def analyze_ticker(hist: pd.DataFrame, spy_close=None, entry_price: float | None = None) -> dict:
+def analyze_ticker(hist: pd.DataFrame, spy_close=None, entry_price: float | None = None,
+                   entry_date=None) -> dict:
     regime = classify_regime(hist, spy_close=spy_close)
     timing = evaluate_timing(hist, regime)
-    exits = compute_exit_signals(hist, entry_price=entry_price)
+    exits = compute_exit_signals(hist, entry_price=entry_price, entry_date=entry_date)
     return {"regime": regime, "timing": timing, "exit": exits}
 
 
@@ -679,15 +795,40 @@ def alert_severity_keys(analysis: dict, pos_verdict=None) -> dict:
     return out
 
 
+def baseline_suppressed_events(analysis: dict, entry_baseline=None, pos_verdict=None) -> set:
+    """2A 로 억제할 스윙 이벤트 집합. 상태머신(EOD)·장중 경로 공용 SSOT.
+
+    현재 심각도 코드가 '진입 시점 코드의 부분집합'이면 = 진입 후 새로 나빠진 것이
+    하나도 없다는 뜻 → 발동하지 않는다. baseline 이 만료됐으면 억제하지 않는다.
+    """
+    out = set()
+    bl = entry_baseline if isinstance(entry_baseline, dict) else {}
+    if not bl.get("ok") or bl.get("expired"):
+        return out
+    codes = bl.get("codes") or {}
+    sev = alert_severity_keys(analysis, pos_verdict=pos_verdict)
+    for e in ("exit", "risk"):
+        base = set(codes.get(e) or [])
+        now = set(sev.get(e) or [])
+        if base and now and now <= base:
+            out.add(e)
+    return out
+
+
 def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: str = "",
                                today_str: str = "", price=None, stop_loss=None,
                                target_price=None, confirm_days: int = ALERT_CONFIRM_DAYS,
                                alert_price=None, alert_rsi=None, alert_ma200=False,
-                               pos_verdict=None):
+                               pos_verdict=None, entry_baseline=None):
     """상태 전환 기반 알림 평가 (2일 확정 + 재무장). 순수 함수.
 
     ※ 하루 1회 호출 전제(자동화). 호출 1회 = 평가 1회로 pending 카운터가 1 진행된다.
        앱(rerun마다 호출)에서는 절대 호출하지 말 것 — 미리보기는 alert_conditions 사용.
+
+    entry_baseline: compute_entry_baseline() 반환값. 주어지면 '진입 시점에 이미 참이던'
+      스윙 코드(exit/risk)만으로 구성된 조건은 발동시키지 않는다(2A). 보유 기간이
+      SWING_BASELINE_EXPIRY_BARS 를 넘기면 baseline 이 폐기되어 정상 발동으로 복귀하고,
+      50일선 미회복 건은 문구로 구분 표시한다(5A). 미지정 시 기존 동작 불변.
 
     반환: (fired: list[{event,label,message}], new_last_state_json: str)
     """
@@ -710,6 +851,13 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
     sev = alert_severity_keys(analysis, pos_verdict=pos_verdict)
     fired = []
 
+    # 2A: 진입 시점 baseline — 스윙(exit/risk)에만 적용. 만료되면 억제 해제.
+    _bl = entry_baseline if isinstance(entry_baseline, dict) else {}
+    _bl_expired = bool(_bl.get("ok")) and bool(_bl.get("expired"))
+    _bl_exit_codes = set((_bl.get("codes") or {}).get("exit") or [])
+    _bl_hold = int(_bl.get("hold_days", -1) or -1)
+    _suppressed = baseline_suppressed_events(analysis, _bl, pos_verdict=pos_verdict)
+
     # 일반 이벤트: 조건 지속 + confirm_days 확정 + 재무장(조건 해제 시)
     #   + 발동 이후에도 '새 사유'가 추가되면 1회 재발동(악화 감지).
     for e in ("entry", "risk", "exit", "pexit", "ptrim", "price", "watch"):
@@ -722,6 +870,17 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
         pending = int(s.get("pending", 0) or 0)
         seen = set(s.get("keys") or [])
         now_keys = set(sev.get(e) or [])
+
+        # ── 2A 억제 / 5A 문구 (스윙 전용) ──────────────────────────────────
+        if cond and e in _suppressed:
+            # 진입 시점부터 참이던 조건뿐 → '추세가 꺾인 것'이 아니므로 발동하지 않음
+            cond = False
+        elif (cond and e == "exit" and _bl_expired and "ma50_break" in now_keys
+                and now_keys <= _bl_exit_codes):
+            # 만료 후 재발동 — '이탈'이 아니라 '기한 내 미회복'임을 구분(5A)
+            _hd = f"{_bl_hold}거래일" if _bl_hold >= 0 else "기한"
+            msg = f"⏳ 스윙 기한 경과({_hd}) — 50일선 미회복 · {msg}".rstrip(" ·")
+
         if cond:
             if status == "armed":
                 pending += 1
@@ -1666,32 +1825,54 @@ def build_sell_card(analysis: dict, plan: dict = None) -> dict:
 _DEFAULT_TRAILING_STOP_PCT = 15.0
 
 
+# 3D: 1개월 수익률은 이 값 이하일 때만 감점. 이전에는 -0.1% 도 -30% 와 동일하게
+#     1점이라, 조정장에서 사실상 상시 +1 오프셋이 되어 SELL 문턱을 4→3 으로 낮췄다.
+POSITION_MONTH_DROP_PCT = -5.0
+# 3E-b: 200일선 이탈 점수를 이격 폭에 비례시킨다(절벽 제거).
+#   score = BASE + (4-BASE) * min(1, |이격%| / FULL)
+#   이격 -1.3% → 2.33 / -3% → 2.75 / -8% 이상 → 4.0
+#   이전에는 이탈 여부만 보고 일괄 4점이라, 200일선을 0.1% 밑돌아도 단독 SELL 문턱을
+#   채웠다. 200일선 근처 등락이 그대로 보유↔청산 플립플롭이 되는 구조였다.
+MA200_GAP_BASE_SCORE = 2.0
+MA200_GAP_FULL_PCT = 8.0
+
+
 def integrated_sell_verdict(*, above_ma200, one_month_return, rsi, macd_signal,
                             pct_from_52w_high, drawdown_from_high_pct,
-                            trailing_stop_pct: float = _DEFAULT_TRAILING_STOP_PCT):
+                            trailing_stop_pct: float = _DEFAULT_TRAILING_STOP_PCT,
+                            gap_ma200_pct=None):
     """200일선(후행) + 트레일링 스톱 + MACD/1개월/과열(선행)을 한 점수로 종합한
     포지션(중장기) 매도 판정. 반환: (label, reason). 라벨은 청산/줄이기/보유 통일 용어
-    (괄호에 SELL/익절/HOLD 키워드 유지 → 기존 파서·스타일러 호환)."""
+    (괄호에 SELL/익절/HOLD 키워드 유지 → 기존 파서·스타일러 호환).
+
+    gap_ma200_pct: (종가/200일선 - 1)*100. 주어지면 이탈 점수를 이격에 비례시킨다(3E-b).
+      미지정/NaN 이면 종전대로 일괄 4점(보수적 폴백)."""
     reasons = []
-    score = 0
+    score = 0.0
     if above_ma200 is False:
-        score += 4
-        reasons.append("200일선 이탈(추세 붕괴)")
+        if gap_ma200_pct is not None and pd.notna(gap_ma200_pct):
+            _g = abs(float(gap_ma200_pct))
+            score += MA200_GAP_BASE_SCORE + (4.0 - MA200_GAP_BASE_SCORE) * min(
+                1.0, _g / MA200_GAP_FULL_PCT)
+            reasons.append(f"200일선 이탈 -{_g:.1f}%(추세 붕괴)")
+        else:
+            score += 4.0
+            reasons.append("200일선 이탈(추세 붕괴)")
     if pd.notna(drawdown_from_high_pct) and drawdown_from_high_pct <= -abs(trailing_stop_pct):
-        score += 3
+        score += 3.0
         reasons.append(f"고점 대비 {drawdown_from_high_pct:.0f}% 하락(트레일링 스톱 -{abs(trailing_stop_pct):.0f}%)")
     if macd_signal == "DEAD_CROSS":
-        score += 2
+        score += 2.0
         reasons.append("MACD 데드크로스(추세 꺾임)")
     elif macd_signal == "BELOW_SIGNAL":
-        score += 1
-    if pd.notna(one_month_return) and one_month_return < 0:
-        score += 1
+        score += 1.0
+    if pd.notna(one_month_return) and one_month_return <= POSITION_MONTH_DROP_PCT:
+        score += 1.0
         reasons.append(f"1개월 {one_month_return:+.1f}%")
     overheated = (pd.notna(rsi) and rsi > 70
                   and pd.notna(pct_from_52w_high) and pct_from_52w_high > -3)
     if overheated:
-        score += 1
+        score += 1.0
         reasons.append(f"RSI {rsi:.0f} 과열 + 신고가 부근(단기 조정 위험)")
     if score >= 4:
         label = "🔴 청산 (SELL)"
@@ -1827,6 +2008,8 @@ def position_sell_verdict(hist, entry_price=None, entry_date=None,
     price = float(close.iloc[-1])
     ma200 = _ma_last(close, 200)
     above_ma200 = bool(price > ma200) if np.isfinite(ma200) else None
+    gap_ma200_pct = ((price / ma200 - 1.0) * 100.0
+                     if (np.isfinite(ma200) and ma200 > 0) else np.nan)
     one_month_return = np.nan
     if len(close) > 22:
         p0 = float(close.iloc[-22])
@@ -1848,6 +2031,7 @@ def position_sell_verdict(hist, entry_price=None, entry_date=None,
         above_ma200=above_ma200, one_month_return=one_month_return, rsi=rsi,
         macd_signal=macd_signal, pct_from_52w_high=pct_from_52w_high,
         drawdown_from_high_pct=drawdown_from_high_pct, trailing_stop_pct=trailing_stop_pct,
+        gap_ma200_pct=gap_ma200_pct,
     )
     if dd_err:
         reason = (reason + " · " + DD_DATA_ERROR_NOTE).strip(" ·")
