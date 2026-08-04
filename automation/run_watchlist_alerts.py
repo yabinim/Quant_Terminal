@@ -77,6 +77,26 @@ _PF_INTRADAY_EVENTS = ("exit", "risk")        # 장중 보유 행동 가능 이�
 _PF_COL_AVG = 3
 _PF_COL_DATE_ADDED = 5
 
+# 진입 시점 baseline(2A) 재구성용 — Date_Added 이전 200봉이 있어야 MA200 이 나온다.
+_PF_HIST_LIMIT = 600
+_DEEP_KEY = "__deep__"      # 티커와 충돌 불가한 센티넬 키
+
+
+def _pf_hist(tk: str, hist_cache: dict):
+    """보유 종목용 깊은 히스토리. 얕게 캐시된 프레임이 있으면 1회만 덮어쓴다.
+
+    ⚠️ 깊은 조회 여부는 hist_cache 안에 기록한다. 모듈 전역에 두면 캐시가 새로
+       만들어진 뒤 재조회를 건너뛰어 None 이 반환된다(평가 전체가 조용히 스킵됨).
+    """
+    deep = hist_cache.setdefault(_DEEP_KEY, set())
+    if tk not in deep:
+        deep.add(tk)
+        h = _fmp_price_history(tk, limit=_PF_HIST_LIMIT)
+        if h is not None and not h.empty:
+            hist_cache[tk] = h
+    return hist_cache.get(tk)
+
+
 # NYSE 휴장일 (run_narrative.py 와 동일 목록)
 _NYSE_HOLIDAYS = {
     "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
@@ -655,13 +675,15 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
         enabled = rc.resolve_alert_events(states_csv, _PF_ALERT_DEFAULT)
         prev = state_map.get(key, {}).get("last", "")
         try:
-            if tk not in hist_cache:
-                hist_cache[tk] = _fmp_price_history(tk)
-            hist = hist_cache[tk]
+            hist = _pf_hist(tk, hist_cache)
             if hist is None or hist.empty:
                 new_rows.append([key, states_csv, prev, today]); continue
+            _entry = float(avg) if pd.notna(avg) else None
             an = rc.analyze_ticker(hist, spy_close=spy_close,
-                                   entry_price=float(avg) if pd.notna(avg) else None)
+                                   entry_price=_entry, entry_date=date_added)
+            # 2A: 진입 시점 baseline 을 매 실행 시 Date_Added 로 재구성(시트 저장 없음).
+            _bl = rc.compute_entry_baseline(hist, entry_price=_entry,
+                                            entry_date=date_added, spy_close=spy_close)
             # 포지션(중장기) 판정은 상태머신 '입력'이다 — pexit/ptrim 이벤트의 트리거이므로
             # 발동 여부와 무관하게 먼저 계산해서 넘긴다. (이전에는 fired 이후에만 계산돼
             #  스윙이 울려야만 포지션 판정이 사용자에게 도달했다.)
@@ -669,7 +691,7 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
                 hist, float(avg) if pd.notna(avg) else None, entry_date=date_added)
             fired, new_state = rc.evaluate_alert_transitions(
                 an, enabled, prev, today_str=today, price=float(hist["Close"].iloc[-1]),
-                pos_verdict=_posv,
+                pos_verdict=_posv, entry_baseline=_bl,
             )
             new_rows.append([key, states_csv, new_state, today]); n_eval += 1
             if fired:
@@ -811,14 +833,15 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
         if not (any(e in enabled for e in _PF_INTRADAY_EVENTS) or _has_plan):
             continue
         try:
-            if tk not in hist_cache:
-                hist_cache[tk] = _fmp_price_history(tk)
+            _base_hist = _pf_hist(tk, hist_cache)
+            if tk not in quote_cache:
                 quote_cache[tk] = _fmp_quote_price(tk)
-            hist = _with_intraday_price(hist_cache[tk], quote_cache[tk])
+            hist = _with_intraday_price(_base_hist, quote_cache[tk])
             if hist is None or hist.empty:
                 continue
+            _entry = float(avg) if pd.notna(avg) else None
             an = rc.analyze_ticker(hist, spy_close=spy_close,
-                                   entry_price=float(avg) if pd.notna(avg) else None)
+                                   entry_price=_entry, entry_date=date_added)
             if not an.get("regime", {}).get("enough_data"):
                 continue
             live = quote_cache[tk] if quote_cache[tk] is not None else float(hist["Close"].iloc[-1])
@@ -826,8 +849,13 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
                 hist, float(avg) if pd.notna(avg) else None, entry_date=date_added)
             conds = rc.alert_conditions(an, price=live, stop_loss=_sl, target_price=_tp,
                                         pos_verdict=_posv)
+            # 2A: EOD 와 동일 규칙으로 장중에도 억제(공용 SSOT 헬퍼)
+            _bl = rc.compute_entry_baseline(hist, entry_price=_entry,
+                                            entry_date=date_added, spy_close=spy_close)
+            _sup = rc.baseline_suppressed_events(an, _bl, pos_verdict=_posv)
             active = [{"event": e, "label": rc.ALERT_EVENT_LABELS[e], "message": conds[e][1]}
-                      for e in _PF_INTRADAY_EVENTS if e in enabled and conds.get(e, (False, ""))[0]]
+                      for e in _PF_INTRADAY_EVENTS
+                      if e in enabled and e not in _sup and conds.get(e, (False, ""))[0]]
             # 손절/목표 도달(price)은 플랜이 설정된 보유에서 항상 발화
             if _has_plan and conds.get("price", (False, ""))[0]:
                 active.append({"event": "price", "label": rc.ALERT_EVENT_LABELS["price"],
