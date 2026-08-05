@@ -315,16 +315,24 @@ def _bucket_table(engine: str, snap: dict) -> str:
     df = sc._scanner_score_df_format_for_display(snap["score_df"].copy(), engine)
     cutoff = sc.SCANNER_CUTOFF.get(engine, 50.0)
     rows = []
+    _th = sc.watchlist_threshold(engine)
     for _, r in df.head(15).iterrows():
         fs = pd.to_numeric(r.get("Final Score"), errors="coerce")
         fsv = 0.0 if pd.isna(fs) else float(fs)
-        if fsv >= sc.WATCHLIST_AUTO_ADD_THRESHOLD:
+        if fsv >= _th:
             badge, color = "🔔 편입", "#4ade80"
         elif fsv >= cutoff:
             badge, color = "관심", "#fbbf24"
         else:
             badge, color = "관망", "#6b7280"
         why = str(r.get("Narrative Why", r.get("Structural Why", "")) or "")[:60]
+        # 확산주는 "어느 테마의 몇 차 확산"인지 함께 보여 인과 고리를 눈으로 검증하게 한다
+        _theme, _stage = str(r.get("Theme", "") or ""), str(r.get("Stage", "") or "")
+        if engine == "expansion" and (_theme or _stage):
+            why = (f'<span style="color:#60a5fa;">[{_esc(_theme[:18])}'
+                   f'{" · " + _esc(_stage[:12]) if _stage else ""}]</span> ') + _esc(why)
+        else:
+            why = _esc(why)
         rows.append(
             f'<tr>'
             f'<td style="padding:7px 10px;border-bottom:1px solid #232733;font-weight:600;">'
@@ -336,7 +344,7 @@ def _bucket_table(engine: str, snap: dict) -> str:
             f'<td style="padding:7px 10px;border-bottom:1px solid #232733;color:{color};'
             f'font-size:12px;">{badge}</td>'
             f'<td style="padding:7px 10px;border-bottom:1px solid #232733;color:#9aa0a6;'
-            f'font-size:12px;">{_esc(why)}</td>'
+            f'font-size:12px;">{why}</td>'
             f'</tr>')
     _uni_n = len(snap.get("universe") or [])
     _cov = float(snap.get("coverage", 0.0)) * 100
@@ -348,7 +356,7 @@ def _bucket_table(engine: str, snap: dict) -> str:
     <div style="margin:22px 0 8px;font-size:16px;font-weight:700;">
       {_ENGINE_EMOJI[engine]} {sc.ENGINE_LABELS[engine]}
       <span style="font-size:12px;color:#7a7f87;font-weight:400;">
-        · 유니버스 {_uni_n}종목 · 채점 {len(snap["score_df"])}종목 · 컷오프 {cutoff:.0f}
+        · 유니버스 {_uni_n}종목 · 채점 {len(snap["score_df"])}종목 · 컷오프 {cutoff:.0f} · 편입선 {_th:.0f}
         {_cov_html}</span>
     </div>
     <table style="width:100%;border-collapse:collapse;font-size:13px;">
@@ -386,7 +394,7 @@ def build_email(result: dict, added: list, skipped: list,
           <div style="font-weight:700;margin-bottom:8px;color:#4ade80;">
             🔔 워치리스트 신규 편입 {len(added)}종목
             <span style="font-weight:400;font-size:12px;color:#7a9a85;">
-              (Final Score ≥ {sc.WATCHLIST_AUTO_ADD_THRESHOLD:.0f})</span>
+              (주도주·대기주 ≥{sc.watchlist_threshold("leaders"):.0f} · 확산주 ≥{sc.watchlist_threshold("expansion"):.0f})</span>
           </div>
           <table style="width:100%;border-collapse:collapse;font-size:13px;">{rows}</table>
           <div style="margin-top:10px;font-size:12px;color:#7a9a85;">
@@ -397,7 +405,7 @@ def build_email(result: dict, added: list, skipped: list,
     else:
         added_html = ('<div style="color:#7a7f87;margin:18px 0;padding:12px 16px;'
                       'background:#1a1d24;border-radius:4px;">'
-                      f'70점 이상 신규 종목이 없습니다.</div>')
+                      f'편입 기준을 넘긴 신규 종목이 없습니다.</div>')
 
     skip_html = ""
     if skipped:
