@@ -85,8 +85,18 @@ jobs:
           GMAIL_TO:            ${{ secrets.GMAIL_TO }}
           GSPREAD_KEY:         ${{ secrets.GSPREAD_KEY }}
           SCANNER_SCAN_FORCE:  ${{ inputs.force_weekly && '1' || '' }}
+          # FMP Starter 플랜 = 300콜/분. 여유를 두고 250 으로 페이싱한다.
+          # (미설정 시 스캐너가 61초에 950콜을 쏴 한도를 3배 초과 → 확산주 76종목 중
+          #  73종목이 데이터 수집에 실패하고 뒤이은 Hidden Alpha 까지 죽었다)
+          FMP_RATE_LIMIT_PER_MIN: '250'
         run: |
           python automation/run_scanner_scan.py
+
+      # 레이트 리미터는 프로세스별 슬라이딩 윈도우라 프로세스가 바뀌면 초기화된다.
+      # 직전 1분에 소모한 토큰이 FMP 서버 쪽에는 남아 있으므로 쿨다운을 둔다.
+      - name: ⏳ FMP 레이트리밋 쿨다운
+        if: always()
+        run: sleep 60
 
       - name: 💰 Hidden Alpha Radar (주간 · Top5 로테이션)
         if: always()
@@ -97,6 +107,7 @@ jobs:
           GMAIL_TO:           ${{ secrets.GMAIL_TO }}
           GSPREAD_KEY:        ${{ secrets.GSPREAD_KEY }}
           HIDDEN_ALPHA_FORCE: ${{ inputs.force_hidden_alpha }}
+          FMP_RATE_LIMIT_PER_MIN: '250'
         run: |
           python automation/run_hidden_alpha.py
 
