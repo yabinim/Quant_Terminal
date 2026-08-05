@@ -507,9 +507,26 @@ def main():
         f"테마 {len(analysis.get('themes') or [])}개")
 
     # ── 2) 3버킷 입력 풀 ──────────────────────────────────────────────────
-    pools = narrative_core.weekly_scan_pools(analysis)
+    pools = narrative_core.weekly_scan_pools(analysis, with_stats=True)
+    _ps = pools.get("stats") or {}
     log(f"[STEP 2] 풀 분리 — winners {len(pools['winners'])} · "
         f"expanding {len(pools['expanding'])}")
+    if _ps:
+        log(f"[INFO] 확산주 정제: 원본 {_ps.get('raw', 0)}종목 → {_ps.get('kept', 0)}종목")
+        _ov = _ps.get("dropped_overlap") or []
+        if _ov:
+            log(f"[INFO]   ① winners 교집합 제거 {len(_ov)}종목: "
+                f"{', '.join(_ov[:20])}{' …' if len(_ov) > 20 else ''}")
+        _rare = _ps.get("dropped_rare") or []
+        if _rare:
+            log(f"[INFO]   ② 등장 {_ps.get('min_days')}일 미만 제거 {len(_rare)}종목: "
+                f"{', '.join(_rare[:20])}{' …' if len(_rare) > 20 else ''}")
+        if not _ps.get("freq_available"):
+            log("[WARN]   빈도 정보 없는 구 레코드 — 등장일수 필터 미적용")
+        _h = _ps.get("freq_hist") or {}
+        if _h:
+            log("[INFO]   등장 일수 분포: "
+                + " · ".join(f"{d}일 {n}종목" for d, n in _h.items()))
     if not pools["winners"] and not pools["expanding"]:
         log("[ERROR] 스캔 가능한 티커가 없습니다.")
         return 1
@@ -532,6 +549,21 @@ def main():
             f"(커버리지 {cov:.0f}%){flag}")
         if snap.get("degraded"):
             _degraded.append(sc.ENGINE_LABELS[e])
+    for e in _ENGINES:
+        snap = result.get(e)
+        if snap is None or snap["score_df"].empty:
+            continue
+        _fs = pd.to_numeric(
+            sc._scanner_score_df_format_for_display(snap["score_df"].copy(), e)["Final Score"],
+            errors="coerce").dropna()
+        if _fs.empty:
+            continue
+        _q = _fs.quantile([.25, .5, .75, .9]).round(2)
+        log(f"[DIST] {sc.ENGINE_LABELS[e]} 점수 — 최소 {_fs.min():.2f} · "
+            f"Q1 {_q.iloc[0]} · 중앙 {_q.iloc[1]} · Q3 {_q.iloc[2]} · "
+            f"P90 {_q.iloc[3]} · 최대 {_fs.max():.2f}")
+        _cuts = " · ".join(f"{c}점 {int((_fs >= c).sum())}종목" for c in (70, 72, 74, 76, 78, 80))
+        log(f"[DIST] {sc.ENGINE_LABELS[e]} 커트라인별 — {_cuts}")
     log(f"[INFO] {fx.fmp_stats_line()}")
     if _degraded:
         log(f"[WARN] 커버리지 부족 버킷: {', '.join(_degraded)} — 워치리스트 편입 제외")
