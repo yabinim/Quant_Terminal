@@ -720,6 +720,14 @@ NARRATIVE_SOURCE_WEEKLY_7D = "weekly_trend_7d"
 # 7일치 themes 를 제목 기준으로 병합한 뒤 유지할 최대 테마 수 (설계 확정: 12)
 WEEKLY_THEME_MERGE_LIMIT = 12
 
+# 확산주 유니버스 최소 등장 '일수'(ET 달력 기준 고유 날짜).
+# 주간 브리핑 프롬프트가 이미 "7일 빈도·일관성"을 기준으로 쓰는데 확산주 풀만
+# 그 기준을 안 쓰고 있어서 하루 스쳐간 일회성 언급까지 전부 들어와 87종목까지 불었다.
+import os as _os
+WEEKLY_EXPANSION_MIN_DAYS = max(1, int(_os.environ.get("WEEKLY_EXPANSION_MIN_DAYS", "2") or 2))
+
+_WEEKLY_ET_TZ = pytz.timezone("America/New_York")
+
 # Google Sheets 셀 한도 50,000자에 대한 안전 예산
 SHEET_CELL_BUDGET = 49000
 
@@ -796,6 +804,41 @@ def compact_record_for_timeseries(rec):
         "rotation": str(a.get("rotation") or "")[:800],
         "summary": str(a.get("summary") or "")[:2000],
     }
+
+
+def _rec_et_date(rec):
+    """레코드의 ET 달력 날짜. 하루 여러 스냅샷(8am/5pm)을 1일로 세기 위함."""
+    s = str((rec or {}).get("saved_at") or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_WEEKLY_ET_TZ).date().isoformat()
+    except Exception:
+        return None
+
+
+def count_expanding_frequency(week_recs) -> dict:
+    """티커 → expanding_to 에 등장한 '고유 날짜 수'(ET 기준).
+
+    확산주 풀 정제용. 추가 API 호출 없이 이미 가진 스냅샷만으로 계산한다.
+    """
+    seen = {}
+    for rec in (week_recs or []):
+        if not isinstance(rec, dict):
+            continue
+        a = rec.get("analysis") if isinstance(rec.get("analysis"), dict) else {}
+        if str(a.get("source") or "") == NARRATIVE_SOURCE_WEEKLY_7D:
+            continue
+        day = _rec_et_date(rec) or f"_seq{len(seen)}"
+        for th in (a.get("themes") or []):
+            for tk in theme_expanding_tickers(th if isinstance(th, dict) else {}):
+                seen.setdefault(tk, set()).add(day)
+    return {tk: len(days) for tk, days in seen.items()}
 
 
 def merge_weekly_themes(week_recs, limit: int = WEEKLY_THEME_MERGE_LIMIT) -> list:
@@ -890,15 +933,27 @@ def merge_weekly_themes(week_recs, limit: int = WEEKLY_THEME_MERGE_LIMIT) -> lis
     return out
 
 
-def weekly_scan_pools(analysis) -> dict:
+def weekly_scan_pools(analysis, min_days: int = None, with_stats: bool = False) -> dict:
     """주간 레코드 analysis 에서 3버킷 입력 풀을 뽑는다 (2C).
 
+    확산주 풀에 두 가지 정제를 적용한다:
+      ① **winners ∩ expanding 교집합 제거** — 확산주는 정의상 "아직 주도주·대기주가
+         아닌" 후발주다. MSFT 가 대기주(39.54)와 확산주(83.90)에 동시 등장한 것은
+         설계 위반이었다. driver 종목은 인과 고리가 없어 근거도 일반론으로 흐른다.
+      ② **등장 일수 하한** — 7일 중 `min_days` 일 이상 expanding_to 에 나온 티커만.
+         하루 스쳐간 일회성 언급을 걸러낸다. 추가 API 호출 없음.
+
+    Args:
+        min_days: 기본 WEEKLY_EXPANSION_MIN_DAYS. 0/None-safe.
+        with_stats: True 면 정제 내역(`stats`)을 함께 반환.
+
     Returns:
-        {"winners": [...],   # 주도주·대기주 라우팅 후보
-         "expanding": [...]} # 확산주 유니버스
+        {"winners": [...], "expanding": [...]}  (+ with_stats 면 "stats")
     """
     a = analysis if isinstance(analysis, dict) else {}
     themes = a.get("themes") if isinstance(a.get("themes"), list) else []
+    thr = WEEKLY_EXPANSION_MIN_DAYS if min_days is None else max(1, int(min_days))
+    freq = a.get("expanding_freq") if isinstance(a.get("expanding_freq"), dict) else {}
 
     winners, seen_w = [], set()
     expanding, seen_x = [], set()
@@ -917,6 +972,26 @@ def weekly_scan_pools(analysis) -> dict:
                 seen_x.add(tk)
                 expanding.append(tk)
 
+    raw_expanding = list(expanding)
+    dropped_overlap = [t for t in raw_expanding if t in seen_w]
+    kept = [t for t in raw_expanding if t not in seen_w]
+    # 빈도 정보가 없는 옛 레코드는 필터를 적용하지 않는다(하위 호환).
+    if freq:
+        dropped_rare = [t for t in kept if int(freq.get(t, 0)) < thr]
+        kept = [t for t in kept if int(freq.get(t, 0)) >= thr]
+    else:
+        dropped_rare = []
+    expanding = kept
+    _stats = {
+        "raw": len(raw_expanding),
+        "dropped_overlap": dropped_overlap,
+        "dropped_rare": dropped_rare,
+        "min_days": thr,
+        "freq_available": bool(freq),
+        "kept": len(expanding),
+        "freq_hist": _freq_histogram(freq, raw_expanding) if freq else {},
+    }
+
     # themes 가 비어 있는 옛 주간 레코드 폴백 — precomputed_universe 를 winners 로 사용
     if not winners and not expanding:
         pre = a.get("precomputed_universe")
@@ -926,7 +1001,19 @@ def weekly_scan_pools(analysis) -> dict:
                 if tk and tk not in seen_w:
                     seen_w.add(tk)
                     winners.append(tk)
-    return {"winners": winners, "expanding": expanding}
+    out = {"winners": winners, "expanding": expanding}
+    if with_stats:
+        out["stats"] = _stats
+    return out
+
+
+def _freq_histogram(freq: dict, tickers) -> dict:
+    """등장 일수별 티커 수 — 다음 주 임계값을 실측으로 정하기 위한 분포 로그."""
+    hist = {}
+    for t in (tickers or []):
+        d = int((freq or {}).get(t, 0))
+        hist[d] = hist.get(d, 0) + 1
+    return dict(sorted(hist.items()))
 
 
 def build_weekly_trend_record(briefing_markdown: str, language: str, week_recs: list,
@@ -951,6 +1038,8 @@ def build_weekly_trend_record(briefing_markdown: str, language: str, week_recs: 
     analysis = {
         "source": NARRATIVE_SOURCE_WEEKLY_7D,
         "themes": merged,
+        # 확산주 풀 정제용 티커별 등장 일수 (weekly_scan_pools 가 필터에 사용)
+        "expanding_freq": count_expanding_frequency(week_recs),
         "regime": {},
         "rotation": (f"최근 7일 롤링 윈도우 · 스냅샷 {len(week_recs or [])}건 기반 주간 트렌드 브리핑 "
                      f"(테마 {len(merged)}개 병합)"),

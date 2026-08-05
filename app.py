@@ -11530,6 +11530,7 @@ def get_latest_weekly_expansion_universe():
         reverse=True,
     )
     analysis = weekly[0].get("analysis") or {}
+    # 교집합 제거 + 등장일수 필터가 적용된 풀 (자동화와 동일)
     pools = narrative_core.weekly_scan_pools(analysis)
     return filter_scanner_ticker_list(pools["expanding"]), analysis
 
@@ -15482,9 +15483,16 @@ if st.session_state.get("logged_in"):
             if not _wk_a:
                 st.error("주간 트렌드 레코드가 없습니다. 「1.5 📊 주간 트렌드 추출」을 먼저 실행해 주세요.")
             else:
-                _pools = narrative_core.weekly_scan_pools(_wk_a)
+                _pools = narrative_core.weekly_scan_pools(_wk_a, with_stats=True)
+                _ps = _pools.get("stats") or {}
                 st.caption(f"입력 풀 — winners {len(_pools['winners'])}종목 · "
                            f"expanding {len(_pools['expanding'])}종목")
+                if _ps.get("raw"):
+                    st.caption(
+                        f"확산주 정제: {_ps['raw']} → {_ps['kept']}종목 "
+                        f"(주도주·대기주 중복 −{len(_ps.get('dropped_overlap') or [])} · "
+                        f"등장 {_ps.get('min_days')}일 미만 "
+                        f"−{len(_ps.get('dropped_rare') or [])})")
                 _reset_scanner_progress()
                 with st.spinner("3버킷 일괄 스캔 중... (수 분 소요)"):
                     _res = sc.run_three_bucket_scan(
