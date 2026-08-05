@@ -88,7 +88,10 @@ jobs:
           # FMP Starter 플랜 = 300콜/분. 여유를 두고 250 으로 페이싱한다.
           # (미설정 시 스캐너가 61초에 950콜을 쏴 한도를 3배 초과 → 확산주 76종목 중
           #  73종목이 데이터 수집에 실패하고 뒤이은 Hidden Alpha 까지 죽었다)
-          FMP_RATE_LIMIT_PER_MIN: '250'
+          FMP_RATE_LIMIT_PER_MIN: '200'
+          FMP_MAX_RETRIES: '3'
+          # 확산주 유니버스 최소 등장 일수 (7일 중). 풀이 여전히 크면 3으로 올린다.
+          WEEKLY_EXPANSION_MIN_DAYS: '2'
         run: |
           python automation/run_scanner_scan.py
 
@@ -107,7 +110,8 @@ jobs:
           GMAIL_TO:           ${{ secrets.GMAIL_TO }}
           GSPREAD_KEY:        ${{ secrets.GSPREAD_KEY }}
           HIDDEN_ALPHA_FORCE: ${{ inputs.force_hidden_alpha }}
-          FMP_RATE_LIMIT_PER_MIN: '250'
+          FMP_RATE_LIMIT_PER_MIN: '200'
+          FMP_MAX_RETRIES: '3'
         run: |
           python automation/run_hidden_alpha.py
 
