@@ -48,8 +48,25 @@ SCANNER_SCHEMA_VERSION = "v3-3bucket-auto"
 # 절대 컷오프 — Final Score 가 이 값 미만이면 "관망"(추천 없음). 절대 앵커링이라 의미 보존.
 SCANNER_CUTOFF = {"leaders": 55.0, "setups": 50.0, "expansion": 50.0}
 
-# 워치리스트 자동 편입 기준선 (3버킷 공통). 앱 배지·이메일·자동 추가가 전부 이 값을 본다.
-WATCHLIST_AUTO_ADD_THRESHOLD = 70.0
+# ── 워치리스트 자동 편입 기준선 (엔진별) ────────────────────────────────────
+# 세 엔진은 가중치 구조가 달라 **같은 70점이 같은 엄격도가 아니다.** 실측(2026-08-05):
+#   주도주 중앙 57.26 · 최대 72.17 → 70점 이상 5.3%
+#   대기주 중앙 62.72 · 최대 72.30 → 70점 이상 6.3%
+#   확산주 중앙 66.76 · 최대 77.44 → 70점 이상 32.6% / 76점 이상 4.7%
+# 확산주는 모멘텀·RS 를 의도적으로 뺀 자리에 Structural(Gemini) 0.40 이 들어가 하방이
+# 막혀 있다(무특징 종목의 기본값 ≈ 66점). 그래서 확산주만 76 으로 올려 엄격도를 맞춘다.
+_DEF_TH = {"leaders": 70.0, "emerging": 70.0, "expansion": 76.0}
+WATCHLIST_AUTO_ADD_THRESHOLDS = {
+    k: float(os.environ.get(f"WATCHLIST_TH_{k.upper()}", v) or v) for k, v in _DEF_TH.items()
+}
+# 하위 호환 — 엔진 미지정 호출부의 기본값
+WATCHLIST_AUTO_ADD_THRESHOLD = WATCHLIST_AUTO_ADD_THRESHOLDS["leaders"]
+
+
+def watchlist_threshold(engine: str) -> float:
+    """엔진별 워치리스트 편입 기준선. 앱 배지·이메일·자동 추가가 전부 이 함수를 본다."""
+    return float(WATCHLIST_AUTO_ADD_THRESHOLDS.get(str(engine).strip(),
+                                                   WATCHLIST_AUTO_ADD_THRESHOLD))
 
 # 자동 추가 종목의 기본 알림 플래그 (app.py `_WL_ALERT_DEFAULT` 와 동일해야 함)
 WATCHLIST_AUTO_ADD_ALERT_STATES = "entry,risk,watch"
@@ -1687,6 +1704,12 @@ def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
     가격 신호가 없어 모멘텀/RS 제외. Structural(공급망 연결강도) 0.40 + Accumulation(초기 축적) 0.25
     + Fundamentals 0.20 + Valuation(재평가 여지) 0.15. 절대 앵커링.
     """
+    _expansion_ctx = {}
+    try:
+        import narrative_core as _nc
+        _expansion_ctx = _nc.expansion_ticker_context(latest_analysis)
+    except Exception:
+        _expansion_ctx = {}
     if not universe_tickers:
         return pd.DataFrame()
 
@@ -1793,10 +1816,14 @@ def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
 
         long_name = str(info.get("longName") or info.get("shortName") or ticker).strip()
 
+        _ctx = _expansion_ctx.get(ticker, {})
         rows.append(
             {
                 "Ticker": ticker,
                 "Name": long_name,
+                # 어느 테마의 몇 차 확산인지 — 인과 고리 타당성을 눈으로 검증하기 위함
+                "Theme": str(_ctx.get("theme", "") or ""),
+                "Stage": str(_ctx.get("stage", "") or ""),
                 "Price": round(float(last_px), 4) if pd.notna(last_px) else np.nan,
                 "Structural Raw": structural_score,
                 "Structural Available": bool(structural_available),
@@ -1844,7 +1871,7 @@ def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
 #    앱 배지 · 이메일 표시 · 자동 추가가 **전부 이 함수 하나**를 본다.
 # ══════════════════════════════════════════════════════════════════════════════
 def pick_watchlist_candidates(score_df, engine: str,
-                              threshold: float = WATCHLIST_AUTO_ADD_THRESHOLD,
+                              threshold: float = None,
                               snap: dict = None) -> list:
     """Final Score 가 기준선 이상인 종목을 점수 내림차순으로 반환.
 
@@ -1856,6 +1883,8 @@ def pick_watchlist_candidates(score_df, engine: str,
         [{"ticker","score","engine","engine_label","name","price","why","risk"}, ...]
         상한 없음(설계 확정) — 70점을 넘긴 종목은 전부 편입 대상이다.
     """
+    if threshold is None:
+        threshold = watchlist_threshold(engine)
     if isinstance(snap, dict) and snap.get("degraded"):
         _log("warn", f"{ENGINE_LABELS.get(engine, engine)}: 커버리지 부족으로 "
                      f"워치리스트 편입을 건너뜁니다.")

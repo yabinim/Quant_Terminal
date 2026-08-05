@@ -92,7 +92,8 @@ _SCANNER_GEMINI_CHUNK_MAX_RETRIES    = sc._SCANNER_GEMINI_CHUNK_MAX_RETRIES
 _SCANNER_GEMINI_CHUNK_RETRY_SLEEP_SEC = sc._SCANNER_GEMINI_CHUNK_RETRY_SLEEP_SEC
 SCANNER_NARRATIVE_API_FAIL_MESSAGE        = sc.SCANNER_NARRATIVE_API_FAIL_MESSAGE
 SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS  = sc.SCANNER_NARRATIVE_EXCLUDE_WEIGHT_REASONS
-WATCHLIST_AUTO_ADD_THRESHOLD = sc.WATCHLIST_AUTO_ADD_THRESHOLD
+WATCHLIST_AUTO_ADD_THRESHOLD  = sc.WATCHLIST_AUTO_ADD_THRESHOLD
+WATCHLIST_AUTO_ADD_THRESHOLDS = sc.WATCHLIST_AUTO_ADD_THRESHOLDS
 
 # ── scanner_core 훅 배선 (Streamlit 분리 계층) ───────────────────────────────
 # lambda 라 호출 시점에 이름이 해석된다 → 아래에 정의되는 _ensure_genai_client 도 안전.
@@ -15535,8 +15536,9 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     pass
                 if _picks:
-                    st.info("🔔 워치리스트 편입 기준(≥"
-                            f"{sc.WATCHLIST_AUTO_ADD_THRESHOLD:.0f}점) 충족: "
+                    st.info("🔔 워치리스트 편입 기준 충족 "
+                            f"(주도주·대기주 ≥{sc.watchlist_threshold('leaders'):.0f} · "
+                            f"확산주 ≥{sc.watchlist_threshold('expansion'):.0f}): "
                             + ", ".join(f"{p['ticker']} {p['score']:.2f}"
                                         f"({p['engine_label']})" for p in _picks)
                             + "  — 자동 편입은 토요일 자동화가 수행합니다.")

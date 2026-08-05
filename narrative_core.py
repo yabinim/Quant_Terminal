@@ -301,6 +301,12 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
    - driver(이 테마의 실제 원동력)에서 출발해 전파를 추론하라. 일반 섹터 상식으로 채우지 말 것.
    - 인과 고리를 설명할 수 없는 종목은 포함하지 말 것.
    - 이미 크게 오른 유명 대형주보다, 아직 시장이 주목하지 않은 후발 수혜주를 우선하라.
+   - **driver 기업 자체는 expanding_to 에 넣지 말 것.** 테마의 원동력에 해당하는 기업
+     (예: AI 캐팩스 테마의 반도체 설계·클라우드 사업자)은 확산의 '출발점'이지 수혜처가
+     아니다. 같은 theme 의 winners·emerging 에 이미 넣은 티커도 expanding_to 에서 제외한다.
+   - stage 3(원거리)에서 인과 고리를 확신할 수 있는 티커가 없으면 **그 stage 를 통째로
+     생략하라.** 규칙 11(티커 정확도) 때문에 확신 가능한 유명 대형주로 빈칸을 메우는 것을
+     금지한다 — 억지로 채운 확산주는 다음 단계에서 걸러지지 않고 그대로 매수 후보가 된다.
 8) momentum_note: 반드시 "강함", "보통", "약함" 셋 중 하나만 출력 (설명 금지, 큰따옴표 사용 금지)
 9) 결과는 반드시 {language_label}로, 금융 전문 용어를 사용하여 가장 자연스럽게 작성
 10) winners/emerging 선정 근거: 뉴스의 Tickers 태그 + 반복 등장 횟수 + 뉴스에 드러난 가격 모멘텀을 종합해 판단하세요.
@@ -930,6 +936,27 @@ def merge_weekly_themes(week_recs, limit: int = WEEKLY_THEME_MERGE_LIMIT) -> lis
             "risk": b["risk"],
             "occurrences": b["occurrences"],
         })
+    return out
+
+
+def expansion_ticker_context(analysis) -> dict:
+    """확산주 티커 → {"theme","stage","linkage"} 맥락 맵.
+
+    "어느 테마의 몇 차 확산인가"를 표·이메일에 표시해 사용자가 인과 고리의 타당성을
+    눈으로 검증할 수 있게 한다. 억지로 끼워진 확산주가 바로 드러난다.
+    """
+    a = analysis if isinstance(analysis, dict) else {}
+    out = {}
+    for th in (a.get("themes") or []):
+        th = th if isinstance(th, dict) else {}
+        title = str(th.get("title", "") or "").strip()
+        for flow in (th.get("expanding_to") or []):
+            flow = flow if isinstance(flow, dict) else {}
+            stage = str(flow.get("stage", "") or "").strip()
+            linkage = str(flow.get("linkage", "") or "").strip()
+            for tk in parse_theme_tickers(flow.get("expected_tickers", "")):
+                if tk not in out:   # 먼저 등장한(= 빈도 높은) 테마를 대표로
+                    out[tk] = {"theme": title, "stage": stage, "linkage": linkage}
     return out
 
 
