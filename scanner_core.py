@@ -34,6 +34,7 @@ import pytz
 
 import regime_core as rc
 import gemini_core
+import fmp_extras as fx
 
 # ── 공용 상수 ─────────────────────────────────────────────────────────────────
 _FMP_BASE = "https://financialmodelingprep.com/stable"
@@ -52,6 +53,11 @@ WATCHLIST_AUTO_ADD_THRESHOLD = 70.0
 
 # 자동 추가 종목의 기본 알림 플래그 (app.py `_WL_ALERT_DEFAULT` 와 동일해야 함)
 WATCHLIST_AUTO_ADD_ALERT_STATES = "entry,risk,watch"
+
+# 데이터 커버리지 하한 — 유니버스 대비 채점 성공률이 이 값 미만이면 "오염(degraded)" 으로
+# 표시하고 **워치리스트 자동 편입에서 제외**한다.
+# (Starter 플랜 300콜/분 초과로 확산주 76종목 중 3종목만 채점됐던 사고 재발 방지)
+SCAN_MIN_COVERAGE = 0.60
 
 ENGINE_LABELS = {"leaders": "주도주", "emerging": "대기주", "expansion": "확산주"}
 
@@ -366,7 +372,7 @@ def _fmp_profile(ticker: str) -> dict:
     k = _fmp_key()
     if not k: return {}
     try:
-        r = requests.get(f"{_FMP_BASE}/profile?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
+        r = fx.fmp_get(f"{_FMP_BASE}/profile?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
         d = r.json()
         return d[0] if isinstance(d, list) and d else {}
     except Exception:
@@ -378,8 +384,8 @@ def _fmp_ratios(ticker: str) -> dict:
     k = _fmp_key()
     if not k: return {}
     try:
-        r = requests.get(f"{_FMP_BASE}/ratios-ttm?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
-        if r.status_code == 200:
+        r = fx.fmp_get(f"{_FMP_BASE}/ratios-ttm?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
+        if r is not None:
             d = r.json()
             return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
     except Exception:
@@ -392,8 +398,8 @@ def _fmp_key_metrics(ticker: str) -> dict:
     k = _fmp_key()
     if not k: return {}
     try:
-        r = requests.get(f"{_FMP_BASE}/key-metrics-ttm?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
-        if r.status_code == 200:
+        r = fx.fmp_get(f"{_FMP_BASE}/key-metrics-ttm?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
+        if r is not None:
             d = r.json()
             return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
     except Exception:
@@ -406,7 +412,7 @@ def _fmp_income(ticker: str) -> dict:
     k = _fmp_key()
     if not k: return {}
     try:
-        r = requests.get(f"{_FMP_BASE}/income-statement?symbol={ticker}&period=annual&limit=2&apikey={k}", timeout=_FMP_TIMEOUT)
+        r = fx.fmp_get(f"{_FMP_BASE}/income-statement?symbol={ticker}&period=annual&limit=2&apikey={k}", timeout=_FMP_TIMEOUT)
         d = r.json()
         return {"latest": d[0] if d else {}, "prev": d[1] if len(d) > 1 else {}}
     except Exception:
@@ -419,11 +425,11 @@ def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
     if not k:
         return pd.DataFrame()
     try:
-        r = requests.get(
+        r = fx.fmp_get(
             f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
-        if r.status_code != 200:
+        if r is None:
             return pd.DataFrame()
         data = r.json()
         rows = data.get("historical", data) if isinstance(data, dict) else data
@@ -482,8 +488,8 @@ def _fmp_quote(ticker: str) -> dict:
     if not k:
         return {}
     try:
-        r = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
-        if r.status_code == 200:
+        r = fx.fmp_get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k}", timeout=_FMP_TIMEOUT)
+        if r is not None:
             d = r.json()
             return d[0] if isinstance(d, list) and d else {}
     except Exception:
@@ -497,11 +503,11 @@ def _fmp_analyst_estimates(ticker: str) -> list:
     if not k:
         return []
     try:
-        r = requests.get(
+        r = fx.fmp_get(
             f"{_FMP_BASE}/analyst-estimates?symbol={ticker}&period=annual&limit=4&apikey={k}",
             timeout=_FMP_TIMEOUT,
         )
-        if r.status_code == 200:
+        if r is not None:
             d = r.json()
             return d if isinstance(d, list) else []
     except Exception:
@@ -515,11 +521,11 @@ def _fmp_balance_sheet(ticker: str) -> dict:
     if not k:
         return {}
     try:
-        r = requests.get(
+        r = fx.fmp_get(
             f"{_FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit=2&apikey={k}",
             timeout=_FMP_TIMEOUT,
         )
-        if r.status_code == 200:
+        if r is not None:
             d = r.json()
             return d[0] if isinstance(d, list) and d else {}
     except Exception:
@@ -1838,13 +1844,22 @@ def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
 #    앱 배지 · 이메일 표시 · 자동 추가가 **전부 이 함수 하나**를 본다.
 # ══════════════════════════════════════════════════════════════════════════════
 def pick_watchlist_candidates(score_df, engine: str,
-                              threshold: float = WATCHLIST_AUTO_ADD_THRESHOLD) -> list:
+                              threshold: float = WATCHLIST_AUTO_ADD_THRESHOLD,
+                              snap: dict = None) -> list:
     """Final Score 가 기준선 이상인 종목을 점수 내림차순으로 반환.
+
+    Args:
+        snap: 해당 버킷 스냅샷. degraded=True 면 **빈 리스트**를 반환한다.
+              데이터 수집이 깨진 상태에서 나온 고득점은 신뢰할 수 없기 때문.
 
     Returns:
         [{"ticker","score","engine","engine_label","name","price","why","risk"}, ...]
         상한 없음(설계 확정) — 70점을 넘긴 종목은 전부 편입 대상이다.
     """
+    if isinstance(snap, dict) and snap.get("degraded"):
+        _log("warn", f"{ENGINE_LABELS.get(engine, engine)}: 커버리지 부족으로 "
+                     f"워치리스트 편입을 건너뜁니다.")
+        return []
     if not isinstance(score_df, pd.DataFrame) or score_df.empty:
         return []
     if "Final Score" not in score_df.columns or "Ticker" not in score_df.columns:
@@ -1921,6 +1936,9 @@ def run_three_bucket_scan(winners_pool, expansion_pool, latest_analysis,
     result = {
         "leaders": None, "emerging": None, "expansion": None,
         "routed": None, "run_by": run_by, "completed_at": completed_at,
+        # 후보 풀은 있었는데 결과가 비어버린 버킷 — "후보 없음"과 구분해야 한다.
+        # (전량 데이터 실패가 정상처럼 보이는 조용한 실패를 막는다)
+        "failed": [],
     }
 
     # ── 정량 라우팅: 후보 풀을 regime 으로 분기 ────────────────────────────
@@ -1933,14 +1951,29 @@ def run_three_bucket_scan(winners_pool, expansion_pool, latest_analysis,
     }
     _log("info", f"[라우팅] 주도주 {len(routed['leaders'])} · 대기주 {len(routed['setups'])} "
                  f"· 제외 {len(routed['excluded'])}")
+    if winners_pool and not routed["leaders"] and not routed["setups"]:
+        result["failed"].append("routing")
+        _log("error", f"라우팅: 후보 {len(winners_pool)}종목이 전부 제외됐습니다. "
+                      f"가격 데이터 수집 실패 가능성이 높습니다.")
 
     def _snap(df, mode_note, universe):
+        uni = list(universe)
+        scored = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+        coverage = (scored / len(uni)) if uni else 0.0
+        degraded = bool(uni) and coverage < SCAN_MIN_COVERAGE
+        if degraded:
+            _log("error",
+                 f"{mode_note}: 커버리지 {coverage*100:.0f}% ({scored}/{len(uni)}) — "
+                 f"데이터 수집 실패로 판단. 워치리스트 자동 편입에서 제외합니다.")
         return {
             "score_df": df.copy(),
             "mode_note": mode_note,
             "scanner_mode": "주간 3버킷 일괄 스캔",
             "scanner_data_source": "주간 메가 트렌드",
-            "universe": list(universe),
+            "universe": uni,
+            "scored_count": scored,
+            "coverage": round(coverage, 4),
+            "degraded": degraded,
             "completed_at": completed_at,
             "run_by": run_by,
         }
@@ -1954,8 +1987,13 @@ def run_three_bucket_scan(winners_pool, expansion_pool, latest_analysis,
             if isinstance(df_l, pd.DataFrame) and not df_l.empty:
                 df_l = df_l.copy()
                 df_l["Narrative Why"] = df_l.get("Narrative Why", "")
-                result["leaders"] = _snap(df_l, "주도주 · 주간 메가 트렌드", winners_pool)
+                result["leaders"] = _snap(df_l, "주도주 · 주간 메가 트렌드", routed["leaders"])
+            else:
+                result["failed"].append("leaders")
+                _log("error", f"주도주: 후보 {len(routed['leaders'])}종목인데 채점 결과가 "
+                              f"비었습니다. 데이터 수집 실패로 판단합니다.")
         except Exception as exc:
+            result["failed"].append("leaders")
             _log("error", f"주도주 스캔 실패: {exc}\n{traceback.format_exc()}")
     else:
         _log("warn", "주도주(강세 추세) 후보가 없습니다.")
@@ -1965,8 +2003,13 @@ def run_three_bucket_scan(winners_pool, expansion_pool, latest_analysis,
         try:
             df_e = score_emerging_opportunity_universe(routed["setups"], latest_analysis)
             if isinstance(df_e, pd.DataFrame) and not df_e.empty:
-                result["emerging"] = _snap(df_e, "대기주 · 주간 메가 트렌드", winners_pool)
+                result["emerging"] = _snap(df_e, "대기주 · 주간 메가 트렌드", routed["setups"])
+            else:
+                result["failed"].append("emerging")
+                _log("error", f"대기주: 후보 {len(routed['setups'])}종목인데 채점 결과가 "
+                              f"비었습니다. 데이터 수집 실패로 판단합니다.")
         except Exception as exc:
+            result["failed"].append("emerging")
             _log("error", f"대기주 스캔 실패: {exc}\n{traceback.format_exc()}")
     else:
         _log("warn", "대기주(베이스 단계) 후보가 없습니다.")
@@ -1977,9 +2020,18 @@ def run_three_bucket_scan(winners_pool, expansion_pool, latest_analysis,
             df_x = score_expansion_opportunity_universe(expansion_pool, latest_analysis)
             if isinstance(df_x, pd.DataFrame) and not df_x.empty:
                 result["expansion"] = _snap(df_x, "확산주 · 주간 expanding_to", expansion_pool)
+            else:
+                result["failed"].append("expansion")
+                _log("error", f"확산주: 후보 {len(expansion_pool)}종목인데 채점 결과가 "
+                              f"비었습니다. 데이터 수집 실패로 판단합니다.")
         except Exception as exc:
+            result["failed"].append("expansion")
             _log("error", f"확산주 스캔 실패: {exc}\n{traceback.format_exc()}")
     else:
         _log("warn", "확산주(expanding_to) 후보가 없습니다.")
 
+    try:
+        _log("info", fx.fmp_stats_line())
+    except Exception:
+        pass
     return result

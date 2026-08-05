@@ -9529,6 +9529,9 @@ def save_scanner_last_result(user_id: str, snap: dict, engine: str) -> tuple[boo
             "scanner_mode": snap.get("scanner_mode", ""),
             "scanner_data_source": snap.get("scanner_data_source", ""),
             "universe": snap.get("universe", []),
+            "scored_count": snap.get("scored_count"),
+            "coverage": snap.get("coverage"),
+            "degraded": bool(snap.get("degraded")),
             "completed_at": snap.get("completed_at", saved_at),
             "schema_version": _SCANNER_SCHEMA_VERSION,
             # 앱 배너용 — "🤖 자동화 스캔(이메일과 동일)" vs "✋ 수동 스캔" 구분
@@ -9596,6 +9599,9 @@ def load_scanner_last_result(user_id: str, engine: str) -> dict | None:
                         "scanner_mode": meta.get("scanner_mode", ""),
                         "scanner_data_source": meta.get("scanner_data_source", ""),
                         "universe": meta.get("universe", []),
+                        "scored_count": meta.get("scored_count"),
+                        "coverage": meta.get("coverage"),
+                        "degraded": bool(meta.get("degraded")),
                         "completed_at": meta.get("completed_at", ""),
                         # 자동화가 쓴 스냅샷이면 "auto" — 배너가 이 값을 본다
                         "run_by": meta.get("run_by", "manual"),
@@ -15433,6 +15439,13 @@ if st.session_state.get("logged_in"):
             if isinstance(_s, dict) and isinstance(_s.get("score_df"), pd.DataFrame):
                 _run_by_seen.append((str(_s.get("run_by") or "manual"),
                                      str(_s.get("completed_at") or "")))
+        _deg_snaps = [k for k in ("scanner_results", "scanner_results_emerging",
+                                  "scanner_results_expansion")
+                      if isinstance(st.session_state.get(k), dict)
+                      and st.session_state[k].get("degraded")]
+        if _deg_snaps:
+            st.error("⚠️ 일부 버킷이 데이터 수집 실패 상태로 저장돼 있습니다. "
+                     "점수를 신뢰하지 마시고 재스캔해 주세요.")
         if _run_by_seen:
             _auto = [x for x in _run_by_seen if x[0] == "auto"]
             _when = ""
@@ -15491,12 +15504,28 @@ if st.session_state.get("logged_in"):
                     save_scanner_result_history(_uid_bulk, _snap["score_df"], engine=_eng)
                     _saved += 1
                 # 70점 편입 대상 미리보기 — 자동화와 동일한 판정 함수
-                _picks = []
+                _picks, _deg = [], []
                 for _eng in ("leaders", "emerging", "expansion"):
-                    if _res.get(_eng) is not None:
-                        _picks.extend(sc.pick_watchlist_candidates(
-                            _res[_eng]["score_df"], _eng))
+                    _sn = _res.get(_eng)
+                    if _sn is None:
+                        continue
+                    if _sn.get("degraded"):
+                        _deg.append(f"{sc.ENGINE_LABELS[_eng]} "
+                                    f"{_sn.get('coverage', 0) * 100:.0f}%")
+                    _picks.extend(sc.pick_watchlist_candidates(
+                        _sn["score_df"], _eng, snap=_sn))
                 st.success(f"일괄 스캔 완료 — {_saved}개 버킷 저장.")
+                if _deg:
+                    st.error(
+                        "⚠️ 데이터 수집 실패로 커버리지가 낮은 버킷이 있습니다: "
+                        + ", ".join(_deg)
+                        + " — 점수를 신뢰할 수 없어 워치리스트 편입 대상에서 제외했습니다. "
+                        "FMP 레이트리밋일 가능성이 높으니 잠시 후 재시도해 주세요."
+                    )
+                try:
+                    st.caption(fx.fmp_stats_line())
+                except Exception:
+                    pass
                 if _picks:
                     st.info("🔔 워치리스트 편입 기준(≥"
                             f"{sc.WATCHLIST_AUTO_ADD_THRESHOLD:.0f}점) 충족: "

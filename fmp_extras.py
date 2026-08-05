@@ -824,3 +824,89 @@ def filter_rotation_universe(pairs: list) -> tuple[list, list]:
             continue
         (excluded if is_rotation_excluded(tk, nm) else kept).append(tk)
     return kept, excluded
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# FMP 레이트 리미터 (SSOT) — Starter 플랜 300 calls/min 대응
+#
+# 배경: 주간 3버킷 스캐너가 61초에 약 950콜을 쏴서 한도를 3배 초과했고,
+#       그 직후 실행된 Hidden Alpha 는 324티커 전부 조회에 실패해 종료됐다.
+#       확산주도 76종목 중 73종목이 가격 데이터를 못 받아 결과가 오염됐다.
+#
+# scanner_core / run_hidden_alpha / 그 밖의 FMP 소비자는 **반드시** fmp_get() 을 쓴다.
+# 프로세스별 슬라이딩 윈도우이므로, 워크플로에서 스텝 사이 쿨다운도 함께 둘 것.
+# ══════════════════════════════════════════════════════════════════════════
+import threading as _threading
+from collections import deque as _deque
+
+# 한도의 약 83% 로 보수적 설정. 워크플로에서 환경변수로 조절 가능.
+FMP_RATE_LIMIT_PER_MIN = max(30, int(_os.environ.get("FMP_RATE_LIMIT_PER_MIN", "250") or 250))
+_FMP_WINDOW_SEC = 60.0
+
+_fmp_rate_lock = _threading.Lock()
+_fmp_call_times = _deque()
+_fmp_stats = {"ok": 0, "rate_limited": 0, "http_error": 0, "exception": 0,
+              "throttle_waits": 0, "throttle_sec": 0.0}
+
+
+def fmp_rate_limit_acquire() -> float:
+    """슬라이딩 윈도우 토큰 확보. 한도 초과 시 여유가 생길 때까지 대기.
+
+    Returns: 실제 대기한 초(0.0 이면 즉시 통과).
+    """
+    waited = 0.0
+    while True:
+        with _fmp_rate_lock:
+            now = _time.time()
+            while _fmp_call_times and (now - _fmp_call_times[0]) >= _FMP_WINDOW_SEC:
+                _fmp_call_times.popleft()
+            if len(_fmp_call_times) < FMP_RATE_LIMIT_PER_MIN:
+                _fmp_call_times.append(now)
+                if waited > 0:
+                    _fmp_stats["throttle_waits"] += 1
+                    _fmp_stats["throttle_sec"] += waited
+                return waited
+            sleep_for = _FMP_WINDOW_SEC - (now - _fmp_call_times[0]) + 0.01
+        sleep_for = min(max(sleep_for, 0.01), 5.0)
+        _time.sleep(sleep_for)
+        waited += sleep_for
+
+
+def fmp_get(url: str, timeout: float = None):
+    """레이트 리밋을 적용한 GET. 실패는 통계로 집계한다(조용한 실패 방지).
+
+    Returns: requests.Response | None
+    """
+    fmp_rate_limit_acquire()
+    try:
+        r = requests.get(url, timeout=(timeout or _FMP_TIMEOUT))
+    except Exception:
+        _fmp_stats["exception"] += 1
+        return None
+    if r.status_code == 200:
+        _fmp_stats["ok"] += 1
+        return r
+    if r.status_code in (429, 402):
+        _fmp_stats["rate_limited"] += 1
+    else:
+        _fmp_stats["http_error"] += 1
+    return None
+
+
+def fmp_stats() -> dict:
+    with _fmp_rate_lock:
+        return dict(_fmp_stats)
+
+
+def fmp_reset_stats() -> None:
+    with _fmp_rate_lock:
+        for k in _fmp_stats:
+            _fmp_stats[k] = 0 if k != "throttle_sec" else 0.0
+
+
+def fmp_stats_line() -> str:
+    s = fmp_stats()
+    total = s["ok"] + s["rate_limited"] + s["http_error"] + s["exception"]
+    return (f"FMP {total}콜 — 성공 {s['ok']} · 레이트리밋 {s['rate_limited']} · "
+            f"HTTP오류 {s['http_error']} · 예외 {s['exception']} · "
+            f"스로틀 대기 {s['throttle_sec']:.0f}초 (한도 {FMP_RATE_LIMIT_PER_MIN}/분)")
