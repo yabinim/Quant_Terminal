@@ -1,4 +1,4 @@
-name: 📅 5PM 주말·휴일 (내러티브만)
+name: 📅 5PM 주말·휴일 (내러티브 + 주간 리포트 + 3버킷 스캐너)
 
 on:
   repository_dispatch:
@@ -9,12 +9,18 @@ on:
         description: 'Hidden Alpha 강제 발송 (주1회 가드 무시)'
         type: boolean
         default: false
+      force_weekly:
+        description: '주간 리포트 + 3버킷 스캐너 강제 실행 (토요일 가드 무시)'
+        type: boolean
+        default: false
   # schedule 제거: GitHub Actions 자체 스케줄 비활성화
 
 jobs:
   run-5pm-weekend:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 주간 리포트(Gemini 1회) + 3버킷 스캔(FMP 병렬 수집 + Gemini 청크 3~6회)이
+    # 추가되어 기존 20분으로는 부족하다.
+    timeout-minutes: 45
 
     steps:
       - name: 📥 코드 체크아웃
@@ -51,6 +57,37 @@ jobs:
         run: |
           python automation/run_narrative.py
 
+      # ── 주간 리포트 (토요일 전용) ────────────────────────────────────────
+      # 스크립트 내부에 토요일 가드 + ISO주 중복 가드가 있어 일요일엔 스스로 스킵한다.
+      # 실패하면 exit 1 → 다음 스캐너 스텝이 자동으로 건너뛰어진다(설계 확정 ③).
+      - name: 📊 주간 트렌드 리포트 (토요일)
+        id: weekly
+        if: always()
+        env:
+          GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
+          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:            ${{ secrets.GMAIL_TO }}
+          GSPREAD_KEY:         ${{ secrets.GSPREAD_KEY }}
+          WEEKLY_REPORT_FORCE: ${{ inputs.force_weekly && '1' || '' }}
+        run: |
+          python automation/run_weekly_report.py
+
+      # ── 3버킷 AI 종목 스캐너 (주간 리포트 성공 시에만) ──────────────────
+      # steps.weekly.outcome == 'success' 가 설계 확정 ③(실패 시 스캔 스킵)을 구현한다.
+      - name: 🚀 주간 3버킷 스캐너 + 워치리스트 편입
+        if: steps.weekly.outcome == 'success'
+        env:
+          GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
+          FMP_API_KEY:         ${{ secrets.FMP_API_KEY }}
+          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:            ${{ secrets.GMAIL_TO }}
+          GSPREAD_KEY:         ${{ secrets.GSPREAD_KEY }}
+          SCANNER_SCAN_FORCE:  ${{ inputs.force_weekly && '1' || '' }}
+        run: |
+          python automation/run_scanner_scan.py
+
       - name: 💰 Hidden Alpha Radar (주간 · Top5 로테이션)
         if: always()
         env:
@@ -68,5 +105,6 @@ jobs:
         run: |
           echo "======================================"
           echo "5PM 주말 자동화 완료"
+          echo "주간 리포트: ${{ steps.weekly.outcome }}"
           echo "실행 시각 (UTC): $(date -u)"
           echo "======================================"
