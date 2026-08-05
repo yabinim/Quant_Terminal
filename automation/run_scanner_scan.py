@@ -43,6 +43,7 @@ from google import genai
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import narrative_core
 import scanner_core as sc
+import fmp_extras as fx
 
 # ── 환경변수 ─────────────────────────────────────────────────────────────────
 GOOGLE_API_KEY     = os.environ["GOOGLE_API_KEY"]
@@ -337,11 +338,18 @@ def _bucket_table(engine: str, snap: dict) -> str:
             f'<td style="padding:7px 10px;border-bottom:1px solid #232733;color:#9aa0a6;'
             f'font-size:12px;">{_esc(why)}</td>'
             f'</tr>')
+    _uni_n = len(snap.get("universe") or [])
+    _cov = float(snap.get("coverage", 0.0)) * 100
+    _deg = bool(snap.get("degraded"))
+    _cov_html = (f'<span style="color:#ff6b6b;font-weight:700;"> · ⚠️ 커버리지 '
+                 f'{_cov:.0f}% — 데이터 수집 실패, 편입 제외</span>') if _deg else \
+                f'<span> · 커버리지 {_cov:.0f}%</span>'
     return f"""
     <div style="margin:22px 0 8px;font-size:16px;font-weight:700;">
       {_ENGINE_EMOJI[engine]} {sc.ENGINE_LABELS[engine]}
       <span style="font-size:12px;color:#7a7f87;font-weight:400;">
-        · 유니버스 {len(snap.get('universe') or [])}종목 · 컷오프 {cutoff:.0f}</span>
+        · 유니버스 {_uni_n}종목 · 채점 {len(snap["score_df"])}종목 · 컷오프 {cutoff:.0f}
+        {_cov_html}</span>
     </div>
     <table style="width:100%;border-collapse:collapse;font-size:13px;">
       <tr style="color:#7a7f87;font-size:12px;text-align:left;">
@@ -398,6 +406,24 @@ def build_email(result: dict, added: list, skipped: list,
                      f'이미 워치리스트에 있어 건너뜀 {len(skipped)}종목 — {_esc(names)}'
                      f'<br>기존 손절가·목표가·알림 설정은 그대로 유지됩니다.</div>')
 
+    _deg_names = [sc.ENGINE_LABELS[e] for e in _ENGINES
+                  if result.get(e) is not None and result[e].get("degraded")]
+    _deg_names += [f"{sc.ENGINE_LABELS.get(e, e)}(전량 실패)"
+                   for e in (result.get("failed") or []) if e in sc.ENGINE_LABELS]
+    if "routing" in (result.get("failed") or []):
+        _deg_names.append("regime 라우팅(전량 제외)")
+    _degraded_banner = ""
+    if _deg_names:
+        _degraded_banner = (
+            '<div style="background:#2a1416;border-left:3px solid #ff6b6b;padding:12px 16px;'
+            'border-radius:4px;margin-bottom:16px;">'
+            '<div style="font-weight:700;color:#ff6b6b;margin-bottom:6px;">'
+            f'⚠️ 데이터 수집 실패 — {", ".join(_deg_names)}</div>'
+            '<div style="color:#d0a0a0;font-size:13px;line-height:1.6;">'
+            'FMP 응답 부족으로 해당 버킷의 점수를 신뢰할 수 없습니다. '
+            '워치리스트 자동 편입에서 제외했습니다. '
+            f'({fx.fmp_stats_line()})</div></div>')
+
     wk = weekly_dt.astimezone(_ET).strftime("%Y-%m-%d %H:%M ET") if weekly_dt else "-"
     body = f"""<html><body style="margin:0;padding:0;background:#0f1116;">
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -408,6 +434,7 @@ def build_email(result: dict, added: list, skipped: list,
         주간 리포트 기준 {wk} · 자동 실행
       </div>
 
+      {_degraded_banner}
       <div style="background:#1a1d24;padding:14px 16px;border-radius:6px;
            border-left:3px solid #60a5fa;">
         <div style="font-weight:700;margin-bottom:8px;">📊 주간 메가 트렌드</div>
@@ -492,10 +519,22 @@ def main():
     result = sc.run_three_bucket_scan(
         pools["winners"], pools["expanding"], analysis, run_by="auto")
 
+    _degraded = []
     for e in _ENGINES:
         snap = result.get(e)
-        n = 0 if snap is None else len(snap["score_df"])
-        log(f"[INFO] {sc.ENGINE_LABELS[e]}: {n}종목 채점")
+        if snap is None:
+            log(f"[INFO] {sc.ENGINE_LABELS[e]}: 후보 없음")
+            continue
+        n = len(snap["score_df"])
+        cov = snap.get("coverage", 0.0) * 100
+        flag = " ⚠️ 커버리지 부족" if snap.get("degraded") else ""
+        log(f"[INFO] {sc.ENGINE_LABELS[e]}: {n}/{len(snap.get('universe') or [])}종목 채점 "
+            f"(커버리지 {cov:.0f}%){flag}")
+        if snap.get("degraded"):
+            _degraded.append(sc.ENGINE_LABELS[e])
+    log(f"[INFO] {fx.fmp_stats_line()}")
+    if _degraded:
+        log(f"[WARN] 커버리지 부족 버킷: {', '.join(_degraded)} — 워치리스트 편입 제외")
 
     if all(result.get(e) is None for e in _ENGINES):
         log("[ERROR] 3버킷 모두 결과 없음.")
@@ -519,7 +558,7 @@ def main():
     for e in _ENGINES:
         if result.get(e) is None:
             continue
-        picks = sc.pick_watchlist_candidates(result[e]["score_df"], e)
+        picks = sc.pick_watchlist_candidates(result[e]["score_df"], e, snap=result[e])
         log(f"  {sc.ENGINE_LABELS[e]}: {len(picks)}종목 "
             f"{[(p['ticker'], p['score']) for p in picks]}")
         candidates.extend(picks)
@@ -550,6 +589,11 @@ def main():
 
     log("=" * 60)
     log(f"[DONE] 주도주/대기주/확산주 스캔 완료 · 워치리스트 +{len(added)}")
+    if result.get("failed") or _degraded:
+        # 메일은 이미 보냈다(사용자가 상황을 봐야 하므로). 다만 워크플로에는 실패로 알린다.
+        log(f"[FAIL] 데이터 수집 문제 — 전량실패 {result.get('failed')} · "
+            f"커버리지부족 {_degraded}")
+        return 1
     return 0
 
 

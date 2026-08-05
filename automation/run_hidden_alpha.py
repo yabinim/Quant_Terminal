@@ -173,11 +173,11 @@ def load_universe_tickers(ws) -> list[str]:
 def _fmp_price_history_close(ticker: str, limit: int = 130) -> pd.Series:
     """historical-price-eod → Close 시리즈."""
     try:
-        r = requests.get(
+        r = fx.fmp_get(
             f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
             timeout=_FMP_TIMEOUT,
         )
-        if r.status_code != 200:
+        if r is None:
             return pd.Series(dtype=float)
         data = r.json()
         rows = data.get("historical", data) if isinstance(data, dict) else data
@@ -222,7 +222,7 @@ def _fmp_batch_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
 
 def _fmp_profile(ticker: str) -> dict:
     try:
-        r = requests.get(f"{_FMP_BASE}/profile?symbol={ticker}&apikey={FMP_API_KEY}", timeout=_FMP_TIMEOUT)
+        r = fx.fmp_get(f"{_FMP_BASE}/profile?symbol={ticker}&apikey={FMP_API_KEY}", timeout=_FMP_TIMEOUT)
         d = r.json()
         return d[0] if isinstance(d, list) and d else {}
     except Exception:
@@ -232,8 +232,8 @@ def _fmp_profile(ticker: str) -> dict:
 def _fmp_etf_symbol_set() -> set:
     """/stable/etf-list → ETF 심볼 집합 (멤버십 판별용)."""
     try:
-        r = requests.get(f"{_FMP_BASE}/etf-list?apikey={FMP_API_KEY}", timeout=15)
-        if r.status_code != 200:
+        r = fx.fmp_get(f"{_FMP_BASE}/etf-list?apikey={FMP_API_KEY}", timeout=15)
+        if r is None:
             return set()
         data = r.json()
         if not isinstance(data, list):
@@ -270,10 +270,10 @@ def discover_and_add_new_etfs(ws) -> int:
         today_et = datetime.now(_ET)
         cutoff = today_et - timedelta(days=_DISCOVERY_LOOKBACK_DAYS)
         from_str, to_str = cutoff.strftime("%Y-%m-%d"), today_et.strftime("%Y-%m-%d")
-        r = requests.get(f"{_FMP_BASE}/ipos-calendar?from={from_str}&to={to_str}&apikey={FMP_API_KEY}",
+        r = fx.fmp_get(f"{_FMP_BASE}/ipos-calendar?from={from_str}&to={to_str}&apikey={FMP_API_KEY}",
                          timeout=15)
-        if r.status_code != 200:
-            print(f"[WARN] ipos-calendar status {r.status_code} — 발견 단계 스킵")
+        if r is None:
+            print("[WARN] ipos-calendar 조회 실패(레이트리밋/HTTP 오류) — 발견 단계 스킵")
             return 0
         ipos = r.json()
         if not isinstance(ipos, list):
