@@ -23396,20 +23396,28 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                             "_code": _t["code"], "_t": _t, "_mv": _mv, "_ann": _ann}
                     (_rows_act if _t["code"] in ("trim", "trim_hard") else _rows_hold).append(_rec)
                 else:
+                    # 손절폭: 수동(Stop_Loss) 우선, 없으면 ATR 추정(R:R 게이트와 동일 규약).
+                    # 미설정이라고 무조건 차단하면 '예상 갭 vs 손절폭' 비교가 아예 죽는다.
                     _sl = _obj.get("stop_loss")
-                    _stop_pct = None
+                    _stop_pct, _stop_src = None, ""
+                    _cp = _px_map.get(_tk)
                     try:
-                        _cp = _px_map.get(_tk)
                         if _cp and pd.notna(_sl) and float(_sl) > 0 and float(_cp) > 0:
                             _stop_pct = abs((float(_cp) - float(_sl)) / float(_cp) * 100.0)
+                            _stop_src = "manual"
                     except Exception:
                         _stop_pct = None
+                    if _stop_pct is None:
+                        _stop_pct = ec.derived_stop_pct(
+                            cached_earnings_price_history(_tk), price=_cp)
+                        _stop_src = "atr" if _stop_pct is not None else ""
                     _g = ec.evaluate_entry_gate(_mv, planned_stop_pct=_stop_pct,
                                                 days_until=_dd,
-                                                earnings_date=_ann.get("earnings_date", ""))
+                                                earnings_date=_ann.get("earnings_date", ""),
+                                                stop_source=_stop_src)
                     _rows_block.append({"티커": _tk, "계좌": str(_obj.get("account") or "") or "-",
                                         "D": _dd, "_g": _g, "_mv": _mv, "_ann": _ann,
-                                        "_stop_pct": _stop_pct})
+                                        "_stop_pct": _stop_pct, "_stop_src": _stop_src})
             except Exception:
                 continue
         _prog.empty()
@@ -23495,13 +23503,19 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                     "티커": _b["티커"], "실적일": _b["_ann"].get("earnings_date", ""),
                     "D-Day": f"D-{_b['D']}",
                     "예상 갭": (f"±{_b['_mv']['median_pct']:.1f}%" if _b["_mv"].get("ok") else "미상"),
-                    "계획 손절": (f"{_b['_stop_pct']:.1f}%" if _b["_stop_pct"] else "미설정"),
+                    "계획 손절": (
+                        f"{_b['_stop_pct']:.1f}%"
+                        + (" (추정)" if _b.get("_stop_src") == "atr" else "")
+                        if _b["_stop_pct"] else "산출 불가"),
                     "판정": _b["_g"]["label"],
                     "사유": _b["_g"]["reason"] or "-",
                 })
             st.dataframe(pd.DataFrame(_brows), use_container_width=True, hide_index=True)
             st.caption("차단된 종목은 매수 알림 이메일이 **보류**됩니다. 알림 상태는 동결되어 "
-                       "발표 후 멈춘 지점에서 그대로 재개됩니다(신호가 유실되지 않습니다).")
+                       "발표 후 멈춘 지점에서 그대로 재개됩니다(신호가 유실되지 않습니다).  \n"
+                       "손절이 **(추정)** 인 항목은 워치리스트에 Stop_Loss 가 없어 ATR 기반으로 "
+                       "산출한 값입니다 — R:R 게이트가 쓰는 것과 같은 규약입니다. "
+                       "직접 지정하면 그 값이 우선합니다.")
 
         # ── 섹션 4: 발표 완료 · PEAD ──
         st.divider()

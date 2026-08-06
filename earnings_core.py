@@ -473,16 +473,51 @@ def atr_pct_of(hist: pd.DataFrame, window: int = 22) -> float | None:
 # 4) 진입 게이트 — "손절이 작동하는가"만 본다. 비중과 무관.
 # ──────────────────────────────────────────────────────────────────────────
 
+def derived_stop_pct(hist, price=None, atr_mult=None) -> float | None:
+    """수동 손절이 없을 때 ATR 기반 손절폭(%) 추정 — R:R 게이트와 동일 규약.
+
+    워치리스트에 Stop_Loss 를 넣지 않는 종목이 많은데, 손절 미상이라고 무조건
+    차단하면 '예상 갭 vs 손절폭' 비교라는 이 게이트의 핵심이 아예 작동하지 않는다
+    (±3% 종목과 ±19% 종목의 판정이 같아진다). regime_core.build_watchlist_plan 이
+    수동 손절 없을 때 쓰는 것과 같은 ATR 손절을 추정치로 쓴다.
+
+    반환: 양수 % (예: 6.4). 산출 불가 시 None.
+    """
+    try:
+        import regime_core as _rc
+    except Exception:
+        return None
+    if hist is None or getattr(hist, "empty", True) or "Close" not in hist.columns:
+        return None
+    try:
+        px = _num(price)
+        if px is None:
+            px = _num(pd.to_numeric(hist["Close"], errors="coerce").dropna().iloc[-1])
+        if px is None or px <= 0:
+            return None
+        mult = _num(atr_mult)
+        if mult is None:
+            mult = float(_rc.regime_params({})["atr_mult"])
+        atr = _num(_rc.compute_atr(hist, _rc.ATR_WINDOW))
+        if atr is None or atr <= 0:
+            return None
+        return round(atr * mult / px * 100.0, 2)
+    except Exception:
+        return None
+
+
 def evaluate_entry_gate(move: dict, planned_stop_pct=None, days_until=None,
                         block_days: int = ENTRY_BLOCK_DAYS,
-                        earnings_date: str = "") -> dict:
+                        earnings_date: str = "", stop_source: str = "") -> dict:
     """실적 직전 신규 진입 차단 판정.
 
     planned_stop_pct: 계획 손절폭 (양수 %, 예: -7% 손절 → 7.0). None 이면 보수적 차단.
-    반환: {blocked, code, label, reason, unblock_after}
+    stop_source     : 'manual' | 'atr'(추정) — 사유 문구에만 반영.
+    반환: {blocked, code, label, reason, unblock_after, stop_pct, stop_source}
     """
     out = {"blocked": False, "code": "open", "label": GATE_LABELS["open"],
-           "reason": "", "unblock_after": ""}
+           "reason": "", "unblock_after": "",
+           "stop_pct": _num(planned_stop_pct), "stop_source": str(stop_source or "")}
     d = _num(days_until)
     if d is None or d < 0 or d > int(block_days):
         return out
@@ -491,6 +526,7 @@ def evaluate_entry_gate(move: dict, planned_stop_pct=None, days_until=None,
     mv = (move or {}).get("median_pct") if isinstance(move, dict) else None
     ok = bool((move or {}).get("ok")) if isinstance(move, dict) else False
     sp = _num(planned_stop_pct)
+    _sfx = " (추정)" if str(stop_source or "").lower() == "atr" else ""
 
     if not ok or mv is None:
         # 측정 불가 + 실적 임박 → 보수적 차단 (D1 원칙: 미상이면 엄격)
@@ -498,18 +534,18 @@ def evaluate_entry_gate(move: dict, planned_stop_pct=None, days_until=None,
                     "reason": f"실적 D-{int(d)} · 예상 변동폭 산출 불가 — 발표 후 재평가"})
         return out
 
-    if sp is None:
+    if sp is None or sp <= 0:
         out.update({"blocked": True, "code": "blocked", "label": GATE_LABELS["blocked"],
-                    "reason": f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% · 손절 미설정 — 발표 후 재평가"})
+                    "reason": f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% · 손절 산출 불가 — 발표 후 재평가"})
         return out
 
     if mv > sp:
         out.update({"blocked": True, "code": "blocked", "label": GATE_LABELS["blocked"],
-                    "reason": (f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% > 계획 손절 {sp:.1f}% "
+                    "reason": (f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% > 손절 {sp:.1f}%{_sfx} "
                                f"— 손절이 작동하지 않는 구간")})
         return out
 
-    out["reason"] = f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% ≤ 손절 {sp:.1f}%"
+    out["reason"] = f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% ≤ 손절 {sp:.1f}%{_sfx}"
     return out
 
 
