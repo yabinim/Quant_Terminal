@@ -39,7 +39,7 @@ import secrets as _pysecrets
 import pandas as pd
 
 # ── 스키마 ─────────────────────────────────────────────────────────────────────
-SSOT_VERSION = "2026-08-06b"
+SSOT_VERSION = "2026-08-06a"
 
 USER_SHEET_COLS = [
     "ID", "Password", "Reason", "Source", "Status",
