@@ -150,6 +150,16 @@ def ensure_users_header_v4(ws) -> bool:
             관리자(yab)만 전부 Y.
     반환: 마이그레이션을 실제로 수행했으면 True.
     """
+    # ⚠️ Google Sheets 워크시트는 열 수가 고정이다. 시트가 12열인데 A1:M1(13열)을
+    #    쓰면 'exceeds grid limits' APIError 가 난다. 스키마를 넓힐 때는 먼저 그리드를
+    #    넓혀야 한다. 호출부가 전부 try/except 로 감싸고 있어 실패가 조용히 묻힌다.
+    try:
+        if int(getattr(ws, "col_count", 0) or 0) < NCOL:
+            ws.add_cols(NCOL - int(ws.col_count))
+            print(f"[MIGRATE] Users 워크시트 열 확장 → {NCOL}열")
+    except Exception as _e:
+        print(f"[WARN] Users 워크시트 열 확장 실패(계속 진행): {_e}")
+
     vals = ws.get_all_values()
     if not vals or not any(str(c).strip() for c in (vals[0] if vals else [])):
         ws.update([USER_SHEET_COLS], range_name=f"A1:{LAST_COL}1",

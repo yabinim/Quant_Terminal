@@ -23185,6 +23185,14 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                         "💰 Hidden Alpha 수신 — 주간 위성 ETF Top5 로테이션",
                         value=_truthy_set(_row_set.get("Alert_HiddenAlpha", "")),
                     )
+                    ns_earnings = st.checkbox(
+                        "📅 실적 레이더 수신 — 실적 D-3 사전 경고 + 발표 후 결과",
+                        value=_truthy_set(_row_set.get("Alert_Earnings", "")),
+                        help=("⚠️ 이 토글은 메일뿐 아니라 **실적 진입 차단 게이트**도 함께 켭니다. "
+                              "켜면 실적 임박 종목의 매수 알림이 보류됩니다(알림 상태는 동결되어 "
+                              "발표 후 재개). 끄면 매수 알림은 평소와 동일하게 동작하고, "
+                              "자동화는 계속 돌면서 실적 데이터만 쌓습니다."),
+                    )
                     st.markdown("---")
                     ns_autowl = st.checkbox(
                         "🔔 자동 워치리스트 편입 — 주간 스캐너 기준 통과 종목을 내 워치리스트에 자동 추가",
@@ -23198,7 +23206,8 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                     ns_submit = st.form_submit_button("알림 설정 저장", type="primary", use_container_width=True)
                 if ns_submit:
                     _ns_email = str(ns_email or "").strip()
-                    _any_mail = ns_radar or ns_global or ns_drg or ns_weekly or ns_hidden
+                    _any_mail = (ns_radar or ns_global or ns_drg or ns_weekly
+                                 or ns_hidden or ns_earnings)
                     if _any_mail and (not _ns_email or "@" not in _ns_email):
                         st.error("이메일 알림을 받으려면 올바른 이메일 주소를 입력하세요.")
                     else:
@@ -23209,6 +23218,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                             "Alert_DRG": "Y" if ns_drg else "N",
                             "Alert_Weekly": "Y" if ns_weekly else "N",
                             "Alert_HiddenAlpha": "Y" if ns_hidden else "N",
+                            "Alert_Earnings": "Y" if ns_earnings else "N",
                             "Auto_Watchlist": "Y" if ns_autowl else "N",
                         })
                         if ok_ns:
