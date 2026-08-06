@@ -819,7 +819,8 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
                                today_str: str = "", price=None, stop_loss=None,
                                target_price=None, confirm_days: int = ALERT_CONFIRM_DAYS,
                                alert_price=None, alert_rsi=None, alert_ma200=False,
-                               pos_verdict=None, entry_baseline=None):
+                               pos_verdict=None, entry_baseline=None,
+                               entry_blocked: bool = False):
     """상태 전환 기반 알림 평가 (2일 확정 + 재무장). 순수 함수.
 
     ※ 하루 1회 호출 전제(자동화). 호출 1회 = 평가 1회로 pending 카운터가 1 진행된다.
@@ -829,6 +830,20 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
       스윙 코드(exit/risk)만으로 구성된 조건은 발동시키지 않는다(2A). 보유 기간이
       SWING_BASELINE_EXPIRY_BARS 를 넘기면 baseline 이 폐기되어 정상 발동으로 복귀하고,
       50일선 미회복 건은 문구로 구분 표시한다(5A). 미지정 시 기존 동작 불변.
+
+    entry_blocked: 실적 등 예정 이벤트로 신규 진입을 막는 구간 (earnings_core 가 판정).
+      True 면 'entry' 이벤트만 **동결(freeze)** 한다 — 평가를 건너뛰고 이전 하위상태를
+      그대로 보존하며, entry/entry_invalid 를 발동시키지 않는다. 차단이 풀리면 멈춘
+      지점에서 정확히 이어서 재개된다. 기본 False = 기존 동작 완전 불변.
+
+      ※ 왜 동결인가 (다른 두 방식은 모두 깨진다):
+         · 이메일 층에서 드롭 → 상태는 'fired' 로 진행 → 발표 후 조건이 지속되면
+           'fired' 라 침묵 → 신호가 영영 안 나간다.
+         · cond=False 로 억제 → 재무장되며 pending 리셋 + 직전이 'fired' 였다면
+           entry_invalid('매수 신호 조건 해제')가 오발송된다. 실적 때문에 막힌 것을
+           '신호 무효화'로 잘못 알린다.
+      보유 관리 이벤트(risk/exit/pexit/ptrim)는 동결하지 않는다 — 실적 전에
+      추세가 꺾이면 알아야 한다.
 
     반환: (fired: list[{event,label,message}], new_last_state_json: str)
     """
@@ -861,6 +876,10 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
     # 일반 이벤트: 조건 지속 + confirm_days 확정 + 재무장(조건 해제 시)
     #   + 발동 이후에도 '새 사유'가 추가되면 1회 재발동(악화 감지).
     for e in ("entry", "risk", "exit", "pexit", "ptrim", "price", "watch"):
+        if e == "entry" and entry_blocked:
+            # 동결: 이전 하위상태를 손대지 않고 그대로 통과시킨다.
+            # (events_state 에 키가 없으면 없는 채로 두어야 차단 해제 시 정상 초기화된다)
+            continue
         if e not in enabled:
             events_state[e] = {"status": "armed", "pending": 0, "keys": []}
             continue
@@ -960,6 +979,7 @@ DEFAULT_MIN_TRADE_DOLLARS = 0.0  # 이 금액 미만이면 집행 무의미 (0 =
 # 투입 금액을 최종적으로 결정한 제약(=binding constraint) 라벨
 BINDING_LABELS = {
     "risk":    "리스크 기준",
+    "event":   "이벤트 갭 리스크",
     "cap":     "비중 상한",
     "reserve": "투자 여유",
     "cash":    "가용 현금",
@@ -999,7 +1019,8 @@ def position_size(equity, risk_pct, entry, stop,
                   invested_value: float = 0.0,
                   slots_used=None, max_positions=None,
                   min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS,
-                  sizing_mode: str = SIZING_MODE_DEFAULT) -> dict:
+                  sizing_mode: str = SIZING_MODE_DEFAULT,
+                  event_move_pct=None) -> dict:
     """고정 분율 리스크 사이징 — **금액(dollars)이 불변량, 주(shares)는 파생값**.
 
     설계 원칙(중요):
@@ -1009,9 +1030,20 @@ def position_size(equity, risk_pct, entry, stop,
 
     제약 4종 중 가장 작은 값이 투입 금액을 결정하고, 무엇이 결정했는지를 binding 으로 돌려준다.
       risk    : equity × risk_pct% ÷ 손절폭%      (리스크 고정)
+      event   : equity × risk_pct% ÷ 예상 갭폭%   (실적 등 이벤트 갭 — 아래 참조)
       cap     : equity × max_position_pct%        (단일 종목 집중도)
       reserve : equity × (1-reserve_pct%) - invested_value  (예비 현금 확보)
       cash    : cash                              (실제 집행 가능액)
+
+    event_move_pct (선택, 기본 None = 기존 동작 완전 불변):
+      실적 등 예정된 이벤트의 예상 변동폭(양수 %, 예: ±11% → 11.0).
+      갭은 손절 주문을 통과해 체결되므로, 손절폭보다 큰 갭이 예정돼 있으면
+      '손절이 지켜진다'는 리스크 계산의 전제가 이미 깨져 있다. 그래서 갭폭이
+      손절폭보다 클 때만 **risk 와 동일한 공식에 실효 손절폭을 대입한** 제약을
+      하나 더 추가한다. 손절 '가격'과 risk_dollars 는 건드리지 않는다 —
+      표시 손절가가 오염되면 소비처가 서로 다른 값을 보게 된다.
+      equal_weight 모드에는 적용하지 않는다(그 모드의 계약은 '손절폭이 금액에
+      영향을 주지 않는다' 이고, 기계적 회전 계좌는 대상이 ETF 라 실적이 없다).
 
     전환점: 손절폭% > risk_pct ÷ max_position_pct 이면 risk 가, 아니면 cap 이 결정한다.
       예) 3%/20% → 15% · 1%/20% → 5%
@@ -1077,6 +1109,16 @@ def position_size(equity, risk_pct, entry, stop,
         limits = {"equal": max(eq * (1.0 - _rv0 / 100.0), 0.0) / _slots}
     else:
         limits = {"risk": (eq * (rp / 100.0)) / stop_frac}
+        # 이벤트 갭 제약 — 갭이 손절폭보다 클 때만 추가(작으면 risk 가 이미 더 빡빡).
+        _ev = event_move_pct
+        try:
+            _ev = float(_ev) if _ev is not None else None
+        except (TypeError, ValueError):
+            _ev = None
+        if _ev is not None and np.isfinite(_ev) and _ev > 0:
+            _ev_frac = _ev / 100.0
+            if _ev_frac > stop_frac:
+                limits["event"] = (eq * (rp / 100.0)) / _ev_frac
     if np.isfinite(mp) and mp > 0:
         limits["cap"] = eq * (mp / 100.0)
     try:
@@ -1220,12 +1262,15 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
                      invested_value: float = 0.0,
                      slots_used=None, max_positions=None,
                      min_trade_dollars: float = DEFAULT_MIN_TRADE_DOLLARS,
-                     sizing_mode: str = SIZING_MODE_DEFAULT) -> dict:
+                     sizing_mode: str = SIZING_MODE_DEFAULT,
+                     event_move_pct=None) -> dict:
     """verdict + 손절/목표 + 자본 → 게이트 판정 + 사이즈 일괄. 순수 조합 함수.
 
     게이트(백테스트 반영):
       avoid → 회피(사이즈 0 권고) · entry/wait & R:R≥목표 → 적합 · 좋아도 R:R<목표 → 건너뛰기
       overheat/trend_break → 신중. (R:R 필터는 독립 목표가 있을 때만; rr_derived 면 정보용)
+
+    event_move_pct: position_size 로 그대로 전달(실적 등 이벤트 갭 제약). 기본 None = 기존 동작 불변.
     """
     plan = {
         "entry": np.nan, "stop": np.nan, "stop_source": stop_source, "stop_pct": np.nan,
@@ -1268,7 +1313,8 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
     sz = position_size(equity, risk_pct, e, stop, max_position_pct,
                        cash=cash, reserve_pct=reserve_pct, invested_value=invested_value,
                        slots_used=slots_used, max_positions=max_positions,
-                       min_trade_dollars=min_trade_dollars, sizing_mode=sizing_mode)
+                       min_trade_dollars=min_trade_dollars, sizing_mode=sizing_mode,
+                       event_move_pct=event_move_pct)
     plan.update({k: sz[k] for k in (
         "shares", "shares_whole", "shares_exact", "dollars", "risk_dollars",
         "position_pct", "capped", "binding", "binding_label", "limits",

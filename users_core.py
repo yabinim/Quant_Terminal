@@ -2,8 +2,9 @@
 """
 users_core.py — Users 시트 SSOT 모듈 (app.py + automation 공용)
 ────────────────────────────────────────────────────────────────
-스키마 v3 (12열): ID, Password, Reason, Source, Status, Email, Alert_Radar,
-                  Alert_Global, Alert_DRG, Alert_Weekly, Alert_HiddenAlpha, Auto_Watchlist
+스키마 v4 (13열): ID, Password, Reason, Source, Status, Email, Alert_Radar,
+                  Alert_Global, Alert_DRG, Alert_Weekly, Alert_HiddenAlpha, Auto_Watchlist,
+                  Alert_Earnings
 
 - Password: "pbkdf2$<iterations>$<salt_hex>$<hash_hex>" 형식 해시.
   접두어(pbkdf2$)가 없으면 레거시 평문으로 간주 → 로그인 성공 시 호출측이 해시로 승격.
@@ -14,6 +15,7 @@ users_core.py — Users 시트 SSOT 모듈 (app.py + automation 공용)
 - Alert_HiddenAlpha: Hidden Alpha 주간 ETF 로테이션 메일 수신 여부 ("Y"/"N")
 - Auto_Watchlist: 주간 스캐너 결과를 **본인 워치리스트에 자동 편입**할지 ("Y"/"N")
                   Alert_Weekly 와 독립 — 메일 없이 편입만, 편입 없이 메일만 모두 가능.
+- Alert_Earnings: 실적 레이더 메일(D-3 사전 경고 + 발표 후 결과) 수신 여부 ("Y"/"N")
 
 ⚠️ 관리자(yab)도 예외가 아니다. 모든 토글은 관리자에게도 동일하게 적용되어,
    코드 수정 없이 특정 알림만 일시 중지할 수 있어야 한다.
@@ -37,15 +39,16 @@ import secrets as _pysecrets
 import pandas as pd
 
 # ── 스키마 ─────────────────────────────────────────────────────────────────────
-SSOT_VERSION = "2026-08-06a"
+SSOT_VERSION = "2026-08-06b"
 
 USER_SHEET_COLS = [
     "ID", "Password", "Reason", "Source", "Status",
     "Email", "Alert_Radar", "Alert_Global",
     "Alert_DRG", "Alert_Weekly", "Alert_HiddenAlpha", "Auto_Watchlist",
+    "Alert_Earnings",
 ]
-NCOL = len(USER_SHEET_COLS)               # 12
-LAST_COL = chr(ord("A") + NCOL - 1)       # "L"
+NCOL = len(USER_SHEET_COLS)               # 13
+LAST_COL = chr(ord("A") + NCOL - 1)       # "M"
 
 # v2(8열) 스키마 — 마이그레이션 판별용
 _USER_SHEET_COLS_V2 = [
@@ -61,16 +64,27 @@ ALERT_KINDS = {
     "weekly": "Alert_Weekly",    # 주간 3버킷 스캐너
     "hidden": "Alert_HiddenAlpha",  # Hidden Alpha 주간 ETF 로테이션
     "autowl": "Auto_Watchlist",  # 워치리스트 자동 편입(메일 아님)
+    "earnings": "Alert_Earnings",   # 실적 레이더 (개인)
 }
+# ⚠️ alert_column() 은 미지의 kind 를 Alert_Global 로 폴백한다. 새 알림을 추가하면서
+#    여기 매핑을 빠뜨리면 그 알림이 **조용히 내러티브 토글을 따라간다**. 반드시 함께 추가.
 
 # v2 → v3 마이그레이션 기본값.
 #   기존 알림(DRG)은 현행 유지를 위해 Y, 신규 기능은 동의 없이 켜지 않도록 N.
 #   관리자(yab)만 전부 Y 로 채운다.
-_NEW_V3_COLS = ["Alert_DRG", "Alert_Weekly", "Alert_HiddenAlpha", "Auto_Watchlist"]
-_V3_DEFAULTS_GUEST = {"Alert_DRG": "Y", "Alert_Weekly": "N",
-                      "Alert_HiddenAlpha": "N", "Auto_Watchlist": "N"}
-_V3_DEFAULTS_ADMIN = {"Alert_DRG": "Y", "Alert_Weekly": "Y",
-                      "Alert_HiddenAlpha": "Y", "Auto_Watchlist": "Y"}
+#   v4 는 여기에 Alert_Earnings 를 더한다(게스트 N, 관리자 Y).
+_MIGRATED_COLS = ["Alert_DRG", "Alert_Weekly", "Alert_HiddenAlpha", "Auto_Watchlist",
+                  "Alert_Earnings"]
+_MIGRATE_START = 8                        # USER_SHEET_COLS 상 시작 인덱스 (= "I" 열)
+_DEFAULTS_GUEST = {"Alert_DRG": "Y", "Alert_Weekly": "N", "Alert_HiddenAlpha": "N",
+                   "Auto_Watchlist": "N", "Alert_Earnings": "N"}
+_DEFAULTS_ADMIN = {"Alert_DRG": "Y", "Alert_Weekly": "Y", "Alert_HiddenAlpha": "Y",
+                   "Auto_Watchlist": "Y", "Alert_Earnings": "Y"}
+
+# 하위 호환 별칭 (기존 참조가 있을 경우 대비)
+_NEW_V3_COLS = _MIGRATED_COLS[:4]
+_V3_DEFAULTS_GUEST = {k: _DEFAULTS_GUEST[k] for k in _NEW_V3_COLS}
+_V3_DEFAULTS_ADMIN = {k: _DEFAULTS_ADMIN[k] for k in _NEW_V3_COLS}
 
 ADMIN_CONTENT_OWNER_ID = "yab"            # 전역(자동화) 콘텐츠 소유자 uid
 
@@ -122,14 +136,18 @@ def gen_temp_password(length: int = 10) -> str:
 
 
 # ── 시트 스키마/조회 ───────────────────────────────────────────────────────────
-def ensure_users_header_v3(ws) -> bool:
-    """헤더를 v3(11열)로 보장하고, v2 행에는 신규 3열 기본값을 채운다.
+def ensure_users_header_v4(ws) -> bool:
+    """헤더를 v4(13열)로 보장하고, 구 스키마 행의 빈 토글에 기본값을 채운다.
+
+    v2(8열) / v3(12열) 어느 쪽에서 올라오든 한 번에 처리한다 —
+    인덱스 8("I")부터 끝까지를 대상으로 **비어 있는 칸만** 기본값으로 채우므로
+    이미 값이 있는 행은 그대로 보존된다.
 
     ⚠️ 앱과 자동화 **양쪽 진입부에서** 호출해야 한다. 자동화가 앱보다 먼저 돌면
        구 스키마를 읽게 되고, 신규 토글이 빈 문자열이라 전부 꺼진 것으로 오인된다.
 
-    기본값(A1): 게스트 Alert_DRG=Y · Alert_Weekly=N · Auto_Watchlist=N
-                관리자(yab) 전부 Y
+    기본값: 기존 알림(DRG)은 현행 유지를 위해 Y, 신규 기능은 동의 없이 켜지 않도록 N.
+            관리자(yab)만 전부 Y.
     반환: 마이그레이션을 실제로 수행했으면 True.
     """
     vals = ws.get_all_values()
@@ -140,37 +158,41 @@ def ensure_users_header_v3(ws) -> bool:
 
     hdr = [str(c).strip() for c in vals[0]]
     if hdr[:NCOL] == USER_SHEET_COLS and len(hdr) >= NCOL:
-        return False  # 이미 v3
+        return False  # 이미 v4
 
-    # 헤더 갱신
     ws.update([USER_SHEET_COLS], range_name=f"A1:{LAST_COL}1",
               value_input_option="USER_ENTERED")
 
-    # 본문 행의 신규 3열 채우기 (기존 8열은 손대지 않는다)
+    # 본문 행의 토글 열 채우기 (인덱스 0~7 기존 열은 손대지 않는다)
     body = vals[1:]
     if not body:
         return True
     new_cells = []
     for r in body:
         uid = str((list(r) + [""])[0]).strip().lower()
-        defaults = _V3_DEFAULTS_ADMIN if uid == ADMIN_CONTENT_OWNER_ID else _V3_DEFAULTS_GUEST
+        defaults = _DEFAULTS_ADMIN if uid == ADMIN_CONTENT_OWNER_ID else _DEFAULTS_GUEST
         row = (list(r) + [""] * NCOL)[:NCOL]
-        vals3 = []
-        for i, col in enumerate(_NEW_V3_COLS, start=8):
+        filled = []
+        for i, col in enumerate(_MIGRATED_COLS, start=_MIGRATE_START):
             cur = str(row[i] or "").strip()
-            vals3.append(cur if cur else defaults[col])
-        new_cells.append(vals3)
-    start_col = chr(ord("A") + 8)          # "I"
+            filled.append(cur if cur else defaults[col])
+        new_cells.append(filled)
+    start_col = chr(ord("A") + _MIGRATE_START)      # "I"
     end_row = 1 + len(new_cells)
     ws.update(new_cells, range_name=f"{start_col}2:{LAST_COL}{end_row}",
               value_input_option="USER_ENTERED")
     return True
 
 
-# 하위 호환 별칭 — 기존 호출부(app.py 등)가 깨지지 않도록 유지
+# 하위 호환 별칭 — 기존 호출부(app.py / automation)가 깨지지 않도록 유지
+def ensure_users_header_v3(ws) -> bool:
+    """(레거시 별칭) v4 마이그레이션을 수행한다."""
+    return ensure_users_header_v4(ws)
+
+
 def ensure_users_header_v2(ws) -> None:
-    """(레거시 별칭) v3 마이그레이션을 수행한다."""
-    ensure_users_header_v3(ws)
+    """(레거시 별칭) v4 마이그레이션을 수행한다."""
+    ensure_users_header_v4(ws)
 
 
 def fetch_users_df(ws) -> pd.DataFrame:

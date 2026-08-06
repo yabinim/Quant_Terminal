@@ -37,6 +37,7 @@ import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_n
 import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화와 동일 모듈
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
 import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 자동화와 동일 모듈
+import earnings_core as ec  # 실적 이벤트 리스크 SSOT — 자동화(run_earnings_watch)와 동일 모듈
 
 # ── 1.6 AI 종목 스캐너 SSOT (scanner_core) ───────────────────────────────────
 # 3버킷 스코어링·프롬프트·상수·표시 포맷·70점 판정은 전부 scanner_core 에만 존재한다.
@@ -206,6 +207,8 @@ _PORTFOLIO_ALERT_STATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Update
 _ACCOUNT_PROFILE_WORKSHEET_TITLE = ac.WORKSHEET_TITLE
 _ACCOUNT_PROFILE_SHEET_COLS = ac.COLS
 _ACCOUNT_PROFILE_DEFAULTS = ac.DEFAULTS
+# ⚠️ 시트 기록 범위는 열 수에서 계산한다 — 하드코딩된 'J' 는 스키마가 늘면 조용히 잘린다.
+_ACCT_PROF_LAST_COL = chr(ord('A') + len(_ACCOUNT_PROFILE_SHEET_COLS) - 1)
 _SIZING_MODE_LABELS = ac.SIZING_MODE_LABELS
 _PORTFOLIO_ALERT_DEFAULT = "exit,risk"   # 보유 기본 알림: 청산 + 추세 흔들림 (손절은 exit의 ATR 트레일링에 포함)
 _ETF_UNIVERSE_SHEET_TITLE = "ETF_Universe"
@@ -886,7 +889,8 @@ def open_account_profile_worksheet():
         except Exception:
             ws = sh.add_worksheet(title=_ACCOUNT_PROFILE_WORKSHEET_TITLE,
                                   rows=500, cols=len(_ACCOUNT_PROFILE_SHEET_COLS))
-            ws.update([_ACCOUNT_PROFILE_SHEET_COLS], range_name="A1:J1",
+            ws.update([_ACCOUNT_PROFILE_SHEET_COLS],
+                      range_name=f"A1:{_ACCT_PROF_LAST_COL}1",
                       value_input_option="USER_ENTERED")
         return ws, None
     except Exception as exc:
@@ -978,11 +982,79 @@ def save_account_profile(user_id: str, account: str, prof: dict):
         new_row = ac.to_row(uid, acct, prof, _narrative_now_et_string())
         rows = [_ACCOUNT_PROFILE_SHEET_COLS] + keep + [new_row]
         ws.clear()
-        ws.update(rows, range_name=f"A1:J{len(rows)}", value_input_option="USER_ENTERED")
+        ws.update(rows, range_name=f"A1:{_ACCT_PROF_LAST_COL}{len(rows)}",
+                  value_input_option="USER_ENTERED")
         _invalidate_account_profile_cache()
         return True, ""
     except Exception as exc:
         return False, str(exc)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 📅 실적 레이더 — 시트 접근자 + 캐시 래퍼
+#   순수 로직은 earnings_core(SSOT). 여기서는 IO 와 캐시만 담당한다.
+#   Earnings_Events 는 **티커 단위 공유 데이터**(관리자 소유·게스트 읽기 전용).
+#   계좌별 축소 판정은 저장하지 않고 사용자별로 런타임 계산한다.
+# ══════════════════════════════════════════════════════════════════════
+def open_earnings_events_worksheet():
+    """Earnings_Events 워크시트. 없으면 헤더와 함께 생성."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+    except Exception as exc:
+        return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` 를 열 수 없습니다: {exc}"
+    try:
+        return sh.worksheet(ec.EVENTS_WORKSHEET), None
+    except Exception:
+        pass
+    try:
+        ws = sh.add_worksheet(title=ec.EVENTS_WORKSHEET, rows=2000,
+                              cols=max(ec.EVENTS_NCOL, 26))
+        _end = gspread.utils.rowcol_to_a1(1, ec.EVENTS_NCOL)
+        ws.update([ec.EVENTS_COLS], range_name=f"A1:{_end}",
+                  value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc:
+        return None, f"Earnings_Events 워크시트를 만들 수 없습니다: {exc}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_earnings_events() -> list[dict]:
+    """Earnings_Events 전체 로드(10분 캐시). 실패 시 빈 목록."""
+    ws, err = open_earnings_events_worksheet()
+    if err or ws is None:
+        return []
+    try:
+        return ec.parse_events(ws.get_all_values() or [])
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_expected_move(ticker_upper: str) -> dict:
+    """티커의 예상 실적 변동폭(1시간 캐시). 과거 8분기 반응일 close-to-close 기준."""
+    try:
+        tk = str(ticker_upper).strip().upper()
+        hist = cached_timing_price_history(tk)
+        if hist is None or hist.empty:
+            return {"ok": False, "note": "가격 이력 없음", "sample_n": 0}
+        past = ec.past_earnings_dates(tk, key=_fmp_key())
+        gaps = ec.gap_history(hist, past)
+        return ec.expected_move(gaps, atr_pct=ec.atr_pct_of(hist))
+    except Exception as exc:
+        return {"ok": False, "note": f"산출 실패: {exc}", "sample_n": 0}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_next_earnings(ticker_upper: str) -> dict:
+    """다음 실적 발표 예정 1건(1시간 캐시). 없으면 빈 dict."""
+    try:
+        return ec.fetch_next_earnings(str(ticker_upper).strip().upper(),
+                                      key=_fmp_key()) or {}
+    except Exception:
+        return {}
 
 
 def compute_account_context(user_id: str, account: str) -> dict:
@@ -2016,6 +2088,8 @@ _MAIN_NAV_OPTIONS = (
     "📊 매매 복기",
     # ── 계정 (index 14: 맨 끝 append — 기존 인덱스 분기 불변) ────────────────
     "⚙️ 내 설정",
+    # ── 실적 (index 15: 맨 끝 append — 표시 순서는 아래 _nav_opts 에서 재배치) ──
+    "📅 실적 레이더",
 )
 
 
@@ -13598,6 +13672,11 @@ if st.session_state.get("logged_in"):
         if _review_label in _nav_opts and _radar_label in _nav_opts:
             _nav_opts.remove(_review_label)
             _nav_opts.insert(_nav_opts.index(_radar_label) + 1, _review_label)
+        # 📅 실적 레이더(index 15)도 포트폴리오 관리 묶음으로 끌어올린다.
+        _earn_label = _MAIN_NAV_OPTIONS[15]
+        if _earn_label in _nav_opts and _radar_label in _nav_opts:
+            _nav_opts.remove(_earn_label)
+            _nav_opts.insert(_nav_opts.index(_radar_label) + 1, _earn_label)
     except Exception:
         pass
     if st.session_state.get("user_role") == "admin":
@@ -17794,6 +17873,23 @@ if st.session_state.get("logged_in"):
                         except Exception:
                             pass
 
+                        # ── 📅 실적 갭 제약 (earnings_core SSOT) ──────────
+                        # 갭은 손절 주문을 통과해 체결된다. 손절폭보다 큰 갭이 예정돼
+                        # 있으면 리스크 계산의 전제가 이미 깨진 상태이므로 사이즈로 방어한다.
+                        _ev_ann, _ev_days, _ev_move_pct = {}, None, None
+                        if not is_etf_mode:
+                            try:
+                                _ev_ann = cached_next_earnings(str(selected_ticker).strip().upper()) or {}
+                                _ev_days = _ev_ann.get("days_until")
+                                if _ev_days is not None and 0 <= int(_ev_days) <= ec.SCAN_HORIZON_DAYS:
+                                    _ev_mv = cached_expected_move(str(selected_ticker).strip().upper())
+                                    if _ev_mv.get("ok"):
+                                        _ev_move_pct = float(_ev_mv["median_pct"])
+                                else:
+                                    _ev_move_pct = None
+                            except Exception:
+                                _ev_ann, _ev_days, _ev_move_pct = {}, None, None
+
                         _plan = rc.build_trade_plan(
                             verdict_code=_timing_res.get("code"),
                             entry=float(current_price), atr=_atr_val, ma200=_ma200_val,
@@ -17810,7 +17906,22 @@ if st.session_state.get("logged_in"):
                             max_positions=(int(_pf_s["Max_Positions"]) if _ctx_size else None),
                             min_trade_dollars=float(_pf_s["Min_Trade_Dollars"]),
                             sizing_mode=str(_pf_s.get("Sizing_Mode", rc.SIZING_MODE_DEFAULT)),
+                            event_move_pct=_ev_move_pct,
                         )
+
+                        if _plan.get("binding") == "event":
+                            st.warning(
+                                f"📅 **실적 D-{_ev_days} — 갭이 손절을 통과합니다.** "
+                                f"예상 ±{_ev_move_pct:.1f}% > 손절 {abs(_plan.get('stop_pct') or 0):.1f}% → "
+                                f"투입 금액을 갭 기준으로 축소했습니다. "
+                                f"손절가 자체는 그대로이며, '손절이 지켜진다'는 전제가 깨진 구간이라 "
+                                f"사이즈로만 방어합니다."
+                            )
+                        elif _ev_days is not None and 0 <= _ev_days <= ec.SCAN_HORIZON_DAYS:
+                            _mv_txt = (f" · 예상 ±{_ev_move_pct:.1f}%" if _ev_move_pct else "")
+                            st.caption(f"📅 실적 D-{_ev_days} ({_ev_ann.get('earnings_date', '')}"
+                                       f"{_ev_ann.get('date_source') and ' · ' + ec.DATE_SOURCE_LABELS.get(_ev_ann['date_source'], '') or ''})"
+                                       f"{_mv_txt}")
 
                         _gate = _plan["gate"]
                         _gate_fn = {"fit": st.success, "skip": st.warning, "avoid": st.error,
@@ -18792,6 +18903,48 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                                  value=float(_p["Cash_Reserve_Pct"]), key=f"_prof_res_{_pa}")
                     _v_min = st.number_input("최소 거래금액 ($ · 0 = 미사용)", min_value=0.0, step=5.0,
                                              value=float(_p["Min_Trade_Dollars"]), key=f"_prof_min_{_pa}")
+
+                    # ── 📅 실적 축소 한도 ──────────────────────────────
+                    st.markdown("**📅 실적 축소 한도**")
+                    _cap_cur = ac.resolve_earn_trim_cap(_p)
+                    if not _cap_cur["is_set"]:
+                        st.caption(
+                            "⚙️ 계좌 유형 미설정 — 비과세 기준(엄격)으로 표시 중입니다. "
+                            "과세계좌라면 매도 시 세금이 발생하니 아래에서 지정해 주세요."
+                        )
+                    _pk = list(ac.EARN_PRESETS)
+                    _v_preset = st.selectbox(
+                        "계좌 유형", _pk,
+                        index=_pk.index(_cap_cur["preset"]),
+                        format_func=lambda k: ac.EARN_PRESET_LABELS[k],
+                        key=f"_prof_epreset_{_pa}",
+                        help="실적 갭 노출이 이 한도를 넘으면 축소를 제안합니다. "
+                             "축이 '세금'인 이유는 매도의 실제 비용이 거기서 갈리기 때문입니다.",
+                    )
+                    st.caption(ac.EARN_PRESET_HELP.get(_v_preset, ""))
+                    _v_ecap = st.number_input(
+                        "한도 (% · 0 = 프리셋 기본값 사용)", min_value=0.0, max_value=20.0, step=0.25,
+                        value=float(_p.get("Earn_Trim_Cap_Pct", 0.0) or 0.0),
+                        key=f"_prof_ecap_{_pa}",
+                        help="0 이면 계좌 유형과 거래당 리스크로 자동 계산합니다. "
+                             "직접 넣으면 Risk_Pct 와 분리되어 고정됩니다.",
+                    )
+                    _def_ecap = ac.preset_default_cap(_v_preset, float(_v_risk))
+                    if _v_preset == "dca_only":
+                        st.caption("→ 축소 제안 없음 (실적 캘린더·진입 차단 게이트는 그대로 유지)")
+                    elif _v_preset == "custom" and float(_v_ecap) <= 0:
+                        st.caption("⚠️ 직접 입력인데 값이 0 — 축소 판정이 보류됩니다.")
+                    elif float(_v_ecap) > 0:
+                        _d_txt = f" · 프리셋 기본값 {_def_ecap:.2f}%" if _def_ecap else ""
+                        st.caption(f"→ 적용 한도 **{float(_v_ecap):.2f}%** (직접 입력){_d_txt}"
+                                   + ("  ·  0 으로 두면 프리셋 값으로 되돌아갑니다" if _def_ecap else ""))
+                    else:
+                        st.caption(f"→ 적용 한도 **{(_def_ecap or 0):.2f}%** "
+                                   f"= 거래당 리스크 {float(_v_risk):.1f}% × "
+                                   f"{ac.EARN_PRESET_MULT.get(_v_preset) or 0:.1f}")
+                    st.caption(f"최악 시 계좌 타격이 {ec.TAIL_ALERT_PCT:.0f}% 를 넘으면 "
+                               f"한도와 무관하게 테일 경보가 발동합니다(계좌 공통).")
+
                     _fb1, _fb2 = st.columns(2)
                     with _fb1:
                         _preview_clicked = st.form_submit_button("🔄 미리보기 갱신", use_container_width=True)
@@ -18869,6 +19022,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         "Cash": float(_v_cash), "Sizing_Mode": _v_mode, "Risk_Pct": float(_v_risk),
                         "Max_Position_Pct": float(_v_cap), "Max_Positions": int(_v_slots),
                         "Cash_Reserve_Pct": float(_v_res), "Min_Trade_Dollars": float(_v_min),
+                        "Earn_Preset": str(_v_preset), "Earn_Trim_Cap_Pct": float(_v_ecap),
                     })
                     if _ok_p:
                         _invalidate_account_context_memo()
@@ -23057,6 +23211,316 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                             st.success("비밀번호가 변경되었습니다. 기존 자동 로그인은 해제되며, 다음 로그인부터 적용됩니다.")
                         else:
                             st.error(err_pw)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 📅 실적 레이더 (index 15)
+    #   새로운 매수/매도 신호를 만들지 않는다. 하는 일은 셋:
+    #     차단(게이트) · 축소(사이징) · 관찰(PEAD)
+    #   매수는 레짐·타이밍·R:R 게이트가, 매도는 스윙/포지션 신호가 결정한다.
+    # ═══════════════════════════════════════════════════════════════════
+    elif main_nav == _MAIN_NAV_OPTIONS[15]:
+        st.title("📅 실적 레이더")
+        st.caption("실적 발표 전후의 **이벤트 리스크**를 관리합니다. "
+                   "여기서 나오는 판정은 매매 신호가 아니라 신호 위에 얹히는 제약입니다.")
+
+        _euid = str(st.session_state.get("user_id") or "").strip()
+        if not _euid:
+            st.warning("로그인이 필요합니다.")
+            st.stop()
+
+        _e_today = pd.Timestamp(datetime.now(_MARKET_ET_TZ).date())
+        _events = load_earnings_events()
+        _ev_by_tk = {}
+        for _r in _events:
+            _tk_r = str(_r.get("Ticker") or "").strip().upper()
+            if not _tk_r:
+                continue
+            _ev_by_tk.setdefault(_tk_r, []).append(_r)
+
+        # ── 대상 수집: 보유 + 워치리스트 ──
+        try:
+            _e_pf = load_portfolio()
+        except Exception:
+            _e_pf = pd.DataFrame()
+        if _e_pf is None:
+            _e_pf = pd.DataFrame()
+        _e_wl = load_watchlist_sheet(_euid) or []
+
+        if _e_pf.empty and not _e_wl:
+            st.info("보유 종목과 워치리스트가 비어 있습니다. 종목을 추가하면 실적 일정이 여기에 표시됩니다.")
+            st.stop()
+
+        with st.expander("이 탭이 하는 일 / 하지 않는 일", expanded=False):
+            st.markdown(
+                "**하는 일 3가지 — 전부 손실 방지 방향입니다.**\n\n"
+                f"1. **차단** — 예상 갭이 계획 손절폭보다 크면 D-{ec.ENTRY_BLOCK_DAYS} 이내 "
+                "신규 진입 알림을 보류합니다. 갭은 손절 주문을 통과해 체결되므로, "
+                "그 구간에서는 손절이 존재하지 않는 것과 같습니다.\n"
+                "2. **축소** — 갭 리스크가 계좌 한도를 넘는 보유를 줄이도록 제안합니다.\n"
+                "3. **관찰** — 발표 후 갭·거래량·갭 유지 여부를 측정해 기록합니다.\n\n"
+                "**하지 않는 일** — 새로운 매수/매도 신호를 만들지 않고, 워치리스트를 "
+                "자동으로 추가·삭제하지 않습니다.\n\n"
+                "**예상 변동폭은 옵션 내재 변동폭이 아닙니다.** FMP 는 옵션 체인을 제공하지 "
+                f"않고, 내재 변동폭은 정의상 대칭이라 방향 정보가 없습니다. 대신 과거 "
+                f"{ec.GAP_QUARTERS}분기 실적 반응일의 종가-종가 변동률 **중앙값**을 씁니다 — "
+                "실현 움직임을 직접 재는 값이라 사이징 판단에 더 잘 맞습니다."
+            )
+
+        # 코어/정기적립 판별 — Portfolios 에는 메모 컬럼이 없고 Thesis 시트가 SSOT.
+        _core_keys = set()
+        try:
+            _th = load_thesis_records(_euid)
+            if _th is not None and not _th.empty:
+                _cm = _th[_th["Narrative_Category"].astype(str).str.strip().str.lower()
+                          == "core_dca"]
+                for _, _tr in _cm.iterrows():
+                    _core_keys.add((str(_tr.get("Account") or "").strip().lower(),
+                                    str(_tr.get("Ticker") or "").strip().upper()))
+        except Exception:
+            _core_keys = set()
+
+        # ── 계좌별 한도 해석 ──
+        _e_accts = (sorted(_e_pf["Account"].dropna().astype(str).str.strip().unique().tolist())
+                    if (not _e_pf.empty and "Account" in _e_pf.columns) else [])
+        _e_accts = [a for a in _e_accts if a]
+        _caps, _ctxs = {}, {}
+        for _a in _e_accts:
+            _pr = get_account_profile(_euid, _a)
+            _caps[_a] = ac.resolve_earn_trim_cap(_pr)
+            _caps[_a]["_profile"] = _pr
+            try:
+                _ctxs[_a] = compute_account_context(_euid, _a)
+            except Exception:
+                _ctxs[_a] = None
+
+        _unset = [a for a in _e_accts if not _caps[a]["is_set"]]
+        if _unset:
+            st.warning(
+                "⚙️ **계좌 유형 미설정**: " + ", ".join(_unset[:6])
+                + " — 비과세 기준(엄격)으로 표시 중입니다. 과세계좌라면 매도 시 세금이 "
+                "발생하니 `[4단계] 포트폴리오 매도 레이더 → ⚙️ 계좌 프로필`에서 지정해 주세요."
+            )
+
+        # ── 판정 계산 ──
+        _rows_act, _rows_hold, _rows_block, _rows_post = [], [], [], []
+        _all_tk = set()
+        if not _e_pf.empty and "Ticker" in _e_pf.columns:
+            _all_tk |= set(_e_pf["Ticker"].dropna().astype(str).str.upper())
+        _all_tk |= {str(w.get("ticker") or "").upper() for w in _e_wl}
+        _all_tk = {t for t in _all_tk if t}
+        try:
+            _px_map = fetch_latest_prices_for_tickers(tuple(sorted(_all_tk)))
+        except Exception:
+            _px_map = {}
+        _prog = st.progress(0.0, text="실적 일정 조회 중...")
+        _uni = []
+        if not _e_pf.empty:
+            for _, _h in _e_pf.iterrows():
+                _uni.append(("hold", str(_h.get("Ticker") or "").strip().upper(), _h))
+        for _w in _e_wl:
+            _uni.append(("watch", str(_w.get("ticker") or "").strip().upper(), _w))
+        _uni = [u for u in _uni if u[1]]
+        _seen_tk = {}
+
+        for _i, (_kind, _tk, _obj) in enumerate(_uni):
+            _prog.progress((_i + 1) / max(len(_uni), 1), text=f"조회 중... {_tk}")
+            try:
+                if _tk not in _seen_tk:
+                    _seen_tk[_tk] = (cached_next_earnings(_tk) or {}, None)
+                _ann, _mv = _seen_tk[_tk]
+                _dd = _ann.get("days_until")
+                if _dd is None or _dd > ec.SCAN_HORIZON_DAYS:
+                    continue
+                if _mv is None:
+                    _mv = cached_expected_move(_tk)
+                    _seen_tk[_tk] = (_ann, _mv)
+
+                if _kind == "hold":
+                    _acct = str(_obj.get("Account") or "").strip()
+                    _cap = _caps.get(_acct) or ac.resolve_earn_trim_cap(
+                        get_account_profile(_euid, _acct))
+                    _ctx = _ctxs.get(_acct)
+                    _eq = float(_ctx["equity"]) if _ctx else 0.0
+                    _qty = pd.to_numeric(_obj.get("Quantity"), errors="coerce")
+                    _avg = pd.to_numeric(_obj.get("Purchase_Price"), errors="coerce")
+                    _px = _px_map.get(_tk)
+                    _px = float(_px) if _px else (float(_avg) if pd.notna(_avg) else None)
+                    if not _px or pd.isna(_qty):
+                        continue
+                    _t = ec.evaluate_trim(
+                        _px * float(_qty), _eq, _mv,
+                        trim_cap_pct=_cap["cap_pct"],
+                        min_trade_dollars=(float(_cap["_profile"]["Min_Trade_Dollars"])
+                                           if _cap.get("_profile") else 0.0),
+                        is_core=((_acct.lower(), _tk) in _core_keys),
+                    )
+                    _rec = {"티커": _tk, "계좌": _acct, "D": _dd, "판정": _t["label"],
+                            "_code": _t["code"], "_t": _t, "_mv": _mv, "_ann": _ann}
+                    (_rows_act if _t["code"] in ("trim", "trim_hard") else _rows_hold).append(_rec)
+                else:
+                    _sl = _obj.get("stop_loss")
+                    _stop_pct = None
+                    try:
+                        _cp = _px_map.get(_tk)
+                        if _cp and pd.notna(_sl) and float(_sl) > 0 and float(_cp) > 0:
+                            _stop_pct = abs((float(_cp) - float(_sl)) / float(_cp) * 100.0)
+                    except Exception:
+                        _stop_pct = None
+                    _g = ec.evaluate_entry_gate(_mv, planned_stop_pct=_stop_pct,
+                                                days_until=_dd,
+                                                earnings_date=_ann.get("earnings_date", ""))
+                    _rows_block.append({"티커": _tk, "계좌": str(_obj.get("account") or "") or "-",
+                                        "D": _dd, "_g": _g, "_mv": _mv, "_ann": _ann,
+                                        "_stop_pct": _stop_pct})
+            except Exception:
+                continue
+        _prog.empty()
+
+        # ── 섹션 1: 조치 요약 ──
+        st.markdown("## 1️⃣ 조치 요약")
+        _blocked = [b for b in _rows_block if b["_g"]["blocked"]]
+        if not (_rows_act or _blocked):
+            st.success("✅ 지금 조치가 필요한 실적 이벤트가 없습니다.")
+        else:
+            _sum = []
+            for _r in sorted(_rows_act, key=lambda x: (0 if x["_code"] == "trim_hard" else 1,
+                                                       -(x["_t"]["position_value"] or 0))):
+                _t = _r["_t"]
+                _sum.append({
+                    "조치": "🔴 절반↓" if _r["_code"] == "trim_hard" else "🟠 축소",
+                    "티커": _r["티커"], "계좌": _r["계좌"], "D": f"D-{_r['D']}",
+                    "지금": f"{_t['position_pct']:.1f}%",
+                    "목표": f"{_t['target_pct']:.1f}%",
+                    "매도액": f"${_t['sell_dollars']:,.0f}",
+                    "타격": (f"{_t['cap_multiple']:.1f}×" if _t["cap_multiple"] else "-"),
+                    "통상/최악": (f"±{_r['_mv'].get('median_pct', 0):.1f}/"
+                                 f"−{_r['_mv'].get('worst_down_pct', 0):.1f}%"),
+                })
+            for _b in sorted(_blocked, key=lambda x: x["D"]):
+                _sum.append({
+                    "조치": "⛔ 보류", "티커": _b["티커"], "계좌": _b["계좌"],
+                    "D": f"D-{_b['D']}", "지금": "-", "목표": "-", "매도액": "-", "타격": "-",
+                    "통상/최악": (f"±{_b['_mv'].get('median_pct', 0):.1f}%"
+                                 if _b["_mv"].get("ok") else "미상"),
+                })
+            st.dataframe(pd.DataFrame(_sum), use_container_width=True, hide_index=True)
+
+        # ── 섹션 2: 보유 노출 진단 ──
+        st.divider()
+        st.markdown("## 2️⃣ 보유 종목 노출 진단")
+        if not (_rows_act or _rows_hold):
+            st.caption(f"D-{ec.SCAN_HORIZON_DAYS} 이내 실적 예정인 보유 종목이 없습니다.")
+        else:
+            for _r in (_rows_act + sorted(_rows_hold, key=lambda x: x["D"])):
+                _t, _m, _a = _r["_t"], _r["_mv"], _r["_ann"]
+                _box = st.error if _r["_code"] == "trim_hard" else (
+                    st.warning if _r["_code"] == "trim" else st.info)
+                with st.container(border=True):
+                    _c1, _c2 = st.columns([1, 2.2])
+                    with _c1:
+                        st.markdown(f"### {_r['티커']}")
+                        st.caption(f"{_a.get('earnings_date', '')} "
+                                   f"({ec.DATE_SOURCE_LABELS.get(_a.get('date_source'), '')})<br>"
+                                   f"{ec.TIMING_LABELS.get(_a.get('timing'), '')} · D-{_r['D']} · "
+                                   f"{_r['계좌']}", unsafe_allow_html=True)
+                    with _c2:
+                        if _t["code"] in ("trim", "trim_hard"):
+                            _box(f"**{_t['label']} — 약 ${_t['sell_dollars']:,.0f} 매도**  \n"
+                                 f"비중 {_t['position_pct']:.1f}% → {_t['target_pct']:.1f}% "
+                                 f"(${_t['position_value']:,.0f} → ${_t['target_value']:,.0f})")
+                        else:
+                            _box(f"**{_t['label']}**")
+                        st.caption(f"**왜:** {_t['reason']}")
+                        if _m.get("ok"):
+                            _bits = [f"통상 ±{_m['median_pct']:.1f}%"]
+                            if _m.get("worst_down_pct"):
+                                _bits.append(f"최악 −{_m['worst_down_pct']:.1f}%")
+                            if _m.get("atr_multiple"):
+                                _bits.append(f"평소 일간의 {_m['atr_multiple']:.1f}배")
+                            _bits.append(f"표본 {_m['sample_n']}분기 · {_m['confidence_label']}")
+                            st.caption(" · ".join(_bits))
+                            if _m.get("note"):
+                                st.caption(f"⚠️ {_m['note']}")
+                        if _t.get("tail_flag"):
+                            st.caption(f"☠️ 최악 시 계좌 타격 {_t['tail_pct']:.1f}% — "
+                                       f"테일 경보 기준 {ec.TAIL_ALERT_PCT:.0f}% 초과")
+
+        # ── 섹션 3: 진입 차단 현황 ──
+        st.divider()
+        st.markdown("## 3️⃣ 워치리스트 진입 차단")
+        if not _rows_block:
+            st.caption(f"D-{ec.SCAN_HORIZON_DAYS} 이내 실적 예정인 워치리스트 종목이 없습니다.")
+        else:
+            _brows = []
+            for _b in sorted(_rows_block, key=lambda x: x["D"]):
+                _brows.append({
+                    "티커": _b["티커"], "실적일": _b["_ann"].get("earnings_date", ""),
+                    "D-Day": f"D-{_b['D']}",
+                    "예상 갭": (f"±{_b['_mv']['median_pct']:.1f}%" if _b["_mv"].get("ok") else "미상"),
+                    "계획 손절": (f"{_b['_stop_pct']:.1f}%" if _b["_stop_pct"] else "미설정"),
+                    "판정": _b["_g"]["label"],
+                    "사유": _b["_g"]["reason"] or "-",
+                })
+            st.dataframe(pd.DataFrame(_brows), use_container_width=True, hide_index=True)
+            st.caption("차단된 종목은 매수 알림 이메일이 **보류**됩니다. 알림 상태는 동결되어 "
+                       "발표 후 멈춘 지점에서 그대로 재개됩니다(신호가 유실되지 않습니다).")
+
+        # ── 섹션 4: 발표 완료 · PEAD ──
+        st.divider()
+        st.markdown("## 4️⃣ 발표 완료 — 반응 측정")
+        _mine = {str(w.get("ticker") or "").upper() for w in _e_wl}
+        if not _e_pf.empty and "Ticker" in _e_pf.columns:
+            _mine |= set(_e_pf["Ticker"].dropna().astype(str).str.upper())
+        _done = [r for r in _events
+                 if str(r.get("Gap_Pct") or "").strip()
+                 and str(r.get("Ticker") or "").upper() in _mine]
+        _done.sort(key=lambda r: str(r.get("Earnings_Date") or ""), reverse=True)
+        if not _done:
+            st.caption("측정된 실적 반응이 아직 없습니다. "
+                       "평일 5PM ET 자동화가 발표 후 반응일 종가로 기록합니다.")
+        else:
+            _drows = []
+            for _r in _done[:30]:
+                _gp = ec._num(_r.get("Gap_Pct"))
+                _held = str(_r.get("Gap_Held") or "").strip().upper()
+                _drows.append({
+                    "티커": _r.get("Ticker"), "실적일": _r.get("Earnings_Date"),
+                    "실제 갭": (f"{_gp:+.1f}%" if _gp is not None else "-"),
+                    "예상": (lambda m: f"±{m:.1f}%" if m is not None else "-")(
+                        ec._num(_r.get("Exp_Median_Pct"))),
+                    "거래량": (lambda v: f"{v:.1f}배" if v is not None else "-")(
+                        ec._num(_r.get("Volume_Ratio"))),
+                    "갭 유지": {"TRUE": "✅", "FALSE": "❌"}.get(_held, "-"),
+                    "판정": ec.PEAD_LABELS.get(str(_r.get("PEAD_Verdict") or ""), "-"),
+                    "D+5": (lambda v: f"{v:+.1f}%" if v is not None else "-")(
+                        ec._num(_r.get("D5_Return_Pct"))),
+                })
+            st.dataframe(pd.DataFrame(_drows), use_container_width=True, hide_index=True)
+            st.caption("**PEAD는 예측이 아니라 관찰입니다.** 상승 지속 후보로 나와도 "
+                       "실제 진입은 레짐·타이밍·R:R 게이트를 다시 통과해야 합니다. "
+                       "하락 이탈은 신규 진입 대상이 아니라 기존 근거 훼손 신호로만 씁니다.")
+
+        # ── 섹션 5: 예측 성적표 (C층 — 2차 도입) ──
+        st.divider()
+        st.markdown("## 5️⃣ 방향 예측 성적표")
+        _acc = ec.accuracy_summary(_events)
+        _m1, _m2, _m3 = st.columns(3)
+        with _m1:
+            st.metric("적중률", f"{_acc['accuracy']:.1f}%" if _acc["accuracy"] is not None else "—")
+        with _m2:
+            st.metric("무조건상승 대조군",
+                      f"{_acc['baseline_accuracy']:.1f}%" if _acc["baseline_accuracy"] is not None else "—",
+                      (f"{_acc['edge']:+.1f}%p" if _acc["edge"] is not None else None))
+        with _m3:
+            st.metric("채점 표본", f"{_acc['n']}건", f"최소 {ec.PRED_MIN_SAMPLE}건")
+        if _acc["banner"]:
+            st.warning(f"⚠️ {_acc['banner']}")
+        st.caption(
+            "**기준선은 50%가 아닙니다.** 시장이 우상향하므로 '무조건 상승'이 진짜 대조군이고, "
+            "적중률이 그 값을 넘지 못하면 엣지가 없는 것입니다. 중립 예측은 채점에서 제외합니다.  \n"
+            "방향 예측 생성은 2차 도입 예정입니다 — 1차는 게이트·축소·관찰만 동작하며, "
+            "이 표는 채점 체계가 준비돼 있음을 보여줍니다."
+        )
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)

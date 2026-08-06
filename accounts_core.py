@@ -21,6 +21,8 @@ WORKSHEET_TITLE = "Account_Profile"
 COLS = [
     "ID", "Account", "Cash", "Sizing_Mode", "Risk_Pct", "Max_Position_Pct",
     "Max_Positions", "Cash_Reserve_Pct", "Min_Trade_Dollars", "Updated_At",
+    # ── 실적 레이더 (맨 뒤 append — Updated_At 인덱스 9 하드코딩을 깨지 않는다) ──
+    "Earn_Preset", "Earn_Trim_Cap_Pct",
 ]
 NCOL = len(COLS)
 
@@ -33,6 +35,8 @@ DEFAULTS = {
     "Max_Positions": rc.DEFAULT_MAX_POSITIONS,
     "Cash_Reserve_Pct": rc.DEFAULT_RESERVE_PCT,
     "Min_Trade_Dollars": rc.DEFAULT_MIN_TRADE_DOLLARS,
+    "Earn_Preset": "",          # 미설정 — 아래 EARN_PRESET_FALLBACK 이 임시 적용된다
+    "Earn_Trim_Cap_Pct": 0.0,   # 0 = 미저장 → 프리셋 기본값을 계산해서 쓴다
 }
 
 SIZING_MODE_LABELS = {
@@ -40,6 +44,42 @@ SIZING_MODE_LABELS = {
     "equal_weight": "균등 배분 (기계적 회전)",
     "off": "사용 안 함",
 }
+
+# ── 실적 축소 임계 프리셋 ────────────────────────────────────────────────
+# 축 = **매도 시 세금 발생 여부**. 이게 축소의 실제 비용을 좌우한다.
+#   비과세(IRA/Roth/HSA/401k) : 매도가 공짜 → 리스크 예산에 가깝게 붙인다.
+#   과세(일반 위탁계좌)        : 오른 종목을 실적 회피로 팔면 단기 양도세가 확정된다.
+#                               회피하려는 손실보다 확정 비용이 큰 경우가 실제로 생기므로
+#                               '정말 위험할 때만' 발동하도록 크게 벌린다.
+#   장기적립 전용              : 계좌 전체가 인덱스 DCA → 축소 제안 자체를 끈다
+#                               (캘린더·진입 차단 게이트는 그대로 유지된다).
+# 값은 Risk_Pct 배수. 아무것도 안 건드리면 Risk_Pct 를 따라가므로 자동 스케일되고,
+# 명시 저장(custom)하면 Risk_Pct 와 분리된다.
+EARN_PRESET_MULT = {
+    "tax_free": 1.5,
+    "taxable":  3.0,
+    "dca_only": None,     # None = 축소 판정 미사용
+    "custom":   None,     # 저장된 Earn_Trim_Cap_Pct 값을 그대로 사용
+}
+EARN_PRESETS = tuple(EARN_PRESET_MULT.keys())
+
+EARN_PRESET_LABELS = {
+    "tax_free": "🟦 비과세 계좌 (IRA·Roth·HSA·401k)",
+    "taxable":  "🟨 과세 계좌 (일반 위탁)",
+    "dca_only": "🟩 장기적립 전용 (축소 제안 없음)",
+    "custom":   "⚙️ 직접 입력",
+}
+EARN_PRESET_HELP = {
+    "tax_free": "매도해도 세금이 없어 축소가 자유롭습니다. 한도 = 거래당 리스크 × 1.5",
+    "taxable":  "매도 시 양도세가 확정되므로 정말 위험할 때만 발동합니다. 한도 = 거래당 리스크 × 3.0",
+    "dca_only": "실적 캘린더와 진입 차단은 유지하되, 보유 축소 제안만 끕니다.",
+    "custom":   "Risk_Pct 와 분리된 절대값을 직접 지정합니다.",
+}
+
+# 미설정 계좌에 임시 적용할 프리셋 — 엄격한 쪽(D1 원칙).
+# 앱은 주문을 내지 않고 '제안'만 하므로, 경고가 뜨면 사용자가 세금을 보고 거를 수 있다.
+# 반대로 경고가 아예 안 뜨면 거를 기회조차 없다.
+EARN_PRESET_FALLBACK = "tax_free"
 
 
 def default_profile(account: str = "") -> dict:
@@ -59,7 +99,8 @@ def _coerce_row(row: list) -> dict:
     prof["Updated_At"] = str(r[9]).strip()
 
     idx = {c: i for i, c in enumerate(COLS)}
-    for key in ("Cash", "Risk_Pct", "Max_Position_Pct", "Cash_Reserve_Pct", "Min_Trade_Dollars"):
+    for key in ("Cash", "Risk_Pct", "Max_Position_Pct", "Cash_Reserve_Pct",
+                "Min_Trade_Dollars", "Earn_Trim_Cap_Pct"):
         v = pd.to_numeric(r[idx[key]], errors="coerce")
         if pd.notna(v) and float(v) >= 0:
             prof[key] = float(v)
@@ -69,6 +110,9 @@ def _coerce_row(row: list) -> dict:
     m = str(r[idx["Sizing_Mode"]]).strip()
     if m in rc.SIZING_MODES:
         prof["Sizing_Mode"] = m
+    p = str(r[idx["Earn_Preset"]]).strip().lower()
+    if p in EARN_PRESETS:
+        prof["Earn_Preset"] = p
     return prof
 
 
@@ -114,7 +158,66 @@ def to_row(user_id: str, account: str, prof: dict, now_et: str) -> list:
         float(prof.get("Cash_Reserve_Pct", 0.0) or 0.0),
         float(prof.get("Min_Trade_Dollars", 0.0) or 0.0),
         str(now_et or ""),
+        str(prof.get("Earn_Preset", "") or ""),
+        float(prof.get("Earn_Trim_Cap_Pct", 0.0) or 0.0),
     ]
+
+
+# ── 실적 축소 한도 해석 (SSOT) ──────────────────────────────────────────
+# app.py 와 automation 이 각자 기본값을 두면 즉시 드리프트한다. 반드시 여기만 쓴다.
+# earnings_core 는 해석이 끝난 숫자만 받는다(계좌 프로필을 침범하지 않는다).
+
+def preset_default_cap(preset: str, risk_pct) -> float | None:
+    """프리셋 코드 + Risk_Pct → 기본 한도(%). dca_only/custom 은 None."""
+    mult = EARN_PRESET_MULT.get(str(preset or "").strip().lower())
+    if mult is None:
+        return None
+    try:
+        rp = float(risk_pct)
+    except (TypeError, ValueError):
+        rp = float(rc.DEFAULT_RISK_PCT)
+    if not (np.isfinite(rp) and rp > 0):
+        rp = float(rc.DEFAULT_RISK_PCT)
+    return round(rp * float(mult), 4)
+
+
+def resolve_earn_trim_cap(prof: dict) -> dict:
+    """프로필 → 실적 축소 한도 해석 결과.
+
+    저장 방식(C1): 프리셋 '코드'와 '확정값'을 둘 다 저장하고 **계산은 값만** 쓴다.
+      → 나중에 프리셋 정의(배수)를 바꿔도 기존 사용자의 알림 동작이 조용히 바뀌지 않는다.
+      → 값이 비어 있을 때만 프리셋 배수로 계산한다(신규 계좌·미설정 계좌).
+
+    반환: {cap_pct, preset, preset_label, is_set, is_default, default_cap, disabled}
+      cap_pct : evaluate_trim 에 넘길 한도(%). None 이면 축소 판정 미사용.
+      is_set  : 사용자가 프리셋을 명시했는가 (False 면 UI 가 미설정 배너를 띄운다)
+    """
+    p = dict(prof or {})
+    raw_preset = str(p.get("Earn_Preset", "") or "").strip().lower()
+    is_set = raw_preset in EARN_PRESETS
+    preset = raw_preset if is_set else EARN_PRESET_FALLBACK
+    risk = p.get("Risk_Pct", rc.DEFAULT_RISK_PCT)
+
+    stored = pd.to_numeric(p.get("Earn_Trim_Cap_Pct"), errors="coerce")
+    stored = float(stored) if (pd.notna(stored) and float(stored) > 0) else None
+    default_cap = preset_default_cap(preset, risk)
+
+    if preset == "dca_only":
+        cap = None
+    elif preset == "custom":
+        cap = stored          # 직접 입력인데 값이 없으면 판정 불가 → None
+    else:
+        cap = stored if stored is not None else default_cap
+
+    return {
+        "cap_pct": cap,
+        "preset": preset,
+        "preset_label": EARN_PRESET_LABELS.get(preset, preset),
+        "is_set": is_set,
+        "is_default": (stored is None),
+        "default_cap": default_cap,
+        "disabled": (preset == "dca_only"),
+    }
 
 
 def compute_equity(holdings: list, price_map: dict, cash: float) -> dict:
