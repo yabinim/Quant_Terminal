@@ -164,10 +164,11 @@ def load_universe():
     """수신자별 관심 종목 수집.
 
     반환: (holdings, watch, all_tickers)
-      holdings : {uid: {account: [{ticker, qty, avg}]}}
-      watch    : {uid: {ticker: account}}
+      holdings  : {uid: {account: [{ticker, qty, avg}]}}
+      watch     : {uid: {ticker: account}}
+      wl_stops  : {(uid, TICKER): Stop_Loss}  — 게이트 손절폭 산출용
     """
-    holdings, watch, tickers = {}, {}, set()
+    holdings, watch, tickers, wl_stops = {}, {}, set(), {}
 
     try:
         vals = _ws(_PF_WORKSHEET).get_all_values() or []
@@ -196,11 +197,14 @@ def load_universe():
             if not uid or not tk:
                 continue
             watch.setdefault(uid, {})[tk] = str(r[12]).strip()
+            _sl = pd.to_numeric(r[8], errors="coerce")   # I열 = Stop_Loss
+            if pd.notna(_sl) and float(_sl) > 0:
+                wl_stops[(uid, tk)] = float(_sl)
             tickers.add(tk)
     except Exception as e:
         print(f"[WARN] Watchlist 로드 실패: {e}")
 
-    return holdings, watch, sorted(tickers)
+    return holdings, watch, sorted(tickers), wl_stops
 
 
 def load_profiles(uid: str, cache: dict):
@@ -364,7 +368,7 @@ def pass_delayed(rows, hist_cache, today):
 
 # ── 수신자별 판정 (계좌 프로필 반영) ──────────────────────────────────────
 def build_user_report(uid, holdings, watch, snapshots, results, prof_cache, hist_cache,
-                      core_keys=None):
+                      core_keys=None, wl_stops=None):
     """수신자 1명분 리포트. 계좌별 축소 판정은 여기서 런타임 계산한다."""
     profiles = load_profiles(uid, prof_cache)
     pre, blocked, post = [], [], []
@@ -402,6 +406,7 @@ def build_user_report(uid, holdings, watch, snapshots, results, prof_cache, hist
                         "trim": t, "cap": cap, "move": move})
 
     # 워치리스트 — 진입 차단
+    wl_stops = wl_stops or {}
     for tk, acct in (watch.get(uid) or {}).items():
         snap = snapshots.get(tk)
         if not snap:
@@ -415,8 +420,24 @@ def build_user_report(uid, holdings, watch, snapshots, results, prof_cache, hist
         if dd is None:
             d = ec._d(snap.get("Earnings_Date"))
             dd = int((d - pd.Timestamp.today().normalize()).days) if d is not None else None
-        g = ec.evaluate_entry_gate(move, planned_stop_pct=None, days_until=dd,
-                                   earnings_date=snap.get("Earnings_Date"))
+        # 손절폭: 워치리스트 수동 손절 우선, 없으면 ATR 추정(app.py 와 동일 규약)
+        stop_pct, stop_src = None, ""
+        hist = hist_cache.get(tk)
+        px = None
+        if hist is not None and not hist.empty:
+            px = float(hist["Close"].iloc[-1])
+        try:
+            sl = float(wl_stops.get((uid, tk)) or 0.0)
+            if sl > 0 and px and px > 0:
+                stop_pct, stop_src = abs((px - sl) / px * 100.0), "manual"
+        except (TypeError, ValueError):
+            stop_pct = None
+        if stop_pct is None and hist is not None and not hist.empty:
+            stop_pct = ec.derived_stop_pct(hist, price=px)
+            stop_src = "atr" if stop_pct is not None else ""
+        g = ec.evaluate_entry_gate(move, planned_stop_pct=stop_pct, days_until=dd,
+                                   earnings_date=snap.get("Earnings_Date"),
+                                   stop_source=stop_src)
         if g["blocked"]:
             blocked.append({"ticker": tk, "account": acct, "gate": g, "snap": snap})
 
@@ -543,7 +564,7 @@ def main():
     existing = {str(r.get("Event_ID") or ""): r for r in rows}
     print(f"[INFO] 기존 이벤트 {len(rows)}건")
 
-    holdings, watch, tickers = load_universe()
+    holdings, watch, tickers, wl_stops = load_universe()
     print(f"[INFO] 대상 티커 {len(tickers)}개 "
           f"(보유 {len(holdings)}명 · 워치 {len(watch)}명)")
 
@@ -591,7 +612,8 @@ def main():
     for uid, email in (rcpts or []):
         try:
             rep = build_user_report(uid, holdings, watch, snapshots, results,
-                                    prof_cache, hist_cache, core_keys=core_keys)
+                                    prof_cache, hist_cache, core_keys=core_keys,
+                                    wl_stops=wl_stops)
             if not (rep["pre"] or rep["blocked"] or rep["post"]):
                 print(f"  [SKIP] {uid} — 해당 이벤트 없음")
                 continue
