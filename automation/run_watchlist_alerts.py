@@ -92,11 +92,33 @@ def load_earnings_blocks() -> dict:
         rows = ec.parse_events(ws.get_all_values() or [])
         blocks = ec.blocked_tickers(rows, today=datetime.now(_ET).date())
         if blocks:
-            print(f"[GATE] 실적 진입 차단 {len(blocks)}종목: {', '.join(sorted(blocks))}")
+            print(f"[GATE] 실적 진입 차단 후보 {len(blocks)}종목: {', '.join(sorted(blocks))}")
         return blocks
     except Exception as e:
         print(f"[INFO] 실적 게이트 조회 생략(fail-open): {e}")
         return {}
+
+
+def load_earnings_gate_users() -> set:
+    """실적 게이트를 적용할 사용자 ID 집합 (Users.Alert_Earnings = Y).
+
+    ⚠️ 게이트는 **매수 알림을 실제로 막는** 동작이다. 실적 레이더를 아직 신뢰하지
+       않는 사용자의 기존 알림 흐름까지 바꾸면 안 되므로, 토글이 꺼진 사용자에게는
+       차단을 적용하지 않는다(관리자 포함). 조회 실패 시 빈 집합 = 차단 없음(fail-open).
+    """
+    try:
+        gc = get_gspread_client()
+        ws = gc.open(_SPREADSHEET_TITLE).worksheet("Users")
+        uc.ensure_users_header_v4(ws)
+        uids = {str(u).strip().lower()
+                for u, _e in (uc.get_recipients(ws, "earnings",
+                                                admin_fallback_email=GMAIL_TO) or [])}
+        print(f"[GATE] 실적 게이트 적용 대상 {len(uids)}명"
+              + (f": {', '.join(sorted(uids))}" if uids else " — 전원 미사용"))
+        return uids
+    except Exception as e:
+        print(f"[INFO] 실적 게이트 대상 조회 실패 — 차단 미적용: {e}")
+        return set()
 _DEEP_KEY = "__deep__"      # 티커와 충돌 불가한 센티넬 키
 
 
@@ -581,7 +603,7 @@ def _sizing_kwargs_for(uid: str, account: str, hist_cache: dict) -> dict:
     }
 
 
-def eval_watchlist_eod(spy_close, hist_cache, today, earn_blocks=None):
+def eval_watchlist_eod(spy_close, hist_cache, today, earn_blocks=None, earn_users=None):
     """워치리스트: 상태 전환 2일 확정 + Alert_LastState(L열) 저장. → fired_by_user
 
     earn_blocks: {TICKER: 사유} — 실적 임박 종목의 entry 이벤트를 **동결**한다.
@@ -590,6 +612,7 @@ def eval_watchlist_eod(spy_close, hist_cache, today, earn_blocks=None):
     """
     fired_by_user = {}
     _blocks = earn_blocks or {}
+    _earn_users = earn_users or set()
     try:
         sh, ws = _open_ws(_WATCHLIST_WORKSHEET)
     except Exception as e:
@@ -621,7 +644,8 @@ def eval_watchlist_eod(spy_close, hist_cache, today, earn_blocks=None):
             if hist is None or hist.empty:
                 laststate_col.append([prev_state]); continue
             an = rc.analyze_ticker(hist, spy_close=spy_close)
-            _eblk = _blocks.get(tk)
+            _eblk = (_blocks.get(tk)
+                     if str(uid).strip().lower() in _earn_users else None)
             fired, new_state = rc.evaluate_alert_transitions(
                 an, enabled, prev_state, today_str=today, price=float(hist["Close"].iloc[-1]),
                 entry_blocked=bool(_eblk),
@@ -943,8 +967,11 @@ def main():
             wl_res, pf_res = {}, {}
             if do_wl:
                 # 실적 임박 종목의 entry 는 동결(freeze)한다 — 상태 보존 → 발표 후 재개
-                wl_res = eval_watchlist_eod(spy_close, hist_cache, today,
-                                            earn_blocks=load_earnings_blocks())
+                _e_users = load_earnings_gate_users()
+                wl_res = eval_watchlist_eod(
+                    spy_close, hist_cache, today,
+                    earn_blocks=(load_earnings_blocks() if _e_users else {}),
+                    earn_users=_e_users)
             if do_pf:
                 pf_res = eval_portfolio_eod(spy_close, hist_cache, today)
             total = (sum(len(v) for v in wl_res.values())
