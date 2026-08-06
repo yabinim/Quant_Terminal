@@ -281,7 +281,8 @@ def _radar_recipients() -> list[tuple[str, str]]:
     try:
         gc = get_gspread_client()
         ws = gc.open(_SPREADSHEET_TITLE).worksheet("Users")
-        _rcpts = uc.get_recipients(ws, "radar")
+        uc.ensure_users_header_v3(ws)   # 자동화가 앱보다 먼저 돌 수 있으므로 방어
+        _rcpts = uc.get_recipients(ws, "radar", admin_fallback_email=GMAIL_TO)
         if _rcpts:
             print(f"[RADAR] 수신자 {len(_rcpts)}명: "
                   + ", ".join(str(u).strip() for u, _ in _rcpts))
@@ -350,21 +351,17 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
 
     print(f"[RADAR] 발동 uid: {sorted(_fired) or '없음'} (총 {total}건)")
 
-    # 1) 관리자(yab): 본인 데이터만 → GMAIL_TO (to_addr=None → send_email 기본값)
-    try:
-        _send_one_user(_admin_uid, None)
-    except Exception as e:
-        print(f"[WARN] 관리자({_admin_uid}) 개별 발송 실패: {e}")
-
-    # 2) 나머지 유저: 본인 데이터만 → 본인 이메일
+    # 수신자 전원(관리자 포함)에게 **본인 데이터만** 발송.
+    # ⚠️ 예전에는 관리자를 무조건 먼저 보내서 Alert_Radar 토글로 끌 수 없었다.
+    #    이제 yab 행도 다른 사용자와 동일하게 Users 시트 토글을 따른다.
     _rcpt_uids = set()
     for _uid, _email in _radar_recipients():
         try:
             _uid_s = str(_uid).strip()
             _rcpt_uids.add(_uid_s.lower())
-            if _uid_s.upper() == _admin_uid_u or str(_email).strip().lower() == _admin_email_l:
-                continue  # 관리자는 위에서 이미 발송
-            _send_one_user(_uid_s, _email)
+            # 관리자는 GMAIL_TO 기본값 경로를 유지(to_addr=None)해 기존 동작과 동일하게
+            _to = None if _uid_s.upper() == _admin_uid_u else _email
+            _send_one_user(_uid_s, _to)
         except Exception as e:
             print(f"[WARN] {_uid} 개별 발송 실패(다음 유저 진행): {e}")
 

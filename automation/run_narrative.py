@@ -787,27 +787,41 @@ def _global_recipients() -> list[tuple[str, str]]:
     try:
         gc = get_gspread_client()
         ws = gc.open(_SPREADSHEET_TITLE).worksheet("Users")
-        return uc.get_recipients(ws, "global")
+        uc.ensure_users_header_v3(ws)   # 자동화가 앱보다 먼저 돌 수 있으므로 방어
+        return uc.get_recipients(ws, "global", admin_fallback_email=GMAIL_TO)
     except Exception as e:
-        print(f"[WARN] Users 수신자 조회 실패 — 관리자 메일만 발송: {e}")
-        return []
+        print(f"[WARN] Users 수신자 조회 실패 — 관리자 폴백만 발송: {e}")
+        return [(uc.ADMIN_CONTENT_OWNER_ID, GMAIL_TO)]
 
 
 def send_email(subject: str, html_body: str) -> bool:
-    """전역 브리핑 브로드캐스트: 관리자(GMAIL_TO) + Alert_Global ON 유저 전원에게 동일 본문 발송.
+    """시장 내러티브 브리핑 브로드캐스트 — Alert_Global ON 인 승인 사용자 전원.
 
-    관리자 발송이 기준 성공값이며, 유저별 실패는 격리(다음 수신자 진행).
+    ⚠️ 관리자도 예외가 아니다. 예전에는 GMAIL_TO 로 무조건 먼저 보내서 관리자가
+       토글로 알림을 끌 수 없었다. 이제 yab 행의 Alert_Global 을 그대로 따른다.
+       (yab 행이 없거나 Email 이 무효일 때만 users_core 가 GMAIL_TO 로 폴백)
+
+    반환: 관리자 발송 성공 여부(관리자가 수신 대상일 때). 게스트 실패는 격리한다.
     """
-    ok_admin = _send_email_one(subject, html_body, GMAIL_TO)
-    _admin_l = str(GMAIL_TO).strip().lower()
-    for _uid, _email in _global_recipients():
+    rcpts = _global_recipients()
+    if not rcpts:
+        print("[INFO] Alert_Global 수신자가 없습니다 — 발송 생략")
+        return True
+    admin_uid_u = str(uc.ADMIN_CONTENT_OWNER_ID).strip().upper()
+    ok_admin, admin_targeted = True, False
+    for _uid, _email in rcpts:
+        is_admin = str(_uid).strip().upper() == admin_uid_u
         try:
-            if str(_email).strip().lower() == _admin_l:
-                continue  # 관리자 중복 방지
-            _send_email_one(subject, html_body, str(_email).strip())
+            ok = _send_email_one(subject, html_body, str(_email).strip())
         except Exception as e:
             print(f"[WARN] {_uid} 발송 실패(다음 수신자 진행): {e}")
-    return ok_admin
+            ok = False
+        if is_admin:
+            admin_targeted = True
+            ok_admin = ok
+        elif not ok:
+            print(f"[WARN] 게스트 {_uid} 발송 실패 — 계속 진행")
+    return ok_admin if admin_targeted else True
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────

@@ -41,16 +41,16 @@ from google.oauth2.service_account import Credentials
 
 # ── 🛰️ 위성 섹터 Top10 SSOT (fmp_extras) — 리포지토리 루트에서 임포트 ──
 # 실행 위치와 무관하게 동작하도록 스크립트의 부모(리포 루트)와 자기 폴더를 sys.path 에 추가.
-# 임포트 실패 시 위성 섹션만 생략하고 메일 발송은 계속한다(비차단).
+# fmp_extras(레이트 리미터) · users_core(수신자)는 필수 의존이다.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (os.path.dirname(_HERE), _HERE):
     if _p and _p not in sys.path:
         sys.path.insert(0, _p)
-try:
-    import fmp_extras as fx
-except Exception as _fx_exc:  # pragma: no cover
-    fx = None
-    print(f"[WARN] fmp_extras 임포트 실패 — 위성 섹터 섹션 생략: {_fx_exc}")
+# ⚠️ fmp_extras 는 이제 선택이 아니다 — 모든 FMP 호출이 fx.fmp_get(레이트 리미터)을
+#    경유하므로 import 가 실패하면 가격 조회 자체가 불가능하다. 조용히 넘어가면
+#    "랭킹 산출 실패"만 남고 원인을 알 수 없으므로 즉시 중단한다.
+import fmp_extras as fx
+import users_core as uc
 
 # ── 환경변수 (기존 run_*.py와 동일 시크릿) ────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -643,24 +643,50 @@ def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
 </body></html>"""
 
 
-def send_email(subject: str, html_body: str) -> bool:
+def _send_email_one(subject: str, html_body: str, to_addr: str) -> bool:
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = GMAIL_USER
-        msg["To"] = GMAIL_TO
+        msg["To"] = str(to_addr)
         msg.attach(MIMEText(html_body, "html", "utf-8"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, GMAIL_TO, msg.as_string())
-        print(f"[OK] 이메일 발송 완료 → {GMAIL_TO}")
+            server.sendmail(GMAIL_USER, str(to_addr), msg.as_string())
+        print(f"[OK] 이메일 발송 완료 → {to_addr}")
         return True
     except Exception as e:
-        print(f"[ERROR] 이메일 발송 실패: {e}")
+        print(f"[ERROR] 이메일 발송 실패({to_addr}): {e}")
         return False
 
 
-# ── 메인 ──────────────────────────────────────────────────────────────────────
+def send_email(subject: str, html_body: str) -> bool:
+    """Hidden Alpha 브로드캐스트 — Alert_HiddenAlpha ON 인 승인 사용자 전원.
+
+    ⚠️ 관리자도 Users 시트 토글을 따른다(예전엔 GMAIL_TO 하드코딩이라 끌 수 없었다).
+    """
+    try:
+        gc = get_gspread_client()
+        ws = gc.open(_SPREADSHEET_TITLE).worksheet("Users")
+        uc.ensure_users_header_v3(ws)
+        rcpts = uc.get_recipients(ws, "hidden", admin_fallback_email=GMAIL_TO)
+    except Exception as e:
+        print(f"[WARN] Users 수신자 조회 실패 — 관리자 폴백: {e}")
+        rcpts = [(uc.ADMIN_CONTENT_OWNER_ID, GMAIL_TO)]
+    if not rcpts:
+        print("[INFO] Hidden Alpha 수신자가 없습니다 — 발송 생략")
+        return True
+    admin_u = str(uc.ADMIN_CONTENT_OWNER_ID).strip().upper()
+    ok_admin, admin_targeted = True, False
+    for _uid, _email in rcpts:
+        is_admin = str(_uid).strip().upper() == admin_u
+        ok = _send_email_one(subject, html_body, str(_email).strip())
+        if is_admin:
+            admin_targeted, ok_admin = True, ok
+        elif not ok:
+            print(f"[WARN] 게스트 {_uid} 발송 실패 — 계속 진행")
+    return ok_admin if admin_targeted else True
+
 def main():
     print("=" * 60)
     print(f"[START] Hidden Alpha 자동화: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")

@@ -44,6 +44,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import narrative_core
 import scanner_core as sc
 import fmp_extras as fx
+import users_core as uc
+import portfolio_core as pc
 
 # ── 환경변수 ─────────────────────────────────────────────────────────────────
 GOOGLE_API_KEY     = os.environ["GOOGLE_API_KEY"]
@@ -61,6 +63,8 @@ _ET  = pytz.timezone("America/New_York")
 _SPREADSHEET_TITLE = "Quant_DB"
 _ADMIN_USER_ID     = "yab"
 
+_WS_USERS       = "Users"
+_WS_PORTFOLIOS  = "Portfolios"
 _WS_NARRATIVES  = "Narratives"
 _WS_WATCHLIST   = "Watchlist"
 _WS_SCAN_LAST   = "Scanner_Last_Result"
@@ -77,6 +81,10 @@ _TARGET_WEEKDAY = 5  # 토요일
 _FORCE_RUN = str(os.environ.get("SCANNER_SCAN_FORCE", "")).strip() in ("1", "true", "TRUE")
 
 _ENGINES = ("leaders", "emerging", "expansion")
+
+# 사용자당 워치리스트 총량 상한. 초과하면 자동 편입을 중단하고 메일로 알린다.
+# run_watchlist_alerts 가 매 평일 전 종목을 평가하므로 인원수 × 종목수만큼 FMP 부하가 는다.
+_WATCHLIST_MAX_PER_USER = int(os.environ.get("WATCHLIST_MAX_PER_USER", "100") or 100)
 _ENGINE_EMOJI = {"leaders": "🏆", "emerging": "🌱", "expansion": "🚀"}
 
 
@@ -256,48 +264,59 @@ def save_scanner_history(sh, engine: str, snap: dict) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 # 6) 워치리스트 70점 편입 — 신규만 추가, 기존 행은 절대 손대지 않음 (4A)
 # ══════════════════════════════════════════════════════════════════════════════
-def load_existing_watchlist_tickers(ws) -> set:
+def load_watchlist_by_user(ws) -> dict:
+    """{USER_ID(대문자): set(TICKER)} — 사용자별 기존 워치리스트."""
     vals = ws.get_all_values() or []
-    out = set()
+    out = {}
     for r in (vals[1:] if len(vals) > 1 else []):
-        if len(r) >= 2 and str(r[0]).strip().upper() == _ADMIN_USER_ID.upper():
-            tk = str(r[1]).strip().upper()
-            if tk:
-                out.add(tk)
+        if len(r) < 2:
+            continue
+        uid = str(r[0]).strip().upper()
+        tk = str(r[1]).strip().upper()
+        if uid and tk:
+            out.setdefault(uid, set()).add(tk)
     return out
 
 
-def add_watchlist_rows(ws, candidates: list, existing: set) -> tuple:
-    """70점 이상 신규 종목만 append.
+def build_watchlist_rows(user_id: str, candidates: list, existing: set,
+                        held: set) -> tuple:
+    """편입 대상을 사용자별 워치리스트 행으로 변환.
 
     ⚠️ app.py `add_to_watchlist` 는 동일 티커의 기존 행을 **삭제 후 재추가**하므로
        손절가·목표가·Alert_States·Account 가 초기화된다. 자동화는 그 경로를 쓰지 않고
        신규 티커만 append 한다 (기존 행 무손상 보장).
 
-    Returns: (추가된 목록, 건너뛴 목록)
+    Returns: (rows, added, skipped_existing, skipped_held, capped)
     """
     today = datetime.now(_ET).strftime("%Y-%m-%d")
-    added, skipped, rows = [], [], []
+    uid_u = str(user_id).strip().upper()
+    rows, added, skip_exist, skip_held = [], [], [], []
     seen = set(existing)
+    room = max(0, _WATCHLIST_MAX_PER_USER - len(seen))
+    capped = []
     for c in candidates:
         tk = c["ticker"]
+        if tk in held:
+            skip_held.append(c)          # 이미 보유 → 매도 레이더가 담당
+            continue
         if tk in seen:
-            skipped.append(c)
+            skip_exist.append(c)
+            continue
+        if len(added) >= room:
+            capped.append(c)
             continue
         seen.add(tk)
         row = [""] * _WL_NCOL
-        row[0] = _ADMIN_USER_ID.upper()                              # ID
-        row[1] = tk                                                  # Ticker
-        row[2] = sc.build_auto_memo(c["engine"], c["score"], today)   # Memo
-        row[6] = "" if c.get("price") is None else round(float(c["price"]), 4)  # Saved_Price
-        row[7] = today                                               # Date_Added
-        row[10] = sc.WATCHLIST_AUTO_ADD_ALERT_STATES                 # Alert_States
-        row[12] = "미지정"                                            # Account (M열 고정)
+        row[0] = uid_u                                                # ID
+        row[1] = tk                                                   # Ticker
+        row[2] = sc.build_auto_memo(c["engine"], c["score"], today)    # Memo
+        row[6] = "" if c.get("price") is None else round(float(c["price"]), 4)
+        row[7] = today                                                # Date_Added
+        row[10] = sc.WATCHLIST_AUTO_ADD_ALERT_STATES                  # Alert_States
+        row[12] = "미지정"                                             # Account (M열 고정)
         rows.append(row)
         added.append(c)
-    if rows:
-        _safe_append_rows(ws, rows)
-    return added, skipped
+    return rows, added, skip_exist, skip_held, capped
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,6 +371,21 @@ def _bucket_table(engine: str, snap: dict) -> str:
     _cov_html = (f'<span style="color:#ff6b6b;font-weight:700;"> · ⚠️ 커버리지 '
                  f'{_cov:.0f}% — 데이터 수집 실패, 편입 제외</span>') if _deg else \
                 f'<span> · 커버리지 {_cov:.0f}%</span>'
+    # 누락 티커 명세 — "왜 빠졌는지"를 보여 환각 심볼과 단순 데이터 공백을 구분하게 한다.
+    # (API 호출은 성공했는데 데이터가 없는 경우: 상장폐지·OTC·신규상장·미존재 심볼)
+    _drops = snap.get("drops") or []
+    _drop_html = ""
+    if _drops:
+        _items = "".join(
+            f'<li style="margin:2px 0;"><b>{_esc(d.get("ticker",""))}</b> — '
+            f'{_esc(d.get("reason",""))}</li>' for d in _drops[:12])
+        _more = (f'<li style="color:#6b7280;">…외 {len(_drops)-12}종목</li>'
+                 if len(_drops) > 12 else "")
+        _drop_html = (
+            f'<div style="margin:4px 0 10px;padding:8px 12px;background:#1a1d24;'
+            f'border-radius:4px;font-size:12px;color:#9aa0a6;">'
+            f'제외 {len(_drops)}종목'
+            f'<ul style="margin:6px 0 0 16px;padding:0;">{_items}{_more}</ul></div>')
     return f"""
     <div style="margin:22px 0 8px;font-size:16px;font-weight:700;">
       {_ENGINE_EMOJI[engine]} {sc.ENGINE_LABELS[engine]}
@@ -359,6 +393,7 @@ def _bucket_table(engine: str, snap: dict) -> str:
         · 유니버스 {_uni_n}종목 · 채점 {len(snap["score_df"])}종목 · 컷오프 {cutoff:.0f} · 편입선 {_th:.0f}
         {_cov_html}</span>
     </div>
+    {_drop_html}
     <table style="width:100%;border-collapse:collapse;font-size:13px;">
       <tr style="color:#7a7f87;font-size:12px;text-align:left;">
         <th style="padding:4px 10px;">티커</th><th style="padding:4px 10px;">종목명</th>
@@ -369,8 +404,16 @@ def _bucket_table(engine: str, snap: dict) -> str:
     </table>"""
 
 
-def build_email(result: dict, added: list, skipped: list,
-                weekly_dt, briefing_md: str) -> tuple:
+def build_email(result: dict, added: list, skipped: list, weekly_dt, briefing_md: str,
+                held_skipped: list = None, capped: list = None,
+                is_admin: bool = True, auto_wl: bool = True,
+                wl_count: int = 0) -> tuple:
+    """수신자별 개인화 메일.
+
+    공통  : 주간 메가 트렌드 + 3버킷 점수표 + 커버리지/누락 명세
+    개인화: 🔔 편입 대상 · 📌 보유 중이라 제외 · ⚠️ 상한 초과
+            (각 수신자의 **자기 워치리스트·자기 포트폴리오** 기준으로 계산된다)
+    """
     counts = {e: (0 if result.get(e) is None else len(result[e]["score_df"]))
               for e in _ENGINES}
     subject = (f"🚀 [주간 스캐너] 주도주 {counts['leaders']} · 대기주 {counts['emerging']} · "
@@ -382,30 +425,64 @@ def build_email(result: dict, added: list, skipped: list,
     brief_lines = [l for l in head_md.split("\n") if l.strip()][:14]
     brief_html = "<br>".join(_esc(l) for l in brief_lines)
 
+    held_skipped = held_skipped or []
+    capped = capped or []
     if added:
         rows = "".join(
             f'<tr><td style="padding:6px 10px;font-weight:600;">{_esc(c["ticker"])}</td>'
             f'<td style="padding:6px 10px;color:#b8b8b8;">{_esc(c["engine_label"])}</td>'
             f'<td style="padding:6px 10px;text-align:right;color:#4ade80;font-weight:700;">'
             f'{c["score"]:.2f}</td></tr>' for c in added)
+        _title = (f"🔔 워치리스트 신규 편입 {len(added)}종목" if auto_wl
+                  else f"🔔 편입 기준 충족 {len(added)}종목 — 앱에서 직접 추가하세요")
         added_html = f"""
         <div style="background:#132018;border-left:3px solid #4ade80;padding:12px 16px;
              border-radius:4px;margin:18px 0;">
           <div style="font-weight:700;margin-bottom:8px;color:#4ade80;">
-            🔔 워치리스트 신규 편입 {len(added)}종목
+            {_title}
             <span style="font-weight:400;font-size:12px;color:#7a9a85;">
               (주도주·대기주 ≥{sc.watchlist_threshold("leaders"):.0f} · 확산주 ≥{sc.watchlist_threshold("expansion"):.0f})</span>
           </div>
           <table style="width:100%;border-collapse:collapse;font-size:13px;">{rows}</table>
           <div style="margin-top:10px;font-size:12px;color:#7a9a85;">
-            알림 플래그 {sc.WATCHLIST_AUTO_ADD_ALERT_STATES} · 계좌 미지정 ·
-            첫 매수/리스크 알림은 월요일 5pm ET
+            {"알림 플래그 " + sc.WATCHLIST_AUTO_ADD_ALERT_STATES + " · 계좌 미지정 · 첫 매수/리스크 알림은 월요일 5pm ET"
+             if auto_wl else
+             "자동 편입이 꺼져 있습니다. 설정에서 「자동 워치리스트」를 켜면 매주 자동으로 추가됩니다."}
           </div>
         </div>"""
     else:
         added_html = ('<div style="color:#7a7f87;margin:18px 0;padding:12px 16px;'
                       'background:#1a1d24;border-radius:4px;">'
                       f'편입 기준을 넘긴 신규 종목이 없습니다.</div>')
+
+    held_html = ""
+    if held_skipped:
+        _hrows = "".join(
+            f'<tr><td style="padding:5px 10px;font-weight:600;">{_esc(c["ticker"])}</td>'
+            f'<td style="padding:5px 10px;color:#b8b8b8;">{_esc(c["engine_label"])}</td>'
+            f'<td style="padding:5px 10px;text-align:right;color:#93c5fd;">{c["score"]:.2f}</td>'
+            f'<td style="padding:5px 10px;color:#7a7f87;font-size:12px;">'
+            f'{_esc(", ".join(c.get("accounts") or []))}</td></tr>' for c in held_skipped)
+        held_html = f"""
+        <div style="background:#131c26;border-left:3px solid #60a5fa;padding:12px 16px;
+             border-radius:4px;margin:14px 0;">
+          <div style="font-weight:700;margin-bottom:8px;color:#93c5fd;">
+            📌 보유 중이라 편입 제외 {len(held_skipped)}종목</div>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">{_hrows}</table>
+          <div style="margin-top:8px;font-size:12px;color:#7a8fa5;">
+            매도 레이더가 이미 추적 중입니다. 추가 매수 판단은 직접 하세요.
+          </div>
+        </div>"""
+
+    cap_html = ""
+    if capped:
+        cap_html = (
+            '<div style="background:#2a2416;border-left:3px solid #fbbf24;padding:12px 16px;'
+            'border-radius:4px;margin:14px 0;color:#fcd34d;font-size:13px;">'
+            f'⚠️ 워치리스트 상한({_WATCHLIST_MAX_PER_USER}종목) 도달 — '
+            f'{len(capped)}종목을 편입하지 못했습니다 (현재 {wl_count}종목).<br>'
+            '<span style="color:#d0b070;font-size:12px;">앱에서 「자동 편입분 일괄 삭제」로 '
+            '정리하거나 오래된 종목을 정리해 주세요.</span></div>')
 
     skip_html = ""
     if skipped:
@@ -454,6 +531,8 @@ def build_email(result: dict, added: list, skipped: list,
       {_bucket_table('expansion', result.get('expansion'))}
 
       {added_html}
+      {held_html}
+      {cap_html}
       {skip_html}
 
       <div style="margin-top:26px;padding-top:14px;border-top:1px solid #232733;
@@ -466,17 +545,16 @@ def build_email(result: dict, added: list, skipped: list,
     return subject, body
 
 
-def send_email(subject: str, html_body: str) -> bool:
+def send_email(subject: str, html_body: str, to_addr: str = None) -> bool:
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = GMAIL_USER
-        msg["To"] = GMAIL_TO
+        msg["To"] = str(to_addr or GMAIL_TO)
         msg.attach(MIMEText(html_body, "html", "utf-8"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
             s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
             s.send_message(msg)
-        log("[OK] 스캐너 메일 발송")
         return True
     except Exception as e:
         log(f"[ERROR] 메일 발송 실패: {e}")
@@ -550,6 +628,7 @@ def main():
         if snap is None:
             log(f"[INFO] {sc.ENGINE_LABELS[e]}: 후보 없음")
             continue
+        snap["drops"] = sc.get_last_drops(e)
         n = len(snap["score_df"])
         cov = snap.get("coverage", 0.0) * 100
         flag = " ⚠️ 커버리지 부족" if snap.get("degraded") else ""
@@ -557,6 +636,8 @@ def main():
             f"(커버리지 {cov:.0f}%){flag}")
         if snap.get("degraded"):
             _degraded.append(sc.ENGINE_LABELS[e])
+        for _d in (snap.get("drops") or []):
+            log(f"[DROP]   {_d.get('ticker','')} — {_d.get('reason','')}")
     for e in _ENGINES:
         snap = result.get(e)
         if snap is None or snap["score_df"].empty:
@@ -592,8 +673,9 @@ def main():
         if result.get(e) is not None:
             save_scanner_history(sh, e, result[e])
 
-    # ── 6) 70점 워치리스트 편입 (3버킷 전부 · 상한 없음) ──────────────────
-    log(f"[STEP 6] 워치리스트 편입 (≥{sc.WATCHLIST_AUTO_ADD_THRESHOLD:.0f}점)...")
+    # ── 6) 편입 후보 산출 (버킷별 커트라인 · degraded 버킷 제외) ─────────
+    log(f"[STEP 6] 편입 후보 산출 (주도주·대기주 ≥{sc.watchlist_threshold('leaders'):.0f} · "
+        f"확산주 ≥{sc.watchlist_threshold('expansion'):.0f})...")
     candidates = []
     for e in _ENGINES:
         if result.get(e) is None:
@@ -609,30 +691,103 @@ def main():
         if c["ticker"] not in seen:
             seen.add(c["ticker"])
             dedup.append(c)
+    log(f"[INFO] 중복 제거 후 편입 후보 {len(dedup)}종목")
 
-    added, skipped = [], []
+    # ── 7) 사용자별 반영 + 개인화 메일 ────────────────────────────────────
+    log("[STEP 7] 사용자별 워치리스트 반영 & 메일 발송...")
+    try:
+        ws_users = sh.worksheet(_WS_USERS)
+        uc.ensure_users_header_v3(ws_users)     # 자동화가 앱보다 먼저 돌 수 있으므로 방어
+    except Exception as e:
+        log(f"[ERROR] Users 시트 접근 실패: {e}")
+        traceback.print_exc()
+        return 1
+
+    mail_users = uc.get_recipients(ws_users, "weekly", admin_fallback_email=GMAIL_TO)
+    autowl_users = set(u.upper() for u in uc.get_flagged_users(ws_users, "autowl"))
+    log(f"[INFO] 주간 메일 수신자 {len(mail_users)}명 · 자동편입 대상 {len(autowl_users)}명")
+
     try:
         ws_wl = _get_or_create_ws(sh, _WS_WATCHLIST, _WL_COLS, rows=2000)
-        existing = load_existing_watchlist_tickers(ws_wl)
-        log(f"[INFO] 기존 워치리스트 {len(existing)}종목")
-        added, skipped = add_watchlist_rows(ws_wl, dedup, existing)
-        log(f"[OK] 신규 편입 {len(added)} · 기존 보유로 건너뜀 {len(skipped)}")
+        wl_by_user = load_watchlist_by_user(ws_wl)
     except Exception as e:
-        log(f"[ERROR] 워치리스트 반영 실패(메일은 계속 발송): {e}")
+        log(f"[ERROR] 워치리스트 로드 실패: {e}")
         traceback.print_exc()
+        ws_wl, wl_by_user = None, {}
 
-    # ── 7) 메일 ───────────────────────────────────────────────────────────
-    log("[STEP 7] 메일 발송...")
+    try:
+        ws_pf = sh.worksheet(_WS_PORTFOLIOS)
+        holdings = pc.holdings_by_user(ws_pf)
+    except Exception as e:
+        log(f"[WARN] 포트폴리오 로드 실패(보유 제외 미적용): {e}")
+        holdings = {}
+
+    # 자동 편입 대상 = 메일 수신자 ∪ autowl 사용자 (D1: 두 토글은 독립)
+    target_uids = {u.upper() for u, _ in mail_users} | autowl_users
     briefing = str(analysis.get("weekly_briefing_markdown") or analysis.get("summary") or "")
-    subject, body = build_email(result, added, skipped, weekly_dt, briefing)
-    send_email(subject, body)
+    email_by_uid = {u.upper(): em for u, em in mail_users}
 
+    all_rows, per_user, admin_mail_failed, guest_mail_failed = [], {}, False, 0
+    for uid in sorted(target_uids):
+        existing = wl_by_user.get(uid, set())
+        held_map = holdings.get(uid, {})
+        held = set(held_map.keys())
+        do_wl = (uid in autowl_users) and ws_wl is not None
+        rows, added, skip_exist, skip_held, capped = build_watchlist_rows(
+            uid, dedup, existing, held)
+        # 어느 계좌에 보유 중인지 메일에 표시
+        skip_held = [dict(c, accounts=held_map.get(c["ticker"], {}).get("accounts", []))
+                     for c in skip_held]
+        if do_wl:
+            all_rows.extend(rows)
+        per_user[uid] = {"added": added if do_wl else [], "pending": [] if do_wl else added,
+                         "skip_exist": skip_exist, "skip_held": skip_held,
+                         "capped": capped, "wl_count": len(existing), "auto": do_wl}
+        log(f"  {uid}: 편입 {len(added) if do_wl else 0} · "
+            f"기준충족(수동) {0 if do_wl else len(added)} · "
+            f"보유제외 {len(skip_held)} · 기보유WL {len(skip_exist)} · "
+            f"상한초과 {len(capped)} · 현재 {len(existing)}종목"
+            + ("" if do_wl else "  [자동편입 OFF]"))
+
+    if all_rows and ws_wl is not None:
+        try:
+            _safe_append_rows(ws_wl, all_rows)
+            log(f"[OK] 워치리스트 {len(all_rows)}행 추가")
+        except Exception as e:
+            log(f"[ERROR] 워치리스트 쓰기 실패(메일은 계속): {e}")
+            traceback.print_exc()
+            for u in per_user:
+                per_user[u]["pending"] += per_user[u]["added"]
+                per_user[u]["added"] = []
+
+    for uid, em in [(u.upper(), e) for u, e in mail_users]:
+        d = per_user.get(uid, {"added": [], "pending": [], "skip_exist": [],
+                               "skip_held": [], "capped": [], "wl_count": 0, "auto": False})
+        shown = d["added"] or d["pending"]
+        subject, body = build_email(
+            result, shown, d["skip_exist"], weekly_dt, briefing,
+            held_skipped=d["skip_held"], capped=d["capped"],
+            is_admin=(uid == _ADMIN_USER_ID.upper()), auto_wl=d["auto"],
+            wl_count=d["wl_count"])
+        if send_email(subject, body, em):
+            log(f"  ✉️ {uid} → {em}")
+        else:
+            # 게스트 1명의 잘못된 주소가 전체를 막으면 안 된다. 관리자 실패만 워크플로 실패.
+            if uid == _ADMIN_USER_ID.upper():
+                admin_mail_failed = True
+                log(f"  ❌ 관리자 발송 실패 ({em})")
+            else:
+                guest_mail_failed += 1
+                log(f"  ⚠️ 게스트 발송 실패 ({uid} → {em}) — 계속 진행")
+
+    total_added = sum(len(d["added"]) for d in per_user.values())
     log("=" * 60)
-    log(f"[DONE] 주도주/대기주/확산주 스캔 완료 · 워치리스트 +{len(added)}")
-    if result.get("failed") or _degraded:
-        # 메일은 이미 보냈다(사용자가 상황을 봐야 하므로). 다만 워크플로에는 실패로 알린다.
-        log(f"[FAIL] 데이터 수집 문제 — 전량실패 {result.get('failed')} · "
-            f"커버리지부족 {_degraded}")
+    log(f"[DONE] 3버킷 스캔 완료 · 워치리스트 +{total_added} · "
+        f"메일 {len(mail_users) - guest_mail_failed - (1 if admin_mail_failed else 0)}"
+        f"/{len(mail_users)}통 발송")
+    if result.get("failed") or _degraded or admin_mail_failed:
+        log(f"[FAIL] 전량실패 {result.get('failed')} · 커버리지부족 {_degraded} · "
+            f"관리자메일실패 {admin_mail_failed}")
         return 1
     return 0
 
