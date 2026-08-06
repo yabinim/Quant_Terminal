@@ -43,6 +43,10 @@ _MARKET_ET_TZ = pytz.timezone("America/New_York")
 
 # 점수표 스키마 버전 — 변경 시 Scanner_Last_Result 옛 캐시가 자동 무효화된다.
 # v3-3bucket-auto: run_by/run_at 메타 추가 (자동화 스캔과 수동 스캔 구분).
+# SSOT 버전 스탬프 — app.py 가 import 직후 대조한다.
+# 배포 누락/재부팅 누락 시 AttributeError 대신 명확한 안내를 띄우기 위함.
+SSOT_VERSION = "2026-08-06a"
+
 SCANNER_SCHEMA_VERSION = "v3-3bucket-auto"
 
 # 절대 컷오프 — Final Score 가 이 값 미만이면 "관망"(추천 없음). 절대 앵커링이라 의미 보존.
@@ -77,6 +81,39 @@ WATCHLIST_AUTO_ADD_ALERT_STATES = "entry,risk,watch"
 SCAN_MIN_COVERAGE = 0.60
 
 ENGINE_LABELS = {"leaders": "주도주", "emerging": "대기주", "expansion": "확산주"}
+
+# ── 누락 티커 사유 기록 ─────────────────────────────────────────────────────
+# 커버리지 93% 같은 숫자만으로는 "어떤 3종목이 왜 빠졌는지"를 알 수 없다.
+# API 호출은 성공했는데 데이터가 없는 경우(상장폐지·OTC·신규상장·환각 심볼)를
+# 구분해야 내러티브 품질 문제인지 단순 데이터 공백인지 판단할 수 있다.
+# 스캔은 순차 실행이므로 모듈 레벨 dict 로 충분하다.
+_LAST_DROPS = {}
+
+
+def _reset_drops(engine: str):
+    _LAST_DROPS[engine] = []
+
+
+def _record_drop(engine: str, ticker: str, reason: str):
+    _LAST_DROPS.setdefault(engine, []).append({"ticker": ticker, "reason": reason})
+
+
+def get_last_drops(engine: str) -> list:
+    """직전 스캔에서 제외된 티커와 사유. [{"ticker","reason"}, ...]"""
+    return list(_LAST_DROPS.get(engine) or [])
+
+
+def _drop_reason_from_price(close_series, close_num, min_bars: int) -> str:
+    """가격 데이터 상태로 제외 사유를 분류한다."""
+    try:
+        if close_series is None or (hasattr(close_series, "empty") and close_series.empty):
+            return "가격 이력 없음 (FMP 응답 0건 — 상장폐지·OTC·미존재 심볼 가능)"
+        n = len(close_num) if close_num is not None else 0
+        if n < min_bars:
+            return f"거래일 부족 ({n}일 / 최소 {min_bars}일 — 신규 상장 가능)"
+        return "거래량 데이터 없음"
+    except Exception:
+        return "데이터 확인 불가"
 
 # ── 스캐너 티커 검증 ──────────────────────────────────────────────────────────
 _SCANNER_TICKER_BLACKLIST = frozenset(
@@ -1461,6 +1498,10 @@ def score_opportunity_universe(universe_tickers, latest_analysis, regime_detail=
         return score_df
 
     # 가격 시계열이 없거나 핵심 모멘텀/RS가 NaN인 종목은 랭킹에서 제외 (내러티브만으로 상위 노출 방지)
+    _reset_drops("leaders")
+    for _, _r in score_df[score_df[["Momentum 1M Raw", "RS Raw"]].isna().any(axis=1)].iterrows():
+        _record_drop("leaders", str(_r.get("Ticker", "")),
+                     "가격 이력 없음/부족 (모멘텀·RS 계산 불가)")
     score_df = score_df.dropna(subset=["Momentum 1M Raw", "RS Raw"])
     if score_df.empty:
         progress.empty()
@@ -1674,6 +1715,11 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
         return score_df
 
     # 기술적 팩터(Early RS·거래량 가속·RSI) 중 하나라도 계산 불가면 최종 랭크에서 제외
+    _reset_drops("emerging")
+    _miss = score_df[score_df[["Early RS Raw", "Vol Accel Raw", "RSI(14)"]].isna().any(axis=1)]
+    for _, _r in _miss.iterrows():
+        _record_drop("emerging", str(_r.get("Ticker", "")),
+                     "가격 이력 없음/부족 (Early RS·거래량·RSI 계산 불가)")
     score_df = score_df.dropna(subset=["Early RS Raw", "Vol Accel Raw", "RSI(14)"])
     if score_df.empty:
         progress.empty()
@@ -1704,6 +1750,7 @@ def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
     가격 신호가 없어 모멘텀/RS 제외. Structural(공급망 연결강도) 0.40 + Accumulation(초기 축적) 0.25
     + Fundamentals 0.20 + Valuation(재평가 여지) 0.15. 절대 앵커링.
     """
+    _drop_detail = {}
     _expansion_ctx = {}
     try:
         import narrative_core as _nc
@@ -1755,6 +1802,8 @@ def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
 
         # 초기 축적: 조용한 베이스에서 거래량이 막 붙기 시작(저밴드 가점) + 저변동성 베이스
         accum_available = pd.notna(vol_ratio) and len(close_num) >= 20
+        if not accum_available:
+            _drop_detail[ticker] = _drop_reason_from_price(close_series, close_num, 20)
         if accum_available:
             if vol_ratio >= 1.3:
                 vol_acc = 100.0
@@ -1845,6 +1894,10 @@ def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
         return score_df
 
     # 가격 데이터 자체가 없는 종목(초기 축적 계산 불가)은 제외
+    _reset_drops("expansion")
+    for _, _r in score_df[score_df["Accumulation Raw"].isna()].iterrows():
+        _tk = str(_r.get("Ticker", ""))
+        _record_drop("expansion", _tk, _drop_detail.get(_tk, "가격/거래량 데이터 없음"))
     score_df = score_df.dropna(subset=["Accumulation Raw"])
     if score_df.empty:
         progress.empty()

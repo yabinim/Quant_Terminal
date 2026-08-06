@@ -44,6 +44,27 @@ import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 
 # 토요일 이메일 숫자가 구조적으로 갈라질 수 없다.
 # ⚠️ scanner_core.py 수정 시 app.py + automation 을 함께 배포할 것(lockstep).
 import scanner_core as sc
+import portfolio_core as pc
+
+# ── SSOT 버전 대조 ───────────────────────────────────────────────────────────
+# 공용 모듈을 덜 배포했거나 Streamlit 재부팅을 안 하면 AttributeError 로 죽는데,
+# Streamlit 이 메시지를 가려서 어느 파일이 문제인지 알 수 없다. 먼저 잡아 안내한다.
+_SSOT_REQUIRED = "2026-08-06a"
+_ssot_bad = [
+    (_n, getattr(_m, "SSOT_VERSION", None))
+    for _n, _m in (("scanner_core", sc), ("narrative_core", narrative_core),
+                   ("users_core", uc), ("fmp_extras", fx), ("portfolio_core", pc))
+    if getattr(_m, "SSOT_VERSION", None) != _SSOT_REQUIRED
+]
+if _ssot_bad:
+    st.error(
+        "⚠️ **공용 모듈 버전 불일치** — app.py 와 함께 배포되지 않았거나 "
+        "Streamlit 재부팅이 필요합니다.\n\n"
+        + "\n".join(f"- `{_n}.py` : 필요 `{_SSOT_REQUIRED}` / 현재 "
+                    f"`{_v or '없음(구버전)'}`" for _n, _v in _ssot_bad)
+        + "\n\n배포 후 **Manage app → Reboot** 을 실행하세요."
+    )
+    st.stop()
 
 # 기존 호출부 호환을 위한 재노출 (구현은 scanner_core 단일 정의)
 to_float                       = sc.to_float
@@ -15412,7 +15433,10 @@ if st.session_state.get("logged_in"):
         # ── 세션 최초 진입 시 Sheets에서 마지막 스캔 결과 복원 ──────────────
         # (함수 정의 이후 시점이므로 NameError 없음)
         if not st.session_state.get("_scanner_last_result_restored"):
-            _uid_restore = str(st.session_state.get("user_id") or "").strip()
+            # ⚠️ 스캐너 결과는 **공유 콘텐츠**다. 자동화가 관리자(yab) 소유로 저장하므로
+            #    로그인 사용자 ID 로 조회하면 게스트는 빈 화면을 보게 된다.
+            #    내러티브·DRG·Hidden Alpha 와 동일하게 _shared_owner_uid() 를 쓴다.
+            _uid_restore = str(_shared_owner_uid() or "").strip()
             if _uid_restore:
                 if st.session_state.get("scanner_results") is None:
                     _restored_l = load_scanner_last_result(_uid_restore, "leaders")
@@ -21273,6 +21297,52 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         else:
             st.markdown(f"### 📋 관심 종목 현황 ({len(wl_items)}개)")
 
+            # ── 자동 편입분 일괄 정리 ────────────────────────────────────
+            # 주간 스캐너가 넣은 종목은 Memo 가 "AUTO|" 로 시작한다.
+            # 자동 편입을 켰다가 목록이 불어났을 때 한 번에 되돌릴 수단.
+            _auto_items = [w for w in wl_items
+                           if sc.is_auto_memo(str(w.get("memo", "") or ""))]
+            if _auto_items:
+                _c_a1, _c_a2 = st.columns([3, 1])
+                with _c_a1:
+                    st.caption(
+                        f"🔔 주간 스캐너 자동 편입 {len(_auto_items)}종목 "
+                        f"(전체 {len(wl_items)}개 중) — "
+                        f"{', '.join(str(w.get('ticker','')) for w in _auto_items[:12])}"
+                        + (" …" if len(_auto_items) > 12 else "")
+                    )
+                with _c_a2:
+                    if st.button("🧹 자동 편입분 일괄 삭제", key="wl_purge_auto",
+                                 use_container_width=True,
+                                 help="Memo 가 AUTO| 로 시작하는 행만 삭제합니다. "
+                                      "직접 추가하신 종목과 수정한 손절가·목표가는 "
+                                      "영향을 받지 않습니다."):
+                        st.session_state["_wl_purge_confirm"] = True
+                if st.session_state.get("_wl_purge_confirm"):
+                    st.warning(f"자동 편입 {len(_auto_items)}종목을 삭제합니다. "
+                               f"되돌릴 수 없습니다.")
+                    _c_y, _c_n = st.columns(2)
+                    with _c_y:
+                        if st.button("삭제 확인", key="wl_purge_yes", type="primary",
+                                     use_container_width=True):
+                            _uid_p = str(st.session_state.get("user_id") or "").strip()
+                            _done, _fail = 0, 0
+                            for _w in _auto_items:
+                                _ok_p, _ = delete_from_watchlist(_uid_p,
+                                                                 str(_w.get("ticker", "")))
+                                _done += 1 if _ok_p else 0
+                                _fail += 0 if _ok_p else 1
+                            st.session_state["_wl_purge_confirm"] = False
+                            if _fail:
+                                st.error(f"{_done}종목 삭제, {_fail}종목 실패")
+                            else:
+                                st.success(f"{_done}종목을 삭제했습니다.")
+                            st.rerun()
+                    with _c_n:
+                        if st.button("취소", key="wl_purge_no", use_container_width=True):
+                            st.session_state["_wl_purge_confirm"] = False
+                            st.rerun()
+
             # ── 📖 배지 설명 (범례) ──────────────────────────────────────
             with st.expander("📖 배지 설명 (국면 · 매수 타이밍)", expanded=False):
                 st.markdown("**국면(추세 강도)**")
@@ -22890,7 +22960,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                             _safe_append_rows(
                                 ws_set,
                                 [_set_uid, uc.hash_password(_mk_pw), "admin", "self", "approved",
-                                 _mk_email, "Y", "Y"],
+                                 _mk_email, "Y", "Y", "Y", "Y", "Y", "Y"],
                                 value_input_option="USER_ENTERED",
                             )
                             st.success("계정 행이 생성되었습니다. 페이지를 새로고침하세요.")
@@ -22907,19 +22977,47 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                         value=_truthy_set(_row_set.get("Alert_Radar", "")),
                     )
                     ns_global = st.checkbox(
-                        "🌐 시장 브리핑 수신 — AI 시장 내러티브 · 거시 방향 예측(DRG)",
+                        "🌐 시장 내러티브 브리핑 수신 — AI 시장 내러티브",
                         value=_truthy_set(_row_set.get("Alert_Global", "")),
+                    )
+                    ns_drg = st.checkbox(
+                        "🎯 거시 방향 예측(DRG) 수신 — 예측·검증 메일",
+                        value=_truthy_set(_row_set.get("Alert_DRG", "")),
+                        help="내러티브와 분리되어 있어 DRG만 잠시 끌 수 있습니다.",
+                    )
+                    ns_weekly = st.checkbox(
+                        "🚀 주간 3버킷 스캐너 수신 — 토요일 주도주·대기주·확산주 결과",
+                        value=_truthy_set(_row_set.get("Alert_Weekly", "")),
+                    )
+                    ns_hidden = st.checkbox(
+                        "💰 Hidden Alpha 수신 — 주간 위성 ETF Top5 로테이션",
+                        value=_truthy_set(_row_set.get("Alert_HiddenAlpha", "")),
+                    )
+                    st.markdown("---")
+                    ns_autowl = st.checkbox(
+                        "🔔 자동 워치리스트 편입 — 주간 스캐너 기준 통과 종목을 내 워치리스트에 자동 추가",
+                        value=_truthy_set(_row_set.get("Auto_Watchlist", "")),
+                        help=(f"주도주·대기주 ≥{sc.watchlist_threshold('leaders'):.0f}점, "
+                              f"확산주 ≥{sc.watchlist_threshold('expansion'):.0f}점. "
+                              "이미 보유 중인 종목과 기존 워치리스트 종목은 제외되며, "
+                              "기존 손절가·목표가·알림 설정은 절대 변경되지 않습니다. "
+                              "메일 수신과 독립적으로 동작합니다."),
                     )
                     ns_submit = st.form_submit_button("알림 설정 저장", type="primary", use_container_width=True)
                 if ns_submit:
                     _ns_email = str(ns_email or "").strip()
-                    if (ns_radar or ns_global) and (not _ns_email or "@" not in _ns_email):
+                    _any_mail = ns_radar or ns_global or ns_drg or ns_weekly or ns_hidden
+                    if _any_mail and (not _ns_email or "@" not in _ns_email):
                         st.error("이메일 알림을 받으려면 올바른 이메일 주소를 입력하세요.")
                     else:
                         ok_ns, err_ns = uc.update_user_fields(ws_set, _set_uid, {
                             "Email": _ns_email,
                             "Alert_Radar": "Y" if ns_radar else "N",
                             "Alert_Global": "Y" if ns_global else "N",
+                            "Alert_DRG": "Y" if ns_drg else "N",
+                            "Alert_Weekly": "Y" if ns_weekly else "N",
+                            "Alert_HiddenAlpha": "Y" if ns_hidden else "N",
+                            "Auto_Watchlist": "Y" if ns_autowl else "N",
                         })
                         if ok_ns:
                             st.success("저장되었습니다. 다음 발송분부터 반영됩니다.")

@@ -721,6 +721,10 @@ def format_quant_gate_note(report) -> str:
 #   - analysis.themes = 확산주 Structural(가중치 0.40) 채점 근거
 # =============================================================================
 
+# SSOT 버전 스탬프 — app.py 가 import 직후 대조한다.
+# 배포 누락/재부팅 누락 시 AttributeError 대신 명확한 안내를 띄우기 위함.
+SSOT_VERSION = "2026-08-06a"
+
 NARRATIVE_SOURCE_WEEKLY_7D = "weekly_trend_7d"
 
 # 7일치 themes 를 제목 기준으로 병합한 뒤 유지할 최대 테마 수 (설계 확정: 12)
