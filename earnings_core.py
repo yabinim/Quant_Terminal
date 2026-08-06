@@ -517,14 +517,29 @@ def evaluate_entry_gate(move: dict, planned_stop_pct=None, days_until=None,
     """
     out = {"blocked": False, "code": "open", "label": GATE_LABELS["open"],
            "reason": "", "unblock_after": "",
-           "stop_pct": _num(planned_stop_pct), "stop_source": str(stop_source or "")}
+           "stop_pct": _num(planned_stop_pct), "stop_source": str(stop_source or ""),
+           "median_pct": None, "gate_move_pct": None, "gate_basis": ""}
     d = _num(days_until)
     if d is None or d < 0 or d > int(block_days):
         return out
 
     out["unblock_after"] = str(earnings_date or "")
-    mv = (move or {}).get("median_pct") if isinstance(move, dict) else None
+    # 게이트 임계는 **P75**(상위 25% 갭). 중앙값을 쓰면 "절반 이상의 확률로 손절이
+    # 뚫릴 때만 차단"이 되는데, 손절이 뚫릴 확률 50%는 이미 받아들이기 어려운 수준이다.
+    # P75 = "4번 중 1번 뚫리면 차단". 축소 판정(상시 중앙값)과 달리 게이트는 대상이
+    # 워치리스트 몇 종목뿐이고 창도 3일이라 더 보수적으로 가도 알림 피로가 작다.
+    # 표시용 통상 변동폭은 여전히 중앙값이다(gate_basis 로 구분해 반환).
     ok = bool((move or {}).get("ok")) if isinstance(move, dict) else False
+    med = (move or {}).get("median_pct") if isinstance(move, dict) else None
+    p75 = (move or {}).get("p75") if isinstance(move, dict) else None
+    mv = _num(p75)
+    basis = "p75"
+    if mv is None:
+        mv, basis = _num(med), "median"
+    out["median_pct"] = _num(med)
+    out["gate_move_pct"] = mv
+    out["gate_basis"] = basis
+    _bl = "상위 25% 갭" if basis == "p75" else "예상 갭"
     sp = _num(planned_stop_pct)
     _sfx = " (추정)" if str(stop_source or "").lower() == "atr" else ""
 
@@ -536,16 +551,16 @@ def evaluate_entry_gate(move: dict, planned_stop_pct=None, days_until=None,
 
     if sp is None or sp <= 0:
         out.update({"blocked": True, "code": "blocked", "label": GATE_LABELS["blocked"],
-                    "reason": f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% · 손절 산출 불가 — 발표 후 재평가"})
+                    "reason": f"실적 D-{int(d)} · {_bl} ±{mv:.1f}% · 손절 산출 불가 — 발표 후 재평가"})
         return out
 
     if mv > sp:
         out.update({"blocked": True, "code": "blocked", "label": GATE_LABELS["blocked"],
-                    "reason": (f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% > 손절 {sp:.1f}%{_sfx} "
+                    "reason": (f"실적 D-{int(d)} · {_bl} ±{mv:.1f}% > 손절 {sp:.1f}%{_sfx} "
                                f"— 손절이 작동하지 않는 구간")})
         return out
 
-    out["reason"] = f"실적 D-{int(d)} · 예상 갭 ±{mv:.1f}% ≤ 손절 {sp:.1f}%{_sfx}"
+    out["reason"] = f"실적 D-{int(d)} · {_bl} ±{mv:.1f}% ≤ 손절 {sp:.1f}%{_sfx}"
     return out
 
 
