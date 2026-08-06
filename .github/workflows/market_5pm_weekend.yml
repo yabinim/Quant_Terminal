@@ -92,6 +92,9 @@ jobs:
           FMP_MAX_RETRIES: '3'
           # 확산주 유니버스 최소 등장 일수 (7일 중). 풀이 여전히 크면 3으로 올린다.
           WEEKLY_EXPANSION_MIN_DAYS: '2'
+          # 사용자당 워치리스트 총량 상한. run_watchlist_alerts 가 매 평일 전 종목을
+          # 평가하므로 인원수 × 종목수만큼 FMP 부하가 는다.
+          WATCHLIST_MAX_PER_USER: '100'
         run: |
           python automation/run_scanner_scan.py
 
