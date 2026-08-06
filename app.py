@@ -1032,12 +1032,50 @@ def load_earnings_events() -> list[dict]:
         return []
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_earnings_price_history(ticker_upper: str):
+    """실적 갭 산출 전용 심층 일봉(약 3.5년, 6시간 캐시).
+
+    ⚠️ cached_timing_price_history 는 limit=260(1년)이라 실적이 4분기밖에 안 들어간다.
+       가장 오래된 건은 직전 봉이 없어 측정 불가 → 실질 3건 → MIN_SAMPLE 미달로 '미상'.
+       또 automation(run_earnings_watch._HIST_LIMIT=900)과 표본 수가 달라져
+       앱 화면과 이메일의 예상 변동폭이 갈린다. 그래서 전용 심층 캐시를 둔다.
+       (기술적 분석용 1년 캐시는 다른 8개 호출부가 쓰므로 건드리지 않는다.)
+    """
+    k = _fmp_key()
+    if not k:
+        return pd.DataFrame()
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker_upper.strip().upper()}"
+            f"&limit=900&apikey={k}", timeout=_FMP_TIMEOUT)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json()
+        rows = data.get("historical", data) if isinstance(data, dict) else data
+        if not isinstance(rows, list) or not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        if "date" not in df.columns or "close" not in df.columns:
+            return pd.DataFrame()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        out = pd.DataFrame(index=df.index)
+        for _src, _dst in (("open", "Open"), ("high", "High"), ("low", "Low"),
+                           ("close", "Close"), ("volume", "Volume")):
+            if _src in df.columns:
+                out[_dst] = pd.to_numeric(df[_src], errors="coerce")
+        return out.dropna(subset=["Close"])
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_expected_move(ticker_upper: str) -> dict:
     """티커의 예상 실적 변동폭(1시간 캐시). 과거 8분기 반응일 close-to-close 기준."""
     try:
         tk = str(ticker_upper).strip().upper()
-        hist = cached_timing_price_history(tk)
+        hist = cached_earnings_price_history(tk)
         if hist is None or hist.empty:
             return {"ok": False, "note": "가격 이력 없음", "sample_n": 0}
         past = ec.past_earnings_dates(tk, key=_fmp_key())
