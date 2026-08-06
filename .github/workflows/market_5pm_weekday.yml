@@ -63,6 +63,22 @@ jobs:
       - name: ⏳ 15초 대기
         run: sleep 15
 
+      # ⚠️ 워치리스트 알림보다 **먼저** 실행해야 한다.
+      #    실적 진입 차단 게이트가 Earnings_Events 시트를 공유 상태로 쓰므로,
+      #    스냅샷이 먼저 기록돼야 당일 D-3 종목이 곧바로 차단된다.
+      - name: 📅 실적 레이더 (사전 게이트 + 발표 후 측정)
+        env:
+          FMP_API_KEY:       ${{ secrets.FMP_API_KEY }}
+          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:          ${{ secrets.GMAIL_TO }}
+          GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/run_earnings_watch.py
+
+      - name: ⏳ 15초 대기
+        run: sleep 15
+
       - name: 🔔 워치리스트 레짐/타이밍 알림 (regime_core 엔진, app.py와 lockstep)
         env:
           FMP_API_KEY:       ${{ secrets.FMP_API_KEY }}
