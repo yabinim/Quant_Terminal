@@ -336,7 +336,8 @@ def report(evs):
     print(f"  SPY 동일기간     {_fmt(_stat([e['spy_b'] for e in evs]))}")
     print(f"  초과수익(B−SPY)  {_fmt(_stat([e['exc_b'] for e in evs]))}")
     hb = _stat([e.get("hold_b") for e in evs])
-    print(f"  평균 보유        {'-' if hb is None else f'{hb['mean']:.1f}세션'}")
+    _hb_txt = "-" if hb is None else "%.1f세션" % hb["mean"]
+    print(f"  평균 보유        {_hb_txt}")
     kinds = {}
     for e in evs:
         kinds[e.get("exit_kind") or "-"] = kinds.get(e.get("exit_kind") or "-", 0) + 1
