@@ -51,7 +51,7 @@ EXIT_A_OFFSET = 1        # 갭 직전 마지막 세션 (반응일 −1)
 HOLD_B_MAX = 20          # 전략 B 최대 보유 세션
 SURPRISE_LOOKBACK = 8    # F2 산출 분기 수
 RS_WINDOW = 20           # F3 창(세션)
-GRADE_WINDOW = 30        # F4 창(일)
+GRADE_WINDOW = 60        # F4 창(일) — 30일이면 등급 변경이 거의 없어 그룹부족이 난다
 COST_BPS = 5.0           # 편도 거래비용 (bp)
 MIN_EVENTS = 40          # 이 미만이면 결론 보류
 HIST_LIMIT = 1400        # 약 5.5년 — FMP 상한 근처
@@ -227,19 +227,29 @@ def build_events(ticker, hist, spy, recs, grades):
             cost = COST_BPS / 100.0 * 2
             ret_a = (float(hist["Close"].iloc[x_i]) - px_in) / px_in * 100.0 - cost
 
-            ret_b, exit_kind = None, ""
+            ret_b, exit_kind, spy_b, hold_b = None, "", None, None
             if i + HOLD_B_MAX < len(idx):
                 ma50 = hist["Close"].rolling(50).mean()
-                ret_b, exit_kind = None, "hold"
+                x_b = None
                 for j in range(i, min(i + HOLD_B_MAX + 1, len(idx))):
                     c = float(hist["Close"].iloc[j])
                     m = ma50.iloc[j]
                     if pd.notna(m) and c < float(m):
-                        ret_b, exit_kind = (c - px_in) / px_in * 100.0 - cost, "signal"
+                        x_b, exit_kind = j, "signal"
                         break
-                if ret_b is None:
-                    c = float(hist["Close"].iloc[i + HOLD_B_MAX])
-                    ret_b, exit_kind = (c - px_in) / px_in * 100.0 - cost, "timeout"
+                if x_b is None:
+                    x_b, exit_kind = i + HOLD_B_MAX, "timeout"
+                ret_b = (float(hist["Close"].iloc[x_b]) - px_in) / px_in * 100.0 - cost
+                hold_b = x_b - e_i
+                # ⚠️ B 는 보유기간이 이벤트마다 다르다. **같은 구간의 SPY** 와 비교해야
+                #    강세장 베타를 초과수익으로 착각하지 않는다(위성 백테스트 교훈).
+                if spy is not None and not spy.empty:
+                    try:
+                        sb = spy.loc[idx[e_i]:idx[x_b]]
+                        if len(sb) >= 2:
+                            spy_b = (float(sb.iloc[-1]) - float(sb.iloc[0])) / float(sb.iloc[0]) * 100.0
+                    except Exception:
+                        pass
 
             spy_a = None
             if spy is not None and not spy.empty:
@@ -259,8 +269,10 @@ def build_events(ticker, hist, spy, recs, grades):
                 "ticker": ticker, "date": rec["date"], "entry": entry_dt.strftime("%Y-%m-%d"),
                 "F2_beat": beat_rate, "F2_surp": avg_surp, "F3_rs": rs,
                 "F4_net": ups - dns,
-                "ret_a": ret_a, "ret_b": ret_b, "spy_a": spy_a,
-                "gap": gap, "exit_kind": exit_kind,
+                "ret_a": ret_a, "ret_b": ret_b, "spy_a": spy_a, "spy_b": spy_b,
+                "exc_a": (None if spy_a is None else ret_a - spy_a),
+                "exc_b": (None if (spy_b is None or ret_b is None) else ret_b - spy_b),
+                "hold_b": hold_b, "gap": gap, "exit_kind": exit_kind,
             })
         except Exception:
             continue
@@ -321,11 +333,23 @@ def report(evs):
 
     print("\n■ 비교군 (전략 B: D-10 매수 → 갭 통과 → 50MA 이탈/D+20)")
     print(f"  무조건 진입      {_fmt(_stat([e['ret_b'] for e in evs]))}")
+    print(f"  SPY 동일기간     {_fmt(_stat([e['spy_b'] for e in evs]))}")
+    print(f"  초과수익(B−SPY)  {_fmt(_stat([e['exc_b'] for e in evs]))}")
+    hb = _stat([e.get("hold_b") for e in evs])
+    print(f"  평균 보유        {'-' if hb is None else f'{hb['mean']:.1f}세션'}")
     kinds = {}
     for e in evs:
         kinds[e.get("exit_kind") or "-"] = kinds.get(e.get("exit_kind") or "-", 0) + 1
     print(f"  청산 사유        {kinds}")
     print(f"  실제 갭 분포     {_fmt(_stat([e['gap'] for e in evs]))}")
+
+    # F4 측정 가능성 진단 — 창 안에 등급 변경이 없으면 요인 자체가 무의미
+    nz = sum(1 for e in evs if e.get("F4_net") not in (None, 0))
+    pos = sum(1 for e in evs if (e.get("F4_net") or 0) > 0)
+    print(f"\n  [진단] 등급 변경 창({GRADE_WINDOW}일) 안에 변동 있는 이벤트 "
+          f"{nz}/{len(evs)}건 (순상향 {pos}건)")
+    if pos < 20:
+        print("         → F4 는 표본 부족으로 사실상 검증 불가")
 
     mid = sorted(e["date"] for e in evs)[len(evs) // 2]
     h1 = [e for e in evs if e["date"] < mid]
@@ -334,7 +358,10 @@ def report(evs):
     # 임계값 2종을 함께 본다:
     #   fixed  = 배포에 쓸 해석 가능한 절대 기준
     #   median = 표본을 반씩 가르는 상대 기준(한쪽이 비는 문제를 없앰)
-    for ret_key, label in (("ret_a", "전략 A"), ("ret_b", "전략 B")):
+    # ⚠️ 요인 평가는 **초과수익(−SPY) 기준**으로 한다. 원수익 기준이면
+    #    2021~2026 강세장의 시장 베타가 전부 '엣지'로 보인다.
+    for ret_key, label in (("exc_a", "전략 A (초과수익)"),
+                           ("exc_b", "전략 B (초과수익)")):
         for mode in ("fixed", "median"):
             print(f"\n■ 요인별 성과 — {label} · {mode} 임계   (half-split ~{mid})")
             print(f"  {'요인':<28} {'임계':>7} {'전체':>9} {'전반':>8} {'후반':>8}  판정")
@@ -359,8 +386,8 @@ def report(evs):
     # ── 스코어 버킷 (C1 동일가중) ──
     # AND 조합은 요인이 늘수록 표본이 급감해(예: 4개 전부 만족 = 몇 건) 결론을
     # 낼 수 없다. 대신 '양의 요인 개수'로 버킷을 나눠 단조성을 본다.
-    print("\n■ 스코어 버킷 — 양의 요인 개수별 성과 (C1 동일가중)")
-    for ret_key, label in (("ret_a", "전략 A"), ("ret_b", "전략 B")):
+    print("\n■ 스코어 버킷 — 양의 요인 개수별 초과수익 (C1 동일가중)")
+    for ret_key, label in (("exc_a", "전략 A"), ("exc_b", "전략 B")):
         for e in evs:
             e["_score"] = sum(1 for k, t, _ in FACTORS
                               if e.get(k) is not None and e[k] > t)
@@ -392,15 +419,31 @@ def report(evs):
             print("    → 버킷 부족 — 판단 보류"); continue
         sl1, _, _ = _slope(h1)
         sl2, _, _ = _slope(h2)
-        spread = top["mean"] - bot["mean"]
         half_ok = (sl1 is not None and sl2 is not None
                    and np.sign(sl1) == np.sign(sl2) == np.sign(sl))
-        ok = (sl > 0 and spread > 0 and half_ok)
-        print(f"    기울기 {sl:+.2f}%p/점 · 상단−하단 {spread:+.2f}%p "
-              f"· half-split {('일치' if half_ok else '불일치')}"
+        # ⚠️ 평균만 보면 소수의 큰 상승이 최상위 버킷을 끌어올려 착각한다.
+        #    (첫 실행에서 3/4 버킷이 평균 +1.96% 인데 중앙 −1.34% · 승률 43.9%)
+        #    → 평균·중앙값·승률이 **모두** 상단>하단이어야 통과.
+        d_mean = top["mean"] - bot["mean"]
+        d_med = top["median"] - bot["median"]
+        d_win = top["win"] - bot["win"]
+        ok = (sl > 0 and half_ok and d_mean > 0 and d_med > 0 and d_win > 0)
+        print(f"    기울기 {sl:+.2f}%p/점 · half-split "
+              f"{('일치' if half_ok else '불일치')}"
               f" ({'—' if sl1 is None else f'{sl1:+.2f}'}/"
               f"{'—' if sl2 is None else f'{sl2:+.2f}'})")
-        print(f"    → {'✅ 요인 조합에 근거 있음' if ok else '❌ 근거 없음 (세 조건 모두 필요)'}")
+        print(f"    상단−하단  평균 {d_mean:+.2f}%p · 중앙 {d_med:+.2f}%p "
+              f"· 승률 {d_win:+.1f}%p")
+        if not ok:
+            miss = []
+            if sl <= 0: miss.append("기울기")
+            if not half_ok: miss.append("half-split")
+            if d_mean <= 0: miss.append("평균")
+            if d_med <= 0: miss.append("중앙값")
+            if d_win <= 0: miss.append("승률")
+            print(f"    → ❌ 근거 없음 (미충족: {', '.join(miss)})")
+        else:
+            print("    → ✅ 요인 조합에 근거 있음 (5개 조건 전부 통과)")
 
 
 def main():
@@ -436,6 +479,8 @@ def main():
     report(all_evs)
     print("\n" + "=" * 74)
     print("해석 주의")
+    print("  0) 모든 요인·버킷 평가는 **초과수익(−SPY)** 기준이다. 원수익으로 보면")
+    print("     2021~2026 강세장의 시장 베타가 전부 엣지로 보인다.")
     print("  1) 다중검정: 요인 4 × 임계 2 × 전략 2 = 16회 검정이다. 순수 랜덤에서도")
     print("     1~2개는 '채택'이 나온다. 단일 요인 채택은 근거로 부족하고,")
     print("     **스코어 버킷이 세 조건을 모두 통과할 때만** 의미를 둘 것.")
