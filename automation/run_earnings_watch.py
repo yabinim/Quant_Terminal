@@ -96,10 +96,26 @@ def _sheet():
 
 
 def _ws(title: str, cols: list = None):
-    """워크시트 조회. 없으면 헤더와 함께 생성(신규 배포 첫 실행 대비)."""
+    """워크시트 조회. 없으면 헤더와 함께 생성(신규 배포 첫 실행 대비).
+
+    ⚠️ 이미 있는 시트라도 스키마가 넓어졌으면 **그리드를 먼저 확장**해야 한다.
+       Google Sheets 는 열 수가 고정이라 17열 시트에 20열을 쓰면
+       'exceeds grid limits' APIError 가 난다(Users 시트에서 겪은 문제).
+    """
     sh = _sheet()
     try:
-        return sh.worksheet(title)
+        w = sh.worksheet(title)
+        if cols:
+            try:
+                if int(getattr(w, "col_count", 0) or 0) < len(cols):
+                    w.add_cols(len(cols) - int(w.col_count))
+                    print(f"[MIGRATE] '{title}' 열 확장 → {len(cols)}열")
+                    _end = gspread.utils.rowcol_to_a1(1, len(cols))
+                    w.update([cols], range_name=f"A1:{_end}",
+                             value_input_option="USER_ENTERED")
+            except Exception as e:
+                print(f"[WARN] '{title}' 열 확장 실패: {e}")
+        return w
     except Exception:
         if not cols:
             raise
