@@ -1030,7 +1030,17 @@ def open_earnings_calendar_worksheet():
     except Exception as exc:
         return None, f"스프레드시트를 열 수 없습니다: {exc}"
     try:
-        return sh.worksheet(ec.CALENDAR_WORKSHEET), None
+        _w = sh.worksheet(ec.CALENDAR_WORKSHEET)
+        # 스키마가 넓어졌으면 그리드 확장 (Users 시트에서 겪은 grid limits 방지)
+        try:
+            if int(getattr(_w, "col_count", 0) or 0) < ec.CALENDAR_NCOL:
+                _w.add_cols(ec.CALENDAR_NCOL - int(_w.col_count))
+                _w.update([ec.CALENDAR_COLS],
+                          range_name=f"A1:{gspread.utils.rowcol_to_a1(1, ec.CALENDAR_NCOL)}",
+                          value_input_option="USER_ENTERED")
+        except Exception:
+            pass
+        return _w, None
     except Exception:
         pass
     try:

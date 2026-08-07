@@ -26,6 +26,7 @@ lockstep 대상:
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta
 
@@ -571,9 +572,17 @@ CALENDAR_COLS = [
     "Last_Checked", "Check_Tier",
     "Exp_Median_Pct", "Exp_Worst_Pct", "Exp_P25_Pct", "Exp_P75_Pct",
     "ATR_Multiple", "Sample_N", "Move_Confidence",
-    "Move_Computed_At", "Move_For_Date", "Notes",
+    "Move_Computed_At", "Move_For_Date",
+    # ── EPS 추정치 리비전 축적 (전방 전용) ──────────────────────────────
+    # FMP analyst-estimates 는 '현재 시점 전망'만 준다 — 과거에 추정치가 어떻게
+    # 변해왔는지의 시계열이 없어 백테스트가 불가능하다. 유일한 방법은 오늘부터
+    # 매일 스냅샷을 남기는 것. 2~3 실적 시즌 뒤 리비전 요인으로 쓸 수 있다.
+    "Est_EPS", "Est_History_JSON", "Est_Revision_Pct",
+    "Notes",
 ]
 CALENDAR_NCOL = len(CALENDAR_COLS)
+EST_HISTORY_MAX = 24          # 분기당 약 3개월치 일별 스냅샷 상한
+EST_REVISION_WINDOW = 30      # 리비전 산출 기준 일수
 
 TIER_NEAR, TIER_MID, TIER_FAR = "near", "mid", "far"
 TIER_REFRESH_DAYS = {TIER_NEAR: 1, TIER_MID: 7, TIER_FAR: 30}
@@ -651,13 +660,64 @@ def calendar_row(ticker: str, ev: dict = None, move: dict = None,
               _keep("Exp_P75_Pct"), _keep("ATR_Multiple"), _keep("Sample_N"),
               _keep("Move_Confidence"), _keep("Move_Computed_At"), _keep("Move_For_Date")]
 
+    # EPS 추정치 스냅샷 — 분기가 바뀌면 이력도 새로 시작한다
+    est = _num(e.get("eps_estimate"))
+    prev_json = "" if date_changed else str(p.get("Est_History_JSON", "") or "")
+    est_json = push_estimate(prev_json, est, today=t0) if (ev is not None) else prev_json
+    est_cur = est if est is not None else (
+        "" if date_changed else _blank(p.get("Est_EPS")))
+    rev = estimate_revision_pct(est_json, today=t0)
+
     row = [
         str(ticker or "").strip().upper(), ed,
         str(e.get("date_source") or (p.get("Date_Source", "") if not date_changed else "")),
         str(e.get("timing") or (p.get("Timing", "") if not date_changed else "")),
         days, t0.strftime("%Y-%m-%d"), tier_of(days if days != "" else None),
-    ] + mv + [str(p.get("Notes", "") or "")]
+    ] + mv + [_blank(est_cur), est_json, _blank(rev),
+              str(p.get("Notes", "") or "")]
     return (row + [""] * CALENDAR_NCOL)[:CALENDAR_NCOL]
+
+
+def push_estimate(prev_json: str, eps, today=None, keep: int = EST_HISTORY_MAX) -> str:
+    """EPS 추정치 스냅샷을 누적. 값이 같으면 날짜만 갱신(중복 방지)."""
+    t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    ds = t0.strftime("%Y-%m-%d")
+    v = _num(eps)
+    try:
+        hist = json.loads(prev_json) if str(prev_json or "").strip() else []
+        if not isinstance(hist, list):
+            hist = []
+    except Exception:
+        hist = []
+    if v is None:
+        return json.dumps(hist[-keep:], separators=(",", ":"))
+    if hist and _num(hist[-1].get("eps")) == v:
+        hist[-1]["d"] = ds                      # 값 동일 → 마지막 관측일만 갱신
+    else:
+        hist.append({"d": ds, "eps": round(v, 4)})
+    return json.dumps(hist[-keep:], separators=(",", ":"))
+
+
+def estimate_revision_pct(hist_json: str, today=None,
+                          window: int = EST_REVISION_WINDOW):
+    """최근 window 일 EPS 추정치 변화율(%). 표본 부족 시 None.
+
+    양수 = 상향(발표 전 애널리스트가 눈높이를 올리는 중).
+    """
+    t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    try:
+        hist = json.loads(hist_json) if str(hist_json or "").strip() else []
+    except Exception:
+        return None
+    if not isinstance(hist, list) or len(hist) < 2:
+        return None
+    cutoff = t0 - pd.Timedelta(days=int(window))
+    older = [h for h in hist if (_d(h.get("d")) is not None and _d(h.get("d")) <= cutoff)]
+    base = _num((older[-1] if older else hist[0]).get("eps"))
+    cur = _num(hist[-1].get("eps"))
+    if base is None or cur is None or abs(base) < 1e-9:
+        return None
+    return round((cur - base) / abs(base) * 100.0, 2)
 
 
 def parse_calendar(values: list) -> dict:
