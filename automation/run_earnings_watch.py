@@ -114,6 +114,10 @@ def _events_ws():
     return _ws(ec.EVENTS_WORKSHEET, ec.EVENTS_COLS)
 
 
+def _calendar_ws():
+    return _ws(ec.CALENDAR_WORKSHEET, ec.CALENDAR_COLS)
+
+
 def _col_a1(n: int) -> str:
     """1-base 열 번호 → A1 문자 (AA 이상 대응)."""
     s = ""
@@ -241,43 +245,112 @@ def load_core_keys() -> set:
     return keys
 
 
-# ── 패스 1: 사전 스냅샷 ───────────────────────────────────────────────────
-def pass_snapshot(tickers, existing, hist_cache, today, now_et):
-    """D-SNAPSHOT_DAYS 도달 종목의 예상 변동폭 스냅샷. 이미 있으면 건너뜀."""
-    new_rows, snapshots = [], {}
+# ── 패스 0: 캘린더 갱신 (계단식 1A) ───────────────────────────────────────
+#   앱 탭이 FMP 를 한 번도 부르지 않도록, 실적일과 예상 변동폭을 여기서 시트에
+#   적재한다. 전 종목을 매일 3콜씩 검증하면 자동화가 느려지므로 D-Day 에 따라
+#   갱신 주기를 나눈다(far 30일 / mid 7일 / near 매일).
+# ──────────────────────────────────────────────────────────────────────────
+
+def pass_calendar(tickers, cal, hist_cache, today, now_et):
+    """캘린더 갱신. 반환: (updates, appends, cal) — cal 은 갱신 반영된 dict."""
+    updates, appends = [], []
+    n_skip = n_light = n_full = n_move = 0
+
     for tk in tickers:
         try:
-            ev = ec.fetch_next_earnings(tk, today=today, key=FMP_API_KEY)
-            if not ev:
+            prev = cal.get(tk)
+            if prev is not None and not ec.needs_refresh(prev, today):
+                n_skip += 1
                 continue
-            dd = ev["days_until"]
-            if dd > ec.SCAN_HORIZON_DAYS:
+
+            dd_prev = ec.days_until_from_row(prev, today) if prev else None
+            tier = ec.tier_of(dd_prev)
+
+            # near 만 3콜 교차 확인 — 그 밖은 확정일이 어차피 안 나온다
+            if tier == ec.TIER_NEAR:
+                ev = ec.fetch_next_earnings(tk, today=today, key=FMP_API_KEY)
+                n_full += 1
+            else:
+                ev = ec.fetch_next_earnings_light(tk, today=today, key=FMP_API_KEY)
+                n_light += 1
+                # 경량 조회 결과가 D-10 안이면 즉시 3콜로 승격
+                if ev and ev["days_until"] <= ec.SCAN_HORIZON_DAYS:
+                    ev = ec.fetch_next_earnings(tk, today=today, key=FMP_API_KEY) or ev
+                    n_full += 1
+
+            dd = ev["days_until"] if ev else None
+            row_for_move = dict(prev or {})
+            if ev:
+                row_for_move["Earnings_Date"] = ev["earnings_date"]
+
+            move = None
+            if ev is not None and ec.needs_move(row_for_move, days_until=dd):
+                hist = hist_cache.get(tk)
+                if hist is None:
+                    hist = hist_cache[tk] = fmp_price_history(tk)
+                if hist is not None and not hist.empty:
+                    past = ec.past_earnings_dates(tk, today=today, key=FMP_API_KEY)
+                    move = ec.expected_move(ec.gap_history(hist, past),
+                                            atr_pct=ec.atr_pct_of(hist))
+                    n_move += 1
+                    print(f"  [MOVE] {tk} D-{dd} ±{move.get('median_pct')}% "
+                          f"n={move.get('sample_n')} ({move.get('confidence')})")
+
+            row = ec.calendar_row(tk, ev, move, today=today, now_et=now_et, prev=prev)
+            if prev is not None:
+                updates.append((prev["_row"], row))
+            else:
+                appends.append(row)
+            cal[tk] = {c: row[i] for i, c in enumerate(ec.CALENDAR_COLS)}
+            cal[tk]["_row"] = (prev or {}).get("_row", 0)
+        except Exception as e:
+            print(f"  [WARN] {tk} 캘린더 갱신 실패: {e}")
+
+    print(f"[CAL] 생략 {n_skip} · 경량 {n_light}콜 · 정밀 {n_full}×3콜 · 변동폭 {n_move}")
+    return updates, appends, cal
+
+
+# ── 패스 1: 사전 스냅샷 ───────────────────────────────────────────────────
+def pass_snapshot(cal, existing, hist_cache, today, now_et):
+    """D-SNAPSHOT_DAYS 도달 종목의 스냅샷. **캘린더에서 읽으므로 FMP 재조회 없음.**"""
+    new_rows, snapshots = [], {}
+    for tk, row in (cal or {}).items():
+        try:
+            ed = str(row.get("Earnings_Date") or "")
+            dd = ec.days_until_from_row(row, today)
+            if dd is None or dd < 0 or dd > ec.SCAN_HORIZON_DAYS:
                 continue
-            eid = ec.event_id(tk, ev["earnings_date"])
+            move = ec.move_from_row(row)
+            ev = {"ticker": tk, "earnings_date": ed, "days_until": dd,
+                  "timing": str(row.get("Timing") or ""),
+                  "date_source": str(row.get("Date_Source") or "")}
+
+            eid = ec.event_id(tk, ed)
             if eid in existing:
-                snapshots[tk] = existing[eid]
+                rec = dict(existing[eid]); rec["_move"] = move; rec["_event"] = ev
+                snapshots[tk] = rec
                 continue
             if dd > ec.SNAPSHOT_DAYS:
-                continue                       # 아직 스냅샷 시점 아님
-
-            hist = hist_cache.get(tk)
-            if hist is None:
-                hist = hist_cache[tk] = fmp_price_history(tk)
-            if hist is None or hist.empty:
-                print(f"  [WARN] {tk} 가격 이력 없음 — 스냅샷 생략")
+                # 아직 스냅샷 시점은 아니지만 앱/메일 표시용으로는 캘린더 값을 쓴다
+                snapshots[tk] = {"Ticker": tk, "Earnings_Date": ed,
+                                 "Date_Source": ev["date_source"], "Timing": ev["timing"],
+                                 "Exp_Median_Pct": row.get("Exp_Median_Pct", ""),
+                                 "Exp_Worst_Pct": row.get("Exp_Worst_Pct", ""),
+                                 "Sample_N": row.get("Sample_N", ""),
+                                 "_move": move, "_event": ev, "_pending": True}
                 continue
 
-            past = ec.past_earnings_dates(tk, today=today, key=FMP_API_KEY)
-            gaps = ec.gap_history(hist, past)
-            move = ec.expected_move(gaps, atr_pct=ec.atr_pct_of(hist))
-            px = float(hist["Close"].iloc[-1])
-            row = ec.snapshot_row(ev, move, price=px, now_et=now_et)
-            new_rows.append(row)
-            rec = {c: row[i] for i, c in enumerate(ec.EVENTS_COLS)}
-            rec["_move"] = move
-            rec["_event"] = ev
+            hist = hist_cache.get(tk)
+            px = float(hist["Close"].iloc[-1]) if (hist is not None and not hist.empty) else None
+            if px is None:
+                hist = hist_cache[tk] = fmp_price_history(tk)
+                px = float(hist["Close"].iloc[-1]) if (hist is not None and not hist.empty) else None
+            srow = ec.snapshot_row(ev, move, price=px, now_et=now_et)
+            new_rows.append(srow)
+            rec = {c: srow[i] for i, c in enumerate(ec.EVENTS_COLS)}
+            rec["_move"] = move; rec["_event"] = ev
             snapshots[tk] = rec
-            print(f"  [SNAP] {tk} D-{dd} {ev['earnings_date']}({ev['date_source']}) "
+            print(f"  [SNAP] {tk} D-{dd} {ed}({ev['date_source']}) "
                   f"±{move.get('median_pct')}% n={move.get('sample_n')}")
         except Exception as e:
             print(f"  [WARN] {tk} 스냅샷 실패: {e}")
@@ -562,7 +635,11 @@ def main():
     ews = _events_ws()
     rows = ec.parse_events(ews.get_all_values() or [])
     existing = {str(r.get("Event_ID") or ""): r for r in rows}
-    print(f"[INFO] 기존 이벤트 {len(rows)}건")
+    cws = _calendar_ws()
+    _cal_vals = cws.get_all_values() or []
+    cal = ec.parse_calendar(_cal_vals)
+    _cal_next_row = max(len(_cal_vals), 1) + 1   # 헤더 포함 마지막 행 다음
+    print(f"[INFO] 기존 이벤트 {len(rows)}건 · 캘린더 {len(cal)}종목")
 
     holdings, watch, tickers, wl_stops = load_universe()
     print(f"[INFO] 대상 티커 {len(tickers)}개 "
@@ -570,12 +647,27 @@ def main():
 
     hist_cache = {}
 
+    print("\n▶ 패스 0: 캘린더 갱신")
+    c_updates, c_appends, cal = pass_calendar(tickers, cal, hist_cache, today, now_et)
     print("\n▶ 패스 2: 사후 측정")
     v_updates, results = pass_verify(rows, hist_cache, today)
     print("\n▶ 패스 3: D+5 지연")
     d_updates = pass_delayed(rows, hist_cache, today)
     print("\n▶ 패스 1: 사전 스냅샷")
-    new_rows, snapshots = pass_snapshot(tickers, existing, hist_cache, today, now_et)
+    new_rows, snapshots = pass_snapshot(cal, existing, hist_cache, today, now_et)
+
+    # ── 캘린더 기록: 갱신 먼저, 추가는 마지막 ──
+    for row_i, vals in c_updates:
+        try:
+            _safe_update(cws, [vals], row_i, ec.CALENDAR_NCOL)
+        except Exception as e:
+            print(f"[ERROR] 캘린더 행 {row_i} 갱신 실패: {e}")
+    if c_appends:
+        try:
+            _safe_update(cws, c_appends, _cal_next_row, ec.CALENDAR_NCOL)
+            print(f"[OK] 캘린더 신규 {len(c_appends)}종목 추가")
+        except Exception as e:
+            print(f"[ERROR] 캘린더 추가 실패: {e}")
 
     # ── 시트 기록: 갱신 먼저, 추가는 마지막 (부분 실패 시 재시도 가능) ──
     idx = {c: i for i, c in enumerate(ec.EVENTS_COLS)}
@@ -627,7 +719,8 @@ def main():
             traceback.print_exc()
 
     print("\n" + "=" * 60)
-    print(f"완료 — 스냅샷 {len(new_rows)} · 측정 {len(v_updates)} · "
+    print(f"완료 — 캘린더 {len(c_updates)}갱신/{len(c_appends)}신규 · "
+          f"스냅샷 {len(new_rows)} · 측정 {len(v_updates)} · "
           f"D+5 {len(d_updates)} · 메일 {sent}통")
     print("=" * 60)
 

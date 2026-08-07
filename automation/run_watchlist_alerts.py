@@ -88,9 +88,9 @@ _PF_HIST_LIMIT = 600
 def load_earnings_blocks() -> dict:
     """{TICKER: 사유}. 조회 실패 시 빈 dict."""
     try:
-        _, ws = _open_ws(ec.EVENTS_WORKSHEET)
-        rows = ec.parse_events(ws.get_all_values() or [])
-        blocks = ec.blocked_tickers(rows, today=datetime.now(_ET).date())
+        _, ws = _open_ws(ec.CALENDAR_WORKSHEET)
+        cal = ec.parse_calendar(ws.get_all_values() or [])
+        blocks = ec.blocked_from_calendar(cal, today=datetime.now(_ET).date())
         if blocks:
             print(f"[GATE] 실적 진입 차단 후보 {len(blocks)}종목: {', '.join(sorted(blocks))}")
         return blocks
