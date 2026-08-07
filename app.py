@@ -1020,6 +1020,47 @@ def open_earnings_events_worksheet():
         return None, f"Earnings_Events 워크시트를 만들 수 없습니다: {exc}"
 
 
+def open_earnings_calendar_worksheet():
+    """Earnings_Calendar 워크시트. 없으면 헤더와 함께 생성."""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+    except Exception as exc:
+        return None, f"스프레드시트를 열 수 없습니다: {exc}"
+    try:
+        return sh.worksheet(ec.CALENDAR_WORKSHEET), None
+    except Exception:
+        pass
+    try:
+        ws = sh.add_worksheet(title=ec.CALENDAR_WORKSHEET, rows=2000,
+                              cols=max(ec.CALENDAR_NCOL, 26))
+        _end = gspread.utils.rowcol_to_a1(1, ec.CALENDAR_NCOL)
+        ws.update([ec.CALENDAR_COLS], range_name=f"A1:{_end}",
+                  value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc:
+        return None, f"Earnings_Calendar 워크시트를 만들 수 없습니다: {exc}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_earnings_calendar() -> dict:
+    """{TICKER: 캘린더행} (10분 캐시).
+
+    ⚠️ 앱은 실적 관련 FMP 호출을 하지 않는다. 5PM 자동화가 계단식 주기로
+       Earnings_Calendar 를 적재하고, 앱은 그 시트만 읽는다.
+       (예전에는 종목당 3콜 × 30종목 = 90콜을 탭 열 때마다 돌려 로딩이 길었다.)
+    """
+    ws, err = open_earnings_calendar_worksheet()
+    if err or ws is None:
+        return {}
+    try:
+        return ec.parse_calendar(ws.get_all_values() or [])
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_earnings_events() -> list[dict]:
     """Earnings_Events 전체 로드(10분 캐시). 실패 시 빈 목록."""
@@ -17917,12 +17958,28 @@ if st.session_state.get("logged_in"):
                         _ev_ann, _ev_days, _ev_move_pct = {}, None, None
                         if not is_etf_mode:
                             try:
-                                _ev_ann = cached_next_earnings(str(selected_ticker).strip().upper()) or {}
-                                _ev_days = _ev_ann.get("days_until")
-                                if _ev_days is not None and 0 <= int(_ev_days) <= ec.SCAN_HORIZON_DAYS:
-                                    _ev_mv = cached_expected_move(str(selected_ticker).strip().upper())
-                                    if _ev_mv.get("ok"):
-                                        _ev_move_pct = float(_ev_mv["median_pct"])
+                                _tk_u = str(selected_ticker).strip().upper()
+                                # 캘린더(시트) 우선 — 워치리스트/보유 종목은 FMP 호출 0
+                                _crow = (load_earnings_calendar() or {}).get(_tk_u)
+                                if _crow is not None:
+                                    _ev_days = ec.days_until_from_row(
+                                        _crow, datetime.now(_MARKET_ET_TZ).date())
+                                    _ev_ann = {"earnings_date": str(_crow.get("Earnings_Date") or ""),
+                                               "date_source": str(_crow.get("Date_Source") or ""),
+                                               "timing": str(_crow.get("Timing") or ""),
+                                               "days_until": _ev_days}
+                                    _ev_mv = ec.move_from_row(_crow)
+                                else:
+                                    # 캘린더 밖 임의 티커 — 이때만 실시간 조회
+                                    _ev_ann = cached_next_earnings(_tk_u) or {}
+                                    _ev_days = _ev_ann.get("days_until")
+                                    _ev_mv = (cached_expected_move(_tk_u)
+                                              if (_ev_days is not None
+                                                  and 0 <= int(_ev_days) <= ec.SCAN_HORIZON_DAYS)
+                                              else {"ok": False})
+                                if (_ev_days is not None and 0 <= int(_ev_days) <= ec.SCAN_HORIZON_DAYS
+                                        and _ev_mv.get("ok")):
+                                    _ev_move_pct = float(_ev_mv["median_pct"])
                                 else:
                                     _ev_move_pct = None
                             except Exception:
@@ -23360,7 +23417,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
             _px_map = fetch_latest_prices_for_tickers(tuple(sorted(_all_tk)))
         except Exception:
             _px_map = {}
-        _prog = st.progress(0.0, text="실적 일정 조회 중...")
+        _cal = load_earnings_calendar()
         _uni = []
         if not _e_pf.empty:
             for _, _h in _e_pf.iterrows():
@@ -23368,20 +23425,22 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
         for _w in _e_wl:
             _uni.append(("watch", str(_w.get("ticker") or "").strip().upper(), _w))
         _uni = [u for u in _uni if u[1]]
-        _seen_tk = {}
 
+        _missing = []
         for _i, (_kind, _tk, _obj) in enumerate(_uni):
-            _prog.progress((_i + 1) / max(len(_uni), 1), text=f"조회 중... {_tk}")
             try:
-                if _tk not in _seen_tk:
-                    _seen_tk[_tk] = (cached_next_earnings(_tk) or {}, None)
-                _ann, _mv = _seen_tk[_tk]
-                _dd = _ann.get("days_until")
-                if _dd is None or _dd > ec.SCAN_HORIZON_DAYS:
+                _crow = _cal.get(_tk)
+                if _crow is None:
+                    _missing.append(_tk)
                     continue
-                if _mv is None:
-                    _mv = cached_expected_move(_tk)
-                    _seen_tk[_tk] = (_ann, _mv)
+                _dd = ec.days_until_from_row(_crow, _e_today)
+                if _dd is None or _dd < 0 or _dd > ec.SCAN_HORIZON_DAYS:
+                    continue
+                _ann = {"earnings_date": str(_crow.get("Earnings_Date") or ""),
+                        "date_source": str(_crow.get("Date_Source") or ""),
+                        "timing": str(_crow.get("Timing") or ""),
+                        "days_until": _dd}
+                _mv = ec.move_from_row(_crow)
 
                 if _kind == "hold":
                     _acct = str(_obj.get("Account") or "").strip()
@@ -23418,8 +23477,10 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                     except Exception:
                         _stop_pct = None
                     if _stop_pct is None:
+                        # ATR 손절 추정 — 기술적 분석용 1년 캐시로 충분하다
+                        # (ATR 22봉만 쓰므로 심층 이력이 필요 없다)
                         _stop_pct = ec.derived_stop_pct(
-                            cached_earnings_price_history(_tk), price=_cp)
+                            cached_timing_price_history(_tk), price=_cp)
                         _stop_src = "atr" if _stop_pct is not None else ""
                     _g = ec.evaluate_entry_gate(_mv, planned_stop_pct=_stop_pct,
                                                 days_until=_dd,
@@ -23430,7 +23491,13 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                                         "_stop_pct": _stop_pct, "_stop_src": _stop_src})
             except Exception:
                 continue
-        _prog.empty()
+        if _missing:
+            st.info(
+                f"⏳ **데이터 준비 중** ({len(_missing)}종목): {', '.join(sorted(_missing)[:12])}"
+                + (" 외" if len(_missing) > 12 else "")
+                + "  \n최근 추가하신 종목입니다. 평일 5PM ET 자동화가 실적 일정을 채우면 "
+                  "다음날부터 표시됩니다."
+            )
 
         # ── 섹션 1: 조치 요약 ──
         st.markdown("## 1️⃣ 조치 요약")

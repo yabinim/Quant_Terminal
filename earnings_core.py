@@ -506,6 +506,226 @@ def derived_stop_pct(hist, price=None, atr_mult=None) -> float | None:
         return None
 
 
+def fetch_next_earnings_light(ticker: str, today=None,
+                              horizon_days: int = CALENDAR_HORIZON_DAYS,
+                              key: str = "") -> dict | None:
+    """다음 실적 예정일 — **1콜 경량 조회** (교차 확인 없음).
+
+    D-10 밖 종목은 어차피 FMP 가 확정일을 안 내놓는다(보통 발표 2~4주 전에 확정).
+    그 구간에서 3콜 교차 확인은 낭비이므로 캘린더 1콜만 쓰고 date_source 는
+    항상 'estimated' 로 둔다. D-10 이내로 들어오면 fetch_next_earnings 가
+    3소스 교차 확인으로 승격시킨다.
+    """
+    tk = str(ticker or "").strip().upper()
+    if not tk:
+        return None
+    t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    hi = t0 + pd.Timedelta(days=int(horizon_days))
+    frm, to = t0.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
+
+    best = None
+    for it in (_get(f"earnings-calendar?symbol={tk}&from={frm}&to={to}", key) or []):
+        if not isinstance(it, dict):
+            continue
+        d = _d(it.get("date"))
+        if d is None or d < t0 or d > hi:
+            continue
+        if best is None or d < best[0]:
+            best = (d, _timing_of(it),
+                    _num(it.get("epsEstimated") or it.get("estimatedEPS")))
+    if best is None:
+        return None
+    return {
+        "ticker": tk,
+        "earnings_date": best[0].strftime("%Y-%m-%d"),
+        "days_until": int((best[0] - t0).days),
+        "timing": best[1],
+        "date_source": "estimated",
+        "eps_estimate": best[2],
+        "sources": ["calendar"],
+        "conflict": False,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 1-b) Earnings_Calendar — 종목당 1행을 계속 갱신하는 캐시 시트
+#
+#   왜 시트에 두는가:
+#     앱 탭이 매번 종목별 3콜(확정/추정 교차 확인)을 돌면 30종목에 90콜이 든다.
+#     실적일은 몇 주에 한 번 바뀌는 정보인데 화면 열 때마다 재조회할 이유가 없다.
+#     → 5PM 자동화가 계단식 주기로 갱신하고, 앱은 **FMP 호출 0회**로 시트만 읽는다.
+#
+#   Earnings_Events 와 분리하는 이유:
+#     캘린더는 '종목당 1행이 갱신'되고 이벤트는 '분기마다 1행이 추가'된다.
+#     성격이 달라 한 시트에 섞으면 차단 판정 필터가 꼬인다.
+#
+#   계단식 갱신 (1A):
+#     D-30 초과 → 30일에 1회 (경량 1콜)
+#     D-30~D-11 → 7일에 1회  (경량 1콜)
+#     D-10 이하 → 매일       (3콜 교차 확인 + 변동폭 산출)
+# ──────────────────────────────────────────────────────────────────────────
+
+CALENDAR_WORKSHEET = "Earnings_Calendar"
+CALENDAR_COLS = [
+    "Ticker", "Earnings_Date", "Date_Source", "Timing", "Days_Until",
+    "Last_Checked", "Check_Tier",
+    "Exp_Median_Pct", "Exp_Worst_Pct", "Exp_P25_Pct", "Exp_P75_Pct",
+    "ATR_Multiple", "Sample_N", "Move_Confidence",
+    "Move_Computed_At", "Move_For_Date", "Notes",
+]
+CALENDAR_NCOL = len(CALENDAR_COLS)
+
+TIER_NEAR, TIER_MID, TIER_FAR = "near", "mid", "far"
+TIER_REFRESH_DAYS = {TIER_NEAR: 1, TIER_MID: 7, TIER_FAR: 30}
+TIER_MID_MAX = 30          # D-30 이하부터 mid
+
+
+def tier_of(days_until) -> str:
+    """D-Day → 갱신 등급. 날짜 미상이면 far(30일에 1회만 확인)."""
+    d = _num(days_until)
+    if d is None or d > TIER_MID_MAX:
+        return TIER_FAR
+    if d > SCAN_HORIZON_DAYS:
+        return TIER_MID
+    return TIER_NEAR
+
+
+def needs_refresh(row: dict, today=None) -> bool:
+    """이 행을 오늘 다시 조회해야 하는가."""
+    t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    if not isinstance(row, dict):
+        return True
+    last = _d(row.get("Last_Checked"))
+    if last is None:
+        return True
+    ed = _d(row.get("Earnings_Date"))
+    # 저장된 날짜가 이미 지났으면 다음 분기를 찾아야 한다 → 무조건 갱신
+    if ed is not None and ed < t0:
+        return True
+    days = int((ed - t0).days) if ed is not None else None
+    interval = TIER_REFRESH_DAYS[tier_of(days)]
+    return int((t0 - last).days) >= interval
+
+
+def needs_move(row: dict, days_until=None) -> bool:
+    """예상 변동폭을 (재)산출해야 하는가.
+
+    2A: 확정일을 기다리지 않고 **D-10 도달 시 무조건** 산출한다. 확정일 없이
+        발표되는 종목이 있어 확정을 기다리면 게이트를 놓친다. 산출 자체는
+        과거 8분기 갭이라 발표일 확정 여부와 무관하다.
+    """
+    d = _num(days_until if days_until is not None else (row or {}).get("Days_Until"))
+    if d is None or d > SCAN_HORIZON_DAYS or d < 0:
+        return False
+    if not isinstance(row, dict):
+        return True
+    # 분기가 바뀌면(=산출 기준 날짜가 다르면) 다시 계산
+    if str(row.get("Move_For_Date") or "") != str(row.get("Earnings_Date") or ""):
+        return True
+    return not str(row.get("Move_Computed_At") or "").strip()
+
+
+def calendar_row(ticker: str, ev: dict = None, move: dict = None,
+                 today=None, now_et: str = "", prev: dict = None) -> list:
+    """캘린더 1행 생성. ev/move 가 없으면 prev 값을 보존한다."""
+    t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    p = prev or {}
+    e = ev or {}
+    ed = str(e.get("earnings_date") or p.get("Earnings_Date") or "")
+    d = _d(ed)
+    days = int((d - t0).days) if d is not None else ""
+    # 날짜가 바뀌었으면 이전 분기의 변동폭은 버린다
+    date_changed = bool(ed) and str(p.get("Earnings_Date") or "") not in ("", ed)
+    m = move if (isinstance(move, dict) and move.get("ok")) else (None if date_changed else None)
+
+    def _keep(col, val=None):
+        return val if val is not None else (p.get(col, "") if not date_changed else "")
+
+    if isinstance(move, dict) and move.get("ok"):
+        mv = [_blank(move.get("median_pct")), _blank(move.get("worst_down_pct")),
+              _blank(move.get("p25")), _blank(move.get("p75")),
+              _blank(move.get("atr_multiple")), int(move.get("sample_n") or 0),
+              str(move.get("confidence") or ""), str(now_et or ""), ed]
+    else:
+        mv = [_keep("Exp_Median_Pct"), _keep("Exp_Worst_Pct"), _keep("Exp_P25_Pct"),
+              _keep("Exp_P75_Pct"), _keep("ATR_Multiple"), _keep("Sample_N"),
+              _keep("Move_Confidence"), _keep("Move_Computed_At"), _keep("Move_For_Date")]
+
+    row = [
+        str(ticker or "").strip().upper(), ed,
+        str(e.get("date_source") or (p.get("Date_Source", "") if not date_changed else "")),
+        str(e.get("timing") or (p.get("Timing", "") if not date_changed else "")),
+        days, t0.strftime("%Y-%m-%d"), tier_of(days if days != "" else None),
+    ] + mv + [str(p.get("Notes", "") or "")]
+    return (row + [""] * CALENDAR_NCOL)[:CALENDAR_NCOL]
+
+
+def parse_calendar(values: list) -> dict:
+    """Earnings_Calendar get_all_values → {TICKER: {col: val, _row: n}}"""
+    out = {}
+    if not values or len(values) < 2:
+        return out
+    for i, r in enumerate(values[1:], start=2):
+        r = (list(r) + [""] * CALENDAR_NCOL)[:CALENDAR_NCOL]
+        tk = str(r[0]).strip().upper()
+        if not tk:
+            continue
+        d = {c: r[j] for j, c in enumerate(CALENDAR_COLS)}
+        d["_row"] = i
+        out[tk] = d
+    return out
+
+
+def move_from_row(row: dict) -> dict:
+    """캘린더 행 → expected_move 형태 dict (게이트·축소 판정 입력용)."""
+    r = row or {}
+    med = _num(r.get("Exp_Median_Pct"))
+    if med is None:
+        return {"ok": False, "sample_n": int(_num(r.get("Sample_N")) or 0),
+                "note": "예상 변동폭 미산출 (D-10 도달 시 계산)"}
+    conf = str(r.get("Move_Confidence") or "")
+    return {
+        "ok": True, "median_pct": med,
+        "worst_down_pct": _num(r.get("Exp_Worst_Pct")),
+        "p25": _num(r.get("Exp_P25_Pct")), "p75": _num(r.get("Exp_P75_Pct")),
+        "atr_multiple": _num(r.get("ATR_Multiple")),
+        "sample_n": int(_num(r.get("Sample_N")) or 0),
+        "confidence": conf,
+        "confidence_label": MOVE_CONF_LABELS.get(conf, conf),
+        "note": "",
+    }
+
+
+def days_until_from_row(row: dict, today=None):
+    """저장된 Days_Until 은 어제 값일 수 있으므로 **항상 재계산**한다."""
+    d = _d((row or {}).get("Earnings_Date"))
+    if d is None:
+        return None
+    t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    return int((d - t0).days)
+
+
+def blocked_from_calendar(cal: dict, today=None,
+                          block_days: int = ENTRY_BLOCK_DAYS) -> dict:
+    """캘린더 → {TICKER: 사유} (현재 진입 차단 중인 종목).
+
+    4A: run_watchlist_alerts 와 앱이 **같은 시트 한 곳**을 본다.
+        행이 없으면 차단하지 않는다(fail-open) — 캘린더가 아직 안 쌓였다고
+        매수 알림을 통째로 막는 쪽이 더 나쁘다.
+    """
+    out = {}
+    for tk, row in (cal or {}).items():
+        dd = days_until_from_row(row, today)
+        if dd is None or not (0 <= dd <= int(block_days)):
+            continue
+        mv = _num(row.get("Exp_Median_Pct"))
+        why = f"실적 D-{dd}"
+        if mv is not None:
+            why += f" · 예상 갭 ±{mv:.1f}%"
+        out[str(tk).strip().upper()] = why
+    return out
+
+
 def evaluate_entry_gate(move: dict, planned_stop_pct=None, days_until=None,
                         block_days: int = ENTRY_BLOCK_DAYS,
                         earnings_date: str = "", stop_source: str = "") -> dict:
