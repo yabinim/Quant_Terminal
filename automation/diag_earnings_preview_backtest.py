@@ -1,29 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-diag_earnings_preview_backtest.py
-─────────────────────────────────
-실적 발표 **전** 진입 전략의 요인 유효성 검증. workflow_dispatch 전용 진단 스크립트.
+diag_earnings_preview_backtest.py  (v2)
+───────────────────────────────────────
+실적 발표 **전** 진입 판단의 요인 유효성 검증. workflow_dispatch 전용.
 
-검증 대상 요인 (3B — ⑤ 과거 갭 방향 편향은 과적합 위험으로 제외)
-  F2 서프라이즈 지속성 : 직전 8분기 beat 비율 · 평균 서프라이즈%
-  F3 발표 전 상대강도  : D-20~D-1 수익률 − SPY 동일 기간
-  F4 등급 변경 흐름    : D-30~D-1 상향 건수 − 하향 건수
-  (F1 EPS 추정치 리비전은 FMP 가 과거 시계열을 주지 않아 검증 불가.
-   run_earnings_watch 가 오늘부터 Earnings_Calendar 에 스냅샷을 쌓는다.)
+v1 대비 바뀐 것
+  1) F4(등급 변경) 파싱 수정 + **원본 스키마 진단 출력**
+     v1 은 1130건 전부 F4=0 이었다. FMP 응답 필드명이 코드 가정과 다른 것으로 보여
+     여러 후보 필드를 훑고, 첫 레코드의 원본 키를 그대로 찍어 확인 가능하게 했다.
+  2) **방향 적중률 직접 측정** — 스코어별 '실제 갭 상승 비율'.
+     v1 은 수익률 크기만 봤다. "오를까 내릴까"에 답하려면 방향을 직접 재야 한다.
+     기준선은 50% 가 아니라 **무조건상승 대조군**(시장이 우상향하므로).
+  3) **임계 설정 가능성 판정** — 스코어별 상승 확률이 단조 증가해야 "N점 이상 매수"를
+     정당화할 수 있다. 단조가 아니면 어떤 임계도 근거가 없고, 그 자체가 결론이다.
+  4) **진입 5 x 청산 7 격자** — 언제 사서 언제 팔지를 전부 비교.
+     '반응일종가' 진입(갭을 보고 나서 삼)이 격자에 있어, 예측이 관찰보다 나은지 갈린다.
+  5) ETF 자동 제외 + 종목 간 sleep (레이트리밋)
 
-전략 2종 (2C)
-  A  D-10 종가 매수 → **D-1 종가 매도**        갭을 아예 회피
-  B  D-10 종가 매수 → 갭 통과 → 청산 신호/D+20  서프라이즈를 노림
-
-비교군
-  · SPY 동일 보유기간
-  · 무조건 진입(요인 필터 없음)  ← 요인이 실제로 걸러내는지 확인
-  · 매수후보유(전 기간)
-
-검증 규율 (위성 백테스트 교훈)
-  · look-ahead 차단: 모든 요인은 **진입 시점 이전 데이터만** 사용
-  · half-split: 시간 기준 전반/후반. **부호가 양쪽에서 일치하는 요인만 채택**
-  · 거래비용 반영(진입·청산 각 5bp)
+검증 규율
+  - look-ahead 차단: 모든 요인은 진입 시점 **이전** 데이터만 사용
+  - half-split: 시간 기준 전반/후반 부호 일치 필수
+  - 초과수익(-SPY) 기준: 강세장 베타를 엣지로 오인하지 않기 위해
+  - 다중검정 경고: 격자 35칸은 우연히 좋아 보이는 칸을 반드시 만든다
 
 실행: python automation/diag_earnings_preview_backtest.py
 """
@@ -31,6 +29,7 @@ diag_earnings_preview_backtest.py
 import json
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 
@@ -45,22 +44,21 @@ FMP_API_KEY = os.environ["FMP_API_KEY"]
 _FMP_BASE = "https://financialmodelingprep.com/stable"
 _TIMEOUT = 20
 
-# ── 파라미터 ──────────────────────────────────────────────────────────────
-ENTRY_OFFSET = 11        # 반응일 기준 몇 세션 전에 진입할지 (= 대략 D-10)
-EXIT_A_OFFSET = 1        # 갭 직전 마지막 세션 (반응일 −1)
-HOLD_B_MAX = 20          # 전략 B 최대 보유 세션
-SURPRISE_LOOKBACK = 8    # F2 산출 분기 수
-RS_WINDOW = 20           # F3 창(세션)
-GRADE_WINDOW = 60        # F4 창(일) — 30일이면 등급 변경이 거의 없어 그룹부족이 난다
-COST_BPS = 5.0           # 편도 거래비용 (bp)
-MIN_EVENTS = 40          # 이 미만이면 결론 보류
-HIST_LIMIT = 1400        # 약 5.5년 — FMP 상한 근처
+SURPRISE_LOOKBACK = 8
+RS_WINDOW = 20
+GRADE_WINDOW = 60
+COST_BPS = 5.0
+MIN_EVENTS = 40
+HIST_LIMIT = 1400
+SLEEP_SEC = 0.35
+SIGNAL_MAX = 20
 
-_GSPREAD = None
-_SPREADSHEET_TITLE = "Quant_DB"
+ENTRIES = [("D-10", -11), ("D-5", -6), ("D-2", -3),
+           ("발표당일종가", -1), ("반응일종가", 0)]
+EXITS = [("D-1갭회피", -1), ("D+1", 1), ("D+3", 3), ("D+5", 5),
+         ("D+10", 10), ("D+20", 20), ("매도신호", "signal")]
 
 
-# ── FMP ───────────────────────────────────────────────────────────────────
 def _get(path):
     try:
         sep = "&" if "?" in path else "?"
@@ -89,7 +87,6 @@ def price_history(ticker, limit=HIST_LIMIT):
 
 
 def earnings_records(ticker):
-    """[{date, timing, surprise_pct, beat}] 최신순. look-ahead 없이 쓰려면 날짜로 필터."""
     rows, seen = [], set()
     for path in (f"earnings?symbol={ticker}&limit=60",
                  f"earnings-surprises?symbol={ticker}&limit=60"):
@@ -104,32 +101,64 @@ def earnings_records(ticker):
                 continue
             act = ec._num(it.get("epsActual") or it.get("actualEarningResult") or it.get("eps"))
             est = ec._num(it.get("epsEstimated") or it.get("estimatedEarning"))
-            sp = None
-            if act is not None and est is not None and abs(est) > 1e-9:
-                sp = (act - est) / abs(est) * 100.0
-            if sp is None:
+            if act is None or est is None or abs(est) < 1e-9:
                 continue
             seen.add(ds)
             rows.append({"date": ds, "timing": ec._timing_of(it),
-                         "surprise_pct": sp, "beat": bool(sp > 0)})
+                         "surprise_pct": (act - est) / abs(est) * 100.0,
+                         "beat": bool(act > est)})
     rows.sort(key=lambda x: x["date"], reverse=True)
     return rows
 
 
-def grade_changes(ticker):
-    """[{date, action}] — action: up/down/other."""
+# ── 등급 변경 (F4) — v1 에서 전 이벤트 0 이었던 부분 ────────────────────
+_GRADE_RANK = {
+    "strong sell": 0, "sell": 1, "underweight": 1, "underperform": 1, "reduce": 1,
+    "negative": 1, "sector underperform": 1, "market underperform": 1,
+    "hold": 2, "neutral": 2, "market perform": 2, "equal weight": 2, "in-line": 2,
+    "sector perform": 2, "peer perform": 2, "equal-weight": 2, "inline": 2,
+    "buy": 3, "overweight": 3, "outperform": 3, "accumulate": 3, "positive": 3,
+    "sector outperform": 3, "market outperform": 3, "add": 3, "over weight": 3,
+    "strong buy": 4, "conviction buy": 4, "top pick": 4,
+}
+_UP_WORDS = ("upgrade", "raised", "initiat", "resumed", "positive")
+_DOWN_WORDS = ("downgrade", "lowered", "cut", "negative")
+_SCHEMA_SHOWN = [False]
+
+
+def _grade_dir(prev, new):
+    a = _GRADE_RANK.get(str(prev).strip().lower())
+    b = _GRADE_RANK.get(str(new).strip().lower())
+    if a is None or b is None or a == b:
+        return "other"
+    return "up" if b > a else "down"
+
+
+def grade_changes(ticker, show_schema=False):
+    """[{date, action}]. FMP 필드명이 판올림마다 달라 후보를 폭넓게 훑는다."""
+    raw = _get(f"grades-historical?symbol={ticker}&limit=1000") or []
+    if show_schema and raw and not _SCHEMA_SHOWN[0] and isinstance(raw[0], dict):
+        _SCHEMA_SHOWN[0] = True
+        print(f"\n  [진단] grades-historical 원본 스키마 ({ticker})")
+        print(f"         키: {sorted(raw[0].keys())}")
+        print(f"         샘플: {json.dumps(raw[0], ensure_ascii=False)[:280]}\n")
+
     out = []
-    for it in (_get(f"grades-historical?symbol={ticker}&limit=1000") or []):
+    for it in raw:
         if not isinstance(it, dict):
             continue
-        d = ec._d(it.get("date"))
+        d = ec._d(it.get("date") or it.get("publishedDate") or it.get("gradeDate"))
         if d is None:
             continue
-        a = str(it.get("action") or "").strip().lower()
-        prev, new = str(it.get("previousGrade") or ""), str(it.get("newGrade") or "")
-        if "up" in a:
+        a = " ".join(str(it.get(k) or "") for k in
+                     ("action", "ratingChange", "gradeChange", "newsTitle")).lower()
+        prev = (it.get("previousGrade") or it.get("previousRating")
+                or it.get("gradePrevious") or "")
+        new = (it.get("newGrade") or it.get("newRating")
+               or it.get("gradeNew") or it.get("grade") or "")
+        if any(w in a for w in _UP_WORDS):
             act = "up"
-        elif "down" in a:
+        elif any(w in a for w in _DOWN_WORDS):
             act = "down"
         else:
             act = _grade_dir(prev, new)
@@ -137,22 +166,7 @@ def grade_changes(ticker):
     return out
 
 
-_GRADE_RANK = {"strong sell": 0, "sell": 1, "underweight": 1, "underperform": 1,
-               "hold": 2, "neutral": 2, "market perform": 2, "equal weight": 2,
-               "buy": 3, "overweight": 3, "outperform": 3, "accumulate": 3,
-               "strong buy": 4}
-
-
-def _grade_dir(prev, new):
-    a, b = _GRADE_RANK.get(str(prev).strip().lower()), _GRADE_RANK.get(str(new).strip().lower())
-    if a is None or b is None or a == b:
-        return "other"
-    return "up" if b > a else "down"
-
-
-# ── 대상 티커 ─────────────────────────────────────────────────────────────
 def load_tickers():
-    """워치리스트 + 보유 종목. 시트 접근 실패 시 환경변수 TICKERS 폴백."""
     env = str(os.environ.get("TICKERS", "") or "").strip()
     if env:
         return sorted({t.strip().upper() for t in env.split(",") if t.strip()})
@@ -163,7 +177,7 @@ def load_tickers():
         gc = gspread.authorize(Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/spreadsheets",
                           "https://www.googleapis.com/auth/drive"]))
-        sh = gc.open(_SPREADSHEET_TITLE)
+        sh = gc.open("Quant_DB")
         tks = set()
         for name, col in (("Watchlist", 1), ("Portfolios", 2)):
             try:
@@ -174,322 +188,245 @@ def load_tickers():
                 print(f"[WARN] {name} 로드 실패: {e}")
         return sorted(tks)
     except Exception as e:
-        print(f"[WARN] 시트 접근 실패 — TICKERS 환경변수를 쓰세요: {e}")
+        print(f"[WARN] 시트 접근 실패 — TICKERS 환경변수 사용: {e}")
         return []
 
 
-# ── 이벤트 생성 ───────────────────────────────────────────────────────────
 def build_events(ticker, hist, spy, recs, grades):
-    """이벤트별 요인 + 성과. 요인은 **진입 시점 이전 데이터만** 사용."""
     if hist is None or hist.empty or not recs:
         return []
     idx = hist.index
+    ma50 = hist["Close"].rolling(50).mean()
     evs = []
-    recs_sorted = sorted(recs, key=lambda x: x["date"])   # 과거→최신
+    recs_sorted = sorted(recs, key=lambda x: x["date"])
+    back = max(abs(o) for _, o in ENTRIES)
+    fwd = max(o for _, o in EXITS if isinstance(o, int))
 
     for k, rec in enumerate(recs_sorted):
         try:
             i = ec.resolve_reaction_index(hist, rec["date"], rec.get("timing", ""))
-            if i is None:
+            if i is None or i - back - RS_WINDOW < 1 or i + fwd >= len(idx):
                 continue
-            e_i = i - ENTRY_OFFSET          # 진입
-            x_i = i - EXIT_A_OFFSET         # 전략 A 청산 (갭 직전 마지막 종가)
-            if e_i < RS_WINDOW + 1 or x_i <= e_i:
-                continue
-            entry_dt = idx[e_i]
 
-            # ── 요인 (전부 entry 이전 정보) ──
-            prior = [r for r in recs_sorted[:k] if r["date"] < entry_dt.strftime("%Y-%m-%d")]
-            prior = prior[-SURPRISE_LOOKBACK:]
+            base_i = i - 11                 # 요인 산출 기준 = 가장 이른 진입 시점
+            base_dt = idx[base_i]
+
+            prior = [r for r in recs_sorted[:k]
+                     if r["date"] < base_dt.strftime("%Y-%m-%d")][-SURPRISE_LOOKBACK:]
             if len(prior) < 4:
                 continue
-            beat_rate = sum(1 for r in prior if r["beat"]) / len(prior) * 100.0
-            avg_surp = float(np.mean([r["surprise_pct"] for r in prior]))
+            f2_beat = sum(1 for r in prior if r["beat"]) / len(prior) * 100.0
+            f2_surp = float(np.mean([r["surprise_pct"] for r in prior]))
 
-            c0, c1 = float(hist["Close"].iloc[e_i - RS_WINDOW]), float(hist["Close"].iloc[e_i])
-            stock_r = (c1 - c0) / c0 * 100.0
-            rs = stock_r
+            c0 = float(hist["Close"].iloc[base_i - RS_WINDOW])
+            c1 = float(hist["Close"].iloc[base_i])
+            f3 = (c1 - c0) / c0 * 100.0
             if spy is not None and not spy.empty:
                 try:
-                    s_slice = spy.loc[:entry_dt]
-                    if len(s_slice) > RS_WINDOW:
-                        s0 = float(s_slice.iloc[-RS_WINDOW - 1]); s1 = float(s_slice.iloc[-1])
-                        rs = stock_r - (s1 - s0) / s0 * 100.0
+                    ss = spy.loc[:base_dt]
+                    if len(ss) > RS_WINDOW:
+                        s0, s1 = float(ss.iloc[-RS_WINDOW - 1]), float(ss.iloc[-1])
+                        f3 -= (s1 - s0) / s0 * 100.0
                 except Exception:
                     pass
 
-            lo = entry_dt - pd.Timedelta(days=GRADE_WINDOW)
-            ups = sum(1 for g in grades if lo <= g["date"] <= entry_dt and g["action"] == "up")
-            dns = sum(1 for g in grades if lo <= g["date"] <= entry_dt and g["action"] == "down")
+            lo = base_dt - pd.Timedelta(days=GRADE_WINDOW)
+            ups = sum(1 for g in grades if lo <= g["date"] <= base_dt and g["action"] == "up")
+            dns = sum(1 for g in grades if lo <= g["date"] <= base_dt and g["action"] == "down")
 
-            # ── 성과 ──
-            px_in = float(hist["Close"].iloc[e_i])
+            pc = float(hist["Close"].iloc[i - 1])
+            gap = (float(hist["Close"].iloc[i]) - pc) / pc * 100.0
+
+            e = {"ticker": ticker, "date": rec["date"], "F2_beat": f2_beat,
+                 "F2_surp": f2_surp, "F3_rs": f3, "F4_net": ups - dns,
+                 "gap": gap, "grade_any": ups + dns}
+
             cost = COST_BPS / 100.0 * 2
-            ret_a = (float(hist["Close"].iloc[x_i]) - px_in) / px_in * 100.0 - cost
-
-            ret_b, exit_kind, spy_b, hold_b = None, "", None, None
-            if i + HOLD_B_MAX < len(idx):
-                ma50 = hist["Close"].rolling(50).mean()
-                x_b = None
-                for j in range(i, min(i + HOLD_B_MAX + 1, len(idx))):
-                    c = float(hist["Close"].iloc[j])
-                    m = ma50.iloc[j]
-                    if pd.notna(m) and c < float(m):
-                        x_b, exit_kind = j, "signal"
-                        break
-                if x_b is None:
-                    x_b, exit_kind = i + HOLD_B_MAX, "timeout"
-                ret_b = (float(hist["Close"].iloc[x_b]) - px_in) / px_in * 100.0 - cost
-                hold_b = x_b - e_i
-                # ⚠️ B 는 보유기간이 이벤트마다 다르다. **같은 구간의 SPY** 와 비교해야
-                #    강세장 베타를 초과수익으로 착각하지 않는다(위성 백테스트 교훈).
-                if spy is not None and not spy.empty:
-                    try:
-                        sb = spy.loc[idx[e_i]:idx[x_b]]
-                        if len(sb) >= 2:
-                            spy_b = (float(sb.iloc[-1]) - float(sb.iloc[0])) / float(sb.iloc[0]) * 100.0
-                    except Exception:
-                        pass
-
-            spy_a = None
-            if spy is not None and not spy.empty:
-                try:
-                    ss = spy.loc[idx[e_i]:idx[x_i]]
-                    if len(ss) >= 2:
-                        spy_a = (float(ss.iloc[-1]) - float(ss.iloc[0])) / float(ss.iloc[0]) * 100.0
-                except Exception:
-                    pass
-
-            gap = None
-            if i >= 1:
-                pc = float(hist["Close"].iloc[i - 1])
-                gap = (float(hist["Close"].iloc[i]) - pc) / pc * 100.0
-
-            evs.append({
-                "ticker": ticker, "date": rec["date"], "entry": entry_dt.strftime("%Y-%m-%d"),
-                "F2_beat": beat_rate, "F2_surp": avg_surp, "F3_rs": rs,
-                "F4_net": ups - dns,
-                "ret_a": ret_a, "ret_b": ret_b, "spy_a": spy_a, "spy_b": spy_b,
-                "exc_a": (None if spy_a is None else ret_a - spy_a),
-                "exc_b": (None if (spy_b is None or ret_b is None) else ret_b - spy_b),
-                "hold_b": hold_b, "gap": gap, "exit_kind": exit_kind,
-            })
+            for en, eo in ENTRIES:
+                ei = i + eo
+                if ei < 1:
+                    continue
+                px_in = float(hist["Close"].iloc[ei])
+                for xn, xo in EXITS:
+                    if xo == "signal":
+                        xi = None
+                        for j in range(ei + 1, min(ei + SIGNAL_MAX + 1, len(idx))):
+                            m = ma50.iloc[j]
+                            if pd.notna(m) and float(hist["Close"].iloc[j]) < float(m):
+                                xi = j
+                                break
+                        if xi is None:
+                            xi = min(ei + SIGNAL_MAX, len(idx) - 1)
+                    else:
+                        xi = i + xo
+                    if xi <= ei or xi >= len(idx):
+                        continue
+                    r = (float(hist["Close"].iloc[xi]) - px_in) / px_in * 100.0 - cost
+                    sr = None
+                    if spy is not None and not spy.empty:
+                        try:
+                            sb = spy.loc[idx[ei]:idx[xi]]
+                            if len(sb) >= 2:
+                                sr = ((float(sb.iloc[-1]) - float(sb.iloc[0]))
+                                      / float(sb.iloc[0]) * 100.0)
+                        except Exception:
+                            pass
+                    e[f"exc::{en}::{xn}"] = None if sr is None else r - sr
+            evs.append(e)
         except Exception:
             continue
     return evs
 
 
-# ── 분석 ──────────────────────────────────────────────────────────────────
 def _stat(vals):
     v = [x for x in vals if x is not None and np.isfinite(x)]
     if not v:
         return None
-    a = np.array(v, dtype=float)
+    a = np.array(v, float)
     return {"n": len(a), "mean": float(a.mean()), "median": float(np.median(a)),
-            "win": float((a > 0).mean() * 100.0), "std": float(a.std(ddof=1)) if len(a) > 1 else 0.0}
-
-
-def _fmt(s):
-    return "—" if s is None else (f"n={s['n']:<4} 평균 {s['mean']:+6.2f}% "
-                                  f"중앙 {s['median']:+6.2f}% 승률 {s['win']:5.1f}%")
-
-
-def factor_split(evs, key, thresh, ret_key):
-    """요인 상위/하위 그룹 성과 차이. 한쪽이 비면 None."""
-    hi = [e[ret_key] for e in evs if e.get(key) is not None and e[key] > thresh]
-    lo = [e[ret_key] for e in evs if e.get(key) is not None and e[key] <= thresh]
-    sh, sl = _stat(hi), _stat(lo)
-    if sh is None or sl is None or sh["n"] < 5 or sl["n"] < 5:
-        return None
-    return {"hi": sh, "lo": sl, "edge": sh["mean"] - sl["mean"]}
-
-
-def median_thresh(evs, key):
-    v = [e[key] for e in evs if e.get(key) is not None and np.isfinite(e[key])]
-    return float(np.median(v)) if v else None
+            "win": float((a > 0).mean() * 100.0)}
 
 
 FACTORS = [
-    ("F2_beat", 60.0, "서프라이즈 지속성 (직전 beat율)"),
+    ("F2_beat", 60.0, "서프라이즈 지속성(beat율)"),
     ("F2_surp", 2.0, "평균 서프라이즈 폭"),
-    ("F3_rs", 0.0, "발표 전 상대강도 (SPY 대비)"),
-    ("F4_net", 0.0, "등급 변경 순상향"),
+    ("F3_rs", 0.0, "발표 전 상대강도"),
+    ("F4_net", 0.0, "등급 순상향"),
 ]
 
 
 def report(evs):
-    print("\n" + "=" * 74)
-    print(f"표본 {len(evs)}건 · 종목 {len({e['ticker'] for e in evs})}개 · "
-          f"{min(e['date'] for e in evs)} ~ {max(e['date'] for e in evs)}")
-    print("=" * 74)
-    if len(evs) < MIN_EVENTS:
-        print(f"⚠️ 표본 {len(evs)}건 < 최소 {MIN_EVENTS}건 — 결론 보류")
-
-    print("\n■ 비교군 (전략 A: D-10 매수 → D-1 매도)")
-    print(f"  무조건 진입      {_fmt(_stat([e['ret_a'] for e in evs]))}")
-    print(f"  SPY 동일기간     {_fmt(_stat([e['spy_a'] for e in evs]))}")
-    ex = _stat([e['ret_a'] - e['spy_a'] for e in evs if e['spy_a'] is not None])
-    print(f"  초과수익(A−SPY)  {_fmt(ex)}")
-
-    print("\n■ 비교군 (전략 B: D-10 매수 → 갭 통과 → 50MA 이탈/D+20)")
-    print(f"  무조건 진입      {_fmt(_stat([e['ret_b'] for e in evs]))}")
-    print(f"  SPY 동일기간     {_fmt(_stat([e['spy_b'] for e in evs]))}")
-    print(f"  초과수익(B−SPY)  {_fmt(_stat([e['exc_b'] for e in evs]))}")
-    hb = _stat([e.get("hold_b") for e in evs])
-    _hb_txt = "-" if hb is None else "%.1f세션" % hb["mean"]
-    print(f"  평균 보유        {_hb_txt}")
-    kinds = {}
     for e in evs:
-        kinds[e.get("exit_kind") or "-"] = kinds.get(e.get("exit_kind") or "-", 0) + 1
-    print(f"  청산 사유        {kinds}")
-    print(f"  실제 갭 분포     {_fmt(_stat([e['gap'] for e in evs]))}")
+        e["_score"] = sum(1 for k, t, _ in FACTORS
+                          if e.get(k) is not None and e[k] > t)
+    n = len(evs)
+    print("\n" + "=" * 78)
+    print(f"표본 {n}건 · 종목 {len({e['ticker'] for e in evs})}개 · "
+          f"{min(e['date'] for e in evs)} ~ {max(e['date'] for e in evs)}")
+    print("=" * 78)
+    if n < MIN_EVENTS:
+        print(f"[!] 표본 {n} < {MIN_EVENTS} — 결론 보류")
 
-    # F4 측정 가능성 진단 — 창 안에 등급 변경이 없으면 요인 자체가 무의미
-    nz = sum(1 for e in evs if e.get("F4_net") not in (None, 0))
-    pos = sum(1 for e in evs if (e.get("F4_net") or 0) > 0)
-    print(f"\n  [진단] 등급 변경 창({GRADE_WINDOW}일) 안에 변동 있는 이벤트 "
-          f"{nz}/{len(evs)}건 (순상향 {pos}건)")
-    if pos < 20:
-        print("         → F4 는 표본 부족으로 사실상 검증 불가")
+    ga = sum(1 for e in evs if e.get("grade_any"))
+    print(f"\n[진단] 등급 변경 창({GRADE_WINDOW}일) 안에 변동 있는 이벤트 {ga}/{n}건")
+    if ga < 50:
+        print("       → F4 는 표본 부족으로 검증 불가 (3요인 결과로 읽을 것)")
 
-    mid = sorted(e["date"] for e in evs)[len(evs) // 2]
-    h1 = [e for e in evs if e["date"] < mid]
-    h2 = [e for e in evs if e["date"] >= mid]
+    print("\n■ 방향 적중률 — 스코어별 실제 '갭 상승' 비율")
+    up_all = sum(1 for e in evs if (e["gap"] or 0) > 0) / n * 100.0
+    print(f"  기준선(무조건상승 대조군) {up_all:.1f}%  ← 이걸 넘어야 예측력이 있다")
+    rows = []
+    for sc in range(len(FACTORS) + 1):
+        sub = [e for e in evs if e["_score"] == sc]
+        if len(sub) < 20:
+            continue
+        up = sum(1 for e in sub if (e["gap"] or 0) > 0) / len(sub) * 100.0
+        g = _stat([e["gap"] for e in sub])
+        rows.append((sc, len(sub), up))
+        print(f"  스코어 {sc}/{len(FACTORS)}  n={len(sub):<5} 상승비율 {up:5.1f}% "
+              f"({up - up_all:+5.1f}%p) · 갭 평균 {g['mean']:+5.2f}% "
+              f"중앙 {g['median']:+5.2f}%")
 
-    # 임계값 2종을 함께 본다:
-    #   fixed  = 배포에 쓸 해석 가능한 절대 기준
-    #   median = 표본을 반씩 가르는 상대 기준(한쪽이 비는 문제를 없앰)
-    # ⚠️ 요인 평가는 **초과수익(−SPY) 기준**으로 한다. 원수익 기준이면
-    #    2021~2026 강세장의 시장 베타가 전부 '엣지'로 보인다.
-    for ret_key, label in (("exc_a", "전략 A (초과수익)"),
-                           ("exc_b", "전략 B (초과수익)")):
-        for mode in ("fixed", "median"):
-            print(f"\n■ 요인별 성과 — {label} · {mode} 임계   (half-split ~{mid})")
-            print(f"  {'요인':<28} {'임계':>7} {'전체':>9} {'전반':>8} {'후반':>8}  판정")
-            for key, th0, name in FACTORS:
-                th = th0 if mode == "fixed" else median_thresh(evs, key)
-                if th is None:
-                    print(f"  {name:<28} {'—':>7}"); continue
-                full = factor_split(evs, key, th, ret_key)
-                a = factor_split(h1, key, th, ret_key)
-                b = factor_split(h2, key, th, ret_key)
-                if full is None:
-                    print(f"  {name:<28} {th:>7.1f} {'그룹부족':>9}"); continue
-                ea = a["edge"] if a else None
-                eb = b["edge"] if b else None
-                ok = (ea is not None and eb is not None
-                      and np.sign(ea) == np.sign(eb) and full["edge"] > 0)
-                print(f"  {name:<28} {th:>7.1f} {full['edge']:>+8.2f}%p "
-                      f"{('—' if ea is None else f'{ea:+7.2f}')} "
-                      f"{('—' if eb is None else f'{eb:+7.2f}')}  "
-                      f"{'✅ 채택' if ok else '❌ 기각'}")
-
-    # ── 스코어 버킷 (C1 동일가중) ──
-    # AND 조합은 요인이 늘수록 표본이 급감해(예: 4개 전부 만족 = 몇 건) 결론을
-    # 낼 수 없다. 대신 '양의 요인 개수'로 버킷을 나눠 단조성을 본다.
-    print("\n■ 스코어 버킷 — 양의 요인 개수별 초과수익 (C1 동일가중)")
-    for ret_key, label in (("exc_a", "전략 A"), ("exc_b", "전략 B")):
-        for e in evs:
-            e["_score"] = sum(1 for k, t, _ in FACTORS
-                              if e.get(k) is not None and e[k] > t)
-        print(f"  {label}")
-        rows = []
-        for sc in range(len(FACTORS) + 1):
-            st = _stat([e[ret_key] for e in evs if e["_score"] == sc])
-            if st:
-                rows.append((sc, st))
-                print(f"    스코어 {sc}/{len(FACTORS)}  {_fmt(st)}")
-        # ⚠️ 가중 회귀 기울기만 보면 중간 버킷에 끌려가 **거짓 양성**이 난다.
-        #    (랜덤 데이터에서 0/4=-1.5%, 4/4=-2.3% 인데 기울기는 +로 나오는 사례 확인)
-        #    → 세 조건을 모두 요구한다: 상단>하단 · 기울기>0 · half-split 부호 일치
-        def _slope(sub):
-            rs = []
-            for sc in range(len(FACTORS) + 1):
-                st2 = _stat([e[ret_key] for e in sub if e["_score"] == sc])
-                if st2 and st2["n"] >= 5:
-                    rs.append((sc, st2))
-            if len(rs) < 3:
-                return None, None, None
-            xs = np.array([r[0] for r in rs], float)
-            ys = np.array([r[1]["mean"] for r in rs], float)
-            ws = np.array([r[1]["n"] for r in rs], float)
-            return float(np.polyfit(xs, ys, 1, w=ws)[0]), rs[0][1], rs[-1][1]
-
-        sl, bot, top = _slope(evs)
-        if sl is None:
-            print("    → 버킷 부족 — 판단 보류"); continue
-        sl1, _, _ = _slope(h1)
-        sl2, _, _ = _slope(h2)
-        half_ok = (sl1 is not None and sl2 is not None
-                   and np.sign(sl1) == np.sign(sl2) == np.sign(sl))
-        # ⚠️ 평균만 보면 소수의 큰 상승이 최상위 버킷을 끌어올려 착각한다.
-        #    (첫 실행에서 3/4 버킷이 평균 +1.96% 인데 중앙 −1.34% · 승률 43.9%)
-        #    → 평균·중앙값·승률이 **모두** 상단>하단이어야 통과.
-        d_mean = top["mean"] - bot["mean"]
-        d_med = top["median"] - bot["median"]
-        d_win = top["win"] - bot["win"]
-        ok = (sl > 0 and half_ok and d_mean > 0 and d_med > 0 and d_win > 0)
-        print(f"    기울기 {sl:+.2f}%p/점 · half-split "
-              f"{('일치' if half_ok else '불일치')}"
-              f" ({'—' if sl1 is None else f'{sl1:+.2f}'}/"
-              f"{'—' if sl2 is None else f'{sl2:+.2f}'})")
-        print(f"    상단−하단  평균 {d_mean:+.2f}%p · 중앙 {d_med:+.2f}%p "
-              f"· 승률 {d_win:+.1f}%p")
-        if not ok:
-            miss = []
-            if sl <= 0: miss.append("기울기")
-            if not half_ok: miss.append("half-split")
-            if d_mean <= 0: miss.append("평균")
-            if d_med <= 0: miss.append("중앙값")
-            if d_win <= 0: miss.append("승률")
-            print(f"    → ❌ 근거 없음 (미충족: {', '.join(miss)})")
+    print("\n■ 임계 설정 가능성 — 'N점 이상 매수' 규칙이 정당한가")
+    if len(rows) < 3:
+        print("  버킷 부족 — 판단 보류")
+        hi_sc = None
+    else:
+        ups = [r[2] for r in rows]
+        mono = all(ups[j] <= ups[j + 1] for j in range(len(ups) - 1))
+        best = max(rows, key=lambda r: r[2])
+        # 격자용 '고득점' 그룹은 **최고 점수 버킷**이다(상승비율 1위 버킷이 아님).
+        # 0점이 상승비율 1위로 뽑히면 고득점 그룹이 전체와 같아져 비교가 무의미해진다.
+        hi_sc = max(r[0] for r in rows)
+        print(f"  상승비율 단조 증가: {'예' if mono else '아니오'}"
+              f"  ({' → '.join(f'{u:.0f}%' for u in ups)})")
+        print(f"  최고 버킷: {best[0]}점  상승비율 {best[2]:.1f}%  (기준선 {up_all:.1f}%)")
+        if mono and best[2] > up_all:
+            print(f"  → [OK] '{best[0]}점 이상 매수' 임계에 근거 있음")
+        elif not mono:
+            print("  → [X] 단조가 아니다 — 어떤 임계도 정당화되지 않는다")
         else:
-            print("    → ✅ 요인 조합에 근거 있음 (5개 조건 전부 통과)")
+            print("  → [X] 최고 버킷도 기준선을 못 넘는다")
+
+    mid = sorted(e["date"] for e in evs)[n // 2]
+    groups = [(evs, "전체 이벤트")]
+    if hi_sc is not None:
+        hi = [e for e in evs if e["_score"] >= hi_sc]
+        if hi:
+            groups.append((hi, f"고득점({hi_sc}점 이상)"))
+
+    for group, glabel in groups:
+        print(f"\n■ 진입x청산 격자 — 초과수익(-SPY) 중앙값 / 승률   "
+              f"[{glabel}] n={len(group)}")
+        print(" " * 14 + "".join(f"{xn:>14}" for xn, _ in EXITS))
+        for en, _ in ENTRIES:
+            cells = []
+            for xn, _ in EXITS:
+                key = f"exc::{en}::{xn}"
+                s = _stat([e.get(key) for e in group])
+                if s is None or s["n"] < 20:
+                    cells.append("—")
+                    continue
+                a = _stat([e.get(key) for e in group if e["date"] < mid])
+                b = _stat([e.get(key) for e in group if e["date"] >= mid])
+                ok = (a and b and np.sign(a["median"]) == np.sign(b["median"])
+                      and s["median"] > 0)
+                cells.append(f"{s['median']:+5.2f}/{s['win']:4.1f}{'*' if ok else ''}")
+            print(f"  {en:<12}" + "".join(f"{c:>14}" for c in cells))
+        print("   * = 중앙값>0 이고 half-split 부호 일치")
+
+    print("\n" + "=" * 78)
+    print("해석 주의")
+    print("  - 모든 수치는 초과수익(-SPY). 원수익은 강세장 베타가 섞인다.")
+    print("  - 격자 35칸은 다중검정이다. '*' 하나로 결론 내지 말 것.")
+    print("  - '반응일종가' 진입은 갭을 보고 사는 관찰 전략이다. 이게 예측 진입보다")
+    print("    나으면 방향 예측 요인은 쓸모가 없다는 뜻이다.")
+    print("  - F1(EPS 리비전)은 없다 — FMP가 과거 시계열을 안 준다.")
+    print("    run_earnings_watch 가 오늘부터 스냅샷을 쌓는다.")
+    print("=" * 78)
 
 
 def main():
-    print("=" * 74)
-    print(f"실적 프리뷰 요인 백테스트 — {datetime.now():%Y-%m-%d %H:%M}")
-    print("=" * 74)
+    print("=" * 78)
+    print(f"실적 프리뷰 요인 백테스트 v2 — {datetime.now():%Y-%m-%d %H:%M}")
+    print("=" * 78)
     tickers = load_tickers()
     if not tickers:
-        print("[ERROR] 대상 티커 없음"); return
-    print(f"대상 {len(tickers)}종목: {', '.join(tickers)}")
+        print("[ERROR] 대상 티커 없음")
+        return
+    print(f"대상 {len(tickers)}종목\n")
 
     spy_h = price_history("SPY")
     spy = spy_h["Close"] if not spy_h.empty else None
-    print(f"SPY 기준 {len(spy_h)}봉\n")
 
-    all_evs = []
+    all_evs, skipped = [], []
     for tk in tickers:
         try:
+            recs = earnings_records(tk)
+            if not recs:
+                skipped.append(tk)
+                time.sleep(SLEEP_SEC)
+                continue
             h = price_history(tk)
             if h.empty:
-                print(f"  {tk:6} 가격 이력 없음"); continue
-            recs = earnings_records(tk)
-            grades = grade_changes(tk)
+                skipped.append(tk)
+                time.sleep(SLEEP_SEC)
+                continue
+            grades = grade_changes(tk, show_schema=True)
             evs = build_events(tk, h, spy, recs, grades)
             all_evs += evs
-            print(f"  {tk:6} 봉 {len(h):>4} · 실적 {len(recs):>2} · 등급 {len(grades):>3} "
-                  f"→ 이벤트 {len(evs)}")
+            print(f"  {tk:6} 봉 {len(h):>4} · 실적 {len(recs):>2} · "
+                  f"등급 {len(grades):>3} → 이벤트 {len(evs)}")
         except Exception as e:
             print(f"  {tk:6} 실패: {e}")
+        time.sleep(SLEEP_SEC)
 
+    if skipped:
+        print(f"\n  제외 {len(skipped)}종목(실적 없음/ETF): {', '.join(skipped)}")
     if not all_evs:
-        print("\n[ERROR] 유효 이벤트 0건"); return
+        print("\n[ERROR] 유효 이벤트 0건")
+        return
     report(all_evs)
-    print("\n" + "=" * 74)
-    print("해석 주의")
-    print("  0) 모든 요인·버킷 평가는 **초과수익(−SPY)** 기준이다. 원수익으로 보면")
-    print("     2021~2026 강세장의 시장 베타가 전부 엣지로 보인다.")
-    print("  1) 다중검정: 요인 4 × 임계 2 × 전략 2 = 16회 검정이다. 순수 랜덤에서도")
-    print("     1~2개는 '채택'이 나온다. 단일 요인 채택은 근거로 부족하고,")
-    print("     **스코어 버킷이 세 조건을 모두 통과할 때만** 의미를 둘 것.")
-    print("  2) 전략 B 청산은 50MA 이탈 근사다(실제 매도 레이더의 스윙/포지션")
-    print("     이중 신호와 다름). 방향성 판단용으로만 보라.")
-    print("  3) F1(EPS 추정치 리비전)은 여기 없다 — FMP가 과거 시계열을 주지 않는다.")
-    print("     run_earnings_watch 가 오늘부터 스냅샷을 쌓는다.")
-    print("=" * 74)
 
 
 if __name__ == "__main__":
