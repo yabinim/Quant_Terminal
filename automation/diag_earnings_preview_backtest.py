@@ -46,7 +46,6 @@ _TIMEOUT = 20
 
 SURPRISE_LOOKBACK = 8
 RS_WINDOW = 20
-GRADE_WINDOW = 60
 COST_BPS = 5.0
 MIN_EVENTS = 40
 HIST_LIMIT = 1400
@@ -111,59 +110,62 @@ def earnings_records(ticker):
     return rows
 
 
-# ── 등급 변경 (F4) — v1 에서 전 이벤트 0 이었던 부분 ────────────────────
-_GRADE_RANK = {
-    "strong sell": 0, "sell": 1, "underweight": 1, "underperform": 1, "reduce": 1,
-    "negative": 1, "sector underperform": 1, "market underperform": 1,
-    "hold": 2, "neutral": 2, "market perform": 2, "equal weight": 2, "in-line": 2,
-    "sector perform": 2, "peer perform": 2, "equal-weight": 2, "inline": 2,
-    "buy": 3, "overweight": 3, "outperform": 3, "accumulate": 3, "positive": 3,
-    "sector outperform": 3, "market outperform": 3, "add": 3, "over weight": 3,
-    "strong buy": 4, "conviction buy": 4, "top pick": 4,
-}
-_UP_WORDS = ("upgrade", "raised", "initiat", "resumed", "positive")
-_DOWN_WORDS = ("downgrade", "lowered", "cut", "negative")
+# ── 애널리스트 의견 (F4/F5) ──────────────────────────────────────────────
+# ⚠️ grades-historical 은 '등급 변경 내역'이 아니라 **월별 의견 분포 스냅샷**이다.
+#    실제 스키마: {symbol, date, analystRatingsStrongBuy, analystRatingsBuy,
+#                  analystRatingsHold, analystRatingsSell, analystRatingsStrongSell}
+#    previousGrade/newGrade/action 필드는 존재하지 않는다 — v1/v2 초안이 이걸
+#    가정해서 1209건 전부 F4=0 이 나왔다.
+#    → 매수의견 비율 = (StrongBuy + Buy) / 전체 로 환산해 두 가지 요인을 만든다.
+#         F4_drift : 최근 GRADE_DRIFT_DAYS 간 매수의견 비율 **변화**(%p) — 흐름
+#         F5_level : 진입 시점의 매수의견 비율 **수준**(%)          — 절대 강도
+
+GRADE_DRIFT_DAYS = 90     # 월별 데이터라 60일이면 관측점이 1~2개뿐
 _SCHEMA_SHOWN = [False]
 
 
-def _grade_dir(prev, new):
-    a = _GRADE_RANK.get(str(prev).strip().lower())
-    b = _GRADE_RANK.get(str(new).strip().lower())
-    if a is None or b is None or a == b:
-        return "other"
-    return "up" if b > a else "down"
-
-
-def grade_changes(ticker, show_schema=False):
-    """[{date, action}]. FMP 필드명이 판올림마다 달라 후보를 폭넓게 훑는다."""
+def grade_series(ticker, show_schema=False):
+    """[(date, buy_pct)] 오름차순. 매수의견 비율 = (StrongBuy+Buy)/전체 × 100."""
     raw = _get(f"grades-historical?symbol={ticker}&limit=1000") or []
     if show_schema and raw and not _SCHEMA_SHOWN[0] and isinstance(raw[0], dict):
         _SCHEMA_SHOWN[0] = True
         print(f"\n  [진단] grades-historical 원본 스키마 ({ticker})")
         print(f"         키: {sorted(raw[0].keys())}")
-        print(f"         샘플: {json.dumps(raw[0], ensure_ascii=False)[:280]}\n")
+        print(f"         샘플: {json.dumps(raw[0], ensure_ascii=False)[:220]}\n")
 
     out = []
     for it in raw:
         if not isinstance(it, dict):
             continue
-        d = ec._d(it.get("date") or it.get("publishedDate") or it.get("gradeDate"))
+        d = ec._d(it.get("date") or it.get("publishedDate"))
         if d is None:
             continue
-        a = " ".join(str(it.get(k) or "") for k in
-                     ("action", "ratingChange", "gradeChange", "newsTitle")).lower()
-        prev = (it.get("previousGrade") or it.get("previousRating")
-                or it.get("gradePrevious") or "")
-        new = (it.get("newGrade") or it.get("newRating")
-               or it.get("gradeNew") or it.get("grade") or "")
-        if any(w in a for w in _UP_WORDS):
-            act = "up"
-        elif any(w in a for w in _DOWN_WORDS):
-            act = "down"
-        else:
-            act = _grade_dir(prev, new)
-        out.append({"date": d, "action": act})
+        sb = ec._num(it.get("analystRatingsStrongBuy")) or 0.0
+        b = ec._num(it.get("analystRatingsBuy")) or 0.0
+        h = ec._num(it.get("analystRatingsHold")) or 0.0
+        sl = ec._num(it.get("analystRatingsSell")) or 0.0
+        ss = ec._num(it.get("analystRatingsStrongSell")) or 0.0
+        tot = sb + b + h + sl + ss
+        if tot <= 0:
+            continue
+        out.append((d, (sb + b) / tot * 100.0))
+    out.sort(key=lambda x: x[0])
     return out
+
+
+def grade_factors(series, base_dt, drift_days=GRADE_DRIFT_DAYS):
+    """(F4_drift, F5_level). look-ahead 차단: base_dt 이전 관측만 사용."""
+    if not series:
+        return None, None
+    past = [(d, v) for d, v in series if d <= base_dt]
+    if not past:
+        return None, None
+    level = past[-1][1]
+    cutoff = base_dt - pd.Timedelta(days=int(drift_days))
+    older = [v for d, v in past if d <= cutoff]
+    if not older:
+        return None, level
+    return level - older[-1], level
 
 
 def load_tickers():
@@ -192,7 +194,7 @@ def load_tickers():
         return []
 
 
-def build_events(ticker, hist, spy, recs, grades):
+def build_events(ticker, hist, spy, recs, gseries):
     if hist is None or hist.empty or not recs:
         return []
     idx = hist.index
@@ -230,16 +232,14 @@ def build_events(ticker, hist, spy, recs, grades):
                 except Exception:
                     pass
 
-            lo = base_dt - pd.Timedelta(days=GRADE_WINDOW)
-            ups = sum(1 for g in grades if lo <= g["date"] <= base_dt and g["action"] == "up")
-            dns = sum(1 for g in grades if lo <= g["date"] <= base_dt and g["action"] == "down")
+            f4, f5 = grade_factors(gseries, base_dt)
 
             pc = float(hist["Close"].iloc[i - 1])
             gap = (float(hist["Close"].iloc[i]) - pc) / pc * 100.0
 
             e = {"ticker": ticker, "date": rec["date"], "F2_beat": f2_beat,
-                 "F2_surp": f2_surp, "F3_rs": f3, "F4_net": ups - dns,
-                 "gap": gap, "grade_any": ups + dns}
+                 "F2_surp": f2_surp, "F3_rs": f3,
+                 "F4_drift": f4, "F5_level": f5, "gap": gap}
 
             cost = COST_BPS / 100.0 * 2
             for en, eo in ENTRIES:
@@ -291,7 +291,8 @@ FACTORS = [
     ("F2_beat", 60.0, "서프라이즈 지속성(beat율)"),
     ("F2_surp", 2.0, "평균 서프라이즈 폭"),
     ("F3_rs", 0.0, "발표 전 상대강도"),
-    ("F4_net", 0.0, "등급 순상향"),
+    ("F4_drift", 0.0, "매수의견 비율 상승(90일)"),
+    ("F5_level", 60.0, "매수의견 비율 수준"),
 ]
 
 
@@ -307,10 +308,16 @@ def report(evs):
     if n < MIN_EVENTS:
         print(f"[!] 표본 {n} < {MIN_EVENTS} — 결론 보류")
 
-    ga = sum(1 for e in evs if e.get("grade_any"))
-    print(f"\n[진단] 등급 변경 창({GRADE_WINDOW}일) 안에 변동 있는 이벤트 {ga}/{n}건")
-    if ga < 50:
-        print("       → F4 는 표본 부족으로 검증 불가 (3요인 결과로 읽을 것)")
+    g4 = sum(1 for e in evs if e.get("F4_drift") is not None)
+    g5 = sum(1 for e in evs if e.get("F5_level") is not None)
+    print(f"\n[진단] 매수의견 산출 가능 — 변화(F4) {g4}/{n}건 · 수준(F5) {g5}/{n}건")
+    if g4 < 50 or g5 < 50:
+        print("       → 해당 요인은 표본 부족으로 검증 불가")
+    else:
+        d4 = _stat([e["F4_drift"] for e in evs])
+        d5 = _stat([e["F5_level"] for e in evs])
+        print(f"       F4 변화폭 분포: 중앙 {d4['median']:+.1f}%p · 평균 {d4['mean']:+.1f}%p")
+        print(f"       F5 수준 분포  : 중앙 {d5['median']:.1f}% · 평균 {d5['mean']:.1f}%")
 
     print("\n■ 방향 적중률 — 스코어별 실제 '갭 상승' 비율")
     up_all = sum(1 for e in evs if (e["gap"] or 0) > 0) / n * 100.0
@@ -412,11 +419,11 @@ def main():
                 skipped.append(tk)
                 time.sleep(SLEEP_SEC)
                 continue
-            grades = grade_changes(tk, show_schema=True)
-            evs = build_events(tk, h, spy, recs, grades)
+            gseries = grade_series(tk, show_schema=True)
+            evs = build_events(tk, h, spy, recs, gseries)
             all_evs += evs
             print(f"  {tk:6} 봉 {len(h):>4} · 실적 {len(recs):>2} · "
-                  f"등급 {len(grades):>3} → 이벤트 {len(evs)}")
+                  f"의견 {len(gseries):>3} → 이벤트 {len(evs)}")
         except Exception as e:
             print(f"  {tk:6} 실패: {e}")
         time.sleep(SLEEP_SEC)
