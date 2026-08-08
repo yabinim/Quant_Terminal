@@ -191,29 +191,88 @@ def fmp_price_target_summary(ticker: str) -> dict:
     return out
 
 
+def _iso_date_or_blank(v) -> str:
+    """'YYYY-MM-DD' 로 파싱 가능하면 그대로, 아니면 빈 문자열."""
+    s = str(v or "")[:10]
+    if len(s) != 10:
+        return ""
+    try:
+        _dt.date.fromisoformat(s)
+        return s
+    except Exception:
+        return ""
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
-def fmp_dividends(ticker: str) -> dict:
-    """다가오는/최근 배당 정보. 반환: {"ex_date","amount","yield_hint"} 또는 {}."""
+def fmp_dividend_history(ticker: str) -> list[dict]:
+    """배당 이력(과거 + 발표된 예정분) 전체 — **ex_date 오름차순**.
+
+    반환: [{"ex_date","record_date","pay_date","declaration_date",
+            "amount","frequency"}]  · 실패 시 [].
+
+    ⚠️ 배당 수령 자격은 **ex_date(배당락일) 개장 시점 보유** 기준이다.
+       즉 체결일이 ex_date **미만**이어야 받는다(ex_date 당일 매수는 못 받음).
+       실제 현금 입금·DRIP 체결은 pay_date(지급일) 기준이므로 두 날짜를 모두 돌려준다.
+
+    ⚠️ ROC(원금환급) 구분은 FMP 가 제공하지 않는다. QQQI·JEPQ 같은 커버드콜 ETF는
+       배당의 상당분이 ROC 라서 세무상 평단가를 '낮춰야' 하지만 여기서는 알 수 없다.
+       → 재투자 결과는 어디까지나 **장부 근사치**다.
+    """
     data = _get_json(f"dividends?symbol={ticker}")
     if not isinstance(data, list) or not data:
-        return {}
-    today = _dt.date.today()
-    upcoming = None
+        return []
+    out, seen = [], set()
     for row in data:
         if not isinstance(row, dict):
             continue
-        ds = str(row.get("date", row.get("recordDate", "")))[:10]
+        ex = _iso_date_or_blank(row.get("date"))
+        if not ex or ex in seen:
+            continue
+        amt = _f(row.get("dividend"))
+        if np.isnan(amt) or amt <= 0:
+            amt = _f(row.get("adjDividend"))
+        if np.isnan(amt) or amt <= 0:
+            continue
+        seen.add(ex)
+        out.append({
+            "ex_date": ex,
+            "record_date": _iso_date_or_blank(row.get("recordDate")),
+            "pay_date": _iso_date_or_blank(row.get("paymentDate")),
+            "declaration_date": _iso_date_or_blank(row.get("declarationDate")),
+            "amount": round(float(amt), 6),
+            "frequency": str(row.get("frequency") or "").strip(),
+        })
+    out.sort(key=lambda d: d["ex_date"])
+    return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fmp_dividends(ticker: str) -> dict:
+    """다가오는/최근 배당 1건. 반환: {"ex_date","amount","is_upcoming",...} 또는 {}.
+
+    ⚠️ 기존 호출부 호환 유지 — 반환 키(ex_date/amount/is_upcoming)와 선택 규칙
+       (미래 건이 있으면 가장 가까운 미래, 없으면 가장 최근 과거)은 그대로다.
+       내부 파싱만 fmp_dividend_history(SSOT)로 위임했다.
+    """
+    rows = fmp_dividend_history(ticker)
+    if not rows:
+        return {}
+    today = _dt.date.today()
+    upcoming = None
+    for r in rows:  # 오름차순 → 첫 미래 건이 가장 가까운 미래
         try:
-            d = _dt.date.fromisoformat(ds)
+            if _dt.date.fromisoformat(r["ex_date"]) >= today:
+                upcoming = r
+                break
         except Exception:
             continue
-        if d >= today:
-            upcoming = row  # 가장 가까운 미래(데이터가 최신순이면 마지막으로 갱신)
-    target = upcoming or data[0]
+    target = upcoming or rows[-1]  # 미래가 없으면 가장 최근 과거
     return {
-        "ex_date": str(target.get("date", ""))[:10],
-        "amount": _f(target.get("dividend", target.get("adjDividend"))),
+        "ex_date": target["ex_date"],
+        "amount": target["amount"],
         "is_upcoming": upcoming is not None,
+        "pay_date": target.get("pay_date", ""),
+        "frequency": target.get("frequency", ""),
     }
 
 

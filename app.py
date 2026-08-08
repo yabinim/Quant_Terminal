@@ -240,6 +240,37 @@ _WL_ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price", "watch")
 _WL_ALERT_DEFAULT = "entry,risk,watch"
 _THESIS_SHEET_COLS = ["ID", "Ticker", "Account", "Thesis_Title", "Narrative_Category", "Narrative_Date", "Date_Added"]
 
+# ── 💰 배당 재투자(DRIP) ──────────────────────────────────────────────────
+# ⚠️ Portfolios 시트(6열)는 **건드리지 않는다**. 7번째 열을 붙이면 portfolio_core.py
+#    스키마가 깨져 automation 5개를 전부 lockstep 해야 한다 — 리스크 대비 이득 없음.
+#    → 종목별 설정은 별도 Dividend_Prefs, 처리 이력은 Dividend_Log 로 분리한다.
+_DIVIDEND_PREFS_SHEET_TITLE = "Dividend_Prefs"
+_DIVIDEND_PREFS_COLS = ["ID", "Account", "Ticker", "Mode", "Updated_At"]
+_DIVIDEND_LOG_SHEET_TITLE = "Dividend_Log"
+_DIVIDEND_LOG_COLS = [
+    "ID", "Account", "Ticker", "Ex_Date", "Pay_Date",
+    "Per_Share", "Shares_Held", "Gross_Amount",
+    "Action", "Reinvest_Price", "Reinvest_Shares",
+    "Status", "Decided_At", "Note",
+]
+# 멱등 키 = (ID, Account, Ticker, Ex_Date). 로그에 있는 배당은 절대 재처리하지 않는다.
+_DIVIDEND_MODES = ("ask", "auto_drip", "auto_cash")
+_DIVIDEND_MODE_LABELS = {
+    "ask": "❓ 물어보기 (기본)",
+    "auto_drip": "🔁 자동 재투자 (DRIP)",
+    "auto_cash": "💵 자동 현금 적립",
+}
+_DIVIDEND_MODE_DEFAULT = "ask"
+# 소급 상한. 첫 접속에 수십 건이 한꺼번에 뜨는 것을 막는다. 이보다 오래된 배당은
+# 조회조차 하지 않으며, '미처리'로도 남지 않는다(조용히 무시).
+_DIVIDEND_BACKFILL_DAYS = 90
+# Trade_History 액션 코드. 현금 배당은 BUY/SELL 어디에도 해당하지 않으므로 별도 코드.
+# 기존 소비처(compute_realized_pnl / compute_closed_trades_detail / 미매칭 매도 점검)는
+# 전부 `== "BUY"` / `== "SELL"` 완전일치라 DIV 행은 조용히 무시된다 — 실현손익 불변.
+_DIVIDEND_TRADE_ACTION = "DIV"
+_DIVIDEND_MEMO_TAG_DRIP = "[배당재투자]"
+_DIVIDEND_MEMO_TAG_CASH = "[배당현금]"
+
 
 @st.cache_resource
 def get_gspread_client():
@@ -8182,6 +8213,544 @@ def append_trade_history_row(user_id: str, account: str, ticker: str, action: st
         return True, ""
     except Exception as exc:
         return False, str(exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 💰 배당 재투자(DRIP) 엔진
+#
+# 설계 원칙
+#  1) Portfolios(6열) 스키마 불변 — 설정/이력은 별도 시트 2개로 분리.
+#  2) 멱등성: (ID, Account, Ticker, Ex_Date) 가 Dividend_Log 에 있으면 절대 재처리 안 함.
+#  3) 현금 정합: 재투자 = `현금 +배당` → `BUY(-동액)` 2단계. net 0.
+#     ⚠️ BUY 만 기록하면 append_trade_history_row 가 현금을 실제로 차감해버린다
+#        (배당 입금이 없었으므로 잔고가 조용히 줄어듦). 순서를 바꾸면 안 된다.
+#  4) 로그는 **확정 결정만 append**. 가격 미확보 건은 기록하지 않고 다음 접속에 재시도
+#     (fail-open) — 행 업데이트가 필요 없어 시트 경합이 없다.
+#  5) 결과는 어디까지나 **장부 근사치**. 실제 증권사 DRIP 체결가·ROC 처리와 다르다.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def open_dividend_prefs_worksheet():
+    """Quant_DB / Dividend_Prefs 탭. 없으면 자동 생성. (ws|None, err|None)"""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        last_col = chr(ord("A") + len(_DIVIDEND_PREFS_COLS) - 1)
+        titles = [w.title for w in sh.worksheets()]
+        if _DIVIDEND_PREFS_SHEET_TITLE in titles:
+            return sh.worksheet(_DIVIDEND_PREFS_SHEET_TITLE), None
+        ws = sh.add_worksheet(title=_DIVIDEND_PREFS_SHEET_TITLE, rows=1000,
+                              cols=len(_DIVIDEND_PREFS_COLS))
+        ws.update([_DIVIDEND_PREFS_COLS], range_name=f"A1:{last_col}1",
+                  value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc:
+        return None, f"Dividend_Prefs 워크시트 열기/생성 실패: {exc}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _dividend_prefs_all_values_cached():
+    ws, err = open_dividend_prefs_worksheet()
+    if err or ws is None:
+        return [], err
+    try:
+        return ws.get_all_values() or [], None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _invalidate_dividend_prefs_cache():
+    try:
+        _dividend_prefs_all_values_cached.clear()
+    except Exception:
+        pass
+
+
+def load_dividend_prefs(user_id: str) -> dict:
+    """해당 user_id 의 종목별 배당 처리 모드. 반환: {(account_lower, TICKER): mode}."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {}
+    try:
+        vals, err = _dividend_prefs_all_values_cached()
+    except Exception:
+        return {}
+    if err or not vals or len(vals) < 2:
+        return {}
+    ncol = len(_DIVIDEND_PREFS_COLS)
+    out = {}
+    for r in vals[1:]:
+        r = (list(r) + [""] * ncol)[:ncol]
+        if str(r[0]).strip().upper() != uid.upper():
+            continue
+        acct = str(r[1]).strip()
+        tk = str(r[2]).strip().upper()
+        mode = str(r[3]).strip().lower()
+        if not acct or not tk or mode not in _DIVIDEND_MODES:
+            continue
+        out[(acct.lower(), tk)] = mode
+    return out
+
+
+def get_dividend_mode(prefs: dict, account: str, ticker: str) -> str:
+    """저장된 모드 조회. 미설정이면 기본값('ask')."""
+    key = (str(account or "").strip().lower(), str(ticker or "").strip().upper())
+    return str((prefs or {}).get(key, _DIVIDEND_MODE_DEFAULT))
+
+
+def save_dividend_pref(user_id: str, account: str, ticker: str, mode: str) -> tuple[bool, str]:
+    """(ID, Account, Ticker) 한 행만 교체/추가. 다른 행은 보존."""
+    uid = str(user_id or "").strip()
+    acct = str(account or "").strip()
+    tk = str(ticker or "").strip().upper()
+    md = str(mode or "").strip().lower()
+    if not uid or not acct or not tk:
+        return False, "user_id / 계좌 / 티커가 비어 있습니다."
+    if md not in _DIVIDEND_MODES:
+        return False, f"알 수 없는 모드: {mode}"
+    ws, err = open_dividend_prefs_worksheet()
+    if err or ws is None:
+        return False, err or "시트를 열 수 없습니다."
+    ncol = len(_DIVIDEND_PREFS_COLS)
+    last_col = chr(ord("A") + ncol - 1)
+    try:
+        vals = ws.get_all_values() or []
+        keep = []
+        for r in vals[1:]:
+            r = (list(r) + [""] * ncol)[:ncol]
+            if not str(r[0]).strip():
+                continue
+            if (str(r[0]).strip().upper() == uid.upper()
+                    and str(r[1]).strip().lower() == acct.lower()
+                    and str(r[2]).strip().upper() == tk):
+                continue
+            keep.append(r)
+        rows = ([_DIVIDEND_PREFS_COLS] + keep
+                + [[uid, acct, tk, md, _narrative_now_et_string()]])
+        ws.clear()
+        ws.update(rows, range_name=f"A1:{last_col}{len(rows)}",
+                  value_input_option="USER_ENTERED")
+        _invalidate_dividend_prefs_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def open_dividend_log_worksheet():
+    """Quant_DB / Dividend_Log 탭. 없으면 자동 생성. (ws|None, err|None)"""
+    gc = get_gspread_client()
+    if gc is None:
+        return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
+    try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        last_col = chr(ord("A") + len(_DIVIDEND_LOG_COLS) - 1)
+        titles = [w.title for w in sh.worksheets()]
+        if _DIVIDEND_LOG_SHEET_TITLE in titles:
+            return sh.worksheet(_DIVIDEND_LOG_SHEET_TITLE), None
+        ws = sh.add_worksheet(title=_DIVIDEND_LOG_SHEET_TITLE, rows=3000,
+                              cols=len(_DIVIDEND_LOG_COLS))
+        ws.update([_DIVIDEND_LOG_COLS], range_name=f"A1:{last_col}1",
+                  value_input_option="USER_ENTERED")
+        return ws, None
+    except Exception as exc:
+        return None, f"Dividend_Log 워크시트 열기/생성 실패: {exc}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _dividend_log_all_values_cached():
+    ws, err = open_dividend_log_worksheet()
+    if err or ws is None:
+        return [], err
+    try:
+        return ws.get_all_values() or [], None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _invalidate_dividend_log_cache():
+    try:
+        _dividend_log_all_values_cached.clear()
+    except Exception:
+        pass
+
+
+def load_dividend_log(user_id: str) -> pd.DataFrame:
+    """해당 user_id 의 배당 처리 이력."""
+    empty = pd.DataFrame(columns=_DIVIDEND_LOG_COLS)
+    uid = str(user_id or "").strip()
+    if not uid:
+        return empty
+    try:
+        vals, err = _dividend_log_all_values_cached()
+    except Exception:
+        return empty
+    if err or not vals or len(vals) < 2:
+        return empty
+    ncol = len(_DIVIDEND_LOG_COLS)
+    rows = [(list(r) + [""] * ncol)[:ncol] for r in vals[1:]
+            if str((list(r) + [""])[0]).strip().upper() == uid.upper()]
+    if not rows:
+        return empty
+    df = pd.DataFrame(rows, columns=_DIVIDEND_LOG_COLS)
+    for c in ("Per_Share", "Shares_Held", "Gross_Amount", "Reinvest_Price", "Reinvest_Shares"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def load_dividend_done_keys(user_id: str) -> set:
+    """이미 처리된 배당 키 집합 {(account_lower, TICKER, ex_date)} — 멱등성 게이트."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return set()
+    try:
+        vals, err = _dividend_log_all_values_cached()
+    except Exception:
+        return set()
+    if err or not vals or len(vals) < 2:
+        return set()
+    ncol = len(_DIVIDEND_LOG_COLS)
+    out = set()
+    for r in vals[1:]:
+        r = (list(r) + [""] * ncol)[:ncol]
+        if str(r[0]).strip().upper() != uid.upper():
+            continue
+        acct, tk, ex = str(r[1]).strip().lower(), str(r[2]).strip().upper(), str(r[3]).strip()[:10]
+        if acct and tk and ex:
+            out.add((acct, tk, ex))
+    return out
+
+
+def append_dividend_log_row(user_id: str, item: dict, action: str, status: str,
+                            reinvest_price=None, reinvest_shares=None,
+                            note: str = "") -> tuple[bool, str]:
+    """Dividend_Log 에 확정 결정 1행 추가."""
+    ws, err = open_dividend_log_worksheet()
+    if err or ws is None:
+        return False, err or "시트를 열 수 없습니다."
+    try:
+        row = [
+            str(user_id).strip(),
+            str(item.get("account", "")).strip(),
+            str(item.get("ticker", "")).strip().upper(),
+            str(item.get("ex_date", "")).strip(),
+            str(item.get("pay_date", "")).strip(),
+            str(round(float(item.get("per_share") or 0), 6)),
+            str(round(float(item.get("shares_held") or 0), 6)),
+            str(round(float(item.get("gross") or 0), 4)),
+            str(action).strip().lower(),
+            "" if reinvest_price is None else str(round(float(reinvest_price), 6)),
+            "" if reinvest_shares is None else str(round(float(reinvest_shares), 6)),
+            str(status).strip().lower(),
+            _narrative_now_et_string(),
+            str(note or "").strip(),
+        ]
+        _safe_append_rows(ws, row, value_input_option="USER_ENTERED")
+        _invalidate_dividend_log_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+# ── 시점별 보유 수량 재구성 (D2-C: 원장 우선, 없으면 현재 수량 폴백) ──────────
+
+def dividend_shares_at(trade_df: pd.DataFrame, portfolio_df: pd.DataFrame,
+                       account: str, ticker: str, ex_date: str) -> dict:
+    """배당락일(ex_date) 개장 시점 보유 수량 추정.
+
+    반환: {"shares": float, "basis": str, "warn": str}
+      basis = "ledger"          — Trade_History 로 재구성(신뢰)
+              "ledger_mismatch" — 재구성했지만 현재 수량과 어긋남(원장 누락 의심)
+              "current"         — 원장에 매수 기록이 없어 현재 수량으로 대체
+
+    ⚠️ 배당 자격은 ex_date **당일 개장 시점** 보유 기준 → 체결일이 ex_date '미만'인
+       거래까지만 합산한다(ex_date 당일 매수는 배당을 받지 못한다).
+    """
+    acct = str(account or "").strip()
+    tk = str(ticker or "").strip().upper()
+    out = {"shares": 0.0, "basis": "current", "warn": ""}
+
+    cur_qty = 0.0
+    try:
+        if portfolio_df is not None and not portfolio_df.empty:
+            m = portfolio_df[(portfolio_df["Account"].astype(str).str.strip() == acct)
+                             & (portfolio_df["Ticker"].astype(str).str.strip().str.upper() == tk)]
+            if not m.empty:
+                cur_qty = float(pd.to_numeric(m["Quantity"].values[0], errors="coerce") or 0.0)
+    except Exception:
+        cur_qty = 0.0
+
+    try:
+        ex_ts = pd.to_datetime(str(ex_date)[:10], errors="coerce")
+    except Exception:
+        ex_ts = pd.NaT
+    if pd.isna(ex_ts):
+        out["shares"] = cur_qty
+        out["warn"] = "배당락일 파싱 실패 — 현재 수량으로 계산"
+        return out
+
+    grp = pd.DataFrame()
+    try:
+        if trade_df is not None and not trade_df.empty:
+            g = trade_df.copy()
+            g["_acct"] = g["account"].astype(str).str.strip()
+            g["_tk"] = g["ticker"].astype(str).str.strip().str.upper()
+            g["_act"] = g["action"].astype(str).str.strip().str.upper()
+            g["_dt"] = pd.to_datetime(g["date"], errors="coerce")
+            grp = g[(g["_acct"] == acct) & (g["_tk"] == tk) & g["_dt"].notna()]
+    except Exception:
+        grp = pd.DataFrame()
+
+    has_buy = (not grp.empty) and bool((grp["_act"] == "BUY").any())
+    if not has_buy:
+        out["shares"] = cur_qty
+        out["basis"] = "current"
+        out["warn"] = "매수 원장이 없어 **현재 보유 수량**으로 계산했습니다"
+        return out
+
+    def _net_upto(cutoff_ts, inclusive: bool) -> float:
+        sel = grp[grp["_dt"] <= cutoff_ts] if inclusive else grp[grp["_dt"] < cutoff_ts]
+        n = 0.0
+        for _, r in sel.iterrows():
+            sh = float(pd.to_numeric(r.get("shares"), errors="coerce") or 0.0)
+            if sh <= 0:
+                continue
+            if r["_act"] == "BUY":
+                n += sh
+            elif r["_act"] == "SELL":
+                n -= sh
+        return max(0.0, n)
+
+    shares_at_ex = _net_upto(ex_ts, inclusive=False)
+    ledger_now = _net_upto(pd.Timestamp.now().normalize(), inclusive=True)
+
+    out["shares"] = shares_at_ex
+    out["basis"] = "ledger"
+    tol = max(0.01, abs(cur_qty) * 0.01)
+    if abs(ledger_now - cur_qty) > tol:
+        out["basis"] = "ledger_mismatch"
+        out["warn"] = (f"원장 재구성 수량({ledger_now:g}주)이 현재 보유({cur_qty:g}주)와 "
+                       f"달라 매수·매도 기록이 일부 누락된 것으로 보입니다 — 수량을 확인하세요")
+    return out
+
+
+def _dividend_reinvest_price(ticker: str, pay_date: str, ex_date: str):
+    """재투자 체결가 = 지급일 종가. 반환: (price|None, price_date, note).
+
+    지급일이 휴장일이면 **그 이후 첫 거래일** 종가를 쓴다. 지급일이 미래이거나
+    데이터가 아직 없으면 (None, "", 사유) → 기록하지 않고 다음 접속에 재시도한다.
+    """
+    tk = str(ticker or "").strip().upper()
+    target = str(pay_date or "").strip()[:10]
+    note = ""
+    if not target:
+        target = str(ex_date or "").strip()[:10]
+        note = "지급일 미제공 → 배당락일 종가 사용"
+    if not tk or not target:
+        return None, "", "날짜 정보 없음"
+    try:
+        hist = _fmp_price_history(tk, limit=260)
+    except Exception:
+        hist = None
+    if hist is None or getattr(hist, "empty", True) or "Close" not in getattr(hist, "columns", []):
+        return None, "", "가격 이력 조회 실패"
+    try:
+        ts = pd.to_datetime(target, errors="coerce")
+        if pd.isna(ts):
+            return None, "", "날짜 파싱 실패"
+        fwd = hist[hist.index >= ts]
+        if fwd.empty:
+            return None, "", "지급일 종가 미확보(미래 또는 데이터 지연)"
+        px = float(pd.to_numeric(fwd["Close"].iloc[0], errors="coerce"))
+        if not np.isfinite(px) or px <= 0:
+            return None, "", "종가 값 이상"
+        pdate = fwd.index[0].strftime("%Y-%m-%d")
+        if pdate != target and not note:
+            note = f"지급일({target}) 휴장 → {pdate} 종가 사용"
+        return px, pdate, note
+    except Exception as exc:
+        return None, "", f"가격 조회 오류: {exc}"
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _cached_dividend_history(ticker: str) -> list:
+    """fmp_extras.fmp_dividend_history 래퍼 — 앱 캐시 계층 통일용."""
+    try:
+        return fx.fmp_dividend_history(str(ticker).strip().upper()) or []
+    except Exception:
+        return []
+
+
+def scan_pending_dividends(user_id: str, portfolio_df: pd.DataFrame,
+                           trade_df: pd.DataFrame, prefs: dict,
+                           done_keys: set) -> list[dict]:
+    """미처리 배당 목록. Dividend_Log 에 있는 건은 제외(멱등).
+
+    반환 항목: {account, ticker, ex_date, pay_date, per_share, shares_held, gross,
+                mode, basis, warn, price, price_date, price_note, ready}
+      ready=False → 지급일 종가 미확보. 표시만 하고 기록하지 않는다.
+    """
+    uid = str(user_id or "").strip()
+    if not uid or portfolio_df is None or portfolio_df.empty:
+        return []
+    today = datetime.now(_MARKET_ET_TZ).date()
+    cutoff = today - timedelta(days=int(_DIVIDEND_BACKFILL_DAYS))
+
+    items = []
+    for _, prow in portfolio_df.iterrows():
+        acct = str(prow.get("Account", "")).strip()
+        tk = str(prow.get("Ticker", "")).strip().upper()
+        if not acct or not tk:
+            continue
+        try:
+            hist = _cached_dividend_history(tk)
+        except Exception:
+            hist = []
+        if not hist:
+            continue
+        for d in hist:
+            ex_s = str(d.get("ex_date", ""))[:10]
+            if not ex_s:
+                continue
+            try:
+                ex_d = datetime.strptime(ex_s, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if ex_d < cutoff or ex_d > today:
+                continue  # 소급 상한 밖이거나 아직 배당락 전
+            if (acct.lower(), tk, ex_s) in (done_keys or set()):
+                continue
+            per_share = float(d.get("amount") or 0.0)
+            if per_share <= 0:
+                continue
+            basis = dividend_shares_at(trade_df, portfolio_df, acct, tk, ex_s)
+            shares_held = float(basis.get("shares") or 0.0)
+            if shares_held <= 1e-9:
+                continue  # 배당락일에 미보유 → 물어볼 것도 없음
+            px, pdate, pnote = _dividend_reinvest_price(tk, d.get("pay_date", ""), ex_s)
+            items.append({
+                "account": acct, "ticker": tk,
+                "ex_date": ex_s, "pay_date": str(d.get("pay_date", ""))[:10],
+                "frequency": str(d.get("frequency", "")),
+                "per_share": per_share,
+                "shares_held": shares_held,
+                "gross": round(per_share * shares_held, 4),
+                "mode": get_dividend_mode(prefs, acct, tk),
+                "basis": basis.get("basis", "current"),
+                "warn": basis.get("warn", ""),
+                "price": px, "price_date": pdate, "price_note": pnote,
+                "ready": px is not None,
+            })
+    items.sort(key=lambda x: (x["ex_date"], x["account"], x["ticker"]))
+    return items
+
+
+def apply_dividend_decision(user_id: str, item: dict, action: str) -> tuple[bool, str]:
+    """배당 1건 확정 반영. action ∈ {"drip", "cash", "skip"}.
+
+    drip: 현금 +배당 → Portfolios 수량·평단 갱신 → Trade_History BUY(-동액) → 로그
+          ⚠️ 현금 입금을 **먼저** 해야 한다. BUY 만 넣으면 잔고가 실제로 차감된다.
+    cash: 현금 +배당 → Trade_History DIV(현금 미변동 코드) → 로그
+    skip: 배당락일 미보유였음 — 아무것도 바꾸지 않고 로그만 남겨 재질문을 막는다.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False, "로그인 user_id가 없습니다."
+    act = str(action or "").strip().lower()
+    acct = str(item.get("account", "")).strip()
+    tk = str(item.get("ticker", "")).strip().upper()
+    ex_s = str(item.get("ex_date", ""))[:10]
+    gross = float(item.get("gross") or 0.0)
+    if not acct or not tk or not ex_s:
+        return False, "배당 항목 정보가 불완전합니다."
+
+    # 멱등 재확인 — 다른 탭/세션에서 이미 처리했을 수 있다.
+    try:
+        if (acct.lower(), tk, ex_s) in load_dividend_done_keys(uid):
+            return True, f"{tk} {ex_s} 배당은 이미 처리되어 있습니다."
+    except Exception:
+        pass
+
+    if act == "skip":
+        ok, err = append_dividend_log_row(uid, item, "skip", "skipped",
+                                          note="배당락일 미보유로 사용자 확인")
+        return (ok, "" if ok else err)
+
+    if gross <= 0:
+        return False, "배당 금액이 0입니다."
+
+    pay_for_record = str(item.get("price_date") or item.get("pay_date") or ex_s)[:10]
+
+    if act == "cash":
+        ok_c, res_c = adjust_account_cash(uid, acct, +gross, note=f"{tk} 배당 입금")
+        if not ok_c:
+            return False, f"현금 반영 실패: {res_c}"
+        try:
+            append_trade_history_row(
+                uid, acct, tk, _DIVIDEND_TRADE_ACTION,
+                float(item.get("shares_held") or 0.0), float(item.get("per_share") or 0.0),
+                pay_for_record, f"{_DIVIDEND_MEMO_TAG_CASH} 배당락 {ex_s} · 현금 적립",
+            )
+        except Exception:
+            pass  # 원장 기록 실패가 현금 반영을 되돌리지는 않는다
+        ok, err = append_dividend_log_row(uid, item, "cash", "done",
+                                          note=str(item.get("price_note") or ""))
+        return (ok, "" if ok else err)
+
+    if act != "drip":
+        return False, f"알 수 없는 처리: {action}"
+
+    px = item.get("price")
+    if px is None or float(px) <= 0:
+        return False, "지급일 종가를 아직 확보하지 못해 재투자할 수 없습니다."
+    px = float(px)
+    add_shares = gross / px
+    if add_shares <= 0:
+        return False, "재투자 수량이 0입니다."
+
+    # ① 배당 현금 입금
+    ok_c, res_c = adjust_account_cash(uid, acct, +gross, note=f"{tk} 배당 입금")
+    if not ok_c:
+        return False, f"현금 반영 실패: {res_c}"
+
+    # ② Portfolios 수량·평단 갱신
+    try:
+        pf = load_portfolio()
+        mask = ((pf["Account"].astype(str).str.strip() == acct)
+                & (pf["Ticker"].astype(str).str.strip().str.upper() == tk))
+        if not mask.any():
+            adjust_account_cash(uid, acct, -gross, note=f"{tk} 배당 재투자 롤백")
+            return False, f"{acct}/{tk} 보유 행을 찾지 못했습니다."
+        idx = pf.index[mask][0]
+        old_q = float(pd.to_numeric(pf.loc[idx, "Quantity"], errors="coerce") or 0.0)
+        old_p = float(pd.to_numeric(pf.loc[idx, "Purchase_Price"], errors="coerce") or 0.0)
+        new_q = old_q + add_shares
+        if new_q <= 0:
+            adjust_account_cash(uid, acct, -gross, note=f"{tk} 배당 재투자 롤백")
+            return False, "갱신 후 수량이 0 이하입니다."
+        new_avg = ((old_p * old_q) + gross) / new_q
+        pf.loc[idx, "Quantity"] = new_q
+        pf.loc[idx, "Purchase_Price"] = new_avg
+        save_portfolio(pf)
+    except Exception as exc:
+        adjust_account_cash(uid, acct, -gross, note=f"{tk} 배당 재투자 롤백")
+        return False, f"보유 갱신 실패(현금 롤백함): {exc}"
+
+    # ③ Trade_History BUY — 여기서 현금이 -gross 되어 ①과 상쇄(net 0)
+    try:
+        append_trade_history_row(
+            uid, acct, tk, "BUY", float(add_shares), px, pay_for_record,
+            f"{_DIVIDEND_MEMO_TAG_DRIP} 배당락 {ex_s} · ${gross:,.2f} 재투자",
+        )
+    except Exception:
+        pass
+
+    ok, err = append_dividend_log_row(
+        uid, item, "drip", "done",
+        reinvest_price=px, reinvest_shares=add_shares,
+        note=str(item.get("price_note") or ""),
+    )
+    return (ok, "" if ok else err)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -18697,6 +19266,206 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         puid = str(st.session_state.get("user_id") or "").strip()
         if st.session_state.get("_portfolio_last_sheet_error"):
             st.warning(f"Portfolios 시트: {st.session_state['_portfolio_last_sheet_error']}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 💰 배당 처리 (DRIP) — 미처리 배당 확인 · 재투자/현금 반영
+        #   멱등 키 = (ID, Account, Ticker, Ex_Date). Dividend_Log 에 있으면 재질문 없음.
+        #   스캔은 세션당 하루 1회만 — 매 rerun 마다 FMP 를 두드리지 않는다.
+        # ═══════════════════════════════════════════════════════════════════
+        if puid and not portfolio_df.empty:
+            _div_today = datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d")
+            _div_scan_key = f"_div_scan::{puid}"
+            _div_hit = st.session_state.get(_div_scan_key)
+            _need_scan = not (isinstance(_div_hit, tuple) and len(_div_hit) == 2
+                              and _div_hit[0] == _div_today)
+            if st.session_state.pop("_div_force_rescan", False):
+                _need_scan = True
+
+            if _need_scan:
+                try:
+                    with st.spinner("배당 내역 확인 중..."):
+                        _div_prefs = load_dividend_prefs(puid)
+                        _div_done = load_dividend_done_keys(puid)
+                        _div_trades = load_trade_history(puid)
+                        _div_items = scan_pending_dividends(
+                            puid, portfolio_df, _div_trades, _div_prefs, _div_done)
+                except Exception as _e_div:
+                    _div_items, _div_prefs = [], {}
+                    st.caption(f"배당 조회를 건너뛰었습니다: {_e_div}")
+                st.session_state[_div_scan_key] = (_div_today, _div_items)
+            else:
+                _div_items = _div_hit[1]
+                try:
+                    _div_prefs = load_dividend_prefs(puid)
+                except Exception:
+                    _div_prefs = {}
+
+            # 자동 모드(auto_drip / auto_cash) — 묻지 않고 즉시 반영
+            _auto_pending = [it for it in _div_items
+                             if it.get("mode") in ("auto_drip", "auto_cash") and it.get("ready")]
+            if _auto_pending:
+                _auto_msgs, _auto_fail = [], []
+                for _it in _auto_pending:
+                    _a = "drip" if _it["mode"] == "auto_drip" else "cash"
+                    _ok_a, _err_a = apply_dividend_decision(puid, _it, _a)
+                    if _ok_a:
+                        _auto_msgs.append(
+                            f"{_it['account']}/{_it['ticker']} {_it['ex_date']} "
+                            f"${_it['gross']:,.2f} → "
+                            + ("재투자" if _a == "drip" else "현금"))
+                    else:
+                        _auto_fail.append(f"{_it['ticker']} {_it['ex_date']}: {_err_a}")
+                if _auto_msgs:
+                    st.success(_esc_md("💰 배당 자동 반영 — " + " · ".join(_auto_msgs)))
+                if _auto_fail:
+                    st.warning("배당 자동 반영 실패 — " + " · ".join(_auto_fail))
+                st.session_state["_div_force_rescan"] = True
+                st.rerun()
+
+            _ask_items = [it for it in _div_items if it.get("mode") == "ask"]
+            _wait_items = [it for it in _div_items if not it.get("ready")]
+
+            if _ask_items:
+                st.warning(f"💰 확인이 필요한 배당 **{len(_ask_items)}건**이 있습니다.")
+            with st.expander(
+                f"💰 배당 처리 ({len(_ask_items)}건 대기)" if _ask_items else "💰 배당 처리 · 종목별 설정",
+                expanded=bool(_ask_items),
+            ):
+                st.caption(_esc_md(
+                    "배당락일(ex-date) 개장 시점에 보유 중이었다면 배당을 받습니다. 재투자 체결가는 "
+                    "**지급일 종가**를 씁니다. ⚠️ 실제 증권사 DRIP 체결가·ROC(원금환급) 처리와는 "
+                    f"다를 수 있는 **장부 근사치**입니다. 소급은 최대 {_DIVIDEND_BACKFILL_DAYS}일까지만 합니다."
+                ))
+
+                for _it in _ask_items:
+                    _k = f"{_it['account']}|{_it['ticker']}|{_it['ex_date']}"
+                    st.markdown(
+                        f"**{_it['ticker']}** · {_it['account']} — 배당락 `{_it['ex_date']}`"
+                        + (f" · 지급 `{_it['pay_date']}`" if _it.get("pay_date") else "")
+                    )
+                    st.caption(_esc_md(
+                        f"주당 ${_it['per_share']:,.4f} × {_it['shares_held']:g}주 = "
+                        f"**${_it['gross']:,.2f}**"
+                        + (f" · 재투자가 ${_it['price']:,.4f}"
+                           f" → +{(_it['gross'] / _it['price']):.4f}주" if _it.get("ready") else "")
+                    ))
+                    if _it.get("basis") == "current":
+                        st.caption("⚠️ " + _it.get("warn", ""))
+                    elif _it.get("basis") == "ledger_mismatch":
+                        st.warning("⚠️ " + _it.get("warn", ""))
+                    if _it.get("price_note"):
+                        st.caption(f"ℹ️ {_it['price_note']}")
+
+                    if not _it.get("ready"):
+                        st.info(f"지급일 종가 대기 중 — {_it.get('price_note') or '다음 접속 때 다시 시도합니다'}")
+                        st.divider()
+                        continue
+
+                    _c1, _c2, _c3 = st.columns(3)
+                    with _c1:
+                        if st.button("🔁 재투자", key=f"div_drip_{_k}", use_container_width=True,
+                                     type="primary"):
+                            _ok_d, _err_d = apply_dividend_decision(puid, _it, "drip")
+                            if _ok_d:
+                                st.session_state["_div_force_rescan"] = True
+                                st.rerun()
+                            else:
+                                st.error(_esc_md(f"재투자 실패: {_err_d}"))
+                    with _c2:
+                        if st.button("💵 현금으로", key=f"div_cash_{_k}", use_container_width=True):
+                            _ok_d, _err_d = apply_dividend_decision(puid, _it, "cash")
+                            if _ok_d:
+                                st.session_state["_div_force_rescan"] = True
+                                st.rerun()
+                            else:
+                                st.error(_esc_md(f"현금 반영 실패: {_err_d}"))
+                    with _c3:
+                        if st.button("🚫 이때 미보유", key=f"div_skip_{_k}", use_container_width=True,
+                                     help="배당락일에 실제로는 보유하지 않았다면 선택하세요. 아무것도 바꾸지 않고 다시 묻지 않습니다."):
+                            _ok_d, _err_d = apply_dividend_decision(puid, _it, "skip")
+                            if _ok_d:
+                                st.session_state["_div_force_rescan"] = True
+                                st.rerun()
+                            else:
+                                st.error(_esc_md(f"기록 실패: {_err_d}"))
+                    st.divider()
+
+                if not _ask_items and _wait_items:
+                    st.info(f"지급일 종가 대기 중인 배당 {len(_wait_items)}건 — 다음 접속 때 다시 확인합니다.")
+                elif not _div_items:
+                    st.success(f"최근 {_DIVIDEND_BACKFILL_DAYS}일 내 미처리 배당이 없습니다.")
+
+                # ── 종목별 기본 처리 방식 ─────────────────────────────────
+                st.markdown("#### ⚙️ 종목별 기본 처리 방식")
+                st.caption("자동 모드로 두면 다음부터는 묻지 않고 바로 반영합니다. 언제든 바꿀 수 있습니다.")
+                _pf_pairs = sorted({(str(r.get("Account", "")).strip(),
+                                     str(r.get("Ticker", "")).strip().upper())
+                                    for _, r in portfolio_df.iterrows()
+                                    if str(r.get("Ticker", "")).strip()})
+                if not _pf_pairs:
+                    st.caption("보유 종목이 없습니다.")
+                else:
+                    with st.form("dividend_prefs_form", clear_on_submit=False):
+                        _new_modes = {}
+                        for _acc, _tkp in _pf_pairs:
+                            _cur = get_dividend_mode(_div_prefs, _acc, _tkp)
+                            _new_modes[(_acc, _tkp)] = st.selectbox(
+                                f"{_tkp} · {_acc}",
+                                options=list(_DIVIDEND_MODES),
+                                index=list(_DIVIDEND_MODES).index(_cur)
+                                if _cur in _DIVIDEND_MODES else 0,
+                                format_func=lambda m: _DIVIDEND_MODE_LABELS.get(m, m),
+                                key=f"div_mode_{_acc}_{_tkp}",
+                            )
+                        if st.form_submit_button("배당 설정 저장", use_container_width=True):
+                            _saved, _failed = 0, []
+                            for (_acc, _tkp), _md in _new_modes.items():
+                                if _md == get_dividend_mode(_div_prefs, _acc, _tkp):
+                                    continue
+                                _ok_s, _err_s = save_dividend_pref(puid, _acc, _tkp, _md)
+                                if _ok_s:
+                                    _saved += 1
+                                else:
+                                    _failed.append(f"{_tkp}: {_err_s}")
+                            if _failed:
+                                st.error("저장 실패 — " + " · ".join(_failed))
+                            elif _saved:
+                                st.success(f"{_saved}개 종목의 배당 설정을 저장했습니다.")
+                                st.session_state["_div_force_rescan"] = True
+                                st.rerun()
+                            else:
+                                st.info("변경된 설정이 없습니다.")
+
+                # ── 처리 이력 ─────────────────────────────────────────────
+                try:
+                    _div_log = load_dividend_log(puid)
+                except Exception:
+                    _div_log = pd.DataFrame()
+                if _div_log is not None and not _div_log.empty:
+                    st.markdown("#### 📒 배당 처리 이력")
+                    _dl = _div_log.copy().sort_values("Ex_Date", ascending=False)
+                    _dl["처리"] = _dl["Action"].map(
+                        {"drip": "🔁 재투자", "cash": "💵 현금", "skip": "🚫 미보유"}
+                    ).fillna(_dl["Action"])
+                    _disp_dl = _dl.rename(columns={
+                        "Account": "계좌", "Ticker": "티커", "Ex_Date": "배당락",
+                        "Pay_Date": "지급일", "Per_Share": "주당", "Shares_Held": "보유수량",
+                        "Gross_Amount": "배당총액", "Reinvest_Price": "재투자가",
+                        "Reinvest_Shares": "추가수량",
+                    })[["배당락", "계좌", "티커", "처리", "주당", "보유수량",
+                        "배당총액", "재투자가", "추가수량"]]
+                    st.dataframe(
+                        _disp_dl.style.format({
+                            "주당": "${:,.4f}", "보유수량": "{:,.4f}",
+                            "배당총액": "${:,.2f}", "재투자가": "${:,.4f}",
+                            "추가수량": "{:,.4f}",
+                        }, na_rep="—"),
+                        use_container_width=True, hide_index=True,
+                    )
+                    _tot_div = float(pd.to_numeric(_dl.loc[_dl["Action"].isin(["drip", "cash"]),
+                                                           "Gross_Amount"],
+                                                   errors="coerce").sum() or 0.0)
+                    st.caption(_esc_md(f"누적 수령 배당(기록 기준): **${_tot_div:,.2f}**"))
 
         st.markdown("### 보유 계좌별 요약 · 📡 레짐 기반 청산 신호")
         st.caption(f"시트에서 **ID = `{puid or '—'}`** 인 행만 표시합니다. 종목별 청산 신호는 "
