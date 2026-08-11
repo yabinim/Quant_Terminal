@@ -1,0 +1,31 @@
+name: 🔍 진단 — 워치리스트 지표 파이프라인 (수동 전용)
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/repository_dispatch 트리거 없음.
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # numpy/pandas 만 필요. 네트워크·시트·Streamlit 접근 없음.
+      - name: 📦 의존성
+        run: pip install numpy pandas
+
+      - name: 🔍 지표 왕복·신선도·SSOT 일치 + 뮤테이션
+        run: python automation/diag_watchlist_metrics.py
+
+      - name: 🔍 워치리스트 쓰기 경로 드리프트 가드
+        run: python automation/diag_watchlist_writepath.py
+
+      - name: ✅ Python 3.11 f-string 호환성
+        run: python check_py311.py app.py run_watchlist_alerts.py watchlist_metrics_core.py
