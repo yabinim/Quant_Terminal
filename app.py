@@ -39,7 +39,7 @@ import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화�
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
 import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 자동화와 동일 모듈
 import earnings_core as ec
-import watchlist_metrics_core as wm  # 실적 이벤트 리스크 SSOT — 자동화(run_earnings_watch)와 동일 모듈
+import watchlist_metrics_core as wm  # 워치리스트 표시 지표 SSOT — 자동화(run_watchlist_alerts)와 동일 모듈
 
 # ── 1.6 AI 종목 스캐너 SSOT (scanner_core) ───────────────────────────────────
 # 3버킷 스코어링·프롬프트·상수·표시 포맷·70점 판정은 전부 scanner_core 에만 존재한다.
@@ -56,7 +56,8 @@ _SSOT_REQUIRED = "2026-08-06a"
 _ssot_bad = [
     (_n, getattr(_m, "SSOT_VERSION", None))
     for _n, _m in (("scanner_core", sc), ("narrative_core", narrative_core),
-                   ("users_core", uc), ("fmp_extras", fx), ("portfolio_core", pc))
+                   ("users_core", uc), ("fmp_extras", fx), ("portfolio_core", pc),
+                   ("watchlist_metrics_core", wm))
     if getattr(_m, "SSOT_VERSION", None) != _SSOT_REQUIRED
 ]
 if _ssot_bad:
