@@ -429,6 +429,71 @@ def _install_fmp_instrumentation() -> None:
 _install_fmp_instrumentation()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 구간 타이밍 계측 — "느리다"를 추측이 아니라 숫자로 가른다
+#
+#   Sheets·FMP 호출 수만으로는 부족하다. 둘 다 0인데 느리면 남은 건 CPU 아니면
+#   렌더링인데 그걸 구분할 수단이 없어 진단이 추측으로 흘렀다.
+#   with _timed("구간명"): 으로 감싸면 소요 시간이 누적된다.
+#
+#   ⚠️ 세션 단위(session_state)로 센다. 워커 스레드 안에서는 쓰지 않는다 —
+#      스레드에서 st.session_state 접근은 실패한다. 병렬 구간은 바깥에서 감쌀 것.
+# ══════════════════════════════════════════════════════════════════════════════
+_PERF_KEY = "_perf_spans"
+
+
+def _perf_bucket() -> dict:
+    try:
+        b = st.session_state.get(_PERF_KEY)
+        if not isinstance(b, dict):
+            b = {}
+            st.session_state[_PERF_KEY] = b
+        return b
+    except Exception:
+        return {}
+
+
+class _timed:
+    """구간 소요 시간을 누적하는 컨텍스트 매니저. 계측 실패는 절대 전파하지 않는다."""
+
+    __slots__ = ("label", "_t0", "_note")
+
+    def __init__(self, label: str, note: str = ""):
+        self.label = str(label)
+        self._note = str(note or "")
+        self._t0 = 0.0
+
+    def __enter__(self):
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            _dt = time.perf_counter() - self._t0
+            _b = _perf_bucket()
+            _e = _b.get(self.label)
+            if not isinstance(_e, dict):
+                _e = {"n": 0, "sec": 0.0, "note": ""}
+                _b[self.label] = _e
+            _e["n"] += 1
+            _e["sec"] += _dt
+            if self._note:
+                _e["note"] = self._note
+        except Exception:
+            pass
+        return False   # 예외를 삼키지 않는다
+
+
+def _perf_note(label: str, note: str) -> None:
+    """이미 기록된 구간에 부가 설명(캐시 히트 수 등)을 남긴다."""
+    try:
+        _e = _perf_bucket().get(label)
+        if isinstance(_e, dict):
+            _e["note"] = str(note)
+    except Exception:
+        pass
+
+
 @st.cache_resource(ttl=600, show_spinner=False)
 def _open_quant_db():
     """Quant_DB 스프레드시트 핸들 (10분 캐시). 실패 시 None.
@@ -15062,10 +15127,29 @@ if st.session_state.get("logged_in"):
 
             if st.button("계측 초기화", key="gs_stats_reset", use_container_width=True):
                 st.session_state[_GS_STATS_KEY] = {"n": 0, "sec": 0.0}
+                st.session_state[_PERF_KEY] = {}
                 with _FMP_STATS_LOCK:
                     _FMP_STATS["n"] = 0
                     _FMP_STATS["sec"] = 0.0
                 st.rerun()
+
+            # ── 구간별 소요 시간 ──────────────────────────────────────────
+            #   호출 수가 0인데 느릴 때 CPU/렌더 구간을 가려낸다.
+            _spans = _perf_bucket()
+            if _spans:
+                st.caption("**구간별 소요** (느린 순)")
+                _rows = sorted(_spans.items(), key=lambda kv: -float(kv[1].get("sec", 0)))
+                _tot = sum(float(v.get("sec", 0)) for _, v in _rows)
+                for _lbl, _v in _rows[:8]:
+                    _sec = float(_v.get("sec", 0))
+                    _n = int(_v.get("n", 0))
+                    _nt = str(_v.get("note", "") or "")
+                    st.markdown(
+                        f"- **{_lbl}** — {_sec:.2f}초"
+                        + (f" ×{_n}" if _n > 1 else "")
+                        + (f" · {_nt}" if _nt else "")
+                    )
+                st.caption(f"합계 {_tot:.2f}초 (계측된 구간만)")
 
             st.caption(
                 "측정 방법: 초기화 → 대상 동작 1회 실행 → 증가분 확인.\n\n"
@@ -18184,7 +18268,8 @@ if st.session_state.get("logged_in"):
         # ── 회사 기본 정보 ────────────────────────────────────────────────
         try:
             with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
-                co = fetch_company_overview(str(selected_ticker).strip().upper())
+                with _timed("정밀 회사정보"):
+                    co = fetch_company_overview(str(selected_ticker).strip().upper())
         except Exception as _co_err:
             co = {}
             st.warning(f"회사 기본정보 조회 실패: {_co_err}")
@@ -18305,7 +18390,8 @@ if st.session_state.get("logged_in"):
             label_visibility="collapsed",
         )
         with st.spinner(f"{selected_ticker} {selected_period} 차트 로딩 중..."):
-            period_hist = fetch_price_history_by_period(str(selected_ticker).strip().upper(), selected_period)
+            with _timed("정밀 차트 일봉"):
+                period_hist = fetch_price_history_by_period(str(selected_ticker).strip().upper(), selected_period)
 
         if period_hist is not None and not period_hist.empty and "Close" in period_hist.columns:
             close_p = pd.to_numeric(period_hist["Close"], errors="coerce").dropna()
@@ -18397,9 +18483,10 @@ if st.session_state.get("logged_in"):
                     st.dataframe(styled_top10, use_container_width=True, hide_index=True)
             else:
                 with st.spinner(f"{selected_ticker} 데이터 불러오는 중..."):
-                    kpi_df, _c_pass, _c_fail, _c_nodata, margin_context = cached_evaluate_kpis_snapshot(
-                        selected_ticker
-                    )
+                    with _timed("정밀 KPI 스냅샷"):
+                        kpi_df, _c_pass, _c_fail, _c_nodata, margin_context = cached_evaluate_kpis_snapshot(
+                            selected_ticker
+                        )
                 # 캐시된 카운트 무시 — kpi_df에서 직접 계산 (캐시 형식 불일치 방지)
                 _pp = kpi_df["Pass"].astype(str)
                 pass_count   = int((_pp.str.contains("Pass",  case=False) & ~_pp.str.contains("Fail", case=False)).sum())
@@ -23014,13 +23101,15 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             st.warning("복구할 가격 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
 
             with st.spinner("실시간 가격 및 지표 계산 중..."):
-                price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
+                with _timed("WL 현재가"):
+                    price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
                 rsi_map_wl, ma200_map_wl, regime_map_wl = {}, {}, {}
                 atr_map_wl, high_map_wl = {}, {}   # #2 사이징용 ATR·최근고점
                 hist_map_wl, wl_dec_key = {}, {}   # 결정 카드/정렬용
                 # RS(상대강도) 계산용 SPY 종가 — 1회만 조회
                 try:
-                    _spy_hist_wl = _fmp_price_history("SPY", limit=252)
+                    with _timed("WL SPY 일봉"):
+                        _spy_hist_wl = _fmp_price_history("SPY", limit=252)
                     _spy_close_wl = (
                         _spy_hist_wl["Close"]
                         if (_spy_hist_wl is not None and not _spy_hist_wl.empty and "Close" in _spy_hist_wl.columns)
@@ -23033,7 +23122,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 #   레짐/타이밍/RSI/MA200/ATR 은 일봉 파생이라 장중에 거의 변하지 않는다.
                 #   빠르게 변하는 현재가는 위 price_map_wl 이 실시간으로 담당한다.
                 #   낡았거나(직전 완료 세션 이전) 시트에 없는 종목만 실시간 계산한다.
-                _wl_metrics = load_watchlist_metrics()
+                with _timed("WL 지표시트 로드"):
+                    _wl_metrics = load_watchlist_metrics()
                 _wl_ref_date = wm.last_completed_session(
                     _spy_hist_wl, datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d"))
                 _wl_live, _wl_cached_n = [], 0
@@ -23054,7 +23144,10 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 #    요구하기 때문인데, 카드는 expander 를 펼친 종목에서만 그려진다.
                 #    저장본이 있는 종목의 일봉은 카드를 펼칠 때 그 자리에서 받으면 된다
                 #    (_fmp_price_history 는 프로세스 캐시라 두 번째부터 즉시 반환).
-                _hist_pre = _wl_prefetch_histories(tuple(_wl_live)) if _wl_live else {}
+                with _timed("WL 일봉 프리페치") as _tp:
+                    _hist_pre = _wl_prefetch_histories(tuple(_wl_live)) if _wl_live else {}
+                _perf_note("WL 일봉 프리페치", f"{len(_wl_live)}종목")
+                _t_loop = time.perf_counter()
                 for tk in wl_tickers:
                     try:
                         hist = _hist_pre.get(tk)
@@ -23079,6 +23172,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         high_map_wl[tk] = np.nan
                         hist_map_wl[tk] = None
                         wl_dec_key[tk] = "na"
+                try:
+                    _b = _perf_bucket()
+                    _b["WL 지표 조립"] = {
+                        "n": 1, "sec": time.perf_counter() - _t_loop,
+                        "note": f"저장본 {_wl_cached_n} / 폴백계산 {len(_wl_live)}",
+                    }
+                except Exception:
+                    pass
 
             # 지표 출처 표시 — 어떤 봉 기준의 판정인지 항상 보이게 한다
             _wms = st.session_state.get("_wl_metrics_stat") or {}
