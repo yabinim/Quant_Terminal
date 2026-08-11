@@ -922,7 +922,8 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
     return hits_by_user
 
 
-def persist_watchlist_metrics(spy_close, hist_cache, today_et: str) -> int:
+def persist_watchlist_metrics(spy_close, hist_cache, today_et: str,
+                              completed_only: bool = False) -> int:
     """워치리스트 표시용 지표를 Watchlist_Metrics 시트에 저장한다. → 저장 종목 수
 
     앱이 리런마다 55종목 × analyze_ticker 를 돌리느라 10초씩 걸리던 계산을 여기로
@@ -957,7 +958,12 @@ def persist_watchlist_metrics(spy_close, hist_cache, today_et: str) -> int:
             try:
                 if tk not in hist_cache:
                     hist_cache[tk] = _fmp_price_history(tk)
-                m = wm.compute_metrics(tk, hist_cache[tk], spy_close=spy_close,
+                _h = hist_cache[tk]
+                if completed_only:
+                    # 백필 모드: 당일 미완성 봉을 잘라 확정 봉 기준으로 고정한다.
+                    # hist_cache 에는 되쓰지 않는다(다른 평가 경로가 원본을 쓰도록).
+                    _h = wm.completed_bars_only(_h, today_et)
+                m = wm.compute_metrics(tk, _h, spy_close=spy_close,
                                        updated_at=_now)
                 if m is None:
                     continue
@@ -998,19 +1004,44 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["eod", "intraday"], default="eod",
                         help="eod=마감 후 확정(기본) / intraday=장중 잠정 헤드업")
-    parser.add_argument("--scope", choices=["watchlist", "portfolio", "both"], default="both",
-                        help="평가 대상 (기본 both)")
+    parser.add_argument("--scope",
+                        choices=["watchlist", "portfolio", "both", "metrics"], default="both",
+                        help="평가 대상 (기본 both). metrics=지표 백필 전용 "
+                             "(알림·이메일·상태머신 없음, 휴장일에도 동작)")
     args = parser.parse_args()
 
     print("=" * 60)
     print(f"[START] 알림 ({args.mode}/{args.scope}): "
           f"{datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
 
+    today = datetime.now(_ET).strftime("%Y-%m-%d")
+
+    # ── 지표 백필 (--scope metrics) ────────────────────────────────────────
+    #   Watchlist_Metrics 만 다시 쓴다. 평가·이메일·알림 상태머신을 전부 건너뛰므로
+    #   2일 확정 카운터가 진행되지 않고 오발송도 없다.
+    #   휴장일 가드도 우회한다 — 시트 복구는 언제든 가능해야 한다.
+    #   확정 봉 기준이라 실행 시각과 무관하게 결과가 결정적이다.
+    if args.scope == "metrics":
+        print("[MODE] 지표 백필 — 확정 봉 기준 · 알림/이메일 없음 · 상태머신 미진행")
+        try:
+            _spy = wm.completed_bars_only(_fmp_price_history("SPY"), today)
+            _spy_c = (_spy["Close"]
+                      if (_spy is not None and not _spy.empty and "Close" in _spy.columns)
+                      else None)
+            if _spy_c is None:
+                print("[WARN] SPY 일봉 없음 — RS 없이 진행합니다.")
+            n = persist_watchlist_metrics(_spy_c, {}, today, completed_only=True)
+            print(f"[DONE] 백필 {n}종목 — {datetime.now(_KST).strftime('%H:%M KST')}")
+        except Exception as e:
+            print(f"[ERROR] 백필 실패: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+        return
+
     if not is_market_open_today():
         print("[SKIP] 오늘은 NYSE 휴장일 — 평가 건너뜀(카운터 미진행).")
         return
 
-    today = datetime.now(_ET).strftime("%Y-%m-%d")
     do_wl = args.scope in ("watchlist", "both")
     do_pf = args.scope in ("portfolio", "both")
 

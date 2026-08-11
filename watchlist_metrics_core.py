@@ -259,6 +259,37 @@ def from_row(r: list) -> dict | None:
         return None
 
 
+def completed_bars_only(hist, today_et_str: str):
+    """오늘(ET) 봉을 제외한 확정 봉만 남긴다.
+
+    FMP EOD 일봉은 장중에 당일 미완성 봉을 포함한다. 백필은 아무 때나 돌 수 있어야
+    하므로, 저장되는 지표를 항상 '확정된 마지막 세션' 기준으로 고정한다.
+    이렇게 하면 실행 시각과 무관하게 결과가 결정적이고, is_fresh 의 기준
+    (last_completed_session)과도 정확히 맞는다.
+
+    ⚠️ 정기 EOD 실행(마감 후)에는 쓰지 않는다. 그때는 당일 봉이 이미 확정이라
+       자르면 하루 낡은 값을 저장하게 된다.
+    ⚠️ 자를 봉이 하나도 안 남으면 원본을 그대로 돌려준다(비정상 데이터 방어).
+    """
+    try:
+        if hist is None or getattr(hist, "empty", True):
+            return hist
+        _t = str(today_et_str or "").strip()[:10]
+        if not _t:
+            return hist
+        mask = [
+            (i.strftime("%Y-%m-%d") if hasattr(i, "strftime") else str(i)[:10]) < _t
+            for i in hist.index
+        ]
+        if not any(mask):
+            return hist
+        if all(mask):
+            return hist
+        return hist[pd.Series(mask, index=hist.index)]
+    except Exception:
+        return hist
+
+
 def last_completed_session(hist, today_et_str: str) -> str:
     """오늘(ET)보다 앞선 마지막 봉 날짜 = 최근 '완료된' 세션.
 
