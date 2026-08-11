@@ -38,7 +38,8 @@ import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_n
 import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화와 동일 모듈
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
 import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 자동화와 동일 모듈
-import earnings_core as ec  # 실적 이벤트 리스크 SSOT — 자동화(run_earnings_watch)와 동일 모듈
+import earnings_core as ec
+import watchlist_metrics_core as wm  # 실적 이벤트 리스크 SSOT — 자동화(run_earnings_watch)와 동일 모듈
 
 # ── 1.6 AI 종목 스캐너 SSOT (scanner_core) ───────────────────────────────────
 # 3버킷 스코어링·프롬프트·상수·표시 포맷·70점 판정은 전부 scanner_core 에만 존재한다.
@@ -11412,6 +11413,37 @@ def _wl_session_remove(user_id: str, ticker: str) -> None:
                     if str(it.get("ticker", "")).strip().upper() != tk]
     except Exception:
         store.pop(k, None)
+
+
+def open_watchlist_metrics_worksheet():
+    """Watchlist_Metrics 탭. 없으면 None (자동화가 아직 안 돈 상태 — 폴백으로 처리)."""
+    if get_gspread_client() is None:
+        return None
+    return _ws_handle(wm.SHEET_TITLE)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_watchlist_metrics() -> dict:
+    """Watchlist_Metrics 시트 → {TICKER: metrics dict}. 5분 캐시.
+
+    티커 단위 공용 데이터라 user_id 를 키에 넣지 않는다(개인 데이터 없음).
+    시트가 없거나 읽기에 실패하면 빈 dict — 호출부가 전부 실시간 계산으로 떨어진다.
+    """
+    try:
+        ws = open_watchlist_metrics_worksheet()
+        if ws is None:
+            return {}
+        vals = ws.get_all_values() or []
+        if len(vals) < 2:
+            return {}
+        out = {}
+        for r in vals[1:]:
+            m = wm.from_row(r)
+            if m:
+                out[m["ticker"]] = m
+        return out
+    except Exception:
+        return {}
 
 
 def _wl_prefetch_histories(tickers: tuple, limit: int = 252) -> dict:
@@ -22968,25 +23000,46 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         else None
                     )
                 except Exception:
-                    _spy_close_wl = None
+                    _spy_hist_wl, _spy_close_wl = None, None
+
+                # ── 지표는 자동화가 미리 계산해 둔 Watchlist_Metrics 를 먼저 쓴다 ──
+                #   레짐/타이밍/RSI/MA200/ATR 은 일봉 파생이라 장중에 거의 변하지 않는다.
+                #   빠르게 변하는 현재가는 위 price_map_wl 이 실시간으로 담당한다.
+                #   낡았거나(직전 완료 세션 이전) 시트에 없는 종목만 실시간 계산한다.
+                _wl_metrics = load_watchlist_metrics()
+                _wl_ref_date = wm.last_completed_session(
+                    _spy_hist_wl, datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d"))
+                _wl_live, _wl_cached_n = [], 0
+                for tk in wl_tickers:
+                    if wm.is_fresh(_wl_metrics.get(tk), _wl_ref_date):
+                        _wl_cached_n += 1
+                    else:
+                        _wl_live.append(tk)
+                st.session_state["_wl_metrics_stat"] = {
+                    "cached": _wl_cached_n, "live": len(_wl_live),
+                    "ref": _wl_ref_date,
+                    "updated": (next((m.get("updated_at") for m in _wl_metrics.values()
+                                      if m.get("updated_at")), "") if _wl_metrics else ""),
+                }
+
+                # 일봉은 어차피 매수 카드(build_buy_card)에 필요하므로 병렬로 한 번에 받는다
+                _hist_pre = _wl_prefetch_histories(tuple(wl_tickers))
                 for tk in wl_tickers:
                     try:
-                        hist = _fmp_price_history(tk, limit=252)
-                        close = pd.to_numeric(hist["Close"], errors="coerce").dropna() if not hist.empty else pd.Series(dtype=float)
-                        rsi_series = calculate_rsi(close).dropna()
-                        rsi_map_wl[tk] = float(rsi_series.iloc[-1]) if not rsi_series.empty else np.nan
-                        ma200_map_wl[tk] = float(close.rolling(200, min_periods=200).mean().iloc[-1]) if len(close) >= 200 else np.nan
-                        # 레짐/타이밍 — 개별종목 탭과 동일한 regime_core 엔진(SSOT)
-                        regime_map_wl[tk] = rc.analyze_ticker(hist, spy_close=_spy_close_wl)
-                        atr_map_wl[tk] = rc.compute_atr(hist) if not hist.empty else np.nan
-                        _hi_wl = (pd.to_numeric(hist["High"], errors="coerce")
-                                  if "High" in hist.columns else close)
-                        high_map_wl[tk] = float(_hi_wl.dropna().tail(120).max()) if not _hi_wl.dropna().empty else np.nan
+                        hist = _hist_pre.get(tk)
                         hist_map_wl[tk] = hist
-                        _amwl = regime_map_wl[tk]
-                        wl_dec_key[tk] = (rc.buy_decision(_amwl["timing"].get("code"), None,
-                                                          _amwl["regime"].get("regime"))["key"]
-                                          if _amwl else "na")
+                        _m = _wl_metrics.get(tk)
+                        if tk in _wl_live:
+                            # 폴백: 이 종목만 실시간 계산 (SSOT 는 동일 함수)
+                            _m = wm.compute_metrics(tk, hist, spy_close=_spy_close_wl)
+                        if not _m:
+                            raise ValueError("metrics unavailable")
+                        rsi_map_wl[tk] = _m["rsi"]
+                        ma200_map_wl[tk] = _m["ma200"]
+                        atr_map_wl[tk] = _m["atr"]
+                        high_map_wl[tk] = _m["high_120"]
+                        regime_map_wl[tk] = _m["analysis"]
+                        wl_dec_key[tk] = _m.get("dec_key", "na")
                     except Exception:
                         rsi_map_wl[tk] = np.nan
                         ma200_map_wl[tk] = np.nan
@@ -22995,6 +23048,22 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         high_map_wl[tk] = np.nan
                         hist_map_wl[tk] = None
                         wl_dec_key[tk] = "na"
+
+            # 지표 출처 표시 — 어떤 봉 기준의 판정인지 항상 보이게 한다
+            _wms = st.session_state.get("_wl_metrics_stat") or {}
+            if _wms.get("cached"):
+                st.caption(
+                    f"📊 지표 기준일 **{_wms.get('ref') or '?'}** (종가 확정분) · "
+                    f"저장본 {_wms['cached']}종목"
+                    + (f" · 실시간 계산 {_wms['live']}종목" if _wms.get("live") else "")
+                    + (f" · 자동 갱신 {_wms['updated']}" if _wms.get("updated") else "")
+                    + " — 현재가·수익률은 실시간입니다."
+                )
+            elif wl_tickers:
+                st.caption(
+                    "📊 지표를 실시간 계산했습니다 — 자동화(마감 후)가 한 번 돌면 "
+                    "다음부터 즉시 표시됩니다."
+                )
 
             # ── 포지션 플랜 입력 (사이징·R:R) — 개별종목 탭과 세션 공유 (#2) ──
             _wl_acct = str(st.session_state.get("_active_account") or "").strip()
