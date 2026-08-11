@@ -235,6 +235,12 @@ _ETF_AUTO_UPDATE_INTERVAL_DAYS = 7  # 자동 업데이트 주기
 _WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added", "Stop_Loss", "Target_Price", "Alert_States", "Alert_LastState", "Account"]
 _WL_NCOL = len(_WATCHLIST_SHEET_COLS)  # =13. 과거 8/10/12열 시트는 읽을 때 빈 칸으로 패딩되어 자동 마이그레이션됨.
 _WL_COL_ACCOUNT = 12  # 0-index
+# 앱에서 제자리 수정이 허용되는 컬럼(0-index). 화이트리스트라 여기 없는 열은
+# update_watchlist_row 가 절대 건드리지 않는다.
+#   제외 0=ID, 1=Ticker  → 행을 찾는 식별자. 바뀌면 다른 레코드가 된다.
+#   제외 11=Alert_LastState → 자동화(run_watchlist_alerts)가 L열에 쓰는 소유 영역.
+#          앱이 덮으면 깜빡임 방지 상태가 초기화된다(구 삭제+재추가 방식의 부작용).
+_WL_EDITABLE_COL_IDX = (2, 3, 4, 5, 6, 7, 8, 9, 10, 12)
 # 상태 기반 알림 이벤트 코드 (Alert_States 콤마 플래그). 기본 ON = entry + risk.
 _WL_ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price", "watch")
 _WL_ALERT_DEFAULT = "entry,risk,watch"
@@ -290,6 +296,137 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Google Sheets 접근 최적화 — 스프레드시트/탭 핸들 캐시 + HTTP 호출 계측
+#
+#   [문제] gc.open(제목)은 Drive files.list 검색 + Sheets 메타데이터 조회로 매번
+#          2왕복이 나가고, 이어지는 sh.worksheet(탭명) / sh.worksheets() 가 또
+#          메타데이터를 재조회한다. open_*_worksheet 17개 함수가 시트를 건드릴
+#          때마다 이 3왕복을 반복해 왔다.
+#   [해결] 핸들을 @st.cache_resource 로 재사용한다. 핸들은 사용자와 무관한
+#          (스프레드시트 ID, 탭 ID) 참조라 전 세션 공유가 안전하다.
+#   [주의] 탭 생성·삭제 후에는 반드시 _invalidate_ws_handles() 를 호출한다.
+#          없는 탭에 대해 None 이 캐시되면 생성 직후에도 계속 None 이 나온다.
+# ══════════════════════════════════════════════════════════════════════════════
+_GS_STATS_KEY = "_gs_call_stats"
+
+# gspread 6.x 는 http_client.HTTPClient.request, 5.x 는 client.Client.request 가
+# 유일한 HTTP 진입점이다. 여기 하나만 감싸면 왕복 1회 = 카운트 1회로 정확히 맞는다.
+# (Worksheet.get_all_values → get_values → get 처럼 상위 메서드를 감싸면 중복 집계됨)
+_GS_HTTP_TARGETS = (
+    ("gspread.http_client", "HTTPClient", "request"),
+    ("gspread.client", "Client", "request"),
+)
+
+
+def _gs_stats_bucket() -> dict:
+    """세션 단위 누적 통계 버킷. session_state 접근 실패 시 더미를 돌려준다."""
+    try:
+        b = st.session_state.get(_GS_STATS_KEY)
+        if not isinstance(b, dict):
+            b = {"n": 0, "sec": 0.0}
+            st.session_state[_GS_STATS_KEY] = b
+        return b
+    except Exception:
+        return {"n": 0, "sec": 0.0}
+
+
+def _make_gs_counter(fn):
+    """HTTP 요청 1건마다 횟수·소요시간을 누적하는 래퍼. 계측 실패는 절대 전파하지 않는다."""
+    def _wrapped(*args, **kwargs):
+        _t0 = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            try:
+                _b = _gs_stats_bucket()
+                _b["n"] = int(_b.get("n", 0)) + 1
+                _b["sec"] = float(_b.get("sec", 0.0)) + (time.perf_counter() - _t0)
+            except Exception:
+                pass
+    _wrapped._qt_wrapped = True
+    _wrapped.__name__ = getattr(fn, "__name__", "request")
+    _wrapped.__doc__ = getattr(fn, "__doc__", None)
+    return _wrapped
+
+
+def _install_gs_instrumentation() -> None:
+    """gspread HTTP 진입점을 1회 래핑(멱등). 클래스 속성이라 프로세스당 한 번만 적용된다."""
+    import importlib
+    for _mod_name, _cls_name, _meth in _GS_HTTP_TARGETS:
+        try:
+            _mod = importlib.import_module(_mod_name)
+        except Exception:
+            continue
+        _cls = getattr(_mod, _cls_name, None)
+        if _cls is None:
+            continue
+        _fn = getattr(_cls, _meth, None)
+        if _fn is None or getattr(_fn, "_qt_wrapped", False):
+            continue
+        try:
+            setattr(_cls, _meth, _make_gs_counter(_fn))
+        except Exception:
+            pass
+
+
+_install_gs_instrumentation()
+
+
+@st.cache_resource(ttl=600, show_spinner=False)
+def _open_quant_db():
+    """Quant_DB 스프레드시트 핸들 (10분 캐시). 실패 시 None.
+
+    ttl=600 은 안전장치다. 자동화가 탭을 추가·삭제하거나 그리드를 늘려도
+    최대 10분 안에 핸들이 자연 갱신된다.
+    """
+    gc = get_gspread_client()
+    if gc is None:
+        return None
+    try:
+        return gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+    except Exception:
+        return None
+
+
+@st.cache_resource(ttl=600, show_spinner=False)
+def _ws_handle(sheet_title: str):
+    """탭 핸들 (10분 캐시). 탭이 없으면 None — 생성 책임은 호출부(open_*_worksheet)에 있다."""
+    sh = _open_quant_db()
+    if sh is None:
+        return None
+    try:
+        return sh.worksheet(str(sheet_title))
+    except Exception:
+        return None
+
+
+def _ws_handle_required(sheet_title: str):
+    """탭 핸들을 반환하되 없으면 예외를 던진다.
+
+    ⚠️ 예외 메시지에 반드시 'not found' 를 포함시킨다. 기존 호출부(narratives /
+       portfolios / trade_history)가 `str(exc).lower()` 에 'not found' 가 있는지로
+       '탭 생성' 분기를 타기 때문이다. 문구를 바꾸면 탭 자동 생성이 조용히 죽는다.
+    """
+    ws = _ws_handle(sheet_title)
+    if ws is None:
+        raise gspread.exceptions.WorksheetNotFound(
+            f"Worksheet '{sheet_title}' not found")
+    return ws
+
+
+def _invalidate_ws_handles() -> None:
+    """탭 생성·삭제·그리드 확장 직후 호출. 핸들 메타데이터 stale 을 막는다."""
+    try:
+        _ws_handle.clear()
+    except Exception:
+        pass
+    try:
+        _open_quant_db.clear()
+    except Exception:
+        pass
+
+
 def _safe_append_rows(ws, rows, value_input_option: str = "USER_ENTERED") -> None:
     """gspread append_row/append_rows의 '계단식 드리프트' 버그를 회피하는 안전한 행 추가.
 
@@ -338,8 +475,7 @@ def open_users_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_USERS_WORKSHEET_TITLE)
+        ws = _ws_handle_required(_USERS_WORKSHEET_TITLE)
         return ws, None
     except Exception as exc:
         return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_USERS_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
@@ -351,16 +487,16 @@ def open_narratives_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_NARRATIVES_WORKSHEET_TITLE)
+        ws = _ws_handle_required(_NARRATIVES_WORKSHEET_TITLE)
         return ws, None
     except Exception as exc:
         msg = str(exc).lower()
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                sh = _open_quant_db()
                 ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET_TITLE, rows=3000, cols=7)
                 ensure_narratives_header_row(ws)
+                _invalidate_ws_handles()
                 return ws, None
             except Exception as exc2:
                 return None, f"`{_NARRATIVES_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
@@ -373,16 +509,16 @@ def open_portfolios_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_PORTFOLIOS_WORKSHEET_TITLE)
+        ws = _ws_handle_required(_PORTFOLIOS_WORKSHEET_TITLE)
         return ws, None
     except Exception as exc:
         msg = str(exc).lower()
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                sh = _open_quant_db()
                 ws = sh.add_worksheet(title=_PORTFOLIOS_WORKSHEET_TITLE, rows=3000, cols=6)
                 ensure_portfolios_header_row(ws)
+                _invalidate_ws_handles()
                 return ws, None
             except Exception as exc2:
                 return None, f"`{_PORTFOLIOS_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
@@ -395,12 +531,13 @@ def open_thesis_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing_titles = [ws.title for ws in sh.worksheets()]
-        if _THESIS_WORKSHEET_TITLE in existing_titles:
-            return sh.worksheet(_THESIS_WORKSHEET_TITLE), None
+        _ws_c = _ws_handle(_THESIS_WORKSHEET_TITLE)
+        if _ws_c is not None:
+            return _ws_c, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_THESIS_WORKSHEET_TITLE, rows=3000, cols=7)
         ws.update([_THESIS_SHEET_COLS], range_name="A1:G1", value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Thesis 워크시트 열기/생성 실패: {exc}"
@@ -412,11 +549,9 @@ def open_portfolio_alert_state_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing_titles = [w.title for w in sh.worksheets()]
         _last_col = chr(ord("A") + len(_PORTFOLIO_ALERT_STATE_COLS) - 1)
-        if _PORTFOLIO_ALERT_STATE_TITLE in existing_titles:
-            ws = sh.worksheet(_PORTFOLIO_ALERT_STATE_TITLE)
+        ws = _ws_handle(_PORTFOLIO_ALERT_STATE_TITLE)
+        if ws is not None:
             try:  # 스키마 확장(4→6칸) 시 헤더 자동 갱신 — 기존 행은 빈칸 패딩
                 if (ws.row_values(1) or []) != _PORTFOLIO_ALERT_STATE_COLS:
                     ws.update([_PORTFOLIO_ALERT_STATE_COLS], range_name=f"A1:{_last_col}1",
@@ -424,9 +559,11 @@ def open_portfolio_alert_state_worksheet():
             except Exception:
                 pass
             return ws, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_PORTFOLIO_ALERT_STATE_TITLE, rows=2000,
                               cols=len(_PORTFOLIO_ALERT_STATE_COLS))
         ws.update([_PORTFOLIO_ALERT_STATE_COLS], range_name=f"A1:{_last_col}1", value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Portfolio_Alert_State 워크시트 열기/생성 실패: {exc}"
@@ -914,15 +1051,15 @@ def open_account_profile_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        try:
-            ws = sh.worksheet(_ACCOUNT_PROFILE_WORKSHEET_TITLE)
-        except Exception:
+        ws = _ws_handle(_ACCOUNT_PROFILE_WORKSHEET_TITLE)
+        if ws is None:
+            sh = _open_quant_db()
             ws = sh.add_worksheet(title=_ACCOUNT_PROFILE_WORKSHEET_TITLE,
                                   rows=500, cols=len(_ACCOUNT_PROFILE_SHEET_COLS))
             ws.update([_ACCOUNT_PROFILE_SHEET_COLS],
                       range_name=f"A1:{_ACCT_PROF_LAST_COL}1",
                       value_input_option="USER_ENTERED")
+            _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"`{_ACCOUNT_PROFILE_WORKSHEET_TITLE}` 워크시트를 열 수 없습니다: {exc}"
@@ -1033,11 +1170,16 @@ def open_earnings_events_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        sh = _open_quant_db()
+        if sh is None:
+            raise RuntimeError("스프레드시트 핸들을 얻지 못했습니다.")
     except Exception as exc:
         return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` 를 열 수 없습니다: {exc}"
     try:
-        return sh.worksheet(ec.EVENTS_WORKSHEET), None
+        _ws_c = _ws_handle(ec.EVENTS_WORKSHEET)
+        if _ws_c is None:
+            raise RuntimeError("worksheet not found")
+        return _ws_c, None
     except Exception:
         pass
     try:
@@ -1046,6 +1188,7 @@ def open_earnings_events_worksheet():
         _end = gspread.utils.rowcol_to_a1(1, ec.EVENTS_NCOL)
         ws.update([ec.EVENTS_COLS], range_name=f"A1:{_end}",
                   value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Earnings_Events 워크시트를 만들 수 없습니다: {exc}"
@@ -1057,11 +1200,15 @@ def open_earnings_calendar_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        sh = _open_quant_db()
+        if sh is None:
+            raise RuntimeError("스프레드시트 핸들을 얻지 못했습니다.")
     except Exception as exc:
         return None, f"스프레드시트를 열 수 없습니다: {exc}"
     try:
-        _w = sh.worksheet(ec.CALENDAR_WORKSHEET)
+        _w = _ws_handle(ec.CALENDAR_WORKSHEET)
+        if _w is None:
+            raise RuntimeError("worksheet not found")
         # 스키마가 넓어졌으면 그리드 확장 (Users 시트에서 겪은 grid limits 방지)
         try:
             if int(getattr(_w, "col_count", 0) or 0) < ec.CALENDAR_NCOL:
@@ -1069,6 +1216,7 @@ def open_earnings_calendar_worksheet():
                 _w.update([ec.CALENDAR_COLS],
                           range_name=f"A1:{gspread.utils.rowcol_to_a1(1, ec.CALENDAR_NCOL)}",
                           value_input_option="USER_ENTERED")
+                _invalidate_ws_handles()
         except Exception:
             pass
         return _w, None
@@ -1080,6 +1228,7 @@ def open_earnings_calendar_worksheet():
         _end = gspread.utils.rowcol_to_a1(1, ec.CALENDAR_NCOL)
         ws.update([ec.CALENDAR_COLS], range_name=f"A1:{_end}",
                   value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Earnings_Calendar 워크시트를 만들 수 없습니다: {exc}"
@@ -3724,12 +3873,13 @@ def _open_rs_incubator_ws():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        titles = [ws.title for ws in sh.worksheets()]
-        if _RS_INCUBATOR_SHEET_TITLE in titles:
-            return sh.worksheet(_RS_INCUBATOR_SHEET_TITLE), None
+        _ws_c = _ws_handle(_RS_INCUBATOR_SHEET_TITLE)
+        if _ws_c is not None:
+            return _ws_c, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_RS_INCUBATOR_SHEET_TITLE, rows=1000, cols=3)
         ws.update([_RS_INCUBATOR_COLS], range_name="A1:C1", value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"RS_Incubator 워크시트 열기/생성 실패: {exc}"
@@ -5456,17 +5606,18 @@ def _open_drg_snapshot_ws():
     gc = get_gspread_client()
     if gc is None:
         return None
-    sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+    _ws_c = _ws_handle(_DRG_SNAPSHOT_WORKSHEET)
+    if _ws_c is not None:
+        return _ws_c
     try:
-        return sh.worksheet(_DRG_SNAPSHOT_WORKSHEET)
+        sh = _open_quant_db()
+        ws = sh.add_worksheet(title=_DRG_SNAPSHOT_WORKSHEET, rows=10, cols=3)
+        ws.update([["updated_at_et", "payload_json"]], range_name="A1:B1",
+                  value_input_option="RAW")
+        _invalidate_ws_handles()
+        return ws
     except Exception:
-        try:
-            ws = sh.add_worksheet(title=_DRG_SNAPSHOT_WORKSHEET, rows=10, cols=3)
-            ws.update([["updated_at_et", "payload_json"]], range_name="A1:B1",
-                      value_input_option="RAW")
-            return ws
-        except Exception:
-            return None
+        return None
 
 
 def _drg_save_snapshot(drg: dict) -> None:
@@ -7889,12 +8040,14 @@ def open_drg_predictions_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        sh = _open_quant_db()
+        if sh is None:
+            raise RuntimeError("스프레드시트 핸들을 얻지 못했습니다.")
     except Exception as exc:
         return None, f"스프레드시트 접근 실패: {exc}"
     # 탭 열기 시도 → 실패하면 무조건 생성
     try:
-        ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET_TITLE)
+        ws = _ws_handle_required(_DRG_PREDICTIONS_WORKSHEET_TITLE)
         return ws, None
     except Exception:
         pass
@@ -7904,6 +8057,7 @@ def open_drg_predictions_worksheet():
         ws.update([_DRG_PREDICTIONS_SHEET_COLS],
                   range_name=f"A1:{chr(64+ncols)}1",
                   value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc2:
         return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
@@ -8105,16 +8259,16 @@ def open_trade_history_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        ws = sh.worksheet(_TRADE_HISTORY_WORKSHEET_TITLE)
+        ws = _ws_handle_required(_TRADE_HISTORY_WORKSHEET_TITLE)
         return ws, None
     except Exception as exc:
         msg = str(exc).lower()
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
-                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+                sh = _open_quant_db()
                 ws = sh.add_worksheet(title=_TRADE_HISTORY_WORKSHEET_TITLE, rows=5000, cols=8)
                 ws.update([_TRADE_HISTORY_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+                _invalidate_ws_handles()
                 return ws, None
             except Exception as exc2:
                 return None, f"Trade_History 시트를 만들 수 없습니다: {exc2}"
@@ -8235,15 +8389,16 @@ def open_dividend_prefs_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
         last_col = chr(ord("A") + len(_DIVIDEND_PREFS_COLS) - 1)
-        titles = [w.title for w in sh.worksheets()]
-        if _DIVIDEND_PREFS_SHEET_TITLE in titles:
-            return sh.worksheet(_DIVIDEND_PREFS_SHEET_TITLE), None
+        _ws_c = _ws_handle(_DIVIDEND_PREFS_SHEET_TITLE)
+        if _ws_c is not None:
+            return _ws_c, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_DIVIDEND_PREFS_SHEET_TITLE, rows=1000,
                               cols=len(_DIVIDEND_PREFS_COLS))
         ws.update([_DIVIDEND_PREFS_COLS], range_name=f"A1:{last_col}1",
                   value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Dividend_Prefs 워크시트 열기/생성 실패: {exc}"
@@ -8343,15 +8498,16 @@ def open_dividend_log_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
         last_col = chr(ord("A") + len(_DIVIDEND_LOG_COLS) - 1)
-        titles = [w.title for w in sh.worksheets()]
-        if _DIVIDEND_LOG_SHEET_TITLE in titles:
-            return sh.worksheet(_DIVIDEND_LOG_SHEET_TITLE), None
+        _ws_c = _ws_handle(_DIVIDEND_LOG_SHEET_TITLE)
+        if _ws_c is not None:
+            return _ws_c, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_DIVIDEND_LOG_SHEET_TITLE, rows=3000,
                               cols=len(_DIVIDEND_LOG_COLS))
         ws.update([_DIVIDEND_LOG_COLS], range_name=f"A1:{last_col}1",
                   value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Dividend_Log 워크시트 열기/생성 실패: {exc}"
@@ -9824,12 +9980,13 @@ def open_early_signal_history_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing_titles = [ws.title for ws in sh.worksheets()]
-        if _EARLY_SIGNAL_HISTORY_SHEET_TITLE in existing_titles:
-            return sh.worksheet(_EARLY_SIGNAL_HISTORY_SHEET_TITLE), None
+        _ws_c = _ws_handle(_EARLY_SIGNAL_HISTORY_SHEET_TITLE)
+        if _ws_c is not None:
+            return _ws_c, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_EARLY_SIGNAL_HISTORY_SHEET_TITLE, rows=5000, cols=8)
         ws.update([_EARLY_SIGNAL_HISTORY_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"EarlySignal_History 워크시트 열기/생성 실패: {exc}"
@@ -9841,12 +9998,13 @@ def open_etf_universe_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing_titles = [ws.title for ws in sh.worksheets()]
-        if _ETF_UNIVERSE_SHEET_TITLE in existing_titles:
-            return sh.worksheet(_ETF_UNIVERSE_SHEET_TITLE), None
+        _ws_c = _ws_handle(_ETF_UNIVERSE_SHEET_TITLE)
+        if _ws_c is not None:
+            return _ws_c, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_ETF_UNIVERSE_SHEET_TITLE, rows=3000, cols=6)
         ws.update([_ETF_UNIVERSE_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"ETF_Universe 워크시트 열기/생성 실패: {exc}"
@@ -10188,13 +10346,12 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: st
     if gc is None:
         return False, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [ws.title for ws in sh.worksheets()]
-        if _SCANNER_HISTORY_SHEET_TITLE not in existing:
+        ws = _ws_handle(_SCANNER_HISTORY_SHEET_TITLE)
+        if ws is None:
+            sh = _open_quant_db()
             ws = sh.add_worksheet(title=_SCANNER_HISTORY_SHEET_TITLE, rows=5000, cols=9)
             ws.update([_SCANNER_HISTORY_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
-        else:
-            ws = sh.worksheet(_SCANNER_HISTORY_SHEET_TITLE)
+            _invalidate_ws_handles()
             # ── 헤더 마이그레이션: Engine 컬럼 없으면 자동 추가 ──────────
             cur_header = ws.row_values(1)
             if "Engine" not in cur_header:
@@ -10258,13 +10415,12 @@ def save_scanner_last_result(user_id: str, snap: dict, engine: str) -> tuple[boo
     if gc is None:
         return False, "Google 서비스 계정 미설정"
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [w.title for w in sh.worksheets()]
-        if _SCANNER_LAST_RESULT_SHEET_TITLE not in existing:
+        ws = _ws_handle(_SCANNER_LAST_RESULT_SHEET_TITLE)
+        if ws is None:
+            sh = _open_quant_db()
             ws = sh.add_worksheet(title=_SCANNER_LAST_RESULT_SHEET_TITLE, rows=100, cols=5)
             ws.update([_SCANNER_LAST_RESULT_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
-        else:
-            ws = sh.worksheet(_SCANNER_LAST_RESULT_SHEET_TITLE)
+            _invalidate_ws_handles()
 
         uid_u = str(user_id).strip().upper()
         engine_label = str(engine).strip()
@@ -10321,11 +10477,9 @@ def load_scanner_last_result(user_id: str, engine: str) -> dict | None:
     if gc is None:
         return None
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [w.title for w in sh.worksheets()]
-        if _SCANNER_LAST_RESULT_SHEET_TITLE not in existing:
+        ws = _ws_handle(_SCANNER_LAST_RESULT_SHEET_TITLE)
+        if ws is None:
             return None
-        ws = sh.worksheet(_SCANNER_LAST_RESULT_SHEET_TITLE)
         all_vals = ws.get_all_values()
         if not all_vals or len(all_vals) < 2:
             return None
@@ -10377,13 +10531,12 @@ def save_accuracy_tracker_last_result(user_id: str, snap: dict) -> tuple[bool, s
         result_df = snap.get("result_df")
         if not isinstance(result_df, pd.DataFrame) or result_df.empty:
             return False, "결과 데이터 없음"
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [w.title for w in sh.worksheets()]
-        if _ACCURACY_TRACKER_LAST_SHEET_TITLE not in existing:
+        ws = _ws_handle(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
+        if ws is None:
+            sh = _open_quant_db()
             ws = sh.add_worksheet(title=_ACCURACY_TRACKER_LAST_SHEET_TITLE, rows=100, cols=5)
             ws.update([_ACCURACY_TRACKER_LAST_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
-        else:
-            ws = sh.worksheet(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
+            _invalidate_ws_handles()
         uid_u = str(user_id).strip().upper()
         saved_at = snap.get("saved_at") or datetime.now(timezone.utc).isoformat()
         eval_horizon = str(snap.get("eval_horizon", ""))
@@ -10416,11 +10569,9 @@ def load_accuracy_tracker_last_result(user_id: str) -> dict | None:
     if gc is None:
         return None
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [w.title for w in sh.worksheets()]
-        if _ACCURACY_TRACKER_LAST_SHEET_TITLE not in existing:
+        ws = _ws_handle(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
+        if ws is None:
             return None
-        ws = sh.worksheet(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
         all_vals = ws.get_all_values()
         if not all_vals or len(all_vals) < 2:
             return None
@@ -10658,11 +10809,9 @@ def load_scanner_history(user_id: str, engine: str = "all") -> pd.DataFrame:
     if gc is None:
         return pd.DataFrame()
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [ws.title for ws in sh.worksheets()]
-        if _SCANNER_HISTORY_SHEET_TITLE not in existing:
+        ws = _ws_handle(_SCANNER_HISTORY_SHEET_TITLE)
+        if ws is None:
             return pd.DataFrame()
-        ws = sh.worksheet(_SCANNER_HISTORY_SHEET_TITLE)
         vals = ws.get_all_values()
         if not vals or len(vals) < 2:
             return pd.DataFrame()
@@ -10707,12 +10856,13 @@ def open_portfolio_history_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [ws.title for ws in sh.worksheets()]
-        if _PORTFOLIO_HISTORY_SHEET_TITLE in existing:
-            return sh.worksheet(_PORTFOLIO_HISTORY_SHEET_TITLE), None
+        _ws_c = _ws_handle(_PORTFOLIO_HISTORY_SHEET_TITLE)
+        if _ws_c is not None:
+            return _ws_c, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_PORTFOLIO_HISTORY_SHEET_TITLE, rows=5000, cols=8)
         ws.update([_PORTFOLIO_HISTORY_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Portfolio_History 워크시트 열기/생성 실패: {exc}"
@@ -10821,12 +10971,13 @@ def open_emerging_tracker_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        existing = [ws.title for ws in sh.worksheets()]
-        if _EMERGING_TRACKER_SHEET_TITLE in existing:
-            return sh.worksheet(_EMERGING_TRACKER_SHEET_TITLE), None
+        _ws_c = _ws_handle(_EMERGING_TRACKER_SHEET_TITLE)
+        if _ws_c is not None:
+            return _ws_c, None
+        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_EMERGING_TRACKER_SHEET_TITLE, rows=2000, cols=9)
         ws.update([_EMERGING_TRACKER_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Emerging_Tracker 워크시트 열기/생성 실패: {exc}"
@@ -11041,34 +11192,211 @@ def open_watchlist_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-        # 먼저 기존 탭 목록에서 찾기
-        existing_titles = [ws.title for ws in sh.worksheets()]
-        if _WATCHLIST_SHEET_TITLE in existing_titles:
-            ws = sh.worksheet(_WATCHLIST_SHEET_TITLE)
+        ws = _ws_handle(_WATCHLIST_SHEET_TITLE)
+        if ws is not None:
             # 과거 드리프트/헤더 누락 데이터 자동 복구 (세션당 1회)
             if not st.session_state.get("_wl_layout_repaired"):
                 try:
                     if _repair_watchlist_layout(ws):
+                        # 시트를 통째로 재작성했으므로 세션 레이어도 반드시 버린다
                         load_watchlist_sheet.clear()
+                        _wl_session_invalidate()
                         st.session_state.pop("_sidebar_wl_count", None)
                 except Exception:
                     pass
                 st.session_state["_wl_layout_repaired"] = True
             return ws, None
         # 없으면 새로 생성
+        sh = _open_quant_db()
+        if sh is None:
+            return None, "Quant_DB 스프레드시트를 열 수 없습니다."
         ws = sh.add_worksheet(title=_WATCHLIST_SHEET_TITLE, rows=1000, cols=max(_WL_NCOL, 10))
         _hdr_end = gspread.utils.rowcol_to_a1(1, _WL_NCOL)
         ws.update([_WATCHLIST_SHEET_COLS], range_name=f"A1:{_hdr_end}", value_input_option="USER_ENTERED")
+        _invalidate_ws_handles()
         st.session_state["_wl_layout_repaired"] = True
         return ws, None
     except Exception as exc:
         return None, f"Watchlist 워크시트를 열거나 생성할 수 없습니다: {exc}"
 
 
+def _wl_row_to_item(r: list) -> dict:
+    """시트 행 → item dict. (읽기 측 SSOT — load/update 가 같은 해석을 쓰도록)"""
+    r = (list(r) + [""] * _WL_NCOL)[:_WL_NCOL]
+    _states_raw = str(r[10]).strip()
+    return {
+        "ticker": str(r[1]).strip().upper(),
+        "memo": str(r[2]).strip(),
+        "alert_price": pd.to_numeric(r[3], errors="coerce") if r[3] else np.nan,
+        "alert_rsi": pd.to_numeric(r[4], errors="coerce") if r[4] else np.nan,
+        "alert_ma200": str(r[5]).strip().lower() == "true",
+        "saved_price": pd.to_numeric(r[6], errors="coerce") if r[6] else np.nan,
+        "date_added": str(r[7]).strip(),
+        "stop_loss": pd.to_numeric(r[8], errors="coerce") if r[8] else np.nan,
+        "target_price": pd.to_numeric(r[9], errors="coerce") if r[9] else np.nan,
+        # 상태 기반 알림: 활성 이벤트 리스트 + 깜빡임 방지용 마지막 상태(JSON 문자열)
+        "alert_states": [s.strip() for s in _states_raw.split(",") if s.strip()] if _states_raw else [],
+        "alert_last_state": str(r[11]).strip(),
+        # 계좌 귀속(빈 문자열 = 미지정 → 활성 계좌 기준으로 사이징)
+        "account": str(r[_WL_COL_ACCOUNT]).strip(),
+    }
+
+
+def _wl_item_to_row(user_id: str, item: dict) -> list:
+    """item dict → 시트 행. (쓰기 측 SSOT — save/update 가 같은 직렬화를 쓰도록)
+
+    ⚠️ 반환 길이는 반드시 _WL_NCOL(13)이다. 칸 수가 어긋나면 값이 옆 열로 밀려
+       그대로 드리프트가 된다. 마지막 줄에서 길이를 강제 정규화한다.
+    """
+    def _num(v, nd):
+        try:
+            if v is None or v == "" or pd.isna(v):
+                return ""
+            return str(round(float(v), nd))
+        except (TypeError, ValueError):
+            return ""
+
+    _states = item.get("alert_states", "")
+    if isinstance(_states, (list, tuple)):
+        _states_s = ",".join(str(s).strip() for s in _states if str(s).strip())
+    else:
+        _states_s = str(_states or "").strip()
+
+    row = [
+        str(user_id).strip(),
+        str(item.get("ticker", "")).strip().upper(),
+        str(item.get("memo", "") or "").strip(),
+        _num(item.get("alert_price"), 4),
+        _num(item.get("alert_rsi"), 1),
+        "true" if item.get("alert_ma200") else "false",
+        _num(item.get("saved_price"), 4),
+        str(item.get("date_added") or _narrative_now_et_string()).strip(),
+        _num(item.get("stop_loss"), 4),
+        _num(item.get("target_price"), 4),
+        _states_s,
+        str(item.get("alert_last_state", "") or "").strip(),
+        str(item.get("account", "") or "").strip(),
+    ]
+    return (row + [""] * _WL_NCOL)[:_WL_NCOL]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Watchlist 세션 캐시 레이어 — 저장 직후 시트 재읽기를 없앤다 (optimistic update)
+#
+#   @st.cache_data 는 외부에서 값 주입이 불가능해(clear 만 가능) 저장할 때마다
+#   "쓰기 → 캐시 폐기 → rerun → 시트 재읽기" 가 강제됐다. 그 위에 얇은 세션
+#   레이어를 얹어, 쓰기가 성공하면 메모리 목록만 갱신하고 시트는 다시 읽지 않는다.
+#
+#   ⚠️ 표시용 레이어다. 시트 쓰기가 성공한 뒤에만 갱신하고, 실패 시에는 손대지
+#      않아 다음 조회에서 시트의 진실을 다시 읽게 한다.
+#   ⚠️ 사용자별로 분리한다. 게스트 목록이 관리자 화면에 섞이면 안 된다.
+#   ⚠️ 목록이 아직 적재되지 않은 사용자에게는 upsert 하지 않는다. 1건짜리 부분
+#      목록이 '전체'인 것처럼 굳어 나머지 종목이 사라져 보이는 사고를 막는다.
+# ══════════════════════════════════════════════════════════════════════════════
+_WL_SESSION_KEY = "_wl_items_session"
+
+
+def _wl_session_key(user_id: str) -> str:
+    return str(user_id or "").strip().upper()
+
+
+def _wl_session_store(create: bool = False):
+    try:
+        store = st.session_state.get(_WL_SESSION_KEY)
+        if not isinstance(store, dict):
+            if not create:
+                return None
+            store = {}
+            st.session_state[_WL_SESSION_KEY] = store
+        return store
+    except Exception:
+        return None
+
+
+def _wl_session_invalidate(user_id=None) -> None:
+    """user_id 지정 시 해당 사용자만, 생략 시 전체 무효화."""
+    store = _wl_session_store()
+    if store is None:
+        return
+    try:
+        if user_id is None:
+            store.clear()
+        else:
+            store.pop(_wl_session_key(user_id), None)
+    except Exception:
+        pass
+
+
+def _wl_session_set(user_id: str, items: list) -> None:
+    store = _wl_session_store(create=True)
+    if store is None:
+        return
+    try:
+        store[_wl_session_key(user_id)] = [dict(it) for it in (items or [])]
+    except Exception:
+        pass
+
+
+def _wl_session_upsert(user_id: str, item: dict) -> None:
+    """목록이 이미 적재된 경우에만 해당 티커를 교체/추가한다."""
+    store = _wl_session_store()
+    k = _wl_session_key(user_id)
+    if store is None or k not in store:
+        return
+    try:
+        tk = str(item.get("ticker", "")).strip().upper()
+        lst = [dict(it) for it in store[k] if str(it.get("ticker", "")).strip().upper() != tk]
+        lst.append(dict(item))
+        store[k] = lst
+    except Exception:
+        store.pop(k, None)
+
+
+def _wl_session_remove(user_id: str, ticker: str) -> None:
+    """목록이 이미 적재된 경우에만 해당 티커를 제거한다."""
+    store = _wl_session_store()
+    k = _wl_session_key(user_id)
+    if store is None or k not in store:
+        return
+    try:
+        tk = str(ticker).strip().upper()
+        store[k] = [dict(it) for it in store[k]
+                    if str(it.get("ticker", "")).strip().upper() != tk]
+    except Exception:
+        store.pop(k, None)
+
+
+def get_watchlist_items(user_id: str, force: bool = False) -> list[dict]:
+    """Watchlist 조회 진입점. 세션 레이어 우선 → 미적재 시 시트 읽기.
+
+    force=True 는 세션·시트 캐시를 모두 버리고 시트에서 다시 읽는다(수동 새로고침).
+    반환값은 방어적 복사본이라 호출부가 수정해도 캐시가 오염되지 않는다.
+    """
+    uid_k = _wl_session_key(user_id)
+    if not uid_k:
+        return []
+    if force:
+        _wl_session_invalidate(user_id)
+        try:
+            load_watchlist_sheet.clear()
+        except Exception:
+            pass
+    else:
+        store = _wl_session_store()
+        if isinstance(store, dict) and uid_k in store:
+            return [dict(it) for it in store[uid_k]]
+    items = load_watchlist_sheet(user_id)
+    _wl_session_set(user_id, items)
+    return [dict(it) for it in items]
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_watchlist_sheet(user_id: str) -> list[dict]:
-    """Watchlist 시트에서 현재 user_id 기록 로드. 60초 캐시."""
+    """Watchlist 시트에서 현재 user_id 기록 로드. 5분 캐시.
+
+    ⚠️ 직접 호출하지 말고 get_watchlist_items() 를 쓴다. 세션 레이어를 건너뛰면
+       저장 직후 옛 목록이 보일 수 있다.
+    """
     ws, err = open_watchlist_worksheet()
     if err or ws is None:
         return []
@@ -11077,31 +11405,100 @@ def load_watchlist_sheet(user_id: str) -> list[dict]:
         if not vals or len(vals) < 2:
             return []
         uid_u = str(user_id).strip().upper()
-        items = []
-        for r in vals[1:]:
-            r = (r + [""] * _WL_NCOL)[:_WL_NCOL]
-            if str(r[0]).strip().upper() != uid_u:
-                continue
-            _states_raw = str(r[10]).strip()
-            items.append({
-                "ticker": str(r[1]).strip().upper(),
-                "memo": str(r[2]).strip(),
-                "alert_price": pd.to_numeric(r[3], errors="coerce") if r[3] else np.nan,
-                "alert_rsi": pd.to_numeric(r[4], errors="coerce") if r[4] else np.nan,
-                "alert_ma200": str(r[5]).strip().lower() == "true",
-                "saved_price": pd.to_numeric(r[6], errors="coerce") if r[6] else np.nan,
-                "date_added": str(r[7]).strip(),
-                "stop_loss": pd.to_numeric(r[8], errors="coerce") if r[8] else np.nan,
-                "target_price": pd.to_numeric(r[9], errors="coerce") if r[9] else np.nan,
-                # 상태 기반 알림: 활성 이벤트 리스트 + 깜빡임 방지용 마지막 상태(JSON 문자열)
-                "alert_states": [s.strip() for s in _states_raw.split(",") if s.strip()] if _states_raw else [],
-                "alert_last_state": str(r[11]).strip(),
-                # 계좌 귀속(빈 문자열 = 미지정 → 활성 계좌 기준으로 사이징)
-                "account": str(r[_WL_COL_ACCOUNT]).strip(),
-            })
-        return items
+        return [_wl_row_to_item(r) for r in vals[1:]
+                if str((list(r) + [""])[0]).strip().upper() == uid_u]
     except Exception:
         return []
+
+
+def update_watchlist_row(user_id: str, ticker: str, updates: dict) -> tuple[bool, str, dict]:
+    """(user_id, ticker) 행을 제자리 갱신. '삭제 후 재추가'(9콜)를 2콜로 대체한다.
+
+    부수 효과로, 재추가 때 손절가·목표가·Alert_States·Account 가 초기화되던 문제
+    (run_scanner_scan.py 주석에 지적된 그 동작)도 사라진다.
+
+    ▣ 드리프트 방지 4중 가드
+      1. 행 번호는 방금 읽은 스냅샷에서만 얻는다 — 기억해 둔 옛 좌표를 쓰지 않는다
+      2. 기록 직전 대상 좌표를 '별도의 새 읽기'로 재확인한다 (A{r}:B{r} 1콜).
+         ⚠️ 스냅샷 자신과 대조하면 항상 참이라 아무것도 못 막는다. 반드시
+            시간상 나중의 독립 관측이어야 한다. Watchlist 는 전 사용자 공용
+            시트라 오좌표 기록은 곧 타인 행 파손이다.
+      3. 변경된 필드만 1칸짜리 range 로 기록한다. 연속 범위를 통째로 덮지 않아
+         칸 수 불일치로 옆 열이 밀릴 여지 자체가 없다.
+      4. 모든 range 는 화이트리스트(B~M, 알려진 필드)만 허용하고 A열(ID)은 금지.
+
+    3번의 부수 효과가 크다. 사용자가 건드리지 않은 칸(특히 자동화가 쓰는
+    L열 Alert_LastState, 그리고 Saved_Price·Date_Added)을 아예 만지지 않으므로
+    자동화 결과를 덮어쓰지 않고 숫자 표기도 원본 그대로 남는다.
+
+    반환: (성공, 에러메시지, 갱신된 item). 행이 없으면 (False, "not_found", {}).
+    """
+    uid = str(user_id).strip()
+    tk = str(ticker).strip().upper()
+    if not uid or not tk:
+        return False, "유저ID 또는 티커 없음", {}
+    ws, err = open_watchlist_worksheet()
+    if err or ws is None:
+        return False, err or "워크시트 열기 실패", {}
+    try:
+        vals = ws.get_all_values() or []          # 가드 1
+        uid_u = uid.upper()
+        target_row, cur = None, None
+        for i, r in enumerate(vals[1:], start=2):
+            rr = (list(r) + [""] * _WL_NCOL)[:_WL_NCOL]
+            if str(rr[0]).strip().upper() == uid_u and str(rr[1]).strip().upper() == tk:
+                target_row, cur = i, rr
+                break
+        if target_row is None:
+            return False, "not_found", {}
+
+        # 변경 필드만 셀 단위로 추린다 (가드 3)
+        item = _wl_row_to_item(cur)
+        full_new = dict(item)
+        for _k, _v in (updates or {}).items():
+            full_new[_k] = _v
+        full_new["ticker"] = tk
+        old_cells = _wl_item_to_row(uid, item)
+        new_cells = _wl_item_to_row(uid, full_new)
+
+        reqs, touched = [], []
+        for _idx in _WL_EDITABLE_COL_IDX:                        # 가드 4
+            if str(old_cells[_idx]) == str(new_cells[_idx]):
+                continue
+            _a1 = f"{gspread.utils.rowcol_to_a1(target_row, _idx + 1)}"
+            reqs.append({"range": _a1, "values": [[new_cells[_idx]]]})
+            touched.append(_a1)
+        if not reqs:
+            _wl_session_upsert(uid, full_new)
+            return True, "", full_new              # 변경 없음 → 쓰기 자체를 생략
+
+        # 가드 2 — 스냅샷과 무관한 '새 관측'으로 좌표 재확인
+        try:
+            _probe = ws.get(f"A{target_row}:B{target_row}") or []
+        except Exception as _pe:
+            return False, f"좌표 재확인 실패: {_pe}", {}
+        _pr = (list(_probe[0]) if _probe else []) + ["", ""]
+        if str(_pr[0]).strip().upper() != uid_u or str(_pr[1]).strip().upper() != tk:
+            _wl_session_invalidate(uid)
+            try:
+                load_watchlist_sheet.clear()
+            except Exception:
+                pass
+            return False, ("시트가 방금 변경되어 행 위치가 달라졌습니다. "
+                           "새로고침 후 다시 시도해 주세요."), {}
+
+        ws.batch_update(reqs, value_input_option="USER_ENTERED")
+
+        _wl_session_upsert(uid, full_new)
+        try:
+            load_watchlist_sheet.clear()
+        except Exception:
+            pass
+        st.session_state.pop("_sidebar_wl_count", None)
+        st.session_state["_watchlist_alert_checked"] = False
+        return True, "", full_new
+    except Exception as exc:
+        return False, str(exc), {}
 
 
 def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
@@ -11117,48 +11514,22 @@ def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
             r for r in vals[1:]
             if str((r + [""])[0]).strip().upper() != uid_u
         ]
-        new_rows = []
-        for item in items:
-            ticker = str(item.get("ticker", "")).strip().upper()
-            if not ticker:
-                continue
-            alert_price = item.get("alert_price", "")
-            alert_price_str = str(round(float(alert_price), 4)) if pd.notna(alert_price) and alert_price != "" else ""
-            alert_rsi = item.get("alert_rsi", "")
-            alert_rsi_str = str(round(float(alert_rsi), 1)) if pd.notna(alert_rsi) and alert_rsi != "" else ""
-            alert_ma200_str = "true" if item.get("alert_ma200") else "false"
-            saved_price = item.get("saved_price", "")
-            saved_price_str = str(round(float(saved_price), 4)) if pd.notna(saved_price) and saved_price != "" else ""
-            stop_loss = item.get("stop_loss", "")
-            stop_loss_str = str(round(float(stop_loss), 4)) if pd.notna(stop_loss) and stop_loss != "" else ""
-            target_price = item.get("target_price", "")
-            target_price_str = str(round(float(target_price), 4)) if pd.notna(target_price) and target_price != "" else ""
-            # 상태 기반 알림 직렬화
-            _states = item.get("alert_states", "")
-            if isinstance(_states, (list, tuple)):
-                alert_states_str = ",".join(str(s).strip() for s in _states if str(s).strip())
-            else:
-                alert_states_str = str(_states or "").strip()
-            alert_last_state_str = str(item.get("alert_last_state", "") or "").strip()
-            new_rows.append([
-                str(user_id).strip(),
-                ticker,
-                str(item.get("memo", "")).strip(),
-                alert_price_str,
-                alert_rsi_str,
-                alert_ma200_str,
-                saved_price_str,
-                str(item.get("date_added", _narrative_now_et_string())).strip(),
-                stop_loss_str,
-                target_price_str,
-                alert_states_str,
-                alert_last_state_str,
-                str(item.get("account", "") or "").strip(),
-            ])
+        # 직렬화는 _wl_item_to_row 단일 경로 — update_watchlist_row 와 규칙이 갈리지 않게 한다
+        new_rows = [
+            _wl_item_to_row(user_id, item) for item in items
+            if str(item.get("ticker", "")).strip()
+        ]
+        # 다른 유저 행도 13칸으로 정규화 (구 8열 레코드 혼재 시 열 밀림 방지)
+        other_rows = [(list(r) + [""] * _WL_NCOL)[:_WL_NCOL] for r in other_rows]
         all_rows = [_WATCHLIST_SHEET_COLS] + other_rows + new_rows
         ws.clear()
         _end_cell = gspread.utils.rowcol_to_a1(len(all_rows), _WL_NCOL)
         ws.update(all_rows, range_name=f"A1:{_end_cell}", value_input_option="USER_ENTERED")
+        _wl_session_set(user_id, [_wl_row_to_item(r) for r in new_rows])
+        try:
+            load_watchlist_sheet.clear()
+        except Exception:
+            pass
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -11183,7 +11554,8 @@ def delete_from_watchlist(user_id: str, ticker: str) -> tuple[bool, str]:
                 to_del.append(i)
         for row_idx in reversed(to_del):
             ws.delete_rows(row_idx)
-        # 캐시 초기화
+        # 세션 목록에서만 제거 → rerun 후 시트 재읽기 없음 (optimistic update)
+        _wl_session_remove(uid_u, tk_u)
         load_watchlist_sheet.clear()
         st.session_state.pop("_sidebar_wl_count", None)
         st.session_state["_watchlist_alert_checked"] = False
@@ -11238,22 +11610,28 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
         # 새 행 추가 (12열: ... Date_Added, Stop_Loss, Target_Price, Alert_States, Alert_LastState)
         #   alert_states is None → 신규 기본값(entry,risk) / "" → 알림 없음(사용자가 전부 해제)
         _states_val = _WL_ALERT_DEFAULT if alert_states is None else str(alert_states).strip()
-        _safe_append_rows(ws, [
-            uid, tk,
-            str(memo).strip(),
-            str(round(float(alert_price), 4)) if alert_price is not None else "",
-            str(round(float(alert_rsi), 1)) if alert_rsi is not None else "",
-            "true" if alert_ma200 else "false",
-            str(round(float(cur_price), 4)) if pd.notna(cur_price) else "",
-            _narrative_now_et_string(),
-            str(round(float(stop_loss), 4)) if (stop_loss is not None and pd.notna(stop_loss)) else "",
-            str(round(float(target_price), 4)) if (target_price is not None and pd.notna(target_price)) else "",
-            str(_states_val).strip(),
-            "",  # Alert_LastState 초기값(빈) — 첫 평가 시 채워짐
-            (str(st.session_state.get("_active_account") or "").strip()
-             if account is None else str(account).strip()),
-        ], value_input_option="USER_ENTERED")
-        # 캐시 초기화
+        _new_item = {
+            "ticker": tk,
+            "memo": str(memo).strip(),
+            "alert_price": alert_price,
+            "alert_rsi": alert_rsi,
+            "alert_ma200": bool(alert_ma200),
+            "saved_price": cur_price,
+            "date_added": _narrative_now_et_string(),
+            "stop_loss": stop_loss,
+            "target_price": target_price,
+            "alert_states": str(_states_val).strip(),
+            "alert_last_state": "",  # 첫 평가 시 채워짐
+            "account": (str(st.session_state.get("_active_account") or "").strip()
+                        if account is None else str(account).strip()),
+        }
+        # ⚠️ _safe_append_rows 는 그대로 둔다. 자동화(run_scanner_scan)가 같은 시트에
+        #    append 하므로 앱이 기억한 마지막 행 번호는 신뢰할 수 없고, 내부의
+        #    get_all_values() 가 계단식 드리프트를 막는 안전장치다. 1콜은 남긴다.
+        _safe_append_rows(ws, _wl_item_to_row(uid, _new_item),
+                          value_input_option="USER_ENTERED")
+        # 세션 목록만 갱신 → rerun 후 시트 재읽기 없음 (optimistic update)
+        _wl_session_upsert(uid, _wl_row_to_item(_wl_item_to_row(uid, _new_item)))
         load_watchlist_sheet.clear()
         st.session_state.pop("_sidebar_wl_count", None)
         st.session_state["_watchlist_alert_checked"] = False
@@ -14265,7 +14643,7 @@ if st.session_state.get("logged_in"):
     if _uid_alert and not st.session_state.get("_watchlist_alert_checked"):
         st.session_state["_watchlist_alert_checked"] = True
         try:
-            _wl_items = load_watchlist_sheet(_uid_alert)
+            _wl_items = get_watchlist_items(_uid_alert)
             if _wl_items:
                 _wl_tickers = [i["ticker"] for i in _wl_items]
                 _price_map = fetch_latest_prices_for_tickers(tuple(_wl_tickers))
@@ -14471,7 +14849,7 @@ if st.session_state.get("logged_in"):
     _uid_sidebar = str(st.session_state.get("user_id") or "").strip()
     if "_sidebar_wl_count" not in st.session_state:
         try:
-            _temp_wl = load_watchlist_sheet(_uid_sidebar)
+            _temp_wl = get_watchlist_items(_uid_sidebar)
             st.session_state["_sidebar_wl_count"] = len(_temp_wl)
         except Exception:
             st.session_state["_sidebar_wl_count"] = 0
@@ -14481,6 +14859,27 @@ if st.session_state.get("logged_in"):
     else:
         st.sidebar.caption("저장된 Watchlist 메모가 없습니다.")
     
+    # ── 🔧 Sheets 호출 계측 (관리자 전용) ─────────────────────────────────
+    #   gspread HTTP 왕복 횟수·누적 시간을 세션 단위로 보여준다. 최적화 전후를
+    #   추정이 아니라 숫자로 비교하기 위한 패널이다.
+    if _is_admin():
+        with st.sidebar.expander("🔧 Sheets 호출 계측", expanded=False):
+            _st_b = _gs_stats_bucket()
+            _st_n = int(_st_b.get("n", 0))
+            _st_s = float(_st_b.get("sec", 0.0))
+            _c1, _c2 = st.columns(2)
+            _c1.metric("누적 호출", f"{_st_n}회")
+            _c2.metric("누적 시간", f"{_st_s:.1f}초")
+            if _st_n > 0:
+                st.caption(f"평균 {_st_s / _st_n:.2f}초/호출 · 세션 시작 이후 누적")
+            if st.button("계측 초기화", key="gs_stats_reset", use_container_width=True):
+                st.session_state[_GS_STATS_KEY] = {"n": 0, "sec": 0.0}
+                st.rerun()
+            st.caption(
+                "측정 방법: 초기화 → 대상 동작 1회 실행 → 증가분 확인.\n\n"
+                "기준(최적화 후): 워치리스트 수정 2회 · 추가 3회 · 삭제 3회."
+            )
+
     if st.sidebar.button("로그아웃", key="sidebar_logout_btn", use_container_width=True):
         st.session_state["logged_in"] = False
         st.session_state["user_role"] = None
@@ -15870,7 +16269,7 @@ if st.session_state.get("logged_in"):
                                     "saved_price": float(_cur_p) if pd.notna(_cur_p) else np.nan,
                                     "date_added": _narrative_now_et_string(),
                                 }
-                                _em_wl = load_watchlist_sheet(_uid_em)
+                                _em_wl = get_watchlist_items(_uid_em)
                                 _em_wl = [x for x in _em_wl if x["ticker"] != tk]
                                 _em_wl.append(_em_item)
                                 _ok_em, _ = save_watchlist_sheet(_uid_em, _em_wl)
@@ -15910,7 +16309,7 @@ if st.session_state.get("logged_in"):
                                     "saved_price": float(_cur_p2) if pd.notna(_cur_p2) else np.nan,
                                     "date_added": _narrative_now_et_string(),
                                 }
-                                _el_wl = load_watchlist_sheet(_uid_el)
+                                _el_wl = get_watchlist_items(_uid_el)
                                 _el_wl = [x for x in _el_wl if x["ticker"] != tk]
                                 _el_wl.append(_el_item)
                                 _ok_el, _ = save_watchlist_sheet(_uid_el, _el_wl)
@@ -17271,7 +17670,7 @@ if st.session_state.get("logged_in"):
                     return []
             elif choice == "Watchlist 종목만":
                 try:
-                    wl = load_watchlist_sheet(uid)
+                    wl = get_watchlist_items(uid)
                     return [i["ticker"] for i in wl] if wl else []
                 except Exception:
                     return []
@@ -17284,7 +17683,7 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     pass
                 try:
-                    wl = load_watchlist_sheet(uid)
+                    wl = get_watchlist_items(uid)
                     tickers += [i["ticker"] for i in wl] if wl else []
                 except Exception:
                     pass
@@ -22126,7 +22525,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             st.divider()
 
         # ── Watchlist 로드 ─────────────────────────────────────────────────
-        wl_items = load_watchlist_sheet(uid_wl)
+        wl_items = get_watchlist_items(uid_wl)
         try:
             _wl_pf_df = load_portfolio()
             _wl_acct_opts = (sorted(_wl_pf_df["Account"].dropna().astype(str).str.strip().unique().tolist())
@@ -22801,16 +23200,26 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             # 기존 항목 삭제 후 새 항목 추가 (행 단위 처리)
                             # ⚠️ saved_price/stop/target은 재추가 시 보존해야 함
                             # ⚠️ 알림 설정 변경 시 깜빡임 상태(Alert_LastState)는 초기화됨(다음 자동화에서 재설정)
-                            _keep_saved = pd.to_numeric(item.get("saved_price"), errors="coerce")
-                            _ok_del, _ = delete_from_watchlist(uid_wl, tk)
-                            if _ok_del:
+                            _upd = {
+                                "memo": new_memo.strip(),
+                                "stop_loss": float(new_sl) if new_sl > 0 else None,
+                                "target_price": float(new_tp) if new_tp > 0 else None,
+                                "alert_states": (",".join(new_states) if new_states else "none"),  # 전부 해제=none
+                                "account": ("" if new_account == "(미지정)" else new_account),
+                            }
+                            _ok_u, _err_u, _ = update_watchlist_row(uid_wl, tk, _upd)
+                            if _ok_u:
+                                st.rerun()
+                            elif _err_u == "not_found":
+                                # 행이 사라진 경우에만 기존 추가 경로로 폴백 (saved_price 보존)
+                                _keep_saved = pd.to_numeric(item.get("saved_price"), errors="coerce")
                                 _ok_add, _err_add = add_to_watchlist(
                                     uid_wl, tk,
                                     memo=new_memo.strip(),
                                     saved_price=float(_keep_saved) if pd.notna(_keep_saved) else None,
                                     stop_loss=float(new_sl) if new_sl > 0 else None,
                                     target_price=float(new_tp) if new_tp > 0 else None,
-                                    alert_states=(",".join(new_states) if new_states else "none"),  # 전부 해제=none
+                                    alert_states=(",".join(new_states) if new_states else "none"),
                                     account=("" if new_account == "(미지정)" else new_account),
                                 )
                                 if _ok_add:
@@ -22818,7 +23227,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 else:
                                     st.error(f"저장 실패: {_err_add}")
                             else:
-                                st.error("기존 항목 삭제 실패")
+                                st.error(f"저장 실패: {_err_u}")
 
                     # ── ✅ 매수 완료 → 포트폴리오 등록 (Watchlist 원클릭) ──────────
                     #   이메일 알림 → 실제 매수 → 여기서 즉시 등록. 포트폴리오 탭 이동 불필요.
@@ -24128,7 +24537,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
             _e_pf = pd.DataFrame()
         if _e_pf is None:
             _e_pf = pd.DataFrame()
-        _e_wl = load_watchlist_sheet(_euid) or []
+        _e_wl = get_watchlist_items(_euid) or []
 
         if _e_pf.empty and not _e_wl:
             st.info("보유 종목과 워치리스트가 비어 있습니다. 종목을 추가하면 실적 일정이 여기에 표시됩니다.")
