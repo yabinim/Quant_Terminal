@@ -1,0 +1,52 @@
+name: 🧰 지표 백필 — Watchlist_Metrics 재생성 (수동 전용)
+
+# 언제 쓰나:
+#   - 배포 직후 정기 EOD 실행 전에 시트를 미리 만들어 검증할 때
+#   - 워치리스트에 종목을 여러 개 추가한 직후 즉시 반영하고 싶을 때
+#   - 시트가 손상/삭제되어 복구할 때
+#
+# 안전성: 평가·이메일·알림 상태머신을 전부 건너뛴다. 2일 확정 카운터가 진행되지
+#         않고 오발송도 없다. 확정 봉(당일 미완성 봉 제외) 기준이라 언제 돌려도
+#         결과가 같다. 휴장일에도 동작한다.
+#
+# ⚠️ GMAIL_* 시크릿을 함께 넘긴다. run_watchlist_alerts.py 가 모듈 로드 시점에
+#    os.environ["GMAIL_USER"] 등을 직접 읽으므로, 백필은 메일을 보내지 않더라도
+#    변수가 없으면 임포트 단계에서 KeyError 로 죽는다.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            gspread \
+            google-auth \
+            requests \
+            numpy \
+            pandas \
+            pytz
+
+      - name: 🧰 지표 백필 실행 (알림/이메일 없음)
+        env:
+          FMP_API_KEY:        ${{ secrets.FMP_API_KEY }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:           ${{ secrets.GMAIL_TO }}
+          GSPREAD_KEY:        ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/run_watchlist_alerts.py --scope metrics
