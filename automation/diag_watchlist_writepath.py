@@ -46,6 +46,7 @@ TARGET_FUNCS = [
     "_wl_session_set",
     "_wl_session_upsert",
     "_wl_session_remove",
+    "_wl_mark_alert_recheck",
     "update_watchlist_row",
 ]
 
@@ -359,6 +360,20 @@ def run_tests(src: str) -> list:
     ck(ns["st"].session_state[ns["_WL_SESSION_KEY"]]["YAB"] !=
        ns["st"].session_state[ns["_WL_SESSION_KEY"]]["GUEST1"],
        "사용자별 목록 분리")
+
+    # ── 수정/삭제 시 '그 티커만' 재평가 대상으로 표시되는가 ────────────────
+    ws = FakeWorksheet(base_rows())
+    ns = load_namespace(src, ws)
+    ok, err, _ = ns["update_watchlist_row"]("yab", "NVDA", {"memo": "z"})
+    ck(ok, "마킹 케이스 성공", err)
+    _marked = ns["st"].session_state.get("_wl_alert_recheck")
+    ck(_marked == {"NVDA"}, "수정 티커만 재평가 표시", f"{_marked}")
+    ck(ns["st"].session_state.get("_watchlist_alert_checked") is not False,
+       "전체 재스캔 플래그 미하향", f"{ns['st'].session_state.get('_watchlist_alert_checked')}")
+    # 두 종목 연속 수정 시 누적되어야 한다
+    ns["update_watchlist_row"]("yab", "AVGO", {"memo": "z2"})
+    _marked = ns["st"].session_state.get("_wl_alert_recheck")
+    ck(_marked == {"NVDA", "AVGO"}, "재평가 대상 누적", f"{_marked}")
 
     return fails
 
