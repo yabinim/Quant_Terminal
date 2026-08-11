@@ -11417,10 +11417,27 @@ def _wl_session_remove(user_id: str, ticker: str) -> None:
 
 
 def open_watchlist_metrics_worksheet():
-    """Watchlist_Metrics 탭. 없으면 None (자동화가 아직 안 돈 상태 — 폴백으로 처리)."""
+    """Watchlist_Metrics 탭. 없으면 None (자동화가 아직 안 돈 상태 — 폴백으로 처리).
+
+    ⚠️ _ws_handle 은 '탭 없음(None)'도 10분간 캐시한다. 이 탭은 **다른 프로세스**
+       (GitHub Actions 자동화/백필)가 만들기 때문에, 앱이 생성 직전에 한 번
+       조회했다면 실제로 생긴 뒤에도 최대 10분간 계속 None 이 나온다.
+       → 음성 결과일 때만 캐시를 우회해 직접 한 번 더 확인한다(비용 1콜, 드문 경로).
+    """
     if get_gspread_client() is None:
         return None
-    return _ws_handle(wm.SHEET_TITLE)
+    ws = _ws_handle(wm.SHEET_TITLE)
+    if ws is not None:
+        return ws
+    try:
+        sh = _open_quant_db()
+        if sh is None:
+            return None
+        ws = sh.worksheet(wm.SHEET_TITLE)   # 캐시 우회 직접 조회
+        _invalidate_ws_handles()            # 실제로 있었으니 캐시를 새로 잡게 한다
+        return ws
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -22893,6 +22910,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             st.info("등록된 관심 종목이 없어요. 위에서 종목을 추가해주세요.")
         else:
             st.markdown(f"### 📋 관심 종목 현황 ({len(wl_items)}개)")
+            # 지표 출처 표시 자리. 실제 값은 아래 계산 블록이 끝난 뒤 채운다.
+            # (계산부에 그냥 두면 헤딩에서 150줄 넘게 밀려나 눈에 띄지 않는다)
+            _wl_meta_slot = st.empty()
 
             # ── 자동 편입분 일괄 정리 ────────────────────────────────────
             # 주간 스캐너가 넣은 종목은 Memo 가 "AUTO|" 로 시작한다.
@@ -23053,7 +23073,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             # 지표 출처 표시 — 어떤 봉 기준의 판정인지 항상 보이게 한다
             _wms = st.session_state.get("_wl_metrics_stat") or {}
             if _wms.get("cached"):
-                st.caption(
+                _wl_meta_slot.caption(
                     f"📊 지표 기준일 **{_wms.get('ref') or '?'}** (종가 확정분) · "
                     f"저장본 {_wms['cached']}종목"
                     + (f" · 실시간 계산 {_wms['live']}종목" if _wms.get("live") else "")
@@ -23061,7 +23081,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     + " — 현재가·수익률은 실시간입니다."
                 )
             elif wl_tickers:
-                st.caption(
+                _wl_meta_slot.caption(
                     "📊 지표를 실시간 계산했습니다 — 자동화(마감 후)가 한 번 돌면 "
                     "다음부터 즉시 표시됩니다."
                 )
