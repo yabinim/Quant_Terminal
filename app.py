@@ -29,6 +29,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as st_components  # 인증 쿠키 JS 주입용(height=0, 비가시)
 import gspread
+import threading
 from google.oauth2.service_account import Credentials
 from fredapi import Fred
 
@@ -371,6 +372,53 @@ def _install_gs_instrumentation() -> None:
 
 
 _install_gs_instrumentation()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FMP 호출 계측
+#   Sheets 와 달리 프로세스 수준 카운터를 쓴다. 일봉 프리페치가 ThreadPoolExecutor
+#   위에서 도는데 워커 스레드에서는 st.session_state 접근이 불가능해, 세션 단위로
+#   세면 병렬 호출이 통째로 누락된다. 관리자 진단용이라 프로세스 전체 기준으로도
+#   충분하며 오히려 스레드 작업까지 잡아내 더 정확하다.
+# ══════════════════════════════════════════════════════════════════════════════
+_FMP_STATS = {"n": 0, "sec": 0.0}
+_FMP_STATS_LOCK = threading.Lock()
+_FMP_HOST = "financialmodelingprep.com"
+
+
+def _install_fmp_instrumentation() -> None:
+    """requests.get 을 1회 래핑(멱등). URL 로 걸러 FMP 호출만 집계한다.
+
+    fmp_extras · scanner_core · app.py 가 모두 호출 시점에 `requests.get` 을
+    조회하므로 모듈 속성 하나만 바꾸면 전 경로가 한 번에 잡힌다.
+    Gemini·FRED 등 다른 HTTP 는 호스트가 달라 세지 않는다.
+    """
+    _orig = getattr(requests, "get", None)
+    if _orig is None or getattr(_orig, "_qt_wrapped", False):
+        return
+
+    def _wrapped(url, *a, **k):
+        _is_fmp = _FMP_HOST in str(url)
+        _t0 = time.perf_counter()
+        try:
+            return _orig(url, *a, **k)
+        finally:
+            if _is_fmp:
+                try:
+                    with _FMP_STATS_LOCK:
+                        _FMP_STATS["n"] += 1
+                        _FMP_STATS["sec"] += time.perf_counter() - _t0
+                except Exception:
+                    pass
+
+    _wrapped._qt_wrapped = True
+    try:
+        requests.get = _wrapped
+    except Exception:
+        pass
+
+
+_install_fmp_instrumentation()
 
 
 @st.cache_resource(ttl=600, show_spinner=False)
@@ -11366,6 +11414,58 @@ def _wl_session_remove(user_id: str, ticker: str) -> None:
         store.pop(k, None)
 
 
+def _wl_prefetch_histories(tickers: tuple, limit: int = 252) -> dict:
+    """알림 평가용 일봉을 병렬로 미리 채운다. 반환 {TICKER: DataFrame|None}.
+
+    `_fmp_price_history` 는 scanner_core 의 프로세스 수명 TTL 캐시(30분)를 쓰므로,
+    여기서 한 번 병렬로 훑어두면 이후 호출은 전부 캐시 히트가 된다.
+
+    ⚠️ 병렬화는 네트워크 I/O 에만 적용한다. 레짐 계산(rc.analyze_ticker)은 호출부에서
+       순차로 남겨 스레드 안전성 검증 부담을 만들지 않는다 — 느린 쪽은 어차피 I/O 다.
+    ⚠️ FMP Starter 300/분 한도. max_workers=8 은 앱의 다른 병렬 구간과 같은 수준이다.
+       스캐너·Hidden Alpha 와 동시에 돌리지 않는다는 기존 운영 원칙은 그대로 유효하다.
+    """
+    out = {}
+    tks = [t for t in dict.fromkeys(str(x).strip().upper() for x in (tickers or [])) if t]
+    if not tks:
+        return out
+
+    def _one(tk):
+        try:
+            return tk, _fmp_price_history(tk, limit=limit)
+        except Exception:
+            return tk, None
+
+    try:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=8) as _ex:
+            for _tk, _df in _ex.map(_one, tks):
+                out[_tk] = _df
+    except Exception:
+        # 병렬 실패 시 순차 폴백 — 느릴 뿐 결과는 동일하다
+        for tk in tks:
+            out[tk] = _one(tk)[1]
+    return out
+
+
+def _wl_mark_alert_recheck(ticker: str) -> None:
+    """이 티커만 알림 재평가 대상으로 표시한다.
+
+    ⚠️ 예전에는 종목 하나만 고쳐도 `_watchlist_alert_checked = False` 로 전체
+       플래그를 내려 워치리스트 전 종목(55개)을 순차 재평가했다. 종목당 FMP
+       일봉 1콜 + 레짐 분석이라 캐시가 비어 있으면 10초 넘게 걸렸다.
+       목표가 하나 바꾼 것 때문에 나머지 54종목을 다시 볼 이유는 없다.
+    """
+    try:
+        _s = st.session_state.get("_wl_alert_recheck")
+        if not isinstance(_s, set):
+            _s = set()
+        _s.add(str(ticker).strip().upper())
+        st.session_state["_wl_alert_recheck"] = _s
+    except Exception:
+        pass
+
+
 def get_watchlist_items(user_id: str, force: bool = False) -> list[dict]:
     """Watchlist 조회 진입점. 세션 레이어 우선 → 미적재 시 시트 읽기.
 
@@ -11495,7 +11595,7 @@ def update_watchlist_row(user_id: str, ticker: str, updates: dict) -> tuple[bool
         except Exception:
             pass
         st.session_state.pop("_sidebar_wl_count", None)
-        st.session_state["_watchlist_alert_checked"] = False
+        _wl_mark_alert_recheck(tk)   # 이 종목만 재평가 (전체 55종목 재스캔 방지)
         return True, "", full_new
     except Exception as exc:
         return False, str(exc), {}
@@ -11558,7 +11658,7 @@ def delete_from_watchlist(user_id: str, ticker: str) -> tuple[bool, str]:
         _wl_session_remove(uid_u, tk_u)
         load_watchlist_sheet.clear()
         st.session_state.pop("_sidebar_wl_count", None)
-        st.session_state["_watchlist_alert_checked"] = False
+        _wl_mark_alert_recheck(tk_u)  # 삭제된 종목의 묵은 알림을 걷어내기 위해 표시
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -11634,7 +11734,7 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
         _wl_session_upsert(uid, _wl_row_to_item(_wl_item_to_row(uid, _new_item)))
         load_watchlist_sheet.clear()
         st.session_state.pop("_sidebar_wl_count", None)
-        st.session_state["_watchlist_alert_checked"] = False
+        _wl_mark_alert_recheck(tk)   # 이 종목만 재평가
         st.session_state[f"_wl_added_{tk}"] = True
         return True, ""
     except Exception as exc:
@@ -14638,15 +14738,39 @@ if st.session_state.get("logged_in"):
             except Exception:
                 pass
 
-    # ── Watchlist Alert 자동 체크 (매 세션 1회) ───────────────────────────
+    # ── Watchlist Alert 체크 ──────────────────────────────────────────────
+    #   세션 최초 1회는 전 종목(full), 이후 편집이 생기면 '해당 티커만'(partial).
+    #   예전에는 종목 하나만 고쳐도 전체를 순차 재평가해 캐시가 비면 10초 넘게 걸렸다.
     _uid_alert = str(st.session_state.get("user_id") or "").strip()
-    if _uid_alert and not st.session_state.get("_watchlist_alert_checked"):
+    _wl_recheck = st.session_state.get("_wl_alert_recheck") or set()
+    _wl_full = bool(_uid_alert) and not st.session_state.get("_watchlist_alert_checked")
+    _wl_part = bool(_uid_alert) and bool(_wl_recheck) and not _wl_full
+    if _wl_full or _wl_part:
         st.session_state["_watchlist_alert_checked"] = True
+        st.session_state["_wl_alert_recheck"] = set()
+        _rc_u = {str(t).strip().upper() for t in _wl_recheck}
         try:
-            _wl_items = get_watchlist_items(_uid_alert)
+            _wl_all = get_watchlist_items(_uid_alert)
+            if _wl_full:
+                _wl_items = _wl_all
+            else:
+                _wl_items = [i for i in _wl_all
+                             if str(i.get("ticker", "")).strip().upper() in _rc_u]
+
+            # 부분 재평가에서는 대상 티커의 옛 결과를 먼저 걷어낸다.
+            # (삭제된 종목이라 _wl_items 가 비어도 묵은 알림이 남지 않도록 무조건 수행)
+            if _wl_part:
+                _prev_hits = [t for t in (st.session_state.get("_watchlist_triggered_alerts") or [])
+                              if str(t).strip().upper() not in _rc_u]
+            else:
+                _prev_hits = []
+
+            _alert_hits = []
             if _wl_items:
-                _wl_tickers = [i["ticker"] for i in _wl_items]
-                _price_map = fetch_latest_prices_for_tickers(tuple(_wl_tickers))
+                _wl_tickers = tuple(i["ticker"] for i in _wl_items)
+                _price_map = fetch_latest_prices_for_tickers(_wl_tickers)
+                # 일봉은 병렬로 미리 채운다 — 아래 루프는 전부 캐시 히트가 된다
+                _hist_map = _wl_prefetch_histories(_wl_tickers)
                 try:
                     _spy_h = _fmp_price_history("SPY", limit=252)
                     _spy_c = (_spy_h["Close"]
@@ -14654,11 +14778,10 @@ if st.session_state.get("logged_in"):
                               else None)
                 except Exception:
                     _spy_c = None
-                _alert_hits = []
                 for _it in _wl_items:
                     _tk = _it["ticker"]
                     try:
-                        _hist = _fmp_price_history(_tk, limit=252)
+                        _hist = _hist_map.get(_tk)
                         if _hist is None or _hist.empty:
                             continue
                         _an2 = rc.analyze_ticker(_hist, spy_close=_spy_c)
@@ -14685,8 +14808,10 @@ if st.session_state.get("logged_in"):
                             _alert_hits.append(_tk)
                     except Exception:
                         continue
-                if _alert_hits:
-                    st.session_state["_watchlist_triggered_alerts"] = _alert_hits
+
+            _merged = _prev_hits + _alert_hits
+            if _merged or _wl_part:
+                st.session_state["_watchlist_triggered_alerts"] = _merged
         except Exception:
             pass
 
@@ -14859,25 +14984,37 @@ if st.session_state.get("logged_in"):
     else:
         st.sidebar.caption("저장된 Watchlist 메모가 없습니다.")
     
-    # ── 🔧 Sheets 호출 계측 (관리자 전용) ─────────────────────────────────
-    #   gspread HTTP 왕복 횟수·누적 시간을 세션 단위로 보여준다. 최적화 전후를
-    #   추정이 아니라 숫자로 비교하기 위한 패널이다.
+    # ── 🔧 호출 계측 (관리자 전용) ────────────────────────────────────────
+    #   Sheets·FMP 왕복 횟수와 누적 시간. 최적화 전후를 추정이 아니라 숫자로 비교하고,
+    #   느려졌을 때 어느 쪽이 병목인지 바로 가른다.
     if _is_admin():
-        with st.sidebar.expander("🔧 Sheets 호출 계측", expanded=False):
+        with st.sidebar.expander("🔧 호출 계측", expanded=False):
             _st_b = _gs_stats_bucket()
-            _st_n = int(_st_b.get("n", 0))
-            _st_s = float(_st_b.get("sec", 0.0))
+            _st_n, _st_s = int(_st_b.get("n", 0)), float(_st_b.get("sec", 0.0))
+            with _FMP_STATS_LOCK:
+                _fm_n, _fm_s = int(_FMP_STATS["n"]), float(_FMP_STATS["sec"])
+
+            st.caption("**Sheets** (세션 기준)")
             _c1, _c2 = st.columns(2)
-            _c1.metric("누적 호출", f"{_st_n}회")
-            _c2.metric("누적 시간", f"{_st_s:.1f}초")
-            if _st_n > 0:
-                st.caption(f"평균 {_st_s / _st_n:.2f}초/호출 · 세션 시작 이후 누적")
+            _c1.metric("호출", f"{_st_n}회")
+            _c2.metric("시간", f"{_st_s:.1f}초")
+
+            st.caption("**FMP** (프로세스 기준 · 병렬 포함)")
+            _c3, _c4 = st.columns(2)
+            _c3.metric("호출", f"{_fm_n}회")
+            _c4.metric("시간", f"{_fm_s:.1f}초")
+
             if st.button("계측 초기화", key="gs_stats_reset", use_container_width=True):
                 st.session_state[_GS_STATS_KEY] = {"n": 0, "sec": 0.0}
+                with _FMP_STATS_LOCK:
+                    _FMP_STATS["n"] = 0
+                    _FMP_STATS["sec"] = 0.0
                 st.rerun()
+
             st.caption(
                 "측정 방법: 초기화 → 대상 동작 1회 실행 → 증가분 확인.\n\n"
-                "기준(최적화 후): 워치리스트 수정 2회 · 추가 3회 · 삭제 3회."
+                "기준(최적화 후) — 워치리스트 수정: Sheets 3회 · FMP 1~2회.\n\n"
+                "FMP 시간은 병렬 실행 시 스레드별 소요의 **합**이라 체감 대기보다 큽니다."
             )
 
     if st.sidebar.button("로그아웃", key="sidebar_logout_btn", use_container_width=True):
