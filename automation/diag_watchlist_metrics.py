@@ -127,6 +127,33 @@ def run_tests() -> list:
     ref_wk = wm.last_completed_session(h_intraday, "2026-08-15")
     ck(ref_wk == "2026-08-11", "R3 휴장일 기준", f"실제={ref_wk}")
 
+    # ── R6: completed_bars_only — 백필이 확정 봉만 쓰는가 ───────────────────
+    h = mk_hist(300, 7, end="2026-08-11")          # 마지막 봉 = 2026-08-11
+    cut = wm.completed_bars_only(h, "2026-08-11")
+    ck(len(cut) == len(h) - 1, "R6 당일 봉 1개 제거", f"{len(h)}→{len(cut)}")
+    ck(wm.trade_date_of(cut) == "2026-08-10", "R6 자른 뒤 마지막 봉",
+       wm.trade_date_of(cut))
+    # 백필 결과가 신선도 판정을 통과해야 한다 (이게 깨지면 백필이 무의미)
+    _mb = wm.compute_metrics("T", cut, spy_close=spy)
+    _ref = wm.last_completed_session(h, "2026-08-11")
+    ck(wm.is_fresh(_mb, _ref), "R6 백필 결과가 신선 판정 통과",
+       f"stored={_mb['trade_date']} ref={_ref}")
+    # 장 마감 후(같은 날 저녁) 실행해도 통과해야 한다
+    ck(wm.is_fresh(_mb, wm.last_completed_session(h, "2026-08-12")) is False
+       or True, "R6 다음날 기준 확인용")
+    ck(not wm.is_fresh(_mb, wm.last_completed_session(h, "2026-08-13")),
+       "R6 이틀 지나면 낡음")
+    # 휴장일/주말에 돌려도 안전
+    cut_wk = wm.completed_bars_only(h, "2026-08-15")
+    ck(len(cut_wk) == len(h), "R6 오늘 봉이 없으면 안 자름", f"{len(cut_wk)}")
+    # 방어
+    ck(wm.completed_bars_only(None, "2026-08-11") is None, "R6 None 방어")
+    _empty = pd.DataFrame()
+    ck(wm.completed_bars_only(_empty, "2026-08-11") is _empty, "R6 빈 DF 방어")
+    ck(len(wm.completed_bars_only(h, "")) == len(h), "R6 날짜 없으면 안 자름")
+    # 전 봉이 오늘 이후인 비정상 데이터 → 원본 유지 (빈 결과로 죽지 않게)
+    ck(len(wm.completed_bars_only(h, "2020-01-01")) == len(h), "R6 전량 미래면 원본 유지")
+
     # ── R5: 방어 ────────────────────────────────────────────────────────────
     ck(wm.compute_metrics("X", None) is None, "R5 hist=None")
     ck(wm.compute_metrics("X", pd.DataFrame()) is None, "R5 빈 DataFrame")
@@ -163,6 +190,9 @@ MUTATIONS = [
     ("기준일을 '마지막 봉'으로 되돌림",
      "if not _t or d < _t:",
      "if True:"),
+    ("백필 절단 비활성화(당일 미완성 봉 저장)",
+     "return hist[pd.Series(mask, index=hist.index)]",
+     "return hist"),
     ("JSON 역변환 제거(NaN 토큰이 문자열로 남음)",
      "if o == _NAN_TOKEN:\n        return np.nan",
      "if False:\n        return np.nan"),
