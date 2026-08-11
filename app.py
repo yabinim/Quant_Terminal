@@ -389,21 +389,27 @@ _FMP_HOST = "financialmodelingprep.com"
 
 
 def _install_fmp_instrumentation() -> None:
-    """requests.get 을 1회 래핑(멱등). URL 로 걸러 FMP 호출만 집계한다.
+    """requests 의 실제 HTTP 진입점을 1회 래핑(멱등). URL 로 걸러 FMP 만 집계한다.
 
-    fmp_extras · scanner_core · app.py 가 모두 호출 시점에 `requests.get` 을
-    조회하므로 모듈 속성 하나만 바꾸면 전 경로가 한 번에 잡힌다.
-    Gemini·FRED 등 다른 HTTP 는 호스트가 달라 세지 않는다.
+    ⚠️ `requests.get` 을 감싸면 안 된다. 다른 모듈들이 app.py 보다 **먼저** 임포트되어
+       원본 함수 참조를 자기 네임스페이스에 이미 잡아두기 때문에, 나중에 모듈 속성을
+       바꿔도 그들에게는 반영되지 않는다(실제로 정밀검사 탭 호출이 통째로 누락됐다).
+       requests.get → requests.api.request → Session.request 순으로 내려가므로
+       `Session.request` 하나만 감싸면 임포트 순서와 무관하게 전 경로가 잡힌다.
     """
-    _orig = getattr(requests, "get", None)
+    try:
+        _sess_cls = requests.Session
+    except Exception:
+        return
+    _orig = getattr(_sess_cls, "request", None)
     if _orig is None or getattr(_orig, "_qt_wrapped", False):
         return
 
-    def _wrapped(url, *a, **k):
+    def _wrapped(self, method, url, *a, **k):
         _is_fmp = _FMP_HOST in str(url)
         _t0 = time.perf_counter()
         try:
-            return _orig(url, *a, **k)
+            return _orig(self, method, url, *a, **k)
         finally:
             if _is_fmp:
                 try:
@@ -415,7 +421,7 @@ def _install_fmp_instrumentation() -> None:
 
     _wrapped._qt_wrapped = True
     try:
-        requests.get = _wrapped
+        _sess_cls.request = _wrapped
     except Exception:
         pass
 
@@ -23043,8 +23049,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                       if m.get("updated_at")), "") if _wl_metrics else ""),
                 }
 
-                # 일봉은 어차피 매수 카드(build_buy_card)에 필요하므로 병렬로 한 번에 받는다
-                _hist_pre = _wl_prefetch_histories(tuple(wl_tickers))
+                # 일봉은 폴백 계산이 필요한 종목만 받는다.
+                # ⚠️ 예전에는 전 종목을 받았다. 매수 카드(build_buy_card)가 hist 를
+                #    요구하기 때문인데, 카드는 expander 를 펼친 종목에서만 그려진다.
+                #    저장본이 있는 종목의 일봉은 카드를 펼칠 때 그 자리에서 받으면 된다
+                #    (_fmp_price_history 는 프로세스 캐시라 두 번째부터 즉시 반환).
+                _hist_pre = _wl_prefetch_histories(tuple(_wl_live)) if _wl_live else {}
                 for tk in wl_tickers:
                     try:
                         hist = _hist_pre.get(tk)
@@ -23326,7 +23336,15 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 sizing_mode=_it_mode,
                             )
                             _wl_plan_map[tk] = _wl_plan   # ✅ 매수 등록 폼 수량/금액 프리필용
-                            _bc = rc.build_buy_card(hist_map_wl.get(tk), _an, _wl_plan, confluence=None)
+                            # 프리페치에서 제외된 종목은 카드를 펼치는 이 시점에 받는다
+                            _hist_card = hist_map_wl.get(tk)
+                            if _hist_card is None:
+                                try:
+                                    _hist_card = _fmp_price_history(tk, limit=252)
+                                    hist_map_wl[tk] = _hist_card
+                                except Exception:
+                                    _hist_card = None
+                            _bc = rc.build_buy_card(_hist_card, _an, _wl_plan, confluence=None)
                             st.markdown(f"**🎯 {_bc['badge']}** · {_bc['glance_num']}")
                             if _wl_plan["gate"] == "na":
                                 st.caption(f"🧮 플랜: {_wl_plan['gate_label']} — {_wl_plan['gate_reason']}")
