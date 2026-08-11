@@ -1,0 +1,27 @@
+name: 🔍 진단 — 워치리스트 쓰기 경로 드리프트 가드 (수동 전용)
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/repository_dispatch 트리거 없음.
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5      # 네트워크·시트 접근 없는 순수 정적 검증 — 보통 10초 내
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 의존성 설치 없음 — app.py 를 import 하지 않고 AST 로 대상 함수만 떼어내
+      # 가짜 워크시트 위에서 실행한다. Streamlit·gspread·네트워크 전부 불필요.
+
+      - name: 🔍 드리프트 가드 회귀 + 뮤테이션 검증
+        run: python automation/diag_watchlist_writepath.py
+
+      - name: ✅ Python 3.11 f-string 호환성
+        run: python check_py311.py app.py
