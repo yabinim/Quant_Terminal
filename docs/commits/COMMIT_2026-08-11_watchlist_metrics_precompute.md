@@ -80,7 +80,11 @@ D~K 를 별도 열로 둔 것은 시트를 직접 열어 눈으로 확인하는 
 이걸 분리하지 않으면 앱과 자동화가 갈라지는데, 그게 정확히 SSOT 규칙이 막으려는
 실패 모드다.
 
-- `compute_metrics()` / `to_row()` / `from_row()` / `is_fresh()` / `last_completed_session()`
+- `compute_metrics()` / `to_row()` / `from_row()` / `is_fresh()` /
+  `last_completed_session()` / `completed_bars_only()`
+- `SSOT_VERSION = "2026-08-06a"` — app.py 의 `_SSOT_REQUIRED` 대조 목록에 등록했다.
+  이 모듈만 안 올라가거나 Streamlit 재부팅을 빠뜨리면 앱 시작 단계에서
+  파일 이름을 찍어 알려준다(구버전이 조용히 계속 도는 사고 방지).
 - RSI 는 `rc.compute_rsi` 사용. `app.py` 의 `calculate_rsi`(scanner_core)와 동일한
   단순 롤링 평균 방식이며(compute_rsi 독스트링에 명시), 자동화가 `scanner_core` 를
   임포트하지 않아도 되게 한다. **의존은 `regime_core` 하나뿐이다.**
@@ -105,6 +109,22 @@ D~K 를 별도 열로 둔 것은 시트를 직접 열어 눈으로 확인하는 
   기존 순차 호출을 대체한다.
 - 지표 출처 캡션 추가 — 기준일·저장본/실시간 종목 수·자동 갱신 시각을 항상 표시.
   어떤 봉 기준의 판정인지 숨기지 않는다.
+
+### `run_watchlist_alerts.py` — 지표 백필 모드 (`--scope metrics`)
+
+시트 복구·즉시 반영·휴장일 실행을 위한 수동 전용 경로.
+
+- 평가·이메일·**알림 상태머신을 전부 건너뛴다**. 2일 확정 카운터가 진행되지 않고
+  오발송도 없다.
+- 휴장일 가드보다 **앞에** 분기한다 — 시트 복구는 언제든 가능해야 한다.
+- `wm.completed_bars_only()` 로 당일 미완성 봉을 잘라 **확정 봉 기준으로 고정**한다.
+  실행 시각과 무관하게 결과가 결정적이고, `is_fresh` 의 기준(`last_completed_session`)과
+  정확히 맞는다. 정기 EOD 실행은 마감 후라 당일 봉이 확정이므로 자르지 않는다.
+- 절단본은 지역 변수로만 쓰고 `hist_cache` 에 되쓰지 않는다.
+
+⚠️ 워크플로에 `GMAIL_*` 시크릿을 함께 넘긴다. 이 스크립트는 모듈 로드 시점에
+   `os.environ["GMAIL_USER"]` 등을 직접 읽으므로, 메일을 보내지 않는 백필이라도
+   변수가 없으면 임포트 단계에서 KeyError 로 죽는다.
 
 ### `automation/diag_watchlist_metrics.py` + 워크플로 (신규)
 
@@ -162,14 +182,20 @@ diag_watchlist_writepath.py  → 원본 전 항목 통과 + 뮤테이션 6/6 탐
 
 ## 6. 배포 순서 (lockstep)
 
+⚠️ 배포 위치를 반드시 확인할 것. `run_watchlist_alerts.py` 는 `automation/` 에 있다
+   (기존 워크플로가 `python automation/run_watchlist_alerts.py` 로 실행).
+   루트에 올리면 워크플로는 구버전을 계속 실행해 `--scope metrics` 가
+   `invalid choice` 로 실패한다.
+
 ⚠️ `watchlist_metrics_core.py` 는 공유 SSOT 모듈이다. **app 과 automation 을 반드시
    동시에** 올린다. 한쪽만 올리면 임포트 실패로 죽는다.
 
 1. `watchlist_metrics_core.py` → 저장소 루트 (신규)
 2. `app.py` → 저장소 루트 (덮어쓰기)
-3. `run_watchlist_alerts.py` → 저장소 루트 (덮어쓰기)
+3. `run_watchlist_alerts.py` → **`automation/`** (덮어쓰기) ⚠️ 루트 아님
 4. `automation/diag_watchlist_metrics.py` → 신규
 5. `.github/workflows/diag_watchlist_metrics.yml` → 신규
+5b. `.github/workflows/backfill_metrics.yml` → 신규 (지표 백필 수동 실행)
 6. **Streamlit 재부팅**
 7. Actions → 「🔍 진단 — 워치리스트 지표 파이프라인」 수동 1회
 
@@ -180,6 +206,8 @@ diag_watchlist_writepath.py  → 원본 전 항목 통과 + 뮤테이션 6/6 탐
 **즉시 (자동화 전)**
 - 워치리스트 탭 진입 → 캡션에 "지표를 실시간 계산했습니다" 표시가 정상.
   아직 시트가 없으므로 속도는 종전과 같다.
+- Actions → 「🧰 지표 백필」 수동 실행 → `Watchlist_Metrics` 생성 확인 →
+  앱 새로고침 시 저장본이 잡히는지 확인. 정기 EOD 를 기다리지 않고 검증할 수 있다.
 
 **첫 EOD 자동화(평일 5PM ET) 이후**
 1. Google Sheets 에 `Watchlist_Metrics` 탭 생성 확인. 행 수 = 워치리스트 고유 티커 수.
