@@ -39,6 +39,7 @@ import regime_core as rc  # noqa: E402
 import users_core as uc   # noqa: E402  — Users 시트/수신자 SSOT (app.py와 동일 모듈)
 import accounts_core as ac  # noqa: E402  — 계좌 프로필/자본금 순수 로직 SSOT (app.py와 동일 모듈)
 import earnings_core as ec  # noqa: E402  — 실적 이벤트 리스크 SSOT (app.py와 동일 모듈)
+import watchlist_metrics_core as wm  # noqa: E402  — 워치리스트 표시 지표 SSOT (app.py와 동일 모듈)
 
 # ── 환경변수 ───────────────────────────────────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -921,24 +922,126 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
     return hits_by_user
 
 
+def persist_watchlist_metrics(spy_close, hist_cache, today_et: str,
+                              completed_only: bool = False) -> int:
+    """워치리스트 표시용 지표를 Watchlist_Metrics 시트에 저장한다. → 저장 종목 수
+
+    앱이 리런마다 55종목 × analyze_ticker 를 돌리느라 10초씩 걸리던 계산을 여기로
+    옮긴다. 이 스크립트는 이미 평가 과정에서 hist_cache 를 채우므로 네트워크
+    추가 비용이 사실상 없다.
+
+    ⚠️ 티커 단위 = 전 사용자 합집합. 개인 데이터는 들어가지 않으므로 게스트도
+       그대로 읽는다. 중복 티커는 한 번만 계산한다.
+    ⚠️ 실패해도 예외를 밖으로 던지지 않는다. 앱에는 실시간 계산 폴백이 있어
+       이 저장이 빠져도 느려질 뿐 기능이 죽지 않는다. 알림 발송을 막는 게 더 나쁘다.
+    """
+    try:
+        sh, ws_wl = _open_ws(_WATCHLIST_WORKSHEET)
+    except Exception as e:
+        print(f"[WARN] 지표 저장 스킵 (Watchlist 열기 실패): {e}")
+        return 0
+    try:
+        vals = ws_wl.get_all_values() or []
+        tickers = []
+        for r in vals[1:]:
+            r = (list(r) + [""] * _WL_NCOL)[:_WL_NCOL]
+            tk = str(r[1]).strip().upper()
+            if tk and tk not in tickers:
+                tickers.append(tk)
+        if not tickers:
+            print("[INFO] 지표 저장: 대상 티커 없음.")
+            return 0
+
+        _now = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
+        rows, n_ok = [], 0
+        for tk in tickers:
+            try:
+                if tk not in hist_cache:
+                    hist_cache[tk] = _fmp_price_history(tk)
+                _h = hist_cache[tk]
+                if completed_only:
+                    # 백필 모드: 당일 미완성 봉을 잘라 확정 봉 기준으로 고정한다.
+                    # hist_cache 에는 되쓰지 않는다(다른 평가 경로가 원본을 쓰도록).
+                    _h = wm.completed_bars_only(_h, today_et)
+                m = wm.compute_metrics(tk, _h, spy_close=spy_close,
+                                       updated_at=_now)
+                if m is None:
+                    continue
+                rows.append(wm.to_row(m))
+                n_ok += 1
+            except Exception as e:
+                print(f"  [WARN] {tk} 지표 계산 실패: {e}")
+
+        if not rows:
+            print("[INFO] 지표 저장: 계산 결과 없음.")
+            return 0
+
+        # 티커 단위 전량 재작성. 개인 데이터가 없어 사용자별 병합이 필요 없고,
+        # 워치리스트에서 빠진 종목이 자연히 정리된다.
+        try:
+            titles = [w.title for w in sh.worksheets()]
+            if wm.SHEET_TITLE in titles:
+                ws = sh.worksheet(wm.SHEET_TITLE)
+            else:
+                ws = sh.add_worksheet(title=wm.SHEET_TITLE, rows=2000, cols=wm.NCOL)
+        except Exception as e:
+            print(f"[WARN] 지표 시트 준비 실패: {e}")
+            return 0
+
+        all_rows = [wm.COLS] + rows
+        _end = gspread.utils.rowcol_to_a1(len(all_rows), wm.NCOL)
+        ws.clear()
+        ws.update(all_rows, range_name=f"A1:{_end}", value_input_option="USER_ENTERED")
+        print(f"[OK] 지표 저장 {n_ok}종목 → {wm.SHEET_TITLE} ({wm.SSOT_VERSION})")
+        return n_ok
+    except Exception as e:
+        print(f"[WARN] 지표 저장 실패(무시하고 계속): {e}")
+        return 0
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["eod", "intraday"], default="eod",
                         help="eod=마감 후 확정(기본) / intraday=장중 잠정 헤드업")
-    parser.add_argument("--scope", choices=["watchlist", "portfolio", "both"], default="both",
-                        help="평가 대상 (기본 both)")
+    parser.add_argument("--scope",
+                        choices=["watchlist", "portfolio", "both", "metrics"], default="both",
+                        help="평가 대상 (기본 both). metrics=지표 백필 전용 "
+                             "(알림·이메일·상태머신 없음, 휴장일에도 동작)")
     args = parser.parse_args()
 
     print("=" * 60)
     print(f"[START] 알림 ({args.mode}/{args.scope}): "
           f"{datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
 
+    today = datetime.now(_ET).strftime("%Y-%m-%d")
+
+    # ── 지표 백필 (--scope metrics) ────────────────────────────────────────
+    #   Watchlist_Metrics 만 다시 쓴다. 평가·이메일·알림 상태머신을 전부 건너뛰므로
+    #   2일 확정 카운터가 진행되지 않고 오발송도 없다.
+    #   휴장일 가드도 우회한다 — 시트 복구는 언제든 가능해야 한다.
+    #   확정 봉 기준이라 실행 시각과 무관하게 결과가 결정적이다.
+    if args.scope == "metrics":
+        print("[MODE] 지표 백필 — 확정 봉 기준 · 알림/이메일 없음 · 상태머신 미진행")
+        try:
+            _spy = wm.completed_bars_only(_fmp_price_history("SPY"), today)
+            _spy_c = (_spy["Close"]
+                      if (_spy is not None and not _spy.empty and "Close" in _spy.columns)
+                      else None)
+            if _spy_c is None:
+                print("[WARN] SPY 일봉 없음 — RS 없이 진행합니다.")
+            n = persist_watchlist_metrics(_spy_c, {}, today, completed_only=True)
+            print(f"[DONE] 백필 {n}종목 — {datetime.now(_KST).strftime('%H:%M KST')}")
+        except Exception as e:
+            print(f"[ERROR] 백필 실패: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+        return
+
     if not is_market_open_today():
         print("[SKIP] 오늘은 NYSE 휴장일 — 평가 건너뜀(카운터 미진행).")
         return
 
-    today = datetime.now(_ET).strftime("%Y-%m-%d")
     do_wl = args.scope in ("watchlist", "both")
     do_pf = args.scope in ("portfolio", "both")
 
@@ -980,6 +1083,10 @@ def main():
                 dispatch_radar_emails(wl_res, pf_res, today, "🔔", "매매 레이더")
             else:
                 print("[INFO] 발동된 알림 없음 — 이메일 생략.")
+            # 앱 표시용 지표 저장 — 마감 후 확정 봉 기준. 이메일 발송 뒤에 두어
+            # 저장이 실패해도 알림 전달에는 영향이 없게 한다.
+            if do_wl:
+                persist_watchlist_metrics(spy_close, hist_cache, today)
     except Exception as e:
         print(f"[ERROR] 평가 실패: {e}")
         traceback.print_exc()
