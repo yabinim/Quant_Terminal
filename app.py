@@ -383,9 +383,24 @@ _install_gs_instrumentation()
 #   세면 병렬 호출이 통째로 누락된다. 관리자 진단용이라 프로세스 전체 기준으로도
 #   충분하며 오히려 스레드 작업까지 잡아내 더 정확하다.
 # ══════════════════════════════════════════════════════════════════════════════
-_FMP_STATS = {"n": 0, "sec": 0.0}
 _FMP_STATS_LOCK = threading.Lock()
 _FMP_HOST = "financialmodelingprep.com"
+
+
+@st.cache_resource(show_spinner=False)
+def _fmp_stats_store() -> dict:
+    """FMP 누적 통계 저장소.
+
+    ⚠️ 절대 모듈 레벨 dict 로 두면 안 된다. app.py 는 Streamlit 스크립트 본체라
+       리런마다 위에서부터 재실행되고, 그때 모듈 레벨 변수는 새로 만들어져
+       카운터가 매번 0으로 초기화된다(실제로 FMP 계측이 항상 0으로 보이던 원인).
+       @st.cache_resource 는 리런 간 같은 객체를 돌려주므로 누적이 유지된다.
+       세션이 아니라 프로세스 단위인 것은 의도다 — 워커 스레드에서도 접근해야 한다.
+    """
+    return {"n": 0, "sec": 0.0}
+
+
+_FMP_STATS = _fmp_stats_store()
 
 
 def _install_fmp_instrumentation() -> None:
@@ -442,13 +457,15 @@ _install_fmp_instrumentation()
 _PERF_KEY = "_perf_spans"
 
 
+@st.cache_resource(show_spinner=False)
+def _perf_store() -> dict:
+    """구간 타이밍 저장소. FMP 통계와 같은 이유로 cache_resource 를 쓴다."""
+    return {}
+
+
 def _perf_bucket() -> dict:
     try:
-        b = st.session_state.get(_PERF_KEY)
-        if not isinstance(b, dict):
-            b = {}
-            st.session_state[_PERF_KEY] = b
-        return b
+        return _perf_store()
     except Exception:
         return {}
 
@@ -15127,7 +15144,10 @@ if st.session_state.get("logged_in"):
 
             if st.button("계측 초기화", key="gs_stats_reset", use_container_width=True):
                 st.session_state[_GS_STATS_KEY] = {"n": 0, "sec": 0.0}
-                st.session_state[_PERF_KEY] = {}
+                try:
+                    _perf_store().clear()
+                except Exception:
+                    pass
                 with _FMP_STATS_LOCK:
                     _FMP_STATS["n"] = 0
                     _FMP_STATS["sec"] = 0.0
@@ -15152,9 +15172,11 @@ if st.session_state.get("logged_in"):
                 st.caption(f"합계 {_tot:.2f}초 (계측된 구간만)")
 
             st.caption(
-                "측정 방법: 초기화 → 대상 동작 1회 실행 → 증가분 확인.\n\n"
+                "⚠️ **이 패널은 사이드바라 본문보다 먼저 그려집니다.** 방금 실행한 동작의 "
+                "수치는 화면을 한 번 더 갱신해야(다른 탭 갔다 오거나 위젯 조작) 반영됩니다.\n\n"
+                "측정: 초기화 → 대상 동작 1회 → **한 번 더 갱신** → 증가분 확인.\n\n"
                 "기준(최적화 후) — 워치리스트 수정: Sheets 3회 · FMP 1~2회.\n\n"
-                "FMP 시간은 병렬 실행 시 스레드별 소요의 **합**이라 체감 대기보다 큽니다."
+                "FMP·구간 수치는 프로세스 누적(병렬 스레드 포함)이라 체감 대기보다 클 수 있습니다."
             )
 
     if st.sidebar.button("로그아웃", key="sidebar_logout_btn", use_container_width=True):
