@@ -10016,7 +10016,26 @@ def build_portfolio_sell_radar_df(portfolio_df):
                 ticker_to_rank[tk] = int(rk)
 
     unique_holdings = sorted(dict.fromkeys(clean_tickers))
-    quote_by_ticker = {t: cached_quote_type(t) for t in unique_holdings}
+    # 종목당 1콜씩 순차로 받던 것을 병렬로 묶는다 (보유 50종목이면 50콜 순차 = 수십 초).
+    # cached_quote_type 은 @st.cache_data 라 두 번째부터는 즉시 반환된다.
+    def _qt_one(_t):
+        try:
+            return _t, cached_quote_type(_t)
+        except Exception:
+            return _t, ""
+
+    quote_by_ticker = {}
+    try:
+        import concurrent.futures as _qt_cf
+        _qw = max(2, min(8, len(unique_holdings) or 1))
+        with _qt_cf.ThreadPoolExecutor(max_workers=_qw) as _qt_ex:
+            for _t, _v in _qt_ex.map(_qt_one, unique_holdings):
+                quote_by_ticker[_t] = _v
+    except Exception:
+        quote_by_ticker = {}
+    # 전멸 시 순차 폴백 — quote_type 이 비면 ETF/개별주 구분이 틀어져 판정이 어긋난다
+    if unique_holdings and not any(quote_by_ticker.values()):
+        quote_by_ticker = {t: cached_quote_type(t) for t in unique_holdings}
 
     # 선행 신호(RSI·MACD·52주 이격)를 매도 판정에 통합하기 위해 미리 계산
     sell_sig_map = compute_sell_signal_indicators(unique_holdings)
@@ -11624,6 +11643,40 @@ def _wl_prefetch_histories(tickers: tuple, limit: int = 252) -> dict:
     except Exception:
         # 병렬 실패 시 순차 폴백 — 느릴 뿐 결과는 동일하다
         for tk in tks:
+            out[tk] = _one(tk)[1]
+    return out
+
+
+def _pf_prefetch_histories(tickers: tuple, limit: int = 600) -> dict:
+    """포트폴리오 보유 종목 일봉을 병렬로 미리 받는다. {TICKER: DataFrame|None}
+
+    워치리스트용 _wl_prefetch_histories 와 같은 패턴이지만 봉 수가 600 이다
+    (매도 레이더는 200일선·장기 추세를 봐야 해서 252봉으로는 부족하다).
+
+    ⚠️ max_workers 를 종목 수에 맞춰 조절한다. 보유가 50종목까지 늘어도
+       FMP Starter 300/분 안에서 안전하도록 상한을 8로 둔다. 레이트리밋 자체는
+       fmp_extras 의 락 기반 슬라이딩 윈도우가 강제하므로 초과하지 않는다.
+    ⚠️ 실패한 종목은 None 으로 남긴다. 호출부가 이미 None/빈 DF 를 처리한다.
+    """
+    out = {}
+    tks = [t for t in dict.fromkeys(str(x).strip().upper() for x in (tickers or [])) if t]
+    if not tks:
+        return out
+
+    def _one(tk):
+        try:
+            return tk, _fmp_price_history(tk, limit=limit)
+        except Exception:
+            return tk, None
+
+    try:
+        import concurrent.futures as _cf
+        _w = max(2, min(8, len(tks)))
+        with _cf.ThreadPoolExecutor(max_workers=_w) as _ex:
+            for _tk, _df in _ex.map(_one, tks):
+                out[_tk] = _df
+    except Exception:
+        for tk in tks:                      # 병렬 실패 시 순차 폴백
             out[tk] = _one(tk)[1]
     return out
 
@@ -20322,11 +20375,25 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                  else None)
             except Exception:
                 _spy_pf_close = None
-            _pf_hist_cache = {}
+            # ── 보유 종목 일봉 병렬 프리페치 ──────────────────────────────
+            #   아래 계좌별 루프가 종목마다 600봉을 순차로 받고 analyze_ticker 를
+            #   돌려 25종목 기준 3분 가까이 걸렸다. 조회를 미리 한 번에 끝내면
+            #   루프는 전부 캐시 히트가 된다.
+            #   ⚠️ 병렬화는 네트워크 I/O 에만 적용한다. analyze_ticker 는 계좌 루프에서
+            #      순차로 남긴다 — entry_price/entry_date 가 행마다 달라 캐시가 안 되고,
+            #      regime_core 를 스레드에 태우면 검증 부담이 커진다.
+            #   ⚠️ 600봉은 워치리스트(252봉)의 2.4배다. FMP 레이트리밋은
+            #      fmp_extras 의 락 기반 슬라이딩 윈도우가 처리하므로 초과하지 않는다.
+            with _timed("PF 일봉 프리페치"):
+                _pf_hist_cache = _pf_prefetch_histories(
+                    tuple(portfolio_df["Ticker"].astype(str).str.strip().str.upper().unique())
+                )
+            _perf_note("PF 일봉 프리페치", f"{len(_pf_hist_cache)}종목 · 600봉")
             # 카드·표 매도 판정 통일: integrated_sell_verdict(표와 동일 소스) 상태를 미리 계산해 공유
             _card_status, _card_status_tk = {}, {}
             try:
-                _crdf = build_portfolio_sell_radar_df(portfolio_df)
+                with _timed("PF 매도레이더 계산"):
+                    _crdf = build_portfolio_sell_radar_df(portfolio_df)
                 for _, _cr in _crdf.iterrows():
                     _ck = str(_cr.get("티커", "")).strip().upper()
                     _ca = str(_cr.get("계좌", "")).strip()
@@ -20348,6 +20415,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     return f":green[**{_l}**]"
                 return f"**{_l}**"
 
+            _t_acct0 = time.perf_counter()
+            _n_an = 0
             for acct in sorted(portfolio_df["Account"].astype(str).unique(), key=lambda x: str(x).lower()):
                 sub = portfolio_df[portfolio_df["Account"] == acct].sort_values("Ticker")
                 _acct_rows = []
@@ -20365,6 +20434,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         )
                     except Exception:
                         _an = None
+                    _n_an += 1
                     _acct_rows.append((_tk, _avg, _h.get("Quantity"), _an))
 
                 _n_exit = sum(1 for (_, _, _, a) in _acct_rows if a and a.get("exit", {}).get("is_exit"))
@@ -20547,6 +20617,16 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                         else:
                                             st.error(f"저장 실패: {_e_sug}")
                         st.divider()
+
+            # 계좌 카드 렌더 전체 소요 — 프리페치 후 남는 CPU(analyze_ticker) 비중을 본다
+            try:
+                _b = _perf_bucket()
+                _b["PF 계좌카드 렌더"] = {
+                    "n": 1, "sec": time.perf_counter() - _t_acct0, "fmp": 0,
+                    "note": f"analyze_ticker {_n_an}회",
+                }
+            except Exception:
+                pass
 
         # ── ⚙️ 계좌 프로필 (포지션 사이징 설정) ──────────────────────
         with st.expander("⚙️ 계좌 프로필 (포지션 사이징 설정)", expanded=False):
