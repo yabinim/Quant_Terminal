@@ -20427,17 +20427,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             try:
                 with _timed("PF 매도레이더 계산"):
                     _crdf = build_portfolio_sell_radar_df(portfolio_df)
-                _rm = st.session_state.get("_pf_rank_meta") or {}
-                if _rm.get("date"):
-                    st.caption(
-                        f"🏅 유니버스 랭킹 기준 **{_rm['date']}** (Hidden Alpha 주간 스냅샷 "
-                        f"Top {_rm.get('n', 0)}) — 매주 토요일 갱신됩니다."
-                    )
-                elif _rm:
-                    st.caption(
-                        "🏅 유니버스 랭킹 스냅샷이 아직 없습니다 — "
-                        "Hidden Alpha 자동화가 한 번 돌면 순위가 표시됩니다."
-                    )
                 for _, _cr in _crdf.iterrows():
                     _ck = str(_cr.get("티커", "")).strip().upper()
                     _ca = str(_cr.get("계좌", "")).strip()
@@ -21531,6 +21520,20 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     .map(style_universe_rank_cell, subset=["유니버스 랭킹(Universe Rank)"])
                 )
                 st.dataframe(styled_sell_radar, use_container_width=True, hide_index=True)
+                # 랭킹 출처·기준일은 순위 열이 보이는 이 자리에 둔다.
+                # (계산 지점에 두면 표에서 수백 줄 위라 눈에 띄지 않는다)
+                _rm = st.session_state.get("_pf_rank_meta") or {}
+                if _rm.get("date"):
+                    st.caption(
+                        f"🏅 유니버스 랭킹 기준 **{_rm['date']}** · Hidden Alpha 주간 "
+                        f"스냅샷 Top {_rm.get('n', 0)} — 매주 토요일 갱신 · "
+                        "그 밖은 「30위권 밖」으로 표시"
+                    )
+                elif _rm:
+                    st.caption(
+                        "🏅 유니버스 랭킹 스냅샷이 아직 없습니다 — "
+                        "Hidden Alpha 자동화가 한 번 돌면 순위가 표시됩니다."
+                    )
 
                 # ── 📡 지금 왜 움직이나? (실시간 등락 브리핑) ────────────────
                 st.divider()
