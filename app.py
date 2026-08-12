@@ -6790,8 +6790,29 @@ def fetch_company_overview(ticker_upper: str) -> dict:
     """회사 기본 정보 조회 — FMP profile primary, _fmp_fill 보완."""
     try:
         info = {}
-        info = _fmp_fill(info, ticker_upper)
-        p = _fmp_profile(ticker_upper)
+        # _fmp_fill 과 _fmp_profile 은 서로 독립이라 동시에 받는다.
+        # (아래 '다음 실적 발표일' 4단계는 폴백 체인이라 병렬화하지 않는다 —
+        #  앞이 성공하면 뒤를 아예 부르지 않으므로 병렬화하면 FMP 콜만 늘어난다)
+        try:
+            import concurrent.futures as _co_ex
+            with _co_ex.ThreadPoolExecutor(max_workers=2) as _ex_co:
+                _f_fill = _ex_co.submit(_fmp_fill, {}, ticker_upper)
+                _f_prof = _ex_co.submit(_fmp_profile, ticker_upper)
+                try:
+                    info = _f_fill.result(timeout=20) or {}
+                except Exception:
+                    info = {}
+                try:
+                    p = _f_prof.result(timeout=20) or {}
+                except Exception:
+                    p = {}
+        except Exception:
+            info, p = {}, {}
+        # 둘 다 비면 병렬이 무효였을 수 있다 → 순차로 다시 받는다.
+        # (회사명·섹터가 통째로 빠지면 화면이 잘못된 정보를 보여주게 된다)
+        if not info and not p:
+            info = _fmp_fill({}, ticker_upper)
+            p = _fmp_profile(ticker_upper)
         name = str(info.get("longName") or info.get("shortName") or p.get("companyName") or ticker_upper)
         sector_en = str(info.get("sector") or p.get("sector") or "")
         industry_en = str(info.get("industry") or p.get("industry") or "")
