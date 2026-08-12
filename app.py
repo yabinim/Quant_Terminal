@@ -471,29 +471,50 @@ def _perf_bucket() -> dict:
 
 
 class _timed:
-    """구간 소요 시간을 누적하는 컨텍스트 매니저. 계측 실패는 절대 전파하지 않는다."""
+    """구간 소요 시간 + 그 구간에서 발생한 FMP 호출 수를 누적한다.
 
-    __slots__ = ("label", "_t0", "_note")
+    시간만으로는 부족하다. "이 구간이 느린 게 네트워크 때문인가 CPU 때문인가"를
+    가르려면 구간 안에서 몇 콜이 나갔는지가 필요하다. 진입/이탈 시점의 전역
+    FMP 카운터 차이로 구한다.
+
+    ⚠️ 병렬 구간에서는 다른 스레드의 호출도 함께 잡힐 수 있다. 정밀검사 탭은
+       순차 실행이라 문제없지만, 병렬 구간 수치는 참고값으로 본다.
+    계측 실패는 절대 전파하지 않는다.
+    """
+
+    __slots__ = ("label", "_t0", "_note", "_c0")
 
     def __init__(self, label: str, note: str = ""):
         self.label = str(label)
         self._note = str(note or "")
         self._t0 = 0.0
+        self._c0 = 0
 
     def __enter__(self):
         self._t0 = time.perf_counter()
+        try:
+            with _FMP_STATS_LOCK:
+                self._c0 = int(_FMP_STATS.get("n", 0))
+        except Exception:
+            self._c0 = 0
         return self
 
     def __exit__(self, *exc):
         try:
             _dt = time.perf_counter() - self._t0
+            try:
+                with _FMP_STATS_LOCK:
+                    _dc = int(_FMP_STATS.get("n", 0)) - self._c0
+            except Exception:
+                _dc = 0
             _b = _perf_bucket()
             _e = _b.get(self.label)
             if not isinstance(_e, dict):
-                _e = {"n": 0, "sec": 0.0, "note": ""}
+                _e = {"n": 0, "sec": 0.0, "fmp": 0, "note": ""}
                 _b[self.label] = _e
             _e["n"] += 1
             _e["sec"] += _dt
+            _e["fmp"] = int(_e.get("fmp", 0)) + max(0, _dc)
             if self._note:
                 _e["note"] = self._note
         except Exception:
@@ -15160,16 +15181,24 @@ if st.session_state.get("logged_in"):
                 st.caption("**구간별 소요** (느린 순)")
                 _rows = sorted(_spans.items(), key=lambda kv: -float(kv[1].get("sec", 0)))
                 _tot = sum(float(v.get("sec", 0)) for _, v in _rows)
-                for _lbl, _v in _rows[:8]:
+                for _lbl, _v in _rows[:14]:
                     _sec = float(_v.get("sec", 0))
                     _n = int(_v.get("n", 0))
+                    _fc = int(_v.get("fmp", 0))
                     _nt = str(_v.get("note", "") or "")
                     st.markdown(
                         f"- **{_lbl}** — {_sec:.2f}초"
                         + (f" ×{_n}" if _n > 1 else "")
+                        + (f" · FMP {_fc}콜" if _fc else "")
                         + (f" · {_nt}" if _nt else "")
                     )
-                st.caption(f"합계 {_tot:.2f}초 (계측된 구간만)")
+                _fc_tot = sum(int(v.get("fmp", 0)) for _, v in _rows)
+                with _FMP_STATS_LOCK:
+                    _fc_all = int(_FMP_STATS.get("n", 0))
+                st.caption(
+                    f"계측 구간 합계 {_tot:.2f}초 · FMP {_fc_tot}콜"
+                    + (f" · **미계측 {_fc_all - _fc_tot}콜**" if _fc_all > _fc_tot else "")
+                )
 
             st.caption(
                 "⚠️ **이 패널은 사이드바라 본문보다 먼저 그려집니다.** 방금 실행한 동작의 "
@@ -18465,14 +18494,16 @@ if st.session_state.get("logged_in"):
                 st.success("✅ [ETF 패스] 분산 투자된 펀드이므로 개별 재무 건전성 킬 스위치를 면제합니다.")
     
                 with st.spinner(f"{selected_ticker} 보유 종목(Top Holdings) 불러오는 중..."):
-                    holdings_universe = cached_etf_holdings_universe_str(selected_ticker)
+                    with _timed("정밀 보유ETF검색"):
+                        holdings_universe = cached_etf_holdings_universe_str(selected_ticker)
                     if holdings_universe is None or holdings_universe.empty:
                         holdings_top10 = pd.DataFrame(columns=["Ticker", "Weight(%)"])
                         etf_perf_df = pd.DataFrame()
                     else:
                         holdings_top10 = holdings_universe.head(10).reset_index(drop=True)
                         perf_key = _etf_holdings_perf_cache_key(holdings_top10)
-                        etf_perf_df = cached_build_etf_holdings_performance_pairs(perf_key)
+                        with _timed("정밀 ETF성과쌍"):
+                            etf_perf_df = cached_build_etf_holdings_performance_pairs(perf_key)
     
                 if holdings_universe is None or holdings_universe.empty:
                     st.info("해당 ETF의 세부 종목 데이터를 야후 파이낸스에서 불러올 수 없습니다.")
@@ -18699,7 +18730,8 @@ if st.session_state.get("logged_in"):
                 with st.expander("🏦 재무 건전성 점수 (Altman Z / Piotroski F)", expanded=True):
                     st.caption("FMP `/financial-scores` 기반. Altman Z는 파산 위험, Piotroski F는 재무 종합 점수(0~9).")
                     with st.spinner(f"{selected_ticker} 재무 건전성 점수 조회 중..."):
-                        _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
+                        with _timed("정밀 재무건전성"):
+                            _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
                     if _fs:
                         _az = to_float(_fs.get("altmanZScore"))
                         _ps = to_float(_fs.get("piotroskiScore"))
@@ -18777,7 +18809,8 @@ if st.session_state.get("logged_in"):
         with _tc_col1:
             if st.button("🤖 트랜스크립트 AI 요약 실행", key=f"tc_btn_{selected_ticker}", use_container_width=True):
                 with st.spinner("어닝콜 원문 조회 중..."):
-                    _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
+                    with _timed("정밀 어닝콜원문"):
+                        _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
                 st.session_state[_tc_raw_key] = _tc_data
                 if _tc_data and _tc_data.get("content"):
                     _tc_text = str(_tc_data["content"])[:6000]
@@ -18827,7 +18860,8 @@ if st.session_state.get("logged_in"):
 
         try:
             with st.spinner(f"{selected_ticker} 타이밍 데이터를 불러오는 중..."):
-                timing_history = cached_timing_price_history(str(selected_ticker).strip())
+                with _timed("정밀 타이밍일봉"):
+                    timing_history = cached_timing_price_history(str(selected_ticker).strip())
 
             if timing_history is None or timing_history.empty or "Close" not in timing_history.columns:
                 st.warning("가격 데이터를 불러오지 못했습니다. 티커를 확인해주세요.")
@@ -18904,7 +18938,8 @@ if st.session_state.get("logged_in"):
                 #    고정 30/70 대신 종목의 추세 강도(대장주/횡보/약세)에 맞춰
                 #    Cardwell RSI 밴드(강세 40·80 / 횡보 40·70 / 약세 20·60)를 적용.
                 try:
-                    _spy_hist = cached_timing_price_history("SPY")
+                    with _timed("정밀 SPY일봉"):
+                        _spy_hist = cached_timing_price_history("SPY")
                     _spy_close = (
                         _spy_hist["Close"]
                         if (_spy_hist is not None and not _spy_hist.empty and "Close" in _spy_hist.columns)
@@ -18987,6 +19022,7 @@ if st.session_state.get("logged_in"):
                         if not is_etf_mode:
                             _tkr_u = str(selected_ticker).strip().upper()
                             with st.spinner("근거 종합 중..."):
+                                _t_conf0 = time.perf_counter()
                                 try:
                                     _fsc = _fmp_financial_scores(_tkr_u)
                                     _piotroski = to_float(_fsc.get("piotroskiScore"))
@@ -19011,6 +19047,16 @@ if st.session_state.get("logged_in"):
                                     _ec = fetch_earnings_calendar((_tkr_u,))
                                     if _ec:
                                         _edays = _ec[0].get("days_until")
+                                except Exception:
+                                    pass
+                                try:
+                                    _b = _perf_bucket()
+                                    _e = _b.get("정밀 합류점수 부가지표")
+                                    if not isinstance(_e, dict):
+                                        _e = {"n": 0, "sec": 0.0, "note": "재무점수·내부자·목표가·공매도·실적일"}
+                                        _b["정밀 합류점수 부가지표"] = _e
+                                    _e["n"] += 1
+                                    _e["sec"] += time.perf_counter() - _t_conf0
                                 except Exception:
                                     pass
 
@@ -19411,7 +19457,8 @@ if st.session_state.get("logged_in"):
             st.caption("최근 분기별 EPS 예상 대비 실제 Beat/Miss 현황입니다.")
             try:
                 with st.spinner("어닝 데이터 불러오는 중..."):
-                    earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
+                    with _timed("정밀 실적히스토리"):
+                        earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
 
                 if earn_df.empty:
                     st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
@@ -19564,8 +19611,10 @@ if st.session_state.get("logged_in"):
             try:
                 with st.spinner("인사이더 거래 데이터 불러오는 중..."):
                     _tk_ins = str(selected_ticker).strip().upper()
-                    insider_df = fetch_insider_trading(_tk_ins)
-                    insider_stats = fetch_insider_statistics(_tk_ins)
+                    with _timed("정밀 내부자거래"):
+                        insider_df = fetch_insider_trading(_tk_ins)
+                    with _timed("정밀 내부자통계"):
+                        insider_stats = fetch_insider_statistics(_tk_ins)
 
                 # 통계 요약 먼저 표시
                 if insider_stats or not insider_df.empty:
@@ -19604,7 +19653,8 @@ if st.session_state.get("logged_in"):
             st.caption("월가 애널리스트들의 목표주가 컨센서스. 현재가 대비 상승여력을 확인합니다.")
             try:
                 with st.spinner("애널리스트 데이터 불러오는 중..."):
-                    analyst_data = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
+                    with _timed("정밀 애널리스트"):
+                        analyst_data = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
                 if not analyst_data:
                     st.info("애널리스트 목표주가 데이터를 가져오지 못했습니다.")
                 else:
@@ -19643,7 +19693,8 @@ if st.session_state.get("logged_in"):
             st.caption("미국 의회 의원들의 주식 거래 공시. 정책 방향 선행 지표로 활용됩니다.")
             try:
                 with st.spinner("의회 거래 데이터 불러오는 중..."):
-                    congress_df = fetch_senate_house_trading(str(selected_ticker).strip().upper())
+                    with _timed("정밀 의회거래"):
+                        congress_df = fetch_senate_house_trading(str(selected_ticker).strip().upper())
                 if congress_df.empty:
                     st.info("의회 거래 데이터를 가져오지 못했습니다. (FMP Starter 플랜 제공 범위 외)")
                 else:
@@ -19673,7 +19724,8 @@ if st.session_state.get("logged_in"):
         if st.button("🤖 AI 종합 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
             try:
                 # 이미 위에서 계산된 값들을 최대한 재사용
-                _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
+                with _timed("정밀 타이밍일봉"):
+                    _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
                 _diag_close = pd.to_numeric(_diag_timing["Close"], errors="coerce").dropna() if not _diag_timing.empty else pd.Series(dtype=float)
                 _diag_rsi = float(calculate_rsi(_diag_close).dropna().iloc[-1]) if len(_diag_close) > 14 else np.nan
                 _diag_ma200 = float(_diag_close.rolling(200, min_periods=150).mean().iloc[-1]) if len(_diag_close) >= 150 else np.nan
@@ -19698,7 +19750,8 @@ if st.session_state.get("logged_in"):
                 _kpi_summary = ""
                 _kpi_details = ""
                 try:
-                    _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
+                    with _timed("정밀 KPI 스냅샷"):
+                        _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
                     _kpi_summary = f"KPI: {_pass_n}개 통과 / {_fail_n}개 실패"
                     _safety = _margin.get('margin_of_safety')
                     _intrinsic = _margin.get('intrinsic_value')
@@ -19717,7 +19770,8 @@ if st.session_state.get("logged_in"):
                 # 기관 보유
                 _inst_pct = "데이터 없음"
                 try:
-                    _inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
+                    with _timed("정밀 기관보유"):
+                        _inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
                     if not _inst_df.empty:
                         _pct_col = next((c for c in _inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
                         if _pct_col:
@@ -19735,7 +19789,8 @@ if st.session_state.get("logged_in"):
                 _diag_cs = _diag_vs = _diag_qs = 0
                 _diag_cs_det = _diag_vs_det = _diag_qs_det = _diag_dom = ""
                 try:
-                    _dk, _, _, _, _dm = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
+                    with _timed("정밀 KPI 스냅샷"):
+                        _dk, _, _, _, _dm = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
                     _dpp = _dk["Pass"].astype(str)
                     _diag_pass_items = _dk[_dpp.str.contains("Pass", case=False) & ~_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
                     _diag_fail_items = _dk[_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
@@ -19757,7 +19812,8 @@ if st.session_state.get("logged_in"):
                 # 인사이더 방향
                 _diag_ins_buy = _diag_ins_sell = 0
                 try:
-                    _dis = fetch_insider_statistics(str(selected_ticker).strip().upper())
+                    with _timed("정밀 내부자통계"):
+                        _dis = fetch_insider_statistics(str(selected_ticker).strip().upper())
                     _diag_ins_buy  = int(to_float(_dis.get("total_purchases") or _dis.get("acquired") or 0) or 0)
                     _diag_ins_sell = int(to_float(_dis.get("total_sales")     or _dis.get("disposed")  or 0) or 0)
                 except Exception:
@@ -19767,7 +19823,8 @@ if st.session_state.get("logged_in"):
                 _diag_beat_rate = _diag_beat_n = _diag_earn_n = 0
                 _diag_earn_rows = []
                 try:
-                    _dea = cached_earnings_history(str(selected_ticker).strip().upper())
+                    with _timed("정밀 실적히스토리"):
+                        _dea = cached_earnings_history(str(selected_ticker).strip().upper())
                     if not _dea.empty and "판정" in _dea.columns:
                         _diag_beat_n  = int((_dea["판정"] == "✅ Beat").sum())
                         _diag_earn_n  = len(_dea[_dea["판정"] != "—"])
@@ -19787,7 +19844,8 @@ if st.session_state.get("logged_in"):
                 _diag_buy_pct = _diag_rat_label = _diag_rat_tot = ""
                 _diag_rec_list = []
                 try:
-                    _dan = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
+                    with _timed("정밀 애널리스트"):
+                        _dan = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
                     if _dan:
                         _diag_tgt_mean = _dan.get("target_mean")
                         _diag_tgt_high = _dan.get("target_high")
@@ -19813,7 +19871,8 @@ if st.session_state.get("logged_in"):
                 # 의회 거래
                 _diag_cg_buy = _diag_cg_sell = 0
                 try:
-                    _dcg = fetch_senate_house_trading(str(selected_ticker).strip().upper())
+                    with _timed("정밀 의회거래"):
+                        _dcg = fetch_senate_house_trading(str(selected_ticker).strip().upper())
                     if not _dcg.empty:
                         _diag_cg_buy  = len(_dcg[_dcg["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)])
                         _diag_cg_sell = len(_dcg[_dcg["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)])
