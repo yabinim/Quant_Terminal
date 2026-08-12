@@ -9951,6 +9951,33 @@ def compute_sell_signal_indicators(tickers: list) -> dict:
     return results
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_hidden_alpha_ranks() -> tuple:
+    """HiddenAlpha_Snapshot(A1 셀 JSON) → ({TICKER: rank}, 기준일). 실패 시 ({}, "").
+
+    자동화(run_hidden_alpha, 토요일 5PM)가 이미 계산해 저장한 랭킹이다.
+    앱이 같은 걸 다시 계산하면 ETF 유니버스 전체(~350종목)를 받아야 해서
+    376콜·111초가 든다. 저장본을 읽으면 1콜이다.
+
+    ⚠️ 스냅샷은 **Top 30만** 담는다(자동화가 Δ 계산용으로 그렇게 저장한다).
+       31위 밖 보유 ETF 는 여기 없으므로 호출부가 '30위권 밖'으로 표시해야 한다.
+       없는 것을 '산출 불가'로 뭉뚱그리면 정보가 사라진다.
+    """
+    try:
+        ws = _ws_handle("HiddenAlpha_Snapshot")
+        if ws is None:
+            return {}, ""
+        raw = ws.acell("A1").value
+        if not raw:
+            return {}, ""
+        obj = json.loads(raw)
+        ranks = {str(k).strip().upper(): int(v)
+                 for k, v in (obj.get("ranks") or {}).items()}
+        return ranks, str(obj.get("date", ""))
+    except Exception:
+        return {}, ""
+
+
 def build_portfolio_sell_radar_df(portfolio_df):
     _sell_radar_cols = [
         "계좌",
@@ -10005,15 +10032,18 @@ def build_portfolio_sell_radar_df(portfolio_df):
 
     universe_list = read_etf_universe_file_tickers()
     universe_set = set(str(x).strip().upper() for x in universe_list if str(x).strip())
-    universe_tuple = tuple(sorted(universe_set))
-    rank_df = cached_etf_universe_rankings_full(universe_tuple)
-    ticker_to_rank = {}
-    if rank_df is not None and not rank_df.empty and "Ticker" in rank_df.columns and "Rank" in rank_df.columns:
-        for _, rr in rank_df.iterrows():
-            tk = str(rr.get("Ticker", "")).strip().upper()
-            rk = pd.to_numeric(rr.get("Rank"), errors="coerce")
-            if tk and pd.notna(rk):
-                ticker_to_rank[tk] = int(rk)
+    # 유니버스 랭킹은 자동화가 계산해 둔 스냅샷을 읽는다.
+    # 예전에는 여기서 cached_etf_universe_rankings_full 로 전 유니버스(~350종목)를
+    # 다시 계산해 376콜·111초가 들었다. 표시용 1개 열을 위한 비용으로는 과했다.
+    ticker_to_rank, _ha_rank_date = load_hidden_alpha_ranks()
+    # 주 1회(토요일) 갱신이므로 어느 시점 기준인지 화면에 남긴다. 숨기면
+    # 며칠 지난 순위를 최신으로 오해할 수 있다.
+    try:
+        st.session_state["_pf_rank_meta"] = {
+            "date": _ha_rank_date, "n": len(ticker_to_rank),
+        }
+    except Exception:
+        pass
 
     unique_holdings = sorted(dict.fromkeys(clean_tickers))
     # 종목당 1콜씩 순차로 받던 것을 병렬로 묶는다 (보유 50종목이면 50콜 순차 = 수십 초).
@@ -10135,7 +10165,10 @@ def build_portfolio_sell_radar_df(portfolio_df):
             else:
                 rk = ticker_to_rank.get(ticker)
                 if rk is None:
-                    universe_rank_cell = "순위 산출 불가"
+                    # 스냅샷은 Top 30 까지만 담는다. 유니버스에는 있는데 여기 없다면
+                    # '산출 불가'가 아니라 '30위권 밖'이 정확한 사실이다.
+                    universe_rank_cell = ("🔴 30위권 밖" if ticker_to_rank
+                                          else "순위 산출 불가")
                 else:
                     universe_rank_cell = f"Top {int(rk)}위"
                     if int(rk) > 5:
@@ -20394,6 +20427,17 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             try:
                 with _timed("PF 매도레이더 계산"):
                     _crdf = build_portfolio_sell_radar_df(portfolio_df)
+                _rm = st.session_state.get("_pf_rank_meta") or {}
+                if _rm.get("date"):
+                    st.caption(
+                        f"🏅 유니버스 랭킹 기준 **{_rm['date']}** (Hidden Alpha 주간 스냅샷 "
+                        f"Top {_rm.get('n', 0)}) — 매주 토요일 갱신됩니다."
+                    )
+                elif _rm:
+                    st.caption(
+                        "🏅 유니버스 랭킹 스냅샷이 아직 없습니다 — "
+                        "Hidden Alpha 자동화가 한 번 돌면 순위가 표시됩니다."
+                    )
                 for _, _cr in _crdf.iterrows():
                     _ck = str(_cr.get("티커", "")).strip().upper()
                     _ca = str(_cr.get("계좌", "")).strip()
