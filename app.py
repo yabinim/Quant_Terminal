@@ -19022,41 +19022,86 @@ if st.session_state.get("logged_in"):
                         if not is_etf_mode:
                             _tkr_u = str(selected_ticker).strip().upper()
                             with st.spinner("근거 종합 중..."):
-                                _t_conf0 = time.perf_counter()
+                              with _timed("정밀 합류점수 부가지표",
+                                          "재무점수·내부자·목표가·공매도·실적일(병렬)"):
+                                # 5개 조회는 서로 의존하지 않는다 → 병렬로 동시에 받는다.
+                                # 순차 실행 시 캐시가 비면 3초 넘게 걸리던 구간이다.
+                                # ⚠️ 워커에서 st.* 를 건드리지 않는다(스레드에서 st 접근은 실패).
+                                #    각 작업은 순수 데이터 조회만 하고, 판정은 아래에서 한다.
+                                def _cf_scores():
+                                    return _fmp_financial_scores(_tkr_u)
+
+                                def _cf_insider():
+                                    return fetch_insider_statistics(_tkr_u)
+
+                                def _cf_target():
+                                    return fetch_analyst_price_targets(_tkr_u)
+
+                                def _cf_short():
+                                    return fetch_short_interest(_tkr_u)
+
+                                def _cf_earn():
+                                    return fetch_earnings_calendar((_tkr_u,))
+
+                                _cf_res = {}
                                 try:
-                                    _fsc = _fmp_financial_scores(_tkr_u)
+                                    import concurrent.futures as _cf_ex
+                                    _cf_jobs = {
+                                        "scores": _cf_scores, "insider": _cf_insider,
+                                        "target": _cf_target, "short": _cf_short,
+                                        "earn": _cf_earn,
+                                    }
+                                    with _cf_ex.ThreadPoolExecutor(max_workers=5) as _ex_cf:
+                                        _futs = {k: _ex_cf.submit(f) for k, f in _cf_jobs.items()}
+                                        for _k, _fu in _futs.items():
+                                            try:
+                                                _cf_res[_k] = _fu.result(timeout=20)
+                                            except Exception:
+                                                _cf_res[_k] = None
+                                except Exception:
+                                    _cf_res = {}
+
+                                # ⚠️ 조용한 성능저하 방지 가드.
+                                #    이 5개는 @st.cache_data 함수라 워커 스레드에서는
+                                #    ScriptRunContext 부재로 실패할 수 있다. 그 경우 값이
+                                #    전부 None 이 되어 합류점수가 **말없이 낮게** 나온다.
+                                #    판정이 틀어지는 건 느린 것보다 훨씬 나쁘므로,
+                                #    전부 비면 메인 스레드에서 순차로 다시 받는다.
+                                if not any(v is not None for v in _cf_res.values()):
+                                    for _k, _f in (("scores", _cf_scores), ("insider", _cf_insider),
+                                                   ("target", _cf_target), ("short", _cf_short),
+                                                   ("earn", _cf_earn)):
+                                        try:
+                                            _cf_res[_k] = _f()
+                                        except Exception:
+                                            _cf_res[_k] = None
+                                    _perf_note("정밀 합류점수 부가지표",
+                                               "순차 폴백(병렬 결과 없음)")
+
+                                try:
+                                    _fsc = _cf_res.get("scores") or {}
                                     _piotroski = to_float(_fsc.get("piotroskiScore"))
                                     _altman = to_float(_fsc.get("altmanZScore"))
                                 except Exception:
                                     pass
                                 try:
-                                    _insider_ratio = to_float(fetch_insider_statistics(_tkr_u).get("ratio"))
+                                    _insider_ratio = to_float((_cf_res.get("insider") or {}).get("ratio"))
                                 except Exception:
                                     pass
                                 try:
-                                    _tm = to_float(fetch_analyst_price_targets(_tkr_u).get("target_mean"))
+                                    _tm = to_float((_cf_res.get("target") or {}).get("target_mean"))
                                     if pd.notna(_tm) and pd.notna(current_price) and float(current_price) > 0:
                                         _analyst_up = float(_tm) / float(current_price) - 1.0
                                 except Exception:
                                     pass
                                 try:
-                                    _short = to_float(fetch_short_interest(_tkr_u).get("short_pct"))
+                                    _short = to_float((_cf_res.get("short") or {}).get("short_pct"))
                                 except Exception:
                                     pass
                                 try:
-                                    _ec = fetch_earnings_calendar((_tkr_u,))
+                                    _ec = _cf_res.get("earn")
                                     if _ec:
                                         _edays = _ec[0].get("days_until")
-                                except Exception:
-                                    pass
-                                try:
-                                    _b = _perf_bucket()
-                                    _e = _b.get("정밀 합류점수 부가지표")
-                                    if not isinstance(_e, dict):
-                                        _e = {"n": 0, "sec": 0.0, "note": "재무점수·내부자·목표가·공매도·실적일"}
-                                        _b["정밀 합류점수 부가지표"] = _e
-                                    _e["n"] += 1
-                                    _e["sec"] += time.perf_counter() - _t_conf0
                                 except Exception:
                                     pass
 
