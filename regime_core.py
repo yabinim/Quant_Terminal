@@ -965,7 +965,7 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
 # 게이트 코드 → 라벨 (UI 공유)
 GATE_LABELS = {
     "fit":     "✅ 진입 적합",
-    "skip":    "⚠️ 자리 나쁨 — 건너뛰기",
+    "skip":    "ℹ️ 고점 근접 — 참고",
     "avoid":   "⛔ 진입 비추 — 회피 구간",
     "caution": "🔶 신중 — 분할·관망 고려",
     "na":      "⚪ 판단 보류(데이터 부족)",
@@ -1267,7 +1267,7 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
     """verdict + 손절/목표 + 자본 → 게이트 판정 + 사이즈 일괄. 순수 조합 함수.
 
     게이트(백테스트 반영):
-      avoid → 회피(사이즈 0 권고) · entry/wait & R:R≥목표 → 적합 · 좋아도 R:R<목표 → 건너뛰기
+      avoid → 회피(사이즈 0 권고) · entry/wait & R:R≥목표 → 적합 · R:R<목표 → 고점 근접(참고)
       overheat/trend_break → 신중. (R:R 필터는 독립 목표가 있을 때만; rr_derived 면 정보용)
 
     event_move_pct: position_size 로 그대로 전달(실적 등 이벤트 갭 제약). 기본 None = 기존 동작 불변.
@@ -1336,9 +1336,17 @@ def build_trade_plan(verdict_code, entry, atr, ma200, equity, risk_pct, atr_mult
         except (TypeError, ValueError):
             bar = np.nan
         if rr_is_real and np.isfinite(bar) and rr_val < bar:
+            # v3(2026-08-12): skip 은 '억제'가 아니라 '참고'다.
+            #   Signal_Backtest 개별주(stock) 8개 run 전부에서 skip 이 pass 를 앞섰다
+            #   (승률 51~53% vs 57~59%, 20일 중앙값 0.14~0.64 vs 1.64~1.98,
+            #    MAE −5.55~−5.83 vs −5.24~−5.43). SPY 초과수익 차이는 통계적으로
+            #   유의하지 않았으나(≈0.0~0.1%p), '손실 방지' 명분의 근거인 MAE 가
+            #   오히려 pass 쪽이 깊어 억제를 정당화할 근거가 없다.
+            #   → 라벨·사유만 정보성으로 낮추고 enter_ok 는 True. 버킷은 유지해
+            #     계속 측정한다(상승장 편중 가능성 때문에 제거하지 않음).
             plan.update({"gate": "skip", "gate_label": GATE_LABELS["skip"],
-                         "gate_reason": f"R:R {plan['rr_label']} < 목표 1:{bar:.1f} — 손익비 부족",
-                         "enter_ok": False})
+                         "gate_reason": f"전고점까지 여력 {plan['rr_label']} (목표 1:{bar:.1f} 미만)",
+                         "enter_ok": True})
         else:
             note = "독립 목표 미설정(R:R 정보용)" if not rr_is_real else f"R:R {plan['rr_label']} 충족"
             plan.update({"gate": "fit", "gate_label": GATE_LABELS["fit"],
@@ -1456,8 +1464,9 @@ def decorate_entry_alert(ev: dict, plan: dict, regime: str = "unknown") -> dict:
     """entry 알림 dict 에 R:R 게이트 결과를 반영(v2 — 이메일도 앱과 동일 게이트 판정).
 
     1B 방식: entry 이벤트/상태머신은 그대로 두고 라벨·메시지만 게이트로 구분.
-      통과   → 🟢 매수 신호 (✅ 게이트 통과) + 손절/목표/R:R 라인
-      미통과 → ⚠️ 매수 신호 — 게이트 미통과·건너뛰기 권고 + 사유
+      통과     → 🟢 매수 신호 (✅ 게이트 통과) + 손절/목표/R:R 라인
+      고점근접 → 🟢 매수 신호 (ℹ️ 고점 근접 구간) + 여력 표기 (v3: 억제 아님)
+      회피/신중 → ⚠️ 매수 신호 — 게이트 미통과 + 사유
     plan 산출 불가(gate=na)면 정직하게 '게이트 판단 보류'로 표기(신호 억제 없음).
     """
     ev = ev or {}
@@ -1487,17 +1496,27 @@ def decorate_entry_alert(ev: dict, plan: dict, regime: str = "unknown") -> dict:
         plan_bits.append(f"R:R {rr_s}")
     plan_line = " · ".join(plan_bits)
 
-    if dec.get("key") in ("buy", "buy_split") and gate == "fit":
-        ev["label"] = "🟢 매수 신호 (✅ R:R 게이트 통과)"
-        ev["message"] = base_msg + (f" · {plan_line}" if plan_line else "")
-        note = str(p.get("gate_reason") or "")
-        if "정보용" in note:
-            ev["message"] += " · 독립 목표 미설정(R:R 정보용)"
+    if dec.get("key") in ("buy", "buy_split") and gate in ("fit", "skip"):
+        if gate == "skip":
+            # v3: 고점 근접 구간 — 정보 표기만. 억제 어휘("미통과·건너뛰기·부족") 제거.
+            ev["label"] = "🟢 매수 신호 (ℹ️ 고점 근접 구간)"
+            reason = str(p.get("gate_reason") or "")
+            ev["message"] = base_msg + (f" · {reason}" if reason else "")
+            if plan_line:
+                ev["message"] += f" · {plan_line}"
+        else:
+            ev["label"] = "🟢 매수 신호 (✅ R:R 게이트 통과)"
+            ev["message"] = base_msg + (f" · {plan_line}" if plan_line else "")
+            note = str(p.get("gate_reason") or "")
+            if "정보용" in note:
+                ev["message"] += " · 독립 목표 미설정(R:R 정보용)"
     elif gate == "na":
         ev["label"] = "🟢 매수 신호 (⚪ 게이트 판단 보류)"
         ev["message"] = base_msg + f" · {p.get('gate_reason') or '플랜 산출 불가'}"
     else:
-        ev["label"] = "⚠️ 매수 신호 — 게이트 미통과·건너뛰기 권고"
+        # v3: skip 이 이 분기에서 빠졌으므로 여기는 avoid/caution 전용이다.
+        ev["label"] = ("⛔ 매수 신호 — 회피 구간" if gate == "avoid"
+                       else "⚠️ 매수 신호 — 신중(분할·관망 고려)")
         reason = str(p.get("gate_reason") or "손익비/구간 부적합")
         ev["message"] = base_msg + f" · {reason}" + (f" · {plan_line}" if plan_line else "")
     ev["gate"] = gate
@@ -1694,7 +1713,10 @@ def buy_decision(verdict_code, gate_code=None, regime: str = "unknown") -> dict:
     elif code == "overheat":
         key = "buy_split"
     elif code == "entry":
-        key = "buy" if g != "skip" else ("wait_pullback" if strong else "wait_range")
+        # v3(2026-08-12): skip 강등 제거. skip 은 '고점 근접' 정보일 뿐 억제 근거가
+        #   백테스트로 확인되지 않았다(build_watchlist_plan 주석 참조).
+        #   avoid 만 강등 사유로 남는다(위 분기에서 이미 처리).
+        key = "buy"
     elif code == "wait":
         key = "wait_pullback" if strong else "wait_range"
     else:

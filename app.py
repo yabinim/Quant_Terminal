@@ -29,7 +29,6 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as st_components  # 인증 쿠키 JS 주입용(height=0, 비가시)
 import gspread
-import threading
 from google.oauth2.service_account import Credentials
 from fredapi import Fred
 
@@ -38,8 +37,7 @@ import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_n
 import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화와 동일 모듈
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
 import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 자동화와 동일 모듈
-import earnings_core as ec
-import watchlist_metrics_core as wm  # 워치리스트 표시 지표 SSOT — 자동화(run_watchlist_alerts)와 동일 모듈
+import earnings_core as ec  # 실적 이벤트 리스크 SSOT — 자동화(run_earnings_watch)와 동일 모듈
 
 # ── 1.6 AI 종목 스캐너 SSOT (scanner_core) ───────────────────────────────────
 # 3버킷 스코어링·프롬프트·상수·표시 포맷·70점 판정은 전부 scanner_core 에만 존재한다.
@@ -56,8 +54,7 @@ _SSOT_REQUIRED = "2026-08-06a"
 _ssot_bad = [
     (_n, getattr(_m, "SSOT_VERSION", None))
     for _n, _m in (("scanner_core", sc), ("narrative_core", narrative_core),
-                   ("users_core", uc), ("fmp_extras", fx), ("portfolio_core", pc),
-                   ("watchlist_metrics_core", wm))
+                   ("users_core", uc), ("fmp_extras", fx), ("portfolio_core", pc))
     if getattr(_m, "SSOT_VERSION", None) != _SSOT_REQUIRED
 ]
 if _ssot_bad:
@@ -238,12 +235,6 @@ _ETF_AUTO_UPDATE_INTERVAL_DAYS = 7  # 자동 업데이트 주기
 _WATCHLIST_SHEET_COLS = ["ID", "Ticker", "Memo", "Alert_Price", "Alert_RSI", "Alert_MA200", "Saved_Price", "Date_Added", "Stop_Loss", "Target_Price", "Alert_States", "Alert_LastState", "Account"]
 _WL_NCOL = len(_WATCHLIST_SHEET_COLS)  # =13. 과거 8/10/12열 시트는 읽을 때 빈 칸으로 패딩되어 자동 마이그레이션됨.
 _WL_COL_ACCOUNT = 12  # 0-index
-# 앱에서 제자리 수정이 허용되는 컬럼(0-index). 화이트리스트라 여기 없는 열은
-# update_watchlist_row 가 절대 건드리지 않는다.
-#   제외 0=ID, 1=Ticker  → 행을 찾는 식별자. 바뀌면 다른 레코드가 된다.
-#   제외 11=Alert_LastState → 자동화(run_watchlist_alerts)가 L열에 쓰는 소유 영역.
-#          앱이 덮으면 깜빡임 방지 상태가 초기화된다(구 삭제+재추가 방식의 부작용).
-_WL_EDITABLE_COL_IDX = (2, 3, 4, 5, 6, 7, 8, 9, 10, 12)
 # 상태 기반 알림 이벤트 코드 (Alert_States 콤마 플래그). 기본 ON = entry + risk.
 _WL_ALERT_EVENTS = ("entry", "regime", "risk", "exit", "price", "watch")
 _WL_ALERT_DEFAULT = "entry,risk,watch"
@@ -299,293 +290,6 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Google Sheets 접근 최적화 — 스프레드시트/탭 핸들 캐시 + HTTP 호출 계측
-#
-#   [문제] gc.open(제목)은 Drive files.list 검색 + Sheets 메타데이터 조회로 매번
-#          2왕복이 나가고, 이어지는 sh.worksheet(탭명) / sh.worksheets() 가 또
-#          메타데이터를 재조회한다. open_*_worksheet 17개 함수가 시트를 건드릴
-#          때마다 이 3왕복을 반복해 왔다.
-#   [해결] 핸들을 @st.cache_resource 로 재사용한다. 핸들은 사용자와 무관한
-#          (스프레드시트 ID, 탭 ID) 참조라 전 세션 공유가 안전하다.
-#   [주의] 탭 생성·삭제 후에는 반드시 _invalidate_ws_handles() 를 호출한다.
-#          없는 탭에 대해 None 이 캐시되면 생성 직후에도 계속 None 이 나온다.
-# ══════════════════════════════════════════════════════════════════════════════
-_GS_STATS_KEY = "_gs_call_stats"
-
-# gspread 6.x 는 http_client.HTTPClient.request, 5.x 는 client.Client.request 가
-# 유일한 HTTP 진입점이다. 여기 하나만 감싸면 왕복 1회 = 카운트 1회로 정확히 맞는다.
-# (Worksheet.get_all_values → get_values → get 처럼 상위 메서드를 감싸면 중복 집계됨)
-_GS_HTTP_TARGETS = (
-    ("gspread.http_client", "HTTPClient", "request"),
-    ("gspread.client", "Client", "request"),
-)
-
-
-def _gs_stats_bucket() -> dict:
-    """세션 단위 누적 통계 버킷. session_state 접근 실패 시 더미를 돌려준다."""
-    try:
-        b = st.session_state.get(_GS_STATS_KEY)
-        if not isinstance(b, dict):
-            b = {"n": 0, "sec": 0.0}
-            st.session_state[_GS_STATS_KEY] = b
-        return b
-    except Exception:
-        return {"n": 0, "sec": 0.0}
-
-
-def _make_gs_counter(fn):
-    """HTTP 요청 1건마다 횟수·소요시간을 누적하는 래퍼. 계측 실패는 절대 전파하지 않는다."""
-    def _wrapped(*args, **kwargs):
-        _t0 = time.perf_counter()
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            try:
-                _b = _gs_stats_bucket()
-                _b["n"] = int(_b.get("n", 0)) + 1
-                _b["sec"] = float(_b.get("sec", 0.0)) + (time.perf_counter() - _t0)
-            except Exception:
-                pass
-    _wrapped._qt_wrapped = True
-    _wrapped.__name__ = getattr(fn, "__name__", "request")
-    _wrapped.__doc__ = getattr(fn, "__doc__", None)
-    return _wrapped
-
-
-def _install_gs_instrumentation() -> None:
-    """gspread HTTP 진입점을 1회 래핑(멱등). 클래스 속성이라 프로세스당 한 번만 적용된다."""
-    import importlib
-    for _mod_name, _cls_name, _meth in _GS_HTTP_TARGETS:
-        try:
-            _mod = importlib.import_module(_mod_name)
-        except Exception:
-            continue
-        _cls = getattr(_mod, _cls_name, None)
-        if _cls is None:
-            continue
-        _fn = getattr(_cls, _meth, None)
-        if _fn is None or getattr(_fn, "_qt_wrapped", False):
-            continue
-        try:
-            setattr(_cls, _meth, _make_gs_counter(_fn))
-        except Exception:
-            pass
-
-
-_install_gs_instrumentation()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FMP 호출 계측
-#   Sheets 와 달리 프로세스 수준 카운터를 쓴다. 일봉 프리페치가 ThreadPoolExecutor
-#   위에서 도는데 워커 스레드에서는 st.session_state 접근이 불가능해, 세션 단위로
-#   세면 병렬 호출이 통째로 누락된다. 관리자 진단용이라 프로세스 전체 기준으로도
-#   충분하며 오히려 스레드 작업까지 잡아내 더 정확하다.
-# ══════════════════════════════════════════════════════════════════════════════
-_FMP_STATS_LOCK = threading.Lock()
-_FMP_HOST = "financialmodelingprep.com"
-
-
-@st.cache_resource(show_spinner=False)
-def _fmp_stats_store() -> dict:
-    """FMP 누적 통계 저장소.
-
-    ⚠️ 절대 모듈 레벨 dict 로 두면 안 된다. app.py 는 Streamlit 스크립트 본체라
-       리런마다 위에서부터 재실행되고, 그때 모듈 레벨 변수는 새로 만들어져
-       카운터가 매번 0으로 초기화된다(실제로 FMP 계측이 항상 0으로 보이던 원인).
-       @st.cache_resource 는 리런 간 같은 객체를 돌려주므로 누적이 유지된다.
-       세션이 아니라 프로세스 단위인 것은 의도다 — 워커 스레드에서도 접근해야 한다.
-    """
-    return {"n": 0, "sec": 0.0}
-
-
-_FMP_STATS = _fmp_stats_store()
-
-
-def _install_fmp_instrumentation() -> None:
-    """requests 의 실제 HTTP 진입점을 1회 래핑(멱등). URL 로 걸러 FMP 만 집계한다.
-
-    ⚠️ `requests.get` 을 감싸면 안 된다. 다른 모듈들이 app.py 보다 **먼저** 임포트되어
-       원본 함수 참조를 자기 네임스페이스에 이미 잡아두기 때문에, 나중에 모듈 속성을
-       바꿔도 그들에게는 반영되지 않는다(실제로 정밀검사 탭 호출이 통째로 누락됐다).
-       requests.get → requests.api.request → Session.request 순으로 내려가므로
-       `Session.request` 하나만 감싸면 임포트 순서와 무관하게 전 경로가 잡힌다.
-    """
-    try:
-        _sess_cls = requests.Session
-    except Exception:
-        return
-    _orig = getattr(_sess_cls, "request", None)
-    if _orig is None or getattr(_orig, "_qt_wrapped", False):
-        return
-
-    def _wrapped(self, method, url, *a, **k):
-        _is_fmp = _FMP_HOST in str(url)
-        _t0 = time.perf_counter()
-        try:
-            return _orig(self, method, url, *a, **k)
-        finally:
-            if _is_fmp:
-                try:
-                    with _FMP_STATS_LOCK:
-                        _FMP_STATS["n"] += 1
-                        _FMP_STATS["sec"] += time.perf_counter() - _t0
-                except Exception:
-                    pass
-
-    _wrapped._qt_wrapped = True
-    try:
-        _sess_cls.request = _wrapped
-    except Exception:
-        pass
-
-
-_install_fmp_instrumentation()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 구간 타이밍 계측 — "느리다"를 추측이 아니라 숫자로 가른다
-#
-#   Sheets·FMP 호출 수만으로는 부족하다. 둘 다 0인데 느리면 남은 건 CPU 아니면
-#   렌더링인데 그걸 구분할 수단이 없어 진단이 추측으로 흘렀다.
-#   with _timed("구간명"): 으로 감싸면 소요 시간이 누적된다.
-#
-#   ⚠️ 세션 단위(session_state)로 센다. 워커 스레드 안에서는 쓰지 않는다 —
-#      스레드에서 st.session_state 접근은 실패한다. 병렬 구간은 바깥에서 감쌀 것.
-# ══════════════════════════════════════════════════════════════════════════════
-_PERF_KEY = "_perf_spans"
-
-
-@st.cache_resource(show_spinner=False)
-def _perf_store() -> dict:
-    """구간 타이밍 저장소. FMP 통계와 같은 이유로 cache_resource 를 쓴다."""
-    return {}
-
-
-def _perf_bucket() -> dict:
-    try:
-        return _perf_store()
-    except Exception:
-        return {}
-
-
-class _timed:
-    """구간 소요 시간 + 그 구간에서 발생한 FMP 호출 수를 누적한다.
-
-    시간만으로는 부족하다. "이 구간이 느린 게 네트워크 때문인가 CPU 때문인가"를
-    가르려면 구간 안에서 몇 콜이 나갔는지가 필요하다. 진입/이탈 시점의 전역
-    FMP 카운터 차이로 구한다.
-
-    ⚠️ 병렬 구간에서는 다른 스레드의 호출도 함께 잡힐 수 있다. 정밀검사 탭은
-       순차 실행이라 문제없지만, 병렬 구간 수치는 참고값으로 본다.
-    계측 실패는 절대 전파하지 않는다.
-    """
-
-    __slots__ = ("label", "_t0", "_note", "_c0")
-
-    def __init__(self, label: str, note: str = ""):
-        self.label = str(label)
-        self._note = str(note or "")
-        self._t0 = 0.0
-        self._c0 = 0
-
-    def __enter__(self):
-        self._t0 = time.perf_counter()
-        try:
-            with _FMP_STATS_LOCK:
-                self._c0 = int(_FMP_STATS.get("n", 0))
-        except Exception:
-            self._c0 = 0
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            _dt = time.perf_counter() - self._t0
-            try:
-                with _FMP_STATS_LOCK:
-                    _dc = int(_FMP_STATS.get("n", 0)) - self._c0
-            except Exception:
-                _dc = 0
-            _b = _perf_bucket()
-            _e = _b.get(self.label)
-            if not isinstance(_e, dict):
-                _e = {"n": 0, "sec": 0.0, "fmp": 0, "note": ""}
-                _b[self.label] = _e
-            _e["n"] += 1
-            _e["sec"] += _dt
-            _e["fmp"] = int(_e.get("fmp", 0)) + max(0, _dc)
-            if self._note:
-                _e["note"] = self._note
-        except Exception:
-            pass
-        return False   # 예외를 삼키지 않는다
-
-
-def _perf_note(label: str, note: str) -> None:
-    """이미 기록된 구간에 부가 설명(캐시 히트 수 등)을 남긴다."""
-    try:
-        _e = _perf_bucket().get(label)
-        if isinstance(_e, dict):
-            _e["note"] = str(note)
-    except Exception:
-        pass
-
-
-@st.cache_resource(ttl=600, show_spinner=False)
-def _open_quant_db():
-    """Quant_DB 스프레드시트 핸들 (10분 캐시). 실패 시 None.
-
-    ttl=600 은 안전장치다. 자동화가 탭을 추가·삭제하거나 그리드를 늘려도
-    최대 10분 안에 핸들이 자연 갱신된다.
-    """
-    gc = get_gspread_client()
-    if gc is None:
-        return None
-    try:
-        return gc.open(_QUANT_DB_SPREADSHEET_TITLE)
-    except Exception:
-        return None
-
-
-@st.cache_resource(ttl=600, show_spinner=False)
-def _ws_handle(sheet_title: str):
-    """탭 핸들 (10분 캐시). 탭이 없으면 None — 생성 책임은 호출부(open_*_worksheet)에 있다."""
-    sh = _open_quant_db()
-    if sh is None:
-        return None
-    try:
-        return sh.worksheet(str(sheet_title))
-    except Exception:
-        return None
-
-
-def _ws_handle_required(sheet_title: str):
-    """탭 핸들을 반환하되 없으면 예외를 던진다.
-
-    ⚠️ 예외 메시지에 반드시 'not found' 를 포함시킨다. 기존 호출부(narratives /
-       portfolios / trade_history)가 `str(exc).lower()` 에 'not found' 가 있는지로
-       '탭 생성' 분기를 타기 때문이다. 문구를 바꾸면 탭 자동 생성이 조용히 죽는다.
-    """
-    ws = _ws_handle(sheet_title)
-    if ws is None:
-        raise gspread.exceptions.WorksheetNotFound(
-            f"Worksheet '{sheet_title}' not found")
-    return ws
-
-
-def _invalidate_ws_handles() -> None:
-    """탭 생성·삭제·그리드 확장 직후 호출. 핸들 메타데이터 stale 을 막는다."""
-    try:
-        _ws_handle.clear()
-    except Exception:
-        pass
-    try:
-        _open_quant_db.clear()
-    except Exception:
-        pass
-
-
 def _safe_append_rows(ws, rows, value_input_option: str = "USER_ENTERED") -> None:
     """gspread append_row/append_rows의 '계단식 드리프트' 버그를 회피하는 안전한 행 추가.
 
@@ -634,7 +338,8 @@ def open_users_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        ws = _ws_handle_required(_USERS_WORKSHEET_TITLE)
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_USERS_WORKSHEET_TITLE)
         return ws, None
     except Exception as exc:
         return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` / `{_USERS_WORKSHEET_TITLE}` 를 열 수 없습니다: {exc}"
@@ -646,16 +351,16 @@ def open_narratives_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        ws = _ws_handle_required(_NARRATIVES_WORKSHEET_TITLE)
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_NARRATIVES_WORKSHEET_TITLE)
         return ws, None
     except Exception as exc:
         msg = str(exc).lower()
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
-                sh = _open_quant_db()
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
                 ws = sh.add_worksheet(title=_NARRATIVES_WORKSHEET_TITLE, rows=3000, cols=7)
                 ensure_narratives_header_row(ws)
-                _invalidate_ws_handles()
                 return ws, None
             except Exception as exc2:
                 return None, f"`{_NARRATIVES_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
@@ -668,16 +373,16 @@ def open_portfolios_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        ws = _ws_handle_required(_PORTFOLIOS_WORKSHEET_TITLE)
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_PORTFOLIOS_WORKSHEET_TITLE)
         return ws, None
     except Exception as exc:
         msg = str(exc).lower()
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
-                sh = _open_quant_db()
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
                 ws = sh.add_worksheet(title=_PORTFOLIOS_WORKSHEET_TITLE, rows=3000, cols=6)
                 ensure_portfolios_header_row(ws)
-                _invalidate_ws_handles()
                 return ws, None
             except Exception as exc2:
                 return None, f"`{_PORTFOLIOS_WORKSHEET_TITLE}` 워크시트를 만들 수 없습니다: {exc2}"
@@ -690,13 +395,12 @@ def open_thesis_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        _ws_c = _ws_handle(_THESIS_WORKSHEET_TITLE)
-        if _ws_c is not None:
-            return _ws_c, None
-        sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if _THESIS_WORKSHEET_TITLE in existing_titles:
+            return sh.worksheet(_THESIS_WORKSHEET_TITLE), None
         ws = sh.add_worksheet(title=_THESIS_WORKSHEET_TITLE, rows=3000, cols=7)
         ws.update([_THESIS_SHEET_COLS], range_name="A1:G1", value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Thesis 워크시트 열기/생성 실패: {exc}"
@@ -708,9 +412,11 @@ def open_portfolio_alert_state_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing_titles = [w.title for w in sh.worksheets()]
         _last_col = chr(ord("A") + len(_PORTFOLIO_ALERT_STATE_COLS) - 1)
-        ws = _ws_handle(_PORTFOLIO_ALERT_STATE_TITLE)
-        if ws is not None:
+        if _PORTFOLIO_ALERT_STATE_TITLE in existing_titles:
+            ws = sh.worksheet(_PORTFOLIO_ALERT_STATE_TITLE)
             try:  # 스키마 확장(4→6칸) 시 헤더 자동 갱신 — 기존 행은 빈칸 패딩
                 if (ws.row_values(1) or []) != _PORTFOLIO_ALERT_STATE_COLS:
                     ws.update([_PORTFOLIO_ALERT_STATE_COLS], range_name=f"A1:{_last_col}1",
@@ -718,11 +424,9 @@ def open_portfolio_alert_state_worksheet():
             except Exception:
                 pass
             return ws, None
-        sh = _open_quant_db()
         ws = sh.add_worksheet(title=_PORTFOLIO_ALERT_STATE_TITLE, rows=2000,
                               cols=len(_PORTFOLIO_ALERT_STATE_COLS))
         ws.update([_PORTFOLIO_ALERT_STATE_COLS], range_name=f"A1:{_last_col}1", value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Portfolio_Alert_State 워크시트 열기/생성 실패: {exc}"
@@ -1210,15 +914,15 @@ def open_account_profile_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        ws = _ws_handle(_ACCOUNT_PROFILE_WORKSHEET_TITLE)
-        if ws is None:
-            sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        try:
+            ws = sh.worksheet(_ACCOUNT_PROFILE_WORKSHEET_TITLE)
+        except Exception:
             ws = sh.add_worksheet(title=_ACCOUNT_PROFILE_WORKSHEET_TITLE,
                                   rows=500, cols=len(_ACCOUNT_PROFILE_SHEET_COLS))
             ws.update([_ACCOUNT_PROFILE_SHEET_COLS],
                       range_name=f"A1:{_ACCT_PROF_LAST_COL}1",
                       value_input_option="USER_ENTERED")
-            _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"`{_ACCOUNT_PROFILE_WORKSHEET_TITLE}` 워크시트를 열 수 없습니다: {exc}"
@@ -1329,16 +1033,11 @@ def open_earnings_events_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = _open_quant_db()
-        if sh is None:
-            raise RuntimeError("스프레드시트 핸들을 얻지 못했습니다.")
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
     except Exception as exc:
         return None, f"스프레드시트 `{_QUANT_DB_SPREADSHEET_TITLE}` 를 열 수 없습니다: {exc}"
     try:
-        _ws_c = _ws_handle(ec.EVENTS_WORKSHEET)
-        if _ws_c is None:
-            raise RuntimeError("worksheet not found")
-        return _ws_c, None
+        return sh.worksheet(ec.EVENTS_WORKSHEET), None
     except Exception:
         pass
     try:
@@ -1347,7 +1046,6 @@ def open_earnings_events_worksheet():
         _end = gspread.utils.rowcol_to_a1(1, ec.EVENTS_NCOL)
         ws.update([ec.EVENTS_COLS], range_name=f"A1:{_end}",
                   value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Earnings_Events 워크시트를 만들 수 없습니다: {exc}"
@@ -1359,15 +1057,11 @@ def open_earnings_calendar_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        sh = _open_quant_db()
-        if sh is None:
-            raise RuntimeError("스프레드시트 핸들을 얻지 못했습니다.")
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
     except Exception as exc:
         return None, f"스프레드시트를 열 수 없습니다: {exc}"
     try:
-        _w = _ws_handle(ec.CALENDAR_WORKSHEET)
-        if _w is None:
-            raise RuntimeError("worksheet not found")
+        _w = sh.worksheet(ec.CALENDAR_WORKSHEET)
         # 스키마가 넓어졌으면 그리드 확장 (Users 시트에서 겪은 grid limits 방지)
         try:
             if int(getattr(_w, "col_count", 0) or 0) < ec.CALENDAR_NCOL:
@@ -1375,7 +1069,6 @@ def open_earnings_calendar_worksheet():
                 _w.update([ec.CALENDAR_COLS],
                           range_name=f"A1:{gspread.utils.rowcol_to_a1(1, ec.CALENDAR_NCOL)}",
                           value_input_option="USER_ENTERED")
-                _invalidate_ws_handles()
         except Exception:
             pass
         return _w, None
@@ -1387,7 +1080,6 @@ def open_earnings_calendar_worksheet():
         _end = gspread.utils.rowcol_to_a1(1, ec.CALENDAR_NCOL)
         ws.update([ec.CALENDAR_COLS], range_name=f"A1:{_end}",
                   value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Earnings_Calendar 워크시트를 만들 수 없습니다: {exc}"
@@ -4032,13 +3724,12 @@ def _open_rs_incubator_ws():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        _ws_c = _ws_handle(_RS_INCUBATOR_SHEET_TITLE)
-        if _ws_c is not None:
-            return _ws_c, None
-        sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        titles = [ws.title for ws in sh.worksheets()]
+        if _RS_INCUBATOR_SHEET_TITLE in titles:
+            return sh.worksheet(_RS_INCUBATOR_SHEET_TITLE), None
         ws = sh.add_worksheet(title=_RS_INCUBATOR_SHEET_TITLE, rows=1000, cols=3)
         ws.update([_RS_INCUBATOR_COLS], range_name="A1:C1", value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"RS_Incubator 워크시트 열기/생성 실패: {exc}"
@@ -5765,18 +5456,17 @@ def _open_drg_snapshot_ws():
     gc = get_gspread_client()
     if gc is None:
         return None
-    _ws_c = _ws_handle(_DRG_SNAPSHOT_WORKSHEET)
-    if _ws_c is not None:
-        return _ws_c
+    sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
     try:
-        sh = _open_quant_db()
-        ws = sh.add_worksheet(title=_DRG_SNAPSHOT_WORKSHEET, rows=10, cols=3)
-        ws.update([["updated_at_et", "payload_json"]], range_name="A1:B1",
-                  value_input_option="RAW")
-        _invalidate_ws_handles()
-        return ws
+        return sh.worksheet(_DRG_SNAPSHOT_WORKSHEET)
     except Exception:
-        return None
+        try:
+            ws = sh.add_worksheet(title=_DRG_SNAPSHOT_WORKSHEET, rows=10, cols=3)
+            ws.update([["updated_at_et", "payload_json"]], range_name="A1:B1",
+                      value_input_option="RAW")
+            return ws
+        except Exception:
+            return None
 
 
 def _drg_save_snapshot(drg: dict) -> None:
@@ -6790,29 +6480,8 @@ def fetch_company_overview(ticker_upper: str) -> dict:
     """회사 기본 정보 조회 — FMP profile primary, _fmp_fill 보완."""
     try:
         info = {}
-        # _fmp_fill 과 _fmp_profile 은 서로 독립이라 동시에 받는다.
-        # (아래 '다음 실적 발표일' 4단계는 폴백 체인이라 병렬화하지 않는다 —
-        #  앞이 성공하면 뒤를 아예 부르지 않으므로 병렬화하면 FMP 콜만 늘어난다)
-        try:
-            import concurrent.futures as _co_ex
-            with _co_ex.ThreadPoolExecutor(max_workers=2) as _ex_co:
-                _f_fill = _ex_co.submit(_fmp_fill, {}, ticker_upper)
-                _f_prof = _ex_co.submit(_fmp_profile, ticker_upper)
-                try:
-                    info = _f_fill.result(timeout=20) or {}
-                except Exception:
-                    info = {}
-                try:
-                    p = _f_prof.result(timeout=20) or {}
-                except Exception:
-                    p = {}
-        except Exception:
-            info, p = {}, {}
-        # 둘 다 비면 병렬이 무효였을 수 있다 → 순차로 다시 받는다.
-        # (회사명·섹터가 통째로 빠지면 화면이 잘못된 정보를 보여주게 된다)
-        if not info and not p:
-            info = _fmp_fill({}, ticker_upper)
-            p = _fmp_profile(ticker_upper)
+        info = _fmp_fill(info, ticker_upper)
+        p = _fmp_profile(ticker_upper)
         name = str(info.get("longName") or info.get("shortName") or p.get("companyName") or ticker_upper)
         sector_en = str(info.get("sector") or p.get("sector") or "")
         industry_en = str(info.get("industry") or p.get("industry") or "")
@@ -8220,14 +7889,12 @@ def open_drg_predictions_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        sh = _open_quant_db()
-        if sh is None:
-            raise RuntimeError("스프레드시트 핸들을 얻지 못했습니다.")
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
     except Exception as exc:
         return None, f"스프레드시트 접근 실패: {exc}"
     # 탭 열기 시도 → 실패하면 무조건 생성
     try:
-        ws = _ws_handle_required(_DRG_PREDICTIONS_WORKSHEET_TITLE)
+        ws = sh.worksheet(_DRG_PREDICTIONS_WORKSHEET_TITLE)
         return ws, None
     except Exception:
         pass
@@ -8237,7 +7904,6 @@ def open_drg_predictions_worksheet():
         ws.update([_DRG_PREDICTIONS_SHEET_COLS],
                   range_name=f"A1:{chr(64+ncols)}1",
                   value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc2:
         return None, f"DRG_Predictions 시트 생성 실패: {exc2}"
@@ -8439,16 +8105,16 @@ def open_trade_history_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        ws = _ws_handle_required(_TRADE_HISTORY_WORKSHEET_TITLE)
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        ws = sh.worksheet(_TRADE_HISTORY_WORKSHEET_TITLE)
         return ws, None
     except Exception as exc:
         msg = str(exc).lower()
         if "not found" in msg or "does not exist" in msg or "unable to find" in msg:
             try:
-                sh = _open_quant_db()
+                sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
                 ws = sh.add_worksheet(title=_TRADE_HISTORY_WORKSHEET_TITLE, rows=5000, cols=8)
                 ws.update([_TRADE_HISTORY_SHEET_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
-                _invalidate_ws_handles()
                 return ws, None
             except Exception as exc2:
                 return None, f"Trade_History 시트를 만들 수 없습니다: {exc2}"
@@ -8569,16 +8235,15 @@ def open_dividend_prefs_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
         last_col = chr(ord("A") + len(_DIVIDEND_PREFS_COLS) - 1)
-        _ws_c = _ws_handle(_DIVIDEND_PREFS_SHEET_TITLE)
-        if _ws_c is not None:
-            return _ws_c, None
-        sh = _open_quant_db()
+        titles = [w.title for w in sh.worksheets()]
+        if _DIVIDEND_PREFS_SHEET_TITLE in titles:
+            return sh.worksheet(_DIVIDEND_PREFS_SHEET_TITLE), None
         ws = sh.add_worksheet(title=_DIVIDEND_PREFS_SHEET_TITLE, rows=1000,
                               cols=len(_DIVIDEND_PREFS_COLS))
         ws.update([_DIVIDEND_PREFS_COLS], range_name=f"A1:{last_col}1",
                   value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Dividend_Prefs 워크시트 열기/생성 실패: {exc}"
@@ -8678,16 +8343,15 @@ def open_dividend_log_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
         last_col = chr(ord("A") + len(_DIVIDEND_LOG_COLS) - 1)
-        _ws_c = _ws_handle(_DIVIDEND_LOG_SHEET_TITLE)
-        if _ws_c is not None:
-            return _ws_c, None
-        sh = _open_quant_db()
+        titles = [w.title for w in sh.worksheets()]
+        if _DIVIDEND_LOG_SHEET_TITLE in titles:
+            return sh.worksheet(_DIVIDEND_LOG_SHEET_TITLE), None
         ws = sh.add_worksheet(title=_DIVIDEND_LOG_SHEET_TITLE, rows=3000,
                               cols=len(_DIVIDEND_LOG_COLS))
         ws.update([_DIVIDEND_LOG_COLS], range_name=f"A1:{last_col}1",
                   value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Dividend_Log 워크시트 열기/생성 실패: {exc}"
@@ -9951,33 +9615,6 @@ def compute_sell_signal_indicators(tickers: list) -> dict:
     return results
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_hidden_alpha_ranks() -> tuple:
-    """HiddenAlpha_Snapshot(A1 셀 JSON) → ({TICKER: rank}, 기준일). 실패 시 ({}, "").
-
-    자동화(run_hidden_alpha, 토요일 5PM)가 이미 계산해 저장한 랭킹이다.
-    앱이 같은 걸 다시 계산하면 ETF 유니버스 전체(~350종목)를 받아야 해서
-    376콜·111초가 든다. 저장본을 읽으면 1콜이다.
-
-    ⚠️ 스냅샷은 **Top 30만** 담는다(자동화가 Δ 계산용으로 그렇게 저장한다).
-       31위 밖 보유 ETF 는 여기 없으므로 호출부가 '30위권 밖'으로 표시해야 한다.
-       없는 것을 '산출 불가'로 뭉뚱그리면 정보가 사라진다.
-    """
-    try:
-        ws = _ws_handle("HiddenAlpha_Snapshot")
-        if ws is None:
-            return {}, ""
-        raw = ws.acell("A1").value
-        if not raw:
-            return {}, ""
-        obj = json.loads(raw)
-        ranks = {str(k).strip().upper(): int(v)
-                 for k, v in (obj.get("ranks") or {}).items()}
-        return ranks, str(obj.get("date", ""))
-    except Exception:
-        return {}, ""
-
-
 def build_portfolio_sell_radar_df(portfolio_df):
     _sell_radar_cols = [
         "계좌",
@@ -10032,40 +9669,18 @@ def build_portfolio_sell_radar_df(portfolio_df):
 
     universe_list = read_etf_universe_file_tickers()
     universe_set = set(str(x).strip().upper() for x in universe_list if str(x).strip())
-    # 유니버스 랭킹은 자동화가 계산해 둔 스냅샷을 읽는다.
-    # 예전에는 여기서 cached_etf_universe_rankings_full 로 전 유니버스(~350종목)를
-    # 다시 계산해 376콜·111초가 들었다. 표시용 1개 열을 위한 비용으로는 과했다.
-    ticker_to_rank, _ha_rank_date = load_hidden_alpha_ranks()
-    # 주 1회(토요일) 갱신이므로 어느 시점 기준인지 화면에 남긴다. 숨기면
-    # 며칠 지난 순위를 최신으로 오해할 수 있다.
-    try:
-        st.session_state["_pf_rank_meta"] = {
-            "date": _ha_rank_date, "n": len(ticker_to_rank),
-        }
-    except Exception:
-        pass
+    universe_tuple = tuple(sorted(universe_set))
+    rank_df = cached_etf_universe_rankings_full(universe_tuple)
+    ticker_to_rank = {}
+    if rank_df is not None and not rank_df.empty and "Ticker" in rank_df.columns and "Rank" in rank_df.columns:
+        for _, rr in rank_df.iterrows():
+            tk = str(rr.get("Ticker", "")).strip().upper()
+            rk = pd.to_numeric(rr.get("Rank"), errors="coerce")
+            if tk and pd.notna(rk):
+                ticker_to_rank[tk] = int(rk)
 
     unique_holdings = sorted(dict.fromkeys(clean_tickers))
-    # 종목당 1콜씩 순차로 받던 것을 병렬로 묶는다 (보유 50종목이면 50콜 순차 = 수십 초).
-    # cached_quote_type 은 @st.cache_data 라 두 번째부터는 즉시 반환된다.
-    def _qt_one(_t):
-        try:
-            return _t, cached_quote_type(_t)
-        except Exception:
-            return _t, ""
-
-    quote_by_ticker = {}
-    try:
-        import concurrent.futures as _qt_cf
-        _qw = max(2, min(8, len(unique_holdings) or 1))
-        with _qt_cf.ThreadPoolExecutor(max_workers=_qw) as _qt_ex:
-            for _t, _v in _qt_ex.map(_qt_one, unique_holdings):
-                quote_by_ticker[_t] = _v
-    except Exception:
-        quote_by_ticker = {}
-    # 전멸 시 순차 폴백 — quote_type 이 비면 ETF/개별주 구분이 틀어져 판정이 어긋난다
-    if unique_holdings and not any(quote_by_ticker.values()):
-        quote_by_ticker = {t: cached_quote_type(t) for t in unique_holdings}
+    quote_by_ticker = {t: cached_quote_type(t) for t in unique_holdings}
 
     # 선행 신호(RSI·MACD·52주 이격)를 매도 판정에 통합하기 위해 미리 계산
     sell_sig_map = compute_sell_signal_indicators(unique_holdings)
@@ -10165,10 +9780,7 @@ def build_portfolio_sell_radar_df(portfolio_df):
             else:
                 rk = ticker_to_rank.get(ticker)
                 if rk is None:
-                    # 스냅샷은 Top 30 까지만 담는다. 유니버스에는 있는데 여기 없다면
-                    # '산출 불가'가 아니라 '30위권 밖'이 정확한 사실이다.
-                    universe_rank_cell = ("🔴 30위권 밖" if ticker_to_rank
-                                          else "순위 산출 불가")
+                    universe_rank_cell = "순위 산출 불가"
                 else:
                     universe_rank_cell = f"Top {int(rk)}위"
                     if int(rk) > 5:
@@ -10212,13 +9824,12 @@ def open_early_signal_history_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        _ws_c = _ws_handle(_EARLY_SIGNAL_HISTORY_SHEET_TITLE)
-        if _ws_c is not None:
-            return _ws_c, None
-        sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if _EARLY_SIGNAL_HISTORY_SHEET_TITLE in existing_titles:
+            return sh.worksheet(_EARLY_SIGNAL_HISTORY_SHEET_TITLE), None
         ws = sh.add_worksheet(title=_EARLY_SIGNAL_HISTORY_SHEET_TITLE, rows=5000, cols=8)
         ws.update([_EARLY_SIGNAL_HISTORY_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"EarlySignal_History 워크시트 열기/생성 실패: {exc}"
@@ -10230,13 +9841,12 @@ def open_etf_universe_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        _ws_c = _ws_handle(_ETF_UNIVERSE_SHEET_TITLE)
-        if _ws_c is not None:
-            return _ws_c, None
-        sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if _ETF_UNIVERSE_SHEET_TITLE in existing_titles:
+            return sh.worksheet(_ETF_UNIVERSE_SHEET_TITLE), None
         ws = sh.add_worksheet(title=_ETF_UNIVERSE_SHEET_TITLE, rows=3000, cols=6)
         ws.update([_ETF_UNIVERSE_SHEET_COLS], range_name="A1:F1", value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"ETF_Universe 워크시트 열기/생성 실패: {exc}"
@@ -10578,12 +10188,13 @@ def save_scanner_result_history(user_id: str, score_df: pd.DataFrame, engine: st
     if gc is None:
         return False, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        ws = _ws_handle(_SCANNER_HISTORY_SHEET_TITLE)
-        if ws is None:
-            sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [ws.title for ws in sh.worksheets()]
+        if _SCANNER_HISTORY_SHEET_TITLE not in existing:
             ws = sh.add_worksheet(title=_SCANNER_HISTORY_SHEET_TITLE, rows=5000, cols=9)
             ws.update([_SCANNER_HISTORY_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
-            _invalidate_ws_handles()
+        else:
+            ws = sh.worksheet(_SCANNER_HISTORY_SHEET_TITLE)
             # ── 헤더 마이그레이션: Engine 컬럼 없으면 자동 추가 ──────────
             cur_header = ws.row_values(1)
             if "Engine" not in cur_header:
@@ -10647,12 +10258,13 @@ def save_scanner_last_result(user_id: str, snap: dict, engine: str) -> tuple[boo
     if gc is None:
         return False, "Google 서비스 계정 미설정"
     try:
-        ws = _ws_handle(_SCANNER_LAST_RESULT_SHEET_TITLE)
-        if ws is None:
-            sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [w.title for w in sh.worksheets()]
+        if _SCANNER_LAST_RESULT_SHEET_TITLE not in existing:
             ws = sh.add_worksheet(title=_SCANNER_LAST_RESULT_SHEET_TITLE, rows=100, cols=5)
             ws.update([_SCANNER_LAST_RESULT_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
-            _invalidate_ws_handles()
+        else:
+            ws = sh.worksheet(_SCANNER_LAST_RESULT_SHEET_TITLE)
 
         uid_u = str(user_id).strip().upper()
         engine_label = str(engine).strip()
@@ -10709,9 +10321,11 @@ def load_scanner_last_result(user_id: str, engine: str) -> dict | None:
     if gc is None:
         return None
     try:
-        ws = _ws_handle(_SCANNER_LAST_RESULT_SHEET_TITLE)
-        if ws is None:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [w.title for w in sh.worksheets()]
+        if _SCANNER_LAST_RESULT_SHEET_TITLE not in existing:
             return None
+        ws = sh.worksheet(_SCANNER_LAST_RESULT_SHEET_TITLE)
         all_vals = ws.get_all_values()
         if not all_vals or len(all_vals) < 2:
             return None
@@ -10763,12 +10377,13 @@ def save_accuracy_tracker_last_result(user_id: str, snap: dict) -> tuple[bool, s
         result_df = snap.get("result_df")
         if not isinstance(result_df, pd.DataFrame) or result_df.empty:
             return False, "결과 데이터 없음"
-        ws = _ws_handle(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
-        if ws is None:
-            sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [w.title for w in sh.worksheets()]
+        if _ACCURACY_TRACKER_LAST_SHEET_TITLE not in existing:
             ws = sh.add_worksheet(title=_ACCURACY_TRACKER_LAST_SHEET_TITLE, rows=100, cols=5)
             ws.update([_ACCURACY_TRACKER_LAST_COLS], range_name="A1:E1", value_input_option="USER_ENTERED")
-            _invalidate_ws_handles()
+        else:
+            ws = sh.worksheet(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
         uid_u = str(user_id).strip().upper()
         saved_at = snap.get("saved_at") or datetime.now(timezone.utc).isoformat()
         eval_horizon = str(snap.get("eval_horizon", ""))
@@ -10801,9 +10416,11 @@ def load_accuracy_tracker_last_result(user_id: str) -> dict | None:
     if gc is None:
         return None
     try:
-        ws = _ws_handle(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
-        if ws is None:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [w.title for w in sh.worksheets()]
+        if _ACCURACY_TRACKER_LAST_SHEET_TITLE not in existing:
             return None
+        ws = sh.worksheet(_ACCURACY_TRACKER_LAST_SHEET_TITLE)
         all_vals = ws.get_all_values()
         if not all_vals or len(all_vals) < 2:
             return None
@@ -11041,9 +10658,11 @@ def load_scanner_history(user_id: str, engine: str = "all") -> pd.DataFrame:
     if gc is None:
         return pd.DataFrame()
     try:
-        ws = _ws_handle(_SCANNER_HISTORY_SHEET_TITLE)
-        if ws is None:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [ws.title for ws in sh.worksheets()]
+        if _SCANNER_HISTORY_SHEET_TITLE not in existing:
             return pd.DataFrame()
+        ws = sh.worksheet(_SCANNER_HISTORY_SHEET_TITLE)
         vals = ws.get_all_values()
         if not vals or len(vals) < 2:
             return pd.DataFrame()
@@ -11088,13 +10707,12 @@ def open_portfolio_history_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        _ws_c = _ws_handle(_PORTFOLIO_HISTORY_SHEET_TITLE)
-        if _ws_c is not None:
-            return _ws_c, None
-        sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [ws.title for ws in sh.worksheets()]
+        if _PORTFOLIO_HISTORY_SHEET_TITLE in existing:
+            return sh.worksheet(_PORTFOLIO_HISTORY_SHEET_TITLE), None
         ws = sh.add_worksheet(title=_PORTFOLIO_HISTORY_SHEET_TITLE, rows=5000, cols=8)
         ws.update([_PORTFOLIO_HISTORY_COLS], range_name="A1:H1", value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Portfolio_History 워크시트 열기/생성 실패: {exc}"
@@ -11203,13 +10821,12 @@ def open_emerging_tracker_worksheet():
     if gc is None:
         return None, "Google 서비스 계정이 설정되지 않았습니다."
     try:
-        _ws_c = _ws_handle(_EMERGING_TRACKER_SHEET_TITLE)
-        if _ws_c is not None:
-            return _ws_c, None
-        sh = _open_quant_db()
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        existing = [ws.title for ws in sh.worksheets()]
+        if _EMERGING_TRACKER_SHEET_TITLE in existing:
+            return sh.worksheet(_EMERGING_TRACKER_SHEET_TITLE), None
         ws = sh.add_worksheet(title=_EMERGING_TRACKER_SHEET_TITLE, rows=2000, cols=9)
         ws.update([_EMERGING_TRACKER_COLS], range_name="A1:I1", value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         return ws, None
     except Exception as exc:
         return None, f"Emerging_Tracker 워크시트 열기/생성 실패: {exc}"
@@ -11424,345 +11041,34 @@ def open_watchlist_worksheet():
     if gc is None:
         return None, "Google 서비스 계정(`gcp_service_account`)이 설정되지 않았습니다."
     try:
-        ws = _ws_handle(_WATCHLIST_SHEET_TITLE)
-        if ws is not None:
+        sh = gc.open(_QUANT_DB_SPREADSHEET_TITLE)
+        # 먼저 기존 탭 목록에서 찾기
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if _WATCHLIST_SHEET_TITLE in existing_titles:
+            ws = sh.worksheet(_WATCHLIST_SHEET_TITLE)
             # 과거 드리프트/헤더 누락 데이터 자동 복구 (세션당 1회)
             if not st.session_state.get("_wl_layout_repaired"):
                 try:
                     if _repair_watchlist_layout(ws):
-                        # 시트를 통째로 재작성했으므로 세션 레이어도 반드시 버린다
                         load_watchlist_sheet.clear()
-                        _wl_session_invalidate()
                         st.session_state.pop("_sidebar_wl_count", None)
                 except Exception:
                     pass
                 st.session_state["_wl_layout_repaired"] = True
             return ws, None
         # 없으면 새로 생성
-        sh = _open_quant_db()
-        if sh is None:
-            return None, "Quant_DB 스프레드시트를 열 수 없습니다."
         ws = sh.add_worksheet(title=_WATCHLIST_SHEET_TITLE, rows=1000, cols=max(_WL_NCOL, 10))
         _hdr_end = gspread.utils.rowcol_to_a1(1, _WL_NCOL)
         ws.update([_WATCHLIST_SHEET_COLS], range_name=f"A1:{_hdr_end}", value_input_option="USER_ENTERED")
-        _invalidate_ws_handles()
         st.session_state["_wl_layout_repaired"] = True
         return ws, None
     except Exception as exc:
         return None, f"Watchlist 워크시트를 열거나 생성할 수 없습니다: {exc}"
 
 
-def _wl_row_to_item(r: list) -> dict:
-    """시트 행 → item dict. (읽기 측 SSOT — load/update 가 같은 해석을 쓰도록)"""
-    r = (list(r) + [""] * _WL_NCOL)[:_WL_NCOL]
-    _states_raw = str(r[10]).strip()
-    return {
-        "ticker": str(r[1]).strip().upper(),
-        "memo": str(r[2]).strip(),
-        "alert_price": pd.to_numeric(r[3], errors="coerce") if r[3] else np.nan,
-        "alert_rsi": pd.to_numeric(r[4], errors="coerce") if r[4] else np.nan,
-        "alert_ma200": str(r[5]).strip().lower() == "true",
-        "saved_price": pd.to_numeric(r[6], errors="coerce") if r[6] else np.nan,
-        "date_added": str(r[7]).strip(),
-        "stop_loss": pd.to_numeric(r[8], errors="coerce") if r[8] else np.nan,
-        "target_price": pd.to_numeric(r[9], errors="coerce") if r[9] else np.nan,
-        # 상태 기반 알림: 활성 이벤트 리스트 + 깜빡임 방지용 마지막 상태(JSON 문자열)
-        "alert_states": [s.strip() for s in _states_raw.split(",") if s.strip()] if _states_raw else [],
-        "alert_last_state": str(r[11]).strip(),
-        # 계좌 귀속(빈 문자열 = 미지정 → 활성 계좌 기준으로 사이징)
-        "account": str(r[_WL_COL_ACCOUNT]).strip(),
-    }
-
-
-def _wl_item_to_row(user_id: str, item: dict) -> list:
-    """item dict → 시트 행. (쓰기 측 SSOT — save/update 가 같은 직렬화를 쓰도록)
-
-    ⚠️ 반환 길이는 반드시 _WL_NCOL(13)이다. 칸 수가 어긋나면 값이 옆 열로 밀려
-       그대로 드리프트가 된다. 마지막 줄에서 길이를 강제 정규화한다.
-    """
-    def _num(v, nd):
-        try:
-            if v is None or v == "" or pd.isna(v):
-                return ""
-            return str(round(float(v), nd))
-        except (TypeError, ValueError):
-            return ""
-
-    _states = item.get("alert_states", "")
-    if isinstance(_states, (list, tuple)):
-        _states_s = ",".join(str(s).strip() for s in _states if str(s).strip())
-    else:
-        _states_s = str(_states or "").strip()
-
-    row = [
-        str(user_id).strip(),
-        str(item.get("ticker", "")).strip().upper(),
-        str(item.get("memo", "") or "").strip(),
-        _num(item.get("alert_price"), 4),
-        _num(item.get("alert_rsi"), 1),
-        "true" if item.get("alert_ma200") else "false",
-        _num(item.get("saved_price"), 4),
-        str(item.get("date_added") or _narrative_now_et_string()).strip(),
-        _num(item.get("stop_loss"), 4),
-        _num(item.get("target_price"), 4),
-        _states_s,
-        str(item.get("alert_last_state", "") or "").strip(),
-        str(item.get("account", "") or "").strip(),
-    ]
-    return (row + [""] * _WL_NCOL)[:_WL_NCOL]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Watchlist 세션 캐시 레이어 — 저장 직후 시트 재읽기를 없앤다 (optimistic update)
-#
-#   @st.cache_data 는 외부에서 값 주입이 불가능해(clear 만 가능) 저장할 때마다
-#   "쓰기 → 캐시 폐기 → rerun → 시트 재읽기" 가 강제됐다. 그 위에 얇은 세션
-#   레이어를 얹어, 쓰기가 성공하면 메모리 목록만 갱신하고 시트는 다시 읽지 않는다.
-#
-#   ⚠️ 표시용 레이어다. 시트 쓰기가 성공한 뒤에만 갱신하고, 실패 시에는 손대지
-#      않아 다음 조회에서 시트의 진실을 다시 읽게 한다.
-#   ⚠️ 사용자별로 분리한다. 게스트 목록이 관리자 화면에 섞이면 안 된다.
-#   ⚠️ 목록이 아직 적재되지 않은 사용자에게는 upsert 하지 않는다. 1건짜리 부분
-#      목록이 '전체'인 것처럼 굳어 나머지 종목이 사라져 보이는 사고를 막는다.
-# ══════════════════════════════════════════════════════════════════════════════
-_WL_SESSION_KEY = "_wl_items_session"
-
-
-def _wl_session_key(user_id: str) -> str:
-    return str(user_id or "").strip().upper()
-
-
-def _wl_session_store(create: bool = False):
-    try:
-        store = st.session_state.get(_WL_SESSION_KEY)
-        if not isinstance(store, dict):
-            if not create:
-                return None
-            store = {}
-            st.session_state[_WL_SESSION_KEY] = store
-        return store
-    except Exception:
-        return None
-
-
-def _wl_session_invalidate(user_id=None) -> None:
-    """user_id 지정 시 해당 사용자만, 생략 시 전체 무효화."""
-    store = _wl_session_store()
-    if store is None:
-        return
-    try:
-        if user_id is None:
-            store.clear()
-        else:
-            store.pop(_wl_session_key(user_id), None)
-    except Exception:
-        pass
-
-
-def _wl_session_set(user_id: str, items: list) -> None:
-    store = _wl_session_store(create=True)
-    if store is None:
-        return
-    try:
-        store[_wl_session_key(user_id)] = [dict(it) for it in (items or [])]
-    except Exception:
-        pass
-
-
-def _wl_session_upsert(user_id: str, item: dict) -> None:
-    """목록이 이미 적재된 경우에만 해당 티커를 교체/추가한다."""
-    store = _wl_session_store()
-    k = _wl_session_key(user_id)
-    if store is None or k not in store:
-        return
-    try:
-        tk = str(item.get("ticker", "")).strip().upper()
-        lst = [dict(it) for it in store[k] if str(it.get("ticker", "")).strip().upper() != tk]
-        lst.append(dict(item))
-        store[k] = lst
-    except Exception:
-        store.pop(k, None)
-
-
-def _wl_session_remove(user_id: str, ticker: str) -> None:
-    """목록이 이미 적재된 경우에만 해당 티커를 제거한다."""
-    store = _wl_session_store()
-    k = _wl_session_key(user_id)
-    if store is None or k not in store:
-        return
-    try:
-        tk = str(ticker).strip().upper()
-        store[k] = [dict(it) for it in store[k]
-                    if str(it.get("ticker", "")).strip().upper() != tk]
-    except Exception:
-        store.pop(k, None)
-
-
-def open_watchlist_metrics_worksheet():
-    """Watchlist_Metrics 탭. 없으면 None (자동화가 아직 안 돈 상태 — 폴백으로 처리).
-
-    ⚠️ _ws_handle 은 '탭 없음(None)'도 10분간 캐시한다. 이 탭은 **다른 프로세스**
-       (GitHub Actions 자동화/백필)가 만들기 때문에, 앱이 생성 직전에 한 번
-       조회했다면 실제로 생긴 뒤에도 최대 10분간 계속 None 이 나온다.
-       → 음성 결과일 때만 캐시를 우회해 직접 한 번 더 확인한다(비용 1콜, 드문 경로).
-    """
-    if get_gspread_client() is None:
-        return None
-    ws = _ws_handle(wm.SHEET_TITLE)
-    if ws is not None:
-        return ws
-    try:
-        sh = _open_quant_db()
-        if sh is None:
-            return None
-        ws = sh.worksheet(wm.SHEET_TITLE)   # 캐시 우회 직접 조회
-        _invalidate_ws_handles()            # 실제로 있었으니 캐시를 새로 잡게 한다
-        return ws
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_watchlist_metrics() -> dict:
-    """Watchlist_Metrics 시트 → {TICKER: metrics dict}. 5분 캐시.
-
-    티커 단위 공용 데이터라 user_id 를 키에 넣지 않는다(개인 데이터 없음).
-    시트가 없거나 읽기에 실패하면 빈 dict — 호출부가 전부 실시간 계산으로 떨어진다.
-    """
-    try:
-        ws = open_watchlist_metrics_worksheet()
-        if ws is None:
-            return {}
-        vals = ws.get_all_values() or []
-        if len(vals) < 2:
-            return {}
-        out = {}
-        for r in vals[1:]:
-            m = wm.from_row(r)
-            if m:
-                out[m["ticker"]] = m
-        return out
-    except Exception:
-        return {}
-
-
-def _wl_prefetch_histories(tickers: tuple, limit: int = 252) -> dict:
-    """알림 평가용 일봉을 병렬로 미리 채운다. 반환 {TICKER: DataFrame|None}.
-
-    `_fmp_price_history` 는 scanner_core 의 프로세스 수명 TTL 캐시(30분)를 쓰므로,
-    여기서 한 번 병렬로 훑어두면 이후 호출은 전부 캐시 히트가 된다.
-
-    ⚠️ 병렬화는 네트워크 I/O 에만 적용한다. 레짐 계산(rc.analyze_ticker)은 호출부에서
-       순차로 남겨 스레드 안전성 검증 부담을 만들지 않는다 — 느린 쪽은 어차피 I/O 다.
-    ⚠️ FMP Starter 300/분 한도. max_workers=8 은 앱의 다른 병렬 구간과 같은 수준이다.
-       스캐너·Hidden Alpha 와 동시에 돌리지 않는다는 기존 운영 원칙은 그대로 유효하다.
-    """
-    out = {}
-    tks = [t for t in dict.fromkeys(str(x).strip().upper() for x in (tickers or [])) if t]
-    if not tks:
-        return out
-
-    def _one(tk):
-        try:
-            return tk, _fmp_price_history(tk, limit=limit)
-        except Exception:
-            return tk, None
-
-    try:
-        import concurrent.futures as _cf
-        with _cf.ThreadPoolExecutor(max_workers=8) as _ex:
-            for _tk, _df in _ex.map(_one, tks):
-                out[_tk] = _df
-    except Exception:
-        # 병렬 실패 시 순차 폴백 — 느릴 뿐 결과는 동일하다
-        for tk in tks:
-            out[tk] = _one(tk)[1]
-    return out
-
-
-def _pf_prefetch_histories(tickers: tuple, limit: int = 600) -> dict:
-    """포트폴리오 보유 종목 일봉을 병렬로 미리 받는다. {TICKER: DataFrame|None}
-
-    워치리스트용 _wl_prefetch_histories 와 같은 패턴이지만 봉 수가 600 이다
-    (매도 레이더는 200일선·장기 추세를 봐야 해서 252봉으로는 부족하다).
-
-    ⚠️ max_workers 를 종목 수에 맞춰 조절한다. 보유가 50종목까지 늘어도
-       FMP Starter 300/분 안에서 안전하도록 상한을 8로 둔다. 레이트리밋 자체는
-       fmp_extras 의 락 기반 슬라이딩 윈도우가 강제하므로 초과하지 않는다.
-    ⚠️ 실패한 종목은 None 으로 남긴다. 호출부가 이미 None/빈 DF 를 처리한다.
-    """
-    out = {}
-    tks = [t for t in dict.fromkeys(str(x).strip().upper() for x in (tickers or [])) if t]
-    if not tks:
-        return out
-
-    def _one(tk):
-        try:
-            return tk, _fmp_price_history(tk, limit=limit)
-        except Exception:
-            return tk, None
-
-    try:
-        import concurrent.futures as _cf
-        _w = max(2, min(8, len(tks)))
-        with _cf.ThreadPoolExecutor(max_workers=_w) as _ex:
-            for _tk, _df in _ex.map(_one, tks):
-                out[_tk] = _df
-    except Exception:
-        for tk in tks:                      # 병렬 실패 시 순차 폴백
-            out[tk] = _one(tk)[1]
-    return out
-
-
-def _wl_mark_alert_recheck(ticker: str) -> None:
-    """이 티커만 알림 재평가 대상으로 표시한다.
-
-    ⚠️ 예전에는 종목 하나만 고쳐도 `_watchlist_alert_checked = False` 로 전체
-       플래그를 내려 워치리스트 전 종목(55개)을 순차 재평가했다. 종목당 FMP
-       일봉 1콜 + 레짐 분석이라 캐시가 비어 있으면 10초 넘게 걸렸다.
-       목표가 하나 바꾼 것 때문에 나머지 54종목을 다시 볼 이유는 없다.
-    """
-    try:
-        _s = st.session_state.get("_wl_alert_recheck")
-        if not isinstance(_s, set):
-            _s = set()
-        _s.add(str(ticker).strip().upper())
-        st.session_state["_wl_alert_recheck"] = _s
-    except Exception:
-        pass
-
-
-def get_watchlist_items(user_id: str, force: bool = False) -> list[dict]:
-    """Watchlist 조회 진입점. 세션 레이어 우선 → 미적재 시 시트 읽기.
-
-    force=True 는 세션·시트 캐시를 모두 버리고 시트에서 다시 읽는다(수동 새로고침).
-    반환값은 방어적 복사본이라 호출부가 수정해도 캐시가 오염되지 않는다.
-    """
-    uid_k = _wl_session_key(user_id)
-    if not uid_k:
-        return []
-    if force:
-        _wl_session_invalidate(user_id)
-        try:
-            load_watchlist_sheet.clear()
-        except Exception:
-            pass
-    else:
-        store = _wl_session_store()
-        if isinstance(store, dict) and uid_k in store:
-            return [dict(it) for it in store[uid_k]]
-    items = load_watchlist_sheet(user_id)
-    _wl_session_set(user_id, items)
-    return [dict(it) for it in items]
-
-
 @st.cache_data(ttl=300, show_spinner=False)
 def load_watchlist_sheet(user_id: str) -> list[dict]:
-    """Watchlist 시트에서 현재 user_id 기록 로드. 5분 캐시.
-
-    ⚠️ 직접 호출하지 말고 get_watchlist_items() 를 쓴다. 세션 레이어를 건너뛰면
-       저장 직후 옛 목록이 보일 수 있다.
-    """
+    """Watchlist 시트에서 현재 user_id 기록 로드. 60초 캐시."""
     ws, err = open_watchlist_worksheet()
     if err or ws is None:
         return []
@@ -11771,100 +11077,31 @@ def load_watchlist_sheet(user_id: str) -> list[dict]:
         if not vals or len(vals) < 2:
             return []
         uid_u = str(user_id).strip().upper()
-        return [_wl_row_to_item(r) for r in vals[1:]
-                if str((list(r) + [""])[0]).strip().upper() == uid_u]
+        items = []
+        for r in vals[1:]:
+            r = (r + [""] * _WL_NCOL)[:_WL_NCOL]
+            if str(r[0]).strip().upper() != uid_u:
+                continue
+            _states_raw = str(r[10]).strip()
+            items.append({
+                "ticker": str(r[1]).strip().upper(),
+                "memo": str(r[2]).strip(),
+                "alert_price": pd.to_numeric(r[3], errors="coerce") if r[3] else np.nan,
+                "alert_rsi": pd.to_numeric(r[4], errors="coerce") if r[4] else np.nan,
+                "alert_ma200": str(r[5]).strip().lower() == "true",
+                "saved_price": pd.to_numeric(r[6], errors="coerce") if r[6] else np.nan,
+                "date_added": str(r[7]).strip(),
+                "stop_loss": pd.to_numeric(r[8], errors="coerce") if r[8] else np.nan,
+                "target_price": pd.to_numeric(r[9], errors="coerce") if r[9] else np.nan,
+                # 상태 기반 알림: 활성 이벤트 리스트 + 깜빡임 방지용 마지막 상태(JSON 문자열)
+                "alert_states": [s.strip() for s in _states_raw.split(",") if s.strip()] if _states_raw else [],
+                "alert_last_state": str(r[11]).strip(),
+                # 계좌 귀속(빈 문자열 = 미지정 → 활성 계좌 기준으로 사이징)
+                "account": str(r[_WL_COL_ACCOUNT]).strip(),
+            })
+        return items
     except Exception:
         return []
-
-
-def update_watchlist_row(user_id: str, ticker: str, updates: dict) -> tuple[bool, str, dict]:
-    """(user_id, ticker) 행을 제자리 갱신. '삭제 후 재추가'(9콜)를 2콜로 대체한다.
-
-    부수 효과로, 재추가 때 손절가·목표가·Alert_States·Account 가 초기화되던 문제
-    (run_scanner_scan.py 주석에 지적된 그 동작)도 사라진다.
-
-    ▣ 드리프트 방지 4중 가드
-      1. 행 번호는 방금 읽은 스냅샷에서만 얻는다 — 기억해 둔 옛 좌표를 쓰지 않는다
-      2. 기록 직전 대상 좌표를 '별도의 새 읽기'로 재확인한다 (A{r}:B{r} 1콜).
-         ⚠️ 스냅샷 자신과 대조하면 항상 참이라 아무것도 못 막는다. 반드시
-            시간상 나중의 독립 관측이어야 한다. Watchlist 는 전 사용자 공용
-            시트라 오좌표 기록은 곧 타인 행 파손이다.
-      3. 변경된 필드만 1칸짜리 range 로 기록한다. 연속 범위를 통째로 덮지 않아
-         칸 수 불일치로 옆 열이 밀릴 여지 자체가 없다.
-      4. 모든 range 는 화이트리스트(B~M, 알려진 필드)만 허용하고 A열(ID)은 금지.
-
-    3번의 부수 효과가 크다. 사용자가 건드리지 않은 칸(특히 자동화가 쓰는
-    L열 Alert_LastState, 그리고 Saved_Price·Date_Added)을 아예 만지지 않으므로
-    자동화 결과를 덮어쓰지 않고 숫자 표기도 원본 그대로 남는다.
-
-    반환: (성공, 에러메시지, 갱신된 item). 행이 없으면 (False, "not_found", {}).
-    """
-    uid = str(user_id).strip()
-    tk = str(ticker).strip().upper()
-    if not uid or not tk:
-        return False, "유저ID 또는 티커 없음", {}
-    ws, err = open_watchlist_worksheet()
-    if err or ws is None:
-        return False, err or "워크시트 열기 실패", {}
-    try:
-        vals = ws.get_all_values() or []          # 가드 1
-        uid_u = uid.upper()
-        target_row, cur = None, None
-        for i, r in enumerate(vals[1:], start=2):
-            rr = (list(r) + [""] * _WL_NCOL)[:_WL_NCOL]
-            if str(rr[0]).strip().upper() == uid_u and str(rr[1]).strip().upper() == tk:
-                target_row, cur = i, rr
-                break
-        if target_row is None:
-            return False, "not_found", {}
-
-        # 변경 필드만 셀 단위로 추린다 (가드 3)
-        item = _wl_row_to_item(cur)
-        full_new = dict(item)
-        for _k, _v in (updates or {}).items():
-            full_new[_k] = _v
-        full_new["ticker"] = tk
-        old_cells = _wl_item_to_row(uid, item)
-        new_cells = _wl_item_to_row(uid, full_new)
-
-        reqs, touched = [], []
-        for _idx in _WL_EDITABLE_COL_IDX:                        # 가드 4
-            if str(old_cells[_idx]) == str(new_cells[_idx]):
-                continue
-            _a1 = f"{gspread.utils.rowcol_to_a1(target_row, _idx + 1)}"
-            reqs.append({"range": _a1, "values": [[new_cells[_idx]]]})
-            touched.append(_a1)
-        if not reqs:
-            _wl_session_upsert(uid, full_new)
-            return True, "", full_new              # 변경 없음 → 쓰기 자체를 생략
-
-        # 가드 2 — 스냅샷과 무관한 '새 관측'으로 좌표 재확인
-        try:
-            _probe = ws.get(f"A{target_row}:B{target_row}") or []
-        except Exception as _pe:
-            return False, f"좌표 재확인 실패: {_pe}", {}
-        _pr = (list(_probe[0]) if _probe else []) + ["", ""]
-        if str(_pr[0]).strip().upper() != uid_u or str(_pr[1]).strip().upper() != tk:
-            _wl_session_invalidate(uid)
-            try:
-                load_watchlist_sheet.clear()
-            except Exception:
-                pass
-            return False, ("시트가 방금 변경되어 행 위치가 달라졌습니다. "
-                           "새로고침 후 다시 시도해 주세요."), {}
-
-        ws.batch_update(reqs, value_input_option="USER_ENTERED")
-
-        _wl_session_upsert(uid, full_new)
-        try:
-            load_watchlist_sheet.clear()
-        except Exception:
-            pass
-        st.session_state.pop("_sidebar_wl_count", None)
-        _wl_mark_alert_recheck(tk)   # 이 종목만 재평가 (전체 55종목 재스캔 방지)
-        return True, "", full_new
-    except Exception as exc:
-        return False, str(exc), {}
 
 
 def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
@@ -11880,22 +11117,48 @@ def save_watchlist_sheet(user_id: str, items: list[dict]) -> tuple[bool, str]:
             r for r in vals[1:]
             if str((r + [""])[0]).strip().upper() != uid_u
         ]
-        # 직렬화는 _wl_item_to_row 단일 경로 — update_watchlist_row 와 규칙이 갈리지 않게 한다
-        new_rows = [
-            _wl_item_to_row(user_id, item) for item in items
-            if str(item.get("ticker", "")).strip()
-        ]
-        # 다른 유저 행도 13칸으로 정규화 (구 8열 레코드 혼재 시 열 밀림 방지)
-        other_rows = [(list(r) + [""] * _WL_NCOL)[:_WL_NCOL] for r in other_rows]
+        new_rows = []
+        for item in items:
+            ticker = str(item.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            alert_price = item.get("alert_price", "")
+            alert_price_str = str(round(float(alert_price), 4)) if pd.notna(alert_price) and alert_price != "" else ""
+            alert_rsi = item.get("alert_rsi", "")
+            alert_rsi_str = str(round(float(alert_rsi), 1)) if pd.notna(alert_rsi) and alert_rsi != "" else ""
+            alert_ma200_str = "true" if item.get("alert_ma200") else "false"
+            saved_price = item.get("saved_price", "")
+            saved_price_str = str(round(float(saved_price), 4)) if pd.notna(saved_price) and saved_price != "" else ""
+            stop_loss = item.get("stop_loss", "")
+            stop_loss_str = str(round(float(stop_loss), 4)) if pd.notna(stop_loss) and stop_loss != "" else ""
+            target_price = item.get("target_price", "")
+            target_price_str = str(round(float(target_price), 4)) if pd.notna(target_price) and target_price != "" else ""
+            # 상태 기반 알림 직렬화
+            _states = item.get("alert_states", "")
+            if isinstance(_states, (list, tuple)):
+                alert_states_str = ",".join(str(s).strip() for s in _states if str(s).strip())
+            else:
+                alert_states_str = str(_states or "").strip()
+            alert_last_state_str = str(item.get("alert_last_state", "") or "").strip()
+            new_rows.append([
+                str(user_id).strip(),
+                ticker,
+                str(item.get("memo", "")).strip(),
+                alert_price_str,
+                alert_rsi_str,
+                alert_ma200_str,
+                saved_price_str,
+                str(item.get("date_added", _narrative_now_et_string())).strip(),
+                stop_loss_str,
+                target_price_str,
+                alert_states_str,
+                alert_last_state_str,
+                str(item.get("account", "") or "").strip(),
+            ])
         all_rows = [_WATCHLIST_SHEET_COLS] + other_rows + new_rows
         ws.clear()
         _end_cell = gspread.utils.rowcol_to_a1(len(all_rows), _WL_NCOL)
         ws.update(all_rows, range_name=f"A1:{_end_cell}", value_input_option="USER_ENTERED")
-        _wl_session_set(user_id, [_wl_row_to_item(r) for r in new_rows])
-        try:
-            load_watchlist_sheet.clear()
-        except Exception:
-            pass
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -11920,11 +11183,10 @@ def delete_from_watchlist(user_id: str, ticker: str) -> tuple[bool, str]:
                 to_del.append(i)
         for row_idx in reversed(to_del):
             ws.delete_rows(row_idx)
-        # 세션 목록에서만 제거 → rerun 후 시트 재읽기 없음 (optimistic update)
-        _wl_session_remove(uid_u, tk_u)
+        # 캐시 초기화
         load_watchlist_sheet.clear()
         st.session_state.pop("_sidebar_wl_count", None)
-        _wl_mark_alert_recheck(tk_u)  # 삭제된 종목의 묵은 알림을 걷어내기 위해 표시
+        st.session_state["_watchlist_alert_checked"] = False
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -11976,31 +11238,25 @@ def add_to_watchlist(user_id: str, ticker: str, memo: str = "",
         # 새 행 추가 (12열: ... Date_Added, Stop_Loss, Target_Price, Alert_States, Alert_LastState)
         #   alert_states is None → 신규 기본값(entry,risk) / "" → 알림 없음(사용자가 전부 해제)
         _states_val = _WL_ALERT_DEFAULT if alert_states is None else str(alert_states).strip()
-        _new_item = {
-            "ticker": tk,
-            "memo": str(memo).strip(),
-            "alert_price": alert_price,
-            "alert_rsi": alert_rsi,
-            "alert_ma200": bool(alert_ma200),
-            "saved_price": cur_price,
-            "date_added": _narrative_now_et_string(),
-            "stop_loss": stop_loss,
-            "target_price": target_price,
-            "alert_states": str(_states_val).strip(),
-            "alert_last_state": "",  # 첫 평가 시 채워짐
-            "account": (str(st.session_state.get("_active_account") or "").strip()
-                        if account is None else str(account).strip()),
-        }
-        # ⚠️ _safe_append_rows 는 그대로 둔다. 자동화(run_scanner_scan)가 같은 시트에
-        #    append 하므로 앱이 기억한 마지막 행 번호는 신뢰할 수 없고, 내부의
-        #    get_all_values() 가 계단식 드리프트를 막는 안전장치다. 1콜은 남긴다.
-        _safe_append_rows(ws, _wl_item_to_row(uid, _new_item),
-                          value_input_option="USER_ENTERED")
-        # 세션 목록만 갱신 → rerun 후 시트 재읽기 없음 (optimistic update)
-        _wl_session_upsert(uid, _wl_row_to_item(_wl_item_to_row(uid, _new_item)))
+        _safe_append_rows(ws, [
+            uid, tk,
+            str(memo).strip(),
+            str(round(float(alert_price), 4)) if alert_price is not None else "",
+            str(round(float(alert_rsi), 1)) if alert_rsi is not None else "",
+            "true" if alert_ma200 else "false",
+            str(round(float(cur_price), 4)) if pd.notna(cur_price) else "",
+            _narrative_now_et_string(),
+            str(round(float(stop_loss), 4)) if (stop_loss is not None and pd.notna(stop_loss)) else "",
+            str(round(float(target_price), 4)) if (target_price is not None and pd.notna(target_price)) else "",
+            str(_states_val).strip(),
+            "",  # Alert_LastState 초기값(빈) — 첫 평가 시 채워짐
+            (str(st.session_state.get("_active_account") or "").strip()
+             if account is None else str(account).strip()),
+        ], value_input_option="USER_ENTERED")
+        # 캐시 초기화
         load_watchlist_sheet.clear()
         st.session_state.pop("_sidebar_wl_count", None)
-        _wl_mark_alert_recheck(tk)   # 이 종목만 재평가
+        st.session_state["_watchlist_alert_checked"] = False
         st.session_state[f"_wl_added_{tk}"] = True
         return True, ""
     except Exception as exc:
@@ -15004,39 +14260,15 @@ if st.session_state.get("logged_in"):
             except Exception:
                 pass
 
-    # ── Watchlist Alert 체크 ──────────────────────────────────────────────
-    #   세션 최초 1회는 전 종목(full), 이후 편집이 생기면 '해당 티커만'(partial).
-    #   예전에는 종목 하나만 고쳐도 전체를 순차 재평가해 캐시가 비면 10초 넘게 걸렸다.
+    # ── Watchlist Alert 자동 체크 (매 세션 1회) ───────────────────────────
     _uid_alert = str(st.session_state.get("user_id") or "").strip()
-    _wl_recheck = st.session_state.get("_wl_alert_recheck") or set()
-    _wl_full = bool(_uid_alert) and not st.session_state.get("_watchlist_alert_checked")
-    _wl_part = bool(_uid_alert) and bool(_wl_recheck) and not _wl_full
-    if _wl_full or _wl_part:
+    if _uid_alert and not st.session_state.get("_watchlist_alert_checked"):
         st.session_state["_watchlist_alert_checked"] = True
-        st.session_state["_wl_alert_recheck"] = set()
-        _rc_u = {str(t).strip().upper() for t in _wl_recheck}
         try:
-            _wl_all = get_watchlist_items(_uid_alert)
-            if _wl_full:
-                _wl_items = _wl_all
-            else:
-                _wl_items = [i for i in _wl_all
-                             if str(i.get("ticker", "")).strip().upper() in _rc_u]
-
-            # 부분 재평가에서는 대상 티커의 옛 결과를 먼저 걷어낸다.
-            # (삭제된 종목이라 _wl_items 가 비어도 묵은 알림이 남지 않도록 무조건 수행)
-            if _wl_part:
-                _prev_hits = [t for t in (st.session_state.get("_watchlist_triggered_alerts") or [])
-                              if str(t).strip().upper() not in _rc_u]
-            else:
-                _prev_hits = []
-
-            _alert_hits = []
+            _wl_items = load_watchlist_sheet(_uid_alert)
             if _wl_items:
-                _wl_tickers = tuple(i["ticker"] for i in _wl_items)
-                _price_map = fetch_latest_prices_for_tickers(_wl_tickers)
-                # 일봉은 병렬로 미리 채운다 — 아래 루프는 전부 캐시 히트가 된다
-                _hist_map = _wl_prefetch_histories(_wl_tickers)
+                _wl_tickers = [i["ticker"] for i in _wl_items]
+                _price_map = fetch_latest_prices_for_tickers(tuple(_wl_tickers))
                 try:
                     _spy_h = _fmp_price_history("SPY", limit=252)
                     _spy_c = (_spy_h["Close"]
@@ -15044,10 +14276,11 @@ if st.session_state.get("logged_in"):
                               else None)
                 except Exception:
                     _spy_c = None
+                _alert_hits = []
                 for _it in _wl_items:
                     _tk = _it["ticker"]
                     try:
-                        _hist = _hist_map.get(_tk)
+                        _hist = _fmp_price_history(_tk, limit=252)
                         if _hist is None or _hist.empty:
                             continue
                         _an2 = rc.analyze_ticker(_hist, spy_close=_spy_c)
@@ -15074,10 +14307,8 @@ if st.session_state.get("logged_in"):
                             _alert_hits.append(_tk)
                     except Exception:
                         continue
-
-            _merged = _prev_hits + _alert_hits
-            if _merged or _wl_part:
-                st.session_state["_watchlist_triggered_alerts"] = _merged
+                if _alert_hits:
+                    st.session_state["_watchlist_triggered_alerts"] = _alert_hits
         except Exception:
             pass
 
@@ -15240,7 +14471,7 @@ if st.session_state.get("logged_in"):
     _uid_sidebar = str(st.session_state.get("user_id") or "").strip()
     if "_sidebar_wl_count" not in st.session_state:
         try:
-            _temp_wl = get_watchlist_items(_uid_sidebar)
+            _temp_wl = load_watchlist_sheet(_uid_sidebar)
             st.session_state["_sidebar_wl_count"] = len(_temp_wl)
         except Exception:
             st.session_state["_sidebar_wl_count"] = 0
@@ -15250,71 +14481,6 @@ if st.session_state.get("logged_in"):
     else:
         st.sidebar.caption("저장된 Watchlist 메모가 없습니다.")
     
-    # ── 🔧 호출 계측 (관리자 전용) ────────────────────────────────────────
-    #   Sheets·FMP 왕복 횟수와 누적 시간. 최적화 전후를 추정이 아니라 숫자로 비교하고,
-    #   느려졌을 때 어느 쪽이 병목인지 바로 가른다.
-    if _is_admin():
-        with st.sidebar.expander("🔧 호출 계측", expanded=False):
-            _st_b = _gs_stats_bucket()
-            _st_n, _st_s = int(_st_b.get("n", 0)), float(_st_b.get("sec", 0.0))
-            with _FMP_STATS_LOCK:
-                _fm_n, _fm_s = int(_FMP_STATS["n"]), float(_FMP_STATS["sec"])
-
-            st.caption("**Sheets** (세션 기준)")
-            _c1, _c2 = st.columns(2)
-            _c1.metric("호출", f"{_st_n}회")
-            _c2.metric("시간", f"{_st_s:.1f}초")
-
-            st.caption("**FMP** (프로세스 기준 · 병렬 포함)")
-            _c3, _c4 = st.columns(2)
-            _c3.metric("호출", f"{_fm_n}회")
-            _c4.metric("시간", f"{_fm_s:.1f}초")
-
-            if st.button("계측 초기화", key="gs_stats_reset", use_container_width=True):
-                st.session_state[_GS_STATS_KEY] = {"n": 0, "sec": 0.0}
-                try:
-                    _perf_store().clear()
-                except Exception:
-                    pass
-                with _FMP_STATS_LOCK:
-                    _FMP_STATS["n"] = 0
-                    _FMP_STATS["sec"] = 0.0
-                st.rerun()
-
-            # ── 구간별 소요 시간 ──────────────────────────────────────────
-            #   호출 수가 0인데 느릴 때 CPU/렌더 구간을 가려낸다.
-            _spans = _perf_bucket()
-            if _spans:
-                st.caption("**구간별 소요** (느린 순)")
-                _rows = sorted(_spans.items(), key=lambda kv: -float(kv[1].get("sec", 0)))
-                _tot = sum(float(v.get("sec", 0)) for _, v in _rows)
-                for _lbl, _v in _rows[:14]:
-                    _sec = float(_v.get("sec", 0))
-                    _n = int(_v.get("n", 0))
-                    _fc = int(_v.get("fmp", 0))
-                    _nt = str(_v.get("note", "") or "")
-                    st.markdown(
-                        f"- **{_lbl}** — {_sec:.2f}초"
-                        + (f" ×{_n}" if _n > 1 else "")
-                        + (f" · FMP {_fc}콜" if _fc else "")
-                        + (f" · {_nt}" if _nt else "")
-                    )
-                _fc_tot = sum(int(v.get("fmp", 0)) for _, v in _rows)
-                with _FMP_STATS_LOCK:
-                    _fc_all = int(_FMP_STATS.get("n", 0))
-                st.caption(
-                    f"계측 구간 합계 {_tot:.2f}초 · FMP {_fc_tot}콜"
-                    + (f" · **미계측 {_fc_all - _fc_tot}콜**" if _fc_all > _fc_tot else "")
-                )
-
-            st.caption(
-                "⚠️ **이 패널은 사이드바라 본문보다 먼저 그려집니다.** 방금 실행한 동작의 "
-                "수치는 화면을 한 번 더 갱신해야(다른 탭 갔다 오거나 위젯 조작) 반영됩니다.\n\n"
-                "측정: 초기화 → 대상 동작 1회 → **한 번 더 갱신** → 증가분 확인.\n\n"
-                "기준(최적화 후) — 워치리스트 수정: Sheets 3회 · FMP 1~2회.\n\n"
-                "FMP·구간 수치는 프로세스 누적(병렬 스레드 포함)이라 체감 대기보다 클 수 있습니다."
-            )
-
     if st.sidebar.button("로그아웃", key="sidebar_logout_btn", use_container_width=True):
         st.session_state["logged_in"] = False
         st.session_state["user_role"] = None
@@ -16704,7 +15870,7 @@ if st.session_state.get("logged_in"):
                                     "saved_price": float(_cur_p) if pd.notna(_cur_p) else np.nan,
                                     "date_added": _narrative_now_et_string(),
                                 }
-                                _em_wl = get_watchlist_items(_uid_em)
+                                _em_wl = load_watchlist_sheet(_uid_em)
                                 _em_wl = [x for x in _em_wl if x["ticker"] != tk]
                                 _em_wl.append(_em_item)
                                 _ok_em, _ = save_watchlist_sheet(_uid_em, _em_wl)
@@ -16744,7 +15910,7 @@ if st.session_state.get("logged_in"):
                                     "saved_price": float(_cur_p2) if pd.notna(_cur_p2) else np.nan,
                                     "date_added": _narrative_now_et_string(),
                                 }
-                                _el_wl = get_watchlist_items(_uid_el)
+                                _el_wl = load_watchlist_sheet(_uid_el)
                                 _el_wl = [x for x in _el_wl if x["ticker"] != tk]
                                 _el_wl.append(_el_item)
                                 _ok_el, _ = save_watchlist_sheet(_uid_el, _el_wl)
@@ -18105,7 +17271,7 @@ if st.session_state.get("logged_in"):
                     return []
             elif choice == "Watchlist 종목만":
                 try:
-                    wl = get_watchlist_items(uid)
+                    wl = load_watchlist_sheet(uid)
                     return [i["ticker"] for i in wl] if wl else []
                 except Exception:
                     return []
@@ -18118,7 +17284,7 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     pass
                 try:
-                    wl = get_watchlist_items(uid)
+                    wl = load_watchlist_sheet(uid)
                     tickers += [i["ticker"] for i in wl] if wl else []
                 except Exception:
                     pass
@@ -18426,8 +17592,7 @@ if st.session_state.get("logged_in"):
         # ── 회사 기본 정보 ────────────────────────────────────────────────
         try:
             with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
-                with _timed("정밀 회사정보"):
-                    co = fetch_company_overview(str(selected_ticker).strip().upper())
+                co = fetch_company_overview(str(selected_ticker).strip().upper())
         except Exception as _co_err:
             co = {}
             st.warning(f"회사 기본정보 조회 실패: {_co_err}")
@@ -18548,8 +17713,7 @@ if st.session_state.get("logged_in"):
             label_visibility="collapsed",
         )
         with st.spinner(f"{selected_ticker} {selected_period} 차트 로딩 중..."):
-            with _timed("정밀 차트 일봉"):
-                period_hist = fetch_price_history_by_period(str(selected_ticker).strip().upper(), selected_period)
+            period_hist = fetch_price_history_by_period(str(selected_ticker).strip().upper(), selected_period)
 
         if period_hist is not None and not period_hist.empty and "Close" in period_hist.columns:
             close_p = pd.to_numeric(period_hist["Close"], errors="coerce").dropna()
@@ -18601,16 +17765,14 @@ if st.session_state.get("logged_in"):
                 st.success("✅ [ETF 패스] 분산 투자된 펀드이므로 개별 재무 건전성 킬 스위치를 면제합니다.")
     
                 with st.spinner(f"{selected_ticker} 보유 종목(Top Holdings) 불러오는 중..."):
-                    with _timed("정밀 보유ETF검색"):
-                        holdings_universe = cached_etf_holdings_universe_str(selected_ticker)
+                    holdings_universe = cached_etf_holdings_universe_str(selected_ticker)
                     if holdings_universe is None or holdings_universe.empty:
                         holdings_top10 = pd.DataFrame(columns=["Ticker", "Weight(%)"])
                         etf_perf_df = pd.DataFrame()
                     else:
                         holdings_top10 = holdings_universe.head(10).reset_index(drop=True)
                         perf_key = _etf_holdings_perf_cache_key(holdings_top10)
-                        with _timed("정밀 ETF성과쌍"):
-                            etf_perf_df = cached_build_etf_holdings_performance_pairs(perf_key)
+                        etf_perf_df = cached_build_etf_holdings_performance_pairs(perf_key)
     
                 if holdings_universe is None or holdings_universe.empty:
                     st.info("해당 ETF의 세부 종목 데이터를 야후 파이낸스에서 불러올 수 없습니다.")
@@ -18643,10 +17805,9 @@ if st.session_state.get("logged_in"):
                     st.dataframe(styled_top10, use_container_width=True, hide_index=True)
             else:
                 with st.spinner(f"{selected_ticker} 데이터 불러오는 중..."):
-                    with _timed("정밀 KPI 스냅샷"):
-                        kpi_df, _c_pass, _c_fail, _c_nodata, margin_context = cached_evaluate_kpis_snapshot(
-                            selected_ticker
-                        )
+                    kpi_df, _c_pass, _c_fail, _c_nodata, margin_context = cached_evaluate_kpis_snapshot(
+                        selected_ticker
+                    )
                 # 캐시된 카운트 무시 — kpi_df에서 직접 계산 (캐시 형식 불일치 방지)
                 _pp = kpi_df["Pass"].astype(str)
                 pass_count   = int((_pp.str.contains("Pass",  case=False) & ~_pp.str.contains("Fail", case=False)).sum())
@@ -18837,8 +17998,7 @@ if st.session_state.get("logged_in"):
                 with st.expander("🏦 재무 건전성 점수 (Altman Z / Piotroski F)", expanded=True):
                     st.caption("FMP `/financial-scores` 기반. Altman Z는 파산 위험, Piotroski F는 재무 종합 점수(0~9).")
                     with st.spinner(f"{selected_ticker} 재무 건전성 점수 조회 중..."):
-                        with _timed("정밀 재무건전성"):
-                            _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
+                        _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
                     if _fs:
                         _az = to_float(_fs.get("altmanZScore"))
                         _ps = to_float(_fs.get("piotroskiScore"))
@@ -18916,8 +18076,7 @@ if st.session_state.get("logged_in"):
         with _tc_col1:
             if st.button("🤖 트랜스크립트 AI 요약 실행", key=f"tc_btn_{selected_ticker}", use_container_width=True):
                 with st.spinner("어닝콜 원문 조회 중..."):
-                    with _timed("정밀 어닝콜원문"):
-                        _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
+                    _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
                 st.session_state[_tc_raw_key] = _tc_data
                 if _tc_data and _tc_data.get("content"):
                     _tc_text = str(_tc_data["content"])[:6000]
@@ -18967,8 +18126,7 @@ if st.session_state.get("logged_in"):
 
         try:
             with st.spinner(f"{selected_ticker} 타이밍 데이터를 불러오는 중..."):
-                with _timed("정밀 타이밍일봉"):
-                    timing_history = cached_timing_price_history(str(selected_ticker).strip())
+                timing_history = cached_timing_price_history(str(selected_ticker).strip())
 
             if timing_history is None or timing_history.empty or "Close" not in timing_history.columns:
                 st.warning("가격 데이터를 불러오지 못했습니다. 티커를 확인해주세요.")
@@ -19045,8 +18203,7 @@ if st.session_state.get("logged_in"):
                 #    고정 30/70 대신 종목의 추세 강도(대장주/횡보/약세)에 맞춰
                 #    Cardwell RSI 밴드(강세 40·80 / 횡보 40·70 / 약세 20·60)를 적용.
                 try:
-                    with _timed("정밀 SPY일봉"):
-                        _spy_hist = cached_timing_price_history("SPY")
+                    _spy_hist = cached_timing_price_history("SPY")
                     _spy_close = (
                         _spy_hist["Close"]
                         if (_spy_hist is not None and not _spy_hist.empty and "Close" in _spy_hist.columns)
@@ -19129,84 +18286,28 @@ if st.session_state.get("logged_in"):
                         if not is_etf_mode:
                             _tkr_u = str(selected_ticker).strip().upper()
                             with st.spinner("근거 종합 중..."):
-                              with _timed("정밀 합류점수 부가지표",
-                                          "재무점수·내부자·목표가·공매도·실적일(병렬)"):
-                                # 5개 조회는 서로 의존하지 않는다 → 병렬로 동시에 받는다.
-                                # 순차 실행 시 캐시가 비면 3초 넘게 걸리던 구간이다.
-                                # ⚠️ 워커에서 st.* 를 건드리지 않는다(스레드에서 st 접근은 실패).
-                                #    각 작업은 순수 데이터 조회만 하고, 판정은 아래에서 한다.
-                                def _cf_scores():
-                                    return _fmp_financial_scores(_tkr_u)
-
-                                def _cf_insider():
-                                    return fetch_insider_statistics(_tkr_u)
-
-                                def _cf_target():
-                                    return fetch_analyst_price_targets(_tkr_u)
-
-                                def _cf_short():
-                                    return fetch_short_interest(_tkr_u)
-
-                                def _cf_earn():
-                                    return fetch_earnings_calendar((_tkr_u,))
-
-                                _cf_res = {}
                                 try:
-                                    import concurrent.futures as _cf_ex
-                                    _cf_jobs = {
-                                        "scores": _cf_scores, "insider": _cf_insider,
-                                        "target": _cf_target, "short": _cf_short,
-                                        "earn": _cf_earn,
-                                    }
-                                    with _cf_ex.ThreadPoolExecutor(max_workers=5) as _ex_cf:
-                                        _futs = {k: _ex_cf.submit(f) for k, f in _cf_jobs.items()}
-                                        for _k, _fu in _futs.items():
-                                            try:
-                                                _cf_res[_k] = _fu.result(timeout=20)
-                                            except Exception:
-                                                _cf_res[_k] = None
-                                except Exception:
-                                    _cf_res = {}
-
-                                # ⚠️ 조용한 성능저하 방지 가드.
-                                #    이 5개는 @st.cache_data 함수라 워커 스레드에서는
-                                #    ScriptRunContext 부재로 실패할 수 있다. 그 경우 값이
-                                #    전부 None 이 되어 합류점수가 **말없이 낮게** 나온다.
-                                #    판정이 틀어지는 건 느린 것보다 훨씬 나쁘므로,
-                                #    전부 비면 메인 스레드에서 순차로 다시 받는다.
-                                if not any(v is not None for v in _cf_res.values()):
-                                    for _k, _f in (("scores", _cf_scores), ("insider", _cf_insider),
-                                                   ("target", _cf_target), ("short", _cf_short),
-                                                   ("earn", _cf_earn)):
-                                        try:
-                                            _cf_res[_k] = _f()
-                                        except Exception:
-                                            _cf_res[_k] = None
-                                    _perf_note("정밀 합류점수 부가지표",
-                                               "순차 폴백(병렬 결과 없음)")
-
-                                try:
-                                    _fsc = _cf_res.get("scores") or {}
+                                    _fsc = _fmp_financial_scores(_tkr_u)
                                     _piotroski = to_float(_fsc.get("piotroskiScore"))
                                     _altman = to_float(_fsc.get("altmanZScore"))
                                 except Exception:
                                     pass
                                 try:
-                                    _insider_ratio = to_float((_cf_res.get("insider") or {}).get("ratio"))
+                                    _insider_ratio = to_float(fetch_insider_statistics(_tkr_u).get("ratio"))
                                 except Exception:
                                     pass
                                 try:
-                                    _tm = to_float((_cf_res.get("target") or {}).get("target_mean"))
+                                    _tm = to_float(fetch_analyst_price_targets(_tkr_u).get("target_mean"))
                                     if pd.notna(_tm) and pd.notna(current_price) and float(current_price) > 0:
                                         _analyst_up = float(_tm) / float(current_price) - 1.0
                                 except Exception:
                                     pass
                                 try:
-                                    _short = to_float((_cf_res.get("short") or {}).get("short_pct"))
+                                    _short = to_float(fetch_short_interest(_tkr_u).get("short_pct"))
                                 except Exception:
                                     pass
                                 try:
-                                    _ec = _cf_res.get("earn")
+                                    _ec = fetch_earnings_calendar((_tkr_u,))
                                     if _ec:
                                         _edays = _ec[0].get("days_until")
                                 except Exception:
@@ -19548,7 +18649,7 @@ if st.session_state.get("logged_in"):
                                     "자금이 빠듯하면 R:R 실측 신호를 우선하세요."
                                 )
                             if not _plan["enter_ok"]:
-                                st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 금액은 참고용이며, 회피/건너뛰기/신중 구간에서는 신규 진입을 권하지 않습니다.")
+                                st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 금액은 참고용이며, 회피/신중 구간에서는 신규 진입을 권하지 않습니다.")
                             _cap_pct_eff = float(_pf_s["Max_Position_Pct"])
                             _turn_note = ("" if _mode_now == "risk_based" else "  (균등 배분 계좌에는 전환점이 적용되지 않습니다)")
                             _turn_pct = (_risk_pct / _cap_pct_eff * 100.0) if _cap_pct_eff > 0 else float("nan")
@@ -19609,8 +18710,7 @@ if st.session_state.get("logged_in"):
             st.caption("최근 분기별 EPS 예상 대비 실제 Beat/Miss 현황입니다.")
             try:
                 with st.spinner("어닝 데이터 불러오는 중..."):
-                    with _timed("정밀 실적히스토리"):
-                        earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
+                    earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
 
                 if earn_df.empty:
                     st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
@@ -19763,10 +18863,8 @@ if st.session_state.get("logged_in"):
             try:
                 with st.spinner("인사이더 거래 데이터 불러오는 중..."):
                     _tk_ins = str(selected_ticker).strip().upper()
-                    with _timed("정밀 내부자거래"):
-                        insider_df = fetch_insider_trading(_tk_ins)
-                    with _timed("정밀 내부자통계"):
-                        insider_stats = fetch_insider_statistics(_tk_ins)
+                    insider_df = fetch_insider_trading(_tk_ins)
+                    insider_stats = fetch_insider_statistics(_tk_ins)
 
                 # 통계 요약 먼저 표시
                 if insider_stats or not insider_df.empty:
@@ -19805,8 +18903,7 @@ if st.session_state.get("logged_in"):
             st.caption("월가 애널리스트들의 목표주가 컨센서스. 현재가 대비 상승여력을 확인합니다.")
             try:
                 with st.spinner("애널리스트 데이터 불러오는 중..."):
-                    with _timed("정밀 애널리스트"):
-                        analyst_data = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
+                    analyst_data = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
                 if not analyst_data:
                     st.info("애널리스트 목표주가 데이터를 가져오지 못했습니다.")
                 else:
@@ -19845,8 +18942,7 @@ if st.session_state.get("logged_in"):
             st.caption("미국 의회 의원들의 주식 거래 공시. 정책 방향 선행 지표로 활용됩니다.")
             try:
                 with st.spinner("의회 거래 데이터 불러오는 중..."):
-                    with _timed("정밀 의회거래"):
-                        congress_df = fetch_senate_house_trading(str(selected_ticker).strip().upper())
+                    congress_df = fetch_senate_house_trading(str(selected_ticker).strip().upper())
                 if congress_df.empty:
                     st.info("의회 거래 데이터를 가져오지 못했습니다. (FMP Starter 플랜 제공 범위 외)")
                 else:
@@ -19876,8 +18972,7 @@ if st.session_state.get("logged_in"):
         if st.button("🤖 AI 종합 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
             try:
                 # 이미 위에서 계산된 값들을 최대한 재사용
-                with _timed("정밀 타이밍일봉"):
-                    _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
+                _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
                 _diag_close = pd.to_numeric(_diag_timing["Close"], errors="coerce").dropna() if not _diag_timing.empty else pd.Series(dtype=float)
                 _diag_rsi = float(calculate_rsi(_diag_close).dropna().iloc[-1]) if len(_diag_close) > 14 else np.nan
                 _diag_ma200 = float(_diag_close.rolling(200, min_periods=150).mean().iloc[-1]) if len(_diag_close) >= 150 else np.nan
@@ -19902,8 +18997,7 @@ if st.session_state.get("logged_in"):
                 _kpi_summary = ""
                 _kpi_details = ""
                 try:
-                    with _timed("정밀 KPI 스냅샷"):
-                        _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
+                    _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
                     _kpi_summary = f"KPI: {_pass_n}개 통과 / {_fail_n}개 실패"
                     _safety = _margin.get('margin_of_safety')
                     _intrinsic = _margin.get('intrinsic_value')
@@ -19922,8 +19016,7 @@ if st.session_state.get("logged_in"):
                 # 기관 보유
                 _inst_pct = "데이터 없음"
                 try:
-                    with _timed("정밀 기관보유"):
-                        _inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
+                    _inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
                     if not _inst_df.empty:
                         _pct_col = next((c for c in _inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
                         if _pct_col:
@@ -19941,8 +19034,7 @@ if st.session_state.get("logged_in"):
                 _diag_cs = _diag_vs = _diag_qs = 0
                 _diag_cs_det = _diag_vs_det = _diag_qs_det = _diag_dom = ""
                 try:
-                    with _timed("정밀 KPI 스냅샷"):
-                        _dk, _, _, _, _dm = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
+                    _dk, _, _, _, _dm = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
                     _dpp = _dk["Pass"].astype(str)
                     _diag_pass_items = _dk[_dpp.str.contains("Pass", case=False) & ~_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
                     _diag_fail_items = _dk[_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
@@ -19964,8 +19056,7 @@ if st.session_state.get("logged_in"):
                 # 인사이더 방향
                 _diag_ins_buy = _diag_ins_sell = 0
                 try:
-                    with _timed("정밀 내부자통계"):
-                        _dis = fetch_insider_statistics(str(selected_ticker).strip().upper())
+                    _dis = fetch_insider_statistics(str(selected_ticker).strip().upper())
                     _diag_ins_buy  = int(to_float(_dis.get("total_purchases") or _dis.get("acquired") or 0) or 0)
                     _diag_ins_sell = int(to_float(_dis.get("total_sales")     or _dis.get("disposed")  or 0) or 0)
                 except Exception:
@@ -19975,8 +19066,7 @@ if st.session_state.get("logged_in"):
                 _diag_beat_rate = _diag_beat_n = _diag_earn_n = 0
                 _diag_earn_rows = []
                 try:
-                    with _timed("정밀 실적히스토리"):
-                        _dea = cached_earnings_history(str(selected_ticker).strip().upper())
+                    _dea = cached_earnings_history(str(selected_ticker).strip().upper())
                     if not _dea.empty and "판정" in _dea.columns:
                         _diag_beat_n  = int((_dea["판정"] == "✅ Beat").sum())
                         _diag_earn_n  = len(_dea[_dea["판정"] != "—"])
@@ -19996,8 +19086,7 @@ if st.session_state.get("logged_in"):
                 _diag_buy_pct = _diag_rat_label = _diag_rat_tot = ""
                 _diag_rec_list = []
                 try:
-                    with _timed("정밀 애널리스트"):
-                        _dan = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
+                    _dan = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
                     if _dan:
                         _diag_tgt_mean = _dan.get("target_mean")
                         _diag_tgt_high = _dan.get("target_high")
@@ -20023,8 +19112,7 @@ if st.session_state.get("logged_in"):
                 # 의회 거래
                 _diag_cg_buy = _diag_cg_sell = 0
                 try:
-                    with _timed("정밀 의회거래"):
-                        _dcg = fetch_senate_house_trading(str(selected_ticker).strip().upper())
+                    _dcg = fetch_senate_house_trading(str(selected_ticker).strip().upper())
                     if not _dcg.empty:
                         _diag_cg_buy  = len(_dcg[_dcg["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)])
                         _diag_cg_sell = len(_dcg[_dcg["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)])
@@ -20408,25 +19496,11 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                  else None)
             except Exception:
                 _spy_pf_close = None
-            # ── 보유 종목 일봉 병렬 프리페치 ──────────────────────────────
-            #   아래 계좌별 루프가 종목마다 600봉을 순차로 받고 analyze_ticker 를
-            #   돌려 25종목 기준 3분 가까이 걸렸다. 조회를 미리 한 번에 끝내면
-            #   루프는 전부 캐시 히트가 된다.
-            #   ⚠️ 병렬화는 네트워크 I/O 에만 적용한다. analyze_ticker 는 계좌 루프에서
-            #      순차로 남긴다 — entry_price/entry_date 가 행마다 달라 캐시가 안 되고,
-            #      regime_core 를 스레드에 태우면 검증 부담이 커진다.
-            #   ⚠️ 600봉은 워치리스트(252봉)의 2.4배다. FMP 레이트리밋은
-            #      fmp_extras 의 락 기반 슬라이딩 윈도우가 처리하므로 초과하지 않는다.
-            with _timed("PF 일봉 프리페치"):
-                _pf_hist_cache = _pf_prefetch_histories(
-                    tuple(portfolio_df["Ticker"].astype(str).str.strip().str.upper().unique())
-                )
-            _perf_note("PF 일봉 프리페치", f"{len(_pf_hist_cache)}종목 · 600봉")
+            _pf_hist_cache = {}
             # 카드·표 매도 판정 통일: integrated_sell_verdict(표와 동일 소스) 상태를 미리 계산해 공유
             _card_status, _card_status_tk = {}, {}
             try:
-                with _timed("PF 매도레이더 계산"):
-                    _crdf = build_portfolio_sell_radar_df(portfolio_df)
+                _crdf = build_portfolio_sell_radar_df(portfolio_df)
                 for _, _cr in _crdf.iterrows():
                     _ck = str(_cr.get("티커", "")).strip().upper()
                     _ca = str(_cr.get("계좌", "")).strip()
@@ -20448,8 +19522,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     return f":green[**{_l}**]"
                 return f"**{_l}**"
 
-            _t_acct0 = time.perf_counter()
-            _n_an = 0
             for acct in sorted(portfolio_df["Account"].astype(str).unique(), key=lambda x: str(x).lower()):
                 sub = portfolio_df[portfolio_df["Account"] == acct].sort_values("Ticker")
                 _acct_rows = []
@@ -20467,7 +19539,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         )
                     except Exception:
                         _an = None
-                    _n_an += 1
                     _acct_rows.append((_tk, _avg, _h.get("Quantity"), _an))
 
                 _n_exit = sum(1 for (_, _, _, a) in _acct_rows if a and a.get("exit", {}).get("is_exit"))
@@ -20650,16 +19721,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                         else:
                                             st.error(f"저장 실패: {_e_sug}")
                         st.divider()
-
-            # 계좌 카드 렌더 전체 소요 — 프리페치 후 남는 CPU(analyze_ticker) 비중을 본다
-            try:
-                _b = _perf_bucket()
-                _b["PF 계좌카드 렌더"] = {
-                    "n": 1, "sec": time.perf_counter() - _t_acct0, "fmp": 0,
-                    "note": f"analyze_ticker {_n_an}회",
-                }
-            except Exception:
-                pass
 
         # ── ⚙️ 계좌 프로필 (포지션 사이징 설정) ──────────────────────
         with st.expander("⚙️ 계좌 프로필 (포지션 사이징 설정)", expanded=False):
@@ -21520,20 +20581,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     .map(style_universe_rank_cell, subset=["유니버스 랭킹(Universe Rank)"])
                 )
                 st.dataframe(styled_sell_radar, use_container_width=True, hide_index=True)
-                # 랭킹 출처·기준일은 순위 열이 보이는 이 자리에 둔다.
-                # (계산 지점에 두면 표에서 수백 줄 위라 눈에 띄지 않는다)
-                _rm = st.session_state.get("_pf_rank_meta") or {}
-                if _rm.get("date"):
-                    st.caption(
-                        f"🏅 유니버스 랭킹 기준 **{_rm['date']}** · Hidden Alpha 주간 "
-                        f"스냅샷 Top {_rm.get('n', 0)} — 매주 토요일 갱신 · "
-                        "그 밖은 「30위권 밖」으로 표시"
-                    )
-                elif _rm:
-                    st.caption(
-                        "🏅 유니버스 랭킹 스냅샷이 아직 없습니다 — "
-                        "Hidden Alpha 자동화가 한 번 돌면 순위가 표시됩니다."
-                    )
 
                 # ── 📡 지금 왜 움직이나? (실시간 등락 브리핑) ────────────────
                 st.divider()
@@ -22637,7 +21684,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 # v1.4: Mode 별 분리 — alert(실제 이메일 기준) / verdict(화면 판정 기준)
                 _SB_ALERT_LABELS = {
                     "alert_entry_pass":    "🟢 매수 메일 (게이트 통과)",
-                    "alert_entry_skip":    "🟡 매수 메일 (게이트 미통과)",
+                    "alert_entry_skip":    "🟡 매수 메일 (고점 근접)",
                     "alert_entry_na":      "⚪ 매수 메일 (게이트 보류)",
                     "alert_risk":          "⚠️ 위험 알림",
                     "alert_entry_invalid": "🔄 매수 신호 무효화",
@@ -23079,7 +22126,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             st.divider()
 
         # ── Watchlist 로드 ─────────────────────────────────────────────────
-        wl_items = get_watchlist_items(uid_wl)
+        wl_items = load_watchlist_sheet(uid_wl)
         try:
             _wl_pf_df = load_portfolio()
             _wl_acct_opts = (sorted(_wl_pf_df["Account"].dropna().astype(str).str.strip().unique().tolist())
@@ -23277,9 +22324,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             st.info("등록된 관심 종목이 없어요. 위에서 종목을 추가해주세요.")
         else:
             st.markdown(f"### 📋 관심 종목 현황 ({len(wl_items)}개)")
-            # 지표 출처 표시 자리. 실제 값은 아래 계산 블록이 끝난 뒤 채운다.
-            # (계산부에 그냥 두면 헤딩에서 150줄 넘게 밀려나 눈에 띄지 않는다)
-            _wl_meta_slot = st.empty()
 
             # ── 자동 편입분 일괄 정리 ────────────────────────────────────
             # 주간 스캐너가 넣은 종목은 Memo 가 "AUTO|" 로 시작한다.
@@ -23375,69 +22419,38 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             st.warning("복구할 가격 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
 
             with st.spinner("실시간 가격 및 지표 계산 중..."):
-                with _timed("WL 현재가"):
-                    price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
+                price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
                 rsi_map_wl, ma200_map_wl, regime_map_wl = {}, {}, {}
                 atr_map_wl, high_map_wl = {}, {}   # #2 사이징용 ATR·최근고점
                 hist_map_wl, wl_dec_key = {}, {}   # 결정 카드/정렬용
                 # RS(상대강도) 계산용 SPY 종가 — 1회만 조회
                 try:
-                    with _timed("WL SPY 일봉"):
-                        _spy_hist_wl = _fmp_price_history("SPY", limit=252)
+                    _spy_hist_wl = _fmp_price_history("SPY", limit=252)
                     _spy_close_wl = (
                         _spy_hist_wl["Close"]
                         if (_spy_hist_wl is not None and not _spy_hist_wl.empty and "Close" in _spy_hist_wl.columns)
                         else None
                     )
                 except Exception:
-                    _spy_hist_wl, _spy_close_wl = None, None
-
-                # ── 지표는 자동화가 미리 계산해 둔 Watchlist_Metrics 를 먼저 쓴다 ──
-                #   레짐/타이밍/RSI/MA200/ATR 은 일봉 파생이라 장중에 거의 변하지 않는다.
-                #   빠르게 변하는 현재가는 위 price_map_wl 이 실시간으로 담당한다.
-                #   낡았거나(직전 완료 세션 이전) 시트에 없는 종목만 실시간 계산한다.
-                with _timed("WL 지표시트 로드"):
-                    _wl_metrics = load_watchlist_metrics()
-                _wl_ref_date = wm.last_completed_session(
-                    _spy_hist_wl, datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d"))
-                _wl_live, _wl_cached_n = [], 0
-                for tk in wl_tickers:
-                    if wm.is_fresh(_wl_metrics.get(tk), _wl_ref_date):
-                        _wl_cached_n += 1
-                    else:
-                        _wl_live.append(tk)
-                st.session_state["_wl_metrics_stat"] = {
-                    "cached": _wl_cached_n, "live": len(_wl_live),
-                    "ref": _wl_ref_date,
-                    "updated": (next((m.get("updated_at") for m in _wl_metrics.values()
-                                      if m.get("updated_at")), "") if _wl_metrics else ""),
-                }
-
-                # 일봉은 폴백 계산이 필요한 종목만 받는다.
-                # ⚠️ 예전에는 전 종목을 받았다. 매수 카드(build_buy_card)가 hist 를
-                #    요구하기 때문인데, 카드는 expander 를 펼친 종목에서만 그려진다.
-                #    저장본이 있는 종목의 일봉은 카드를 펼칠 때 그 자리에서 받으면 된다
-                #    (_fmp_price_history 는 프로세스 캐시라 두 번째부터 즉시 반환).
-                with _timed("WL 일봉 프리페치") as _tp:
-                    _hist_pre = _wl_prefetch_histories(tuple(_wl_live)) if _wl_live else {}
-                _perf_note("WL 일봉 프리페치", f"{len(_wl_live)}종목")
-                _t_loop = time.perf_counter()
+                    _spy_close_wl = None
                 for tk in wl_tickers:
                     try:
-                        hist = _hist_pre.get(tk)
+                        hist = _fmp_price_history(tk, limit=252)
+                        close = pd.to_numeric(hist["Close"], errors="coerce").dropna() if not hist.empty else pd.Series(dtype=float)
+                        rsi_series = calculate_rsi(close).dropna()
+                        rsi_map_wl[tk] = float(rsi_series.iloc[-1]) if not rsi_series.empty else np.nan
+                        ma200_map_wl[tk] = float(close.rolling(200, min_periods=200).mean().iloc[-1]) if len(close) >= 200 else np.nan
+                        # 레짐/타이밍 — 개별종목 탭과 동일한 regime_core 엔진(SSOT)
+                        regime_map_wl[tk] = rc.analyze_ticker(hist, spy_close=_spy_close_wl)
+                        atr_map_wl[tk] = rc.compute_atr(hist) if not hist.empty else np.nan
+                        _hi_wl = (pd.to_numeric(hist["High"], errors="coerce")
+                                  if "High" in hist.columns else close)
+                        high_map_wl[tk] = float(_hi_wl.dropna().tail(120).max()) if not _hi_wl.dropna().empty else np.nan
                         hist_map_wl[tk] = hist
-                        _m = _wl_metrics.get(tk)
-                        if tk in _wl_live:
-                            # 폴백: 이 종목만 실시간 계산 (SSOT 는 동일 함수)
-                            _m = wm.compute_metrics(tk, hist, spy_close=_spy_close_wl)
-                        if not _m:
-                            raise ValueError("metrics unavailable")
-                        rsi_map_wl[tk] = _m["rsi"]
-                        ma200_map_wl[tk] = _m["ma200"]
-                        atr_map_wl[tk] = _m["atr"]
-                        high_map_wl[tk] = _m["high_120"]
-                        regime_map_wl[tk] = _m["analysis"]
-                        wl_dec_key[tk] = _m.get("dec_key", "na")
+                        _amwl = regime_map_wl[tk]
+                        wl_dec_key[tk] = (rc.buy_decision(_amwl["timing"].get("code"), None,
+                                                          _amwl["regime"].get("regime"))["key"]
+                                          if _amwl else "na")
                     except Exception:
                         rsi_map_wl[tk] = np.nan
                         ma200_map_wl[tk] = np.nan
@@ -23446,30 +22459,6 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         high_map_wl[tk] = np.nan
                         hist_map_wl[tk] = None
                         wl_dec_key[tk] = "na"
-                try:
-                    _b = _perf_bucket()
-                    _b["WL 지표 조립"] = {
-                        "n": 1, "sec": time.perf_counter() - _t_loop,
-                        "note": f"저장본 {_wl_cached_n} / 폴백계산 {len(_wl_live)}",
-                    }
-                except Exception:
-                    pass
-
-            # 지표 출처 표시 — 어떤 봉 기준의 판정인지 항상 보이게 한다
-            _wms = st.session_state.get("_wl_metrics_stat") or {}
-            if _wms.get("cached"):
-                _wl_meta_slot.caption(
-                    f"📊 지표 기준일 **{_wms.get('ref') or '?'}** (종가 확정분) · "
-                    f"저장본 {_wms['cached']}종목"
-                    + (f" · 실시간 계산 {_wms['live']}종목" if _wms.get("live") else "")
-                    + (f" · 자동 갱신 {_wms['updated']}" if _wms.get("updated") else "")
-                    + " — 현재가·수익률은 실시간입니다."
-                )
-            elif wl_tickers:
-                _wl_meta_slot.caption(
-                    "📊 지표를 실시간 계산했습니다 — 자동화(마감 후)가 한 번 돌면 "
-                    "다음부터 즉시 표시됩니다."
-                )
 
             # ── 포지션 플랜 입력 (사이징·R:R) — 개별종목 탭과 세션 공유 (#2) ──
             _wl_acct = str(st.session_state.get("_active_account") or "").strip()
@@ -23711,15 +22700,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 sizing_mode=_it_mode,
                             )
                             _wl_plan_map[tk] = _wl_plan   # ✅ 매수 등록 폼 수량/금액 프리필용
-                            # 프리페치에서 제외된 종목은 카드를 펼치는 이 시점에 받는다
-                            _hist_card = hist_map_wl.get(tk)
-                            if _hist_card is None:
-                                try:
-                                    _hist_card = _fmp_price_history(tk, limit=252)
-                                    hist_map_wl[tk] = _hist_card
-                                except Exception:
-                                    _hist_card = None
-                            _bc = rc.build_buy_card(_hist_card, _an, _wl_plan, confluence=None)
+                            _bc = rc.build_buy_card(hist_map_wl.get(tk), _an, _wl_plan, confluence=None)
                             st.markdown(f"**🎯 {_bc['badge']}** · {_bc['glance_num']}")
                             if _wl_plan["gate"] == "na":
                                 st.caption(f"🧮 플랜: {_wl_plan['gate_label']} — {_wl_plan['gate_reason']}")
@@ -23820,26 +22801,16 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             # 기존 항목 삭제 후 새 항목 추가 (행 단위 처리)
                             # ⚠️ saved_price/stop/target은 재추가 시 보존해야 함
                             # ⚠️ 알림 설정 변경 시 깜빡임 상태(Alert_LastState)는 초기화됨(다음 자동화에서 재설정)
-                            _upd = {
-                                "memo": new_memo.strip(),
-                                "stop_loss": float(new_sl) if new_sl > 0 else None,
-                                "target_price": float(new_tp) if new_tp > 0 else None,
-                                "alert_states": (",".join(new_states) if new_states else "none"),  # 전부 해제=none
-                                "account": ("" if new_account == "(미지정)" else new_account),
-                            }
-                            _ok_u, _err_u, _ = update_watchlist_row(uid_wl, tk, _upd)
-                            if _ok_u:
-                                st.rerun()
-                            elif _err_u == "not_found":
-                                # 행이 사라진 경우에만 기존 추가 경로로 폴백 (saved_price 보존)
-                                _keep_saved = pd.to_numeric(item.get("saved_price"), errors="coerce")
+                            _keep_saved = pd.to_numeric(item.get("saved_price"), errors="coerce")
+                            _ok_del, _ = delete_from_watchlist(uid_wl, tk)
+                            if _ok_del:
                                 _ok_add, _err_add = add_to_watchlist(
                                     uid_wl, tk,
                                     memo=new_memo.strip(),
                                     saved_price=float(_keep_saved) if pd.notna(_keep_saved) else None,
                                     stop_loss=float(new_sl) if new_sl > 0 else None,
                                     target_price=float(new_tp) if new_tp > 0 else None,
-                                    alert_states=(",".join(new_states) if new_states else "none"),
+                                    alert_states=(",".join(new_states) if new_states else "none"),  # 전부 해제=none
                                     account=("" if new_account == "(미지정)" else new_account),
                                 )
                                 if _ok_add:
@@ -23847,7 +22818,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 else:
                                     st.error(f"저장 실패: {_err_add}")
                             else:
-                                st.error(f"저장 실패: {_err_u}")
+                                st.error("기존 항목 삭제 실패")
 
                     # ── ✅ 매수 완료 → 포트폴리오 등록 (Watchlist 원클릭) ──────────
                     #   이메일 알림 → 실제 매수 → 여기서 즉시 등록. 포트폴리오 탭 이동 불필요.
@@ -24860,7 +23831,7 @@ Winners/Emerging은 티커 환각 검증 + 정량 교차검증(RSI·RS·거래�
 | 라벨 | 뜻 | 행동 |
 |---|---|---|
 | 🎯 지금 매수 구간 (게이트 통과) | 타이밍 + 손익비 모두 충족 | 계산된 수량대로 매수 |
-| ⚠️ 게이트 미통과 · 건너뛰기 | 타이밍은 왔지만 R:R < 1:2 | **매수 금지** — 손익비 부족 |
+| ℹ️ 고점 근접 구간 | 타이밍 충족 · 전고점까지 여력이 목표 R:R 미만 | **참고 정보** — 억제 아님 (백테스트상 근거 없음) |
 | 🚫 매수 신호 무효화 | 직전 매수 신호 조건 해제 | 매수 계획 취소 |
 | 🟡 줄이기 (추세 흔들림·리버설) | 고점 대비 눌림이 추세 위험 | 미보유 → 매수 금지 · 보유 → 축소 |
 | 🔴 청산 계열 | 추세 종료 확인 | 보유 시 청산 검토 |
@@ -24930,9 +23901,17 @@ Early Signal의 종목판 — 여기서 뜨기 시작한 종목이 Watchlist 후
 같은 상태가 지속되면 반복 발송하지 않습니다 (재무장 후 재발송).""",
                 ),
                 (
-                    "Q. 매수 신호가 왔는데 '건너뛰기 권고'래요. 사라는 건가요?",
-                    """**사지 말라는 뜻입니다.** 타이밍(눌림 구간)은 충족했지만 손절까지의 리스크 대비
-목표까지의 보상이 최소 기준(1:2)에 못 미친다는 뜻 — 손익비가 나쁘면 좋은 타이밍도 패스하는 것이 이 앱의 철학입니다.""",
+                    "Q. 매수 신호에 'ℹ️ 고점 근접 구간'이라고 붙어 있어요. 사도 되나요?",
+                    """**억제 표시가 아닙니다.** 타이밍은 충족했고, 다만 전고점까지 남은 여력이 손절폭 대비
+목표 배수에 못 미친다는 **참고 정보**입니다. 목표가는 최근 120일 고점으로 잡히기 때문에
+전고점 돌파를 노리는 모멘텀 종목일수록 이 표시가 붙기 쉽습니다.
+
+과거에는 '건너뛰기 권고'로 표시했으나, Signal_Backtest 개별주 8개 run 전부에서
+이 구간(skip)이 게이트 통과(pass)보다 승률·중앙수익이 높고 최대 하락폭(MAE)은 오히려
+얕게 나와 **억제를 정당화할 근거가 없어** 정보 표기로 낮췄습니다 (2026-08-12).
+다만 측정 기간이 대부분 상승장이라 하락장에서 뒤집힐 수 있어 라벨 자체는 유지하고 계속 관측합니다.
+
+**진짜 사지 말라는 표시는 ⛔ 회피(avoid)입니다** — 이쪽은 음(-)의 초과수익이 확인됐습니다.""",
                 ),
                 (
                     "Q. 등록한 종목이 대부분 등록가보다 떨어져 있어요. 고장인가요?",
@@ -25157,7 +24136,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
             _e_pf = pd.DataFrame()
         if _e_pf is None:
             _e_pf = pd.DataFrame()
-        _e_wl = get_watchlist_items(_euid) or []
+        _e_wl = load_watchlist_sheet(_euid) or []
 
         if _e_pf.empty and not _e_wl:
             st.info("보유 종목과 워치리스트가 비어 있습니다. 종목을 추가하면 실적 일정이 여기에 표시됩니다.")
