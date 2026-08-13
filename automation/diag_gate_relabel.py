@@ -183,37 +183,55 @@ print()
 print("=" * 66)
 print("6) 백테스트 버킷터 — rr_measured 분리")
 print("=" * 66)
+# run_signal_backtest 를 통째로 import 하면 gspread/google-auth/requests/pytz 까지
+# 끌어온다 — 순수 로직 하나 검증하자고 네트워크 라이브러리를 설치할 이유가 없다.
+# (실제로 러너에서 ModuleNotFoundError: pytz 로 실패했다, 2026-08-12)
+# 대신 소스에서 _alert_bucket 만 추출해 격리 실행한다. 검사 대상은 여전히
+# **저장소의 진짜 소스**이고, import 환경과 무관하게 로직을 고정할 수 있다.
+import ast
+
 try:
-    import run_signal_backtest as bt
+    _bt_path = _find("automation/run_signal_backtest.py")
+    with open(_bt_path, encoding="utf-8") as _f:
+        _bt_src = _f.read()
+    _fn = next((n for n in ast.walk(ast.parse(_bt_src))
+                if isinstance(n, ast.FunctionDef) and n.name == "_alert_bucket"), None)
+    ck(_fn is not None, "_alert_bucket 을 소스에서 찾음")
 
-    class _Stub:
-        """_alert_bucket 은 rc.build_watchlist_plan 을 직접 부르므로 monkeypatch 로 검증."""
+    if _fn is not None:
+        _ns = {"rc": rc}
+        exec(compile(ast.Module(body=[_fn], type_ignores=[]),
+                     _bt_path, "exec"), _ns)          # noqa: S102
+        _bucket = _ns["_alert_bucket"]
 
-    orig = rc.build_watchlist_plan
-    cases = [
-        ({"gate": "fit", "rr_measured": True},  "alert_entry_pass", "fit+실측 → pass"),
-        ({"gate": "fit", "rr_measured": False}, "alert_entry_na",   "fit+미실측 → na (오염 제거)"),
-        ({"gate": "skip", "rr_measured": True}, "alert_entry_skip", "skip → skip"),
-        ({"gate": "avoid", "rr_measured": True}, "alert_entry_skip", "avoid → skip 버킷(기존 유지)"),
-        ({"gate": "na", "rr_measured": False},  "alert_entry_na",   "na → na"),
-    ]
-    for fake, want, tag in cases:
-        rc.build_watchlist_plan = (lambda *a, _f=fake, **k: _f)
-        got = bt._alert_bucket({"event": "entry"}, pd.DataFrame(), {})
-        ck(got == want, f"{tag} (got={got})")
-    rc.build_watchlist_plan = orig
+        _orig = rc.build_watchlist_plan
+        cases = [
+            ({"gate": "fit", "rr_measured": True},   "alert_entry_pass", "fit+실측 → pass"),
+            ({"gate": "fit", "rr_measured": False},  "alert_entry_na",   "fit+미실측 → na (오염 제거)"),
+            ({"gate": "skip", "rr_measured": True},  "alert_entry_skip", "skip → skip"),
+            ({"gate": "avoid", "rr_measured": True}, "alert_entry_skip", "avoid → skip 버킷(기존 유지)"),
+            ({"gate": "na", "rr_measured": False},   "alert_entry_na",   "na → na"),
+        ]
+        try:
+            for fake, want, tag in cases:
+                rc.build_watchlist_plan = (lambda *a, _f=fake, **k: _f)
+                got = _bucket({"event": "entry"}, pd.DataFrame(), {})
+                ck(got == want, f"{tag} (got={got})")
 
-    def _boom(*a, **k):
-        raise RuntimeError("plan fail")
-    rc.build_watchlist_plan = _boom
-    ck(bt._alert_bucket({"event": "entry"}, pd.DataFrame(), {}) == "alert_entry_na",
-       "예외 → na (신호 유실 없음)")
-    rc.build_watchlist_plan = orig
+            def _boom(*a, **k):
+                raise RuntimeError("plan fail")
+            rc.build_watchlist_plan = _boom
+            ck(_bucket({"event": "entry"}, pd.DataFrame(), {}) == "alert_entry_na",
+               "예외 → na (신호 유실 없음)")
+        finally:
+            rc.build_watchlist_plan = _orig
 
-    ck(bt._alert_bucket({"event": "risk"}, pd.DataFrame(), {}) == "alert_risk",
-       "risk 이벤트 회귀 없음")
-    ck(bt._alert_bucket({"event": "exit"}, pd.DataFrame(), {}) is None,
-       "집계 대상 아닌 이벤트는 None")
+        ck(_bucket({"event": "risk"}, pd.DataFrame(), {}) == "alert_risk",
+           "risk 이벤트 회귀 없음")
+        ck(_bucket({"event": "entry_invalid"}, pd.DataFrame(), {}) == "alert_entry_invalid",
+           "entry_invalid 회귀 없음")
+        ck(_bucket({"event": "exit"}, pd.DataFrame(), {}) is None,
+           "집계 대상 아닌 이벤트는 None")
 except Exception as e:  # noqa: BLE001
     ck(False, f"버킷터 검증 실패: {type(e).__name__}: {e}")
 
