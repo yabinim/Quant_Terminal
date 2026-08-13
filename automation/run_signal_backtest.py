@@ -245,7 +245,7 @@ RT_OOS_SPLIT_DATE = ""
 
 ALERT_BUCKETS = (
     "alert_entry_pass",     # 매수 메일 발송 + R:R 게이트 통과 → 실제로 사는 신호
-    "alert_entry_skip",     # 매수 메일 발송 + 게이트 미통과(건너뛰기 권고)
+    "alert_entry_skip",     # 매수 메일 발송 + 고점 근접 구간(v3: 억제 아님, 측정용 유지)
     "alert_entry_na",       # 매수 메일 발송 + 게이트 판단 보류(플랜 산출 불가)
     "alert_risk",           # 위험 알림
     "alert_entry_invalid",  # 직전 매수 신호 조건 해제(무효화)
@@ -324,15 +324,25 @@ def _alert_bucket(ev: dict, hist_slice, analysis: dict):
         return "alert_entry_invalid"
     if e != "entry":
         return None                      # watch/exit/price/regime 은 집계 대상 아님
+    # v2.6(2026-08-12): pass 버킷 오염 제거.
+    #   resolve_target 은 (최근고점 − 진입) < 1R 이면 목표를 rr_derived 로 폴백하는데,
+    #   이 경우 R:R 이 자기참조라 게이트 필터로 쓰이지 않고 gate 는 그대로 "fit" 이 된다.
+    #   그 결과 '전고점 코앞이라 R:R 을 재지 못한' 건이 전부 alert_entry_pass 로 들어가
+    #   실측 run 8개 전부에서 alert_entry_na = 0 이 나왔다(측정 불능 상태).
+    #   → gate 는 건드리지 않고(앱/이메일 동작 불변) 버킷 분류에서만 rr_measured 로 분리.
+    #     gate="na"(플랜 산출 실패)와 구분하기 위해 사유를 나눠 집계한다.
     try:
         plan = rc.build_watchlist_plan(hist_slice, analysis)
         gate = str((plan or {}).get("gate") or "na")
+        rr_measured = bool((plan or {}).get("rr_measured"))
     except Exception:
-        gate = "na"
+        gate, rr_measured = "na", False
     if gate == "na":
         return "alert_entry_na"
     if gate in ("skip", "avoid"):
         return "alert_entry_skip"
+    if not rr_measured:
+        return "alert_entry_na"      # 독립 목표 미설정 → R:R 미실측(통과로 볼 수 없음)
     return "alert_entry_pass"
 
 
@@ -381,31 +391,14 @@ def _position_features(h: pd.DataFrame) -> dict:
 
 
 def _market_warnings(spy_arr) -> np.ndarray:
-    """SPY 정렬 배열 → 일자별 시장 경고 개수(0~5). DRG risk_score 의 백테스트 대용.
+    """SPY 정렬 배열 → 일자별 시장 경고 개수(0~5).
 
-    당일까지의 정보만 사용하며(rolling, shift 없음 → 당일 종가 포함), 전 종목이 같은
-    시장 국면을 공유하므로 티커마다 재계산해도 결과는 동일하다.
+    v2.6(2026-08-12): 구현을 regime_core.market_warnings 로 이관했다(SSOT).
+      라이브(run_watchlist_alerts 진입 게이트)와 백테스트가 **반드시 같은 함수**를
+      써야 하기 때문이다. fill_neutral=2.0 은 이관 전 동작을 비트 단위로 재현한다
+      (해당 fillna 는 실제로는 발동하지 않는 죽은 코드 — regime_core 주석 참조).
     """
-    if spy_arr is None:
-        return None
-    c = pd.Series(spy_arr, dtype=float)
-    if c.notna().sum() < 260:
-        return None
-    ma200 = c.rolling(200, min_periods=200).mean()
-    ma50 = c.rolling(50, min_periods=50).mean()
-    ret20 = c / c.shift(20) - 1.0
-    dd = c / c.rolling(252, min_periods=60).max() - 1.0
-    vol20 = (c.pct_change().rolling(20).std())
-    vol_med = vol20.rolling(252, min_periods=60).median()
-    w = (
-        (c < ma200).astype(float)
-        + (c < ma50).astype(float)
-        + (ret20 < 0).astype(float)
-        + (dd < -0.10).astype(float)
-        + (vol20 > vol_med * 1.5).astype(float)
-    )
-    # 지표 산출 전 구간(NaN)은 중립(2)으로 둔다 — 극단으로 치우치지 않게
-    return w.fillna(2.0).to_numpy(dtype=float)
+    return rc.market_warnings(spy_arr, fill_neutral=2.0)
 
 
 def _pos_label_at(feats: dict, price: float, ref_high: float, i: int):
