@@ -11,8 +11,13 @@
   R3. 신선도 판정 — 장중 미완성 봉 때문에 종일 폴백이 터지지 않는가
   R4. SSOT 일치 — 저장본에서 복원한 값 == 실시간 계산값
   R5. 방어 — 빈/짧은 일봉, 깨진 행, 빈 페이로드에서 죽지 않는가
+  R6. completed_bars_only — 백필이 확정 봉만 쓰는가
+  W1~W8. 쓰기 경로(run_watchlist_alerts.persist_watchlist_metrics) — 계산된 지표가
+      실제로 시트에 어떤 모양으로 들어가는가. FMP·Sheets 를 가짜로 갈아끼우고
+      **실제 소스를 임포트**해 부른다(로직 복사본 아님).
 
-마지막에 뮤테이션으로 각 가드가 실제로 동작하는지 확인한다.
+마지막에 뮤테이션으로 각 가드가 실제로 동작하는지 확인한다 —
+watchlist_metrics_core(계산·직렬화)와 run_watchlist_alerts(쓰기) 양쪽 모두.
 
 실행: python diag_watchlist_metrics.py
 """
@@ -31,6 +36,28 @@ for _p in (_HERE, os.path.normpath(os.path.join(_HERE, ".."))):
         sys.path.insert(0, _p)
 
 import watchlist_metrics_core as wm  # noqa: E402
+
+# ── 쓰기 경로 검사를 위한 자동화 모듈 임포트 ─────────────────────────────────
+#   run_watchlist_alerts 는 모듈 로드 시점에 환경변수와 gspread 를 요구한다.
+#   진단은 네트워크·자격증명 없이 돌아야 하므로 최소 스텁을 먼저 심는다.
+import types  # noqa: E402
+
+for _k in ("FMP_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD", "GMAIL_TO"):
+    os.environ.setdefault(_k, "diag")
+os.environ.setdefault("GSPREAD_KEY", "{}")
+
+if "gspread" not in sys.modules:
+    _g = types.ModuleType("gspread")
+    _g.exceptions = types.SimpleNamespace(APIError=Exception)
+    sys.modules["gspread"] = _g
+if "google.oauth2.service_account" not in sys.modules:
+    sys.modules.setdefault("google", types.ModuleType("google"))
+    sys.modules.setdefault("google.oauth2", types.ModuleType("google.oauth2"))
+    _sa = types.ModuleType("google.oauth2.service_account")
+    _sa.Credentials = types.SimpleNamespace(from_service_account_info=lambda *a, **k: None)
+    sys.modules["google.oauth2.service_account"] = _sa
+
+import run_watchlist_alerts as R  # noqa: E402
 
 
 def mk_hist(n: int, seed: int = 1, end: str = "2026-08-11") -> pd.DataFrame:
@@ -70,6 +97,158 @@ def deep_eq(a, b, path=""):
     except (TypeError, ValueError):
         pass
     return None if a == b else f"{path} {a!r} != {b!r}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 쓰기 경로 (W) — 가짜 Sheets/FMP
+# ══════════════════════════════════════════════════════════════════════════════
+class FakeWS:
+    """gspread 워크시트의 최소 모델.
+
+    ⚠️ update() 는 **지정 범위만** 덮어쓰고 그 밖의 행은 남긴다. 실제 시트가 그렇게
+       동작하기 때문이다. 통째로 갈아끼우게 만들면 '옛 행이 남는' 버그를 진단이
+       구조적으로 못 잡는다.
+    """
+
+    def __init__(self, title, vals=None, rows=2000, cols=12):
+        self.title = title
+        self._v = [list(r) for r in (vals or [])]
+        self.row_count, self.col_count = rows, cols
+        self.updates = []
+
+    def get_all_values(self):
+        return [list(r) for r in self._v]
+
+    def update(self, body, range_name=None, value_input_option=None):
+        self.updates.append((body, range_name))
+        while len(self._v) < len(body):
+            self._v.append([""] * self.col_count)
+        for i, row in enumerate(body):
+            self._v[i] = list(row)
+
+    def resize(self, rows=None, cols=None):
+        if rows:
+            self.row_count = rows
+        if cols:
+            self.col_count = cols
+
+
+class FakeSH:
+    def __init__(self, wss):
+        self._w = wss
+
+    def worksheets(self):
+        return list(self._w.values())
+
+    def worksheet(self, t):
+        if t not in self._w:
+            raise KeyError(t)
+        return self._w[t]
+
+    def add_worksheet(self, title, rows, cols):
+        ws = FakeWS(title, rows=rows, cols=cols)
+        self._w[title] = ws
+        return ws
+
+
+def _fake_env(tickers, metrics_rows=None, hist_map=None, dead=()):
+    """R 의 시트/FMP 진입점을 가짜로 갈아끼운다. (sh, worksheets) 반환."""
+    wl = [["User_ID", "Ticker"] + [""] * 11]
+    for t in tickers:
+        wl.append(["yab", t] + [""] * 11)
+    wss = {"Watchlist": FakeWS("Watchlist", wl)}
+    if metrics_rows is not None:
+        wss[wm.SHEET_TITLE] = FakeWS(wm.SHEET_TITLE, [list(wm.COLS)] + metrics_rows)
+    sh = FakeSH(wss)
+    R._open_ws = lambda title: (sh, sh.worksheet(title))
+    hm = hist_map or {t: mk_hist(300, seed=i + 1, end=_TODAY) for i, t in enumerate(tickers)}
+    R._fmp_price_history = lambda tk, limit=252: (
+        pd.DataFrame() if tk in dead else hm.get(tk, mk_hist(300, 9, end=_TODAY)))
+    return sh, wss
+
+
+_TODAY = "2026-08-11"
+
+
+def run_writepath_tests(ck) -> None:
+    """persist_watchlist_metrics 회귀. ck(cond, name, detail) 로 결과를 보고한다."""
+    # ── W1: 정기 EOD 저장 — 폭·헤더·범위·왕복 ──────────────────────────────
+    sh, _ = _fake_env(["AAA", "BBB", "CCC"])
+    n = R.persist_watchlist_metrics(None, {}, _TODAY, completed_only=False)
+    ws = sh.worksheet(wm.SHEET_TITLE)
+    body, rng = ws.updates[-1]
+    ck(n == 3, "W1 3종목 저장", f"n={n}")
+    ck(all(len(r) == wm.NCOL for r in body), "W1 전 행 폭=NCOL")
+    ck(body[0] == list(wm.COLS), "W1 헤더=wm.COLS")
+    ck(rng == f"A1:L{len(body)}", "W1 명시 범위 지정", str(rng))
+    _back = [wm.from_row(r) for r in body[1:]]
+    ck(all(b is not None for b in _back), "W1 앱 리더(from_row) 왕복")
+    ck(all(b and b.get("analysis") for b in _back), "W1 analysis 페이로드 복원")
+    ck(_back[0]["trade_date"] == _TODAY, "W1 당일 봉 기준", str(_back[0]["trade_date"]))
+
+    # ── W2: 백필 — 당일 봉 제외 → 실행 시각 무관하게 결정적 ────────────────
+    sh, _ = _fake_env(["AAA"])
+    R.persist_watchlist_metrics(None, {}, _TODAY, completed_only=True)
+    b2 = wm.from_row(sh.worksheet(wm.SHEET_TITLE).updates[-1][0][1])
+    ck(b2 is not None and b2["trade_date"] < _TODAY, "W2 백필은 확정 봉까지만",
+       str(b2 and b2["trade_date"]))
+    ck(wm.is_fresh(b2, wm.last_completed_session(mk_hist(300, 1, end=_TODAY), _TODAY)),
+       "W2 백필 결과가 앱 신선도 통과")
+
+    # ── W3: 워치리스트 축소 — 유령 티커 제거 ───────────────────────────────
+    old_rows = [wm.to_row({"ticker": t, "trade_date": "2026-01-01", "analysis": {"x": 1}})
+                for t in ("AAA", "BBB", "CCC", "ZZZ")]
+    sh, _ = _fake_env(["AAA"], metrics_rows=old_rows)
+    R.persist_watchlist_metrics(None, {}, _TODAY)
+    _final = sh.worksheet(wm.SHEET_TITLE).get_all_values()
+    ck(not any("ZZZ" in "".join(map(str, r)) for r in _final), "W3 삭제된 티커 흔적 없음")
+    ck(sum(1 for r in _final[1:] if wm.from_row(r)) == 1, "W3 유효 행 1개만 남음")
+
+    # ── W4: 계산 0건 — 기존 값 보존 ────────────────────────────────────────
+    sh, _ = _fake_env(["AAA", "BBB"], metrics_rows=old_rows[:2], dead=("AAA", "BBB"))
+    _before = sh.worksheet(wm.SHEET_TITLE).get_all_values()
+    n = R.persist_watchlist_metrics(None, {}, _TODAY)
+    ck(n == 0, "W4 반환 0")
+    ck(not sh.worksheet(wm.SHEET_TITLE).updates, "W4 시트 쓰기 호출 없음")
+    ck(sh.worksheet(wm.SHEET_TITLE).get_all_values() == _before, "W4 기존 값 보존")
+
+    # ── W5: 방어 경로 ──────────────────────────────────────────────────────
+    sh, _ = _fake_env([])
+    ck(R.persist_watchlist_metrics(None, {}, _TODAY) == 0, "W5 빈 워치리스트 → 0")
+
+    def _boom(_t):
+        raise RuntimeError("시트 없음")
+
+    _save = R._open_ws
+    R._open_ws = _boom
+    try:
+        ck(R.persist_watchlist_metrics(None, {}, _TODAY) == 0, "W5 시트 예외 → 0 (전파 없음)")
+    finally:
+        R._open_ws = _save
+
+    # ── W6: hist_cache 재사용 — 정기 EOD 에서 FMP 추가 호출 0 ──────────────
+    sh, _ = _fake_env(["AAA", "BBB"])
+    _calls = []
+    _orig_fetch = R._fmp_price_history
+    R._fmp_price_history = lambda tk, limit=252: (_calls.append(tk), _orig_fetch(tk))[1]
+    R.persist_watchlist_metrics(
+        None, {"AAA": mk_hist(300, 1, end=_TODAY), "BBB": mk_hist(300, 2, end=_TODAY)}, _TODAY)
+    ck(_calls == [], "W6 캐시된 종목은 FMP 재호출 안 함", f"calls={_calls}")
+
+    # ── W7: 중복 티커 — 여러 사용자가 같은 종목을 담아도 1행 ───────────────
+    sh, _ = _fake_env(["AAA", "AAA", "BBB"])
+    R.persist_watchlist_metrics(None, {}, _TODAY)
+    _rows = [r for r in sh.worksheet(wm.SHEET_TITLE).updates[-1][0][1:] if wm.from_row(r)]
+    ck(len(_rows) == 2, "W7 사용자 간 중복 티커 dedupe", f"{len(_rows)}행")
+
+    # ── W8: main() 배선 — 소스 수준 계약 ───────────────────────────────────
+    _wa = open(_WA_PATH, encoding="utf-8").read()
+    ck('"metrics"' in _wa and "--scope" in _wa, "W8 --scope 에 metrics 존재")
+    ck('args.scope != "metrics"' in _wa, "W8 휴장일 게이트가 백필을 막지 않음")
+    ck("completed_only=True" in _wa and "completed_only=False" in _wa,
+       "W8 백필/정기 EOD 기준 분기 존재")
+    _intraday = _wa.split('elif args.mode == "intraday":')[-1].split("else:")[0]
+    ck("persist_watchlist_metrics" not in _intraday, "W8 장중 경로는 지표를 저장하지 않음")
 
 
 def run_tests() -> list:
@@ -174,8 +353,19 @@ def run_tests() -> list:
     ck(_back is not None and deep_eq(_m["analysis"], _back["analysis"]) is None,
        "R1 시트 문자열화 후에도 왕복")
 
+    # ── W: 쓰기 경로 ────────────────────────────────────────────────────────
+    #   core 뮤테이션 때도 함께 돌아 '계산은 맞는데 저장이 틀린' 경우를 잡는다.
+    try:
+        run_writepath_tests(lambda cond, name, detail="": ck(cond, name, detail))
+    except Exception as e:
+        fails.append(f"W 쓰기 경로 예외: {type(e).__name__}: {e}")
+
     return fails
 
+
+_WA_PATH = os.path.join(_HERE, "run_watchlist_alerts.py")
+if not os.path.isfile(_WA_PATH):
+    _WA_PATH = os.path.normpath(os.path.join(_HERE, "..", "automation", "run_watchlist_alerts.py"))
 
 MUTATIONS = [
     ("NaN 을 null 로 직렬화",
@@ -199,6 +389,56 @@ MUTATIONS = [
 ]
 
 
+# run_watchlist_alerts.py 를 부수는 뮤테이션 — 쓰기 경로 가드가 진짜인지 확인
+MUTATIONS_WA = [
+    ("유령 행 정리 제거(삭제된 티커가 시트에 남음)",
+     "for _ in range(max(0, prev_rows - len(body))):",
+     "for _ in range(0):"),
+    ("계산 0건 가드 제거(FMP 장애 시 시트를 비움)",
+     "if not rows:",
+     "if False and not rows:"),
+    ("백필 절단 무시(실행 시각에 따라 결과가 달라짐)",
+     "h = wm.completed_bars_only(hist, today) if completed_only else hist",
+     "h = hist"),
+    ("행 폭 정규화 우회(열 밀림 드리프트)",
+     "rows.append(wm.to_row(m))",
+     "rows.append(wm.to_row(m)[:9])"),
+]
+
+
+def _run_mutations(title, path, mutations, reload_mods):
+    """path 를 하나씩 부수고 run_tests() 가 잡는지 본다. 미탐지 건수 반환."""
+    print()
+    print("=" * 74)
+    print(title)
+    print("=" * 74)
+    src = open(path, encoding="utf-8").read()
+    weak = 0
+    try:
+        for name, old_s, new_s in mutations:
+            if src.count(old_s) != 1:
+                print(f"  [SKIP] {name}: 앵커 {src.count(old_s)}회 — 뮤테이션 갱신 필요")
+                weak += 1
+                continue
+            open(path, "w", encoding="utf-8").write(src.replace(old_s, new_s, 1))
+            for m in reload_mods:
+                importlib.reload(m)
+            try:
+                mf = run_tests()
+            except Exception as e:
+                mf = [f"예외: {type(e).__name__}"]
+            if mf:
+                print(f"  [OK]   {name}: {len(mf)}건 탐지 (예: {mf[0][:52]})")
+            else:
+                print(f"  [WEAK] {name}: 부쉈는데도 통과 — 테스트가 무력함")
+                weak += 1
+    finally:
+        open(path, "w", encoding="utf-8").write(src)
+        for m in reload_mods:
+            importlib.reload(m)
+    return weak
+
+
 def main():
     path = os.path.join(_HERE, "watchlist_metrics_core.py")
     if not os.path.isfile(path):
@@ -216,32 +456,14 @@ def main():
         return 1
     print("  [OK] 전 항목 통과")
 
-    print()
-    print("=" * 74)
-    print("2) 뮤테이션 검증")
-    print("=" * 74)
-    weak = 0
-    _bak = src
-    try:
-        for name, old, new in MUTATIONS:
-            if src.count(old) != 1:
-                print(f"  [SKIP] {name}: 앵커 {src.count(old)}회 — 뮤테이션 갱신 필요")
-                weak += 1
-                continue
-            open(path, "w", encoding="utf-8").write(src.replace(old, new, 1))
-            importlib.reload(wm)
-            try:
-                mf = run_tests()
-            except Exception as e:
-                mf = [f"예외: {type(e).__name__}"]
-            if mf:
-                print(f"  [OK]   {name}: {len(mf)}건 탐지 (예: {mf[0][:52]})")
-            else:
-                print(f"  [WEAK] {name}: 부쉈는데도 통과 — 테스트가 무력함")
-                weak += 1
-    finally:
-        open(path, "w", encoding="utf-8").write(_bak)
-        importlib.reload(wm)
+    weak = _run_mutations("2) 뮤테이션 검증 — watchlist_metrics_core (계산·직렬화)",
+                          path, MUTATIONS, [wm, R])
+    if not os.path.isfile(_WA_PATH):
+        print(f"\n  [SKIP] run_watchlist_alerts.py 를 찾지 못함: {_WA_PATH}")
+        weak += 1
+    else:
+        weak += _run_mutations("3) 뮤테이션 검증 — run_watchlist_alerts (쓰기 경로)",
+                               _WA_PATH, MUTATIONS_WA, [R])
 
     print()
     print("=" * 74)
