@@ -11,12 +11,31 @@
 """
 from __future__ import annotations
 
+import os
 import sys
+
 import numpy as np
 import pandas as pd
 
-import regime_core as rc
-import users_core as uc
+# automation/ 에서 실행되든 루트에서 실행되든 공용 모듈을 찾게 한다(기존 diag 관례).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.normpath(os.path.join(_HERE, ".."))
+for _p in (_HERE, _ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+
+def _find(name: str) -> str:
+    """소스 파일 실경로. 루트 → automation/ 순으로 찾는다(실행 위치 무관)."""
+    for base in (_ROOT, _HERE, os.getcwd()):
+        p = os.path.join(base, name)
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(name)
+
+
+import regime_core as rc  # noqa: E402
+import users_core as uc  # noqa: E402
 
 FAIL: list[str] = []
 
@@ -232,7 +251,7 @@ print("=" * 68)
 import ast
 
 try:
-    _wa_src = open("run_watchlist_alerts.py", encoding="utf-8").read()
+    _wa_src = open(_find("automation/run_watchlist_alerts.py"), encoding="utf-8").read()
     _tree = ast.parse(_wa_src)
     _fns = {n.name: n for n in ast.walk(_tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
@@ -310,7 +329,7 @@ print("=" * 68)
 import re
 
 try:
-    _app = open("app.py", encoding="utf-8").read()
+    _app = open(_find("app.py"), encoding="utf-8").read()
     _m = re.search(r'_SSOT_REQUIRED\s*=\s*"([^"]+)"', _app)
     ck(_m is not None, "app.py 에 _SSOT_REQUIRED 존재")
     if _m:
@@ -319,7 +338,7 @@ try:
         for _mod in ("scanner_core", "narrative_core", "users_core",
                      "fmp_extras", "portfolio_core"):
             try:
-                _src = open(f"{_mod}.py", encoding="utf-8").read()
+                _src = open(_find(f"{_mod}.py"), encoding="utf-8").read()
                 _v = re.search(r'^SSOT_VERSION\s*=\s*"([^"]+)"', _src, re.M)
                 _v = _v.group(1) if _v else None
                 ck(_v == _req, f"{_mod}.py = {_v} (기대 {_req})")

@@ -11,11 +11,30 @@
 """
 from __future__ import annotations
 
+import os
 import sys
+
 import numpy as np
 import pandas as pd
 
-import regime_core as rc
+# automation/ 에서 실행되든 루트에서 실행되든 공용 모듈을 찾게 한다(기존 diag 관례).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.normpath(os.path.join(_HERE, ".."))
+for _p in (_HERE, _ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+
+def _find(name: str) -> str:
+    """소스 파일 실경로. 루트 → automation/ 순으로 찾는다(실행 위치 무관)."""
+    for base in (_ROOT, _HERE, os.getcwd()):
+        p = os.path.join(base, name)
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(name)
+
+
+import regime_core as rc  # noqa: E402
 
 FAIL: list[str] = []
 BAN = ("건너뛰기", "미통과", "부족", "금지", "비권장")
