@@ -49,25 +49,79 @@ import watchlist_metrics_core as wm  # 워치리스트 표시 지표 SSOT — �
 import scanner_core as sc
 import portfolio_core as pc
 
-# ── SSOT 버전 대조 ───────────────────────────────────────────────────────────
-# 공용 모듈을 덜 배포했거나 Streamlit 재부팅을 안 하면 AttributeError 로 죽는데,
-# Streamlit 이 메시지를 가려서 어느 파일이 문제인지 알 수 없다. 먼저 잡아 안내한다.
-_SSOT_REQUIRED = "2026-08-12a"
-_ssot_bad = [
-    (_n, getattr(_m, "SSOT_VERSION", None))
-    for _n, _m in (("scanner_core", sc), ("narrative_core", narrative_core),
-                   ("users_core", uc), ("fmp_extras", fx), ("portfolio_core", pc),
-                   ("watchlist_metrics_core", wm))
-    if getattr(_m, "SSOT_VERSION", None) != _SSOT_REQUIRED
-]
+# ── SSOT 기능 대조 ───────────────────────────────────────────────────────────
+# 목적: 공용 모듈을 덜 배포했거나 Streamlit 재부팅을 안 했을 때 원인을 짚어준다.
+#   (그대로 두면 AttributeError 가 나는데 Streamlit 이 메시지를 가려 파일 특정이 안 된다.)
+#
+# v2(2026-08-13): **버전 문자열 일치 검사에서 기능 존재 검사로 전환.**
+#   이전 방식은 6개 모듈이 전부 같은 SSOT_VERSION 을 갖도록 요구해서,
+#   한 모듈만 고쳐도 무관한 5개 + app.py 까지 올려야 했다. 하나라도 빠뜨리면
+#   앱 전체가 멈췄고, 실제로 그런 오경보가 반복됐다.
+#   → 실제로 깨지는 것(= app.py 가 쓰는 심볼이 있는가)을 직접 본다.
+#
+# 유지보수: 모듈 간 새 기능을 추가하면 아래에 한 줄 더한다. 빠뜨리면 '검출을 놓칠 뿐'
+#   오경보는 나지 않는다 — 실패 방향이 안전한 쪽이다.
+#   전수 검사(app.py 가 참조하는 모든 속성)는 automation/diag_market_gate.py 가
+#   배포 **전에** AST 로 수행한다. 여기는 런타임용 최소 감시다.
+#
+# portfolio_core 는 app.py 가 import 만 하고 참조하지 않아 대상에서 제외한다.
+_SSOT_NEEDS = (
+    # (표시명, 모듈, 필요 심볼들, 추가조건(모듈)->bool | None, 추가조건 설명)
+    ("regime_core", rc,
+     ("market_gate_status", "market_warnings", "MARKET_GATE_THRESHOLD",
+      "MARKET_WARNING_LABELS", "GATE_LABELS", "build_watchlist_plan",
+      "integrated_sell_verdict", "resolve_alert_events"),
+     lambda m: "고점 근접" in str(m.GATE_LABELS.get("skip", "")),
+     "GATE_LABELS['skip'] 정보 표기 강등(2026-08-12) 반영"),
+    ("users_core", uc,
+     ("USER_SHEET_COLS", "LAST_COL", "ensure_users_header_v2",
+      "fetch_users_df", "update_user_fields", "verify_password"),
+     lambda m: "Gate_Market" in m.USER_SHEET_COLS,
+     "Users 스키마 v5(Gate_Market 열) 반영"),
+    ("watchlist_metrics_core", wm,
+     ("SHEET_TITLE", "compute_metrics", "from_row", "is_fresh",
+      "last_completed_session"),
+     None, ""),
+    ("scanner_core", sc,
+     ("run_three_bucket_scan", "route_candidates_by_regime",
+      "WATCHLIST_AUTO_ADD_THRESHOLDS", "SCANNER_SCHEMA_VERSION",
+      "set_fmp_key_provider", "set_genai_client_provider"),
+     None, ""),
+    ("narrative_core", narrative_core,
+     ("build_narrative_prompt", "parse_narrative_json", "fetch_global_market_news",
+      "verify_narrative_with_quant", "weekly_scan_pools"),
+     None, ""),
+    ("fmp_extras", fx,
+     ("compute_satellite_top10", "compute_sector_signals", "overlap_grade",
+      "filter_rotation_universe", "SECTOR_THEME_ETFS"),
+     None, ""),
+)
+
+_ssot_bad = []
+for _n, _m, _syms, _cond, _why in _SSOT_NEEDS:
+    _missing = [a for a in _syms if not hasattr(_m, a)]
+    if _missing:
+        _ssot_bad.append((_n, _m, f"심볼 없음: {', '.join(_missing[:4])}"
+                                  + (" 외" if len(_missing) > 4 else "")))
+        continue
+    if _cond is not None:
+        try:
+            _ok = bool(_cond(_m))
+        except Exception:
+            _ok = False
+        if not _ok:
+            _ssot_bad.append((_n, _m, f"구버전 내용: {_why}"))
+
 if _ssot_bad:
     st.error(
-        "⚠️ **공용 모듈 버전 불일치** — app.py 와 함께 배포되지 않았거나 "
-        "Streamlit 재부팅이 필요합니다.\n\n"
-        + "\n".join(f"- `{_n}.py` : 필요 `{_SSOT_REQUIRED}` / 현재 "
-                    f"`{_v or '없음(구버전)'}`" for _n, _v in _ssot_bad)
+        "⚠️ **공용 모듈이 구버전입니다** — 해당 파일을 다시 배포하고 재부팅하세요.\n\n"
+        + "\n".join(
+            f"- `{_n}.py` — {_msg}  \n"
+            f"  (파일 버전 `{getattr(_m, 'SSOT_VERSION', '없음')}`)"
+            for _n, _m, _msg in _ssot_bad)
         + "\n\n배포 후 **Manage app → Reboot** 을 실행하세요."
     )
+    st.stop()
     st.stop()
 
 # 기존 호출부 호환을 위한 재노출 (구현은 scanner_core 단일 정의)
