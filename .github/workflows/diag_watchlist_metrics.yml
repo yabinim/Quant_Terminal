@@ -28,4 +28,4 @@ jobs:
         run: python automation/diag_watchlist_writepath.py
 
       - name: ✅ Python 3.11 f-string 호환성
-        run: python check_py311.py app.py run_watchlist_alerts.py watchlist_metrics_core.py
+        run: python check_py311.py app.py automation/run_watchlist_alerts.py watchlist_metrics_core.py

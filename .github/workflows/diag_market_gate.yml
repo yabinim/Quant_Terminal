@@ -1,0 +1,55 @@
+name: 🔍 진단 — 시장 진입 게이트 · 게이트 라벨 (수동 전용)
+
+# 언제 쓰나:
+#   - regime_core / users_core / run_watchlist_alerts 를 건드린 직후, 배포 **전에**
+#   - SSOT 버전 스탬프를 올린 뒤 (2026-08-12 에 users_core 만 올려 앱 전체가 죽은 사고 방지)
+#   - Users 시트 스키마(Gate_Market 등)를 바꾼 뒤
+#
+# 안전성: 네트워크·시트·이메일 접근이 전혀 없다. 합성 데이터로만 돌고
+#         알림 상태머신도 건드리지 않는다. 언제 몇 번을 돌려도 부작용이 없다.
+#
+# 검사 범위:
+#   diag_market_gate.py   1) market_warnings 백테스트 경로 비트 동일성
+#                         2) 라이브 경로 NaN 보존(fail-open)
+#                         3) 임계값 판정 · 경계조건(>=)
+#                         4) 동결이 entry 만 막고 보유 관리는 통과
+#                         5) 동결 재개 — 상태 보존
+#                         6) users_core Gate_Market 스키마 · 기본값
+#                         7) run_watchlist_alerts 게이트 결선 (AST)
+#                         8) SSOT 버전 정합성 (app.py ↔ 공용 모듈 5종)
+#   diag_gate_relabel.py  R:R 게이트 skip 강등 회귀 + 백테스트 버킷터
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/repository_dispatch 트리거 없음.
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # numpy/pandas 만 필요. 네트워크·시트·Streamlit 접근 없음.
+      - name: 📦 의존성
+        run: pip install numpy pandas
+
+      # 두 스크립트 모두 repo 루트의 공용 모듈(regime_core, users_core)을 import 하고
+      # 7·8번 섹션은 루트 파일을 텍스트로 읽는다. 반드시 루트에서 실행할 것.
+      - name: 🚦 시장 진입 게이트 + SSOT 버전 정합성
+        run: python automation/diag_market_gate.py
+
+      - name: 🏷️ R:R 게이트 라벨 회귀
+        run: python automation/diag_gate_relabel.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          app.py regime_core.py users_core.py
+          automation/run_watchlist_alerts.py automation/run_signal_backtest.py
