@@ -321,31 +321,102 @@ except Exception as e:  # noqa: BLE001
 
 print()
 print("=" * 68)
-print("8) SSOT 버전 정합성")
+print("8) app.py ↔ 공용 모듈 심볼 정합성 (전수)")
 print("=" * 68)
-# app.py 의 _SSOT_REQUIRED 와 5개 공용 모듈의 SSOT_VERSION 이 전부 같아야 한다.
-#   한 모듈만 올리면 앱이 st.stop() 으로 죽는다 — 재부팅으로는 해결되지 않는다.
-#   실제로 2026-08-12 users_core 만 올려 앱 전체가 멈췄다.
-import re
+# v2(2026-08-13): 버전 문자열 일치 검사를 폐기하고 **실제 심볼 존재**를 본다.
+#   구 방식은 6개 모듈이 같은 SSOT_VERSION 을 갖도록 요구해 무관한 파일까지
+#   배포하게 만들었고, 하나만 빠뜨려도 앱이 멈췄다(오경보 반복).
+#
+#   여기서는 app.py 가 `rc.foo` / `uc.BAR` 식으로 참조하는 **모든** 속성을 AST 로
+#   뽑아, 대상 모듈의 최상위 정의에 실제로 있는지 대조한다. app.py 런타임 검사는
+#   속도 때문에 핵심 심볼만 보므로, 전수 확인은 배포 **전인** 여기서 한다.
+import ast
+
+
+def _toplevel_names(path):
+    """import 없이 모듈 최상위 정의 이름 집합 (외부 의존성 불필요)."""
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    out = set()
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+        elif isinstance(n, ast.Assign):
+            for tg in n.targets:
+                if isinstance(tg, ast.Name):
+                    out.add(tg.id)
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            out.add(n.target.id)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                out.add(a.asname or a.name.split(".")[0])
+    return out
+
 
 try:
-    _app = open(_find("app.py"), encoding="utf-8").read()
-    _m = re.search(r'_SSOT_REQUIRED\s*=\s*"([^"]+)"', _app)
-    ck(_m is not None, "app.py 에 _SSOT_REQUIRED 존재")
-    if _m:
-        _req = _m.group(1)
-        print(f"     app.py 기대값: {_req}")
-        for _mod in ("scanner_core", "narrative_core", "users_core",
-                     "fmp_extras", "portfolio_core"):
+    _app_src = open(_find("app.py"), encoding="utf-8").read()
+    _app_tree = ast.parse(_app_src)
+
+    _alias = {}
+    for _n in ast.walk(_app_tree):
+        if isinstance(_n, ast.Import):
+            for _a in _n.names:
+                _alias[_a.asname or _a.name] = _a.name
+    _TARGETS = {"scanner_core", "narrative_core", "users_core", "fmp_extras",
+                "portfolio_core", "watchlist_metrics_core", "regime_core"}
+    _al = {k: v for k, v in _alias.items() if v in _TARGETS}
+
+    _used = {}
+    for _n in ast.walk(_app_tree):
+        if (isinstance(_n, ast.Attribute) and isinstance(_n.value, ast.Name)
+                and _n.value.id in _al):
+            _used.setdefault(_al[_n.value.id], set()).add(_n.attr)
+
+    ck(bool(_used), "app.py 의 공용 모듈 참조를 추출함")
+    for _mod in sorted(_used):
+        _syms = _used[_mod]
+        try:
+            _have = _toplevel_names(_find(f"{_mod}.py"))
+        except FileNotFoundError:
+            print(f"  ⏭️  {_mod}.py 미포함 — 배포 시 함께 확인할 것")
+            continue
+        _miss = sorted(s for s in _syms if s not in _have)
+        ck(not _miss,
+           f"{_mod}: app.py 가 쓰는 {len(_syms)}개 심볼 모두 존재"
+           + (f" — 없음 {_miss}" if _miss else ""))
+
+    # 런타임 매니페스트(_SSOT_NEEDS)도 실제 모듈과 맞는지 확인
+    _mani = next((n for n in ast.walk(_app_tree)
+                  if isinstance(n, ast.Assign)
+                  and getattr(n.targets[0], "id", "") == "_SSOT_NEEDS"), None)
+    ck(_mani is not None, "app.py 에 _SSOT_NEEDS 매니페스트 존재")
+    if _mani is not None:
+        _bad = 0
+        for _elt in _mani.value.elts:
+            _name = _elt.elts[0].value
+            _syms = [x.value for x in _elt.elts[2].elts]
+            # 오타난 모듈명을 조용히 건너뛰면 검사가 통째로 무력화된다.
+            # 매니페스트에 적힌 모듈은 반드시 실재해야 한다.
             try:
-                _src = open(_find(f"{_mod}.py"), encoding="utf-8").read()
-                _v = re.search(r'^SSOT_VERSION\s*=\s*"([^"]+)"', _src, re.M)
-                _v = _v.group(1) if _v else None
-                ck(_v == _req, f"{_mod}.py = {_v} (기대 {_req})")
+                _have = _toplevel_names(_find(f"{_name}.py"))
             except FileNotFoundError:
-                print(f"  ⏭️  {_mod}.py 미포함 — 배포 시 함께 확인할 것")
+                ck(False, f"매니페스트의 '{_name}' 파일이 없음 — 모듈명 오타 의심")
+                _bad += 1
+                continue
+            _bad += sum(1 for s in _syms if s not in _have)
+        ck(_bad == 0, f"_SSOT_NEEDS 매니페스트가 실제 모듈과 일치 (불일치 {_bad}건)")
+        # 매니페스트가 비어 있으면 검사 자체가 무력화된다
+        ck(len(_mani.value.elts) >= 5,
+           f"매니페스트에 모듈 {len(_mani.value.elts)}개 등록 (5개 이상)")
+        _names = {e.elts[0].value for e in _mani.value.elts}
+        _unknown = sorted(_names - _TARGETS)
+        ck(not _unknown, f"매니페스트 모듈명이 모두 알려진 공용 모듈"
+                         + (f" — 미상 {_unknown}" if _unknown else ""))
+
+    # 구 방식 잔재가 남아 있으면 오경보가 다시 시작된다
+    ck("_SSOT_REQUIRED" not in _app_src,
+       "구 버전일치 검사(_SSOT_REQUIRED) 제거됨")
 except Exception as e:  # noqa: BLE001
-    ck(False, f"버전 검사 실패: {type(e).__name__}: {e}")
+    ck(False, f"심볼 정합성 검사 실패: {type(e).__name__}: {e}")
 
 print()
 print("=" * 68)
