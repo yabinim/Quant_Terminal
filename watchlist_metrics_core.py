@@ -38,7 +38,7 @@ import regime_core as rc
 
 # 공용 모듈 공통 스탬프. app.py 의 _SSOT_REQUIRED 와 일치해야 하며,
 # 불일치 시 앱 시작 단계에서 어느 파일이 안 올라갔는지 이름을 찍어준다.
-SSOT_VERSION = "2026-08-06a"
+SSOT_VERSION = "2026-08-12a"
 
 SHEET_TITLE = "Watchlist_Metrics"
 COLS = [
