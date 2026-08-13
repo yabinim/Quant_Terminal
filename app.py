@@ -22487,6 +22487,25 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 _wl_rp = _regime_params(_drg_get("전체")[0])
             except Exception:
                 _wl_rp = _regime_params({})
+            # 시장 진입 게이트 상태 — 앱은 **표시만** 한다(종목은 숨기지 않음).
+            #   메일(자동화)은 Users.Gate_Market = Y 인 사용자에 한해 실제로 동결한다.
+            #   배너가 없으면 "메일은 안 왔는데 앱엔 매수 신호"가 설명되지 않는다.
+            try:
+                _wl_spy = cached_timing_price_history("SPY")
+                _wl_mkt = rc.market_gate_status(
+                    _wl_spy["Close"] if (_wl_spy is not None and not _wl_spy.empty
+                                         and "Close" in _wl_spy.columns) else None)
+            except Exception:
+                _wl_mkt = {"blocked": False, "available": False, "label": "", "count": None}
+            if _wl_mkt.get("available"):
+                _wl_mkt_names = ", ".join(rc.MARKET_WARNING_LABELS)
+                if _wl_mkt.get("blocked"):
+                    st.warning(_esc_md(
+                        f"{_wl_mkt['label']} — 신규 매수 알림이 **동결**되는 구간입니다 "
+                        f"(임계 {_wl_mkt['threshold']}개). 보유 관리 알림(줄이기·청산)은 정상 발송됩니다.  \n"
+                        f"판정 신호: {_wl_mkt_names}"))
+                else:
+                    st.caption(_esc_md(f"{_wl_mkt['label']} (임계 {_wl_mkt['threshold']}개)"))
             if wl_items:
                 if _wl_ctx:
                     st.caption(_esc_md(
@@ -23836,6 +23855,12 @@ Winners/Emerging은 티커 환각 검증 + 정량 교차검증(RSI·RS·거래�
 | 🟡 줄이기 (추세 흔들림·리버설) | 고점 대비 눌림이 추세 위험 | 미보유 → 매수 금지 · 보유 → 축소 |
 | 🔴 청산 계열 | 추세 종료 확인 | 보유 시 청산 검토 |
 
+**🚦 시장 진입 게이트:** SPY 기준 5개 신호(200일선·50일선·20일 수익률·52주 고점 대비·변동성)
+중 **2개 이상**이 경고면 신규 매수 알림을 동결합니다. 보유 관리 알림(줄이기·청산)은 그대로 발송됩니다.
+Users 시트 `Gate_Market` 토글로 사용자별 on/off — 기본값은 꺼짐입니다.
+근거: 2026-08-02 백테스트에서 진입을 21% 줄였을 때 SPY 초과수익 +4.91% → +8.86%
+(전·후반 분할 테스트를 통과한 유일한 발견).
+
 **포지션 사이징 원칙:** 앱이 ATR 기반 손절 거리로 수량을 계산합니다. 전 종목 1주씩 사면 이 계산이 무의미해집니다 —
 **소수점 매수로 금액을 그대로 집행**하거나 보유 종목 수를 3~4개로 줄이세요.
 """)
@@ -23918,6 +23943,19 @@ Early Signal의 종목판 — 여기서 뜨기 시작한 종목이 Watchlist 후
                     """정상입니다. 강세 종목의 매수 신호는 **RSI 40~52 눌림**에서 발동하도록 설계되어,
 등록 후 몇 % 하락은 셋업이 익는 과정입니다. 문제는 하락이 아니라 **국면 강등**(⚠️/🔴 전환)입니다 —
 강등 비율이 높으면 너무 늦게(이미 오른 뒤) 담고 있다는 신호이니 소싱을 Early Signal 쪽으로 옮기세요.""",
+                ),
+                (
+                    "Q. 앱에는 매수 신호가 있는데 이메일이 안 왔어요",
+                    """**시장 진입 게이트**가 동결했을 수 있습니다. SPY 기준 경고가 2개 이상인 날은
+개별 종목 매수 신호가 떠도 메일을 보내지 않습니다 — 시장 전체가 나쁠 때의 진입이
+평균적으로 손해였다는 백테스트 결과 때문입니다(진입 21% 감소, SPY 초과 +4.91% → +8.86%).
+
+앱 [7] 워치리스트 탭 상단 배너에서 현재 경고 개수를 확인할 수 있습니다.
+동결은 **상태를 보존**하므로, 게이트가 풀리면 멈춘 지점에서 이어서 재개됩니다
+(신호가 사라지는 게 아닙니다). 보유 관리 알림은 동결되지 않습니다 — 나쁜 장에서
+팔아야 할 것은 팔아야 하기 때문입니다.
+
+Users 시트 `Gate_Market` 을 `N` 으로 두면 이 기능이 꺼집니다(기본값 꺼짐).""",
                 ),
                 (
                     "Q. 실적 발표 캘린더에 데이터가 안 나와요",

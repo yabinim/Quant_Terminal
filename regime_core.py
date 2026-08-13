@@ -1395,6 +1395,100 @@ def regime_params(drg: dict) -> dict:
 _WL_RECENT_HIGH_WINDOW = 120  # app.py [7] 워치리스트 탭과 동일(lockstep)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# 시장 진입 게이트 (Market Entry Gate) — SSOT
+#   run_signal_backtest.py 의 _market_warnings 를 이관. 백테스트가 검증한 함수와
+#   라이브가 쓰는 함수가 반드시 동일해야 하므로 여기가 유일한 정의다.
+#
+#   검증(2026-08-02, 개별주·편향 통제 후):
+#     게이트 없음  N=158  SPY초과 +4.91%  평균R 3.78
+#     경고≥3 차단  N=142  SPY초과 +6.55%  평균R 4.32
+#     경고≥2 차단  N=125  SPY초과 +8.86%  평균R 5.22
+#   전·후반 분할 테스트를 통과한 유일한 발견(청산 모드 13개는 전부 재현 실패).
+#   한계: 측정 구간(2022-06~2026-07)이 상승장 편중. FMP 5년 한도로 2018/2020 검증 불가.
+# ──────────────────────────────────────────────────────────────────────────
+
+MARKET_GATE_THRESHOLD = 2   # 이 개수 이상이면 신규 진입 동결 (0~5 척도)
+MARKET_WARNING_MAX = 5      # 신호 개수 — 표시용
+MARKET_WARNING_LABELS = (
+    "200일선 이탈", "50일선 이탈", "20일 수익률 마이너스",
+    "52주 고점 대비 -10%", "변동성 급등",
+)
+
+
+def market_warnings(spy_close, fill_neutral=None):
+    """SPY 종가 시계열 → 일자별 시장 경고 개수(0~5) 배열.
+
+    당일까지의 정보만 사용한다(rolling, shift 없음 → 당일 종가 포함). 전 종목이 같은
+    시장 국면을 공유하므로 티커마다 재계산해도 결과는 동일하다.
+
+    fill_neutral:
+      · None(기본, 라이브) — 지표 산출 전 구간을 **NaN 으로 되살린다**. 호출 측이
+        '데이터 부족'을 감지해 게이트를 미적용할 수 있어야 하기 때문이다.
+      · 2.0(백테스트) — 이관 전 _market_warnings 동작을 **비트 단위로 재현**한다.
+        NaN 마스킹을 적용하지 않으므로 과거 수치와 그대로 비교할 수 있다.
+
+    ⚠️ 이관 중 발견: 원본의 `w.fillna(2.0)` 은 **죽은 코드**였다. `NaN < NaN` 은 False 라
+       `.astype(float)` 에서 0.0 이 되고 w 에는 NaN 이 생기지 않는다. 즉 원본 주석의
+       "지표 산출 전 구간은 중립(2)" 은 사실이 아니며, 실제로는 **경고 0개(=최대 관대)**
+       였다. 백테스트 워밍업 구간에서 게이트가 전혀 작동하지 않았다는 뜻이다.
+       과거 측정치와의 비교 가능성을 지키기 위해 이 동작은 fill_neutral 경로에서
+       그대로 보존한다. 수정하려면 백테스트를 전량 재실행해야 한다(별건).
+    """
+    if spy_close is None:
+        return None
+    c = pd.Series(spy_close, dtype=float).reset_index(drop=True)
+    if c.notna().sum() < 260:
+        return None
+    ma200 = c.rolling(200, min_periods=200).mean()
+    ma50 = c.rolling(50, min_periods=50).mean()
+    ret20 = c / c.shift(20) - 1.0
+    dd = c / c.rolling(252, min_periods=60).max() - 1.0
+    vol20 = c.pct_change().rolling(20).std()
+    vol_med = vol20.rolling(252, min_periods=60).median()
+    w = (
+        (c < ma200).astype(float)
+        + (c < ma50).astype(float)
+        + (ret20 < 0).astype(float)
+        + (dd < -0.10).astype(float)
+        + (vol20 > vol_med * 1.5).astype(float)
+    )
+    if fill_neutral is not None:
+        return w.fillna(float(fill_neutral)).to_numpy(dtype=float)
+    # 라이브: 산출 불가한 날을 NaN 으로 되살려 fail-open 판정이 가능하게 한다.
+    invalid = (ma200.isna() | ma50.isna() | ret20.isna() | dd.isna()
+               | vol20.isna() | vol_med.isna() | c.isna())
+    return w.mask(invalid).to_numpy(dtype=float)
+
+
+def market_gate_status(spy_close, threshold: int = None) -> dict:
+    """최신 시점의 시장 진입 게이트 판정 (라이브용).
+
+    반환: {"blocked": bool, "count": float|None, "threshold": int,
+           "available": bool, "reason": str, "label": str}
+
+    available=False(데이터 부족·조회 실패)면 blocked=False 로 **기존 동작을 유지**한다
+    (fail-open). 조용히 전 종목 알림이 사라지는 것보다 게이트를 거르는 편이 진단 가능하다.
+    """
+    thr = int(MARKET_GATE_THRESHOLD if threshold is None else threshold)
+    out = {"blocked": False, "count": None, "threshold": thr,
+           "available": False, "reason": "", "label": ""}
+    arr = market_warnings(spy_close)          # fill_neutral 없음 → NaN 유지
+    if arr is None or len(arr) == 0 or not np.isfinite(arr[-1]):
+        out["reason"] = "SPY 데이터 부족 — 게이트 미적용"
+        out["label"] = "⚪ 시장 게이트 판정 불가"
+        return out
+    cnt = float(arr[-1])
+    out.update({"available": True, "count": cnt, "blocked": bool(cnt >= thr)})
+    if out["blocked"]:
+        out["reason"] = f"시장 경고 {cnt:.0f}/{MARKET_WARNING_MAX} (임계 {thr}) — 신규 진입 동결"
+        out["label"] = f"🚦 시장 경고 {cnt:.0f}/{MARKET_WARNING_MAX} — 신규 진입 보류 구간"
+    else:
+        out["reason"] = f"시장 경고 {cnt:.0f}/{MARKET_WARNING_MAX} (임계 {thr}) — 정상"
+        out["label"] = f"🟢 시장 경고 {cnt:.0f}/{MARKET_WARNING_MAX} — 신규 진입 가능"
+    return out
+
+
 def build_watchlist_plan(hist, an: dict, manual_stop=None, manual_target=None,
                          entry=None, atr_mult=None, rr_target=None,
                          equity: float = 0.0, risk_pct: float = 1.0,

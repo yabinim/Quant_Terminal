@@ -39,16 +39,16 @@ import secrets as _pysecrets
 import pandas as pd
 
 # ── 스키마 ─────────────────────────────────────────────────────────────────────
-SSOT_VERSION = "2026-08-06a"
+SSOT_VERSION = "2026-08-12a"
 
 USER_SHEET_COLS = [
     "ID", "Password", "Reason", "Source", "Status",
     "Email", "Alert_Radar", "Alert_Global",
     "Alert_DRG", "Alert_Weekly", "Alert_HiddenAlpha", "Auto_Watchlist",
-    "Alert_Earnings",
+    "Alert_Earnings", "Gate_Market",
 ]
-NCOL = len(USER_SHEET_COLS)               # 13
-LAST_COL = chr(ord("A") + NCOL - 1)       # "M"
+NCOL = len(USER_SHEET_COLS)               # 14
+LAST_COL = chr(ord("A") + NCOL - 1)       # "N"
 
 # v2(8열) 스키마 — 마이그레이션 판별용
 _USER_SHEET_COLS_V2 = [
@@ -65,6 +65,7 @@ ALERT_KINDS = {
     "hidden": "Alert_HiddenAlpha",  # Hidden Alpha 주간 ETF 로테이션
     "autowl": "Auto_Watchlist",  # 워치리스트 자동 편입(메일 아님)
     "earnings": "Alert_Earnings",   # 실적 레이더 (개인)
+    "gate_market": "Gate_Market",   # 시장 진입 게이트 (메일 아님 — 매수 알림 차단 스위치)
 }
 # ⚠️ alert_column() 은 미지의 kind 를 Alert_Global 로 폴백한다. 새 알림을 추가하면서
 #    여기 매핑을 빠뜨리면 그 알림이 **조용히 내러티브 토글을 따라간다**. 반드시 함께 추가.
@@ -74,12 +75,16 @@ ALERT_KINDS = {
 #   관리자(yab)만 전부 Y 로 채운다.
 #   v4 는 여기에 Alert_Earnings 를 더한다(게스트 N, 관리자 Y).
 _MIGRATED_COLS = ["Alert_DRG", "Alert_Weekly", "Alert_HiddenAlpha", "Auto_Watchlist",
-                  "Alert_Earnings"]
+                  "Alert_Earnings", "Gate_Market"]
 _MIGRATE_START = 8                        # USER_SHEET_COLS 상 시작 인덱스 (= "I" 열)
 _DEFAULTS_GUEST = {"Alert_DRG": "Y", "Alert_Weekly": "N", "Alert_HiddenAlpha": "N",
-                   "Auto_Watchlist": "N", "Alert_Earnings": "N"}
+                   "Auto_Watchlist": "N", "Alert_Earnings": "N", "Gate_Market": "N"}
+# ⚠️ Gate_Market 은 관리자도 기본 "N" 이다 — 다른 토글과 다르다.
+#    이 스위치는 알림을 **추가**하는 게 아니라 매수 알림을 약 20% **차단**한다.
+#    근거 수치(2026-08-02 백테스트)가 Signal_Backtest 시트로 재확인되기 전까지는
+#    켜지지 않도록 두고, 확인 후 시트에서 수동으로 "Y" 로 바꾼다.
 _DEFAULTS_ADMIN = {"Alert_DRG": "Y", "Alert_Weekly": "Y", "Alert_HiddenAlpha": "Y",
-                   "Auto_Watchlist": "Y", "Alert_Earnings": "Y"}
+                   "Auto_Watchlist": "Y", "Alert_Earnings": "Y", "Gate_Market": "N"}
 
 # 하위 호환 별칭 (기존 참조가 있을 경우 대비)
 _NEW_V3_COLS = _MIGRATED_COLS[:4]
@@ -137,9 +142,9 @@ def gen_temp_password(length: int = 10) -> str:
 
 # ── 시트 스키마/조회 ───────────────────────────────────────────────────────────
 def ensure_users_header_v4(ws) -> bool:
-    """헤더를 v4(13열)로 보장하고, 구 스키마 행의 빈 토글에 기본값을 채운다.
+    """헤더를 최신 스키마(v5, 14열)로 보장하고, 구 스키마 행의 빈 토글에 기본값을 채운다.
 
-    v2(8열) / v3(12열) 어느 쪽에서 올라오든 한 번에 처리한다 —
+    v2(8열) / v3(12열) / v4(13열) 어느 쪽에서 올라오든 한 번에 처리한다 —
     인덱스 8("I")부터 끝까지를 대상으로 **비어 있는 칸만** 기본값으로 채우므로
     이미 값이 있는 행은 그대로 보존된다.
 

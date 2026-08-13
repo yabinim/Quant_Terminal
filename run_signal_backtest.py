@@ -391,31 +391,14 @@ def _position_features(h: pd.DataFrame) -> dict:
 
 
 def _market_warnings(spy_arr) -> np.ndarray:
-    """SPY 정렬 배열 → 일자별 시장 경고 개수(0~5). DRG risk_score 의 백테스트 대용.
+    """SPY 정렬 배열 → 일자별 시장 경고 개수(0~5).
 
-    당일까지의 정보만 사용하며(rolling, shift 없음 → 당일 종가 포함), 전 종목이 같은
-    시장 국면을 공유하므로 티커마다 재계산해도 결과는 동일하다.
+    v2.6(2026-08-12): 구현을 regime_core.market_warnings 로 이관했다(SSOT).
+      라이브(run_watchlist_alerts 진입 게이트)와 백테스트가 **반드시 같은 함수**를
+      써야 하기 때문이다. fill_neutral=2.0 은 이관 전 동작을 비트 단위로 재현한다
+      (해당 fillna 는 실제로는 발동하지 않는 죽은 코드 — regime_core 주석 참조).
     """
-    if spy_arr is None:
-        return None
-    c = pd.Series(spy_arr, dtype=float)
-    if c.notna().sum() < 260:
-        return None
-    ma200 = c.rolling(200, min_periods=200).mean()
-    ma50 = c.rolling(50, min_periods=50).mean()
-    ret20 = c / c.shift(20) - 1.0
-    dd = c / c.rolling(252, min_periods=60).max() - 1.0
-    vol20 = (c.pct_change().rolling(20).std())
-    vol_med = vol20.rolling(252, min_periods=60).median()
-    w = (
-        (c < ma200).astype(float)
-        + (c < ma50).astype(float)
-        + (ret20 < 0).astype(float)
-        + (dd < -0.10).astype(float)
-        + (vol20 > vol_med * 1.5).astype(float)
-    )
-    # 지표 산출 전 구간(NaN)은 중립(2)으로 둔다 — 극단으로 치우치지 않게
-    return w.fillna(2.0).to_numpy(dtype=float)
+    return rc.market_warnings(spy_arr, fill_neutral=2.0)
 
 
 def _pos_label_at(feats: dict, price: float, ref_high: float, i: int):
