@@ -122,7 +122,6 @@ if _ssot_bad:
         + "\n\n배포 후 **Manage app → Reboot** 을 실행하세요."
     )
     st.stop()
-    st.stop()
 
 # 기존 호출부 호환을 위한 재노출 (구현은 scanner_core 단일 정의)
 to_float                       = sc.to_float

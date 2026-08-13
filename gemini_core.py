@@ -5,7 +5,8 @@
   2) thinking 토큰이 max_output_tokens 예산을 깎아 본문/JSON이 잘림 — thinking_budget=0 기본
      + finish_reason==MAX_TOKENS(잘림) 감지 → 503과 구분 로그, 재시도 대상 처리
 
-run_narrative.py · run_drg_predict.py · run_drg_verify.py 가 공유한다.
+run_narrative.py · run_drg_predict.py · run_drg_verify.py · run_weekly_report.py ·
+scanner_core.py(앱·run_scanner_scan 공용) 가 공유한다.
 순수 google-genai 의존(외부 추가 의존 없음). automation 은 repo root 를 sys.path 에
 추가하므로 `import gemini_core` 로 임포트한다.
 
@@ -61,8 +62,8 @@ def generate_text(client, prompt, *,
                   max_output_tokens: int = 8192,
                   top_p=None,
                   thinking_budget=0,
-                  response_mime_type=None,
                   validate=None,
+                  response_mime_type=None,
                   primary_attempts: int = 5,
                   fallback_attempts: int = 5,
                   backoff=None,
@@ -74,10 +75,11 @@ def generate_text(client, prompt, *,
         client: genai.Client 인스턴스
         prompt: 프롬프트 문자열
         thinking_budget: 0=사고 끔(기본, 잘림 방지). None 이면 thinking_config 미설정(사고 기본 ON).
-        response_mime_type: 예) "application/json". 미지정(None)이면 설정하지 않아 기존 동작 유지.
-                  scanner_core 의 배치 채점이 JSON 배열 강제를 위해 사용한다.
         validate: 선택. callable(text)->bool. False/예외면 그 시도를 실패(재시도 대상)로 처리.
                   예) 내러티브: lambda t: narrative_core.parse_narrative_json(t) is not None
+        response_mime_type: 선택. "application/json" 을 주면 모델이 JSON 만 뱉도록 강제한다.
+                  ⚠️ 이 인자가 없으면 scanner_core 가 TypeError 로 죽는다 — 스캐너는
+                     마크다운 코드펜스 없는 순수 JSON 을 전제로 파싱한다.
         primary_attempts / fallback_attempts: 모델별 최대 시도 횟수.
         backoff: 백오프 초 리스트(없으면 DEFAULT_BACKOFF).
         label: 로그 접두 라벨.
@@ -94,8 +96,7 @@ def generate_text(client, prompt, *,
     cfg_kwargs = dict(temperature=temperature, max_output_tokens=max_output_tokens)
     if top_p is not None:
         cfg_kwargs["top_p"] = top_p
-    if response_mime_type is not None:
-        # 스캐너 배치 채점처럼 JSON 배열만 받아야 하는 호출용. 미지정 시 기존 동작 그대로.
+    if response_mime_type:
         cfg_kwargs["response_mime_type"] = response_mime_type
     if thinking_budget is not None:
         cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=thinking_budget)
