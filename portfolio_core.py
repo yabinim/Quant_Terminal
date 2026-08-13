@@ -21,7 +21,7 @@ from datetime import datetime
 
 import pytz
 
-SSOT_VERSION = "2026-08-06a"
+SSOT_VERSION = "2026-08-12a"
 
 PORTFOLIOS_SHEET_COLS = ["ID", "Account", "Ticker", "AvgPrice", "Quantity", "Date_Added"]
 PORTFOLIOS_LEGACY_HEADER = ["ID", "Ticker", "AvgPrice", "Quantity", "Date_Added"]

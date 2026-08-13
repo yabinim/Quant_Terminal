@@ -902,7 +902,7 @@ from collections import deque as _deque
 # 한도의 약 83% 로 보수적 설정. 워크플로에서 환경변수로 조절 가능.
 # SSOT 버전 스탬프 — app.py 가 import 직후 대조한다.
 # 배포 누락/재부팅 누락 시 AttributeError 대신 명확한 안내를 띄우기 위함.
-SSOT_VERSION = "2026-08-06a"
+SSOT_VERSION = "2026-08-12a"
 
 FMP_RATE_LIMIT_PER_MIN = max(30, int(_os.environ.get("FMP_RATE_LIMIT_PER_MIN", "200") or 200))
 # 429/402 를 만났을 때 재시도 횟수. 재시도가 없으면 한 번 밀린 호출이 그대로 유실되어

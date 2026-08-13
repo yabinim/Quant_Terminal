@@ -45,7 +45,7 @@ _MARKET_ET_TZ = pytz.timezone("America/New_York")
 # v3-3bucket-auto: run_by/run_at 메타 추가 (자동화 스캔과 수동 스캔 구분).
 # SSOT 버전 스탬프 — app.py 가 import 직후 대조한다.
 # 배포 누락/재부팅 누락 시 AttributeError 대신 명확한 안내를 띄우기 위함.
-SSOT_VERSION = "2026-08-06a"
+SSOT_VERSION = "2026-08-12a"
 
 SCANNER_SCHEMA_VERSION = "v3-3bucket-auto"
 

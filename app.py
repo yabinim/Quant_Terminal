@@ -50,7 +50,7 @@ import portfolio_core as pc
 # ── SSOT 버전 대조 ───────────────────────────────────────────────────────────
 # 공용 모듈을 덜 배포했거나 Streamlit 재부팅을 안 하면 AttributeError 로 죽는데,
 # Streamlit 이 메시지를 가려서 어느 파일이 문제인지 알 수 없다. 먼저 잡아 안내한다.
-_SSOT_REQUIRED = "2026-08-06a"
+_SSOT_REQUIRED = "2026-08-12a"
 _ssot_bad = [
     (_n, getattr(_m, "SSOT_VERSION", None))
     for _n, _m in (("scanner_core", sc), ("narrative_core", narrative_core),
