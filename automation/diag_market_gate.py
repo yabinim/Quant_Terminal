@@ -321,6 +321,64 @@ except Exception as e:  # noqa: BLE001
 
 print()
 print("=" * 68)
+print("7-b) 5pm 관찰 배너 (Gate_Market=N 이어도 기록이 남는가)")
+print("=" * 68)
+# 게이트를 켤지 판단하려면 '켜져 있었다면 막혔을 날'의 기록이 필요하다.
+#   판정이 토글에 묶여 있으면(_m_users 가 비면 판정 자체를 안 하면) 관찰이 불가능하다.
+try:
+    _wa_tree = ast.parse(_wa_src)
+    _fns2 = {n.name: n for n in _wa_tree.body if isinstance(n, ast.FunctionDef)}
+    ck("build_market_gate_banner" in _fns2, "build_market_gate_banner 정의됨")
+
+    # 판정이 토글과 무관하게 항상 수행되는지 (구버전: `if _m_users else None`)
+    _mg = next((n for n in ast.walk(_wa_tree)
+                if isinstance(n, ast.Assign) and n.targets
+                and getattr(n.targets[0], "id", "") == "_m_gate"), None)
+    ck(_mg is not None, "_m_gate 대입 존재")
+    if _mg is not None:
+        ck(not isinstance(_mg.value, ast.IfExp),
+           "_m_gate 판정이 토글에 조건부가 아님 (관찰 모드에서도 기록됨)")
+
+    # EOD 발송에 배너가 실제로 전달되는지
+    _wired2 = False
+    for _n in ast.walk(_wa_tree):
+        if (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)
+                and _n.func.id == "dispatch_radar_emails"):
+            for _kw in _n.keywords:
+                if _kw.arg == "banner_html":
+                    _t = ast.get_source_segment(_wa_src, _kw.value) or ""
+                    if "build_market_gate_banner" in _t:
+                        _wired2 = True
+    ck(_wired2, "EOD 발송에 관찰 배너가 전달됨")
+
+    # 배너 동작 — 실제 실행
+    _bn = [_fns2["build_market_gate_banner"]]
+    _bn += [n for n in _wa_tree.body if isinstance(n, ast.Assign)
+            and getattr(n.targets[0], "id", "") == "MARKET_GATE_MAIL_TAG"]
+    _bns = {"rc": rc}
+    exec(compile(ast.Module(body=_bn, type_ignores=[]), "wa", "exec"), _bns)  # noqa: S102
+    _build = _bns["build_market_gate_banner"]
+    _TAG = _bns["MARKET_GATE_MAIL_TAG"]
+
+    ck(_build({"blocked": False, "count": 1.0, "threshold": 2}, set()) == "",
+       "경고 임계 미만 → 배너 없음 (매일 뜨는 잡음 방지)")
+    ck(_build(None, set()) == "", "게이트 None → 배너 없음")
+    # 빈 태그면 `"" in text` 가 항상 참이라 검사가 통과해버린다 — 태그 자체를 먼저 본다.
+    ck(isinstance(_TAG, str) and len(_TAG.strip()) >= 4,
+       f"검색 태그가 실질적인 문자열 ({_TAG!r})")
+    _obs = _build({"blocked": True, "count": 3.0, "threshold": 2}, set())
+    ck(bool(_TAG.strip()) and _TAG in _obs,
+       f"관찰 모드 배너에 검색 태그('{_TAG}') 포함")
+    ck("않았을" in _obs, "관찰 모드는 반사실 문구 (실제 동결 아님)")
+    _live = _build({"blocked": True, "count": 3.0, "threshold": 2}, {"yab"})
+    ck(bool(_TAG.strip()) and _TAG in _live and "동결됐습니다" in _live,
+       "적용 모드는 실제 동결 문구")
+    ck(_obs != _live, "관찰/적용 문구가 구분됨")
+except Exception as e:  # noqa: BLE001
+    ck(False, f"배너 검증 실패: {type(e).__name__}: {e}")
+
+print()
+print("=" * 68)
 print("8) app.py ↔ 공용 모듈 심볼 정합성 (전수)")
 print("=" * 68)
 # v2(2026-08-13): 버전 문자열 일치 검사를 폐기하고 **실제 심볼 존재**를 본다.

@@ -358,6 +358,49 @@ def _radar_recipients() -> list[tuple[str, str]]:
         return []
 
 
+# Gmail 검색용 고정 문구. 나중에 "시장 경고 구간"으로 검색하면 해당 날짜의 메일이
+# 전부 나오고, 그날 온 매수 신호가 이후 어떻게 됐는지 되짚을 수 있다.
+MARKET_GATE_MAIL_TAG = "시장 경고 구간"
+
+
+def build_market_gate_banner(gate: dict | None, applied_users=None) -> str:
+    """5pm 메일 상단 관찰 배너.
+
+    경고가 임계 미만이면 **아무것도 붙이지 않는다** — 매일 뜨면 잡음이 되고,
+    관찰 목적상 필요한 건 '경고 구간이었던 날'의 기록뿐이다.
+
+    게이트가 실제로 적용 중인지(Users.Gate_Market)에 따라 문구가 갈린다:
+      · 미적용(관찰 모드) — 아래 매수 신호는 정상 발송된 것이고, 배너는
+        "게이트가 켜져 있었다면 막혔을 것"이라는 반사실 기록이다.
+      · 적용 중 — 매수 신호가 실제로 동결됐다는 안내.
+    """
+    if not gate or not gate.get("blocked"):
+        return ""
+    cnt = gate.get("count")
+    cnt_s = f"{cnt:.0f}" if isinstance(cnt, (int, float)) else "?"
+    thr = gate.get("threshold", rc.MARKET_GATE_THRESHOLD)
+    names = ", ".join(getattr(rc, "MARKET_WARNING_LABELS", ()) or ())
+    live = bool(applied_users)
+    if live:
+        head = (f"🚦 <b>{MARKET_GATE_MAIL_TAG}</b> — 시장 경고 {cnt_s}/"
+                f"{rc.MARKET_WARNING_MAX} (임계 {thr})")
+        body = ("신규 <b>매수</b> 알림이 동결됐습니다. 보유 관리 알림(줄이기·청산)은 "
+                "정상 발송됩니다. 동결은 상태를 보존하므로 게이트가 풀리면 "
+                "멈춘 지점에서 재개됩니다.")
+        bg, fg = "#fdecea", "#a4342a"
+    else:
+        head = (f"🚦 <b>{MARKET_GATE_MAIL_TAG}</b> — 시장 경고 {cnt_s}/"
+                f"{rc.MARKET_WARNING_MAX} (임계 {thr}) · 관찰 모드")
+        body = ("게이트가 켜져 있었다면 아래 <b>매수</b> 신호는 발송되지 "
+                "않았을 구간입니다. 지금은 <code>Users.Gate_Market = N</code> 이라 "
+                "평소대로 발송됩니다 — 이 종목들이 이후 어떻게 되는지 보고 "
+                "게이트를 켤지 판단하세요.")
+        bg, fg = "#fff8e1", "#8a6d00"
+    return (f"<p style='background:{bg};padding:10px;border-radius:6px;color:{fg};"
+            f"line-height:1.5'>{head}<br>{body}"
+            f"<br><span style='font-size:12px;opacity:.8'>판정 신호: {names}</span></p>")
+
+
 def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
                           subject_emoji: str, subject_label: str,
                           banner_html: str = "") -> None:
@@ -1007,9 +1050,14 @@ def main():
                 _e_users = load_earnings_gate_users()
                 # 시장 진입 게이트 — SPY 는 이미 확보돼 있어 추가 API 호출 없음.
                 _m_users = load_market_gate_users()
-                _m_gate = (rc.market_gate_status(spy_close) if _m_users else None)
-                if _m_gate:
-                    print(f"[GATE] 시장 진입 게이트: {_m_gate['reason']}")
+                # 판정은 **토글과 무관하게 항상** 수행한다.
+                #   _m_users 는 '실제로 동결할 대상'만 정하고, 판정 결과는 관찰 배너에
+                #   쓰인다. 토글이 전원 N 이어도 "게이트가 켜져 있었다면 어땠을까"를
+                #   기록해야 켤지 말지 판단할 근거가 쌓인다.
+                #   SPY 는 이미 확보돼 있어 추가 API 호출은 없다.
+                _m_gate = rc.market_gate_status(spy_close)
+                print(f"[GATE] 시장 진입 게이트: {_m_gate['reason']}"
+                      + (f" · 적용 대상 {len(_m_users)}명" if _m_users else " · 적용 대상 없음(관찰만)"))
                 wl_res = eval_watchlist_eod(
                     spy_close, hist_cache, today,
                     earn_blocks=(load_earnings_blocks() if _e_users else {}),
@@ -1020,7 +1068,8 @@ def main():
             total = (sum(len(v) for v in wl_res.values())
                      + sum(len(v) for v in pf_res.values()))
             if total:
-                dispatch_radar_emails(wl_res, pf_res, today, "🔔", "매매 레이더")
+                dispatch_radar_emails(wl_res, pf_res, today, "🔔", "매매 레이더",
+                                      banner_html=build_market_gate_banner(_m_gate, _m_users))
             else:
                 print("[INFO] 발동된 알림 없음 — 이메일 생략.")
     except Exception as e:
