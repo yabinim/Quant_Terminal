@@ -302,6 +302,34 @@ except Exception as e:  # noqa: BLE001
 
 print()
 print("=" * 68)
+print("8) SSOT 버전 정합성")
+print("=" * 68)
+# app.py 의 _SSOT_REQUIRED 와 5개 공용 모듈의 SSOT_VERSION 이 전부 같아야 한다.
+#   한 모듈만 올리면 앱이 st.stop() 으로 죽는다 — 재부팅으로는 해결되지 않는다.
+#   실제로 2026-08-12 users_core 만 올려 앱 전체가 멈췄다.
+import re
+
+try:
+    _app = open("app.py", encoding="utf-8").read()
+    _m = re.search(r'_SSOT_REQUIRED\s*=\s*"([^"]+)"', _app)
+    ck(_m is not None, "app.py 에 _SSOT_REQUIRED 존재")
+    if _m:
+        _req = _m.group(1)
+        print(f"     app.py 기대값: {_req}")
+        for _mod in ("scanner_core", "narrative_core", "users_core",
+                     "fmp_extras", "portfolio_core"):
+            try:
+                _src = open(f"{_mod}.py", encoding="utf-8").read()
+                _v = re.search(r'^SSOT_VERSION\s*=\s*"([^"]+)"', _src, re.M)
+                _v = _v.group(1) if _v else None
+                ck(_v == _req, f"{_mod}.py = {_v} (기대 {_req})")
+            except FileNotFoundError:
+                print(f"  ⏭️  {_mod}.py 미포함 — 배포 시 함께 확인할 것")
+except Exception as e:  # noqa: BLE001
+    ck(False, f"버전 검사 실패: {type(e).__name__}: {e}")
+
+print()
+print("=" * 68)
 if FAIL:
     print(f"❌ 실패 {len(FAIL)}건")
     for f in FAIL:
