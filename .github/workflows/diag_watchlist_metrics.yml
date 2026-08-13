@@ -19,7 +19,10 @@ jobs:
 
       # numpy/pandas 만 필요. 네트워크·시트·Streamlit 접근 없음.
       - name: 📦 의존성
-        run: pip install numpy pandas
+        # 지표 진단이 이제 automation/run_watchlist_alerts.py(쓰기 경로)를 임포트한다.
+        # gspread/google-auth 는 진단이 스텁으로 대체하지만 pytz·requests 는 모듈
+        # 로드 시점에 실제로 필요하다.
+        run: pip install numpy pandas pytz requests
 
       - name: 🔍 지표 왕복·신선도·SSOT 일치 + 뮤테이션
         run: python automation/diag_watchlist_metrics.py
