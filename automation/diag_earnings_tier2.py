@@ -136,12 +136,13 @@ def _fake(url, timeout=None, retries=None):
 
 fh.fmp_get_ex = _fake
 fh.set_key_provider(lambda: "K")
-res = ec.fetch_market_universe(key="K", spy_top_n=3)
+res = ec.fetch_market_universe(key="K", spy_top_n=3, use_etf=True)
 chk(res["source"] == "etf" and res["ok"], f"출처 etf / ok={res['ok']}")
 chk("USD" not in res["ndx"] and "XTSLA" not in res["ndx"], "현금 항목 제외")
 chk("BRK" not in str(res["ndx"]), "복수클래스(BRK.B) 제외")
 chk(sorted(res["ndx"]) == ["AAPL", "NVDA"], f"QQQ 중복 제거 = {sorted(res['ndx'])}")
-u = ec.merge_universe_sources(res["ndx"], res["sp"], now_et=NOW)
+u = ec.merge_universe_sources(res["ndx"], res["sp"], now_et=NOW,
+                             labels=res.get("labels"))
 chk(u[0][0] == "AAPL" and u[0][4] == "BOTH", "교집합 BOTH + 시총 최상위")
 chk(all(str(r[3]).strip() for r in u), "Market_Cap 스크리너 보강 완료")
 
@@ -156,12 +157,45 @@ def _fake_etf_dead(url, timeout=None, retries=None):
 
 
 fh.fmp_get_ex = _fake_etf_dead
-res2 = ec.fetch_market_universe(key="K", spy_top_n=3)
+res2 = ec.fetch_market_universe(key="K", spy_top_n=3, use_etf=True)
 chk(res2["source"] == "screener" and res2["ok"], f"폴백 승격 = {res2['source']}")
 chk("TINY" not in res2["sp"], "폴백은 1,500억 하한 적용 (TINY 300억 제외)")
 chk("403" in res2["diag"], f"HTTP 상태 진단 노출: {res2['diag'][:40]}...")
 
-print("\n[9] 전멸 → 안전 실패")
+print("\n[9] 스크리너 단독(기본) — ETF 호출 자체를 안 함")
+_calls = []
+
+
+def _fake_count(url, timeout=None, retries=None):
+    _calls.append(url)
+    if "screener" in url:
+        return _R(_SCR), 200, "ok"
+    return None, 402, "plan_limited"
+
+
+fh.fmp_get_ex = _fake_count
+res4 = ec.fetch_market_universe(key="K")
+chk(not any("holdings" in u for u in _calls), f"ETF 호출 0회 (총 {len(_calls)}콜)")
+chk(res4["source"] == "screener", f"출처 = {res4['source']}")
+u4 = ec.merge_universe_sources(res4["ndx"], res4["sp"], now_et=NOW,
+                               labels=res4.get("labels"))
+_labels = {r[4] for r in u4}
+chk(_labels == {"US_LARGE"}, f"라벨 US_LARGE (거짓 SP500_LARGE 아님) = {_labels}")
+
+print("\n[10] 402 는 재시도하지 않는다 (플랜 제한)")
+_n = {"c": 0}
+
+
+def _fake_402(url, timeout=None, retries=None):
+    _n["c"] += 1
+    return None, 402, "plan_limited"
+
+
+fh.fmp_get_ex = _fake_402
+ec._etf_membership("QQQ", "K")
+chk(_n["c"] == 1, f"402 호출 1회로 종료 (실제 {_n['c']}회)")
+
+print("\n[11] 전멸 → 안전 실패")
 fh.fmp_get_ex = lambda url, timeout=None, retries=None: (None, 404, "http_error")
 res3 = ec.fetch_market_universe(key="K")
 chk(not res3["ok"] and res3["source"] == "none", "ok=False → 시트 미갱신 경로")

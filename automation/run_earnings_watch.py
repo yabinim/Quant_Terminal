@@ -260,7 +260,8 @@ def pass_universe(today, now_et, force: bool = False) -> dict:
         print(f"[UNIV] 조회 실패 — 기존 {len(cur)}종목 유지")
         return cur
 
-    rows = ec.merge_universe_sources(res["ndx"], res["sp"], now_et=now_et)
+    rows = ec.merge_universe_sources(res["ndx"], res["sp"], now_et=now_et,
+                                     labels=res.get("labels"))
     if not rows:
         print("[UNIV] 병합 결과 0종목 — 기존 유지")
         return cur
@@ -272,8 +273,12 @@ def pass_universe(today, now_et, force: bool = False) -> dict:
                   range_name=f"A1:{_col_a1(ec.UNIVERSE_NCOL)}{len(rows) + 1}",
                   value_input_option="USER_ENTERED")
         _n_cap = sum(1 for r in rows if str(r[3] or "").strip())
-        print(f"[UNIV] 갱신 완료 — {len(rows)}종목 (출처 {res.get('source')} · "
-              f"NDX {len(res['ndx'])} · SPY상위 {len(res['sp'])} · 시총채움 {_n_cap})")
+        _by_src = {}
+        for r in rows:
+            _by_src[r[4]] = _by_src.get(r[4], 0) + 1
+        _brk = " · ".join(f"{k} {v}" for k, v in sorted(_by_src.items()))
+        print(f"[UNIV] 갱신 완료 — {len(rows)}종목 (출처 {res.get('source')}) "
+              f"· {_brk} · 시총채움 {_n_cap}")
     except Exception as e:
         print(f"[ERROR] Earnings_Universe 기록 실패: {e} — 기존 유지")
         return cur
