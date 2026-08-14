@@ -34,7 +34,16 @@ import json
 import os
 import sys
 
-import fmp_http as fh
+# automation/ 에서 실행되든 루트에서 실행되든 공용 모듈을 찾게 한다(기존 diag 관례).
+# python automation/xxx.py 로 실행하면 sys.path[0] 이 automation/ 이라
+# repo 루트의 fmp_http 를 찾지 못한다 — diag_market_gate.py 와 동일한 처리.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.normpath(os.path.join(_HERE, ".."))
+for _p in (_HERE, _ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import fmp_http as fh  # noqa: E402  (sys.path 설정 후에 import 해야 한다)
 
 # ── 대상 ──────────────────────────────────────────────────────────────────
 _env = str(os.environ.get("TICKERS", "") or "").strip()
