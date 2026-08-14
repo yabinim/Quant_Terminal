@@ -227,6 +227,60 @@ def load_universe():
     return holdings, watch, sorted(tickers), wl_stops
 
 
+def _universe_ws():
+    return _ws(ec.UNIVERSE_WORKSHEET, ec.UNIVERSE_COLS)
+
+
+def load_market_universe() -> dict:
+    """Earnings_Universe 시트 → {TICKER: dict}. 없거나 실패 시 빈 dict."""
+    try:
+        rows = ec.parse_universe(_universe_ws().get_all_values() or [])
+        return {str(r.get("Ticker") or "").strip().upper(): r for r in rows
+                if str(r.get("Ticker") or "").strip()}
+    except Exception as e:
+        print(f"[WARN] Earnings_Universe 로드 실패: {e}")
+        return {}
+
+
+def pass_universe(today, now_et, force: bool = False) -> dict:
+    """Tier 2 유니버스 주 1회 갱신. 반환: {TICKER: dict} (갱신 여부와 무관).
+
+    전체 덮어쓰기다. 부분 결과로 덮으면 멤버십이 조용히 반토막 나므로,
+    ec.fetch_market_universe 가 ok=False 를 주면 **기존 시트를 그대로 둔다.**
+    """
+    cur = load_market_universe()
+    is_refresh_day = (int(pd.Timestamp(today).weekday()) == ec.UNIVERSE_REFRESH_WEEKDAY)
+    if not (force or is_refresh_day or not cur):
+        print(f"[UNIV] 갱신일 아님 — 기존 {len(cur)}종목 사용")
+        return cur
+
+    res = ec.fetch_market_universe(key=FMP_API_KEY)
+    if not res.get("ok"):
+        print(f"[UNIV] 조회 실패(ndx={len(res.get('ndx') or {})} "
+              f"sp500={res.get('n_sp_all')} screener={res.get('n_screen')}) "
+              f"— 기존 {len(cur)}종목 유지")
+        return cur
+
+    rows = ec.merge_universe_sources(res["ndx"], res["sp"], now_et=now_et)
+    if not rows:
+        print("[UNIV] 병합 결과 0종목 — 기존 유지")
+        return cur
+
+    try:
+        ws = _universe_ws()
+        ws.clear()
+        ws.update([ec.UNIVERSE_COLS] + rows,
+                  range_name=f"A1:{_col_a1(ec.UNIVERSE_NCOL)}{len(rows) + 1}",
+                  value_input_option="USER_ENTERED")
+        print(f"[UNIV] 갱신 완료 — {len(rows)}종목 "
+              f"(NDX {len(res['ndx'])} · S&P500 대형주 {len(res['sp'])})")
+    except Exception as e:
+        print(f"[ERROR] Earnings_Universe 기록 실패: {e} — 기존 유지")
+        return cur
+
+    return {r[0]: dict(zip(ec.UNIVERSE_COLS, r)) for r in rows}
+
+
 def load_profiles(uid: str, cache: dict):
     if "_vals" not in cache:
         try:
@@ -267,8 +321,12 @@ def load_core_keys() -> set:
 #   갱신 주기를 나눈다(far 30일 / mid 7일 / near 매일).
 # ──────────────────────────────────────────────────────────────────────────
 
-def pass_calendar(tickers, cal, hist_cache, today, now_et):
-    """캘린더 갱신. 반환: (updates, appends, cal) — cal 은 갱신 반영된 dict."""
+def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None):
+    """캘린더 갱신. 반환: (updates, appends, cal) — cal 은 갱신 반영된 dict.
+
+    user_set: 보유/워치리스트 티커 집합. 여기 없으면 Tier 2(universe)로 기록해
+      스냅샷/이메일/축소 판정에서 제외된다. None 이면 전부 user(구 동작).
+    """
     updates, appends = [], []
     n_skip = n_light = n_full = n_move = 0
 
@@ -312,7 +370,10 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et):
                     print(f"  [MOVE] {tk} D-{dd} ±{move.get('median_pct')}% "
                           f"n={move.get('sample_n')} ({move.get('confidence')})")
 
-            row = ec.calendar_row(tk, ev, move, today=today, now_et=now_et, prev=prev)
+            _src = (ec.SOURCE_USER if (user_set is None or tk in user_set)
+                    else ec.SOURCE_UNIVERSE)
+            row = ec.calendar_row(tk, ev, move, today=today, now_et=now_et,
+                                  prev=prev, source=_src)
             if prev is not None:
                 updates.append((prev["_row"], row))
             else:
@@ -330,8 +391,13 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et):
 def pass_snapshot(cal, existing, hist_cache, today, now_et):
     """D-SNAPSHOT_DAYS 도달 종목의 스냅샷. **캘린더에서 읽으므로 FMP 재조회 없음.**"""
     new_rows, snapshots = [], {}
+    n_univ = 0
     for tk, row in (cal or {}).items():
         try:
+            # Tier 2(유니버스)는 일정/예상갭만 보여준다 — 스냅샷·이메일·축소 제외
+            if ec.is_universe_only(row):
+                n_univ += 1
+                continue
             ed = str(row.get("Earnings_Date") or "")
             dd = ec.days_until_from_row(row, today)
             if dd is None or dd < 0 or dd > ec.SCAN_HORIZON_DAYS:
@@ -370,6 +436,8 @@ def pass_snapshot(cal, existing, hist_cache, today, now_et):
                   f"±{move.get('median_pct')}% n={move.get('sample_n')}")
         except Exception as e:
             print(f"  [WARN] {tk} 스냅샷 실패: {e}")
+    if n_univ:
+        print(f"  [SNAP] Tier 2 유니버스 {n_univ}종목 제외(일정 전용)")
     return new_rows, snapshots
 
 
@@ -658,13 +726,24 @@ def main():
     print(f"[INFO] 기존 이벤트 {len(rows)}건 · 캘린더 {len(cal)}종목")
 
     holdings, watch, tickers, wl_stops = load_universe()
-    print(f"[INFO] 대상 티커 {len(tickers)}개 "
+    user_set = set(tickers)
+    print(f"[INFO] Tier 1 티커 {len(user_set)}개 "
           f"(보유 {len(holdings)}명 · 워치 {len(watch)}명)")
+
+    # ── Tier 2: 대형주 유니버스 (일정 지형 전용) ──
+    print("\n▶ 패스 U: 유니버스 갱신")
+    univ = pass_universe(today, now_et)
+    univ_only = sorted(set(univ) - user_set)
+    # Tier 1 을 먼저 처리한다 — 타임아웃이 나더라도 사용자 종목은 갱신되게.
+    scan_tickers = sorted(user_set) + univ_only
+    print(f"[INFO] Tier 2 유니버스 {len(univ)}종목 (Tier 1 중복 제외 {len(univ_only)})"
+          f" → 캘린더 대상 총 {len(scan_tickers)}종목")
 
     hist_cache = {}
 
     print("\n▶ 패스 0: 캘린더 갱신")
-    c_updates, c_appends, cal = pass_calendar(tickers, cal, hist_cache, today, now_et)
+    c_updates, c_appends, cal = pass_calendar(scan_tickers, cal, hist_cache,
+                                              today, now_et, user_set=user_set)
     print("\n▶ 패스 2: 사후 측정")
     v_updates, results = pass_verify(rows, hist_cache, today)
     print("\n▶ 패스 3: D+5 지연")
