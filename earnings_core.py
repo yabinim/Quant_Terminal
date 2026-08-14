@@ -34,6 +34,10 @@ import numpy as np
 import pandas as pd
 import requests
 
+# FMP HTTP 계층 SSOT. **streamlit 무의존 모듈**이므로 이 파일의 설계 불변식
+# (상단 주석 참조: streamlit 을 import 하지 않는다)을 깨지 않는다.
+import fmp_http as _fh
+
 _FMP_BASE = "https://financialmodelingprep.com/stable"
 _FMP_TIMEOUT = 7
 
@@ -127,18 +131,18 @@ def _num(x):
 
 
 def _get(path: str, key: str = "") -> list | dict | None:
-    """FMP stable GET. 실패 시 None (예외 전파 금지)."""
+    """FMP stable GET. 실패 시 None (예외 전파 금지).
+
+    2026-08-13: 맨 requests.get → fmp_http(공용 레이트리미터)로 전환.
+      이전에는 429 를 만나면 재시도 없이 None 을 돌려줬고, 호출부는 그걸
+      '데이터 없음'으로 처리했다 → **조용히 틀린 값**. 종목 수가 적어 드러나지
+      않았을 뿐이며, 유니버스(Tier 2, ~140종목)를 붙이면 반드시 터진다.
+      반환 계약(비200 → None)은 동일하다.
+    """
     k = key or _fmp_key()
     if not k:
         return None
-    sep = "&" if "?" in path else "?"
-    try:
-        r = requests.get(f"{_FMP_BASE}/{path}{sep}apikey={k}", timeout=_FMP_TIMEOUT)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
+    return _fh.fmp_get_json(path, timeout=_FMP_TIMEOUT, key=k)
 
 
 def _d(s) -> pd.Timestamp | None:
@@ -566,6 +570,41 @@ def fetch_next_earnings_light(ticker: str, today=None,
 #     D-10 이하 → 매일       (3콜 교차 확인 + 변동폭 산출)
 # ──────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────
+# Tier 구분 (2026-08-13)
+#
+# Tier 1 (user)     — 보유/워치리스트. 풀 브리핑·스냅샷·이메일·축소 판정 대상.
+# Tier 2 (universe) — 대형주 유니버스. **일정 + 예상 갭까지만.**
+#                     스냅샷·이메일·축소 판정에서 제외한다.
+#
+# Tier 2 를 브리핑 대상에 넣지 않는 이유: 관심 표명이 없는 130여 종목에 매일
+# 카드를 띄우면 발굴 피드가 되는데, 실적 방향 예측은 백테스트에서 엣지가
+# 확인되지 않았다(diag_earnings_preview_backtest). 유니버스의 용도는 "이번 주
+# 어떤 대형주가 발표하는가" 라는 이벤트 지형 파악이며, 그건 일정만 있으면 된다.
+# ──────────────────────────────────────────────────────────────────────────
+
+SOURCE_USER = "user"
+SOURCE_UNIVERSE = "universe"
+
+
+def normalize_source(v) -> str:
+    """Source 값 정규화. 미상/구 행은 SOURCE_USER 로 본다.
+
+    구 행(Source 열이 없던 시절)은 전부 보유/워치리스트 종목이었으므로
+    빈 값을 user 로 해석하는 것이 안전하다 — universe 로 오인하면 기존
+    종목의 스냅샷·이메일이 조용히 끊긴다(실패 방향이 나쁜 쪽).
+    """
+    s = str(v or "").strip().lower()
+    return SOURCE_UNIVERSE if s == SOURCE_UNIVERSE else SOURCE_USER
+
+
+def is_universe_only(row) -> bool:
+    """이 행이 Tier 2 전용인가(= 스냅샷/이메일/축소 대상에서 제외)."""
+    if isinstance(row, dict):
+        return normalize_source(row.get("Source")) == SOURCE_UNIVERSE
+    return normalize_source(row) == SOURCE_UNIVERSE
+
+
 CALENDAR_WORKSHEET = "Earnings_Calendar"
 CALENDAR_COLS = [
     "Ticker", "Earnings_Date", "Date_Source", "Timing", "Days_Until",
@@ -579,8 +618,170 @@ CALENDAR_COLS = [
     # 매일 스냅샷을 남기는 것. 2~3 실적 시즌 뒤 리비전 요인으로 쓸 수 있다.
     "Est_EPS", "Est_History_JSON", "Est_Revision_Pct",
     "Notes",
+    # ── Tier 구분 (2026-08-13 추가) ────────────────────────────────────
+    # "user"     = 보유/워치리스트 → 풀 브리핑·스냅샷·이메일·축소 판정 대상
+    # "universe" = 대형주 유니버스 → 일정+예상갭만. 스냅샷/이메일/축소 제외
+    # 둘 다면 "user" 가 이긴다(사용자 관심이 우선).
+    # ⚠️ 반드시 **맨 끝**에 둔다. Notes 앞에 끼우면 기존 행의 Notes 값이
+    #    Source 로 오독된다(마이그레이션 불필요하게 만드는 것이 목적).
+    "Source",
 ]
 CALENDAR_NCOL = len(CALENDAR_COLS)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Earnings_Universe — Tier 2 대형주 유니버스 (주 1회 전체 덮어쓰기)
+#
+# 정의: NDX100 ∪ (S&P500 중 시총 1,500억 달러 이상)
+#   FMP 에 S&P 100 전용 엔드포인트가 없다. 시총 상위 100 을 뽑아 "S&P 100"
+#   이라 부르는 것은 틀린 라벨이다 — 실제 OEX 는 위원회가 섹터 균형·옵션
+#   유동성을 보고 고른다. 그래서 순위가 아니라 **시총 하한선**을 쓴다.
+#   목적이 지수 복제가 아니라 "대형주 실적 지형" 파악이므로 하한선이 맞고,
+#   시장이 커지면 자연히 편입되어 자기 유지된다.
+#
+# append 가 아니라 **전체 덮어쓰기**다. 멤버십 스냅샷이라 이전 행을 남기면
+# 편출 종목이 영원히 유니버스에 남는다.
+# ──────────────────────────────────────────────────────────────────────────
+
+UNIVERSE_WORKSHEET = "Earnings_Universe"
+UNIVERSE_COLS = [
+    "Ticker", "Name", "Sector", "Market_Cap", "Source", "Updated_At",
+]
+UNIVERSE_NCOL = len(UNIVERSE_COLS)
+
+# S&P500 시총 하한선 (달러). 대략 90~110종목이 걸린다.
+UNIVERSE_MIN_MARKET_CAP = 150_000_000_000
+# 유니버스 재계산 주기 (요일: 0=월). 주 1회면 편입/편출 반영에 충분하다.
+UNIVERSE_REFRESH_WEEKDAY = 0
+
+# Source 값 — 캘린더의 SOURCE_* 와 다른 축이다(여긴 '어느 지수에서 왔나')
+UNIV_SRC_NDX = "NDX100"
+UNIV_SRC_SP = "SP500_LARGE"
+UNIV_SRC_BOTH = "BOTH"
+
+
+def _constituent_map(path: str, key: str = "") -> dict:
+    """지수 구성종목 → {TICKER: {name, sector, market_cap}}."""
+    out = {}
+    for it in (_get(path, key) or []):
+        if not isinstance(it, dict):
+            continue
+        tk = str(it.get("symbol") or "").strip().upper()
+        if not tk:
+            continue
+        out[tk] = {
+            "name": str(it.get("name") or it.get("companyName") or "").strip(),
+            "sector": str(it.get("sector") or "").strip(),
+            "market_cap": _num(it.get("marketCap")),
+        }
+    return out
+
+
+def fetch_market_universe(min_market_cap: float = None, key: str = "") -> dict:
+    """Tier 2 유니버스 조회. 반환: {"ndx": {...}, "sp": {...}, "ok": bool}
+
+    NDX100 은 그대로, S&P500 은 시총 하한선으로 거른다.
+    스크리너를 지수 구성종목과 **교집합**으로 쓰는 이유: 스크리너만 쓰면
+    S&P500 밖의 대형주(외국 ADR 등)까지 들어오고, 구성종목만 쓰면 시총 정보가
+    없다. 둘을 합쳐야 "S&P500 중 대형주"가 나오고 호출은 총 3콜로 끝난다.
+    """
+    cap = float(min_market_cap if min_market_cap is not None else UNIVERSE_MIN_MARKET_CAP)
+
+    ndx = _constituent_map("nasdaq-constituent", key)
+    sp_all = _constituent_map("sp500-constituent", key)
+
+    # 스크리너: 시총 하한 이상 + ETF 제외. limit 은 넉넉히.
+    screen = {}
+    for it in (_get(f"company-screener?marketCapMoreThan={int(cap)}"
+                    f"&isEtf=false&isActivelyTrading=true&limit=1000", key) or []):
+        if not isinstance(it, dict):
+            continue
+        tk = str(it.get("symbol") or "").strip().upper()
+        if not tk:
+            continue
+        screen[tk] = {
+            "name": str(it.get("companyName") or "").strip(),
+            "sector": str(it.get("sector") or "").strip(),
+            "market_cap": _num(it.get("marketCap")),
+        }
+
+    sp_large = {}
+    for tk, meta in sp_all.items():
+        s = screen.get(tk)
+        if s is None:
+            continue
+        sp_large[tk] = {
+            "name": meta.get("name") or s.get("name") or "",
+            "sector": meta.get("sector") or s.get("sector") or "",
+            "market_cap": s.get("market_cap"),
+        }
+
+    # NDX 쪽에도 시총을 붙여준다(있는 것만)
+    for tk, meta in ndx.items():
+        s = screen.get(tk)
+        if s and meta.get("market_cap") is None:
+            meta["market_cap"] = s.get("market_cap")
+            if not meta.get("sector"):
+                meta["sector"] = s.get("sector") or ""
+
+    # 셋 중 하나라도 비면 실패로 본다 — 부분 결과로 시트를 덮어쓰면
+    # 멤버십이 조용히 반토막 난다(전체 덮어쓰기라 복구가 안 됨).
+    ok = bool(ndx) and bool(sp_all) and bool(screen)
+    return {"ndx": ndx, "sp": sp_large, "ok": ok,
+            "n_screen": len(screen), "n_sp_all": len(sp_all)}
+
+
+def universe_row(ticker: str, name: str = "", sector: str = "",
+                 market_cap=None, source: str = "", now_et: str = "") -> list:
+    """Earnings_Universe 1행."""
+    row = [
+        str(ticker or "").strip().upper(),
+        str(name or "").strip(),
+        str(sector or "").strip(),
+        _blank(_num(market_cap)),
+        str(source or "").strip(),
+        str(now_et or ""),
+    ]
+    return (row + [""] * UNIVERSE_NCOL)[:UNIVERSE_NCOL]
+
+
+def parse_universe(values: list) -> list[dict]:
+    """Earnings_Universe 시트 values → dict 목록 (헤더 행 제외)."""
+    out = []
+    for r in (values or [])[1:]:
+        r = (list(r) + [""] * UNIVERSE_NCOL)[:UNIVERSE_NCOL]
+        d = dict(zip(UNIVERSE_COLS, r))
+        if str(d.get("Ticker") or "").strip():
+            out.append(d)
+    return out
+
+
+def merge_universe_sources(ndx: dict, sp: dict, now_et: str = "") -> list[list]:
+    """NDX100 dict 와 S&P500-대형주 dict 를 합쳐 시트 행 목록으로.
+
+    ndx/sp: {TICKER: {"name":..., "sector":..., "market_cap":...}}
+    반환: 시총 내림차순 행 목록 (헤더 미포함)
+    """
+    ndx = ndx or {}
+    sp = sp or {}
+    rows = []
+    for tk in sorted(set(ndx) | set(sp)):
+        a = ndx.get(tk) or {}
+        b = sp.get(tk) or {}
+        if tk in ndx and tk in sp:
+            src = UNIV_SRC_BOTH
+        elif tk in ndx:
+            src = UNIV_SRC_NDX
+        else:
+            src = UNIV_SRC_SP
+        mc = _num(b.get("market_cap")) or _num(a.get("market_cap"))
+        rows.append((mc or 0.0, universe_row(
+            tk,
+            b.get("name") or a.get("name") or "",
+            b.get("sector") or a.get("sector") or "",
+            mc, src, now_et)))
+    rows.sort(key=lambda x: -x[0])
+    return [r for _, r in rows]
 EST_HISTORY_MAX = 24          # 분기당 약 3개월치 일별 스냅샷 상한
 EST_REVISION_WINDOW = 30      # 리비전 산출 기준 일수
 
@@ -635,8 +836,13 @@ def needs_move(row: dict, days_until=None) -> bool:
 
 
 def calendar_row(ticker: str, ev: dict = None, move: dict = None,
-                 today=None, now_et: str = "", prev: dict = None) -> list:
-    """캘린더 1행 생성. ev/move 가 없으면 prev 값을 보존한다."""
+                 today=None, now_et: str = "", prev: dict = None,
+                 source: str = "") -> list:
+    """캘린더 1행 생성. ev/move 가 없으면 prev 값을 보존한다.
+
+    source: SOURCE_USER / SOURCE_UNIVERSE. 빈 문자열이면 prev 값을 보존하고,
+      그것도 없으면 SOURCE_USER 로 본다(구 행 = 전부 사용자 종목이었음).
+    """
     t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
     p = prev or {}
     e = ev or {}
@@ -674,7 +880,8 @@ def calendar_row(ticker: str, ev: dict = None, move: dict = None,
         str(e.get("timing") or (p.get("Timing", "") if not date_changed else "")),
         days, t0.strftime("%Y-%m-%d"), tier_of(days if days != "" else None),
     ] + mv + [_blank(est_cur), est_json, _blank(rev),
-              str(p.get("Notes", "") or "")]
+              str(p.get("Notes", "") or ""),
+              normalize_source(source or p.get("Source", ""))]
     return (row + [""] * CALENDAR_NCOL)[:CALENDAR_NCOL]
 
 

@@ -24,6 +24,10 @@ import pandas as pd
 import pytz
 import requests
 
+# FMP HTTP 계층 SSOT — 레이트리밋/재시도/URL 조립. streamlit 무의존 모듈.
+#   이 모듈의 모든 FMP 호출은 여기를 거친다(카운터가 프로세스당 하나여야 하므로).
+import fmp_http as _fh
+
 # streamlit 은 앱 환경에서만 존재 — 자동화(GitHub Actions)에서도 이 모듈을
 # import 할 수 있도록 선택적 임포트 + 무해한 심(shim)으로 대체한다.
 # (심: cache_data 는 no-op 데코레이터, secrets 는 빈 dict → _key 가 환경변수로 폴백)
@@ -55,20 +59,19 @@ def _key() -> str:
     return str(_os.environ.get("FMP_API_KEY", "") or "").strip()
 
 
+# st.secrets 우선 키 제공자를 fmp_http 에 설치한다(자동화에서는 _key 가 환경변수로 폴백).
+_fh.set_key_provider(_key)
+
+
 def _get_json(path: str):
-    """공통 GET → JSON. 실패 시 None. (path 예: 'profile?symbol=AAPL')"""
-    k = _key()
-    if not k:
-        return None
-    sep = "&" if "?" in path else "?"
-    url = f"{_FMP_BASE}/{path}{sep}apikey={k}"
-    try:
-        r = requests.get(url, timeout=_FMP_TIMEOUT)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
+    """공통 GET → JSON. 실패 시 None. (path 예: 'profile?symbol=AAPL')
+
+    2026-08-13: 맨 requests.get → fmp_http.fmp_get_json 으로 전환.
+      이전에는 이 경로만 레이트리밋/재시도를 건너뛰어, 429 를 만나면 재시도 없이
+      None 을 돌려줬다. 호출부는 그걸 '데이터 없음'으로 처리하므로 **조용히 틀린
+      값**이 나왔다. 반환 계약(비200 → None)은 동일하다.
+    """
+    return _fh.fmp_get_json(path)
 
 
 def _f(v, default=np.nan) -> float:
@@ -886,121 +889,26 @@ def filter_rotation_universe(pairs: list) -> tuple[list, list]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# FMP 레이트 리미터 (SSOT) — Starter 플랜 300 calls/min 대응
+# FMP 레이트 리미터 — 구현은 fmp_http.py(SSOT)로 이관
 #
 # 배경: 주간 3버킷 스캐너가 61초에 약 950콜을 쏴서 한도를 3배 초과했고,
 #       그 직후 실행된 Hidden Alpha 는 324티커 전부 조회에 실패해 종료됐다.
 #       확산주도 76종목 중 73종목이 가격 데이터를 못 받아 결과가 오염됐다.
 #
-# scanner_core / run_hidden_alpha / 그 밖의 FMP 소비자는 **반드시** fmp_get() 을 쓴다.
-# 프로세스별 슬라이딩 윈도우이므로, 워크플로에서 스텝 사이 쿨다운도 함께 둘 것.
+# 2026-08-13 이관 이유: earnings_core 도 같은 리미터를 써야 하는데, 그 모듈은
+#   "streamlit 을 import 하지 않는다"를 설계 불변식으로 갖는다(파일 상단 명시).
+#   fmp_extras 는 streamlit 심(shim)을 갖고 있어 import 자체는 되지만, 불변식을
+#   지키고 **카운터를 프로세스당 하나로** 유지하기 위해 무의존 모듈로 분리했다.
+#   카운터를 모듈별로 두면 합산 호출량이 한도의 2~3배가 된다.
+#
+# 아래는 기존 호출부(scanner_core / run_hidden_alpha / run_scanner_scan / app.py)
+# 호환을 위한 재노출이다. 구현은 fmp_http 단일 정의.
 # ══════════════════════════════════════════════════════════════════════════
-import random as _random
-import threading as _threading
-from collections import deque as _deque
+FMP_RATE_LIMIT_PER_MIN = _fh.FMP_RATE_LIMIT_PER_MIN
+FMP_MAX_RETRIES        = _fh.FMP_MAX_RETRIES
 
-# 한도의 약 83% 로 보수적 설정. 워크플로에서 환경변수로 조절 가능.
-# SSOT 버전 스탬프 — app.py 가 import 직후 대조한다.
-# 배포 누락/재부팅 누락 시 AttributeError 대신 명확한 안내를 띄우기 위함.
-SSOT_VERSION = "2026-08-12a"
-
-FMP_RATE_LIMIT_PER_MIN = max(30, int(_os.environ.get("FMP_RATE_LIMIT_PER_MIN", "200") or 200))
-# 429/402 를 만났을 때 재시도 횟수. 재시도가 없으면 한 번 밀린 호출이 그대로 유실되어
-# 해당 티커가 dropna 로 탈락한다(대기주 15종목 중 13종목 유실 사고의 원인).
-FMP_MAX_RETRIES = max(0, int(_os.environ.get("FMP_MAX_RETRIES", "3") or 3))
-_FMP_WINDOW_SEC = 60.0
-
-_fmp_rate_lock = _threading.Lock()
-_fmp_call_times = _deque()
-_fmp_stats = {"ok": 0, "rate_limited": 0, "http_error": 0, "exception": 0,
-              "throttle_waits": 0, "throttle_sec": 0.0,
-              "retries": 0, "recovered": 0, "gave_up": 0}
-
-
-def fmp_rate_limit_acquire() -> float:
-    """슬라이딩 윈도우 토큰 확보. 한도 초과 시 여유가 생길 때까지 대기.
-
-    Returns: 실제 대기한 초(0.0 이면 즉시 통과).
-    """
-    waited = 0.0
-    while True:
-        with _fmp_rate_lock:
-            now = _time.time()
-            while _fmp_call_times and (now - _fmp_call_times[0]) >= _FMP_WINDOW_SEC:
-                _fmp_call_times.popleft()
-            if len(_fmp_call_times) < FMP_RATE_LIMIT_PER_MIN:
-                _fmp_call_times.append(now)
-                if waited > 0:
-                    _fmp_stats["throttle_waits"] += 1
-                    _fmp_stats["throttle_sec"] += waited
-                return waited
-            sleep_for = _FMP_WINDOW_SEC - (now - _fmp_call_times[0]) + 0.01
-        sleep_for = min(max(sleep_for, 0.01), 5.0)
-        _time.sleep(sleep_for)
-        waited += sleep_for
-
-
-def fmp_get(url: str, timeout: float = None, retries: int = None):
-    """레이트 리밋 + 429 백오프 재시도를 적용한 GET.
-
-    429(레이트리밋)·402(쿼터)·5xx 는 지수 백오프로 재시도한다. 4xx(잘못된 심볼 등)는
-    재시도해도 소용없으므로 즉시 포기한다.
-
-    Returns: requests.Response | None
-    """
-    n = FMP_MAX_RETRIES if retries is None else max(0, int(retries))
-    last_kind = None
-    for attempt in range(n + 1):
-        fmp_rate_limit_acquire()
-        try:
-            r = requests.get(url, timeout=(timeout or _FMP_TIMEOUT))
-        except Exception:
-            last_kind = "exception"
-            r = None
-        else:
-            if r.status_code == 200:
-                with _fmp_rate_lock:
-                    _fmp_stats["ok"] += 1
-                    if attempt > 0:
-                        _fmp_stats["recovered"] += 1
-                return r
-            if r.status_code in (429, 402):
-                last_kind = "rate_limited"
-            elif r.status_code >= 500:
-                last_kind = "http_error"
-            else:
-                with _fmp_rate_lock:
-                    _fmp_stats["http_error"] += 1
-                return None  # 4xx 는 재시도 무의미
-
-        if attempt < n:
-            with _fmp_rate_lock:
-                _fmp_stats["retries"] += 1
-            # 지수 백오프 + 지터 (스레드가 동시에 몰려 재차 429 나는 것 방지)
-            _time.sleep(min(2.0 * (2 ** attempt), 12.0) + _random.uniform(0, 1.5))
-
-    with _fmp_rate_lock:
-        _fmp_stats[last_kind or "exception"] += 1
-        _fmp_stats["gave_up"] += 1
-    return None
-
-
-def fmp_stats() -> dict:
-    with _fmp_rate_lock:
-        return dict(_fmp_stats)
-
-
-def fmp_reset_stats() -> None:
-    with _fmp_rate_lock:
-        for k in _fmp_stats:
-            _fmp_stats[k] = 0 if k != "throttle_sec" else 0.0
-
-
-def fmp_stats_line() -> str:
-    s = fmp_stats()
-    total = s["ok"] + s["rate_limited"] + s["http_error"] + s["exception"]
-    return (f"FMP {total}콜 — 성공 {s['ok']}(재시도 회복 {s['recovered']}) · "
-            f"레이트리밋 {s['rate_limited']} · HTTP오류 {s['http_error']} · "
-            f"예외 {s['exception']} · 최종포기 {s['gave_up']} · "
-            f"재시도 {s['retries']}회 · 스로틀 {s['throttle_sec']:.0f}초 "
-            f"(한도 {FMP_RATE_LIMIT_PER_MIN}/분, 재시도 {FMP_MAX_RETRIES}회)")
+fmp_rate_limit_acquire = _fh.fmp_rate_limit_acquire
+fmp_get                = _fh.fmp_get
+fmp_stats              = _fh.fmp_stats
+fmp_reset_stats        = _fh.fmp_reset_stats
+fmp_stats_line         = _fh.fmp_stats_line
