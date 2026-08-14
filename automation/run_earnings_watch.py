@@ -175,6 +175,65 @@ def _safe_update(ws, values: list, first_row: int, ncol: int):
              value_input_option="USER_ENTERED", _label="safe_update")
 
 
+def _merge_runs(updates) -> list:
+    """[(row_i, vals)] → [(first_row, [vals...])] 로 **연속 행 병합**.
+
+    행 번호를 정렬해 인접 구간을 하나의 range 로 합친다. 전 종목 갱신
+    (FORCE_CALENDAR)처럼 행이 촘촘하면 169개가 1~2구간으로 줄어든다.
+    """
+    out = []
+    for row_i, vals in sorted(updates, key=lambda x: int(x[0])):
+        row_i = int(row_i)
+        if out and out[-1][0] + len(out[-1][1]) == row_i:
+            out[-1][1].append(vals)
+        else:
+            out.append((row_i, [vals]))
+    return [(r, v) for r, v in out]
+
+
+def _batch_update(ws, updates, ncol: int, label: str = "batch") -> int:
+    """행 단위 갱신 목록을 **최소 API 호출**로 기록. 반환: 실제 API 호출 수.
+
+    2026-08-14 도입 — 429 다발의 근본 원인 해결.
+      이전에는 행마다 ws.update() 를 불렀다. FORCE_CALENDAR 로 169행을 갱신하니
+      쓰기 API 169콜이 되었고, Google Sheets 한도는 **분당 60회**라 구조적으로
+      초과였다. gs_retry 의 4회 백오프로도 3건이 최종 실패했고, 쓰기가 실패하면
+      Last_Checked 도 안 써져 해당 행이 far 티어 30일 주기에 다시 갇힌다.
+
+      1) 연속 행을 하나의 range 로 병합 (_merge_runs)
+      2) 남은 비연속 range 들을 batch_update 로 **단일 호출**에 전송
+
+    batch_update 가 실패하면 구간별 개별 기록으로 폴백한다 — gspread 버전에
+    따라 시그니처 차이가 있을 수 있고, 부분 기록이라도 남기는 편이 낫다.
+    """
+    runs = _merge_runs(updates)
+    if not runs:
+        return 0
+    last = _col_a1(ncol)
+    body = [{"range": f"A{r}:{last}{r + len(v) - 1}", "values": v} for r, v in runs]
+
+    # 메서드 부재는 네트워크 문제가 아니다 — 호출하면 gs_retry 가 '상태를 못 읽는
+    # 예외'로 보고 4회 백오프(약 25초)를 낭비한다. 먼저 존재 여부만 확인한다.
+    if not hasattr(ws, "batch_update"):
+        print("  [WARN] batch_update 미지원 gspread — 구간별 기록으로 폴백")
+    else:
+        try:
+            gsr.call(ws.batch_update, body, value_input_option="USER_ENTERED",
+                     _label=f"{label}.batch({len(body)}구간)")
+            return 1
+        except Exception as e:
+            print(f"  [WARN] batch_update 실패({e}) — 구간별 기록으로 폴백")
+
+    n = 0
+    for r, v in runs:
+        try:
+            _safe_update(ws, v, r, ncol)
+            n += 1
+        except Exception as e:
+            print(f"[ERROR] 행 {r}~{r + len(v) - 1} 갱신 실패: {e}")
+    return n
+
+
 # ── FMP ───────────────────────────────────────────────────────────────────
 def fmp_price_history(ticker: str, limit: int = _HIST_LIMIT) -> pd.DataFrame:
     try:
@@ -417,7 +476,10 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
         except Exception as e:
             print(f"  [WARN] {tk} 캘린더 갱신 실패: {e}")
 
-    print(f"[CAL] 생략 {n_skip} · 경량 {n_light}콜 · 정밀 {n_full}×3콜 · 변동폭 {n_move}")
+    # 정밀 조회는 earnings?symbol= + quote?symbol= 2콜이다.
+    # (2026-08-13 이전에는 earnings-calendar 를 포함해 3콜이었으나, 그 엔드포인트가
+    #  시장 전체용이라 제거했다 — 로그 문구도 함께 정정)
+    print(f"[CAL] 생략 {n_skip} · 경량 {n_light}콜 · 정밀 {n_full}×2콜 · 변동폭 {n_move}")
     return updates, appends, cal
 
 
@@ -789,11 +851,10 @@ def main():
     new_rows, snapshots = pass_snapshot(cal, existing, hist_cache, today, now_et)
 
     # ── 캘린더 기록: 갱신 먼저, 추가는 마지막 ──
-    for row_i, vals in c_updates:
-        try:
-            _safe_update(cws, [vals], row_i, ec.CALENDAR_NCOL)
-        except Exception as e:
-            print(f"[ERROR] 캘린더 행 {row_i} 갱신 실패: {e}")
+    if c_updates:
+        _n_api = _batch_update(cws, c_updates, ec.CALENDAR_NCOL, label="calendar")
+        print(f"[OK] 캘린더 {len(c_updates)}행 갱신 "
+              f"({len(_merge_runs(c_updates))}구간 · API {_n_api}콜)")
     if c_appends:
         try:
             _safe_update(cws, c_appends, _cal_next_row, ec.CALENDAR_NCOL)
@@ -803,6 +864,7 @@ def main():
 
     # ── 시트 기록: 갱신 먼저, 추가는 마지막 (부분 실패 시 재시도 가능) ──
     idx = {c: i for i, c in enumerate(ec.EVENTS_COLS)}
+    _ev_updates = []
     for row_i, patch in (v_updates + d_updates):
         try:
             cur = next((r for r in rows if r["_row"] == row_i), None)
@@ -811,9 +873,12 @@ def main():
             vals = [cur.get(c, "") for c in ec.EVENTS_COLS]
             for c, v in patch.items():
                 vals[idx[c]] = v
-            _safe_update(ews, [vals], row_i, ec.EVENTS_NCOL)
+            _ev_updates.append((row_i, vals))
         except Exception as e:
-            print(f"[ERROR] 행 {row_i} 갱신 실패: {e}")
+            print(f"[ERROR] 행 {row_i} 조립 실패: {e}")
+    if _ev_updates:
+        _n_api = _batch_update(ews, _ev_updates, ec.EVENTS_NCOL, label="events")
+        print(f"[OK] 이벤트 {len(_ev_updates)}행 갱신 (API {_n_api}콜)")
     if new_rows:
         try:
             _safe_update(ews, new_rows, len(rows) + 2, ec.EVENTS_NCOL)
