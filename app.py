@@ -99,7 +99,8 @@ _SSOT_NEEDS = (
      ("CALENDAR_COLS", "CALENDAR_NCOL", "parse_calendar", "move_from_row",
       "days_until_from_row", "evaluate_trim", "evaluate_entry_gate",
       "UNIVERSE_WORKSHEET", "UNIVERSE_COLS", "parse_universe",
-      "is_universe_only", "normalize_source"),
+      "is_universe_only", "normalize_source",
+      "TIMING_LABELS_INFERRED", "infer_timing", "fetch_market_calendar_map"),
      lambda m: "Source" in m.CALENDAR_COLS,
      "Earnings_Calendar 스키마 v2(Source 열 = Tier 구분) 반영"),
 )
@@ -25479,7 +25480,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                         st.markdown(f"### {_r['티커']}")
                         st.caption(f"{_a.get('earnings_date', '')} "
                                    f"({ec.DATE_SOURCE_LABELS.get(_a.get('date_source'), '')})<br>"
-                                   f"{ec.TIMING_LABELS.get(_a.get('timing'), '')} · D-{_r['D']} · "
+                                   f"{ec.TIMING_LABELS_INFERRED.get(_a.get('timing'), '')} · D-{_r['D']} · "
                                    f"{_r['계좌']}", unsafe_allow_html=True)
                     with _c2:
                         if _t["code"] in ("trim", "trim_hard"):
@@ -25625,7 +25626,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                             "티커": (f"⭐ {_tk_u}" if _is_mine else _tk_u),
                             "회사": (str(_meta.get("Name") or "")[:24] or "-"),
                             "실적일": str(_crow_u.get("Earnings_Date") or "-"),
-                            "시점": ec.TIMING_LABELS.get(_t_u, "미상"),
+                            "시점": ec.TIMING_LABELS_INFERRED.get(_t_u, "미상"),
                             "예상 갭": (f"±{_mv_u.get('median_pct', 0):.1f}%"
                                        if _mv_u.get("ok") else "-"),
                             "섹터": (str(_meta.get("Sector") or "")[:18] or "-"),
@@ -25645,6 +25646,9 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                         f"{len(_land)}종목 · ⭐ = 내 보유/워치리스트 {_n_mine}종목  \n"
                         "**판정이 아니라 일정입니다.** 여기 뜬다고 매수/매도 신호가 아니며, "
                         "위 섹션들의 차단·축소 판정은 내 종목에만 적용됩니다.  \n"
+                        "**시점은 추정입니다.** FMP 가 발표 시각(장전/장후)을 제공하지 않아 "
+                        "과거 8분기 거래량이 발표일 당일에 터졌는지 다음날 터졌는지로 "
+                        "역산합니다. 표본이 부족하거나 우세하지 않으면 '미상'으로 둡니다.  \n"
                         f"유니버스는 시총 1,500억 달러 이상 미국 상장 대형주(ADR 포함) "
                         f"{len(_univ)}종목이며, 매주 월요일 갱신됩니다."
                     )

@@ -99,6 +99,15 @@ TIMING_LABELS = {
     "":    "시각 미상",
 }
 
+# FMP stable 은 발표 시각을 제공하지 않는다(2026-08-14 실측). 캘린더에 들어오는
+# timing 은 **전부 과거 거래량 패턴에서 역산한 추정치**이므로, 확정 사실처럼
+# 표시하면 과신을 부른다. 화면에는 이 라벨을 쓴다.
+TIMING_LABELS_INFERRED = {
+    "bmo": "장 시작 전(추정)",
+    "amc": "장 마감 후(추정)",
+    "":    "시각 미상",
+}
+
 DATE_SOURCE_LABELS = {
     "confirmed": "확정",
     "estimated": "추정",
@@ -428,6 +437,71 @@ def measure_reaction(hist: pd.DataFrame, event_date, timing: str = "") -> dict:
             if med > 0:
                 out["volume_ratio"] = round(v / med, 2)
 
+    out["ok"] = True
+    return out
+
+
+TIMING_INFER_MIN_VOTES = 3       # 최소 표본 (분기)
+TIMING_INFER_MIN_RATIO = 0.7     # 다수결 우세 비율 — 미달이면 판정 보류
+TIMING_INFER_MIN_VOL_EDGE = 1.2  # 두 세션 거래량 비. 이 미만이면 그 분기는 기권
+
+
+def infer_timing(hist: pd.DataFrame, events: list,
+                 quarters: int = GAP_QUARTERS) -> dict:
+    """과거 실적 반응 위치로 BMO/AMC 추론. 반환: {timing, votes, n, ratio, ok}
+
+    FMP stable 은 발표 시각(BMO/AMC)을 **어떤 엔드포인트로도 제공하지 않는다**
+    (2026-08-14 실측: earnings-calendar 1,834행 전부 time 필드 없음,
+     quote.earningsAnnouncement 도 미제공). 문서 전체에도 해당 필드가 없다.
+
+    대신 과거 반응에서 역산한다. 발표 다음 세션에 거래량이 터지므로:
+      · 발표일(D) 당일에 터졌다 → 장 시작 전 발표(BMO)
+      · 다음 거래일(D+1)에 터졌다 → 장 마감 후 발표(AMC)
+    기업은 발표 시각을 거의 바꾸지 않으므로 8분기 다수결이면 충분하다.
+
+    **새로운 가정을 도입하지 않는다** — resolve_reaction_index 가 timing 미상일 때
+    이미 쓰는 것과 동일한 신호(거래량 집중)를 반대 방향으로 읽을 뿐이다.
+
+    기권 규칙 (틀린 timing 은 미상보다 나쁘다 — 반응일이 하루 밀린다):
+      · 두 세션 거래량 차이가 TIMING_INFER_MIN_VOL_EDGE 미만이면 그 분기는 무효표
+      · 유효표가 TIMING_INFER_MIN_VOTES 미만이면 판정 보류
+      · 우세 비율이 TIMING_INFER_MIN_RATIO 미만이면 판정 보류(시각을 바꾼 기업)
+    """
+    out = {"timing": "", "votes": {"bmo": 0, "amc": 0}, "n": 0,
+           "ratio": None, "ok": False}
+    if hist is None or hist.empty or "Volume" not in hist.columns:
+        return out
+    idx = hist.index
+    seen = 0
+    for ev in (events or []):
+        if seen >= int(quarters):
+            break
+        d = _d(ev.get("date"))
+        if d is None:
+            continue
+        pos = int(idx.searchsorted(d, side="left"))
+        if pos <= 0 or pos + 1 >= len(idx):
+            continue
+        seen += 1
+        va = _num(hist["Volume"].iloc[pos]) or 0.0
+        vb = _num(hist["Volume"].iloc[pos + 1]) or 0.0
+        if va <= 0 or vb <= 0:
+            continue
+        hi_, lo_ = (va, vb) if va >= vb else (vb, va)
+        if lo_ <= 0 or (hi_ / lo_) < TIMING_INFER_MIN_VOL_EDGE:
+            continue                      # 차이가 미미 → 기권
+        out["votes"]["bmo" if va > vb else "amc"] += 1
+
+    n = out["votes"]["bmo"] + out["votes"]["amc"]
+    out["n"] = n
+    if n < TIMING_INFER_MIN_VOTES:
+        return out
+    top = "bmo" if out["votes"]["bmo"] >= out["votes"]["amc"] else "amc"
+    ratio = out["votes"][top] / float(n)
+    out["ratio"] = round(ratio, 3)
+    if ratio < TIMING_INFER_MIN_RATIO:
+        return out                        # 우세하지 않음 → 보류
+    out["timing"] = top
     out["ok"] = True
     return out
 
