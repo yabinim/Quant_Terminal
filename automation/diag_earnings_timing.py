@@ -221,6 +221,18 @@ chk("ec.infer_timing(hist, past)" in _rw, "move 계산 자리에서 추론(콜 0
 chk('not str(ev.get("timing") or "")' in _rw, "FMP 가 준 timing 이 있으면 덮어쓰지 않음")
 chk("추론 {n_infer}" in _rw, "[CAL] 로그에 추론 건수")
 
+print("\n[15] 게이트 회귀 — force 가 needs_move 도 우회하는가")
+_rw2 = open("run_earnings_watch.py", encoding="utf-8").read()
+_blk = _rw2[_rw2.index("            move = None"):_rw2.index("            _src = (ec.SOURCE_USER")]
+chk("(force or ec.needs_move(" in _blk,
+    "블록 진입 조건이 force 를 포함 (변동폭 캐시가 추론을 막지 않음)")
+chk("_do_move = force or ec.needs_move(" in _blk, "변동폭 재계산은 별도 판정")
+chk(_blk.index("infer_timing") > _blk.index("past = ec.past_earnings_dates"),
+    "추론이 past 로드 이후에 위치")
+chk("if move is not None:" in _blk, "[MOVE] 로그가 None 가드 뒤에 있음")
+chk("_need_timing" not in _rw2,
+    "매 실행 재시도 루프를 만드는 별도 조건이 없음 (분기 내 재추론 무의미)")
+
 fh.fmp_get_ex = _orig
 print("\n" + "=" * 52)
 print(f"❌ 실패 {len(fail)}건" if fail else "✅ 전부 통과")

@@ -458,16 +458,27 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
             if ev:
                 row_for_move["Earnings_Date"] = ev["earnings_date"]
 
+            # ⚠️ force 는 needs_move 도 우회해야 한다.
+            #   FORCE_CALENDAR 는 "캐시 무시 전면 재조회"인데 변동폭 캐시만 남겨두면
+            #   이 블록이 통째로 건너뛰어진다. 2026-08-14 실측에서 `변동폭 0 → 추론 0`
+            #   이 나온 원인이 이것이다(7종목이 이미 Move_For_Date 를 갖고 있었다).
+            #
+            #   timing 추론을 별도 조건으로 빼지 않는 이유: 추론이 보류되면 timing 이
+            #   계속 비어 있어 **매 실행마다 hist·past 를 다시 부르는 루프**가 된다.
+            #   과거 실적 반응은 분기 내내 변하지 않으므로 재시도는 무의미하다.
+            #   needs_move 는 분기가 바뀔 때 True 가 되므로 추론 시점으로 정확하다.
             move = None
-            if ev is not None and ec.needs_move(row_for_move, days_until=dd):
+            if ev is not None and (force or ec.needs_move(row_for_move, days_until=dd)):
                 hist = hist_cache.get(tk)
                 if hist is None:
                     hist = hist_cache[tk] = fmp_price_history(tk)
                 if hist is not None and not hist.empty:
                     past = ec.past_earnings_dates(tk, today=today, key=FMP_API_KEY)
-                    move = ec.expected_move(ec.gap_history(hist, past),
-                                            atr_pct=ec.atr_pct_of(hist))
-                    n_move += 1
+                    _do_move = force or ec.needs_move(row_for_move, days_until=dd)
+                    if _do_move:
+                        move = ec.expected_move(ec.gap_history(hist, past),
+                                                atr_pct=ec.atr_pct_of(hist))
+                        n_move += 1
                     # BMO/AMC 추론 — FMP stable 이 발표 시각을 안 주므로 과거
                     # 거래량 패턴에서 역산한다. hist·past 가 이미 여기 있어 콜 0.
                     if ev is not None and not str(ev.get("timing") or ""):
@@ -478,8 +489,9 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
                             print(f"  [TIME] {tk} → {_inf['timing']} "
                                   f"({_inf['votes']['bmo']}b/{_inf['votes']['amc']}a "
                                   f"n={_inf['n']} {_inf['ratio']:.0%})")
-                    print(f"  [MOVE] {tk} D-{dd} ±{move.get('median_pct')}% "
-                          f"n={move.get('sample_n')} ({move.get('confidence')})")
+                    if move is not None:
+                        print(f"  [MOVE] {tk} D-{dd} ±{move.get('median_pct')}% "
+                              f"n={move.get('sample_n')} ({move.get('confidence')})")
 
             _src = (ec.SOURCE_USER if (user_set is None or tk in user_set)
                     else ec.SOURCE_UNIVERSE)
