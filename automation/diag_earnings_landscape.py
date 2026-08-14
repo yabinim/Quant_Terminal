@@ -103,8 +103,11 @@ print("\n[4] 필드")
 by = {re.sub(r"^⭐ ", "", r["티커"]): r for r in land}
 chk(by["NVDA"]["회사"] == "NVIDIA Corporation", f"회사명 조인 = {by['NVDA']['회사']}")
 chk(by["NVDA"]["섹터"] == "Technology", f"섹터 조인 = {by['NVDA']['섹터']}")
-chk(by["WMT"]["시점"] == "장 시작 전", f"bmo 라벨 = {by['WMT']['시점']}")
-chk(by["NVDA"]["시점"] == "장 마감 후", f"amc 라벨 = {by['NVDA']['시점']}")
+# FMP stable 이 발표 시각을 안 주므로 timing 은 전부 추론값이다 →
+# 확정 사실처럼 보이는 라벨을 쓰면 안 된다(2026-08-14).
+chk(by["WMT"]["시점"] == "장 시작 전(추정)", f"bmo 라벨 = {by['WMT']['시점']}")
+chk(by["NVDA"]["시점"] == "장 마감 후(추정)", f"amc 라벨 = {by['NVDA']['시점']}")
+chk("(추정)" in by["WMT"]["시점"], "추정임이 라벨에 드러남")
 chk(by["NVDA"]["예상 갭"] == "±6.5%", f"예상 갭 = {by['NVDA']['예상 갭']}")
 chk(by["AAPL"]["회사"] == "-", "유니버스에 없는 내 종목 → 회사명 '-' (예외 아님)")
 

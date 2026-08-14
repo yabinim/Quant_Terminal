@@ -147,6 +147,80 @@ chk("fetch_market_calendar_map" in src, "main 에서 맵 1회 조회")
 chk("market_map=market_map" in src, "pass_calendar 로 전달")
 chk("맵적중" in src and "timing확보" in src, "[CAL] 로그에 커버리지 지표")
 
+print("\n[10] BMO/AMC 추론 — 과거 거래량 패턴 역산")
+
+
+def mk_hist(dates, vols):
+    return pd.DataFrame({"Close": [100.0] * len(dates), "Volume": vols},
+                        index=pd.DatetimeIndex(dates))
+
+
+# 거래일 40개 (주말 무시 — 인덱스 위치만 쓴다)
+_days = pd.bdate_range("2026-01-05", periods=40)
+_ev_dates = [_days[10], _days[20], _days[30]]
+
+
+def _vols(spike_offset):
+    """실적일 + offset 세션에 거래량 5배."""
+    v = [1_000_000] * len(_days)
+    for d in _ev_dates:
+        i = list(_days).index(d) + spike_offset
+        v[i] = 5_000_000
+    return v
+
+
+_events = [{"date": d.strftime("%Y-%m-%d")} for d in reversed(_ev_dates)]
+
+r_bmo = ec.infer_timing(mk_hist(_days, _vols(0)), _events)
+chk(r_bmo["timing"] == "bmo" and r_bmo["ok"],
+    f"발표일 당일 급증 → {r_bmo['timing']} (표 {r_bmo['votes']})")
+
+r_amc = ec.infer_timing(mk_hist(_days, _vols(1)), _events)
+chk(r_amc["timing"] == "amc" and r_amc["ok"],
+    f"다음날 급증 → {r_amc['timing']} (표 {r_amc['votes']})")
+
+print("\n[11] 기권 규칙 — 틀린 timing 은 미상보다 나쁘다")
+_flat = mk_hist(_days, [1_000_000] * len(_days))
+r_flat = ec.infer_timing(_flat, _events)
+chk(r_flat["timing"] == "" and not r_flat["ok"],
+    f"거래량 차이 없음 → 판정 보류 (유효표 {r_flat['n']})")
+
+r_few = ec.infer_timing(mk_hist(_days, _vols(0)), _events[:2])
+chk(r_few["timing"] == "" and r_few["n"] == 2,
+    f"표본 2분기(<{ec.TIMING_INFER_MIN_VOTES}) → 보류")
+
+# 3:2 로 갈리면 우세 비율 60% < 70% → 보류
+_mixed_days = pd.bdate_range("2026-01-05", periods=70)
+_mev = [_mixed_days[i] for i in (10, 20, 30, 40, 50)]
+_mv = [1_000_000] * len(_mixed_days)
+for i, d in enumerate(_mev):
+    _mv[list(_mixed_days).index(d) + (0 if i < 3 else 1)] = 5_000_000
+r_mix = ec.infer_timing(mk_hist(_mixed_days, _mv),
+                        [{"date": d.strftime("%Y-%m-%d")} for d in reversed(_mev)])
+chk(r_mix["timing"] == "" and r_mix["ratio"] == 0.6,
+    f"3:2 분열(60% < 70%) → 보류 (표 {r_mix['votes']}, 비율 {r_mix['ratio']})")
+
+print("\n[12] 빈 입력 안전")
+chk(ec.infer_timing(None, _events)["timing"] == "", "hist None")
+chk(ec.infer_timing(mk_hist(_days, _vols(0)), [])["timing"] == "", "events 없음")
+chk(ec.infer_timing(pd.DataFrame({"Close": []}), _events)["timing"] == "",
+    "Volume 열 없음")
+
+print("\n[13] 추정 라벨 — 확정 사실로 표시하지 않는다")
+chk(ec.TIMING_LABELS_INFERRED["bmo"].endswith("(추정)"), ec.TIMING_LABELS_INFERRED["bmo"])
+chk(ec.TIMING_LABELS_INFERRED["amc"].endswith("(추정)"), ec.TIMING_LABELS_INFERRED["amc"])
+chk(ec.TIMING_LABELS_INFERRED[""] == "시각 미상", "미상은 그대로")
+_app = open("app.py", encoding="utf-8").read()
+chk("TIMING_LABELS_INFERRED" in _app and "ec.TIMING_LABELS.get" not in _app,
+    "app.py 가 추정 라벨만 사용")
+chk("시점은 추정입니다" in _app, "지형표 캡션에 근거 명시")
+
+print("\n[14] 자동화 추론 배선")
+_rw = open("run_earnings_watch.py", encoding="utf-8").read()
+chk("ec.infer_timing(hist, past)" in _rw, "move 계산 자리에서 추론(콜 0)")
+chk('not str(ev.get("timing") or "")' in _rw, "FMP 가 준 timing 이 있으면 덮어쓰지 않음")
+chk("추론 {n_infer}" in _rw, "[CAL] 로그에 추론 건수")
+
 fh.fmp_get_ex = _orig
 print("\n" + "=" * 52)
 print(f"❌ 실패 {len(fail)}건" if fail else "✅ 전부 통과")

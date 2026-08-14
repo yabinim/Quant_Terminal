@@ -422,7 +422,7 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
     """
     updates, appends = [], []
     n_skip = n_light = n_full = n_move = n_map = 0
-    n_timing = 0
+    n_timing = n_infer = 0
 
     for tk in tickers:
         try:
@@ -468,6 +468,16 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
                     move = ec.expected_move(ec.gap_history(hist, past),
                                             atr_pct=ec.atr_pct_of(hist))
                     n_move += 1
+                    # BMO/AMC 추론 — FMP stable 이 발표 시각을 안 주므로 과거
+                    # 거래량 패턴에서 역산한다. hist·past 가 이미 여기 있어 콜 0.
+                    if ev is not None and not str(ev.get("timing") or ""):
+                        _inf = ec.infer_timing(hist, past)
+                        if _inf.get("ok"):
+                            ev["timing"] = _inf["timing"]
+                            n_infer += 1
+                            print(f"  [TIME] {tk} → {_inf['timing']} "
+                                  f"({_inf['votes']['bmo']}b/{_inf['votes']['amc']}a "
+                                  f"n={_inf['n']} {_inf['ratio']:.0%})")
                     print(f"  [MOVE] {tk} D-{dd} ±{move.get('median_pct')}% "
                           f"n={move.get('sample_n')} ({move.get('confidence')})")
 
@@ -490,7 +500,8 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
     # (2026-08-13 이전에는 earnings-calendar 를 포함해 3콜이었으나, 그 엔드포인트가
     #  시장 전체용이라 제거했다 — 로그 문구도 함께 정정)
     print(f"[CAL] 생략 {n_skip} · 맵적중 {n_map}(0콜) · 경량 {n_light}콜 · "
-          f"정밀 {n_full}×2콜 · 변동폭 {n_move} · timing확보 {n_timing}")
+          f"정밀 {n_full}×2콜 · 변동폭 {n_move} · "
+          f"timing확보 {n_timing}(추론 {n_infer})")
     return updates, appends, cal
 
 
