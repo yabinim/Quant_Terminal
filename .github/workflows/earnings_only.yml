@@ -24,6 +24,10 @@ on:
         description: "유니버스 강제 재계산 (갱신일=월요일이 아니어도 FMP 재조회)"
         type: boolean
         default: false
+      force_calendar:
+        description: "캘린더 전 종목 강제 재조회 (티어 주기 무시 — 조회 로직 수정 후 1회)"
+        type: boolean
+        default: false
 
 jobs:
   earnings-only:
@@ -52,5 +56,6 @@ jobs:
           GMAIL_TO:           ${{ inputs.dry_run && '' || secrets.GMAIL_TO }}
           GSPREAD_KEY:        ${{ secrets.GSPREAD_KEY }}
           FORCE_UNIVERSE:     ${{ inputs.force_universe && '1' || '' }}
+          FORCE_CALENDAR:     ${{ inputs.force_calendar && '1' || '' }}
         run: |
           python automation/run_earnings_watch.py
