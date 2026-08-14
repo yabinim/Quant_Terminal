@@ -632,12 +632,18 @@ CALENDAR_NCOL = len(CALENDAR_COLS)
 # ──────────────────────────────────────────────────────────────────────────
 # Earnings_Universe — Tier 2 대형주 유니버스 (주 1회 전체 덮어쓰기)
 #
-# 정의: NDX100 ∪ (S&P500 중 시총 1,500억 달러 이상)
-#   FMP 에 S&P 100 전용 엔드포인트가 없다. 시총 상위 100 을 뽑아 "S&P 100"
-#   이라 부르는 것은 틀린 라벨이다 — 실제 OEX 는 위원회가 섹터 균형·옵션
-#   유동성을 보고 고른다. 그래서 순위가 아니라 **시총 하한선**을 쓴다.
-#   목적이 지수 복제가 아니라 "대형주 실적 지형" 파악이므로 하한선이 맞고,
-#   시장이 커지면 자연히 편입되어 자기 유지된다.
+# 정의: QQQ 보유종목(≈나스닥 100) ∪ SPY 보유종목 비중 상위 N(≈S&P500 시총 상위 N)
+#
+#   왜 지수 구성종목 엔드포인트를 안 쓰나 (2026-08-13 실측):
+#     · FMP stable 에 nasdaq-constituent 가 **없다**. historical- 만 존재하며
+#       그건 현재 명단이 아니라 편입/편출 이력이다.
+#     · sp500-constituent 는 경로가 맞는데도 이 계정에서 빈 응답이었다.
+#     · /etf/holdings 는 app.py 의 ETF 유니버스·Hidden Alpha 중복도에서 이미
+#       프로덕션으로 돌고 있어 **동작이 확인된** 유일한 멤버십 경로다.
+#   SPY 비중은 시총 가중이므로 '비중 상위 N' ≈ '시총 상위 N' 이다.
+#
+#   "S&P 100" 이라는 라벨은 쓰지 않는다 — 실제 OEX 는 위원회가 섹터 균형·옵션
+#   유동성을 보고 고르는 별개 지수다.
 #
 # append 가 아니라 **전체 덮어쓰기**다. 멤버십 스냅샷이라 이전 행을 남기면
 # 편출 종목이 영원히 유니버스에 남는다.
@@ -649,8 +655,24 @@ UNIVERSE_COLS = [
 ]
 UNIVERSE_NCOL = len(UNIVERSE_COLS)
 
-# S&P500 시총 하한선 (달러). 대략 90~110종목이 걸린다.
+# ETF 보유종목에 섞여 오는 비주식 항목. 티커 형태(3~5자 알파벳)라 문자 규칙으로는
+# 걸러지지 않아 명시 차단이 필요하다 — QQQ 응답에서 USD 가 실제로 통과했다.
+UNIVERSE_EXCLUDE_TICKERS = {
+    "USD", "CASH", "USDOLLAR", "XTSLA", "MCASH", "FGXXX", "GOVXX",
+    "N/A", "NA", "OTHER", "NONE", "TBILL", "MMF",
+}
+
+# SPY 보유종목 비중 상위 N (= S&P 500 시총 상위 N 근사).
+UNIVERSE_SPY_TOP_N = 100
+
+# 스크리너 시총 하한 — **유니버스 정의가 아니라 보강용**이다.
+# SPY 100위권 시총이 대략 900억 달러대이지만, QQQ 하위권은 그보다 낮다.
+# 유니버스 전원의 Market_Cap/섹터가 채워지도록 넉넉히 아래까지 훑는다.
+UNIVERSE_SCREENER_MIN_CAP = 25_000_000_000
+
+# ETF 두 경로가 모두 실패했을 때만 쓰는 폴백 유니버스의 시총 하한.
 UNIVERSE_MIN_MARKET_CAP = 150_000_000_000
+
 # 유니버스 재계산 주기 (요일: 0=월). 주 1회면 편입/편출 반영에 충분하다.
 UNIVERSE_REFRESH_WEEKDAY = 0
 
@@ -660,75 +682,118 @@ UNIV_SRC_SP = "SP500_LARGE"
 UNIV_SRC_BOTH = "BOTH"
 
 
-def _constituent_map(path: str, key: str = "") -> dict:
-    """지수 구성종목 → {TICKER: {name, sector, market_cap}}."""
+def _etf_membership(etf: str, key: str = "", top_n: int = 0) -> tuple:
+    """ETF 보유종목 → ([(TICKER, weight_pct, name)], status, kind)
+
+    지수 구성종목 엔드포인트 대신 ETF 보유종목을 쓰는 이유:
+      FMP stable 에 nasdaq-constituent 가 **없고**(historical- 만 존재),
+      sp500-constituent 는 이 계정에서 빈 응답이었다(2026-08-13 로그).
+      반면 /etf/holdings 는 app.py 의 ETF 유니버스·Hidden Alpha 중복도에서
+      이미 프로덕션으로 돌고 있어 동작이 확인된 경로다.
+      QQQ ≈ 나스닥 100, SPY ≈ S&P 500(비중 = 시총 가중이므로 비중 상위 N
+      ≈ 시총 상위 N).
+
+    top_n: 0 이면 전량. 비중 내림차순 정렬 후 상위 N.
+    """
+    data, status, kind = _fh.fmp_get_json_ex(
+        f"etf/holdings?symbol={str(etf or '').strip().upper()}",
+        timeout=15, key=key)
+    if not isinstance(data, list):
+        return [], status, kind
+    rows = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        tk = str(it.get("asset") or it.get("symbol") or "").strip().upper()
+        # 현금·채권·복수클래스 티커 제외 (BRK.B 등은 실적 조회가 안 된다)
+        if not tk or "." in tk or len(tk) > 5 or not tk.isalpha():
+            continue
+        if tk in UNIVERSE_EXCLUDE_TICKERS:
+            continue
+        w = _num(it.get("weightPercentage"))
+        if w is None:
+            w = _num(it.get("weight"))
+        if w is None:
+            w = _num(it.get("pctVal"))
+        if w is not None and 0 < w <= 1:
+            w *= 100.0                      # 비율(0~1) → %
+        rows.append((tk, float(w or 0.0), str(it.get("name") or "").strip()))
+    rows.sort(key=lambda x: -x[1])
+    # 같은 티커가 여러 번 나오는 경우 첫(최대 비중) 것만
+    seen, uniq = set(), []
+    for r in rows:
+        if r[0] in seen:
+            continue
+        seen.add(r[0])
+        uniq.append(r)
+    return (uniq[:top_n] if top_n else uniq), status, kind
+
+
+def _screener_map(min_cap: float, key: str = "") -> tuple:
+    """시총 하한 이상 종목 → ({TICKER: {name, sector, market_cap}}, status, kind)."""
+    data, status, kind = _fh.fmp_get_json_ex(
+        f"company-screener?marketCapMoreThan={int(min_cap)}"
+        f"&isEtf=false&isActivelyTrading=true"
+        f"&exchange=NASDAQ,NYSE&limit=2000", timeout=20, key=key)
     out = {}
-    for it in (_get(path, key) or []):
+    if not isinstance(data, list):
+        return out, status, kind
+    for it in data:
         if not isinstance(it, dict):
             continue
         tk = str(it.get("symbol") or "").strip().upper()
-        if not tk:
+        if not tk or "." in tk:
             continue
         out[tk] = {
-            "name": str(it.get("name") or it.get("companyName") or "").strip(),
-            "sector": str(it.get("sector") or "").strip(),
-            "market_cap": _num(it.get("marketCap")),
-        }
-    return out
-
-
-def fetch_market_universe(min_market_cap: float = None, key: str = "") -> dict:
-    """Tier 2 유니버스 조회. 반환: {"ndx": {...}, "sp": {...}, "ok": bool}
-
-    NDX100 은 그대로, S&P500 은 시총 하한선으로 거른다.
-    스크리너를 지수 구성종목과 **교집합**으로 쓰는 이유: 스크리너만 쓰면
-    S&P500 밖의 대형주(외국 ADR 등)까지 들어오고, 구성종목만 쓰면 시총 정보가
-    없다. 둘을 합쳐야 "S&P500 중 대형주"가 나오고 호출은 총 3콜로 끝난다.
-    """
-    cap = float(min_market_cap if min_market_cap is not None else UNIVERSE_MIN_MARKET_CAP)
-
-    ndx = _constituent_map("nasdaq-constituent", key)
-    sp_all = _constituent_map("sp500-constituent", key)
-
-    # 스크리너: 시총 하한 이상 + ETF 제외. limit 은 넉넉히.
-    screen = {}
-    for it in (_get(f"company-screener?marketCapMoreThan={int(cap)}"
-                    f"&isEtf=false&isActivelyTrading=true&limit=1000", key) or []):
-        if not isinstance(it, dict):
-            continue
-        tk = str(it.get("symbol") or "").strip().upper()
-        if not tk:
-            continue
-        screen[tk] = {
             "name": str(it.get("companyName") or "").strip(),
             "sector": str(it.get("sector") or "").strip(),
             "market_cap": _num(it.get("marketCap")),
         }
+    return out, status, kind
 
-    sp_large = {}
-    for tk, meta in sp_all.items():
-        s = screen.get(tk)
-        if s is None:
-            continue
-        sp_large[tk] = {
-            "name": meta.get("name") or s.get("name") or "",
-            "sector": meta.get("sector") or s.get("sector") or "",
-            "market_cap": s.get("market_cap"),
-        }
 
-    # NDX 쪽에도 시총을 붙여준다(있는 것만)
-    for tk, meta in ndx.items():
-        s = screen.get(tk)
-        if s and meta.get("market_cap") is None:
-            meta["market_cap"] = s.get("market_cap")
-            if not meta.get("sector"):
-                meta["sector"] = s.get("sector") or ""
+def fetch_market_universe(key: str = "", spy_top_n: int = None) -> dict:
+    """Tier 2 유니버스 조회 (K-3: ETF 멤버십 + 스크리너 보강).
 
-    # 셋 중 하나라도 비면 실패로 본다 — 부분 결과로 시트를 덮어쓰면
-    # 멤버십이 조용히 반토막 난다(전체 덮어쓰기라 복구가 안 됨).
-    ok = bool(ndx) and bool(sp_all) and bool(screen)
-    return {"ndx": ndx, "sp": sp_large, "ok": ok,
-            "n_screen": len(screen), "n_sp_all": len(sp_all)}
+    구성:
+      · QQQ 보유종목 전량        → 나스닥 100
+      · SPY 보유종목 비중 상위 N → S&P 500 대형주
+      · 스크리너는 **항상 호출**한다 — 폴백이 아니라 Market_Cap/섹터 보강용.
+        ETF 두 개가 모두 실패하면 그때 유니버스 소스로 승격된다.
+
+    반환: {"ndx": {...}, "sp": {...}, "ok": bool, "diag": str, "source": str}
+    """
+    n = int(spy_top_n if spy_top_n is not None else UNIVERSE_SPY_TOP_N)
+
+    qqq, q_st, q_kind = _etf_membership("QQQ", key)
+    spy, s_st, s_kind = _etf_membership("SPY", key, top_n=n)
+    screen, c_st, c_kind = _screener_map(UNIVERSE_SCREENER_MIN_CAP, key)
+
+    diag = (f"QQQ {len(qqq)}종목(HTTP {q_st}/{q_kind}) · "
+            f"SPY상위{n} {len(spy)}종목(HTTP {s_st}/{s_kind}) · "
+            f"스크리너 {len(screen)}종목(HTTP {c_st}/{c_kind})")
+
+    def _meta(tk, name=""):
+        s = screen.get(tk) or {}
+        return {"name": s.get("name") or name or "",
+                "sector": s.get("sector") or "",
+                "market_cap": s.get("market_cap")}
+
+    ndx = {tk: _meta(tk, nm) for tk, _w, nm in qqq}
+    sp = {tk: _meta(tk, nm) for tk, _w, nm in spy}
+
+    if ndx or sp:
+        return {"ndx": ndx, "sp": sp, "ok": True, "diag": diag, "source": "etf"}
+
+    # ETF 두 경로 모두 실패 → 스크리너를 유니버스로 승격(시총 하한 상향 적용)
+    fallback = {tk: m for tk, m in screen.items()
+                if (m.get("market_cap") or 0) >= UNIVERSE_MIN_MARKET_CAP}
+    if fallback:
+        return {"ndx": {}, "sp": fallback, "ok": True,
+                "diag": diag + " → ETF 실패, 스크리너 폴백",
+                "source": "screener"}
+
+    return {"ndx": {}, "sp": {}, "ok": False, "diag": diag, "source": "none"}
 
 
 def universe_row(ticker: str, name: str = "", sector: str = "",

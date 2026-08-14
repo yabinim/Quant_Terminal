@@ -127,16 +127,20 @@ def fmp_rate_limit_acquire() -> float:
 # ══════════════════════════════════════════════════════════════════════════
 # GET
 # ══════════════════════════════════════════════════════════════════════════
-def fmp_get(url: str, timeout: float = None, retries: int = None):
-    """레이트 리밋 + 429 백오프 재시도를 적용한 GET.
+def fmp_get_ex(url: str, timeout: float = None, retries: int = None):
+    """fmp_get 과 동일하되 진단 정보를 함께 준다.
 
-    429(레이트리밋)·402(쿼터)·5xx 는 지수 백오프로 재시도한다. 4xx(잘못된 심볼 등)는
-    재시도해도 소용없으므로 즉시 포기한다.
+    Returns: (Response | None, status, kind)
+      status: 마지막으로 관측한 HTTP 코드 (네트워크 예외/미시도면 None)
+      kind  : "ok" | "rate_limited" | "http_error" | "exception"
 
-    Returns: requests.Response | None
+    존재하는 이유: 실패를 None 하나로 뭉개면 **404(경로 오류)와 403(플랜 제한)과
+    빈 200 응답을 구분할 수 없다.** 실제로 nasdaq-constituent 가 없는 경로였는데
+    로그만 보고는 원인을 알 수 없었다(2026-08-13).
     """
     n = FMP_MAX_RETRIES if retries is None else max(0, int(retries))
     last_kind = None
+    last_status = None
     for attempt in range(n + 1):
         fmp_rate_limit_acquire()
         try:
@@ -145,12 +149,13 @@ def fmp_get(url: str, timeout: float = None, retries: int = None):
             last_kind = "exception"
             r = None
         else:
+            last_status = r.status_code
             if r.status_code == 200:
                 with _fmp_rate_lock:
                     _fmp_stats["ok"] += 1
                     if attempt > 0:
                         _fmp_stats["recovered"] += 1
-                return r
+                return r, r.status_code, "ok"
             if r.status_code in (429, 402):
                 last_kind = "rate_limited"
             elif r.status_code >= 500:
@@ -158,7 +163,7 @@ def fmp_get(url: str, timeout: float = None, retries: int = None):
             else:
                 with _fmp_rate_lock:
                     _fmp_stats["http_error"] += 1
-                return None  # 4xx 는 재시도 무의미
+                return None, r.status_code, "http_error"  # 4xx 는 재시도 무의미
 
         if attempt < n:
             with _fmp_rate_lock:
@@ -169,7 +174,19 @@ def fmp_get(url: str, timeout: float = None, retries: int = None):
     with _fmp_rate_lock:
         _fmp_stats[last_kind or "exception"] += 1
         _fmp_stats["gave_up"] += 1
-    return None
+    return None, last_status, (last_kind or "exception")
+
+
+def fmp_get(url: str, timeout: float = None, retries: int = None):
+    """레이트 리밋 + 429 백오프 재시도를 적용한 GET.
+
+    429(레이트리밋)·402(쿼터)·5xx 는 지수 백오프로 재시도한다. 4xx(잘못된 심볼 등)는
+    재시도해도 소용없으므로 즉시 포기한다.
+
+    Returns: requests.Response | None
+    """
+    r, _st, _k = fmp_get_ex(url, timeout=timeout, retries=retries)
+    return r
 
 
 def fmp_url(path: str, key: str = "") -> str:
@@ -183,6 +200,28 @@ def fmp_url(path: str, key: str = "") -> str:
     return f"{FMP_BASE}/{p}{sep}apikey={k}"
 
 
+def fmp_get_json_ex(path: str, timeout: float = None, retries: int = None,
+                    key: str = "") -> tuple:
+    """fmp_get_json + 진단. Returns: (data | None, status, kind)
+
+    kind: "ok" | "no_key" | "rate_limited" | "http_error" | "exception" | "bad_json"
+      status 200 인데 data 가 빈 리스트면 kind="ok", data=[] 이다 —
+      **경로 오류(404)와 빈 응답을 구분할 수 있어야 한다.**
+    """
+    k = str(key or "").strip() or fmp_key()
+    if not k:
+        return None, None, "no_key"
+    r, status, kind = fmp_get_ex(fmp_url(path, k), timeout=timeout, retries=retries)
+    if r is None:
+        return None, status, kind
+    try:
+        return r.json(), status, "ok"
+    except Exception:
+        with _fmp_rate_lock:
+            _fmp_stats["exception"] += 1
+        return None, status, "bad_json"
+
+
 def fmp_get_json(path: str, timeout: float = None, retries: int = None,
                  key: str = "") -> Any:
     """공통 GET → JSON. 실패 시 None. (path 예: 'profile?symbol=AAPL')
@@ -194,18 +233,8 @@ def fmp_get_json(path: str, timeout: float = None, retries: int = None,
       (app.py 는 st.secrets 키를 earnings_core._get 에 직접 넘긴다 — 이 경로가
        살아 있어야 앱에서 실적 조회가 동작한다.)
     """
-    k = str(key or "").strip() or fmp_key()
-    if not k:
-        return None
-    r = fmp_get(fmp_url(path, k), timeout=timeout, retries=retries)
-    if r is None:
-        return None
-    try:
-        return r.json()
-    except Exception:
-        with _fmp_rate_lock:
-            _fmp_stats["exception"] += 1
-        return None
+    data, _st, _k = fmp_get_json_ex(path, timeout=timeout, retries=retries, key=key)
+    return data
 
 
 # ══════════════════════════════════════════════════════════════════════════
