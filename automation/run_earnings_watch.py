@@ -414,14 +414,15 @@ def load_core_keys() -> set:
 # ──────────────────────────────────────────────────────────────────────────
 
 def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
-                  force: bool = False):
+                  force: bool = False, market_map=None):
     """캘린더 갱신. 반환: (updates, appends, cal) — cal 은 갱신 반영된 dict.
 
     user_set: 보유/워치리스트 티커 집합. 여기 없으면 Tier 2(universe)로 기록해
       스냅샷/이메일/축소 판정에서 제외된다. None 이면 전부 user(구 동작).
     """
     updates, appends = [], []
-    n_skip = n_light = n_full = n_move = 0
+    n_skip = n_light = n_full = n_move = n_map = 0
+    n_timing = 0
 
     for tk in tickers:
         try:
@@ -434,15 +435,22 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
             tier = ec.tier_of(dd_prev)
 
             # near 만 3콜 교차 확인 — 그 밖은 확정일이 어차피 안 나온다
+            _in_map = tk in (market_map or {})
             if tier == ec.TIER_NEAR:
-                ev = ec.fetch_next_earnings(tk, today=today, key=FMP_API_KEY)
+                ev = ec.fetch_next_earnings(tk, today=today, key=FMP_API_KEY,
+                                            market_map=market_map)
                 n_full += 1
             else:
-                ev = ec.fetch_next_earnings_light(tk, today=today, key=FMP_API_KEY)
-                n_light += 1
-                # 경량 조회 결과가 D-10 안이면 즉시 3콜로 승격
+                ev = ec.fetch_next_earnings_light(tk, today=today, key=FMP_API_KEY,
+                                                  market_map=market_map)
+                if _in_map:
+                    n_map += 1          # 맵에서 바로 해결 — FMP 콜 0
+                else:
+                    n_light += 1
+                # 경량 조회 결과가 D-10 안이면 즉시 정밀(2콜)로 승격
                 if ev and ev["days_until"] <= ec.SCAN_HORIZON_DAYS:
-                    ev = ec.fetch_next_earnings(tk, today=today, key=FMP_API_KEY) or ev
+                    ev = ec.fetch_next_earnings(tk, today=today, key=FMP_API_KEY,
+                                                market_map=market_map) or ev
                     n_full += 1
 
             dd = ev["days_until"] if ev else None
@@ -465,6 +473,8 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
 
             _src = (ec.SOURCE_USER if (user_set is None or tk in user_set)
                     else ec.SOURCE_UNIVERSE)
+            if ev and str(ev.get("timing") or ""):
+                n_timing += 1
             row = ec.calendar_row(tk, ev, move, today=today, now_et=now_et,
                                   prev=prev, source=_src)
             if prev is not None:
@@ -479,7 +489,8 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
     # 정밀 조회는 earnings?symbol= + quote?symbol= 2콜이다.
     # (2026-08-13 이전에는 earnings-calendar 를 포함해 3콜이었으나, 그 엔드포인트가
     #  시장 전체용이라 제거했다 — 로그 문구도 함께 정정)
-    print(f"[CAL] 생략 {n_skip} · 경량 {n_light}콜 · 정밀 {n_full}×2콜 · 변동폭 {n_move}")
+    print(f"[CAL] 생략 {n_skip} · 맵적중 {n_map}(0콜) · 경량 {n_light}콜 · "
+          f"정밀 {n_full}×2콜 · 변동폭 {n_move} · timing확보 {n_timing}")
     return updates, appends, cal
 
 
@@ -837,12 +848,19 @@ def main():
 
     hist_cache = {}
 
+    # ── 시장 전체 캘린더 1회 조회 ──
+    #   timing(bmo/amc) 의 주 공급원. per-symbol earnings?symbol= 에는 time 필드가
+    #   없고 quote.earningsAnnouncement 도 stable 에서 오지 않는 것으로 보인다.
+    market_map, _mc_diag = ec.fetch_market_calendar_map(today=today, key=FMP_API_KEY)
+    print(f"[TIME] {_mc_diag}")
+
     print("\n▶ 패스 0: 캘린더 갱신")
     if FORCE_CALENDAR:
         print("[CAL] 강제 재조회(FORCE_CALENDAR) — 티어 주기 무시")
     c_updates, c_appends, cal = pass_calendar(scan_tickers, cal, hist_cache,
                                               today, now_et, user_set=user_set,
-                                              force=FORCE_CALENDAR)
+                                              force=FORCE_CALENDAR,
+                                              market_map=market_map)
     print("\n▶ 패스 2: 사후 측정")
     v_updates, results = pass_verify(rows, hist_cache, today)
     print("\n▶ 패스 3: D+5 지연")
