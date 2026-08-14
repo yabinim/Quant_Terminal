@@ -1,0 +1,55 @@
+name: 🔬 진단 — 실적 프리뷰 필드 스키마 (수동 전용)
+
+# 언제 쓰나:
+#   실적 레이더 2단계(프리뷰 브리핑) 구현 **전에** 딱 한 번.
+#   A/B/C 블록이 의존하는 FMP 필드가 이 플랜에서 실제로 오는지 확인한다.
+#   특히 매출 컨센서스 키는 코드베이스에서 한 번도 읽어본 적이 없다.
+#
+# 안전성:
+#   · 시트 접근 없음 — 읽지도 쓰지도 않는다
+#   · 이메일 없음
+#   · 알림 상태 머신을 건드리지 않는다 (run_watchlist_alerts 를 부르지 않음)
+#   → 몇 번을 돌려도 부작용이 없다. FMP 콜만 소모한다.
+#
+# 비용: 종목당 6콜. 기본 3종목 = 18콜.
+#
+# ⚠️ repository_dispatch 트리거를 넣지 않는다 — Cloud Scheduler 가 자동 호출하면
+#    안 그래도 일회성인 프로브가 매일 콜을 태운다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "쉼표 구분 티커 (비우면 AAPL,NVDA,WMT)"
+        type: string
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # fmp_http 만 있으면 된다. pandas/gspread 불필요.
+      - name: 📦 의존성
+        run: pip install requests
+
+      # fmp_http.py 는 repo 루트에 있다. 반드시 루트에서 실행할 것.
+      - name: 🔬 필드 스키마 프로브
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          TICKERS:     ${{ inputs.tickers }}
+        run: python automation/diag_earnings_preview_fields.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_earnings_preview_fields.py
