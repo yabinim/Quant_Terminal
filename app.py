@@ -95,6 +95,13 @@ _SSOT_NEEDS = (
      ("compute_satellite_top10", "compute_sector_signals", "overlap_grade",
       "filter_rotation_universe", "SECTOR_THEME_ETFS"),
      None, ""),
+    ("earnings_core", ec,
+     ("CALENDAR_COLS", "CALENDAR_NCOL", "parse_calendar", "move_from_row",
+      "days_until_from_row", "evaluate_trim", "evaluate_entry_gate",
+      "UNIVERSE_WORKSHEET", "UNIVERSE_COLS", "parse_universe",
+      "is_universe_only", "normalize_source"),
+     lambda m: "Source" in m.CALENDAR_COLS,
+     "Earnings_Calendar 스키마 v2(Source 열 = Tier 구분) 반영"),
 )
 
 _ssot_bad = []
@@ -1459,6 +1466,27 @@ def load_earnings_calendar() -> dict:
         return {}
     try:
         return ec.parse_calendar(ws.get_all_values() or [])
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_earnings_universe() -> dict:
+    """{TICKER: 유니버스행} (10분 캐시). Tier 2 대형주 메타(회사명/섹터/시총).
+
+    ⚠️ **읽기 전용이다.** 캘린더/이벤트 시트와 달리 없으면 만들지 않는다 —
+       이 시트는 5PM 자동화가 주 1회 **전체 덮어쓰기**로 관리하는 멤버십
+       스냅샷이라, 앱이 빈 헤더를 만들어두면 자동화가 첫 갱신을 하기 전까지
+       '유니버스 0종목'을 정상 상태로 오인하게 된다.
+       시트가 없으면 빈 dict → 지형표가 안내 문구로 대체된다.
+    """
+    try:
+        _w = _ws_handle(ec.UNIVERSE_WORKSHEET)
+        if _w is None:
+            return {}
+        rows = ec.parse_universe(_w.get_all_values() or [])
+        return {str(r.get("Ticker") or "").strip().upper(): r
+                for r in rows if str(r.get("Ticker") or "").strip()}
     except Exception:
         return {}
 
@@ -25557,6 +25585,69 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
             "방향 예측 생성은 2차 도입 예정입니다 — 1차는 게이트·축소·관찰만 동작하며, "
             "이 표는 채점 체계가 준비돼 있음을 보여줍니다."
         )
+
+        # ── 섹션 6: 시장 이벤트 지형 (Tier 2 유니버스) ──
+        #   목적은 **방향 예측이 아니라 이벤트 지형 파악**이다. 이번 주 어떤
+        #   대형주가 발표하는지 알면 섹터 변동성을 예상할 수 있다.
+        #   기본 접힘 — 이 탭의 1순위는 "내가 지금 뭘 해야 하나"이고, 200줄짜리
+        #   시장 표가 조치 요약을 스크롤 아래로 밀어내면 안 된다.
+        st.divider()
+        with st.expander(f"🗺️ 시장 이벤트 지형 — 대형주 실적 D-{ec.SCAN_HORIZON_DAYS} 이내",
+                         expanded=False):
+            _univ = load_earnings_universe()
+            if not _univ:
+                st.info(
+                    "⏳ **유니버스 준비 중** — 대형주 목록이 아직 없습니다.  \n"
+                    "매주 월요일 5PM ET 자동화가 `Earnings_Universe` 시트를 채웁니다."
+                )
+            else:
+                _mine = {str(t).strip().upper() for t in _all_tk}
+                _land = []
+                for _tk_u, _crow_u in (_cal or {}).items():
+                    try:
+                        _tk_u = str(_tk_u).strip().upper()
+                        if not _tk_u:
+                            continue
+                        # 유니버스 종목 또는 **현재** 내 종목만. 이 조건이
+                        # 과거에 보유/워치에서 빠진 캘린더 고아 행을 걸러낸다.
+                        _in_univ = _tk_u in _univ
+                        _is_mine = _tk_u in _mine
+                        if not (_in_univ or _is_mine):
+                            continue
+                        _dd_u = ec.days_until_from_row(_crow_u, _e_today)
+                        if _dd_u is None or _dd_u < 0 or _dd_u > ec.SCAN_HORIZON_DAYS:
+                            continue
+                        _meta = _univ.get(_tk_u) or {}
+                        _mv_u = ec.move_from_row(_crow_u)
+                        _t_u = str(_crow_u.get("Timing") or "")
+                        _land.append({
+                            "D": _dd_u,
+                            "티커": (f"⭐ {_tk_u}" if _is_mine else _tk_u),
+                            "회사": (str(_meta.get("Name") or "")[:24] or "-"),
+                            "실적일": str(_crow_u.get("Earnings_Date") or "-"),
+                            "시점": ec.TIMING_LABELS.get(_t_u, "미상"),
+                            "예상 갭": (f"±{_mv_u.get('median_pct', 0):.1f}%"
+                                       if _mv_u.get("ok") else "-"),
+                            "섹터": (str(_meta.get("Sector") or "")[:18] or "-"),
+                        })
+                    except Exception:
+                        continue
+
+                if not _land:
+                    st.caption(f"D-{ec.SCAN_HORIZON_DAYS} 이내 실적 예정인 대형주가 없습니다.")
+                else:
+                    _land.sort(key=lambda x: (x["D"], x["티커"]))
+                    _df_land = pd.DataFrame(_land)
+                    _df_land["D"] = _df_land["D"].map(lambda d: f"D-{d}")
+                    st.dataframe(_df_land, use_container_width=True, hide_index=True)
+                    _n_mine = sum(1 for r in _land if r["티커"].startswith("⭐"))
+                    st.caption(
+                        f"{len(_land)}종목 · ⭐ = 내 보유/워치리스트 {_n_mine}종목  \n"
+                        "**판정이 아니라 일정입니다.** 여기 뜬다고 매수/매도 신호가 아니며, "
+                        "위 섹션들의 차단·축소 판정은 내 종목에만 적용됩니다.  \n"
+                        f"유니버스는 시총 1,500억 달러 이상 미국 상장 대형주(ADR 포함) "
+                        f"{len(_univ)}종목이며, 매주 월요일 갱신됩니다."
+                    )
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
