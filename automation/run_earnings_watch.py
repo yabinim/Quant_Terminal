@@ -43,6 +43,7 @@ from google.oauth2.service_account import Credentials
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import accounts_core as ac    # noqa: E402
 import earnings_core as ec    # noqa: E402
+import gs_retry as gsr  # noqa: E402  — Sheets 재시도 SSOT(503 등 일시 장애 방어)
 import users_core as uc       # noqa: E402
 
 # ── 환경변수 ──────────────────────────────────────────────────────────────
@@ -97,7 +98,8 @@ _SH = None
 def _sheet():
     global _SH
     if _SH is None:
-        _SH = get_gspread_client().open(_SPREADSHEET_TITLE)
+        _SH = gsr.call(get_gspread_client().open, _SPREADSHEET_TITLE,
+                       _label="open(Quant_DB)")
     return _SH
 
 
@@ -110,24 +112,28 @@ def _ws(title: str, cols: list = None):
     """
     sh = _sheet()
     try:
-        w = sh.worksheet(title)
+        w = gsr.call(sh.worksheet, title, _label=f"worksheet({title})")
         if cols:
             try:
                 if int(getattr(w, "col_count", 0) or 0) < len(cols):
-                    w.add_cols(len(cols) - int(w.col_count))
+                    gsr.call(w.add_cols, len(cols) - int(w.col_count),
+                             _label=f"add_cols({title})")
                     print(f"[MIGRATE] '{title}' 열 확장 → {len(cols)}열")
                     _end = gspread.utils.rowcol_to_a1(1, len(cols))
-                    w.update([cols], range_name=f"A1:{_end}",
-                             value_input_option="USER_ENTERED")
+                    gsr.call(w.update, [cols], range_name=f"A1:{_end}",
+                             value_input_option="USER_ENTERED",
+                             _label=f"header({title})")
             except Exception as e:
                 print(f"[WARN] '{title}' 열 확장 실패: {e}")
         return w
     except Exception:
         if not cols:
             raise
-        w = sh.add_worksheet(title=title, rows=2000, cols=max(len(cols), 26))
-        w.update([cols], range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(cols))}",
-                  value_input_option="USER_ENTERED")
+        w = gsr.call(sh.add_worksheet, title=title, rows=2000,
+                     cols=max(len(cols), 26), _label=f"add_worksheet({title})")
+        gsr.call(w.update, [cols],
+                 range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(cols))}",
+                 value_input_option="USER_ENTERED", _label=f"header({title})")
         print(f"[INIT] '{title}' 시트 생성")
         return w
 
@@ -154,8 +160,9 @@ def _safe_update(ws, values: list, first_row: int, ncol: int):
     if not values:
         return
     last = _col_a1(ncol)
-    ws.update(values, range_name=f"A{first_row}:{last}{first_row + len(values) - 1}",
-              value_input_option="USER_ENTERED")
+    gsr.call(ws.update, values,
+             range_name=f"A{first_row}:{last}{first_row + len(values) - 1}",
+             value_input_option="USER_ENTERED", _label="safe_update")
 
 
 # ── FMP ───────────────────────────────────────────────────────────────────
@@ -197,7 +204,7 @@ def load_universe():
     holdings, watch, tickers, wl_stops = {}, {}, set(), {}
 
     try:
-        vals = _ws(_PF_WORKSHEET).get_all_values() or []
+        vals = gsr.call(_ws(_PF_WORKSHEET).get_all_values, _label="Portfolios") or []
         for r in vals[1:]:
             r = (list(r) + [""] * 8)[:8]
             uid, acct, tk = str(r[0]).strip(), str(r[1]).strip(), str(r[2]).strip().upper()
@@ -216,7 +223,8 @@ def load_universe():
         print(f"[WARN] Portfolios 로드 실패: {e}")
 
     try:
-        vals = _ws(_WATCHLIST_WORKSHEET).get_all_values() or []
+        vals = gsr.call(_ws(_WATCHLIST_WORKSHEET).get_all_values,
+                        _label="Watchlist") or []
         for r in vals[1:]:
             r = (list(r) + [""] * 13)[:13]
             uid, tk = str(r[0]).strip(), str(r[1]).strip().upper()
@@ -240,7 +248,8 @@ def _universe_ws():
 def load_market_universe() -> dict:
     """Earnings_Universe 시트 → {TICKER: dict}. 없거나 실패 시 빈 dict."""
     try:
-        rows = ec.parse_universe(_universe_ws().get_all_values() or [])
+        rows = ec.parse_universe(
+            gsr.call(_universe_ws().get_all_values, _label="Earnings_Universe") or [])
         return {str(r.get("Ticker") or "").strip().upper(): r for r in rows
                 if str(r.get("Ticker") or "").strip()}
     except Exception as e:
@@ -276,10 +285,10 @@ def pass_universe(today, now_et, force: bool = False) -> dict:
 
     try:
         ws = _universe_ws()
-        ws.clear()
-        ws.update([ec.UNIVERSE_COLS] + rows,
-                  range_name=f"A1:{_col_a1(ec.UNIVERSE_NCOL)}{len(rows) + 1}",
-                  value_input_option="USER_ENTERED")
+        gsr.call(ws.clear, _label="Earnings_Universe.clear")
+        gsr.call(ws.update, [ec.UNIVERSE_COLS] + rows,
+                 range_name=f"A1:{_col_a1(ec.UNIVERSE_NCOL)}{len(rows) + 1}",
+                 value_input_option="USER_ENTERED", _label="Earnings_Universe.write")
         _n_cap = sum(1 for r in rows if str(r[3] or "").strip())
         _by_src = {}
         for r in rows:
@@ -297,7 +306,8 @@ def pass_universe(today, now_et, force: bool = False) -> dict:
 def load_profiles(uid: str, cache: dict):
     if "_vals" not in cache:
         try:
-            cache["_vals"] = _ws(_PROFILE_WORKSHEET).get_all_values() or []
+            cache["_vals"] = gsr.call(_ws(_PROFILE_WORKSHEET).get_all_values,
+                                      _label="Account_Profile") or []
         except Exception:
             cache["_vals"] = []
     if uid not in cache:
@@ -313,7 +323,7 @@ def load_core_keys() -> set:
     """
     keys = set()
     try:
-        vals = _ws(_THESIS_WORKSHEET).get_all_values() or []
+        vals = gsr.call(_ws(_THESIS_WORKSHEET).get_all_values, _label="Thesis") or []
         for r in vals[1:]:
             r = (list(r) + [""] * 7)[:7]
             if str(r[4]).strip().lower() != _CORE_CATEGORY:
@@ -730,10 +740,10 @@ def main():
     now_et = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
 
     ews = _events_ws()
-    rows = ec.parse_events(ews.get_all_values() or [])
+    rows = ec.parse_events(gsr.call(ews.get_all_values, _label="Earnings_Events") or [])
     existing = {str(r.get("Event_ID") or ""): r for r in rows}
     cws = _calendar_ws()
-    _cal_vals = cws.get_all_values() or []
+    _cal_vals = gsr.call(cws.get_all_values, _label="Earnings_Calendar") or []
     cal = ec.parse_calendar(_cal_vals)
     _cal_next_row = max(len(_cal_vals), 1) + 1   # 헤더 포함 마지막 행 다음
     print(f"[INFO] 기존 이벤트 {len(rows)}건 · 캘린더 {len(cal)}종목")
@@ -830,6 +840,7 @@ def main():
     print(f"완료 — 캘린더 {len(c_updates)}갱신/{len(c_appends)}신규 · "
           f"스냅샷 {len(new_rows)} · 측정 {len(v_updates)} · "
           f"D+5 {len(d_updates)} · 메일 {sent}통")
+    print(gsr.stats_line())
     print("=" * 60)
 
 
