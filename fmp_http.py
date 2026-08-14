@@ -66,7 +66,8 @@ _FMP_WINDOW_SEC = 60.0
 
 _fmp_rate_lock = _threading.Lock()
 _fmp_call_times: _deque = _deque()
-_fmp_stats = {"ok": 0, "rate_limited": 0, "http_error": 0, "exception": 0,
+_fmp_stats = {"ok": 0, "rate_limited": 0, "plan_limited": 0,
+              "http_error": 0, "exception": 0,
               "throttle_waits": 0, "throttle_sec": 0.0,
               "retries": 0, "recovered": 0, "gave_up": 0}
 
@@ -132,7 +133,7 @@ def fmp_get_ex(url: str, timeout: float = None, retries: int = None):
 
     Returns: (Response | None, status, kind)
       status: 마지막으로 관측한 HTTP 코드 (네트워크 예외/미시도면 None)
-      kind  : "ok" | "rate_limited" | "http_error" | "exception"
+      kind  : "ok" | "rate_limited" | "plan_limited" | "http_error" | "exception"
 
     존재하는 이유: 실패를 None 하나로 뭉개면 **404(경로 오류)와 403(플랜 제한)과
     빈 200 응답을 구분할 수 없다.** 실제로 nasdaq-constituent 가 없는 경로였는데
@@ -156,7 +157,15 @@ def fmp_get_ex(url: str, timeout: float = None, retries: int = None):
                     if attempt > 0:
                         _fmp_stats["recovered"] += 1
                 return r, r.status_code, "ok"
-            if r.status_code in (429, 402):
+            if r.status_code == 402:
+                # 402 Payment Required = **엔드포인트 단위 플랜 제한**.
+                # 재시도해도 절대 안 바뀐다(2026-08-13: /etf/holdings 가 402 를
+                # 3회 재시도하며 백오프로 35초를 버렸다). 429 와 같이 묶으면
+                # rate_limited 통계까지 오염되어 진짜 레이트리밋을 못 본다.
+                with _fmp_rate_lock:
+                    _fmp_stats["plan_limited"] += 1
+                return None, 402, "plan_limited"
+            if r.status_code == 429:
                 last_kind = "rate_limited"
             elif r.status_code >= 500:
                 last_kind = "http_error"
@@ -204,7 +213,8 @@ def fmp_get_json_ex(path: str, timeout: float = None, retries: int = None,
                     key: str = "") -> tuple:
     """fmp_get_json + 진단. Returns: (data | None, status, kind)
 
-    kind: "ok" | "no_key" | "rate_limited" | "http_error" | "exception" | "bad_json"
+    kind: "ok" | "no_key" | "rate_limited" | "plan_limited" | "http_error"
+            | "exception" | "bad_json"
       status 200 인데 data 가 빈 리스트면 kind="ok", data=[] 이다 —
       **경로 오류(404)와 빈 응답을 구분할 수 있어야 한다.**
     """
@@ -253,9 +263,11 @@ def fmp_reset_stats() -> None:
 
 def fmp_stats_line() -> str:
     s = fmp_stats()
-    total = s["ok"] + s["rate_limited"] + s["http_error"] + s["exception"]
+    total = (s["ok"] + s["rate_limited"] + s.get("plan_limited", 0)
+             + s["http_error"] + s["exception"])
     return (f"FMP {total}콜 — 성공 {s['ok']}(재시도 회복 {s['recovered']}) · "
-            f"레이트리밋 {s['rate_limited']} · HTTP오류 {s['http_error']} · "
+            f"레이트리밋 {s['rate_limited']} · 플랜제한 {s.get('plan_limited', 0)} · "
+            f"HTTP오류 {s['http_error']} · "
             f"예외 {s['exception']} · 최종포기 {s['gave_up']} · "
             f"재시도 {s['retries']}회 · 스로틀 {s['throttle_sec']:.0f}초 "
             f"(한도 {FMP_RATE_LIMIT_PER_MIN}/분, 재시도 {FMP_MAX_RETRIES}회)")

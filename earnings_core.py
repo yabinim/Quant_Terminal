@@ -676,10 +676,22 @@ UNIVERSE_MIN_MARKET_CAP = 150_000_000_000
 # 유니버스 재계산 주기 (요일: 0=월). 주 1회면 편입/편출 반영에 충분하다.
 UNIVERSE_REFRESH_WEEKDAY = 0
 
-# Source 값 — 캘린더의 SOURCE_* 와 다른 축이다(여긴 '어느 지수에서 왔나')
+# Source 값 — 캘린더의 SOURCE_* 와 다른 축이다(여긴 '어디서 왔나')
 UNIV_SRC_NDX = "NDX100"
-UNIV_SRC_SP = "SP500_LARGE"
+UNIV_SRC_SP = "SP500_LARGE"     # ETF 경로 전용 (현재 플랜에서 비활성)
 UNIV_SRC_BOTH = "BOTH"
+UNIV_SRC_LARGE = "US_LARGE"     # 스크리너 경로 — S&P500 한정이 아니다(ADR 포함)
+
+# /etf/holdings 멤버십 경로 사용 여부.
+#
+# **현재 False** — 2026-08-13 실측에서 QQQ·SPY 둘 다 HTTP 402(Payment Required)를
+# 반환했다. 엔드포인트 단위 플랜 제한이며(같은 실행에서 스크리너는 200),
+# 요금제가 바뀌기 전까지 절대 변하지 않는다. app.py 6697행에도 같은 취지의
+# 주석이 이미 있었다: "대표종목 폴백 (요금제에 holdings 엔드포인트가 없을 때)".
+#
+# 코드를 남겨둔 이유: 상위 플랜으로 올리면 QQQ = 나스닥 100 정확한 멤버십을
+# 얻을 수 있고, 그때는 이 플래그만 True 로 돌리면 된다.
+UNIVERSE_USE_ETF_MEMBERSHIP = False
 
 
 def _etf_membership(etf: str, key: str = "", top_n: int = 0) -> tuple:
@@ -752,48 +764,62 @@ def _screener_map(min_cap: float, key: str = "") -> tuple:
     return out, status, kind
 
 
-def fetch_market_universe(key: str = "", spy_top_n: int = None) -> dict:
-    """Tier 2 유니버스 조회 (K-3: ETF 멤버십 + 스크리너 보강).
+def fetch_market_universe(key: str = "", spy_top_n: int = None,
+                          use_etf: bool = None) -> dict:
+    """Tier 2 유니버스 조회.
 
-    구성:
-      · QQQ 보유종목 전량        → 나스닥 100
-      · SPY 보유종목 비중 상위 N → S&P 500 대형주
-      · 스크리너는 **항상 호출**한다 — 폴백이 아니라 Market_Cap/섹터 보강용.
-        ETF 두 개가 모두 실패하면 그때 유니버스 소스로 승격된다.
+    현재 유효 경로는 **스크리너 단독**이다 (UNIVERSE_USE_ETF_MEMBERSHIP=False).
+      · company-screener 로 시총 하한 이상 미국 상장주를 받는다.
+      · S&P500 한정이 아니므로 ADR(TSM/ASML/NVO 등)도 포함된다 — 이들도 실적을
+        발표하고 섹터를 흔들기 때문에 '이벤트 지형' 목적에는 포함이 맞다.
+      · 지수 멤버십이 아니라 시총 하한이므로 편입/편출 이벤트에 흔들리지 않고
+        자기 유지된다.
 
-    반환: {"ndx": {...}, "sp": {...}, "ok": bool, "diag": str, "source": str}
+    use_etf=True 로 켜면 QQQ/SPY 보유종목 멤버십을 우선 시도하고, 실패 시
+    스크리너로 폴백한다. 현재 플랜에서는 402 라 기본 비활성.
+
+    반환: {"ndx": {...}, "sp": {...}, "ok": bool, "diag": str, "source": str,
+           "labels": (label_a, label_b, label_both)}
     """
+    _use_etf = UNIVERSE_USE_ETF_MEMBERSHIP if use_etf is None else bool(use_etf)
     n = int(spy_top_n if spy_top_n is not None else UNIVERSE_SPY_TOP_N)
 
-    qqq, q_st, q_kind = _etf_membership("QQQ", key)
-    spy, s_st, s_kind = _etf_membership("SPY", key, top_n=n)
-    screen, c_st, c_kind = _screener_map(UNIVERSE_SCREENER_MIN_CAP, key)
+    parts = []
+    qqq, spy = [], []
+    if _use_etf:
+        qqq, q_st, q_kind = _etf_membership("QQQ", key)
+        spy, s_st, s_kind = _etf_membership("SPY", key, top_n=n)
+        parts.append(f"QQQ {len(qqq)}종목(HTTP {q_st}/{q_kind})")
+        parts.append(f"SPY상위{n} {len(spy)}종목(HTTP {s_st}/{s_kind})")
 
-    diag = (f"QQQ {len(qqq)}종목(HTTP {q_st}/{q_kind}) · "
-            f"SPY상위{n} {len(spy)}종목(HTTP {s_st}/{s_kind}) · "
-            f"스크리너 {len(screen)}종목(HTTP {c_st}/{c_kind})")
+    screen, c_st, c_kind = _screener_map(UNIVERSE_SCREENER_MIN_CAP, key)
+    parts.append(f"스크리너 {len(screen)}종목(HTTP {c_st}/{c_kind})")
+    diag = " · ".join(parts)
 
     def _meta(tk, name=""):
-        s = screen.get(tk) or {}
-        return {"name": s.get("name") or name or "",
-                "sector": s.get("sector") or "",
-                "market_cap": s.get("market_cap")}
+        m = screen.get(tk) or {}
+        return {"name": m.get("name") or name or "",
+                "sector": m.get("sector") or "",
+                "market_cap": m.get("market_cap")}
 
-    ndx = {tk: _meta(tk, nm) for tk, _w, nm in qqq}
-    sp = {tk: _meta(tk, nm) for tk, _w, nm in spy}
+    if qqq or spy:
+        return {"ndx": {tk: _meta(tk, nm) for tk, _w, nm in qqq},
+                "sp": {tk: _meta(tk, nm) for tk, _w, nm in spy},
+                "ok": True, "diag": diag, "source": "etf",
+                "labels": (UNIV_SRC_NDX, UNIV_SRC_SP, UNIV_SRC_BOTH)}
 
-    if ndx or sp:
-        return {"ndx": ndx, "sp": sp, "ok": True, "diag": diag, "source": "etf"}
-
-    # ETF 두 경로 모두 실패 → 스크리너를 유니버스로 승격(시총 하한 상향 적용)
-    fallback = {tk: m for tk, m in screen.items()
+    # 스크리너 경로 — 시총 하한 상향 적용
+    universe = {tk: m for tk, m in screen.items()
                 if (m.get("market_cap") or 0) >= UNIVERSE_MIN_MARKET_CAP}
-    if fallback:
-        return {"ndx": {}, "sp": fallback, "ok": True,
-                "diag": diag + " → ETF 실패, 스크리너 폴백",
-                "source": "screener"}
+    if universe:
+        if _use_etf:
+            diag += " → ETF 실패, 스크리너 폴백"
+        return {"ndx": {}, "sp": universe, "ok": True, "diag": diag,
+                "source": "screener",
+                "labels": (UNIV_SRC_NDX, UNIV_SRC_LARGE, UNIV_SRC_BOTH)}
 
-    return {"ndx": {}, "sp": {}, "ok": False, "diag": diag, "source": "none"}
+    return {"ndx": {}, "sp": {}, "ok": False, "diag": diag, "source": "none",
+            "labels": (UNIV_SRC_NDX, UNIV_SRC_LARGE, UNIV_SRC_BOTH)}
 
 
 def universe_row(ticker: str, name: str = "", sector: str = "",
@@ -821,12 +847,19 @@ def parse_universe(values: list) -> list[dict]:
     return out
 
 
-def merge_universe_sources(ndx: dict, sp: dict, now_et: str = "") -> list[list]:
-    """NDX100 dict 와 S&P500-대형주 dict 를 합쳐 시트 행 목록으로.
+def merge_universe_sources(ndx: dict, sp: dict, now_et: str = "",
+                           labels: tuple = None) -> list[list]:
+    """두 출처 dict 를 합쳐 시트 행 목록으로.
 
     ndx/sp: {TICKER: {"name":..., "sector":..., "market_cap":...}}
+    labels: (label_a, label_b, label_both). fetch_market_universe 가 돌려주는
+      값을 그대로 넘긴다. 생략하면 ETF 경로 기본값.
+      ※ 스크리너 결과에 SP500_LARGE 를 붙이면 **거짓 라벨**이다 — 스크리너는
+        S&P500 한정이 아니라 미국 상장 대형주 전체(ADR 포함)다.
     반환: 시총 내림차순 행 목록 (헤더 미포함)
     """
+    label_a, label_b, label_both = (labels or
+                                    (UNIV_SRC_NDX, UNIV_SRC_SP, UNIV_SRC_BOTH))
     ndx = ndx or {}
     sp = sp or {}
     rows = []
@@ -834,11 +867,11 @@ def merge_universe_sources(ndx: dict, sp: dict, now_et: str = "") -> list[list]:
         a = ndx.get(tk) or {}
         b = sp.get(tk) or {}
         if tk in ndx and tk in sp:
-            src = UNIV_SRC_BOTH
+            src = label_both
         elif tk in ndx:
-            src = UNIV_SRC_NDX
+            src = label_a
         else:
-            src = UNIV_SRC_SP
+            src = label_b
         mc = _num(b.get("market_cap")) or _num(a.get("market_cap"))
         rows.append((mc or 0.0, universe_row(
             tk,
