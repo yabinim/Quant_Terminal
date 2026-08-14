@@ -52,6 +52,12 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 GMAIL_TO           = os.environ["GMAIL_TO"]
 _gcp_info = json.loads(os.environ["GSPREAD_KEY"])
 
+# 유니버스 강제 재계산 (수동 워크플로 전용, 선택). 갱신일(월요일)이 아니어도
+# ec.fetch_market_universe() 를 실제로 태워보고 싶을 때 쓴다.
+# ⚠️ 정기 실행에서는 절대 켜지 말 것 — 매일 스크리너를 호출하게 된다.
+FORCE_UNIVERSE = str(os.environ.get("FORCE_UNIVERSE", "") or "").strip().lower() \
+    in ("1", "true", "y", "yes")
+
 _ET = pytz.timezone("America/New_York")
 _FMP_BASE = "https://financialmodelingprep.com/stable"
 _FMP_TIMEOUT = 15
@@ -253,6 +259,8 @@ def pass_universe(today, now_et, force: bool = False) -> dict:
     if not (force or is_refresh_day or not cur):
         print(f"[UNIV] 갱신일 아님 — 기존 {len(cur)}종목 사용")
         return cur
+    if force and not is_refresh_day:
+        print("[UNIV] 강제 재계산(FORCE_UNIVERSE)")
 
     res = ec.fetch_market_universe(key=FMP_API_KEY)
     print(f"[UNIV] {res.get('diag') or ''}")
@@ -737,7 +745,7 @@ def main():
 
     # ── Tier 2: 대형주 유니버스 (일정 지형 전용) ──
     print("\n▶ 패스 U: 유니버스 갱신")
-    univ = pass_universe(today, now_et)
+    univ = pass_universe(today, now_et, force=FORCE_UNIVERSE)
     univ_only = sorted(set(univ) - user_set)
     # Tier 1 을 먼저 처리한다 — 타임아웃이 나더라도 사용자 종목은 갱신되게.
     scan_tickers = sorted(user_set) + univ_only
