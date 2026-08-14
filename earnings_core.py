@@ -156,8 +156,44 @@ def _d(s) -> pd.Timestamp | None:
         return None
 
 
+ET_TZ_NAME = "America/New_York"
+
+
+def _timing_from_utc(ts) -> str:
+    """UTC 타임스탬프 → ET 기준 bmo/amc.
+
+    2026-08-14 수정 — **버그였다.**
+      quote.earningsAnnouncement 는 `2026-08-20T20:30:00.000+0000` 형태의 UTC 인데,
+      이전 코드는 문자열 [11:16] 을 잘라 _timing_of 에 넘겼고 _timing_of 는 hh<12 를
+      **ET 개장 기준**으로 판정했다. 장전 08:30 ET 발표는 12:30 UTC 이므로 hh=12 →
+      'amc' 로 뒤집힌다. BMO 를 AMC 로 오판하면 resolve_reaction_index 가 반응일을
+      하루 밀려 잡아 갭·PEAD 측정이 통째로 어긋난다.
+    """
+    try:
+        t = pd.Timestamp(ts)
+    except Exception:
+        return ""
+    if t is None or pd.isna(t):
+        return ""
+    # ⚠️ 자정 판정은 **변환 전**에 해야 한다. 변환 후에 보면 00:00 UTC 가
+    #    ET 로 전날 20:00 이 되어 'amc' 로 새어 나간다("2026-08-20" 처럼 날짜만
+    #    온 응답이 전부 장후로 오판됐다).
+    if t.hour == 0 and t.minute == 0 and t.second == 0:
+        return ""
+    try:
+        t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+        t = t.tz_convert(ET_TZ_NAME)
+    except Exception:
+        return ""
+    return "bmo" if (t.hour, t.minute) < (9, 30) else "amc"
+
+
 def _timing_of(item: dict) -> str:
-    """FMP 실적 항목에서 BMO/AMC 추출. 필드명이 판올림마다 달라 다중 키 탐색."""
+    """FMP 실적 항목에서 BMO/AMC 추출. 필드명이 판올림마다 달라 다중 키 탐색.
+
+    ⚠️ 여기 오는 시각은 **ET 라벨**을 전제한다(earnings-calendar 의 time 필드).
+       UTC 타임스탬프는 _timing_from_utc 를 쓸 것.
+    """
     for key in ("time", "when", "timing", "hour", "announcementTime"):
         v = str(item.get(key) or "").strip().lower()
         if not v:
@@ -184,7 +220,7 @@ def _timing_of(item: dict) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 def fetch_next_earnings(ticker: str, today=None, horizon_days: int = CALENDAR_HORIZON_DAYS,
-                        key: str = "") -> dict | None:
+                        key: str = "", market_map: dict = None) -> dict | None:
     """다음 실적 발표 예정 1건. 없으면 None.
 
     반환: {ticker, earnings_date, days_until, timing, date_source, eps_estimate,
@@ -217,14 +253,23 @@ def fetch_next_earnings(ticker: str, today=None, horizon_days: int = CALENDAR_HO
     #    AAPL·NVDA·WMT 가 모두 2026-10-13). per-symbol 은 earnings?symbol= 이다.
     _scan(_get(f"earnings?symbol={tk}", k), "earnings")
 
+    # 시장 전체 캘린더 맵 — 실행당 1회 조회한 것을 티커별로 꺼내 쓴다(추가 콜 0).
+    #   per-symbol earnings?symbol= 에 없는 timing 의 주 공급원이며,
+    #   확정 판정(2개 소스 일치)의 두 번째 소스이기도 하다.
+    _mc = (market_map or {}).get(tk)
+    if isinstance(_mc, dict):
+        _md = _d(_mc.get("date"))
+        if _md is not None and t0 <= _md <= hi:
+            cands.append((_md, str(_mc.get("timing") or ""), None, "calendar"))
+
     # quote.earningsAnnouncement — 단일 날짜 폴백
     q = _get(f"quote?symbol={tk}", k)
     qi = q[0] if isinstance(q, list) and q else (q if isinstance(q, dict) else {})
     if isinstance(qi, dict):
-        d = _d(qi.get("earningsAnnouncement"))
+        _ann = qi.get("earningsAnnouncement")
+        d = _d(_ann)
         if d is not None and t0 <= d <= hi:
-            cands.append((d, _timing_of({"time": str(qi.get("earningsAnnouncement") or "")[11:16]}),
-                          None, "quote"))
+            cands.append((d, _timing_from_utc(_ann), None, "quote"))
 
     if not cands:
         return None
@@ -238,10 +283,13 @@ def fetch_next_earnings(ticker: str, today=None, horizon_days: int = CALENDAR_HO
     eps = next((c[2] for c in cands if c[0] == best_d and c[2] is not None), None)
 
     # 2개 이상 소스가 같은 날짜를 가리키면 '확정'으로 본다.
-    #   구 규약은 (calendar, earnings) 였으나 calendar 가 시장 전체 응답이라
-    #   교차 확인의 의미가 없었다 → (earnings, quote) 로 교체.
+    #   2026-08-13: calendar 를 티커별로 잘못 호출하고 있어 (earnings, quote) 로
+    #     좁혔으나, quote 가 stable 에서 earningsAnnouncement 를 안 주는 것으로
+    #     보여 agree 가 2에 영영 도달하지 못했다(시트 264행 전부 estimated).
+    #   2026-08-14: calendar 를 **시장 전체 맵**으로 올바르게 공급하여 복구.
     #   date_source 는 표시 전용이며 어떤 판정도 게이트하지 않는다.
-    agree = sum(1 for c in cands if c[0] == best_d and c[3] in ("earnings", "quote"))
+    agree = sum(1 for c in cands if c[0] == best_d
+                and c[3] in ("earnings", "calendar", "quote"))
     return {
         "ticker": tk,
         "earnings_date": best_d.strftime("%Y-%m-%d"),
@@ -516,9 +564,60 @@ def derived_stop_pct(hist, price=None, atr_mult=None) -> float | None:
         return None
 
 
+MARKET_CAL_DAYS = 14      # 시장 전체 캘린더 조회 창 (timing 이 실제로 쓰이는 D-10 을 덮는다)
+
+
+def fetch_market_calendar_map(today=None, days: int = None, key: str = "") -> tuple:
+    """시장 전체 실적 캘린더 → ({TICKER: {date, timing}}, diag)
+
+    2026-08-14 도입. earnings-calendar 는 symbol 파라미터가 없는 **시장 전체**
+    엔드포인트다. 지금까지 이걸 티커별 조회에 잘못 쓰다 전 종목 동일 날짜 버그를
+    냈는데, **원래 용도대로 실행당 1회** 호출하면 세 가지가 한꺼번에 해결된다:
+
+      1) timing(bmo/amc) 확보 — per-symbol earnings?symbol= 에는 time 필드가 없고,
+         quote.earningsAnnouncement 는 stable 스키마에서 오지 않는 것으로 보인다
+         (시트 264행 전부 Timing 공란·Date_Source 전부 estimated).
+      2) 확정 규약 복구 — 티커별로 정확한 두 번째 소스가 생겨 (earnings, calendar)
+         교차 확인이 실제로 성립한다.
+      3) 경량 조회 절감 — 맵에 있는 종목은 추가 콜 없이 날짜를 얻는다.
+
+    창을 14일로 좁힌 이유: 응답이 페이지네이션되는 정황이 있었다(90일 창에서
+    이상 동작). timing 은 D-10 이내에서만 실제로 쓰이므로 14일이면 충분하다.
+    커버리지는 diag 로 남겨 실측한다.
+    """
+    t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    n = int(days if days is not None else MARKET_CAL_DAYS)
+    hi = t0 + pd.Timedelta(days=n)
+    frm, to = t0.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
+
+    data, status, kind = _fh.fmp_get_json_ex(
+        f"earnings-calendar?from={frm}&to={to}", timeout=20, key=key)
+    out = {}
+    n_raw = 0
+    if isinstance(data, list):
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            n_raw += 1
+            tk = str(it.get("symbol") or "").strip().upper()
+            d = _d(it.get("date"))
+            if not tk or d is None or d < t0 or d > hi:
+                continue
+            prev = out.get(tk)
+            # 같은 티커가 여러 번 나오면 가장 이른 날짜를 쓴다
+            if prev is not None and _d(prev["date"]) <= d:
+                continue
+            out[tk] = {"date": d.strftime("%Y-%m-%d"), "timing": _timing_of(it)}
+
+    n_tim = sum(1 for v in out.values() if v.get("timing"))
+    diag = (f"시장캘린더 {len(out)}종목/{n_raw}행 · timing {n_tim} "
+            f"({frm}~{to}, HTTP {status}/{kind})")
+    return out, diag
+
+
 def fetch_next_earnings_light(ticker: str, today=None,
                               horizon_days: int = CALENDAR_HORIZON_DAYS,
-                              key: str = "") -> dict | None:
+                              key: str = "", market_map: dict = None) -> dict | None:
     """다음 실적 예정일 — **1콜 경량 조회** (교차 확인 없음).
 
     D-10 밖 종목은 어차피 FMP 가 확정일을 안 내놓는다(보통 발표 2~4주 전에 확정).
@@ -544,6 +643,23 @@ def fetch_next_earnings_light(ticker: str, today=None,
     t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
     hi = t0 + pd.Timedelta(days=int(horizon_days))
     frm, to = t0.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
+
+    # 시장 전체 캘린더 맵에 있으면 **추가 콜 없이** 날짜+timing 을 얻는다.
+    #   맵은 14일 창이므로 '없음'이 '실적 없음'을 뜻하지 않는다 → 폴백 필수.
+    _mc = (market_map or {}).get(tk)
+    if isinstance(_mc, dict):
+        _md = _d(_mc.get("date"))
+        if _md is not None and t0 <= _md <= hi:
+            return {
+                "ticker": tk,
+                "earnings_date": _md.strftime("%Y-%m-%d"),
+                "days_until": int((_md - t0).days),
+                "timing": str(_mc.get("timing") or ""),
+                "date_source": "estimated",
+                "eps_estimate": None,
+                "sources": ["calendar"],
+                "conflict": False,
+            }
 
     best = None
     for it in (_get(f"earnings?symbol={tk}", key) or []):
