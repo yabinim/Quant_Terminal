@@ -1,0 +1,51 @@
+name: 📅 실적 레이더 단독 (수동 전용)
+
+# 존재 이유:
+#   5PM 평일 워크플로는 내러티브 → DRG 검증 → 실적 레이더 → 워치리스트 알림이
+#   한 묶음이다. 실적 레이더 하나만 확인하려고 그 워크플로를 수동 실행하면
+#   run_watchlist_alerts.py 가 같이 돌면서 **알림 상태 머신이 하루치 더 진행된다.**
+#   (regime_core.evaluate_alert_transitions: "하루 1회 호출 전제. 호출 1회 =
+#    평가 1회로 pending 카운터가 1 진행된다")
+#   → 2일 확정이 같은 날 1일 만에 확정되어 신호가 조기 발동한다.
+#
+#   이 워크플로는 실적 레이더만 돌린다. 상태 머신을 건드리지 않는다.
+#
+# ⚠️ repository_dispatch 트리거를 넣지 않는다 — Cloud Scheduler 가 이걸
+#    자동 호출하면 5PM 실행과 중복되어 캘린더 갱신이 두 번 일어난다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "메일 발송 없이 로그만 (GMAIL_TO 를 비워 실행)"
+        type: boolean
+        default: false
+
+jobs:
+  earnings-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 📅 실적 레이더 (사전 게이트 + 발표 후 측정)
+        env:
+          FMP_API_KEY:        ${{ secrets.FMP_API_KEY }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:           ${{ inputs.dry_run && '' || secrets.GMAIL_TO }}
+          GSPREAD_KEY:        ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/run_earnings_watch.py
