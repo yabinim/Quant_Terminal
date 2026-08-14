@@ -59,6 +59,16 @@ _gcp_info = json.loads(os.environ["GSPREAD_KEY"])
 FORCE_UNIVERSE = str(os.environ.get("FORCE_UNIVERSE", "") or "").strip().lower() \
     in ("1", "true", "y", "yes")
 
+# 캘린더 전 종목 강제 재조회 (수동 워크플로 전용, 선택).
+# needs_refresh 의 티어 주기(far=30일)를 무시한다.
+#
+# 필요한 이유: 조회 로직이 바뀌어도 기존 행은 Last_Checked 가 최근이라 far 티어면
+# 30일간 재조회되지 않는다. 2026-08-13 의 earnings-calendar 엔드포인트 버그처럼
+# **저장된 값 자체가 틀린 경우** 수정 코드를 배포해도 두 달간 반영되지 않는다.
+# ⚠️ 정기 실행에서는 절대 켜지 말 것 — 매일 전 종목을 조회하게 된다.
+FORCE_CALENDAR = str(os.environ.get("FORCE_CALENDAR", "") or "").strip().lower() \
+    in ("1", "true", "y", "yes")
+
 _ET = pytz.timezone("America/New_York")
 _FMP_BASE = "https://financialmodelingprep.com/stable"
 _FMP_TIMEOUT = 15
@@ -344,7 +354,8 @@ def load_core_keys() -> set:
 #   갱신 주기를 나눈다(far 30일 / mid 7일 / near 매일).
 # ──────────────────────────────────────────────────────────────────────────
 
-def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None):
+def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
+                  force: bool = False):
     """캘린더 갱신. 반환: (updates, appends, cal) — cal 은 갱신 반영된 dict.
 
     user_set: 보유/워치리스트 티커 집합. 여기 없으면 Tier 2(universe)로 기록해
@@ -356,7 +367,7 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None):
     for tk in tickers:
         try:
             prev = cal.get(tk)
-            if prev is not None and not ec.needs_refresh(prev, today):
+            if prev is not None and not (force or ec.needs_refresh(prev, today)):
                 n_skip += 1
                 continue
 
@@ -765,8 +776,11 @@ def main():
     hist_cache = {}
 
     print("\n▶ 패스 0: 캘린더 갱신")
+    if FORCE_CALENDAR:
+        print("[CAL] 강제 재조회(FORCE_CALENDAR) — 티어 주기 무시")
     c_updates, c_appends, cal = pass_calendar(scan_tickers, cal, hist_cache,
-                                              today, now_et, user_set=user_set)
+                                              today, now_et, user_set=user_set,
+                                              force=FORCE_CALENDAR)
     print("\n▶ 패스 2: 사후 측정")
     v_updates, results = pass_verify(rows, hist_cache, today)
     print("\n▶ 패스 3: D+5 지연")

@@ -202,6 +202,73 @@ chk(not res3["ok"] and res3["source"] == "none", "ok=False → 시트 미갱신 
 fh.fmp_get_ex = _orig_get_ex
 
 
+print("\n[12] 버그 A — per-symbol 엔드포인트 (2026-08-13 회귀)")
+_src_ec = open("earnings_core.py", encoding="utf-8").read()
+import re as _re
+_calls = _re.findall(r'_get\(f?"([a-z0-9\-]+)\?symbol', _src_ec)
+chk("earnings-calendar" not in _calls,
+    f"earnings-calendar?symbol= 사용 0건 (실제: {sorted(set(_calls))})")
+chk(_calls.count("earnings") == 2,
+    f"per-symbol earnings?symbol= 직접호출 {_calls.count('earnings')}건 "
+    f"(light 1 + full 1; past_earnings_dates 는 튜플 순회라 미포함)")
+
+_seen = {}
+
+
+def _fake_earnings(url, timeout=None, retries=None):
+    """티커별로 **다른** 응답을 돌려준다 — 시장 전체 엔드포인트였다면 불가능."""
+    m = _re.search(r"symbol=([A-Z]+)", url)
+    tk = m.group(1) if m else "?"
+    _seen[tk] = _seen.get(tk, 0) + 1
+    table = {"AAPL": ("2026-08-20", 1.55), "NVDA": ("2026-08-26", 0.88),
+             "WMT": ("2026-08-19", 0.72)}
+    if "earnings?symbol" not in url or tk not in table:
+        return None, 200, "ok"
+    d, eps = table[tk]
+    return _R([{"date": d, "epsEstimated": eps}]), 200, "ok"
+
+
+fh.fmp_get_ex = _fake_earnings
+_out = {tk: ec.fetch_next_earnings_light(tk, today=pd.Timestamp("2026-08-14"), key="K")
+        for tk in ("AAPL", "NVDA", "WMT")}
+_dates = {tk: (v or {}).get("earnings_date") for tk, v in _out.items()}
+chk(len(set(_dates.values())) == 3, f"티커별 날짜가 서로 다름 = {_dates}")
+chk(_dates["WMT"] == "2026-08-19", f"WMT = {_dates['WMT']}")
+_eps = {tk: (v or {}).get("eps_estimate") for tk, v in _out.items()}
+chk(len(set(_eps.values())) == 3, f"티커별 EPS 추정도 다름 = {_eps}")
+_d5 = ec.fetch_next_earnings_light("WMT", today=pd.Timestamp("2026-08-14"), key="K")
+chk(_d5 and _d5["days_until"] == 5, f"D-Day 계산 = {_d5['days_until'] if _d5 else 'N/A'}")
+fh.fmp_get_ex = _orig_get_ex
+
+print("\n[13] 버그 B — 유니버스 펀드/우선주 배제")
+_SCR2 = [
+    {"symbol": "NVDA", "companyName": "NVIDIA", "sector": "Tech", "marketCap": 3e12},
+    {"symbol": "VFIAX", "companyName": "Vanguard 500 Index", "marketCap": 1e12},
+    {"symbol": "AGTHX", "companyName": "Growth Fund of America", "marketCap": 3e11},
+    {"symbol": "BRK-B", "companyName": "Berkshire B", "marketCap": 9e11},
+    {"symbol": "MER-PK", "companyName": "Merrill Pfd", "marketCap": 2e11},
+    {"symbol": "SPY", "companyName": "SPDR", "marketCap": 6e11, "isEtf": True},
+    {"symbol": "PIMIX", "companyName": "PIMCO Income", "marketCap": 2e11,
+     "isFund": True},
+    {"symbol": "USD", "companyName": "cash", "marketCap": 9e11},
+]
+fh.fmp_get_ex = lambda url, timeout=None, retries=None: (
+    (_R(_SCR2), 200, "ok") if "screener" in url else (None, 402, "plan_limited"))
+_m, _st2, _k2, _drop = ec._screener_map(1e10, key="K")
+chk(sorted(_m) == ["NVDA"], f"보통주만 통과 = {sorted(_m)}")
+chk(_drop["fund_naming"] == 2, f"펀드 티커 관례 제외 {_drop['fund_naming']} (VFIAX/AGTHX)")
+chk(_drop["ticker_form"] == 2, f"하이픈 티커 제외 {_drop['ticker_form']} (BRK-B/MER-PK)")
+chk(_drop["etf"] == 1 and _drop["fund"] == 1, f"응답 필드 제외 etf/fund = {_drop['etf']}/{_drop['fund']}")
+chk(_drop["excluded"] == 1, f"현금 티커 제외 {_drop['excluded']} (USD)")
+chk("isFund=false" in _src_ec, "스크리너 쿼리에 isFund=false 포함")
+fh.fmp_get_ex = _orig_get_ex
+
+print("\n[14] FORCE_CALENDAR 배선")
+_src_rw = open("run_earnings_watch.py", encoding="utf-8").read()
+chk("FORCE_CALENDAR" in _src_rw, "환경변수 정의")
+chk("force or ec.needs_refresh" in _src_rw, "needs_refresh 우회 조건")
+chk("force=FORCE_CALENDAR" in _src_rw, "main 에서 전달")
+
 print("\n" + ("=" * 52))
 print(f"❌ 실패 {len(fail)}건" if fail else "✅ 전부 통과")
 sys.exit(1 if fail else 0)
