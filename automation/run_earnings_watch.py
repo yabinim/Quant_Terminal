@@ -255,10 +255,9 @@ def pass_universe(today, now_et, force: bool = False) -> dict:
         return cur
 
     res = ec.fetch_market_universe(key=FMP_API_KEY)
+    print(f"[UNIV] {res.get('diag') or ''}")
     if not res.get("ok"):
-        print(f"[UNIV] 조회 실패(ndx={len(res.get('ndx') or {})} "
-              f"sp500={res.get('n_sp_all')} screener={res.get('n_screen')}) "
-              f"— 기존 {len(cur)}종목 유지")
+        print(f"[UNIV] 조회 실패 — 기존 {len(cur)}종목 유지")
         return cur
 
     rows = ec.merge_universe_sources(res["ndx"], res["sp"], now_et=now_et)
@@ -272,8 +271,9 @@ def pass_universe(today, now_et, force: bool = False) -> dict:
         ws.update([ec.UNIVERSE_COLS] + rows,
                   range_name=f"A1:{_col_a1(ec.UNIVERSE_NCOL)}{len(rows) + 1}",
                   value_input_option="USER_ENTERED")
-        print(f"[UNIV] 갱신 완료 — {len(rows)}종목 "
-              f"(NDX {len(res['ndx'])} · S&P500 대형주 {len(res['sp'])})")
+        _n_cap = sum(1 for r in rows if str(r[3] or "").strip())
+        print(f"[UNIV] 갱신 완료 — {len(rows)}종목 (출처 {res.get('source')} · "
+              f"NDX {len(res['ndx'])} · SPY상위 {len(res['sp'])} · 시총채움 {_n_cap})")
     except Exception as e:
         print(f"[ERROR] Earnings_Universe 기록 실패: {e} — 기존 유지")
         return cur
