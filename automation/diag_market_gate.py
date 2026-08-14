@@ -420,7 +420,8 @@ try:
             for _a in _n.names:
                 _alias[_a.asname or _a.name] = _a.name
     _TARGETS = {"scanner_core", "narrative_core", "users_core", "fmp_extras",
-                "portfolio_core", "watchlist_metrics_core", "regime_core"}
+                "portfolio_core", "watchlist_metrics_core", "regime_core",
+                "earnings_core"}   # 2026-08-13: 실적 레이더 Tier 2(Source 열) 추가
     _al = {k: v for k, v in _alias.items() if v in _TARGETS}
 
     _used = {}
