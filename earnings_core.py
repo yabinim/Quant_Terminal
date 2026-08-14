@@ -211,8 +211,10 @@ def fetch_next_earnings(ticker: str, today=None, horizon_days: int = CALENDAR_HO
                        or it.get("epsEstimate") or it.get("estimatedEarning"))
             cands.append((d, _timing_of(it), eps, source))
 
-    frm, to = t0.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
-    _scan(_get(f"earnings-calendar?symbol={tk}&from={frm}&to={to}", k), "calendar")
+    # ⚠️ earnings-calendar 는 **시장 전체** 엔드포인트다(FMP 문서상 symbol 파라미터
+    #    없음). symbol 을 붙여도 무시되어 모든 티커가 같은 응답을 받았고, 그 결과
+    #    캘린더의 Earnings_Date 가 전 종목 동일해졌다(2026-08-13 시트 실측:
+    #    AAPL·NVDA·WMT 가 모두 2026-10-13). per-symbol 은 earnings?symbol= 이다.
     _scan(_get(f"earnings?symbol={tk}", k), "earnings")
 
     # quote.earningsAnnouncement — 단일 날짜 폴백
@@ -236,7 +238,10 @@ def fetch_next_earnings(ticker: str, today=None, horizon_days: int = CALENDAR_HO
     eps = next((c[2] for c in cands if c[0] == best_d and c[2] is not None), None)
 
     # 2개 이상 소스가 같은 날짜를 가리키면 '확정'으로 본다.
-    agree = sum(1 for c in cands if c[0] == best_d and c[3] in ("calendar", "earnings"))
+    #   구 규약은 (calendar, earnings) 였으나 calendar 가 시장 전체 응답이라
+    #   교차 확인의 의미가 없었다 → (earnings, quote) 로 교체.
+    #   date_source 는 표시 전용이며 어떤 판정도 게이트하지 않는다.
+    agree = sum(1 for c in cands if c[0] == best_d and c[3] in ("earnings", "quote"))
     return {
         "ticker": tk,
         "earnings_date": best_d.strftime("%Y-%m-%d"),
@@ -517,9 +522,21 @@ def fetch_next_earnings_light(ticker: str, today=None,
     """다음 실적 예정일 — **1콜 경량 조회** (교차 확인 없음).
 
     D-10 밖 종목은 어차피 FMP 가 확정일을 안 내놓는다(보통 발표 2~4주 전에 확정).
-    그 구간에서 3콜 교차 확인은 낭비이므로 캘린더 1콜만 쓰고 date_source 는
-    항상 'estimated' 로 둔다. D-10 이내로 들어오면 fetch_next_earnings 가
-    3소스 교차 확인으로 승격시킨다.
+    그 구간에서 교차 확인은 낭비이므로 1콜만 쓰고 date_source 는 항상
+    'estimated' 로 둔다. D-10 이내로 들어오면 fetch_next_earnings 가 승격시킨다.
+
+    2026-08-13 수정 — **치명적 버그였다.**
+      이전에는 earnings-calendar?symbol={tk} 를 썼는데, 이 엔드포인트는 FMP 문서상
+      **시장 전체용이며 symbol 파라미터가 없다.** symbol 을 붙여도 무시되어 모든
+      티커가 동일한 응답을 받았다. 시트 실측: AAPL·NVDA·WMT·MSFT 가 전부 같은
+      Earnings_Date(2026-10-13), Est_EPS 도 전부 동일(0.01814).
+
+      더 나쁜 것은 그 값이 항상 ~70일 뒤여서 **D-10 안으로 승격되는 일이 없었다**
+      는 점이다. 신규 편입 종목은 저장된 날짜가 실제로 지나(ed < t0) near 로
+      떨어질 때까지 최대 두 달간 틀린 날짜로 방치됐다.
+
+      timing 은 이 엔드포인트에 없으므로 빈 문자열이 된다 — D-10 승격 시
+      fetch_next_earnings 의 quote?symbol= 이 채운다. 정상 동작이다.
     """
     tk = str(ticker or "").strip().upper()
     if not tk:
@@ -529,15 +546,16 @@ def fetch_next_earnings_light(ticker: str, today=None,
     frm, to = t0.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
 
     best = None
-    for it in (_get(f"earnings-calendar?symbol={tk}&from={frm}&to={to}", key) or []):
+    for it in (_get(f"earnings?symbol={tk}", key) or []):
         if not isinstance(it, dict):
             continue
-        d = _d(it.get("date"))
+        d = _d(it.get("date") or it.get("fiscalDateEnding"))
         if d is None or d < t0 or d > hi:
             continue
         if best is None or d < best[0]:
             best = (d, _timing_of(it),
-                    _num(it.get("epsEstimated") or it.get("estimatedEPS")))
+                    _num(it.get("epsEstimated") or it.get("estimatedEPS")
+                         or it.get("epsEstimate")))
     if best is None:
         return None
     return {
@@ -741,27 +759,63 @@ def _etf_membership(etf: str, key: str = "", top_n: int = 0) -> tuple:
     return (uniq[:top_n] if top_n else uniq), status, kind
 
 
+def _is_fund_ticker(tk: str) -> bool:
+    """미국 뮤추얼 펀드 티커 관례: 5글자이며 X 로 끝난다(NASDAQ 배정 규칙).
+
+    최후의 방어선이다. 스크리너 파라미터·응답 필드로 먼저 걸러지지 않은 것만
+    여기서 잡는다. 오탐 위험이 있으므로 응답 필드 판정이 우선한다.
+    """
+    return len(tk) == 5 and tk.endswith("X")
+
+
 def _screener_map(min_cap: float, key: str = "") -> tuple:
-    """시총 하한 이상 종목 → ({TICKER: {name, sector, market_cap}}, status, kind)."""
+    """시총 하한 이상 **보통주** → ({TICKER: {...}}, status, kind, 제외통계).
+
+    2026-08-13 수정 — 유니버스의 절반이 뮤추얼 펀드였다.
+      isEtf=false 만으로는 뮤추얼 펀드가 걸러지지 않는데, FMP 가 펀드의 AUM 을
+      marketCap 으로 보고하므로 1,500억 하한을 그대로 통과한다. 실측 결과 167종목
+      중 약 82개가 VFIAX·VTSAX·FXAIX·AGTHX 류 펀드였고, MER-PK(우선주)와
+      BRK-A/BRK-B 중복도 섞였다(하이픈 티커가 필터를 통과).
+
+      파라미터(isFund=false)가 이 플랜에서 실제로 먹는지 문서에 명시가 없으므로
+      **응답 필드로도 거른다.** 어느 쪽이 실제로 작동했는지는 제외 통계로 남긴다.
+    """
     data, status, kind = _fh.fmp_get_json_ex(
         f"company-screener?marketCapMoreThan={int(min_cap)}"
-        f"&isEtf=false&isActivelyTrading=true"
+        f"&isEtf=false&isFund=false&isActivelyTrading=true"
         f"&exchange=NASDAQ,NYSE&limit=2000", timeout=20, key=key)
     out = {}
+    drop = {"etf": 0, "fund": 0, "ticker_form": 0, "fund_naming": 0, "excluded": 0}
     if not isinstance(data, list):
-        return out, status, kind
+        return out, status, kind, drop
     for it in data:
         if not isinstance(it, dict):
             continue
         tk = str(it.get("symbol") or "").strip().upper()
-        if not tk or "." in tk:
+        if not tk:
+            continue
+        # 복수클래스(BRK-B)·우선주(MER-PK)·해외 접미(XXXX.L) — 실적 조회가 안 된다
+        if "." in tk or "-" in tk:
+            drop["ticker_form"] += 1
+            continue
+        if tk in UNIVERSE_EXCLUDE_TICKERS:
+            drop["excluded"] += 1
+            continue
+        if bool(it.get("isEtf")):
+            drop["etf"] += 1
+            continue
+        if bool(it.get("isFund")):
+            drop["fund"] += 1
+            continue
+        if _is_fund_ticker(tk):
+            drop["fund_naming"] += 1
             continue
         out[tk] = {
             "name": str(it.get("companyName") or "").strip(),
             "sector": str(it.get("sector") or "").strip(),
             "market_cap": _num(it.get("marketCap")),
         }
-    return out, status, kind
+    return out, status, kind, drop
 
 
 def fetch_market_universe(key: str = "", spy_top_n: int = None,
@@ -792,8 +846,9 @@ def fetch_market_universe(key: str = "", spy_top_n: int = None,
         parts.append(f"QQQ {len(qqq)}종목(HTTP {q_st}/{q_kind})")
         parts.append(f"SPY상위{n} {len(spy)}종목(HTTP {s_st}/{s_kind})")
 
-    screen, c_st, c_kind = _screener_map(UNIVERSE_SCREENER_MIN_CAP, key)
-    parts.append(f"스크리너 {len(screen)}종목(HTTP {c_st}/{c_kind})")
+    screen, c_st, c_kind, c_drop = _screener_map(UNIVERSE_SCREENER_MIN_CAP, key)
+    _dropped = ", ".join(f"{k} {v}" for k, v in c_drop.items() if v) or "0"
+    parts.append(f"스크리너 {len(screen)}종목(HTTP {c_st}/{c_kind}, 제외 {_dropped})")
     diag = " · ".join(parts)
 
     def _meta(tk, name=""):
