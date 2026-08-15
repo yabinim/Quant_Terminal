@@ -1,0 +1,67 @@
+name: 🔬 진단 — C블록 3차 (insider-trading/search 커버리지)
+
+# 언제 쓰나:
+#   3단계 C블록 확정 직전, 마지막 한 번.
+#
+#   2차에서 insider-trading/statistics 가 3/3 생존했다. 다만 한계 둘이 남았다.
+#     · 분기 지연 — 8월 이벤트에 6월말 마감 분기를 붙인다 (46~138일 묵음)
+#     · 건수지 금액이 아니다 — totalSales 는 거래 '건수'다
+#
+#   둘 다 insider-trading/search 로 풀린다(행 단위, 날짜·price 존재).
+#   남은 의문은 하나 — **한 번의 호출이 실적 전 90일을 덮는가.**
+#   1차에서 limit=20 이 AAPL 약 2개월, WMT 는 하루밖에 못 덮었다.
+#
+#   종목별로 넷을 판정한다. 넷이 다 통과해야 달러 환산이 성립한다.
+#     1. 커버리지    page=0&limit=100 이 90일을 덮는가
+#     2. 재량 비중   창 안에서 P-Purchase / S-Sale 이 몇 %인가
+#     3. price 건전성  재량 행의 price 가 채워져 있는가
+#     4. 페이징      page=1 이 더 과거를 주는가, 아니면 중복인가
+#
+#   하나라도 깨지면 2차의 통계형 3컬럼
+#   (Insider_Sales_Q / Insider_Sales_TTM4 / Insider_Q)으로 확정한다.
+#
+# 안전성:
+#   · 시트 접근 없음 · 이메일 없음 · 알림 상태 머신 미접촉
+#   · GOOGLE_API_KEY 불필요
+#   → 몇 번을 돌려도 부작용이 없다.
+#
+# 비용: 총 6콜 (종목당 2 × 3종목).
+#
+# ⚠️ repository_dispatch 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "쉼표 구분 티커 (비우면 AAPL,NVDA,WMT)"
+        type: string
+        default: ""
+
+jobs:
+  probe3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # requests 는 fmp_http 용. 날짜는 표준 datetime 으로 계산한다.
+      - name: 📦 의존성
+        run: pip install requests
+
+      - name: 🔬 search 커버리지·달러 환산 가능성 확인
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          TICKERS:     ${{ inputs.tickers }}
+        run: python automation/diag_earnings_cblock_probe3.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_earnings_cblock_probe3.py
