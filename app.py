@@ -5154,15 +5154,20 @@ def cached_evaluate_kpis_snapshot(ticker_upper: str):
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
-    """분기별 EPS 어닝 서프라이즈 — FMP earnings-surprises + income-statement 사용."""
+    """분기별 EPS 어닝 서프라이즈 — FMP earnings + income-statement 사용."""
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
 
-    # 방법 1: earnings-surprises (과거 EPS 실제 vs 예상)
+    # 방법 1: earnings (과거 EPS 실제 vs 예상)
+    # [2026-08-15] earnings-surprises 에서 교체. stable 에는 개별 심볼용
+    # earnings-surprises 가 없다(-bulk 만 존재) — 실측 404 확인.
+    # 경로와 함께 **필드명도 반드시 같이 바꿔야 한다.** earnings 응답은
+    # epsActual/epsEstimated 를 쓰므로, 경로만 고치면 404 가 "전 행 N/A" 로
+    # 바뀔 뿐 오히려 더 조용한 실패가 된다.
     try:
         r = requests.get(
-            f"{_FMP_BASE}/earnings-surprises?symbol={ticker_upper}&apikey={k}",
+            f"{_FMP_BASE}/earnings?symbol={ticker_upper}&limit=8&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         data = r.json() if r.status_code == 200 else []
@@ -5174,10 +5179,12 @@ def cached_earnings_history(ticker_upper: str) -> pd.DataFrame:
                 if not date_str or date_str >= today_str:
                     continue
                 eps_actual = to_float(
-                    item.get("actualEarningResult") or item.get("actualEPS") or item.get("eps")
+                    item.get("epsActual") or item.get("actualEarningResult")
+                    or item.get("actualEPS") or item.get("eps")
                 )
                 eps_est = to_float(
-                    item.get("estimatedEarning") or item.get("estimatedEPS") or item.get("epsEstimated")
+                    item.get("epsEstimated") or item.get("estimatedEarning")
+                    or item.get("estimatedEPS")
                 )
                 surprise = "N/A"
                 if pd.notna(eps_actual) and pd.notna(eps_est) and eps_est != 0:
@@ -5504,7 +5511,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             for tk in list(dict.fromkeys(risk_tickers))[:3]:
                 try:
                     r = requests.get(
-                        f"{_FMP_BASE}/stock-news?symbols={tk}&limit=3&apikey={k_drg}",
+                        f"{_FMP_BASE}/news/stock?symbols={tk}&limit=3&apikey={k_drg}",
                         timeout=_FMP_TIMEOUT
                     )
                     if r.status_code == 200:
@@ -5970,94 +5977,25 @@ def _drg_get(sector_filter: str = "전체") -> tuple[dict, bool, str]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def find_etfs_holding_stock(stock_ticker: str) -> list[dict]:
+    """개별 주식을 보유한 ETF 검색 — **이 요금제에서 미지원**.
+
+    [2026-08-15] 실측 결과 보유종목 조회 경로가 모두 막혔다.
+        etf-holder/{sym}        → 404 (v3 레거시, stable 에 없음)
+        etf/holdings?symbol=    → 402 (플랜 미포함)
+
+    이전 구현은 check_list 20개 ETF 를 순회하며 매번 404 를 받고 continue 했다.
+    호출당 왕복이 그대로 지연으로 쌓였고 결과는 항상 빈 리스트였다.
+
+    **fmp_extras.ETF_CONSTITUENTS 로 대체하지 않는다.** 그 맵은 ETF 별 대표종목
+    일부만 담은 축약본이라, "어떤 ETF 가 이 종목을 담고 있나"라는 역방향 질문에
+    쓰면 SPY·QQQ·VOO 처럼 맵에 없는 ETF 를 "보유하지 않음"으로 단정하게 된다.
+    없는 것을 없다고 하는 게 아니라 **있는 것을 없다고 하는** 거짓 음성이며,
+    손실 회피 원칙에 정면으로 어긋난다. 데이터가 없으면 없다고 말하는 편이 낫다.
+
+    반환 계약(list[dict])은 호출부 호환을 위해 유지한다.
     """
-    개별 주식이 어떤 ETF의 보유 종목에 포함되어 있는지 찾기.
-    컬럼명에 의존하지 않고 row의 숫자값을 직접 순회해서 weight 추출.
-    """
-    if not stock_ticker:
-        return []
+    return []
 
-    target = str(stock_ticker).strip().upper()
-    results = []
-
-    check_list = [
-        "QQQ", "SPY", "VOO", "VGT", "XLK",
-        "SOXX", "SMH", "XSD", "ARKK", "ARKW",
-        "IWM", "MGK", "RSP", "XLF", "XLV",
-        "XLE", "XLY", "XLI", "CIBR", "BOTZ",
-    ]
-
-    def _extract_weight_from_row(row) -> float:
-        """row에서 0~100 범위의 숫자를 weight로 추출."""
-        for val in row:
-            num = pd.to_numeric(val, errors="coerce")
-            if pd.isna(num):
-                continue
-            # 0~1 범위면 % 비중 (0.05 → 5%)
-            if 0 < num <= 1:
-                return round(float(num) * 100, 3)
-            # 0~100 범위면 이미 %
-            if 1 < num <= 100:
-                return round(float(num), 3)
-        return np.nan
-
-    k = _fmp_key()
-    for etf_tk in check_list:
-        try:
-            holdings_df = None
-            # FMP ETF holdings
-            if k:
-                try:
-                    r = requests.get(
-                        f"{_FMP_BASE}/etf-holder/{etf_tk}?apikey={k}",
-                        timeout=_FMP_TIMEOUT
-                    )
-                    if r.status_code == 200:
-                        data = r.json()
-                        if isinstance(data, list) and data:
-                            holdings_df = pd.DataFrame(data)
-                except Exception:
-                    pass
-
-            if holdings_df is None or holdings_df.empty:
-                continue
-
-            found = False
-            rank = -1
-            weight = np.nan
-
-            # Case A: index가 ticker (가장 흔한 패턴)
-            idx_list = [str(i).strip().upper() for i in holdings_df.index]
-            if target in idx_list:
-                found = True
-                rank = idx_list.index(target) + 1
-                row = holdings_df.iloc[rank - 1]
-                weight = _extract_weight_from_row(row.values)
-
-            # Case B: 컬럼 중 하나가 ticker
-            if not found:
-                for col in holdings_df.columns:
-                    col_vals = holdings_df[col].astype(str).str.strip().str.upper().tolist()
-                    if target in col_vals:
-                        found = True
-                        rank = col_vals.index(target) + 1
-                        row = holdings_df.iloc[rank - 1]
-                        # ticker 컬럼 제외한 나머지 값에서 weight 추출
-                        other_vals = [v for c, v in zip(holdings_df.columns, row.values) if c != col]
-                        weight = _extract_weight_from_row(other_vals)
-                        break
-
-            if found:
-                results.append({
-                    "etf": etf_tk,
-                    "weight": weight if pd.notna(weight) else None,
-                    "rank": rank,
-                })
-        except Exception:
-            continue
-
-    results.sort(key=lambda x: (x.get("weight") or 0), reverse=True)
-    return results
 
 def fetch_short_interest(ticker_upper: str) -> dict:
     """공매도 비율 — FMP stable/shares-float + quote 사용."""
@@ -7114,20 +7052,31 @@ def cached_build_etf_holdings_performance_pairs(holding_pairs):
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
-def cached_etf_holdings_universe_str(etf_ticker: str):
-    t_clean = str(etf_ticker or "").strip().upper()
-    k = _fmp_key()
-    if not k:
-        return []
-    try:
-        r = requests.get(f"{_FMP_BASE}/etf-holder/{t_clean}?apikey={k}", timeout=_FMP_TIMEOUT)
-        data = r.json() if r.status_code == 200 else []
-        if isinstance(data, list) and data:
-            return [str(item.get("asset") or item.get("symbol") or "").strip().upper()
-                    for item in data if item.get("asset") or item.get("symbol")]
-    except Exception:
-        pass
-    return []
+def cached_etf_holdings_universe_str(etf_ticker: str) -> pd.DataFrame:
+    """ETF 보유종목 — **이 요금제에서 미지원**. 빈 DataFrame 을 돌려준다.
+
+    [2026-08-15] 두 가지를 동시에 고친다.
+
+    1) 반환 타입 불일치 (잠복 크래시)
+       기존 구현은 **list** 를 돌려줬는데 호출부는 **DataFrame** 으로 썼다.
+
+           hdf = cached_etf_holdings_universe_str(etf)
+           if hdf is None or hdf.empty or "Ticker" not in hdf.columns:
+
+       `[].empty` → AttributeError. 기회 스캐너의 이 지점은 try 로 감싸여 있지
+       않아 섹터 라벨을 선택하면 그대로 터진다. 정밀 분석 쪽 호출부는 큰 try
+       안이라 조용히 죽었을 뿐 같은 결함이다.
+       호출부가 기대하는 계약은 columns=["Ticker", "Weight(%)"] 인 DataFrame 이다.
+
+    2) 죽은 엔드포인트
+       etf-holder/{sym} → 404 (v3 레거시), etf/holdings?symbol= → 402 (플랜 미포함).
+       살릴 방법이 없으므로 호출을 제거한다.
+
+    ETF_CONSTITUENTS 폴백을 붙이지 않는 이유: 그 맵에는 비중 정보가 없어
+    "Weight(%)" 가 전부 0.0 으로 표시된다. 보유 비중을 0% 로 보여주는 것은
+    데이터 없음보다 나쁘다. 폴백 부착은 비중 표시 방식을 함께 정한 뒤 별건으로.
+    """
+    return pd.DataFrame(columns=["Ticker", "Weight(%)"])
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -14763,7 +14712,7 @@ def _fetch_portfolio_movement_data(tickers: list) -> tuple:
       spy_change_pct = float|None  (시장 컨텍스트용 SPY 당일 등락률)
 
     가격·등락률은 FMP /batch-quote 1콜(누락분만 단일 quote 폴백),
-    뉴스는 종목별 /stock-news 를 ThreadPoolExecutor 로 병렬 조회한다.
+    뉴스는 종목별 /news/stock 을 ThreadPoolExecutor 로 병렬 조회한다.
     """
     import concurrent.futures as _cf
 
@@ -14831,7 +14780,7 @@ def _fetch_portfolio_movement_data(tickers: list) -> tuple:
     def _fetch_one_news(tk):
         try:
             r = requests.get(
-                f"{_FMP_BASE}/stock-news?symbols={tk}&limit=3&apikey={k}",
+                f"{_FMP_BASE}/news/stock?symbols={tk}&limit=3&apikey={k}",
                 timeout=_FMP_TIMEOUT,
             )
             if r.status_code == 200:
@@ -18612,12 +18561,11 @@ if st.session_state.get("logged_in"):
         # ── 이 종목을 보유한 ETF 목록 (기본 접힘) ────────────────────────
         if not is_etf_mode:
             with st.expander("📊 이 종목을 보유한 ETF 목록", expanded=False):
-                st.caption("주요 ETF 20개 중 이 종목을 보유 중인 ETF를 자동으로 찾습니다.")
+                st.caption("현재 FMP 요금제에서 ETF 보유종목 조회가 지원되지 않습니다.")
                 _etf_list_key = f"_etf_holding_{selected_ticker}"
                 if st.session_state.get(_etf_list_key) is None:
                     try:
-                        with st.spinner(f"{selected_ticker} 보유 ETF 검색 중... (약 10초)"):
-                            _etf_list = find_etfs_holding_stock(selected_ticker)
+                        _etf_list = find_etfs_holding_stock(selected_ticker)
                         st.session_state[_etf_list_key] = _etf_list
                     except Exception as _etf_err:
                         st.session_state[_etf_list_key] = []
@@ -18634,7 +18582,12 @@ if st.session_state.get("logged_in"):
                         })
                     st.dataframe(pd.DataFrame(_etf_rows), use_container_width=True, hide_index=True)
                 else:
-                    st.info(f"조회한 주요 ETF 20개 중 {selected_ticker}를 보유한 ETF를 찾지 못했습니다.")
+                    # "찾지 못했다"고 쓰면 조회했는데 보유 ETF 가 없다는 뜻이 된다.
+                    # 실제로는 조회 자체가 불가하다 — 거짓 음성을 만들지 않는다.
+                    st.info(
+                        "ETF 보유종목 데이터는 현재 요금제에서 제공되지 않습니다. "
+                        f"{selected_ticker}를 보유한 ETF가 없다는 뜻이 아닙니다."
+                    )
                 if st.button("🔄 다시 조회", key=f"re_find_etf_{selected_ticker}"):
                     st.session_state.pop(_etf_list_key, None)
                     find_etfs_holding_stock.clear()

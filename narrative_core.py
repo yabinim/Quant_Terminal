@@ -134,9 +134,12 @@ def _dedup_and_rank(all_news: list, top_n: int = 60) -> list:
 
 def _build_news_context_text(top_news: list) -> str:
     """LLM 프롬프트용 섹션 구조화 컨텍스트."""
+    # [2026-08-15] SECTION A(Press Releases) 정의 제거.
+    # 이 섹션을 채우던 유일한 소스가 Layer B 였는데 해당 엔드포인트가 이 플랜에서
+    # 402 로 확정되어 제거됐다. 아래 루프는 `if not items: continue` 로 빈 버킷을
+    # 건너뛰므로 SECTION A 는 이미 렌더링된 적이 없다 — 정의만 남아 있던 죽은 설정이다.
+    # 섹션 문자(B/C/D/E)는 과거 로그와의 대조를 위해 그대로 둔다.
     section_defs = [
-        ("FMP Press Release", "\u2501\u2501\u2501 [SECTION A] Press Releases \u2014 고임팩트 기업 공시 (최우선 참고) \u2501\u2501\u2501",
-         "어닝 발표\u00b7M&A\u00b7가이던스 등 주가에 직접 영향을 주는 공식 기업 공시입니다.\n이 섹션의 Tickers 종목은 즉각적인 가격 반응이 확인된 최우선 winners 후보입니다."),
         ("FMP Stock News", "\u2501\u2501\u2501 [SECTION B] Stock News \u2014 종목 티커 태그 포함 뉴스 \u2501\u2501\u2501",
          "각 기사에 관련 종목 티커가 태그되어 있습니다.\nTickers 필드에 명시된 종목을 해당 테마의 직접 수혜주 후보로 간주하세요."),
         ("FMP Article", "\u2501\u2501\u2501 [SECTION C] FMP Articles \u2014 전문 애널리스트 분석 기사 \u2501\u2501\u2501",
@@ -215,16 +218,21 @@ def fetch_global_market_news(fmp_api_key: str = "", top_n: int = 60):
     all_news = []
     source_log = []
     if fmp_api_key:
+        # [2026-08-15] Layer B(보도자료, weight 1.3) 제거.
+        #   press-releases-latest       → 404 (경로 오기, 공식은 news/ prefix)
+        #   news/press-releases-latest  → 402 (플랜 미포함)
+        #   news/press-releases?symbols= → 402 (플랜 미포함)
+        # 실측 결과 -latest·검색형 모두 402 라 이 플랜에서 보도자료는 확보 불가다.
+        # 그동안 404 를 삼키고 빈 리스트를 더하고 있었으므로 **출력은 바뀌지 않는다**.
+        # 달라지는 것은 호출 1개 절약과 source_log 가 정직해지는 것뿐이다.
         layer_a = _fmp_news_to_unified(_fmp_news_fetch("news/stock-latest", {"page": 0, "limit": 50}, fmp_api_key),
                                        "FMP Stock News", weight=1.2, body_key="text", max_body=300)
-        layer_b = _fmp_news_to_unified(_fmp_news_fetch("press-releases-latest", {"page": 0, "limit": 30}, fmp_api_key),
-                                       "FMP Press Release", weight=1.3, body_key="text", max_body=300)
         layer_c = _fmp_news_to_unified(_fmp_news_fetch("fmp-articles", {"page": 0, "limit": 20}, fmp_api_key),
                                        "FMP Article", weight=1.0, body_key="content", max_body=300)
         layer_d = _fmp_news_to_unified(_fmp_news_fetch("news/general-latest", {"page": 0, "limit": 20}, fmp_api_key),
                                        "FMP General News", weight=0.8, body_key="text", max_body=200)
-        all_news = layer_a + layer_b + layer_c + layer_d
-        source_log = [f"Stock {len(layer_a)}", f"PR {len(layer_b)}", f"Articles {len(layer_c)}", f"General {len(layer_d)}"]
+        all_news = layer_a + layer_c + layer_d
+        source_log = [f"Stock {len(layer_a)}", f"Articles {len(layer_c)}", f"General {len(layer_d)}"]
 
     raw_count = len(all_news)
     if raw_count == 0:
@@ -279,11 +287,9 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
   (이 단계는 개별주 발굴이 목적이며, ETF/섹터 흐름은 별도 단계에서 다룬다.)
 
 뉴스 소스 유형별 활용 지침 (매우 중요):
-- [SECTION A] Press Releases: 기업이 직접 발표한 공식 공시입니다.
-  해당 섹션의 "Tickers:" 필드에 태그된 종목은 실적·M&A·가이던스 등 고임팩트 이벤트가 확인된 종목이므로,
-  이런 이벤트가 가격 상승으로 확인되는 종목을 winners의 최우선 후보로 선정하세요.
 - [SECTION B] Stock News: 각 기사의 "Tickers:" 필드는 해당 뉴스와 직접 연관된 종목입니다.
   동일 티커가 여러 기사에 반복 등장할수록 모멘텀이 강한 종목으로 간주하세요.
+  이 섹션이 winners 선정의 1차 근거입니다.
 - [SECTION C] FMP Articles: 테마의 구조적 맥락과 expanding_to 단계 설정에 활용하세요.
 - [SECTION D] General/Macro News: regime(Risk On/Off, liquidity 방향) 판단에 주로 활용하세요.
 
@@ -332,7 +338,7 @@ def build_narrative_prompt(news_text, target_language: str = "ko",
   "themes": [
     {{
       "title": "테마명 (예: AI Capex Expansion)",
-      "driver": "무엇이 이 테마를 촉발했는가? Press Release·Stock News 기반 구체적 근거 포함",
+      "driver": "무엇이 이 테마를 촉발했는가? Stock News·Article 기반 구체적 근거 포함",
       "winners": "정성+정량 모두 확인된 개별 수혜주 (예: NVDA, MSFT, AVGO)",
       "emerging": "뉴스 Tickers 태그는 있으나 가격 확인 필요한 개별주 (예: ARM, MRVL)",
       "momentum_note": "강함/보통/약함 중 하나만 선택 (예: 강함)",

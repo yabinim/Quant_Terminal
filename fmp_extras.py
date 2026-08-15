@@ -386,7 +386,7 @@ def fmp_batch_market_cap(tickers: tuple) -> dict:
     syms = ",".join(sorted({str(t).upper().strip() for t in tickers if t}))
     if not syms:
         return {}
-    data = _get_json(f"batch-market-capitalization?symbols={syms}")
+    data = _get_json(f"market-capitalization-batch?symbols={syms}")
     if not isinstance(data, list):
         return {}
     out = {}
@@ -449,7 +449,7 @@ def fmp_etf_info(symbol: str) -> dict:
 @st.cache_data(ttl=86400, show_spinner=False)
 def fmp_etf_sector_weighting(symbol: str) -> dict:
     """ETF 섹터 비중. 반환: {섹터: 비중%}."""
-    data = _get_json(f"etf/sector-weighting?symbol={symbol}")
+    data = _get_json(f"etf/sector-weightings?symbol={symbol}")
     if not isinstance(data, list):
         return {}
     out = {}

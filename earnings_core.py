@@ -336,7 +336,9 @@ def past_earnings_dates(ticker: str, today=None, limit: int = GAP_QUARTERS + 4,
         return []
     t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
     rows, seen = [], set()
-    for path in (f"earnings?symbol={tk}", f"earnings-surprises?symbol={tk}"):
+    # earnings-surprises 는 stable 에 개별 심볼용이 없다(-bulk 만 존재). 실측에서
+    # 404 확인됨 — 티커마다 1콜씩 버려지고 있었다. earnings?symbol= 하나로 충분하다.
+    for path in (f"earnings?symbol={tk}",):
         for it in (_get(path, key) or []):
             if not isinstance(it, dict):
                 continue
