@@ -1,0 +1,60 @@
+name: 🧪 회귀 — 내부자 블록 (C블록)
+
+# 언제 도나:
+#   수동 실행, 그리고 관련 파일이 바뀐 PR/푸시에서 자동으로.
+#   네트워크·시트 접근이 없어 언제든 안전하게 돌릴 수 있다.
+#
+# 무엇을 지키나 (실제로 밟았거나 밟을 뻔한 위험):
+#   1. 유형 오염   — A-Award/F-InKind/M-Exempt/G-Gift 를 재량으로 세면
+#                    베스팅일에 가짜 신호가 뜬다
+#   2. 창 오염     — 90일 밖 행이 합계에 들어가면 종목마다 다른 기간을 더한다
+#   3. 열 정렬     — 내부자 4열을 맨 뒤가 아닌 곳에 끼우면 기존 29열 행의
+#                    Data_Flags 가 숫자로, Notes 가 플래그로 읽힌다
+#   4. 결측 vs 0   — 조회 실패를 0 으로 쓰면 "봤는데 없었다"와 "못 봤다"가 섞인다
+#   5. 미래 누출   — 백필이 발표일 이후 분기를 쓰면 백테스트가 통째로 무의미해진다
+#
+#   각 항목에 변이 테스트가 붙어 있다 — 방어를 일부러 망가뜨렸을 때
+#   테스트가 실제로 실패하는지 확인한다. 통과만 하는 테스트는 방어가 아니다.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'earnings_core.py'
+      - 'automation/backfill_insider_stats.py'
+      - 'automation/diag_earnings_insider.py'
+  pull_request:
+    paths:
+      - 'earnings_core.py'
+      - 'automation/backfill_insider_stats.py'
+      - 'automation/diag_earnings_insider.py'
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # gspread 를 일부러 넣지 않는다 — 백필의 순수 함수가 시트 의존 없이
+      # 테스트 가능해야 한다는 조건 자체를 여기서 검증한다.
+      - name: 📦 의존성 (시트 라이브러리 제외)
+        run: pip install requests pandas numpy
+
+      - name: 🧪 내부자 블록 회귀
+        run: python automation/diag_earnings_insider.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          earnings_core.py
+          run_earnings_watch.py
+          automation/backfill_insider_stats.py
+          automation/diag_earnings_insider.py
