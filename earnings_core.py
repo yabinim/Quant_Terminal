@@ -1650,6 +1650,12 @@ EVENTS_COLS = [
     "Gap_Held", "PEAD_Verdict", "Pred_Hit", "Verified_At",
     # 지연 (D+5)
     "D5_Return_Pct", "Notes",
+    # 사전 종가 기준 수익률 (2026-08-15 추가 — 2단계 프리뷰 대조용)
+    #   기존 D5_Return_Pct 는 '반응일 종가' 기준이라 축이 다르다. 이쪽은
+    #   **발표 전날 종가**(= 갭 계산의 분모와 동일) 기준이라, 발표 전에 들고
+    #   들어갔을 때의 실제 손익을 잰다. 둘 다 유지한다.
+    #   ⚠️ 중간 삽입 금지 — 반드시 꼬리에 추가한다(범위 지정이 깨진다).
+    "Pre_Ret_D1_Pct", "Pre_Ret_D3_Pct", "Pre_Ret_D7_Pct",
 ]
 EVENTS_NCOL = len(EVENTS_COLS)
 
@@ -1731,3 +1737,480 @@ def parse_events(values: list) -> list[dict]:
         d["_row"] = i
         out.append(d)
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 실적 프리뷰 브리핑 (2단계) — Earnings_Preview
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 목적
+#   실적 발표 전에 "기대치가 어디 잡혀 있고, 내가 틀리면 얼마 잃나"를 보여준다.
+#   **방향 예측은 하지 않는다.** 1,209건 백테스트에서 5개 요인 전부 방향 예측
+#   엣지가 없음이 확인됐다(최고 점수 구간의 상승 갭 비율 45.2% — 무조건부
+#   기준선보다 낮음). 여기 저장하는 요인들은 '예측'이 아니라
+#   **'시장이 이미 얼마나 반영했나'** 를 서술하는 용도다.
+#
+# 왜 별도 시트인가
+#   Earnings_Events 는 1행 = 1이벤트다. 프리뷰는 1행 = 1스냅샷(D-7/D-3/최종)이라
+#   축이 다르다. 같은 시트에 넣으면 이벤트당 3행이 되어 기존 조회가 전부 깨진다.
+#   append-only 로만 쓴다 — 과거 스냅샷은 절대 수정하지 않는다.
+#   "그때 내가 본 숫자"가 보존되어야 사후 대조가 의미를 갖는다.
+#
+# 이 플랜에서 불가능한 것 (2026-08-15 실측)
+#   · analyst-estimates          → HTTP 402. EPS·매출 컨센서스는
+#                                  earnings?symbol= 의 미래 행에서 얻는다
+#   · earning-call-transcript-*  → HTTP 402. 트랜스크립트 요약 불가.
+#                                  Transcript_Summary 열은 자리만 확보해 둔다
+#   · 공매도 비율                → 엔드포인트 자체가 플랜에 없음.
+#                                  백테스트에 있던 Surprise_Avg_Pct 로 대체
+# ──────────────────────────────────────────────────────────────────────────
+
+PREVIEW_WORKSHEET = "Earnings_Preview"
+PREVIEW_COLS = [
+    # ── 식별 ──
+    "Snapshot_ID", "Event_ID", "Ticker", "Earnings_Date", "Timing",
+    "Phase", "Days_Until", "Snapshot_At",
+    # ── 가격·리스크 (그 시점에 본 최악치를 박아둔다) ──
+    "Price_At_Snapshot", "Exp_Median_Pct", "Exp_Worst_Pct",
+    # ── A블록: 기대치가 어디 잡혀 있나 ──
+    "Est_EPS", "Est_EPS_YoY_Pct", "Est_Revision_Pct",
+    "Est_Revenue", "Est_Revenue_YoY_Pct",
+    "Target_Mean", "Target_Upside_Pct",
+    # ── B블록: 얼마나 이미 반영됐나 (전부 백테스트 검증 산식) ──
+    "RS_20d_Pct", "Beat_Rate_Pct", "Surprise_Avg_Pct",
+    "Grade_Buy_Pct", "Grade_Drift_90d", "Sample_N_Q",
+    # ── C블록: 서술 (3단계에서 Transcript_Summary 사용 예정) ──
+    "News_Count", "News_JSON", "Transcript_Summary",
+    # ── 메타 ──
+    "Data_Flags", "Notes",
+]
+PREVIEW_NCOL = len(PREVIEW_COLS)
+
+# 백테스트(diag_earnings_preview_backtest.py)와 **같은 값을 써야 한다.**
+# 여기서 창을 바꾸면 저장되는 숫자가 검증된 산식과 달라진다.
+PREVIEW_RS_WINDOW = 20            # 상대강도 관측 창 (거래일)
+PREVIEW_GRADE_DRIFT_DAYS = 90     # 의견 변화 관측 창. 월별 데이터라 60일은 관측점 1~2개
+PREVIEW_SURPRISE_LOOKBACK = 8     # beat율·평균 서프라이즈 표본 분기 수
+PREVIEW_MIN_QUARTERS = 4          # 이 미만이면 B블록 산출 거부 (추정치로 지시 금지)
+PREVIEW_YOY_TOL_DAYS = 45         # 전년 동기 매칭 허용 오차 — 분기 날짜가 밀리는 종목 대비
+PREVIEW_NEWS_MAX = 5              # 스냅샷당 저장 헤드라인 수
+PREVIEW_NEWS_TITLE_MAX = 140      # 제목 절단 길이 (셀 용량 방어)
+
+# 스냅샷 발동 창.
+#   창을 두는 이유: 휴장일에 5PM 실행이 건너뛰면 그날 dd 가 그냥 지나가버려
+#   스냅샷이 통째로 유실된다. 창끼리 겹치지 않으므로 이중 발동은 없고,
+#   (Event_ID, Phase) 중복 검사로 한 번 더 막는다.
+PREVIEW_PHASE_WINDOWS = (("D7", 6, 8), ("D3", 3, 4))
+PREVIEW_PHASES = ("D7", "D3", "FINAL")
+
+PREVIEW_PHASE_LABELS = {
+    "D7": "D-7 초기",
+    "D3": "D-3 중간",
+    "FINAL": "최종",
+}
+
+
+def preview_final_dd(timing: str = "") -> int:
+    """최종 스냅샷의 목표 D-N.
+
+    AMC(장 마감 후 발표) → D-1 종가까지 반영 가능.
+    BMO(장 시작 전 발표) → D-1 아침에 이미 발표되므로 D-2 가 마지막 안전 시점.
+    미상 → AMC 로 간주(보수적: 더 늦게 찍는다).
+    """
+    t = str(timing or "").strip().lower()
+    return 2 if t == "bmo" else 1
+
+
+def preview_phase(days_until, timing: str = "") -> str:
+    """D-N → 스냅샷 Phase. 해당 없으면 "".
+
+    dd == 0 에서는 절대 발동하지 않는다. 발표 당일 5PM 실행은 AMC 라면
+    **이미 발표된 뒤**라 '사전' 스냅샷이 아니게 된다.
+    """
+    dd = _num(days_until)
+    if dd is None:
+        return ""
+    dd = int(dd)
+    if dd < 1:
+        return ""
+    for name, lo, hi in PREVIEW_PHASE_WINDOWS:
+        if lo <= dd <= hi:
+            return name
+    if 1 <= dd <= preview_final_dd(timing):
+        return "FINAL"
+    return ""
+
+
+def preview_snapshot_id(eid: str, phase: str) -> str:
+    return f"{str(eid or '')}_{str(phase or '')}"
+
+
+# ── FMP 조회 ──────────────────────────────────────────────────────────────
+
+def fetch_earnings_records(ticker: str, key: str = "", limit: int = 16) -> list[dict]:
+    """earnings?symbol= 원본 → 정규화 레코드 (최신순).
+
+    **이 한 콜이 A블록과 B블록을 동시에 먹인다.**
+      · 미래 행 → EPS·매출 컨센서스 (A블록)
+      · 과거 행 → beat율·평균 서프라이즈 폭 (B블록) + 전년 동기 실적 (YoY)
+
+    2026-08-15 실측 확인 필드:
+        date, epsActual, epsEstimated, lastUpdated,
+        revenueActual, revenueEstimated, symbol
+    """
+    tk = str(ticker or "").strip().upper()
+    if not tk:
+        return []
+    out = []
+    for it in (_get(f"earnings?symbol={tk}&limit={int(limit)}", key) or []):
+        if not isinstance(it, dict):
+            continue
+        d = _d(it.get("date"))
+        if d is None:
+            continue
+        out.append({
+            "date": d.strftime("%Y-%m-%d"),
+            "_dt": d,
+            "eps_est": _num(it.get("epsEstimated")),
+            "eps_act": _num(it.get("epsActual")),
+            "rev_est": _num(it.get("revenueEstimated")),
+            "rev_act": _num(it.get("revenueActual")),
+        })
+    out.sort(key=lambda x: x["date"], reverse=True)
+    return out
+
+
+def split_future_past(records: list, today=None) -> tuple:
+    """레코드 → (다가오는 분기 1건 | None, 과거 분기 목록 최신순).
+
+    '미래'의 기준은 오늘이 아니라 **실적 발표일**이다. 오늘 이후 발표 행 중
+    가장 가까운 것이 이번 이벤트다.
+    """
+    t0 = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    fut = [r for r in (records or []) if r.get("_dt") is not None and r["_dt"] >= t0]
+    past = [r for r in (records or []) if r.get("_dt") is not None and r["_dt"] < t0]
+    fut.sort(key=lambda x: x["date"])
+    return (fut[0] if fut else None), past
+
+
+def fetch_price_target(ticker: str, key: str = "") -> dict:
+    """price-target-consensus → {mean, median, high, low}. 없으면 빈 dict."""
+    tk = str(ticker or "").strip().upper()
+    if not tk:
+        return {}
+    data = _get(f"price-target-consensus?symbol={tk}", key)
+    items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        mean = _num(it.get("targetConsensus") or it.get("targetMean"))
+        med = _num(it.get("targetMedian"))
+        if mean is None and med is None:
+            continue
+        return {"mean": mean, "median": med,
+                "high": _num(it.get("targetHigh")), "low": _num(it.get("targetLow"))}
+    return {}
+
+
+def fetch_grade_series(ticker: str, key: str = "", limit: int = 400) -> list:
+    """grades-historical → [(date, 매수의견 비율%)] 오름차순.
+
+    매수의견 비율 = (StrongBuy + Buy) / 전체 × 100.
+    diag_earnings_preview_backtest.grade_series 와 **동일 산식**이어야 한다.
+
+    이 엔드포인트는 previousGrade/newGrade/action 을 주지 않는다. 월별
+    '의견 분포 스냅샷'이지 '변경 이력'이 아니다.
+    """
+    tk = str(ticker or "").strip().upper()
+    if not tk:
+        return []
+    out = []
+    for it in (_get(f"grades-historical?symbol={tk}&limit={int(limit)}", key) or []):
+        if not isinstance(it, dict):
+            continue
+        d = _d(it.get("date") or it.get("publishedDate"))
+        if d is None:
+            continue
+        sb = _num(it.get("analystRatingsStrongBuy")) or 0.0
+        b = _num(it.get("analystRatingsBuy")) or 0.0
+        h = _num(it.get("analystRatingsHold")) or 0.0
+        sl = _num(it.get("analystRatingsSell")) or 0.0
+        ss = _num(it.get("analystRatingsStrongSell")) or 0.0
+        tot = sb + b + h + sl + ss
+        if tot <= 0:
+            continue
+        out.append((d, (sb + b) / tot * 100.0))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def fetch_stock_news(ticker: str, key: str = "", limit: int = 10) -> list[dict]:
+    """news/stock?symbols= → [{date, title, site, url}] 최신순.
+
+    narrative_core 의 뉴스 경로는 **시장 전체** 전용이라 재사용할 수 없다.
+    """
+    tk = str(ticker or "").strip().upper()
+    if not tk:
+        return []
+    out = []
+    for it in (_get(f"news/stock?symbols={tk}&limit={int(limit)}", key) or []):
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title") or "").strip()
+        if not title:
+            continue
+        d = _d(str(it.get("publishedDate") or "")[:10])
+        out.append({
+            "date": ("" if d is None else d.strftime("%Y-%m-%d")),
+            "title": title[:PREVIEW_NEWS_TITLE_MAX],
+            "site": str(it.get("site") or "").strip()[:40],
+            "url": str(it.get("url") or "").strip()[:300],
+        })
+    out.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return out
+
+
+# ── 순수 계산 ─────────────────────────────────────────────────────────────
+
+def yoy_pct(cur, prior):
+    """전년 대비 증감률(%). 분모가 0에 가까우면 None.
+
+    prior 가 음수(적자)면 부호 때문에 증감률이 무의미해진다 — None 을 준다.
+    '적자에서 흑자'를 +300% 같은 숫자로 표시하면 오독을 부른다.
+    """
+    c, p = _num(cur), _num(prior)
+    if c is None or p is None or p <= 0:
+        return None
+    return (c - p) / p * 100.0
+
+
+def prior_year_quarter(past: list, target_date, tol_days: int = PREVIEW_YOY_TOL_DAYS):
+    """전년 동기 레코드. 인덱스가 아니라 **날짜 매칭**으로 찾는다.
+
+    '4개 전 행'으로 세면 분기 발표가 밀리거나 빠진 종목에서 엉뚱한 분기와
+    비교하게 된다. 목표일(= 이번 발표일 - 365일)에 가장 가까운 행을 쓰되,
+    tol_days 를 넘으면 비교를 포기한다.
+    """
+    t = _d(target_date)
+    if t is None or not past:
+        return None
+    goal = t - pd.Timedelta(days=365)
+    best, best_gap = None, None
+    for r in past:
+        d = r.get("_dt")
+        if d is None:
+            continue
+        gap = abs(int((d - goal).days))
+        if best_gap is None or gap < best_gap:
+            best, best_gap = r, gap
+    if best is None or best_gap > int(tol_days):
+        return None
+    return best
+
+
+def beat_stats(past: list, lookback: int = PREVIEW_SURPRISE_LOOKBACK,
+               min_sample: int = PREVIEW_MIN_QUARTERS) -> dict:
+    """과거 분기 → beat율 + 평균 서프라이즈 폭.
+
+    공매도 비율이 이 플랜에 없어 그 자리를 **평균 서프라이즈 폭**이 대신한다.
+    임의 대체가 아니라 백테스트 FACTORS 에 원래 있던 요인(F2_surp)이다.
+
+    표본이 min_sample 미만이면 산출을 거부한다 — 2~3분기로 낸 beat율은
+    노이즈이고, 그걸 카드에 띄우면 없느니만 못하다.
+    """
+    vals = []
+    for r in (past or [])[:int(lookback)]:
+        act, est = _num(r.get("eps_act")), _num(r.get("eps_est"))
+        if act is None or est is None or abs(est) < 1e-9:
+            continue
+        vals.append((act - est) / abs(est) * 100.0)
+    if len(vals) < int(min_sample):
+        return {"ok": False, "beat_rate_pct": None, "surprise_avg_pct": None,
+                "sample_n": len(vals)}
+    beat = sum(1 for v in vals if v > 0) / len(vals) * 100.0
+    return {"ok": True, "beat_rate_pct": beat,
+            "surprise_avg_pct": sum(vals) / len(vals), "sample_n": len(vals)}
+
+
+def rel_strength_pct(hist, spy_hist, window: int = PREVIEW_RS_WINDOW, asof=None):
+    """20일 상대강도 = 종목 수익률 − SPY 수익률 (%p).
+
+    diag_earnings_preview_backtest.build_events 의 F3_rs 와 동일 산식.
+    SPY 를 못 구하면 절대 수익률을 그대로 준다(부분 정보라도 남긴다).
+    """
+    if hist is None or getattr(hist, "empty", True) or "Close" not in hist.columns:
+        return None
+    s = hist["Close"]
+    if asof is not None:
+        a = _d(asof)
+        if a is not None:
+            s = s.loc[:a]
+    w = int(window)
+    if len(s) < w + 1:
+        return None
+    c0, c1 = _num(s.iloc[-w - 1]), _num(s.iloc[-1])
+    if c0 is None or c1 is None or c0 <= 0:
+        return None
+    out = (c1 - c0) / c0 * 100.0
+    try:
+        if spy_hist is not None and not spy_hist.empty and "Close" in spy_hist.columns:
+            ss = spy_hist["Close"]
+            if asof is not None:
+                a = _d(asof)
+                if a is not None:
+                    ss = ss.loc[:a]
+            if len(ss) > w:
+                s0, s1 = _num(ss.iloc[-w - 1]), _num(ss.iloc[-1])
+                if s0 is not None and s1 is not None and s0 > 0:
+                    out -= (s1 - s0) / s0 * 100.0
+    except Exception:
+        pass
+    return out
+
+
+def grade_factors(series: list, base_dt, drift_days: int = PREVIEW_GRADE_DRIFT_DAYS):
+    """(변화폭, 현재 수준). base_dt 이전 관측만 사용 — look-ahead 차단.
+
+    diag_earnings_preview_backtest.grade_factors 와 동일.
+    """
+    if not series:
+        return None, None
+    b = _d(base_dt)
+    if b is None:
+        return None, None
+    past = [(d, v) for d, v in series if d <= b]
+    if not past:
+        return None, None
+    level = past[-1][1]
+    cutoff = b - pd.Timedelta(days=int(drift_days))
+    older = [v for d, v in past if d <= cutoff]
+    if not older:
+        return None, level
+    return level - older[-1], level
+
+
+def news_digest(items: list, since=None, limit: int = PREVIEW_NEWS_MAX) -> tuple:
+    """(건수, JSON 문자열). since 이후 기사만 — 스냅샷 간 '증분'이 되게 한다.
+
+    since 가 None 이면(=D-7 첫 스냅샷) 최근 limit 건을 담는다.
+    """
+    s = _d(since) if since is not None else None
+    picked = []
+    for it in (items or []):
+        if s is not None:
+            d = _d(it.get("date"))
+            if d is None or d < s:
+                continue
+        picked.append({"d": it.get("date", ""), "t": it.get("title", ""),
+                       "s": it.get("site", ""), "u": it.get("url", "")})
+        if len(picked) >= int(limit):
+            break
+    if not picked:
+        return 0, ""
+    try:
+        return len(picked), json.dumps(picked, ensure_ascii=False)
+    except Exception:
+        return len(picked), ""
+
+
+def parse_news_json(s: str) -> list[dict]:
+    """News_JSON → [{d,t,s,u}]. 깨져 있으면 빈 목록 (표시가 죽지 않게)."""
+    txt = str(s or "").strip()
+    if not txt:
+        return []
+    try:
+        v = json.loads(txt)
+        return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
+def target_upside_pct(target_mean, price):
+    """목표주가 대비 상승 여력(%). 음수면 이미 목표가를 넘어선 상태."""
+    t, p = _num(target_mean), _num(price)
+    if t is None or p is None or p <= 0:
+        return None
+    return (t - p) / p * 100.0
+
+
+# ── 행 조립 ───────────────────────────────────────────────────────────────
+
+def preview_row(ev: dict, phase: str, metrics: dict, now_et: str = "") -> list:
+    """스냅샷 1건 → 시트 행. 결측은 공란으로 두고 Data_Flags 에 사유를 남긴다.
+
+    ⚠️ 여기서 계산하지 않는다. 계산은 automation 이 한 번만 하고, 앱은 저장된
+       스냅샷을 그대로 읽는다 — 메일 숫자와 앱 숫자가 구조적으로 같아야 한다.
+    """
+    m = metrics or {}
+    eid = event_id(ev.get("ticker"), ev.get("earnings_date"))
+    flags = [f for f in (m.get("flags") or []) if f]
+    row = [
+        preview_snapshot_id(eid, phase),
+        eid,
+        str(ev.get("ticker") or "").upper(),
+        str(ev.get("earnings_date") or ""),
+        str(ev.get("timing") or ""),
+        str(phase or ""),
+        ("" if _num(ev.get("days_until")) is None else int(ev.get("days_until"))),
+        str(now_et or ""),
+
+        _blank(m.get("price")),
+        _blank(m.get("exp_median_pct")), _blank(m.get("exp_worst_pct")),
+
+        _blank(m.get("est_eps")), _blank(m.get("est_eps_yoy_pct")),
+        _blank(m.get("est_revision_pct")),
+        _blank(m.get("est_revenue")), _blank(m.get("est_revenue_yoy_pct")),
+        _blank(m.get("target_mean")), _blank(m.get("target_upside_pct")),
+
+        _blank(m.get("rs_20d_pct")), _blank(m.get("beat_rate_pct")),
+        _blank(m.get("surprise_avg_pct")), _blank(m.get("grade_buy_pct")),
+        _blank(m.get("grade_drift_90d")), int(m.get("sample_n_q") or 0),
+
+        int(m.get("news_count") or 0), str(m.get("news_json") or ""),
+        "",                                    # Transcript_Summary — 3단계 예약
+
+        ",".join(flags), str(m.get("notes") or ""),
+    ]
+    return (row + [""] * PREVIEW_NCOL)[:PREVIEW_NCOL]
+
+
+def parse_preview(values: list) -> list[dict]:
+    """Earnings_Preview get_all_values → dict 목록 (헤더 제외)."""
+    out = []
+    if not values or len(values) < 2:
+        return out
+    for i, r in enumerate(values[1:], start=2):
+        r = (list(r) + [""] * PREVIEW_NCOL)[:PREVIEW_NCOL]
+        d = {c: r[j] for j, c in enumerate(PREVIEW_COLS)}
+        d["_row"] = i
+        out.append(d)
+    return out
+
+
+def preview_index(rows: list) -> dict:
+    """[{...}] → {(Event_ID, Phase): row}. 중복 발동 차단용."""
+    out = {}
+    for r in (rows or []):
+        if not isinstance(r, dict):
+            continue
+        k = (str(r.get("Event_ID") or ""), str(r.get("Phase") or ""))
+        if k[0] and k[1]:
+            out[k] = r
+    return out
+
+
+def last_snapshot_at(rows: list, eid: str):
+    """해당 이벤트의 **가장 최근 스냅샷 시각**. 뉴스 증분의 기준점.
+
+    없으면 None → 첫 스냅샷이므로 최근 기사를 그대로 담는다.
+    """
+    best = None
+    for r in (rows or []):
+        if str(r.get("Event_ID") or "") != str(eid or ""):
+            continue
+        d = _d(str(r.get("Snapshot_At") or "")[:10])
+        if d is None:
+            continue
+        if best is None or d > best:
+            best = d
+    return best
