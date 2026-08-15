@@ -156,6 +156,10 @@ def _calendar_ws():
     return _ws(ec.CALENDAR_WORKSHEET, ec.CALENDAR_COLS)
 
 
+def _preview_ws():
+    return _ws(ec.PREVIEW_WORKSHEET, ec.PREVIEW_COLS)
+
+
 def _col_a1(n: int) -> str:
     """1-base 열 번호 → A1 문자 (AA 이상 대응)."""
     s = ""
@@ -624,11 +628,25 @@ def pass_verify(rows, hist_cache, today):
 
 
 def pass_delayed(rows, hist_cache, today):
-    """발표 D+5 도달 행의 D5_Return_Pct 채움."""
+    """발표 D+5 도달 행의 D5_Return_Pct + 사전 종가 기준 수익률 3열.
+
+    두 축을 함께 채운다. 콜 추가는 없다 — 같은 hist 와 같은 반응일 인덱스를
+    이미 손에 쥐고 있다.
+
+      · D5_Return_Pct   기준 = **반응일 종가** (기존)
+      · Pre_Ret_DN_Pct  기준 = **발표 전날 종가** = close[i-1]
+                        (갭 계산의 분모와 동일 — 발표 전에 들고 들어간 사람의 손익)
+
+    D+N 은 '반응일부터 N거래일 보유'로 센다. 따라서 Pre_Ret_D1 은 정의상
+    Gap_Pct 와 같은 값이 된다. 중복이 아니라 **무료 정합성 검사**로 쓴다 —
+    두 값이 어긋나면 반응일 판정이나 가격 이력 중 하나가 틀린 것이다.
+    """
     updates = []
     for r in rows:
         try:
-            if str(r.get("D5_Return_Pct") or "").strip():
+            has_d5 = bool(str(r.get("D5_Return_Pct") or "").strip())
+            has_pre = bool(str(r.get("Pre_Ret_D7_Pct") or "").strip())
+            if has_d5 and has_pre:
                 continue
             if not str(r.get("Gap_Pct") or "").strip():
                 continue
@@ -642,15 +660,167 @@ def pass_delayed(rows, hist_cache, today):
             if hist is None or hist.empty:
                 continue
             i = ec.resolve_reaction_index(hist, r.get("Earnings_Date"), r.get("Timing", ""))
-            if i is None or i + 5 >= len(hist):
+            if i is None or i < 1:
                 continue
-            base, end = float(hist["Close"].iloc[i]), float(hist["Close"].iloc[i + 5])
-            if base <= 0:
-                continue
-            updates.append((r["_row"], {"D5_Return_Pct": round((end - base) / base * 100.0, 2)}))
+            patch = {}
+
+            if not has_d5 and i + 5 < len(hist):
+                base = float(hist["Close"].iloc[i])
+                if base > 0:
+                    end = float(hist["Close"].iloc[i + 5])
+                    patch["D5_Return_Pct"] = round((end - base) / base * 100.0, 2)
+
+            if not has_pre:
+                pre = float(hist["Close"].iloc[i - 1])
+                if pre > 0:
+                    # D+7 까지 전부 확정된 뒤에 한 번에 쓴다. 부분 기록을 남기면
+                    # has_pre 검사(D7 열 기준)가 통과해 D1/D3 만 채운 채 굳는다.
+                    if i + 6 < len(hist):
+                        for col, off in (("Pre_Ret_D1_Pct", 0),
+                                         ("Pre_Ret_D3_Pct", 2),
+                                         ("Pre_Ret_D7_Pct", 6)):
+                            end = float(hist["Close"].iloc[i + off])
+                            patch[col] = round((end - pre) / pre * 100.0, 2)
+
+            if patch:
+                updates.append((r["_row"], patch))
         except Exception as e:
             print(f"  [WARN] D+5 실패({r.get('Ticker')}): {e}")
     return updates
+
+
+# ── 패스 P: 실적 프리뷰 브리핑 (2단계) ────────────────────────────────────
+def pass_preview(cal, prev_rows, hist_cache, today, now_et, spy_hist=None):
+    """D-7 / D-3 / 최종 스냅샷. Tier 1(보유+워치리스트)만.
+
+    스냅샷당 FMP 4콜:
+        earnings?symbol=        A블록(EPS·매출 컨센서스) + B블록(beat·서프라이즈)
+        price-target-consensus  목표주가
+        grades-historical       의견 수준·90일 변화
+        news/stock?symbols=     뉴스 증분
+    가격 이력은 hist_cache 재사용(0콜), SPY 는 실행당 1회.
+
+    append-only. 이미 있는 (Event_ID, Phase) 는 절대 다시 쓰지 않는다 —
+    "그때 본 숫자"가 보존돼야 사후 대조가 의미를 갖는다.
+    """
+    new_rows = []
+    idx = ec.preview_index(prev_rows)
+    n_univ = n_skip = 0
+
+    for tk, row in (cal or {}).items():
+        try:
+            if ec.is_universe_only(row):
+                n_univ += 1
+                continue
+            ed = str(row.get("Earnings_Date") or "")
+            dd = ec.days_until_from_row(row, today)
+            timing = str(row.get("Timing") or "")
+            phase = ec.preview_phase(dd, timing)
+            if not phase:
+                continue
+            eid = ec.event_id(tk, ed)
+            if (eid, phase) in idx:
+                n_skip += 1
+                continue
+
+            hist = hist_cache.get(tk)
+            if hist is None or hist.empty:
+                hist = hist_cache[tk] = fmp_price_history(tk)
+            px = (float(hist["Close"].iloc[-1])
+                  if (hist is not None and not hist.empty) else None)
+
+            flags = []
+            m = {"price": px}
+            mv = ec.move_from_row(row)
+            m["exp_median_pct"] = mv.get("median_pct")
+            m["exp_worst_pct"] = mv.get("worst_down_pct")
+            if m["exp_median_pct"] is None:
+                flags.append("no_expected_move")
+
+            # ── 콜 1: A블록 + B블록 원천 ──
+            recs = ec.fetch_earnings_records(tk, key=FMP_API_KEY)
+            fut, past = ec.split_future_past(recs, today)
+            if fut is None:
+                flags.append("no_estimate")
+            else:
+                m["est_eps"] = fut.get("eps_est")
+                m["est_revenue"] = fut.get("rev_est")
+                if m["est_revenue"] is None:
+                    flags.append("no_revenue_est")
+                py = ec.prior_year_quarter(past, fut.get("date"))
+                if py is None:
+                    flags.append("no_yoy_base")
+                else:
+                    m["est_eps_yoy_pct"] = ec.yoy_pct(fut.get("eps_est"), py.get("eps_act"))
+                    m["est_revenue_yoy_pct"] = ec.yoy_pct(fut.get("rev_est"), py.get("rev_act"))
+
+            bs = ec.beat_stats(past)
+            m["sample_n_q"] = bs.get("sample_n") or 0
+            if bs.get("ok"):
+                m["beat_rate_pct"] = bs.get("beat_rate_pct")
+                m["surprise_avg_pct"] = bs.get("surprise_avg_pct")
+            else:
+                flags.append("few_quarters")
+
+            # 리비전은 캘린더가 이미 축적 중이다 — 재계산하지 않는다(SSOT).
+            rev = ec._num(row.get("Est_Revision_Pct"))
+            if rev is None:
+                flags.append("no_revision")
+            else:
+                m["est_revision_pct"] = rev
+
+            # ── 콜 2: 목표주가 ──
+            tgt = ec.fetch_price_target(tk, key=FMP_API_KEY)
+            if tgt.get("mean") is None:
+                flags.append("no_target")
+            else:
+                m["target_mean"] = tgt.get("mean")
+                m["target_upside_pct"] = ec.target_upside_pct(tgt.get("mean"), px)
+
+            # ── 콜 3: 매수의견 ──
+            gs = ec.fetch_grade_series(tk, key=FMP_API_KEY)
+            drift, level = ec.grade_factors(gs, today)
+            if level is None:
+                flags.append("no_grades")
+            else:
+                m["grade_buy_pct"] = level
+                if drift is None:
+                    flags.append("no_grade_drift")
+                else:
+                    m["grade_drift_90d"] = drift
+
+            # ── 상대강도 (0콜) ──
+            rs = ec.rel_strength_pct(hist, spy_hist)
+            if rs is None:
+                flags.append("no_rs")
+            else:
+                m["rs_20d_pct"] = rs
+                if spy_hist is None or spy_hist.empty:
+                    flags.append("rs_absolute")   # SPY 미확보 → 절대 수익률
+
+            # ── 콜 4: 뉴스 증분 ──
+            since = ec.last_snapshot_at(prev_rows, eid)
+            news = ec.fetch_stock_news(tk, key=FMP_API_KEY)
+            cnt, njson = ec.news_digest(news, since=since)
+            m["news_count"], m["news_json"] = cnt, njson
+
+            m["flags"] = flags
+            ev = {"ticker": tk, "earnings_date": ed, "days_until": dd, "timing": timing}
+            new_rows.append(ec.preview_row(ev, phase, m, now_et=now_et))
+            print(f"  [PREVIEW] {tk} {phase} D-{dd} {ed} "
+                  f"EPS={m.get('est_eps')} 목표대비={_fmt1(m.get('target_upside_pct'))}% "
+                  f"RS={_fmt1(m.get('rs_20d_pct'))}%p 뉴스{cnt}건"
+                  + (f" ⚠️{','.join(flags)}" if flags else ""))
+        except Exception as e:
+            print(f"  [WARN] {tk} 프리뷰 실패: {e}")
+    if n_univ or n_skip:
+        print(f"  [PREVIEW] 유니버스 제외 {n_univ} · 이미 기록됨 {n_skip}")
+    return new_rows
+
+
+def _fmt1(v):
+    n = ec._num(v)
+    return "—" if n is None else f"{n:+.1f}"
 
 
 # ── 수신자별 판정 (계좌 프로필 반영) ──────────────────────────────────────
@@ -891,6 +1061,29 @@ def main():
     print("\n▶ 패스 1: 사전 스냅샷")
     new_rows, snapshots = pass_snapshot(cal, existing, hist_cache, today, now_et)
 
+    # ── 패스 P: 프리뷰 브리핑 ──
+    #   패스 0 다음에 둔다 — 캘린더가 갱신된 뒤라야 D-N 판정이 오늘 기준이 된다.
+    #   메일 발송보다 앞에 두는 이유는, 여기서 터져도 기존 사전 경고 메일은
+    #   나가야 하기 때문이다(프리뷰는 부가 기능이지 게이트가 아니다).
+    print("\n▶ 패스 P: 프리뷰 브리핑")
+    p_rows, prev_rows, _pws = [], [], None
+    try:
+        _pws = _preview_ws()
+        _pv_vals = gsr.call(_pws.get_all_values, _label="Earnings_Preview") or []
+        prev_rows = ec.parse_preview(_pv_vals)
+        _pv_next_row = max(len(_pv_vals), 1) + 1
+        spy_hist = hist_cache.get("SPY")
+        if spy_hist is None or spy_hist.empty:
+            spy_hist = hist_cache["SPY"] = fmp_price_history("SPY")
+        p_rows = pass_preview(cal, prev_rows, hist_cache, today, now_et,
+                              spy_hist=spy_hist)
+        if p_rows:
+            _safe_update(_pws, p_rows, _pv_next_row, ec.PREVIEW_NCOL)
+            print(f"[OK] 프리뷰 스냅샷 {len(p_rows)}건 저장")
+    except Exception as e:
+        print(f"[ERROR] 프리뷰 실패(사전 경고는 계속 진행): {e}")
+        traceback.print_exc()
+
     # ── 캘린더 기록: 갱신 먼저, 추가는 마지막 ──
     if c_updates:
         _n_api = _batch_update(cws, c_updates, ec.CALENDAR_NCOL, label="calendar")
@@ -958,7 +1151,7 @@ def main():
 
     print("\n" + "=" * 60)
     print(f"완료 — 캘린더 {len(c_updates)}갱신/{len(c_appends)}신규 · "
-          f"스냅샷 {len(new_rows)} · 측정 {len(v_updates)} · "
+          f"스냅샷 {len(new_rows)} · 프리뷰 {len(p_rows)} · 측정 {len(v_updates)} · "
           f"D+5 {len(d_updates)} · 메일 {sent}통")
     print(gsr.stats_line())
     print("=" * 60)
