@@ -1,0 +1,57 @@
+name: 🔬 진단 — 매출 컨센서스 실값 확인 (수동 전용)
+
+# 언제 쓰나:
+#   1차 프로브(diag_earnings_preview_fields) 직후 딱 한 번.
+#   analyst-estimates 가 이 플랜에서 402 로 죽어서, A블록 매출 컨센서스를
+#   earnings?symbol= 의 revenueEstimated 로 대체할 수 있는지 확인한다.
+#
+#   1차는 **키의 존재만** 봤다. 키가 있어도 전부 null 이면 쓸 수 없다.
+#   이 프로브는 값을 본다.
+#
+# 안전성:
+#   · 시트 접근 없음 — 읽지도 쓰지도 않는다
+#   · 이메일 없음 · 알림 상태 머신 미접촉
+#   → 몇 번을 돌려도 부작용이 없다.
+#
+# 비용: 종목당 1콜. 기본 3종목 = 3콜.
+#
+# ⚠️ repository_dispatch 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "쉼표 구분 티커 (비우면 AAPL,NVDA,WMT)"
+        type: string
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # requests 는 fmp_http 용. pandas 는 기준일 계산용(없으면 datetime 폴백).
+      - name: 📦 의존성
+        run: pip install requests pandas
+
+      # fmp_http.py 는 repo 루트. 스크립트가 sys.path 를 스스로 잡으므로
+      # 실행 위치는 루트든 automation/ 이든 무관하다.
+      - name: 🔬 매출 컨센서스 실값 확인
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          TICKERS:     ${{ inputs.tickers }}
+        run: python automation/diag_earnings_revenue_field.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_earnings_revenue_field.py
