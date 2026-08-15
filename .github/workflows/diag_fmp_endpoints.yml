@@ -1,0 +1,61 @@
+name: 🔬 진단 — FMP 엔드포인트 경로 실측 (수동 전용)
+
+# 언제 쓰나:
+#   공식 api-docs(278 엔드포인트) 대조에서 코드가 쓰는 경로 6개가 문서에
+#   존재하지 않는 것으로 드러났다. 코드를 고치기 전에 실제로 살아 있는지
+#   확인한다. 결과에 따라 lockstep 수정 대상이 결정된다.
+#
+#   대상:
+#     fmp_extras.py:452      etf/sector-weighting     → etf/sector-weightings
+#     fmp_extras.py:389      batch-market-capitalization → market-capitalization-batch
+#     narrative_core.py:220  press-releases-latest    → news/press-releases-latest
+#     app.py:5507,14834      stock-news               → news/stock
+#     app.py:6012,7123       etf-holder/{sym}         → etf/holdings?symbol=
+#     earnings_core.py:339   earnings-surprises       → (개별 심볼용 없음)
+#
+# 안전성:
+#   · 시트 접근 없음 — 읽지도 쓰지도 않는다
+#   · 이메일 없음 · 알림 상태 머신 미접촉
+#   · 프로젝트 모듈 import 없음 (requests 만 사용)
+#   → 몇 번을 돌려도 부작용이 없다.
+#
+# 비용: 기본 12콜 (6쌍 × 2). extra=true 면 15콜.
+#
+# ⚠️ repository_dispatch 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      extra:
+        description: "참고 확인 3콜 추가 (grades / analyst-estimates / transcript-dates)"
+        type: boolean
+        default: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # fmp_http 를 안 쓰므로 requests 만 있으면 된다.
+      - name: 📦 의존성
+        run: pip install requests
+
+      - name: 🔬 엔드포인트 경로 실측
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          PROBE_EXTRA: ${{ inputs.extra && '1' || '' }}
+        run: python automation/diag_fmp_endpoints.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_fmp_endpoints.py
