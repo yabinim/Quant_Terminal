@@ -102,9 +102,11 @@ _SSOT_NEEDS = (
       "is_universe_only", "normalize_source",
       "TIMING_LABELS_INFERRED", "infer_timing", "fetch_market_calendar_map",
       "PREVIEW_WORKSHEET", "PREVIEW_COLS", "parse_preview",
-      "PREVIEW_PHASES", "PREVIEW_PHASE_LABELS", "parse_news_json"),
-     lambda m: "Pre_Ret_D1_Pct" in m.EVENTS_COLS,
-     "Earnings_Events 스키마 v3(사전 종가 기준 수익률 3열) 반영"),
+      "PREVIEW_PHASES", "PREVIEW_PHASE_LABELS", "parse_news_json",
+      "PREVIEW_INSIDER_WINDOW", "fetch_insider_90d"),
+     lambda m: ("Pre_Ret_D1_Pct" in m.EVENTS_COLS
+                and "Insider_Cov_D" in m.PREVIEW_COLS),
+     "Earnings_Events v3(사전 종가 수익률 3열) + Preview v2(내부자 4열) 반영"),
 )
 
 _ssot_bad = []
