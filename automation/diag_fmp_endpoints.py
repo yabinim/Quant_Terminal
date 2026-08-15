@@ -42,14 +42,37 @@ fmp_http.fmp_get 은 429/402 에서 재시도한 뒤 None 을 돌려준다. 프�
 
 시트 접근 없음 · 이메일 없음 · 알림 상태 머신 미접촉. 재실행 부작용 없다.
 
+2차 확장 (2026-08-15) — SINGLES 그룹
+────────────────────────────────────
+1차 결과에서 narrative_core 의 Layer B(보도자료, weight 1.3)가
+
+    press-releases-latest        → 404 (경로 오기)
+    news/press-releases-latest   → 402 (플랜 미포함)
+
+로 **되살릴 수 없음**이 확정됐다. 그런데 같은 파이프라인의 나머지 3개 레이어는
+한 번도 실측한 적이 없다. Layer B 가 402 인 이상 나머지도 의심해야 하고,
+모르는 채로 narrative_core 를 수술하면 두 번 하게 된다.
+
+SINGLES 는 대응 쌍이 없는 단독 확인용이다. 현재 대상:
+
+    news/stock-latest        내러티브 Layer A (weight 1.2)
+    fmp-articles             내러티브 Layer C (weight 1.0)
+    news/general-latest      내러티브 Layer D (weight 0.8)
+    news/press-releases      Layer B 대체 후보 — 검색형은 살아 있을 수 있다
+    etf/info                 ETF 계열 미검증분 (etf/holdings 가 402 였으므로)
+
+판정은 쌍 비교가 아니라 살아있음/죽음 단독 판정이다.
+
 비용
 ────
-기본 12콜 (6쌍 × 2). PROBE_EXTRA=1 이면 +3콜.
+    PROBE_GROUP=singles  5콜   (기본)
+    PROBE_GROUP=pairs    12콜  (+ PROBE_EXTRA=1 이면 15콜)
+    PROBE_GROUP=all      17콜  (+ PROBE_EXTRA=1 이면 20콜)
 
 실행
 ────
     FMP_API_KEY=xxx python automation/diag_fmp_endpoints.py
-    FMP_API_KEY=xxx PROBE_EXTRA=1 python automation/diag_fmp_endpoints.py
+    FMP_API_KEY=xxx PROBE_GROUP=all PROBE_EXTRA=1 python automation/diag_fmp_endpoints.py
 """
 import json
 import os
@@ -64,6 +87,13 @@ SLEEP_SEC = 0.35  # 12콜이라 레이트리밋 걱정은 없지만 예의상
 
 _KEY = str(os.environ.get("FMP_API_KEY", "") or "").strip()
 _EXTRA = str(os.environ.get("PROBE_EXTRA", "") or "").strip() in ("1", "true", "TRUE", "yes")
+
+# pairs / singles / all — 기본은 singles(2차 확인이 현재 미결 사항이므로)
+_GROUP = str(os.environ.get("PROBE_GROUP", "") or "singles").strip().lower()
+if _GROUP not in ("pairs", "singles", "all"):
+    _GROUP = "singles"
+_RUN_PAIRS = _GROUP in ("pairs", "all")
+_RUN_SINGLES = _GROUP in ("singles", "all")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -107,6 +137,43 @@ PAIRS = [
         "earnings-surprises?symbol=AAPL&limit=8",
         "earnings?symbol=AAPL&limit=8",
         "earnings_core.py:339, app.py:5165, diag_earnings_preview_backtest.py:91",
+    ),
+]
+
+# ══════════════════════════════════════════════════════════════════════════
+# SINGLES — 대응 쌍이 없는 단독 확인
+#   (라벨, 경로, 코드 위치, 죽었을 때의 영향)
+# ══════════════════════════════════════════════════════════════════════════
+SINGLES = [
+    (
+        "내러티브 Layer A (weight 1.2)",
+        "news/stock-latest?page=0&limit=5",
+        "narrative_core.py:218",
+        "죽으면 뉴스 파이프라인 최대 레이어 소실 — 내러티브 품질 직격",
+    ),
+    (
+        "내러티브 Layer C (weight 1.0)",
+        "fmp-articles?page=0&limit=5",
+        "narrative_core.py:222",
+        "죽으면 FMP 자체 기사 레이어 소실",
+    ),
+    (
+        "내러티브 Layer D (weight 0.8)",
+        "news/general-latest?page=0&limit=5",
+        "narrative_core.py:224",
+        "죽으면 거시 일반뉴스 레이어 소실",
+    ),
+    (
+        "Layer B 대체 후보 — 보도자료 검색형",
+        "news/press-releases?symbols=AAPL&limit=5",
+        "(신규 — narrative_core.py:220 대체안)",
+        "살아 있으면 Layer B 를 티커 기반으로 재건 가능",
+    ),
+    (
+        "ETF 기초정보 (미검증분)",
+        "etf/info?symbol=SPY",
+        "fmp_extras.py:434",
+        "etf/holdings 가 402 였으므로 같은 계열인 이것도 의심",
     ),
 ]
 
@@ -252,34 +319,58 @@ def main():
         print("❌ FMP_API_KEY 가 비어 있습니다. 중단.")
         return 2
 
-    ncalls = len(PAIRS) * 2 + (len(EXTRAS) if _EXTRA else 0)
+    ncalls = 0
+    if _RUN_PAIRS:
+        ncalls += len(PAIRS) * 2
+        if _EXTRA:
+            ncalls += len(EXTRAS)
+    if _RUN_SINGLES:
+        ncalls += len(SINGLES)
+
     print("=" * 78)
     print("FMP 엔드포인트 실측 프로브")
     print("  기준: 공식 api-docs (278 엔드포인트) vs 현재 코드")
-    print("  호출 수: " + str(ncalls) + "콜 · 시트/이메일 접촉 없음")
+    print("  그룹: " + _GROUP + " · 호출 수: " + str(ncalls) + "콜 · 시트/이메일 접촉 없음")
     print("=" * 78)
 
     results = []
-    for name, cur, off, where in PAIRS:
-        print("")
-        print("── " + name)
-        print("   코드 위치: " + where)
+    singles_res = []
 
-        r_cur = probe(cur)
-        show("현재", r_cur)
-        time.sleep(SLEEP_SEC)
+    if _RUN_PAIRS:
+        for name, cur, off, where in PAIRS:
+            print("")
+            print("── " + name)
+            print("   코드 위치: " + where)
 
-        if off is None:
-            r_off = None
-            print("  ➖ 공식   -    (공식 문서에 대응 엔드포인트 없음)")
-        else:
-            r_off = probe(off)
-            show("공식", r_off)
+            r_cur = probe(cur)
+            show("현재", r_cur)
             time.sleep(SLEEP_SEC)
 
-        results.append((name, where, cur, off, r_cur, r_off))
+            if off is None:
+                r_off = None
+                print("  ➖ 공식   -    (공식 문서에 대응 엔드포인트 없음)")
+            else:
+                r_off = probe(off)
+                show("공식", r_off)
+                time.sleep(SLEEP_SEC)
 
-    if _EXTRA:
+            results.append((name, where, cur, off, r_cur, r_off))
+
+    if _RUN_SINGLES:
+        print("")
+        print("=" * 78)
+        print("단독 확인 — 대응 쌍 없음")
+        print("=" * 78)
+        for name, path, where, impact in SINGLES:
+            print("")
+            print("── " + name)
+            print("   코드 위치: " + where)
+            r = probe(path)
+            show("확인", r)
+            singles_res.append((name, path, where, impact, r))
+            time.sleep(SLEEP_SEC)
+
+    if _RUN_PAIRS and _EXTRA:
         print("")
         print("=" * 78)
         print("참고 확인 — 문서에는 있으나 플랜 가용성이 불확실한 것들")
@@ -295,6 +386,62 @@ def main():
     print("=" * 78)
     print("최종 판정")
     print("=" * 78)
+
+    # ── 단독 확인 판정 ───────────────────────────────────────────────────
+    # 단독 확인에서는 EMPTY 를 '실패'로 단정할 수 없다. 경로가 맞고 지금 데이터가
+    # 없을 뿐일 수도 있다(뉴스 계열에서 실제로 가능). 쌍 비교에서는 공식 경로와
+    # 대조되므로 모호하지 않지만, 단독에서는 별도 버킷으로 두고 사람이 판단한다.
+    s_live, s_plan, s_dead, s_empty, s_unk = [], [], [], [], []
+    for name, path, where, impact, r in singles_res:
+        v = r["verdict"]
+        if v == "LIVE":
+            s_live.append((name, path, where, impact, r))
+        elif v == "PLAN":
+            s_plan.append((name, path, where, impact, r))
+        elif v == "EMPTY":
+            s_empty.append((name, path, where, impact, r))
+        elif v in ("RATE", "EXC", "AUTH"):
+            s_unk.append((name, path, where, impact, r))
+        else:
+            s_dead.append((name, path, where, impact, r))
+
+    if singles_res:
+        print("")
+        print("── 단독 확인 결과")
+        if s_live:
+            print("")
+            print("  ✅ 정상 — 손댈 것 없음")
+            for name, path, where, impact, r in s_live:
+                print("     · " + name + "  (" + str(r["detail"]) + ")")
+                print("       " + where)
+        if s_plan:
+            print("")
+            print("  🔒 플랜 미포함(402) — 코드 수정으로 해결 안 됨. 기능 제거/대체")
+            for name, path, where, impact, r in s_plan:
+                print("     · " + name)
+                print("       " + where + "   " + path)
+                print("       영향: " + impact)
+        if s_dead:
+            print("")
+            print("  ❌ 경로 실패 — 공식 문서에서 정확한 경로 재확인 필요")
+            for name, path, where, impact, r in s_dead:
+                print("     · " + name + "  [" + r["verdict"] + "]")
+                print("       " + where + "   " + path)
+                print("       영향: " + impact)
+        if s_empty:
+            print("")
+            print("  ⚠️ 200 + 빈 배열 — 판단 보류")
+            print("     경로가 맞고 데이터가 없을 뿐일 수 있다(뉴스 계열은 실제로 가능).")
+            print("     시간대를 바꿔 재실행하거나 파라미터를 바꿔 한 번 더 확인할 것.")
+            for name, path, where, impact, r in s_empty:
+                print("     · " + name)
+                print("       " + where + "   " + path)
+                print("       영향: " + impact)
+        if s_unk:
+            print("")
+            print("  ⏳ 판정 불가 — 재실행 필요")
+            for name, path, where, impact, r in s_unk:
+                print("     · " + name + "  [" + r["verdict"] + "]")
 
     must_fix = []
     keep = []
@@ -358,19 +505,35 @@ def main():
 
     print("")
     print("=" * 78)
-    total = len(results)
-    print("요약: 총 " + str(total) + "쌍 · 수정필수 " + str(len(must_fix))
-          + " · 둘다실패 " + str(len(both_dead))
-          + " · 현행유지 " + str(len(keep))
-          + " · 판정불가 " + str(len(inconclusive)))
+    parts = []
+    if results:
+        parts.append("쌍 " + str(len(results))
+                     + " (수정필수 " + str(len(must_fix))
+                     + " · 둘다실패 " + str(len(both_dead))
+                     + " · 현행유지 " + str(len(keep))
+                     + " · 판정불가 " + str(len(inconclusive)) + ")")
+    if singles_res:
+        parts.append("단독 " + str(len(singles_res))
+                     + " (정상 " + str(len(s_live))
+                     + " · 플랜 " + str(len(s_plan))
+                     + " · 경로실패 " + str(len(s_dead))
+                     + " · 빈배열 " + str(len(s_empty))
+                     + " · 판정불가 " + str(len(s_unk)) + ")")
+    print("요약: " + " | ".join(parts))
     print("=" * 78)
 
     # 기계 판독용 — 워크플로 로그에서 grep 하기 쉽게 한 줄 JSON 으로도 남긴다.
     summary = {
+        "group": _GROUP,
         "must_fix": [w for _, w, _, _, _ in must_fix],
         "both_dead": [w for _, w, _, _, _, _ in both_dead],
         "keep": [w for _, w, _, _, _ in keep],
         "inconclusive": [w for _, w, _, _, _, _ in inconclusive],
+        "singles_live": [w for _, _, w, _, _ in s_live],
+        "singles_plan": [w for _, _, w, _, _ in s_plan],
+        "singles_dead": [w for _, _, w, _, _ in s_dead],
+        "singles_empty": [w for _, _, w, _, _ in s_empty],
+        "singles_unknown": [w for _, _, w, _, _ in s_unk],
     }
     print("PROBE_JSON " + json.dumps(summary, ensure_ascii=False))
 
