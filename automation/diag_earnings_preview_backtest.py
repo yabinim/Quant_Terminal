@@ -87,8 +87,8 @@ def price_history(ticker, limit=HIST_LIMIT):
 
 def earnings_records(ticker):
     rows, seen = [], set()
-    for path in (f"earnings?symbol={ticker}&limit=60",
-                 f"earnings-surprises?symbol={ticker}&limit=60"):
+    # earnings-surprises 는 stable 에 개별 심볼용이 없다(404 실측 확인). 제거.
+    for path in (f"earnings?symbol={ticker}&limit=60",):
         for it in (_get(path) or []):
             if not isinstance(it, dict):
                 continue
