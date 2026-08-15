@@ -1,0 +1,62 @@
+name: 🔬 진단 — 3단계 C블록 대체 후보 생존 확인 (수동 전용)
+
+# 언제 쓰나:
+#   3단계 설계 확정 **전에** 딱 한 번.
+#   C블록 원안(어닝콜 트랜스크립트 요약)이 402 로 불가능해져서,
+#   대체 후보가 이 요금제에서 실제로 살아 있는지 확인한다.
+#
+#   보는 것:
+#     다-1  news/press-releases      회사 원문 보도자료 — 본문 필드 존재·길이
+#     다-2  insider-trading/search   실적 전 내부자 순매수/매도 (수치)
+#     다-2b insider-trade-statistics 위의 집계판
+#     다-3  sec-filings-search       실적 전 8-K 건수/유형 (수치)
+#     (나)  news/stock               본문(text) 필드가 정말 오는가 — 미검증 전제
+#
+# 안전성:
+#   · 시트 접근 없음 — 읽지도 쓰지도 않는다
+#   · 이메일 없음 · 알림 상태 머신 미접촉
+#   · GOOGLE_API_KEY 불필요 (Gemini 호출 없음 — 데이터 존재만 확인)
+#   → 몇 번을 돌려도 부작용이 없다.
+#
+# 비용: 종목당 5콜. 기본 3종목 = 15콜.
+#
+# ⚠️ repository_dispatch 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "쉼표 구분 티커 (비우면 AAPL,NVDA,WMT)"
+        type: string
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # requests 는 fmp_http 용. pandas 불필요 — 날짜는 datetime 으로 계산한다.
+      - name: 📦 의존성
+        run: pip install requests
+
+      # fmp_http.py 는 repo 루트. 스크립트가 sys.path 를 스스로 잡으므로
+      # 실행 위치는 루트든 automation/ 이든 무관하다.
+      - name: 🔬 C블록 대체 후보 생존 확인
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          TICKERS:     ${{ inputs.tickers }}
+        run: python automation/diag_earnings_cblock_probe.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_earnings_cblock_probe.py
