@@ -25688,23 +25688,21 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
         st.markdown("### 🔬 실적 프리뷰 브리핑")
 
         _pv_all = load_earnings_preview()
-        _pv_mine = [r for r in _pv_all
-                    if str(r.get("Ticker") or "").strip().upper() in _all_tk]
+        # 섹션 6 지형표와 같은 원칙: **전부 보여주고 내 것에 ⭐**.
+        #   프리뷰 내용은 시장 공개 데이터(컨센서스·목표주가·뉴스)이고,
+        #   자동화는 전체 사용자 합집합으로 스냅샷을 찍는다. 본인 것만 걸러내면
+        #   같은 탭 안에서 섹션 6(전체 노출)과 원칙이 어긋난다.
+        _pv_rows = [r for r in _pv_all if str(r.get("Ticker") or "").strip()]
 
-        if not _pv_all:
+        if not _pv_rows:
             st.info(
                 "아직 스냅샷이 없습니다. 5PM 자동화가 실적 **D-7 / D-3 / 최종** 시점에 "
                 "자동으로 기록합니다. 보유·워치리스트 종목의 실적이 다가오면 여기에 표시됩니다."
             )
-        elif not _pv_mine:
-            st.info(
-                f"기록된 스냅샷 {len(_pv_all)}건은 모두 현재 보유·워치리스트 밖 종목입니다. "
-                "(과거에 담았다가 뺀 종목일 수 있습니다.)"
-            )
         else:
             # 이벤트 단위로 묶는다. 1이벤트 = 최대 3스냅샷(D7/D3/FINAL).
             _pv_by_ev = {}
-            for _r in _pv_mine:
+            for _r in _pv_rows:
                 _eid = str(_r.get("Event_ID") or "").strip()
                 if _eid:
                     _pv_by_ev.setdefault(_eid, []).append(_r)
@@ -25733,18 +25731,24 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                     return f"{n / 1e6:,.1f}M"
                 return f"{n:,.0f}"
 
-            # 발표일이 가까운 순. 이미 발표된 이벤트는 뒤로 보낸다.
+            # 발표일이 가까운 순. 단 **내 종목을 먼저** 올리고, 이미 발표된
+            # 이벤트는 뒤로 보낸다. 스크롤 맨 위가 내 것이어야 한다.
             def _ev_sort_key(item):
                 _rows = item[1]
+                _tk_s = str(_rows[0].get("Ticker") or "").strip().upper()
                 _ed = str(_rows[0].get("Earnings_Date") or "")
                 _d = ec._d(_ed)
                 _past = 1 if (_d is not None and _d < _e_today) else 0
-                return (_past, _ed)
+                _mine = 0 if _tk_s in _all_tk else 1
+                return (_mine, _past, _ed)
 
             _pv_items = sorted(_pv_by_ev.items(), key=_ev_sort_key)
+            _n_mine_ev = sum(1 for _, _rs in _pv_items
+                             if str(_rs[0].get("Ticker") or "").strip().upper() in _all_tk)
 
             st.caption(
-                f"{len(_pv_items)}개 이벤트 · 스냅샷 {len(_pv_mine)}건  \n"
+                f"{len(_pv_items)}개 이벤트 · 스냅샷 {len(_pv_rows)}건 · "
+                f"⭐ = 내 보유/워치리스트 {_n_mine_ev}개  \n"
                 "**방향 예측이 아닙니다.** 백테스트에서 예측 엣지가 확인되지 않아 "
                 "예측을 하지 않습니다. 아래 숫자는 *시장이 무엇을 이미 기대하고 있는가*를 "
                 "보여주며, 판단은 사용자가 합니다."
@@ -25770,7 +25774,8 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                 else:
                     _when = f"{_ed} · 발표 {abs(_dd)}일 경과"
 
-                st.markdown(f"#### {_tk} — {_when} · {_tm_lbl}")
+                st.markdown(f"#### {'⭐ ' if _tk in _all_tk else ''}{_tk} — "
+                            f"{_when} · {_tm_lbl}")
 
                 _c1, _c2, _c3 = st.columns(3)
                 with _c1:
@@ -25902,6 +25907,9 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                 "스냅샷은 **D-7 / D-3 / 최종**(장후 발표는 D-1, 장전 발표는 D-2) "
                 "세 시점에 자동 기록됩니다. 기록 후에는 수정하지 않습니다 — "
                 "그 시점에 실제로 보였던 숫자가 남아야 사후 대조가 의미를 갖습니다.  \n"
+                "⭐ 없는 종목은 다른 사용자의 보유·워치리스트입니다. 여기 표시되는 "
+                "컨센서스·목표주가·뉴스는 전부 시장 공개 자료이며, **보유 수량이나 "
+                "매매 내역은 포함되지 않습니다.**  \n"
                 "**어닝콜 요약은 현재 제공되지 않습니다.** FMP 트랜스크립트 API가 "
                 "현재 요금제에서 제공되지 않아 뉴스 헤드라인으로 대체하고 있습니다."
             )
