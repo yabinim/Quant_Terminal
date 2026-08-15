@@ -25766,6 +25766,38 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                         f"- 기록 시각 {str(_last.get('Snapshot_At') or '—')}"
                     )
 
+                # ── 내부자 거래 (C블록) ──
+                #   방향 신호가 아니다. 검증되지 않은 가설이라 원자료만 보여주고
+                #   해석은 사용자에게 맡긴다. 창이 잘렸으면 그 사실을 먼저 말한다.
+                _ins_cov = _pv_num(_last.get("Insider_Cov_D"))
+                if _ins_cov is not None:
+                    _sv = _pv_num(_last.get("Insider_Sale_Val_90d"))
+                    _bv = _pv_num(_last.get("Insider_Buy_Val_90d"))
+                    _sn = _pv_num(_last.get("Insider_Sale_N_90d"))
+                    _sn_txt = "" if _sn is None else f" ({int(_sn)}건)"
+                    _cut = _ins_cov < ec.PREVIEW_INSIDER_WINDOW
+                    st.markdown(
+                        f"**내부자 거래** — 최근 {int(ec.PREVIEW_INSIDER_WINDOW)}일 "
+                        f"재량 매도 `{_pv_money(_sv)}`{_sn_txt} · "
+                        f"매수 `{_pv_money(_bv)}`"
+                        + ("  ⚠️ **창 잘림**" if _cut else "")
+                    )
+                    if _cut:
+                        st.caption(
+                            f"이 종목은 신고 건수가 많아 1회 조회가 {int(_ins_cov)}일치만 "
+                            f"덮었습니다. 위 금액은 {int(ec.PREVIEW_INSIDER_WINDOW)}일 전체가 "
+                            "아니라 **잘린 값**이므로 다른 종목·다른 스냅샷과 "
+                            "직접 비교하면 안 됩니다."
+                        )
+                    else:
+                        st.caption(
+                            "부여·세금원천징수·옵션행사·증여는 제외하고 임원이 시장에서 "
+                            "직접 사고판 건만 집계했습니다. 대형주 임원은 대개 주식을 "
+                            "부여받지 매수하지 않으므로 매수가 0인 것은 정상입니다.  \n"
+                            "**이 숫자로 매매 판단을 하지 마십시오.** 실적 반응과의 "
+                            "관계가 아직 검증되지 않아 자료만 축적하는 중입니다."
+                        )
+
                 # ── 스냅샷 추이 ──
                 #   단일 시점보다 **변화**가 중요하다. 기대치가 올라갔는데 주가가
                 #   못 따라갔는지, 그 반대인지가 이 표의 존재 이유다.
@@ -25781,6 +25813,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                             "매출 추정": _pv_money(_r.get("Est_Revenue")),
                             "목표대비": _pv_f(_r.get("Target_Upside_Pct"), "%", signed=True),
                             "상대강도": _pv_f(_r.get("RS_20d_Pct"), "%p", signed=True),
+                            "내부자매도": _pv_money(_r.get("Insider_Sale_Val_90d")),
                         })
                     st.dataframe(pd.DataFrame(_prog), use_container_width=True,
                                  hide_index=True)
@@ -25851,6 +25884,11 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                         "no_rs": "가격 이력 부족 — 상대강도 계산 불가",
                         "rs_absolute": "SPY 미확보 — 상대강도가 아니라 절대 수익률",
                         "no_expected_move": "예상 변동폭 미산출(표본 부족)",
+                        "no_insider": "내부자 거래 조회 실패 — 금액 공란",
+                        "insider_short_window": (
+                            "내부자 관측 창이 90일에 못 미침 — 금액이 잘린 값"),
+                        "insider_price_missing": (
+                            "내부자 거래 중 체결가 없는 건이 있음 — 금액 과소계상"),
                     }
                     st.caption("ℹ️ 자료 없음: "
                                + " · ".join(_FLAG_KO.get(f, f) for f in _flags))
@@ -25863,8 +25901,9 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                 "⭐ 없는 종목은 다른 사용자의 보유·워치리스트입니다. 여기 표시되는 "
                 "컨센서스·목표주가·뉴스는 전부 시장 공개 자료이며, **보유 수량이나 "
                 "매매 내역은 포함되지 않습니다.**  \n"
-                "**어닝콜 요약은 현재 제공되지 않습니다.** FMP 트랜스크립트 API가 "
-                "현재 요금제에서 제공되지 않아 뉴스 헤드라인으로 대체하고 있습니다."
+                "**어닝콜 요약은 제공되지 않습니다.** FMP 트랜스크립트·보도자료 API가 "
+                "현재 요금제에서 막혀 있어(HTTP 402) 뉴스 헤드라인과 내부자 거래 "
+                "금액으로 대체합니다. 뉴스 본문 역시 제공되지 않아 제목만 표시됩니다."
             )
 
     elif main_nav == _NAV_ADMIN_APPROVAL:

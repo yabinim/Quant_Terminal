@@ -1762,9 +1762,21 @@ def parse_events(values: list) -> list[dict]:
 #   · analyst-estimates          → HTTP 402. EPS·매출 컨센서스는
 #                                  earnings?symbol= 의 미래 행에서 얻는다
 #   · earning-call-transcript-*  → HTTP 402. 트랜스크립트 요약 불가.
-#                                  Transcript_Summary 열은 자리만 확보해 둔다
+#                                  Transcript_Summary 열은 **영구 사표**다.
+#                                  기존 행 정렬을 지키려고 남겨둘 뿐 채우지 않는다.
+#   · news/press-releases        → HTTP 402 (2026-08-15 3종목 실측).
+#                                  보도자료 원문도 불가. 서술 노선은 전부 막혔다
+#   · news/stock 의 text 필드    → 존재하지만 138~255자 리드 문단이다.
+#                                  전문이 아니라 발췌라 요약해도 트랜스크립트
+#                                  대체가 안 된다. 제목만 쓴다
 #   · 공매도 비율                → 엔드포인트 자체가 플랜에 없음.
 #                                  백테스트에 있던 Surprise_Avg_Pct 로 대체
+#
+# C블록 확정 (2026-08-15) — 서술 대신 내부자 거래
+#   서술이 전부 막혀서 C블록을 수치로 바꿨다. insider-trading/search 로
+#   최근 90일 **재량** 거래를 달러로 집계한다. Gemini 불필요.
+#   3종목 실측: 100건 1콜이 AAPL 314일 / NVDA 187일 / WMT 151일을 덮었고
+#   price 결측 0건, 페이징 정상.
 # ──────────────────────────────────────────────────────────────────────────
 
 PREVIEW_WORKSHEET = "Earnings_Preview"
@@ -1781,10 +1793,16 @@ PREVIEW_COLS = [
     # ── B블록: 얼마나 이미 반영됐나 (전부 백테스트 검증 산식) ──
     "RS_20d_Pct", "Beat_Rate_Pct", "Surprise_Avg_Pct",
     "Grade_Buy_Pct", "Grade_Drift_90d", "Sample_N_Q",
-    # ── C블록: 서술 (3단계에서 Transcript_Summary 사용 예정) ──
+    # ── C블록: 서술 — Transcript_Summary 는 402 로 영구 사표(항상 공란) ──
     "News_Count", "News_JSON", "Transcript_Summary",
     # ── 메타 ──
     "Data_Flags", "Notes",
+    # ── C블록(수치): 내부자 거래 — 3단계 추가분 ──
+    #   ⚠️ 반드시 **맨 뒤**에 붙인다. 중간에 끼우면 기존 29열 행의 값이
+    #      한 칸씩 밀려 Data_Flags 가 숫자로, Notes 가 플래그로 읽힌다.
+    #      기존 행은 30~33열이 공란이 되고 parse_preview 가 패딩으로 메운다.
+    "Insider_Sale_Val_90d", "Insider_Sale_N_90d",
+    "Insider_Buy_Val_90d", "Insider_Cov_D",
 ]
 PREVIEW_NCOL = len(PREVIEW_COLS)
 
@@ -1797,6 +1815,18 @@ PREVIEW_MIN_QUARTERS = 4          # 이 미만이면 B블록 산출 거부 (추�
 PREVIEW_YOY_TOL_DAYS = 45         # 전년 동기 매칭 허용 오차 — 분기 날짜가 밀리는 종목 대비
 PREVIEW_NEWS_MAX = 5              # 스냅샷당 저장 헤드라인 수
 PREVIEW_NEWS_TITLE_MAX = 140      # 제목 절단 길이 (셀 용량 방어)
+
+# ── 내부자 거래 (C블록 수치) ──
+PREVIEW_INSIDER_WINDOW = 90       # 관측 창(일). 실적 전 분기와 대략 맞춘다
+PREVIEW_INSIDER_LIMIT = 100       # 1콜 행 수. 실측상 90일을 여유 있게 덮는다
+
+# 18종 코드 중 **시장에서 스스로 사고판** 것만. 나머지는 부여·세금·행사·증여라
+# 임원의 판단이 들어가지 않는다. 이걸 안 거르면 베스팅일에 가짜 신호가 뜬다.
+#   실측 반례 — AAPL 2026Q1 은 재량 매수·매도가 둘 다 0인데
+#   acquiredDisposedRatio 는 1.500 이었다. 그 비율은 전체 주식 수 기준이라
+#   A-Award·F-InKind·M-Exempt 가 그대로 섞인다. 그래서 비율은 쓰지 않는다.
+INSIDER_BUY_TYPES = ("P-Purchase",)
+INSIDER_SELL_TYPES = ("S-Sale",)
 
 # 스냅샷 발동 창.
 #   창을 두는 이유: 휴장일에 5PM 실행이 건너뛰면 그날 dd 가 그냥 지나가버려
@@ -1969,6 +1999,97 @@ def fetch_stock_news(ticker: str, key: str = "", limit: int = 10) -> list[dict]:
             "url": str(it.get("url") or "").strip()[:300],
         })
     out.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return out
+
+
+def fetch_insider_90d(ticker: str, key: str = "", today=None,
+                      window: int = PREVIEW_INSIDER_WINDOW,
+                      limit: int = PREVIEW_INSIDER_LIMIT) -> dict:
+    """insider-trading/search → 최근 window 일 **재량** 거래 달러 집계.
+
+    반환 {ok, sale_val, sale_n, buy_val, buy_n, cov_d, price_missing}
+      ok=False 면 나머지는 의미 없음 — 호출부가 공란으로 남겨야 한다.
+      0 을 쓰면 "봤는데 없었다"와 "못 봤다"가 구분되지 않는다.
+
+    왜 statistics 가 아니라 search 인가
+      insider-trading/statistics 는 1콜에 24년치 분기를 주지만
+      (a) 분기 집계라 8월 이벤트에 6월말 마감분을 붙이게 되고(46~138일 지연)
+      (b) 금액이 아니라 **건수**다.
+      search 는 행 단위라 날짜와 price 가 있어 둘 다 해결된다.
+      대신 100행 ≈ 1년치뿐이라 소급 백테스트는 statistics 쪽을 쓴다
+      (automation/backfill_insider_stats.py).
+
+    날짜는 transactionDate 를 쓴다. filingDate 는 신고일이라 거래일보다
+    늦다(Form 4 는 2영업일 내 신고). 실적 전 창을 재려면 실제 거래일이어야 한다.
+
+    cov_d 는 이 응답이 실제로 덮은 일수다. window 보다 작으면 그 행의 달러값은
+    **잘린 값**이라 다른 행과 비교하면 안 된다. 신고가 잦은 종목에서 100행이
+    90일에 못 미칠 수 있고, 그걸 기록해 두지 않으면 백테스트가 조용히 오염된다.
+    """
+    out = {"ok": False, "sale_val": None, "sale_n": 0,
+           "buy_val": None, "buy_n": 0, "cov_d": None, "price_missing": 0}
+    tk = str(ticker or "").strip().upper()
+    if not tk:
+        return out
+
+    items = _get(f"insider-trading/search?symbol={tk}"
+                 f"&page=0&limit={int(limit)}", key)
+    if not isinstance(items, list) or not items:
+        return out
+
+    t0 = _d(today) if today is not None else _d(pd.Timestamp.today())
+    if t0 is None:
+        t0 = pd.Timestamp.today().normalize()
+    cutoff = t0 - pd.Timedelta(days=int(window))
+
+    sale_val = buy_val = 0.0
+    sale_n = buy_n = miss = 0
+    oldest = None
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        # transactionDate 우선. 비어 있으면 그 행은 창 판정을 할 수 없으므로 버린다.
+        d = _d(it.get("transactionDate"))
+        if d is None:
+            continue
+        if oldest is None or d < oldest:
+            oldest = d
+        if d < cutoff:
+            continue
+
+        t = str(it.get("transactionType") or "").strip()
+        if t not in INSIDER_BUY_TYPES and t not in INSIDER_SELL_TYPES:
+            continue
+
+        qty = _num(it.get("securitiesTransacted")) or 0.0
+        px = _num(it.get("price"))
+        if px is None or px <= 0:
+            # 건수는 세되 금액에는 넣지 않는다. 몇 건이 빠졌는지 남긴다.
+            miss += 1
+            if t in INSIDER_SELL_TYPES:
+                sale_n += 1
+            else:
+                buy_n += 1
+            continue
+
+        if t in INSIDER_SELL_TYPES:
+            sale_val += px * abs(qty)
+            sale_n += 1
+        else:
+            buy_val += px * abs(qty)
+            buy_n += 1
+
+    if oldest is None:
+        return out
+
+    out.update({
+        "ok": True,
+        "sale_val": sale_val, "sale_n": sale_n,
+        "buy_val": buy_val, "buy_n": buy_n,
+        "cov_d": int((t0 - oldest).days),
+        "price_missing": miss,
+    })
     return out
 
 
@@ -2172,6 +2293,10 @@ def preview_row(ev: dict, phase: str, metrics: dict, now_et: str = "") -> list:
         "",                                    # Transcript_Summary — 3단계 예약
 
         ",".join(flags), str(m.get("notes") or ""),
+
+        # 내부자 — 조회 실패 시 전부 공란. 0 을 쓰면 "없었다"와 "못 봤다"가 섞인다.
+        _blank(m.get("ins_sale_val")), _blank(m.get("ins_sale_n")),
+        _blank(m.get("ins_buy_val")), _blank(m.get("ins_cov_d")),
     ]
     return (row + [""] * PREVIEW_NCOL)[:PREVIEW_NCOL]
 
