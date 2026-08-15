@@ -1,0 +1,68 @@
+name: 🔬 진단 — C블록 후보 2차 (내부자 통계, 경로 정정판)
+
+# 언제 쓰나:
+#   3단계 C블록 설계 확정 **직전**에 한 번.
+#
+#   1차 프로브에서 insider-trade-statistics?symbol= 로 찔러 404 를 받고
+#   "플랜 제한"으로 오판했다. 공식 문서 확인 결과 경로 오류였다.
+#       틀림  insider-trade-statistics?symbol=
+#       정식  insider-trading/statistics?symbol=
+#   이 워크플로는 정식 경로로 다시 확인한다.
+#
+#   확인하는 것:
+#     A  insider-trading/statistics?symbol=   × 3종목
+#          · 경로 생존 여부
+#          · 설계안 컬럼이 쓸 필드 5개 존재 여부
+#          · 복수 분기 반환 여부 (실적일 근접 분기 선택 가능한가)
+#          · **신선도** — 최신 분기가 며칠 묵었나 / 진행 중인 분기인가
+#     B  insider-trading-transaction-type     × 1 (전역)
+#          · 재량 거래(P-Purchase / S-Sale) 코드 확정
+#
+#   200 이라고 곧바로 채택하지 않는다. 분기 집계가 몇 달 묵은 것이면
+#   실적 이벤트 직전 스냅샷에 붙일 근거가 없다. 그 판정까지 스크립트가 한다.
+#
+# 안전성:
+#   · 시트 접근 없음 · 이메일 없음 · 알림 상태 머신 미접촉
+#   · GOOGLE_API_KEY 불필요
+#   → 몇 번을 돌려도 부작용이 없다.
+#
+# 비용: 총 4콜 (종목 3 + 전역 1).
+#
+# ⚠️ repository_dispatch 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "쉼표 구분 티커 (비우면 AAPL,NVDA,WMT)"
+        type: string
+        default: ""
+
+jobs:
+  probe2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # requests 는 fmp_http 용. 날짜는 표준 datetime/calendar 로 계산한다.
+      - name: 📦 의존성
+        run: pip install requests
+
+      - name: 🔬 내부자 통계 생존·신선도 확인
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          TICKERS:     ${{ inputs.tickers }}
+        run: python automation/diag_earnings_cblock_probe2.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_earnings_cblock_probe2.py
