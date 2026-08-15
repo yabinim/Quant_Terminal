@@ -1,17 +1,32 @@
 name: 🔬 진단 — FMP 엔드포인트 경로 실측 (수동 전용)
 
 # 언제 쓰나:
-#   공식 api-docs(278 엔드포인트) 대조에서 코드가 쓰는 경로 6개가 문서에
-#   존재하지 않는 것으로 드러났다. 코드를 고치기 전에 실제로 살아 있는지
-#   확인한다. 결과에 따라 lockstep 수정 대상이 결정된다.
+#   공식 api-docs(278 엔드포인트) 대조에서 드러난 경로 불일치를 실측한다.
+#   결과에 따라 lockstep 수정 대상이 결정된다.
 #
-#   대상:
-#     fmp_extras.py:452      etf/sector-weighting     → etf/sector-weightings
+# ── 그룹 ──────────────────────────────────────────────────────────────
+#
+#   pairs (12콜, extra 포함 15콜) — 현재 경로 vs 공식 경로 쌍 비교
+#     fmp_extras.py:452      etf/sector-weighting        → etf/sector-weightings
 #     fmp_extras.py:389      batch-market-capitalization → market-capitalization-batch
-#     narrative_core.py:220  press-releases-latest    → news/press-releases-latest
-#     app.py:5507,14834      stock-news               → news/stock
-#     app.py:6012,7123       etf-holder/{sym}         → etf/holdings?symbol=
-#     earnings_core.py:339   earnings-surprises       → (개별 심볼용 없음)
+#     narrative_core.py:220  press-releases-latest       → news/press-releases-latest
+#     app.py:5507,14834      stock-news                  → news/stock
+#     app.py:6012,7123       etf-holder/{sym}            → etf/holdings?symbol=
+#     earnings_core.py:339   earnings-surprises          → (개별 심볼용 없음)
+#
+#   singles (5콜) — 대응 쌍이 없는 단독 확인
+#     narrative_core.py:218  news/stock-latest      Layer A (weight 1.2)
+#     narrative_core.py:222  fmp-articles           Layer C (weight 1.0)
+#     narrative_core.py:224  news/general-latest    Layer D (weight 0.8)
+#     (신규)                 news/press-releases    Layer B 대체 후보
+#     fmp_extras.py:434      etf/info               ETF 계열 미검증분
+#
+#   all (17콜, extra 포함 20콜) — 둘 다
+#
+# ── 1차 실측 결과 (2026-08-15, pairs) ────────────────────────────────
+#   수정필수 4 / 둘다실패 2 / 현행유지 0 / 판정불가 0
+#   Layer B(보도자료)는 404 → 402 로 되살릴 수 없음이 확정.
+#   같은 파이프라인의 나머지 3개 레이어가 미검증이라 singles 를 추가했다.
 #
 # 안전성:
 #   · 시트 접근 없음 — 읽지도 쓰지도 않는다
@@ -19,17 +34,23 @@ name: 🔬 진단 — FMP 엔드포인트 경로 실측 (수동 전용)
 #   · 프로젝트 모듈 import 없음 (requests 만 사용)
 #   → 몇 번을 돌려도 부작용이 없다.
 #
-# 비용: 기본 12콜 (6쌍 × 2). extra=true 면 15콜.
-#
 # ⚠️ repository_dispatch 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
 
 on:
   workflow_dispatch:
     inputs:
+      group:
+        description: "확인 그룹"
+        type: choice
+        options:
+          - singles
+          - pairs
+          - all
+        default: singles
       extra:
-        description: "참고 확인 3콜 추가 (grades / analyst-estimates / transcript-dates)"
+        description: "참고 확인 3콜 추가 (grades / analyst-estimates / transcript-dates) — pairs 에만 적용"
         type: boolean
-        default: true
+        default: false
 
 jobs:
   probe:
@@ -52,6 +73,7 @@ jobs:
       - name: 🔬 엔드포인트 경로 실측
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          PROBE_GROUP: ${{ inputs.group }}
           PROBE_EXTRA: ${{ inputs.extra && '1' || '' }}
         run: python automation/diag_fmp_endpoints.py
 
