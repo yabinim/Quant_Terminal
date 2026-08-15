@@ -100,9 +100,11 @@ _SSOT_NEEDS = (
       "days_until_from_row", "evaluate_trim", "evaluate_entry_gate",
       "UNIVERSE_WORKSHEET", "UNIVERSE_COLS", "parse_universe",
       "is_universe_only", "normalize_source",
-      "TIMING_LABELS_INFERRED", "infer_timing", "fetch_market_calendar_map"),
-     lambda m: "Source" in m.CALENDAR_COLS,
-     "Earnings_Calendar 스키마 v2(Source 열 = Tier 구분) 반영"),
+      "TIMING_LABELS_INFERRED", "infer_timing", "fetch_market_calendar_map",
+      "PREVIEW_WORKSHEET", "PREVIEW_COLS", "parse_preview",
+      "PREVIEW_PHASES", "PREVIEW_PHASE_LABELS", "parse_news_json"),
+     lambda m: "Pre_Ret_D1_Pct" in m.EVENTS_COLS,
+     "Earnings_Events 스키마 v3(사전 종가 기준 수익률 3열) 반영"),
 )
 
 _ssot_bad = []
@@ -1500,6 +1502,28 @@ def load_earnings_events() -> list[dict]:
         return []
     try:
         return ec.parse_events(ws.get_all_values() or [])
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_earnings_preview() -> list[dict]:
+    """Earnings_Preview 전체 로드(10분 캐시). 실패 시 빈 목록.
+
+    ⚠️ **읽기 전용이다.** 없으면 만들지 않는다 — 이 시트는 5PM 자동화가
+       append-only 로 관리하는 스냅샷 로그다. 앱이 빈 헤더를 만들어두면
+       자동화가 첫 스냅샷을 쓰기 전까지 '기록 0건'을 정상 상태로 오인한다.
+       (load_earnings_universe 와 같은 이유)
+
+    **계산하지 않는다.** 자동화가 스냅샷 시점에 한 번 계산해 저장한 값을
+    그대로 보여준다 — 앱에서 다시 계산하면 나중에 붙일 메일 숫자와
+    앱 숫자가 갈라진다.
+    """
+    try:
+        _w = _ws_handle(ec.PREVIEW_WORKSHEET)
+        if _w is None:
+            return []
+        return ec.parse_preview(_w.get_all_values() or [])
     except Exception:
         return []
 
@@ -25652,6 +25676,235 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                         f"유니버스는 시총 1,500억 달러 이상 미국 상장 대형주(ADR 포함) "
                         f"{len(_univ)}종목이며, 매주 월요일 갱신됩니다."
                     )
+
+        # ── 섹션 7: 실적 프리뷰 브리핑 (2단계) ──
+        #   "기대치가 어디 잡혀 있고 내가 틀리면 얼마 잃나"를 보여준다.
+        #   **방향 예측이 아니다.** 백테스트 1,209건에서 5개 요인 전부 엣지가
+        #   없음이 확인됐다(최고 점수 구간 상승 갭 45.2% — 무조건부 기준선 미만).
+        #   여기 숫자는 '맞힐 확률'이 아니라 '시장이 이미 얼마나 반영했나'다.
+        #
+        #   앱은 계산하지 않는다 — 5PM 자동화가 스냅샷 시점에 저장한 값만 읽는다.
+        st.divider()
+        st.markdown("### 🔬 실적 프리뷰 브리핑")
+
+        _pv_all = load_earnings_preview()
+        _pv_mine = [r for r in _pv_all
+                    if str(r.get("Ticker") or "").strip().upper() in _all_tk]
+
+        if not _pv_all:
+            st.info(
+                "아직 스냅샷이 없습니다. 5PM 자동화가 실적 **D-7 / D-3 / 최종** 시점에 "
+                "자동으로 기록합니다. 보유·워치리스트 종목의 실적이 다가오면 여기에 표시됩니다."
+            )
+        elif not _pv_mine:
+            st.info(
+                f"기록된 스냅샷 {len(_pv_all)}건은 모두 현재 보유·워치리스트 밖 종목입니다. "
+                "(과거에 담았다가 뺀 종목일 수 있습니다.)"
+            )
+        else:
+            # 이벤트 단위로 묶는다. 1이벤트 = 최대 3스냅샷(D7/D3/FINAL).
+            _pv_by_ev = {}
+            for _r in _pv_mine:
+                _eid = str(_r.get("Event_ID") or "").strip()
+                if _eid:
+                    _pv_by_ev.setdefault(_eid, []).append(_r)
+
+            _PH_ORDER = {p: i for i, p in enumerate(ec.PREVIEW_PHASES)}
+
+            def _pv_num(v):
+                return ec._num(v)
+
+            def _pv_f(v, unit="", digits=1, signed=False):
+                """숫자 → 표시 문자열. 결측은 '—' (0 으로 보이면 안 된다)."""
+                n = _pv_num(v)
+                if n is None:
+                    return "—"
+                s = f"{n:+.{digits}f}" if signed else f"{n:,.{digits}f}"
+                return f"{s}{unit}"
+
+            def _pv_money(v):
+                """매출은 억/조 단위가 아니라 B(십억 달러)로 통일한다."""
+                n = _pv_num(v)
+                if n is None:
+                    return "—"
+                if abs(n) >= 1e9:
+                    return f"{n / 1e9:,.2f}B"
+                if abs(n) >= 1e6:
+                    return f"{n / 1e6:,.1f}M"
+                return f"{n:,.0f}"
+
+            # 발표일이 가까운 순. 이미 발표된 이벤트는 뒤로 보낸다.
+            def _ev_sort_key(item):
+                _rows = item[1]
+                _ed = str(_rows[0].get("Earnings_Date") or "")
+                _d = ec._d(_ed)
+                _past = 1 if (_d is not None and _d < _e_today) else 0
+                return (_past, _ed)
+
+            _pv_items = sorted(_pv_by_ev.items(), key=_ev_sort_key)
+
+            st.caption(
+                f"{len(_pv_items)}개 이벤트 · 스냅샷 {len(_pv_mine)}건  \n"
+                "**방향 예측이 아닙니다.** 백테스트에서 예측 엣지가 확인되지 않아 "
+                "예측을 하지 않습니다. 아래 숫자는 *시장이 무엇을 이미 기대하고 있는가*를 "
+                "보여주며, 판단은 사용자가 합니다."
+            )
+
+            for _eid, _rows in _pv_items:
+                _rows = sorted(_rows, key=lambda r: _PH_ORDER.get(
+                    str(r.get("Phase") or ""), 99))
+                _last = _rows[-1]                     # 가장 최근 스냅샷
+                _tk = str(_last.get("Ticker") or "").upper()
+                _ed = str(_last.get("Earnings_Date") or "")
+                _d = ec._d(_ed)
+                _dd = None if _d is None else int((_d - _e_today).days)
+                _tm = str(_last.get("Timing") or "").strip().lower()
+                _tm_lbl = {"bmo": "장전", "amc": "장후"}.get(_tm, "시점 미상")
+
+                if _dd is None:
+                    _when = _ed
+                elif _dd > 0:
+                    _when = f"{_ed} · **D-{_dd}**"
+                elif _dd == 0:
+                    _when = f"{_ed} · **오늘 발표**"
+                else:
+                    _when = f"{_ed} · 발표 {abs(_dd)}일 경과"
+
+                st.markdown(f"#### {_tk} — {_when} · {_tm_lbl}")
+
+                _c1, _c2, _c3 = st.columns(3)
+                with _c1:
+                    st.markdown("**기대치**")
+                    st.markdown(
+                        f"- EPS `{_pv_f(_last.get('Est_EPS'), digits=3)}` "
+                        f"(전년비 {_pv_f(_last.get('Est_EPS_YoY_Pct'), '%', signed=True)})\n"
+                        f"- 매출 `{_pv_money(_last.get('Est_Revenue'))}` "
+                        f"(전년비 {_pv_f(_last.get('Est_Revenue_YoY_Pct'), '%', signed=True)})\n"
+                        f"- 목표주가 `{_pv_f(_last.get('Target_Mean'), digits=2)}` "
+                        f"(현재가 대비 {_pv_f(_last.get('Target_Upside_Pct'), '%', signed=True)})\n"
+                        f"- 추정치 수정 {_pv_f(_last.get('Est_Revision_Pct'), '%', signed=True)}"
+                    )
+                with _c2:
+                    st.markdown("**반영도**")
+                    _bn = _pv_num(_last.get("Sample_N_Q")) or 0
+                    st.markdown(
+                        f"- 20일 상대강도 `{_pv_f(_last.get('RS_20d_Pct'), '%p', signed=True)}`\n"
+                        f"- {int(_bn)}분기 beat율 `{_pv_f(_last.get('Beat_Rate_Pct'), '%')}`\n"
+                        f"- 평균 서프라이즈 `{_pv_f(_last.get('Surprise_Avg_Pct'), '%', signed=True)}`\n"
+                        f"- 매수의견 `{_pv_f(_last.get('Grade_Buy_Pct'), '%')}` "
+                        f"(90일 {_pv_f(_last.get('Grade_Drift_90d'), '%p', signed=True)})"
+                    )
+                with _c3:
+                    st.markdown("**리스크**")
+                    _wv = _pv_num(_last.get("Exp_Worst_Pct"))
+                    _mv = _pv_num(_last.get("Exp_Median_Pct"))
+                    # 결측일 때 '±—' / '-—' 같은 기호가 붙지 않게 문자열을 먼저 만든다.
+                    _mv_txt = "—" if _mv is None else f"±{abs(_mv):,.1f}%"
+                    _wv_txt = "—" if _wv is None else f"-{abs(_wv):,.1f}%"
+                    st.markdown(
+                        f"- 예상 갭 `{_mv_txt}`\n"
+                        f"- 최악 `{_wv_txt}`\n"
+                        f"- 스냅샷 시점가 `{_pv_f(_last.get('Price_At_Snapshot'), digits=2)}`\n"
+                        f"- 기록 시각 {str(_last.get('Snapshot_At') or '—')}"
+                    )
+
+                # ── 스냅샷 추이 ──
+                #   단일 시점보다 **변화**가 중요하다. 기대치가 올라갔는데 주가가
+                #   못 따라갔는지, 그 반대인지가 이 표의 존재 이유다.
+                if len(_rows) > 1:
+                    _prog = []
+                    for _r in _rows:
+                        _prog.append({
+                            "시점": ec.PREVIEW_PHASE_LABELS.get(
+                                str(_r.get("Phase") or ""), str(_r.get("Phase") or "")),
+                            "기록": str(_r.get("Snapshot_At") or "")[:10],
+                            "주가": _pv_f(_r.get("Price_At_Snapshot"), digits=2),
+                            "EPS 추정": _pv_f(_r.get("Est_EPS"), digits=3),
+                            "매출 추정": _pv_money(_r.get("Est_Revenue")),
+                            "목표대비": _pv_f(_r.get("Target_Upside_Pct"), "%", signed=True),
+                            "상대강도": _pv_f(_r.get("RS_20d_Pct"), "%p", signed=True),
+                        })
+                    st.dataframe(pd.DataFrame(_prog), use_container_width=True,
+                                 hide_index=True)
+
+                # ── 발표 후 결과 대조 ──
+                #   예상이 맞았는지가 아니라, **예상 범위 안이었는지**를 본다.
+                _res = None
+                for _r in (_ev_by_tk.get(_tk) or []):
+                    if ec.event_id(_tk, str(_r.get("Earnings_Date") or "")) == _eid:
+                        _res = _r
+                        break
+                if _res is not None and str(_res.get("Gap_Pct") or "").strip():
+                    _gap = _pv_num(_res.get("Gap_Pct"))
+                    _exp = _pv_num(_last.get("Exp_Median_Pct"))
+                    # 예상 변동폭이 없으면 '범위 밖'이 아니라 **판정 불가**다.
+                    # 둘을 섞으면 표본이 없어서 못 잰 것을 이상 반응으로 오독한다.
+                    _inside = None
+                    if _gap is not None and _exp is not None:
+                        _inside = abs(_gap) <= abs(_exp)
+                    _verdict = ("대조 불가(예상 변동폭 없음)" if _inside is None
+                                else ("예상 범위 안" if _inside else "예상 범위 밖"))
+                    _exp_txt = ("—" if _exp is None else f"±{_pv_f(_exp, '%')}")
+                    st.markdown(
+                        f"**결과** — 실제 갭 `{_pv_f(_gap, '%', signed=True)}` "
+                        f"vs 예상 `{_exp_txt}` → **{_verdict}**  \n"
+                        f"발표 전날 종가 기준 수익률 · "
+                        f"D+1 `{_pv_f(_res.get('Pre_Ret_D1_Pct'), '%', signed=True)}` · "
+                        f"D+3 `{_pv_f(_res.get('Pre_Ret_D3_Pct'), '%', signed=True)}` · "
+                        f"D+7 `{_pv_f(_res.get('Pre_Ret_D7_Pct'), '%', signed=True)}`"
+                    )
+                    if _inside is False:
+                        st.caption(
+                            "예상 범위를 벗어났다는 것은 과거 8분기 패턴으로 "
+                            "설명되지 않는 반응이라는 뜻입니다. 표본이 적거나 "
+                            "이번 분기에 구조적 변화가 있었을 수 있습니다."
+                        )
+
+                # ── 뉴스 ──
+                _news = ec.parse_news_json(_last.get("News_JSON"))
+                if _news:
+                    with st.expander(f"📰 뉴스 {len(_news)}건 — "
+                                     f"{ec.PREVIEW_PHASE_LABELS.get(str(_last.get('Phase') or ''), '')} "
+                                     f"시점 기준", expanded=False):
+                        for _n in _news:
+                            _t = str(_n.get("t") or "").strip()
+                            _u = str(_n.get("u") or "").strip()
+                            _s = str(_n.get("s") or "").strip()
+                            _dt = str(_n.get("d") or "").strip()
+                            if _u:
+                                st.markdown(f"- [{_t}]({_u})  \n  `{_dt}` · {_s}")
+                            else:
+                                st.markdown(f"- {_t}  \n  `{_dt}` · {_s}")
+
+                # ── 결측 안내 ──
+                #   빈칸을 그냥 두면 '0' 으로 오해한다. 왜 없는지 밝힌다.
+                _flags = [f.strip() for f in
+                          str(_last.get("Data_Flags") or "").split(",") if f.strip()]
+                if _flags:
+                    _FLAG_KO = {
+                        "no_revision": "추정치 수정률 — 축적 중(30일 창이 차야 산출)",
+                        "no_estimate": "이번 분기 컨센서스 미확보",
+                        "no_revenue_est": "매출 컨센서스 미제공",
+                        "no_yoy_base": "전년 동기 실적 없음 — 전년비 계산 불가",
+                        "few_quarters": "과거 분기 표본 부족(4분기 미만) — beat율 산출 안 함",
+                        "no_target": "목표주가 미제공",
+                        "no_grades": "애널리스트 의견 데이터 없음",
+                        "no_grade_drift": "90일 전 의견 관측 없음 — 변화량 계산 불가",
+                        "no_rs": "가격 이력 부족 — 상대강도 계산 불가",
+                        "rs_absolute": "SPY 미확보 — 상대강도가 아니라 절대 수익률",
+                        "no_expected_move": "예상 변동폭 미산출(표본 부족)",
+                    }
+                    st.caption("ℹ️ 자료 없음: "
+                               + " · ".join(_FLAG_KO.get(f, f) for f in _flags))
+                st.divider()
+
+            st.caption(
+                "스냅샷은 **D-7 / D-3 / 최종**(장후 발표는 D-1, 장전 발표는 D-2) "
+                "세 시점에 자동 기록됩니다. 기록 후에는 수정하지 않습니다 — "
+                "그 시점에 실제로 보였던 숫자가 남아야 사후 대조가 의미를 갖습니다.  \n"
+                "**어닝콜 요약은 현재 제공되지 않습니다.** FMP 트랜스크립트 API가 "
+                "현재 요금제에서 제공되지 않아 뉴스 헤드라인으로 대체하고 있습니다."
+            )
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
