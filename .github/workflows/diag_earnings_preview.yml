@@ -1,0 +1,45 @@
+name: 🧪 진단 — 실적 프리뷰 회귀 검사 (수동 전용)
+
+# 무엇을 하나:
+#   earnings_core 의 프리뷰 순수 함수를 합성 데이터로 검증한다.
+#   FMP·Sheets 를 전혀 부르지 않는다 — 네트워크 0, 시트 접근 0, 비용 0.
+#
+# 언제 쓰나:
+#   · earnings_core / run_earnings_watch 를 배포하기 **전**
+#   · Phase 창, B블록 산식, 스키마를 손댄 뒤
+#
+# 실패하면 배포하지 말 것. 특히 아래 두 가지는 조용히 데이터를 오염시킨다:
+#   · EVENTS_COLS 중간 삽입  → 기존 행의 범위 지정이 어긋난다
+#   · Phase 창 중첩         → 하루에 두 스냅샷이 찍힌다
+
+on:
+  workflow_dispatch:
+
+jobs:
+  regress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # earnings_core 가 numpy/pandas/requests 를 import 한다.
+      - name: 📦 의존성
+        run: pip install pandas numpy requests
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          earnings_core.py
+          automation/run_earnings_watch.py
+          automation/diag_earnings_preview.py
+
+      # 실패 시 종료 코드 1 → 워크플로가 빨갛게 뜬다(프로브와 달리 게이트다).
+      - name: 🧪 프리뷰 회귀 검사
+        run: python automation/diag_earnings_preview.py
