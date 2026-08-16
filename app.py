@@ -758,6 +758,146 @@ def _render_reminders_admin() -> None:
                     st.rerun()
 
 
+def _pv_num(v):
+    return ec._num(v)
+
+
+def _pv_f(v, unit="", digits=1, signed=False):
+    """숫자 → 표시 문자열. 결측은 '—' (0 으로 보이면 안 된다).
+
+    ⚠️ 모듈 레벨에 둔다. 예전에는 실적 프리뷰 섹션 안의 중첩 함수였는데,
+       지연 계산 게이트(먼저 실행됨)에서도 같은 포맷이 필요해졌다.
+       중첩으로 두면 게이트가 NameError 로 죽는다.
+    """
+    n = _pv_num(v)
+    if n is None:
+        return "—"
+    s = f"{n:+.{digits}f}" if signed else f"{n:,.{digits}f}"
+    return f"{s}{unit}"
+
+
+def _pv_money(v):
+    """매출·금액은 억/조가 아니라 B(십억 달러)로 통일한다."""
+    n = _pv_num(v)
+    if n is None:
+        return "—"
+    if abs(n) >= 1e9:
+        return f"{n / 1e9:,.2f}B"
+    if abs(n) >= 1e6:
+        return f"{n / 1e6:,.1f}M"
+    return f"{n:,.0f}"
+
+
+def _boot_mark(label: str) -> None:
+    """기동 단계별 소요 시간 기록 (관리자 진단용).
+
+    '로그인 후 첫 화면까지 10초 이상'을 고쳤다고 말하려면 실제로 어디서
+    시간이 가는지 알아야 한다. 추측으로 페이지만 바꾸면 '다른 페이지도 느림'이
+    된다. 세션당 한 번만 쌓고, 표시는 시작 페이지에서 관리자에게만 한다.
+    """
+    try:
+        t = time.perf_counter()
+        marks = st.session_state.setdefault("_boot_marks", [])
+        prev = marks[-1][1] if marks else st.session_state.get("_boot_t0", t)
+        marks.append((str(label), t, t - prev))
+        if len(marks) > 40:      # 재실행이 반복돼도 무한히 자라지 않게
+            del marks[:-40]
+    except Exception:
+        pass
+
+
+def _render_home() -> None:
+    """🏠 시작 — 로그인 직후 착지 지점.
+
+    설계 원칙: **시트만 읽는다.** FMP 호출도, 가격 이력도, DRG 재계산도 하지 않는다.
+    여기서 무거운 계산을 하면 착지 지점을 옮긴 의미가 없다.
+    """
+    st.title("🏠 시작")
+
+    # 사용 가이드 우선 안내 — 앱이 커져서 처음 쓰는 사람이 순서를 모른다.
+    st.info(
+        "**처음이거나 오랜만이라면 `📖 사용 가이드`부터 확인하세요.** "
+        "투자 철학, 표준 워크플로우(발굴 → 검증 → 진입 → 관리 → 청산), "
+        "탭별 기능이 정리돼 있습니다. 이 앱의 판정은 매매 지시가 아니라 "
+        "**손실 방지 제약**이라는 전제를 먼저 이해하고 쓰는 편이 안전합니다."
+    )
+    if st.button("📖 사용 가이드 열기", use_container_width=True):
+        st.session_state["main_nav_idx"] = 12
+        st.rerun()
+
+    st.divider()
+    st.markdown("## 오늘 확인할 것")
+    _shown = False
+
+    # ── 리마인더 (관리자 전용) ──
+    if _is_admin():
+        try:
+            _rws = _ws_handle(rmc.REMINDERS_WORKSHEET)
+            if _rws is not None:
+                _rl = rmc.active_reminders(
+                    rmc.parse_reminders(_rws.get_all_values() or []),
+                    datetime.now(_MARKET_ET_TZ).date())
+                if _rl:
+                    _shown = True
+                    st.warning(f"🔔 **개발 리마인더 {len(_rl)}건**")
+                    for _r in _rl[:5]:
+                        st.markdown(f"- {rmc.kind_label(rmc.classify(_r))} "
+                                    f"{_r.get('Title')} · {_r.get('Due_Date')}")
+        except Exception:
+            pass   # 시작 화면이 부가 정보 때문에 죽으면 안 된다
+
+    # ── 임박 실적 (시트만) ──
+    try:
+        _cal_h = load_earnings_calendar()
+        _today_h = pd.Timestamp(datetime.now(_MARKET_ET_TZ).date())
+        _soon = []
+        for _tk_h, _row_h in (_cal_h or {}).items():
+            _dd_h = ec.days_until_from_row(_row_h, _today_h)
+            if _dd_h is not None and 0 <= _dd_h <= ec.ENTRY_BLOCK_DAYS:
+                _soon.append((_dd_h, _tk_h, str(_row_h.get("Earnings_Date") or "")))
+        if _soon:
+            _shown = True
+            _soon.sort()
+            st.warning(f"📅 **{ec.ENTRY_BLOCK_DAYS}일 내 실적 발표 {len(_soon)}종목**")
+            st.markdown(" · ".join(f"**{t}**(D-{d})" for d, t, _e in _soon[:12])
+                        + (" 외" if len(_soon) > 12 else ""))
+            if st.button("📅 실적 레이더에서 보기", use_container_width=True):
+                st.session_state["main_nav_idx"] = 15
+                st.rerun()
+    except Exception:
+        pass
+
+    if not _shown:
+        st.success("지금 급히 확인할 항목이 없습니다.")
+
+    st.divider()
+    st.markdown("## 바로 가기")
+    _c1, _c2, _c3 = st.columns(3)
+    for _col, _label, _idx in (
+            (_c1, "🚨 Daily Risk Gauge", 0),
+            (_c2, "🛡️ 포트폴리오 매도 레이더", 6),
+            (_c3, "🔔 Buy Watchlist & Alert", 7)):
+        if _col.button(_label, use_container_width=True, key=f"_home_go_{_idx}"):
+            st.session_state["main_nav_idx"] = _idx
+            st.rerun()
+    st.caption(
+        "**시장 위험도(DRG)는 이 화면에서 계산하지 않습니다.** 시작 화면은 시트만 읽어 "
+        "즉시 뜨도록 만들었습니다. 위 버튼으로 이동하면 그때 계산합니다."
+    )
+
+    # ── 기동 계측 (관리자 전용) ──
+    if _is_admin():
+        _marks = st.session_state.get("_boot_marks") or []
+        if _marks:
+            with st.expander("⏱️ 기동 소요 (관리자 진단)", expanded=False):
+                _tot = sum(m[2] for m in _marks)
+                st.caption(f"이번 렌더 누적 {_tot:.2f}초 — "
+                           "느린 구간이 어디인지 보고 판단하세요.")
+                st.dataframe(pd.DataFrame(
+                    [{"단계": m[0], "구간(초)": round(m[2], 3)} for m in _marks]),
+                    use_container_width=True, hide_index=True)
+
+
 def _ws_handle_required(sheet_title: str):
     """탭 핸들을 반환하되 없으면 예외를 던진다.
 
@@ -2759,6 +2899,10 @@ _MAIN_NAV_OPTIONS = (
     "⚙️ 내 설정",
     # ── 실적 (index 15: 맨 끝 append — 표시 순서는 아래 _nav_opts 에서 재배치) ──
     "📅 실적 레이더",
+    # ── 시작 (index 16: 맨 끝 append — 표시 순서는 _nav_opts 에서 맨 앞으로) ──
+    #   ⚠️ 반드시 맨 뒤에 붙인다. 중간에 끼우면 _MAIN_NAV_OPTIONS[n] 인덱스 분기가
+    #      전부 한 칸씩 밀려 엉뚱한 페이지가 열린다.
+    "🏠 시작",
 )
 
 
@@ -15335,6 +15479,10 @@ if st.session_state.get("logged_in"):
         st.success(f"🆕 **ETF Universe 자동 업데이트** — 최근 90일 내 신규 상장 ETF **{_etf_new_cnt}개**가 자동으로 추가됐어요! `[2단계] 섹터 & 자금 흐름`에서 확인하세요.")
 
     _nav_key = "main_sidebar_nav"
+    # 기동 계측 시작 — 이 렌더에서 어디에 시간이 가는지 남긴다(관리자 진단용).
+    st.session_state["_boot_t0"] = time.perf_counter()
+    st.session_state["_boot_marks"] = []
+    _boot_mark("메뉴 구성 시작")
     _nav_opts = list(_MAIN_NAV_OPTIONS)
     # 표시 순서만 재배치: '📊 매매 복기'를 '🛡️ [4단계] 포트폴리오 매도 레이더'(index 6) 바로 뒤로.
     # (분기는 문자열 비교이므로 _MAIN_NAV_OPTIONS 인덱스/cross-nav는 영향 없음)
@@ -15349,6 +15497,13 @@ if st.session_state.get("logged_in"):
         if _earn_label in _nav_opts and _radar_label in _nav_opts:
             _nav_opts.remove(_earn_label)
             _nav_opts.insert(_nav_opts.index(_radar_label) + 1, _earn_label)
+        # 🏠 시작(index 16)을 맨 앞으로. 로그인 직후 기본 착지 지점이 된다.
+        #   DRG 는 스냅샷 즉시 반환 구조지만 콜드 스타트에서 백그라운드 재계산이
+        #   돌면서 첫 화면 체감이 느렸다. 시작 페이지는 시트만 읽어 즉시 뜬다.
+        _home_label = _MAIN_NAV_OPTIONS[16]
+        if _home_label in _nav_opts:
+            _nav_opts.remove(_home_label)
+            _nav_opts.insert(0, _home_label)
     except Exception:
         pass
     if st.session_state.get("user_role") == "admin":
@@ -15575,7 +15730,13 @@ if st.session_state.get("logged_in"):
     quote_type, selected_ticker_obj, selected_ticker_info = detect_quote_type(selected_ticker)
     is_etf_mode = quote_type == "ETF"
     
-    if main_nav == _MAIN_NAV_OPTIONS[0]:
+    _boot_mark("사이드바 완료")
+
+    # 🏠 시작 — 시트만 읽고 즉시 렌더. 어떤 계산도 트리거하지 않는다.
+    if main_nav == _MAIN_NAV_OPTIONS[16]:
+        _render_home()
+
+    elif main_nav == _MAIN_NAV_OPTIONS[0]:
         # ─────────────────────────────────────────────────────────────────────
         # 🚨 Daily Risk Gauge
         # ─────────────────────────────────────────────────────────────────────
@@ -25519,6 +25680,122 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
         except Exception:
             _core_keys = set()
 
+        _cal = load_earnings_calendar()
+        _uni = []
+        if not _e_pf.empty:
+            for _, _h in _e_pf.iterrows():
+                _uni.append(("hold", str(_h.get("Ticker") or "").strip().upper(), _h))
+        for _w in _e_wl:
+            _uni.append(("watch", str(_w.get("ticker") or "").strip().upper(), _w))
+        _uni = [u for u in _uni if u[1]]
+
+        # ── 지연 계산 게이트 ────────────────────────────────────────────────
+        #   판정(차단·축소)은 계좌 컨텍스트 + 현재가 + 종목별 가격 이력(ATR 손절)을
+        #   요구한다. 워치리스트 종목마다 cached_timing_price_history 를 부르므로
+        #   20~30종목이면 탭 진입만으로 수십 초가 걸렸다.
+        #
+        #   첫 화면은 **시트만** 읽어 일정과 자동화 사전 브리핑을 즉시 보여주고,
+        #   판정은 버튼을 눌렀을 때만 계산한다. 결과는 세션에 캐시해 같은 세션에서
+        #   탭을 오갈 때 다시 느려지지 않게 한다(키에 날짜·종목집합 포함 —
+        #   종목을 추가하거나 날이 바뀌면 자동으로 다시 계산한다).
+        #
+        #   ⚠️ 자동화가 판정까지 미리 계산해 두는 방식은 쓰지 않는다.
+        #      판정은 계좌 프로필과 수동 손절가에 의존하는데, 사용자가 손절가를
+        #      바꾸면 어제 판정이 그대로 뜬다. 낡은 판정은 없는 판정보다 위험하다.
+        _e_ck = (_euid, str(_e_today.date()),
+                 tuple(sorted(str(u[1]) for u in _uni)))
+        _e_run = (st.session_state.get("_earn_calc_key") == _e_ck
+                  or bool(st.session_state.pop("_earn_calc_now", False)))
+
+        if not _e_run:
+            st.info(
+                "⚡ **판정은 아직 계산하지 않았습니다.** 아래는 자동화가 미리 채워 둔 "
+                "일정과 사전 브리핑입니다. 차단·축소 판정은 종목별 가격 이력이 "
+                "필요해 시간이 걸리므로 필요할 때만 계산합니다."
+            )
+            if st.button("⚡ 조치 판정 계산", type="primary",
+                         use_container_width=True):
+                st.session_state["_earn_calc_now"] = True
+                st.rerun()
+
+            _quick, _q_missing = [], []
+            for _kq, _tq, _oq in _uni:
+                _cr = _cal.get(_tq)
+                if _cr is None:
+                    _q_missing.append(_tq)
+                    continue
+                _dq = ec.days_until_from_row(_cr, _e_today)
+                if _dq is None or _dq < 0 or _dq > ec.SCAN_HORIZON_DAYS:
+                    continue
+                _mq = ec.move_from_row(_cr)
+                _quick.append({
+                    "티커": _tq,
+                    "구분": "보유" if _kq == "hold" else "관심",
+                    "발표일": str(_cr.get("Earnings_Date") or ""),
+                    "D": _dq,
+                    "시점": str(_cr.get("Timing") or "") or "-",
+                    "예상 변동폭": (f"±{_mq['median_pct']:.1f}%"
+                                if _mq and _mq.get("median_pct") is not None
+                                else "—"),
+                })
+            if _quick:
+                _quick.sort(key=lambda r: r["D"])
+                st.markdown("### 📅 예정된 실적")
+                st.dataframe(pd.DataFrame(_quick), use_container_width=True,
+                             hide_index=True)
+                st.caption(
+                    "**예상 변동폭은 과거 실적 반응의 중앙값입니다.** 방향 정보가 "
+                    "아니고, 이 표에는 아직 계좌 한도·손절폭이 반영돼 있지 않습니다. "
+                    "진입·축소 판단에는 위 버튼을 눌러 판정을 받으십시오."
+                )
+            else:
+                st.caption(
+                    f"향후 {ec.SCAN_HORIZON_DAYS}일 내 실적 발표 예정 종목이 없습니다.")
+            if _q_missing:
+                st.info(
+                    f"⏳ **데이터 준비 중** ({len(_q_missing)}종목): "
+                    f"{', '.join(sorted(_q_missing)[:12])}"
+                    + (" 외" if len(_q_missing) > 12 else "")
+                    + "  \n최근 추가하신 종목입니다. 평일 5PM ET 자동화가 실적 일정을 "
+                      "채우면 다음날부터 표시됩니다."
+                )
+
+            # 자동화가 D-7/D-3/최종에 남긴 사전 브리핑 — 시트 읽기뿐이라 즉시 뜬다.
+            try:
+                _pv_all = load_earnings_preview()
+                _pv_tk = {u[1] for u in _uni}
+                _pv_hit = [p for p in (_pv_all or [])
+                           if str(p.get("Ticker") or "").upper() in _pv_tk]
+                if _pv_hit:
+                    st.markdown("### 📋 사전 브리핑 (자동화 스냅샷)")
+                    _pv_last = {}
+                    for _p in _pv_hit:
+                        _k = str(_p.get("Ticker") or "").upper()
+                        if (_k not in _pv_last
+                                or str(_p.get("Snapshot_At") or "")
+                                > str(_pv_last[_k].get("Snapshot_At") or "")):
+                            _pv_last[_k] = _p
+                    st.dataframe(pd.DataFrame([{
+                        "티커": _k,
+                        "단계": str(_v.get("Phase") or ""),
+                        "기록 시각": str(_v.get("Snapshot_At") or ""),
+                        "예상 변동폭": _pv_f(_v.get("Exp_Median_Pct"), "%"),
+                        "목표가 여력": _pv_f(_v.get("Target_Upside_Pct"), "%",
+                                        signed=True),
+                        "내부자 매도": _pv_money(_v.get("Insider_Sale_Val_90d")),
+                    } for _k, _v in sorted(_pv_last.items())]),
+                        use_container_width=True, hide_index=True)
+                    st.caption(
+                        "발표 D-7·D-3·직전에 자동으로 기록된 값입니다. "
+                        "상세는 판정 계산 후 하단 섹션에서 볼 수 있습니다."
+                    )
+            except Exception:
+                pass
+
+            st.stop()
+
+        st.session_state["_earn_calc_key"] = _e_ck
+
         # ── 계좌별 한도 해석 ──
         _e_accts = (sorted(_e_pf["Account"].dropna().astype(str).str.strip().unique().tolist())
                     if (not _e_pf.empty and "Account" in _e_pf.columns) else [])
@@ -25552,15 +25829,6 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
             _px_map = fetch_latest_prices_for_tickers(tuple(sorted(_all_tk)))
         except Exception:
             _px_map = {}
-        _cal = load_earnings_calendar()
-        _uni = []
-        if not _e_pf.empty:
-            for _, _h in _e_pf.iterrows():
-                _uni.append(("hold", str(_h.get("Ticker") or "").strip().upper(), _h))
-        for _w in _e_wl:
-            _uni.append(("watch", str(_w.get("ticker") or "").strip().upper(), _w))
-        _uni = [u for u in _uni if u[1]]
-
         _missing = []
         for _i, (_kind, _tk, _obj) in enumerate(_uni):
             try:
@@ -25883,28 +26151,6 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                     _pv_by_ev.setdefault(_eid, []).append(_r)
 
             _PH_ORDER = {p: i for i, p in enumerate(ec.PREVIEW_PHASES)}
-
-            def _pv_num(v):
-                return ec._num(v)
-
-            def _pv_f(v, unit="", digits=1, signed=False):
-                """숫자 → 표시 문자열. 결측은 '—' (0 으로 보이면 안 된다)."""
-                n = _pv_num(v)
-                if n is None:
-                    return "—"
-                s = f"{n:+.{digits}f}" if signed else f"{n:,.{digits}f}"
-                return f"{s}{unit}"
-
-            def _pv_money(v):
-                """매출은 억/조 단위가 아니라 B(십억 달러)로 통일한다."""
-                n = _pv_num(v)
-                if n is None:
-                    return "—"
-                if abs(n) >= 1e9:
-                    return f"{n / 1e9:,.2f}B"
-                if abs(n) >= 1e6:
-                    return f"{n / 1e6:,.1f}M"
-                return f"{n:,.0f}"
 
             # 발표일이 가까운 순. 단 **내 종목을 먼저** 올리고, 이미 발표된
             # 이벤트는 뒤로 보낸다. 스크롤 맨 위가 내 것이어야 한다.
