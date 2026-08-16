@@ -1,4 +1,5 @@
 import sys
+import types as _types
 
 if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -108,7 +109,7 @@ _SSOT_NEEDS = (
      lambda m: ("Pre_Ret_D1_Pct" in m.EVENTS_COLS
                 and "Insider_Cov_D" in m.PREVIEW_COLS),
      "Earnings_Events v3(사전 종가 수익률 3열) + Preview v2(내부자 4열) 반영"),
-    ("reminders_core", "reminders_core",
+    ("reminders_core", rmc,
      ("REMINDERS_WORKSHEET", "REMINDER_COLS", "parse_reminders",
       "classify", "active_reminders", "build_email_html", "make"),
      lambda m: "Snoozed_Until" in m.REMINDER_COLS,
@@ -117,6 +118,14 @@ _SSOT_NEEDS = (
 
 _ssot_bad = []
 for _n, _m, _syms, _cond, _why in _SSOT_NEEDS:
+    # ⚠️ 2번째 항목은 **모듈 객체**여야 한다. 문자열("reminders_core")을 넣으면
+    #    hasattr 이 전부 False 가 되어 정상 배포를 '구버전'으로 오진한다.
+    #    실제로 한 번 밟았다 — 배포는 멀쩡한데 앱이 st.stop() 으로 죽었다.
+    if not isinstance(_m, _types.ModuleType):
+        _ssot_bad.append((_n, None,
+                          f"매니페스트 오류: 모듈 객체가 아니라 {type(_m).__name__} "
+                          "가 등록됨 (코드 버그 — 재배포로 해결되지 않음)"))
+        continue
     _missing = [a for a in _syms if not hasattr(_m, a)]
     if _missing:
         _ssot_bad.append((_n, _m, f"심볼 없음: {', '.join(_missing[:4])}"
@@ -135,7 +144,7 @@ if _ssot_bad:
         "⚠️ **공용 모듈이 구버전입니다** — 해당 파일을 다시 배포하고 재부팅하세요.\n\n"
         + "\n".join(
             f"- `{_n}.py` — {_msg}  \n"
-            f"  (파일 버전 `{getattr(_m, 'SSOT_VERSION', '없음')}`)"
+            f"  (파일 버전 `{getattr(_m, 'SSOT_VERSION', '없음') if _m is not None else '해당없음'}`)"
             for _n, _m, _msg in _ssot_bad)
         + "\n\n배포 후 **Manage app → Reboot** 을 실행하세요."
     )
