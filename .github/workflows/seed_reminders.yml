@@ -1,0 +1,60 @@
+name: 🌱 시드 — 초기 개발 리마인더 적재 (수동 전용)
+
+# 무엇을 하나:
+#   Reminders 시트에 초기 3건을 넣는다.
+#     2026-11-03  Hidden Alpha 위성 로테이션 재평가
+#     2026-11-15  내부자 거래 블록 유효성 검증
+#     2027-02-02  신호 기반 매매 성과 평가
+#
+# 왜 앱 UI 가 아니라 스크립트인가:
+#   What_To_Check 본문이 길다. 손으로 치면 "내부자 블록 확인" 한 줄로 줄고,
+#   3개월 뒤에는 그게 무슨 뜻인지 모르게 된다.
+#
+# 안전성:
+#   · 멱등하다 — ID 가 같으면 덮어쓴다. 여러 번 돌려도 중복이 생기지 않는다
+#   · 기존 항목의 Status / Snoozed_Until 은 **보존한다.**
+#     이미 완료·연기 처리한 것을 재실행이 되살리면 안 된다
+#   · Reminders 시트 외에는 아무것도 건드리지 않는다
+#   · 이메일 없음 · FMP 호출 없음 · 알림 상태 머신 미접촉
+#   · DRY_RUN=1 이면 시트에 쓰지 않고 목록만 출력한다 — 먼저 이걸로 확인
+#
+# ⚠️ repository_dispatch 없음 — 일회성 시드가 매일 돌 이유가 없다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "시트에 쓰지 않고 미리보기만"
+        type: boolean
+        default: true
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # DRY_RUN 에서는 시트 라이브러리조차 쓰지 않는다(_open_ws 안에서만 import).
+      # 그래도 실제 실행 경로를 위해 설치해 둔다.
+      - name: 📦 의존성
+        run: pip install --quiet gspread google-auth
+
+      - name: 🌱 초기 리마인더 적재
+        env:
+          GSPREAD_KEY:              ${{ secrets.GSPREAD_KEY }}
+          DRY_RUN:                  ${{ inputs.dry_run && '1' || '' }}
+        run: python automation/seed_reminders.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          reminders_core.py
+          automation/seed_reminders.py
