@@ -39,6 +39,7 @@ import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화�
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
 import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 자동화와 동일 모듈
 import earnings_core as ec
+import reminders_core as rmc  # 개발 로드맵 리마인더 SSOT — run_narrative 와 동일 모듈
 import watchlist_metrics_core as wm  # 워치리스트 표시 지표 SSOT — 자동화(run_watchlist_alerts)와 동일 모듈
 
 # ── 1.6 AI 종목 스캐너 SSOT (scanner_core) ───────────────────────────────────
@@ -107,6 +108,11 @@ _SSOT_NEEDS = (
      lambda m: ("Pre_Ret_D1_Pct" in m.EVENTS_COLS
                 and "Insider_Cov_D" in m.PREVIEW_COLS),
      "Earnings_Events v3(사전 종가 수익률 3열) + Preview v2(내부자 4열) 반영"),
+    ("reminders_core", "reminders_core",
+     ("REMINDERS_WORKSHEET", "REMINDER_COLS", "parse_reminders",
+      "classify", "active_reminders", "build_email_html", "make"),
+     lambda m: "Snoozed_Until" in m.REMINDER_COLS,
+     "개발 리마인더 v1(연기 컬럼 포함) 반영"),
 )
 
 _ssot_bad = []
@@ -623,6 +629,124 @@ def _ws_handle(sheet_title: str):
         return sh.worksheet(str(sheet_title))
     except Exception:
         return None
+
+
+def _reminders_ws():
+    """Reminders 탭 핸들. 없으면 만든다(헤더 포함)."""
+    sh = _open_quant_db()
+    if sh is None:
+        return None
+    try:
+        return sh.worksheet(rmc.REMINDERS_WORKSHEET)
+    except Exception:
+        ws = sh.add_worksheet(title=rmc.REMINDERS_WORKSHEET,
+                              rows=300, cols=rmc.REMINDER_NCOL)
+        ws.update([rmc.REMINDER_COLS],
+                  range_name=f"A1:{chr(64 + rmc.REMINDER_NCOL)}1",
+                  value_input_option="USER_ENTERED")
+        return ws
+
+
+def _reminders_write_all(ws, rows: list) -> None:
+    """전체 재기록. 항목이 수십 건 수준이라 부분 갱신보다 단순하고 안전하다.
+
+    ⚠️ append 계열을 쓰지 않는다 — gspread append 는 계단 밀림을 일으킨다.
+       A열 기준 명시적 범위로 덮어쓴다.
+    """
+    last = chr(64 + rmc.REMINDER_NCOL)
+    ws.clear()
+    body = [rmc.REMINDER_COLS] + [rmc.to_row(r) for r in rows]
+    ws.update(body, range_name=f"A1:{last}{len(body)}",
+              value_input_option="USER_ENTERED")
+
+
+def _render_reminders_admin() -> None:
+    """개발 로드맵 리마인더 — 관리자 전용.
+
+    투자 알림이 아니라 "3개월 뒤 다시 본다"고 미뤄둔 항목의 관리다.
+    매일 오후 내러티브 브리핑 메일에 같은 내용이 첨부된다(관리자에게만).
+    """
+    st.markdown("### 🔔 개발 리마인더")
+    try:
+        ws = _reminders_ws()
+        if ws is None:
+            st.info("`Quant_DB` 연결 실패 — 리마인더를 불러올 수 없습니다.")
+            return
+        rows = rmc.parse_reminders(ws.get_all_values() or [])
+    except Exception as e:
+        st.warning(f"리마인더 로드 실패: {e}")
+        return
+
+    today = datetime.now(pytz.timezone("US/Eastern")).date()
+    live = rmc.active_reminders(rows, today)
+
+    if not live:
+        st.caption("지금 확인할 항목이 없습니다.")
+    for r in live:
+        kind = rmc.classify(r, today)
+        d = rmc.days_left(r, today)
+        when = ("만기 미상" if d is None else
+                f"{-d}일 지남" if d < 0 else "오늘" if d == 0 else f"{d}일 남음")
+        with st.container(border=True):
+            st.markdown(f"**{rmc.kind_label(kind)} {r.get('Title', '')}** "
+                        f"— {when} · {r.get('Due_Date', '')}"
+                        + (f" → 연기 {r.get('Snoozed_Until')}"
+                           if r.get("Snoozed_Until") else ""))
+            st.markdown(r.get("What_To_Check", ""))
+            if r.get("Why"):
+                st.caption(f"미뤘던 이유 — {r.get('Why')}")
+            cols = st.columns(len(rmc.SNOOZE_CHOICES) + 1)
+            rid = r.get("ID", "")
+            for i, days in enumerate(rmc.SNOOZE_CHOICES):
+                if cols[i].button(f"+{days}일", key=f"rmd_snz_{rid}_{days}",
+                                  use_container_width=True):
+                    for x in rows:
+                        if x.get("ID") == rid:
+                            x["Snoozed_Until"] = str(
+                                today + timedelta(days=days))
+                    _reminders_write_all(ws, rows)
+                    st.rerun()
+            if cols[-1].button("✅ 완료", key=f"rmd_done_{rid}",
+                               type="primary", use_container_width=True):
+                for x in rows:
+                    if x.get("ID") == rid:
+                        x["Status"] = rmc.STATUS_DONE
+                _reminders_write_all(ws, rows)
+                st.rerun()
+
+    later = [r for r in rows if rmc.classify(r, today) == "later"]
+    done = [r for r in rows if rmc.classify(r, today) == "done"]
+    if later:
+        with st.expander(f"⚪ 예정 {len(later)}건"):
+            for r in sorted(later, key=lambda x: rmc.sort_key(x, today)):
+                st.markdown(f"- **{r.get('Due_Date')}** · {r.get('Title')} "
+                            f"({rmc.days_left(r, today)}일 남음)")
+    if done:
+        with st.expander(f"✅ 완료 {len(done)}건"):
+            for r in done:
+                st.markdown(f"- ~~{r.get('Title')}~~ · {r.get('Due_Date')}")
+
+    with st.expander("➕ 새 리마인더"):
+        with st.form("reminder_add_form", clear_on_submit=True):
+            _t = st.text_input("제목")
+            _due = st.date_input("만기일", value=today + timedelta(days=90))
+            _cat = st.selectbox("분류", options=rmc.CATEGORIES)
+            _what = st.text_area(
+                "무엇을 확인할 것인가",
+                help="그날의 나에게 주는 실행 지시입니다. "
+                     "'X 시트에서 A와 B의 상관 확인, 무관하면 컬럼 폐기'처럼 "
+                     "바로 움직일 수 있게 씁니다.")
+            _why = st.text_input("왜 미뤘는가 (선택)")
+            if st.form_submit_button("추가", type="primary"):
+                if not str(_t).strip() or not str(_what).strip():
+                    st.error("제목과 확인 항목은 필수입니다.")
+                else:
+                    rows.append(rmc.make(_t, str(_due), _what, _why, _cat,
+                                         source="앱 수동 추가",
+                                         created=str(today)))
+                    _reminders_write_all(ws, rows)
+                    st.success("추가했습니다.")
+                    st.rerun()
 
 
 def _ws_handle_required(sheet_title: str):
@@ -9297,6 +9421,61 @@ def _parse_entry_reason(memo: str) -> str:
         b = s.find("]", a)
         if b != -1:
             val = s[a + 4:b].strip()  # '[진입:' 는 4글자
+            if val:
+                return val
+    return "🧩 기타 / 미기록"
+
+
+# ── 매도 사유 ──────────────────────────────────────────────────────────────
+#   매수는 [진입:라벨] 태그를 붙이는데 매도는 자유 입력뿐이었다. 그래서
+#   "왜 팔았나"를 사후에 가릴 수 없었다 — 시스템 신호를 따른 매도인지,
+#   신호를 무시한 재량 매도인지, 리밸런싱에 쓸려나간 것인지 구분이 안 됐다.
+#   진입 사유별 실현 성과를 보려면 매도 쪽도 라벨이 필요하다.
+#
+#   ⚠️ 기본값을 '시스템 판정'으로 자동 고정하지 않는 이유
+#      기록 시점의 integrated_sell_verdict 를 그대로 박으면 "무엇이 사실인가"와
+#      "왜 팔았나"가 섞인다. 신호가 떴는데 다른 이유로 판 경우가 바로
+#      실행 갭이고, 그게 성과 평가에서 제일 보고 싶은 정보다.
+#      → 시스템 판정을 **기본 선택**으로 제시하되 바꿀 수 있게 한다.
+_SELL_REASON_OPTIONS = [
+    "🧩 기타 / 미지정",
+    "🔴 매도 신호 (시스템 판정)",
+    "⚖️ 리밸런싱",
+    "✋ 재량 매도 (신호 무관)",
+    "💵 현금 확보",
+    "🎯 목표가 도달",
+    "🛑 손절 (스탑 도달)",
+]
+_SELL_REASON_DEFAULT = _SELL_REASON_OPTIONS[0]
+_SELL_REASON_SIGNAL = _SELL_REASON_OPTIONS[1]
+
+
+def _build_sell_memo(reason: str, base: str = "", verdict: str = "") -> str:
+    """매도 사유를 memo 앞에 '[매도:라벨] ' 태그로 붙인다.
+
+    verdict 가 있으면 '[판정:...]' 도 함께 남긴다. 사용자가 고른 사유(왜 팔았나)와
+    그 시점 시스템 판정(무엇이 사실이었나)은 다른 정보이고, 둘이 어긋난 경우가
+    실행 갭이라 나중에 반드시 대조해야 한다.
+    """
+    r = str(reason or "").strip()
+    base = str(base or "").strip()
+    v = str(verdict or "").strip()
+    head = ""
+    if r and r != _SELL_REASON_DEFAULT:
+        head += f"[매도:{r}] "
+    if v:
+        head += f"[판정:{v}] "
+    return (head + base).strip()
+
+
+def _parse_sell_reason(memo: str) -> str:
+    """memo의 '[매도:라벨]' 태그에서 매도 사유 추출. 없으면 '🧩 기타 / 미기록'."""
+    s = str(memo or "")
+    a = s.find("[매도:")
+    if a != -1:
+        b = s.find("]", a)
+        if b != -1:
+            val = s[a + 4:b].strip()   # '[매도:' 는 4글자
             if val:
                 return val
     return "🧩 기타 / 미기록"
@@ -21285,7 +21464,37 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 cur_hold_qty = float(pd.to_numeric(hold_row["Quantity"].values[0], errors="coerce") or 0) if not hold_row.empty else 0.0
                 cur_avg_price = float(pd.to_numeric(hold_row["Purchase_Price"].values[0], errors="coerce") or 0) if not hold_row.empty else 0.0
                 st.caption(f"현재 보유 수량: **{cur_hold_qty:g}주** | 평균 매수가: **${cur_avg_price:,.4f}**")
+
+                # 이 종목의 시스템 매도 판정 — 포트폴리오 표(20484행)에서 이미
+                # 계산해 둔 것을 그대로 재사용한다. 추가 조회 비용이 없고,
+                # 표·카드와 같은 SSOT 를 쓰므로 화면마다 판정이 갈리지 않는다.
+                _sell_verdict, _sell_why = "", ""
+                try:
+                    _v = (_card_status.get((sell_acct_sel, str(sell_ticker_sel).upper()))
+                          or _card_status_tk.get(str(sell_ticker_sel).upper()))
+                    if _v:
+                        _sell_verdict, _sell_why = str(_v[0] or ""), str(_v[1] or "")
+                except Exception:
+                    _sell_verdict, _sell_why = "", ""
+
+                # 시스템이 매도/주의를 띄운 상태면 '매도 신호'를 기본 선택으로 제시한다.
+                # 어디까지나 기본값이고, 다른 이유로 팔았으면 바꿔야 한다.
+                _sig_on = ("매도" in _sell_verdict) or ("🔴" in _sell_verdict)
+                _sell_reason_default_idx = (
+                    _SELL_REASON_OPTIONS.index(_SELL_REASON_SIGNAL) if _sig_on else 0)
+                if _sell_verdict:
+                    st.caption(f"현재 시스템 판정: **{_sell_verdict}**"
+                               + (f" — {_sell_why}" if _sell_why else ""))
+
                 with st.form("portfolio_sell_form", clear_on_submit=False):
+                    selected_sell_reason = st.selectbox(
+                        "매도 사유",
+                        options=_SELL_REASON_OPTIONS,
+                        index=_sell_reason_default_idx,
+                        key="sell_form_reason",
+                        help="왜 팔았는지를 남깁니다. 시스템 판정과 별개로 기록되며, "
+                             "둘이 어긋난 경우가 나중에 실행 갭 분석의 핵심 자료가 됩니다.",
+                    )
                     sell_price_input = st.number_input("매도가 (1주당 $)", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="sell_form_price")
                     sell_qty_input = st.number_input(
                         f"매도 수량 (최대 {cur_hold_qty:g}주 — 초과 시 저장되지 않습니다)",
@@ -21313,7 +21522,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             sell_date_str = sell_date_input.strftime("%Y-%m-%d")
                             ok_th, err_th = append_trade_history_row(
                                 puid, sell_acct_sel, sell_ticker_sel, "SELL",
-                                sell_qty_input, sell_price_input, sell_date_str, sell_memo_input
+                                sell_qty_input, sell_price_input, sell_date_str,
+                                _build_sell_memo(selected_sell_reason,
+                                                 sell_memo_input, _sell_verdict)
                             )
                             if not ok_th:
                                 st.error(f"매도 기록 저장 실패: {err_th}")
@@ -25910,6 +26121,8 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
 
     elif main_nav == _NAV_ADMIN_APPROVAL:
         st.subheader(_NAV_ADMIN_APPROVAL)
+        _render_reminders_admin()
+        st.divider()
         st.caption(
             "`Quant_DB` → `Users` 탭과 동기화됩니다. **Status**는 아래 목록만 선택 가능하며, 저장 시 구글 시트 전체가 덮어씌워집니다."
         )
