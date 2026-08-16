@@ -15373,6 +15373,12 @@ def run_narrative_timeseries_gemini(kind, records_payload, target_language):
 
 
 if st.session_state.get("logged_in"):
+    # 기동 계측 시작 — 로그인 직후부터 잰다.
+    #   처음에는 메뉴 구성 직전부터 쟀는데, 그 표에 4.7초만 찍히고 체감은 30초였다.
+    #   즉 대부분이 그보다 앞(ETF 자동 갱신 · 워치리스트 알림 전체 점검)에 있었다.
+    #   계측 지점이 늦으면 "빨라졌다"는 착각만 준다.
+    st.session_state["_boot_t0"] = time.perf_counter()
+    st.session_state["_boot_marks"] = []
     st.title("🎯 STOCKER — 시장 추적 터미널")
     st.caption(
         "Follow the Signal. Stalk the Stock. · "
@@ -15383,7 +15389,11 @@ if st.session_state.get("logged_in"):
     render_global_market_watch_header()
 
     # ── ETF Universe 자동 업데이트 (주 1회) ─────────────────────────────────
-    if str(st.session_state.get("user_id") or "").strip():
+    #   ⚠️ 🏠 시작 화면에서는 건너뛴다. 사용자 눈에 보이는 산출물이 없는
+    #      백그라운드 유지보수인데, 로그인 직후 첫 렌더를 붙잡고 있었다.
+    #      다음에 다른 탭으로 이동하면 그때 돈다(세션당 1회 규칙은 그대로).
+    _on_home = (st.session_state.get("main_sidebar_nav") in (None, _MAIN_NAV_OPTIONS[16]))
+    if str(st.session_state.get("user_id") or "").strip() and not _on_home:
         if not st.session_state.get("_etf_auto_update_done_this_session"):
             st.session_state["_etf_auto_update_done_this_session"] = True
             try:
@@ -15396,6 +15406,8 @@ if st.session_state.get("logged_in"):
     # ── Watchlist Alert 체크 ──────────────────────────────────────────────
     #   세션 최초 1회는 전 종목(full), 이후 편집이 생기면 '해당 티커만'(partial).
     #   예전에는 종목 하나만 고쳐도 전체를 순차 재평가해 캐시가 비면 10초 넘게 걸렸다.
+    _boot_mark("ETF 유니버스 자동 갱신")
+
     _uid_alert = str(st.session_state.get("user_id") or "").strip()
     _wl_recheck = st.session_state.get("_wl_alert_recheck") or set()
     _wl_full = bool(_uid_alert) and not st.session_state.get("_watchlist_alert_checked")
@@ -15478,11 +15490,9 @@ if st.session_state.get("logged_in"):
     if _etf_new_cnt > 0:
         st.success(f"🆕 **ETF Universe 자동 업데이트** — 최근 90일 내 신규 상장 ETF **{_etf_new_cnt}개**가 자동으로 추가됐어요! `[2단계] 섹터 & 자금 흐름`에서 확인하세요.")
 
+    _boot_mark("워치리스트 알림 점검")
+
     _nav_key = "main_sidebar_nav"
-    # 기동 계측 시작 — 이 렌더에서 어디에 시간이 가는지 남긴다(관리자 진단용).
-    st.session_state["_boot_t0"] = time.perf_counter()
-    st.session_state["_boot_marks"] = []
-    _boot_mark("메뉴 구성 시작")
     _nav_opts = list(_MAIN_NAV_OPTIONS)
     # 표시 순서만 재배치: '📊 매매 복기'를 '🛡️ [4단계] 포트폴리오 매도 레이더'(index 6) 바로 뒤로.
     # (분기는 문자열 비교이므로 _MAIN_NAV_OPTIONS 인덱스/cross-nav는 영향 없음)
