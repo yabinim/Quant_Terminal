@@ -139,9 +139,9 @@ def _open_db():
     import gspread
     from google.oauth2.service_account import Credentials
 
-    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "") or ""
+    raw = os.environ.get("GSPREAD_KEY", "") or ""
     if not raw:
-        raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON 없음")
+        raise RuntimeError("GSPREAD_KEY 없음")
     info = json.loads(raw)
     creds = Credentials.from_service_account_info(info, scopes=[
         "https://www.googleapis.com/auth/spreadsheets",

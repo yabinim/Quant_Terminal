@@ -205,6 +205,34 @@ try:
 except Exception as e:
     check("매니페스트 검사", False, str(e))
 
+print("\n[11] 워크플로 — 존재와 시크릿명")
+try:
+    _repo = os.path.dirname(_HERE) if os.path.basename(_HERE) == "automation" else _ROOT
+    _wf = os.path.join(_repo, ".github", "workflows")
+    # 스크립트마다 짝이 되는 워크플로가 있어야 한다. 없으면 Actions 에서
+    # 실행할 방법이 없다 — 실제로 seed 워크플로를 통째로 빠뜨린 적이 있다.
+    for _s, _y in (("seed_reminders", "seed_reminders.yml"),
+                   ("diag_reminders", "diag_reminders.yml")):
+        check(f"{_y} 존재", os.path.exists(os.path.join(_wf, _y)),
+              "워크플로 누락 — Actions 에서 실행할 수 없다")
+
+    # 시크릿명은 기존 관례(GSPREAD_KEY)를 따라야 한다.
+    # GCP_SERVICE_ACCOUNT_JSON 같은 새 이름을 쓰면 시크릿이 비어 즉시 죽는다.
+    for _f in ("seed_reminders.py",):
+        _p = os.path.join(_HERE, _f)
+        if os.path.exists(_p):
+            _t = open(_p, encoding="utf-8").read()
+            check(f"{_f} 가 GSPREAD_KEY 사용", "GSPREAD_KEY" in _t)
+            check(f"{_f} 에 미등록 시크릿명 없음",
+                  "GCP_SERVICE_ACCOUNT_JSON" not in _t)
+    _yp = os.path.join(_wf, "seed_reminders.yml")
+    if os.path.exists(_yp):
+        _yt = open(_yp, encoding="utf-8").read()
+        check("seed 워크플로가 GSPREAD_KEY 주입", "secrets.GSPREAD_KEY" in _yt)
+        check("seed 워크플로 DRY_RUN 기본 true", "default: true" in _yt)
+except Exception as e:
+    check("워크플로 검사", False, str(e))
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
