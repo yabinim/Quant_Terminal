@@ -794,12 +794,38 @@ def _global_recipients() -> list[tuple[str, str]]:
         return [(uc.ADMIN_CONTENT_OWNER_ID, GMAIL_TO)]
 
 
+def _reminder_block_html() -> str:
+    """관리자 메일에 붙일 개발 리마인더 블록. 없거나 실패하면 빈 문자열.
+
+    ⚠️ 실패해도 브리핑 발송을 막지 않는다. 리마인더는 부가 정보이고,
+       시트 하나 못 읽었다고 그날 브리핑이 통째로 안 나가면 손해가 더 크다.
+    """
+    try:
+        import reminders_core as rmc
+        gc = get_gspread_client()
+        sh = gc.open(_SPREADSHEET_TITLE)
+        try:
+            ws = sh.worksheet(rmc.REMINDERS_WORKSHEET)
+        except gspread.exceptions.WorksheetNotFound:
+            return ""      # 아직 시트를 안 만들었다 — 정상이다
+        html = rmc.build_email_html(rmc.parse_reminders(ws.get_all_values() or []))
+        if html:
+            print("[INFO] 개발 리마인더 블록 첨부")
+        return html
+    except Exception as e:
+        print(f"[WARN] 리마인더 블록 생략(브리핑은 정상 발송): {e}")
+        return ""
+
+
 def send_email(subject: str, html_body: str) -> bool:
     """시장 내러티브 브리핑 브로드캐스트 — Alert_Global ON 인 승인 사용자 전원.
 
     ⚠️ 관리자도 예외가 아니다. 예전에는 GMAIL_TO 로 무조건 먼저 보내서 관리자가
        토글로 알림을 끌 수 없었다. 이제 yab 행의 Alert_Global 을 그대로 따른다.
        (yab 행이 없거나 Email 이 무효일 때만 users_core 가 GMAIL_TO 로 폴백)
+
+    개발 리마인더는 **관리자에게만** 덧붙인다. 투자 알림이 아니라 개발 로드맵
+    관리이므로 게스트 메일에 섞이면 안 된다.
 
     반환: 관리자 발송 성공 여부(관리자가 수신 대상일 때). 게스트 실패는 격리한다.
     """
@@ -808,11 +834,18 @@ def send_email(subject: str, html_body: str) -> bool:
         print("[INFO] Alert_Global 수신자가 없습니다 — 발송 생략")
         return True
     admin_uid_u = str(uc.ADMIN_CONTENT_OWNER_ID).strip().upper()
+
+    # 관리자가 수신 대상일 때만 조회한다 — 게스트만 있는 날 불필요한 시트 호출 방지.
+    rem_html = ""
+    if any(str(_u).strip().upper() == admin_uid_u for _u, _e in rcpts):
+        rem_html = _reminder_block_html()
+
     ok_admin, admin_targeted = True, False
     for _uid, _email in rcpts:
         is_admin = str(_uid).strip().upper() == admin_uid_u
+        _body = (html_body + rem_html) if (is_admin and rem_html) else html_body
         try:
-            ok = _send_email_one(subject, html_body, str(_email).strip())
+            ok = _send_email_one(subject, _body, str(_email).strip())
         except Exception as e:
             print(f"[WARN] {_uid} 발송 실패(다음 수신자 진행): {e}")
             ok = False
