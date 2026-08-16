@@ -1,0 +1,60 @@
+name: 🧪 회귀 — 개발 리마인더 + 매도 사유 태그
+
+# 네트워크·시트 접근이 없어 언제든 안전하게 돌릴 수 있다.
+#
+# 무엇을 지키나:
+#   1. 연기(Snoozed_Until)가 만기를 이기는가
+#      — 못 이기면 "봤지만 아직 못 함"을 done 으로 처리하게 되고 항목이 사라진다
+#   2. 만기 파싱 실패를 숨기지 않는가
+#      — later 로 분류하면 조용히 숨어서 영원히 안 보인다
+#   3. 띄울 게 없을 때 빈 블록을 만들지 않는가
+#      — 매일 붙는 껍데기는 안 읽게 되고, 정작 만기가 왔을 때도 안 읽는다
+#   4. seed 재실행이 완료·연기 상태를 되살리지 않는가
+#   5. 매도 태그가 사용자 사유와 시스템 판정을 뭉개지 않는가
+#      — 둘이 어긋난 경우가 실행 갭이고, 뭉개면 그 정보가 사라진다
+#
+# 각 항목은 변이 테스트로 확인했다 — 방어를 일부러 망가뜨리면 실제로 실패한다.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'reminders_core.py'
+      - 'app.py'
+      - 'automation/seed_reminders.py'
+      - 'automation/diag_reminders.py'
+  pull_request:
+    paths:
+      - 'reminders_core.py'
+      - 'app.py'
+      - 'automation/seed_reminders.py'
+      - 'automation/diag_reminders.py'
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # streamlit/gspread 를 일부러 넣지 않는다 — reminders_core 가 순수 모듈이고
+      # seed 의 시트 의존이 _open_ws() 안에만 있다는 조건을 여기서 검증한다.
+      - name: 📦 의존성 (UI·시트 라이브러리 제외)
+        run: pip install --quiet requests
+
+      - name: 🧪 리마인더 회귀
+        run: python automation/diag_reminders.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          reminders_core.py
+          automation/seed_reminders.py
+          automation/diag_reminders.py
