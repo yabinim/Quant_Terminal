@@ -167,6 +167,44 @@ try:
 except Exception as e:
     check("매도 태그 함수 추출", False, str(e))
 
+print("\n[10] SSOT 매니페스트 등록 형식")
+try:
+    import ast as _ast
+    _app2 = next((p for p in (os.path.join(_ROOT, "app.py"),
+                              os.path.join(_HERE, "app.py"))
+                  if os.path.exists(p)), None)
+    _src2 = open(_app2, encoding="utf-8").read()
+    _tree = _ast.parse(_src2)
+    _mani = next(n for n in _ast.walk(_tree) if isinstance(n, _ast.Assign)
+                 and getattr(n.targets[0], "id", "") == "_SSOT_NEEDS")
+    _aliases = set()
+    for _n2 in _ast.walk(_tree):
+        if isinstance(_n2, _ast.Import):
+            for _a in _n2.names:
+                _aliases.add(_a.asname or _a.name)
+
+    # 2번째 항목은 모듈 **객체**여야 한다. 문자열을 넣으면 hasattr 이 전부
+    # False 가 되어 정상 배포를 '구버전'으로 오진하고 앱이 st.stop() 으로 죽는다.
+    # 실제로 밟은 버그다 — 배포는 멀쩡한데 앱이 안 떴다.
+    bad_type, bad_alias = [], []
+    for _e in _mani.value.elts:
+        _label = _e.elts[0].value
+        _mn = _e.elts[1]
+        if not isinstance(_mn, _ast.Name):
+            bad_type.append(_label)
+        elif _mn.id not in _aliases:
+            bad_alias.append(_label)
+    check("전 항목이 모듈 객체로 등록됨(문자열 아님)", not bad_type, str(bad_type))
+    check("등록된 이름이 실제 import 별칭", not bad_alias, str(bad_alias))
+    check("reminders_core 가 매니페스트에 있음",
+          any(e.elts[0].value == "reminders_core" for e in _mani.value.elts))
+
+    # 런타임 가드가 문자열 등록을 실제로 걸러내는가
+    check("가드에 모듈 타입 검사 존재",
+          "ModuleType" in _src2, "isinstance(_m, _types.ModuleType) 검사 없음")
+except Exception as e:
+    check("매니페스트 검사", False, str(e))
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
