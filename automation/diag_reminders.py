@@ -124,9 +124,15 @@ try:
     check("완료 상태 보존", m0["Status"] == "done", f"got {m0['Status']}")
     check("연기 상태 보존", m1["Snoozed_Until"] == "2027-01-01")
     check("본문은 갱신됨", m0["What_To_Check"] == seeds[0]["What_To_Check"])
-    check("초기 3건", len(seeds) == 3, f"got {len(seeds)}")
+    check("항목이 비어 있지 않음", len(seeds) >= 1, f"got {len(seeds)}")
+    check("ID 가 전부 유일", len({s["ID"] for s in seeds}) == len(seeds))
+    check("만기가 전부 해석 가능",
+          all(rmc._pd(s["Due_Date"]) is not None for s in seeds),
+          str([s["Due_Date"] for s in seeds]))
     check("전부 What_To_Check 가 충실",
           all(len(s["What_To_Check"]) > 60 for s in seeds))
+    check("전부 Why 가 기록됨", all(s["Why"].strip() for s in seeds))
+    check("전부 미래 만기", all(rmc.classify(s, T) != "overdue" for s in seeds))
 except Exception as e:
     check("seed 모듈 로드", False, str(e))
 
