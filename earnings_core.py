@@ -2267,6 +2267,21 @@ def preview_row(ev: dict, phase: str, metrics: dict, now_et: str = "") -> list:
     m = metrics or {}
     eid = event_id(ev.get("ticker"), ev.get("earnings_date"))
     flags = [f for f in (m.get("flags") or []) if f]
+
+    # ── 락스텝 자기점검 ────────────────────────────────────────────────────
+    #   스키마에는 내부자 열이 있는데 호출부가 값도 안 주고 no_insider 플래그도
+    #   안 달았다면, 그 호출부는 내부자 블록을 모르는 **구버전**이다.
+    #   실제로 2026-08-17 에 이 상태로 돌았다 — earnings_core 만 배포되고
+    #   run_earnings_watch 가 구버전이라 30~33열이 조용히 공란으로 저장됐다.
+    #   나쁜 데이터가 들어가진 않지만 수집이 통째로 누락되고, 로그만 봐서는
+    #   정상 실행과 구분되지 않는다. 그래서 여기서 크게 알린다.
+    if ("Insider_Cov_D" in PREVIEW_COLS
+            and "ins_cov_d" not in m and "no_insider" not in flags):
+        print("[FATAL] 락스텝 불일치 — Earnings_Preview 스키마에는 내부자 열이 "
+              "있는데 호출부가 값을 주지 않았습니다. run_earnings_watch.py 가 "
+              "구버전일 가능성이 높습니다. 30~33열이 공란으로 저장됩니다.")
+        flags.append("stale_caller")
+
     row = [
         preview_snapshot_id(eid, phase),
         eid,
