@@ -693,11 +693,12 @@ def pass_delayed(rows, hist_cache, today):
 def pass_preview(cal, prev_rows, hist_cache, today, now_et, spy_hist=None):
     """D-7 / D-3 / 최종 스냅샷. Tier 1(보유+워치리스트)만.
 
-    스냅샷당 FMP 4콜:
-        earnings?symbol=        A블록(EPS·매출 컨센서스) + B블록(beat·서프라이즈)
-        price-target-consensus  목표주가
-        grades-historical       의견 수준·90일 변화
-        news/stock?symbols=     뉴스 증분
+    스냅샷당 FMP 5콜:
+        earnings?symbol=          A블록(EPS·매출 컨센서스) + B블록(beat·서프라이즈)
+        price-target-consensus    목표주가
+        grades-historical         의견 수준·90일 변화
+        news/stock?symbols=       뉴스 증분
+        insider-trading/search    C블록 — 최근 90일 재량 내부자 거래(달러)
     가격 이력은 hist_cache 재사용(0콜), SPY 는 실행당 1회.
 
     append-only. 이미 있는 (Event_ID, Phase) 는 절대 다시 쓰지 않는다 —
@@ -804,12 +805,31 @@ def pass_preview(cal, prev_rows, hist_cache, today, now_et, spy_hist=None):
             cnt, njson = ec.news_digest(news, since=since)
             m["news_count"], m["news_json"] = cnt, njson
 
+            # ── 콜 5: 내부자 거래 (C블록) ──
+            #   방향 신호로 쓰지 않는다. 검증되지 않은 가설이라 원자료만 적재하고
+            #   판정은 Pre_Ret_D1/D3/D7 이 쌓인 뒤 백테스트에 맡긴다.
+            ins = ec.fetch_insider_90d(tk, key=FMP_API_KEY, today=today)
+            if not ins.get("ok"):
+                flags.append("no_insider")
+            else:
+                m["ins_sale_val"] = ins.get("sale_val")
+                m["ins_sale_n"] = ins.get("sale_n")
+                m["ins_buy_val"] = ins.get("buy_val")
+                m["ins_cov_d"] = ins.get("cov_d")
+                _cov = ec._num(ins.get("cov_d"))
+                if _cov is not None and _cov < ec.PREVIEW_INSIDER_WINDOW:
+                    # 잘린 창이다. 이 행의 달러값은 다른 행과 비교하면 안 된다.
+                    flags.append("insider_short_window")
+                if ins.get("price_missing"):
+                    flags.append("insider_price_missing")
+
             m["flags"] = flags
             ev = {"ticker": tk, "earnings_date": ed, "days_until": dd, "timing": timing}
             new_rows.append(ec.preview_row(ev, phase, m, now_et=now_et))
             print(f"  [PREVIEW] {tk} {phase} D-{dd} {ed} "
                   f"EPS={m.get('est_eps')} 목표대비={_fmt1(m.get('target_upside_pct'))}% "
-                  f"RS={_fmt1(m.get('rs_20d_pct'))}%p 뉴스{cnt}건"
+                  f"RS={_fmt1(m.get('rs_20d_pct'))}%p 뉴스{cnt}건 "
+                  f"내부자매도={_fmt_usd(m.get('ins_sale_val'))}"
                   + (f" ⚠️{','.join(flags)}" if flags else ""))
         except Exception as e:
             print(f"  [WARN] {tk} 프리뷰 실패: {e}")
@@ -821,6 +841,18 @@ def pass_preview(cal, prev_rows, hist_cache, today, now_et, spy_hist=None):
 def _fmt1(v):
     n = ec._num(v)
     return "—" if n is None else f"{n:+.1f}"
+
+
+def _fmt_usd(v):
+    """달러 → 로그용 축약. 결측은 '—' (0 과 구분돼야 한다)."""
+    n = ec._num(v)
+    if n is None:
+        return "—"
+    if abs(n) >= 1e9:
+        return f"${n / 1e9:,.2f}B"
+    if abs(n) >= 1e6:
+        return f"${n / 1e6:,.1f}M"
+    return f"${n:,.0f}"
 
 
 # ── 수신자별 판정 (계좌 프로필 반영) ──────────────────────────────────────

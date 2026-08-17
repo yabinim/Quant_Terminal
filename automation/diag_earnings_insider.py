@@ -251,6 +251,37 @@ except Exception as e:
     check("백필 모듈 로드", False, str(e))
 
 # ══════════════════════════════════════════════════════════════════════════
+print("\n[10] 락스텝 자기점검 — 구버전 호출부 감지")
+import contextlib as _ctx
+import io as _io
+_ev = {"ticker": "WMT", "earnings_date": "2026-08-20",
+       "days_until": 3, "timing": "bmo"}
+
+
+def _cap(metrics):
+    b = _io.StringIO()
+    with _ctx.redirect_stdout(b):
+        r = ec.preview_row(_ev, "D3", metrics, now_et="2026-08-17 17:02")
+    return r, b.getvalue()
+
+
+# 스키마에는 내부자 열이 있는데 호출부가 값도 플래그도 안 주면 구버전이다.
+# 2026-08-17 에 실제로 이 상태로 돌아 30~33열이 조용히 공란 저장됐다.
+_r, _o = _cap({"price": 100.0, "flags": ["no_revision"]})
+check("구버전 호출부에 FATAL 출력", "[FATAL] 락스텝 불일치" in _o)
+_mm = {c: _r[i] for i, c in enumerate(ec.PREVIEW_COLS)}
+check("stale_caller 플래그 기록", "stale_caller" in _mm["Data_Flags"],
+      _mm["Data_Flags"])
+check("기존 플래그 보존", "no_revision" in _mm["Data_Flags"])
+
+_r2, _o2 = _cap({"price": 100.0, "ins_cov_d": 151, "ins_sale_val": 1.05e9,
+                 "flags": []})
+check("정상 호출부는 조용", "FATAL" not in _o2)
+
+# 조회 실패(no_insider)는 구버전이 아니다 — 오탐이면 매번 FATAL 이 떠서 무뎌진다
+_r3, _o3 = _cap({"price": 100.0, "flags": ["no_insider"]})
+check("조회 실패는 오탐 아님", "FATAL" not in _o3)
+
 print("\n" + "=" * 70)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
