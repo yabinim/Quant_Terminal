@@ -867,6 +867,29 @@ def _render_home() -> None:
     except Exception:
         pass
 
+    # ── 워치리스트 알림 ──
+    #   기본으로는 돌리지 않는다. 이 점검이 로그인 직후 28.67초 중 24.34초를 썼다.
+    #   대신 버튼으로 즉시 실행할 수 있게 하고, 이미 돌았으면 결과를 보여준다.
+    if st.session_state.get("_watchlist_alert_checked"):
+        _hits = st.session_state.get("_watchlist_triggered_alerts") or []
+        if _hits:
+            _shown = True
+            st.warning(f"🔔 **알림 조건 활성 {len(_hits)}종목** — "
+                       + ", ".join(str(t) for t in _hits))
+            if st.button("🔔 Buy Watchlist & Alert 에서 보기",
+                         use_container_width=True):
+                st.session_state["main_nav_idx"] = 7
+                st.rerun()
+    else:
+        if st.button("🔔 워치리스트 알림 확인", use_container_width=True):
+            st.session_state["_wl_check_now"] = True
+            st.rerun()
+        st.caption(
+            "종목별 일봉을 받아 조건을 평가하므로 워치리스트 크기에 따라 "
+            "20초 이상 걸릴 수 있습니다. **다른 탭으로 이동하면 자동으로 실행됩니다.** "
+            "5PM 자동 이메일로도 같은 알림을 받으므로 지금 누르지 않아도 놓치지 않습니다."
+        )
+
     if not _shown:
         st.success("지금 급히 확인할 항목이 없습니다.")
 
@@ -15412,7 +15435,19 @@ if st.session_state.get("logged_in"):
     _wl_recheck = st.session_state.get("_wl_alert_recheck") or set()
     _wl_full = bool(_uid_alert) and not st.session_state.get("_watchlist_alert_checked")
     _wl_part = bool(_uid_alert) and bool(_wl_recheck) and not _wl_full
-    if _wl_full or _wl_part:
+
+    # ⚠️ 🏠 시작 화면에서는 기본으로 건너뛴다.
+    #   계측 결과 이 블록이 로그인 직후 28.67초 중 **24.34초(85%)** 를 썼다.
+    #   종목별 일봉 252봉 프리페치 + 순차 레짐 계산이라 워치리스트가 클수록 늘어난다.
+    #
+    #   그렇다고 그냥 끄면 알림을 놓칠 수 있다. 그래서:
+    #     · 시작 화면에서는 실행하지 않되 **_watchlist_alert_checked 를 세우지 않는다**
+    #       → 다른 탭으로 이동하면 평소대로 자동 실행된다
+    #     · 시작 화면에 '🔔 알림 확인' 버튼을 두어 원할 때 즉시 돌린다
+    #   알림은 5PM 메일로도 오므로 앱이 유일한 경로가 아니다.
+    _wl_defer = _on_home and not bool(st.session_state.pop("_wl_check_now", False))
+
+    if (_wl_full or _wl_part) and not _wl_defer:
         st.session_state["_watchlist_alert_checked"] = True
         st.session_state["_wl_alert_recheck"] = set()
         _rc_u = {str(t).strip().upper() for t in _wl_recheck}
