@@ -155,6 +155,30 @@ check("예상 변동폭 오해 방지 문구", "과거 실적 반응의 중앙�
 for bad in ("evaluate_entry_gate", "evaluate_trim", "compute_account_context"):
     check(f"지연 화면에서 {bad} 미호출", bad not in seg)
 
+print("\n[7] 시작 화면 무거운 작업 지연")
+# 계측 결과: 로그인 직후 28.67초 중 워치리스트 알림 점검이 24.34초(85%)였다.
+# ETF 자동 갱신은 0.003초로 무죄. 시작 화면에서만 건너뛰고 버튼으로 실행한다.
+check("_on_home 판정 존재", "_on_home = (" in SRC)
+check("_on_home 이 index 16 을 본다",
+      re.search(r"_on_home = \(.*_MAIN_NAV_OPTIONS\[16\]", SRC, re.S) is not None)
+i_on = SRC.find("_on_home = (")
+for user in ("_wl_defer = _on_home", "and not _on_home"):
+    j = SRC.find(user)
+    check(f"'{user[:22]}...' 가 _on_home 정의보다 뒤", j != -1 and i_on < j)
+
+# 건너뛸 때 _watchlist_alert_checked 를 세우면 안 된다 —
+# 세우면 다른 탭으로 가도 영영 점검이 안 돌아 알림을 놓친다.
+i_if = SRC.find("if (_wl_full or _wl_part) and not _wl_defer:")
+check("워치리스트 지연 게이트 존재", i_if != -1)
+if i_if != -1:
+    i_flag = SRC.find('st.session_state["_watchlist_alert_checked"] = True')
+    check("체크 플래그 설정이 게이트 안쪽", i_flag > i_if)
+
+home7 = fn_src("_render_home") or ""
+check("시작 화면에 알림 확인 버튼", "_wl_check_now" in home7)
+check("소요 시간 사전 고지", "20초" in home7)
+check("놓치지 않는다는 안내", "5PM" in home7 or "이메일" in home7)
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
