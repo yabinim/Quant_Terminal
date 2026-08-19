@@ -162,7 +162,9 @@ check("_on_home 판정 존재", "_on_home = (" in SRC)
 check("_on_home 이 index 16 을 본다",
       re.search(r"_on_home = \(.*_MAIN_NAV_OPTIONS\[16\]", SRC, re.S) is not None)
 i_on = SRC.find("_on_home = (")
-for user in ("_wl_defer = _on_home", "and not _on_home"):
+# _on_home 은 이제 ETF 자동 갱신 스킵에만 쓴다.
+# 워치리스트 게이트는 소비 탭 판정(_wl_needed)으로 옮겼다 — [9] 참고.
+for user in ("and not _on_home",):
     j = SRC.find(user)
     check(f"'{user[:22]}...' 가 _on_home 정의보다 뒤", j != -1 and i_on < j)
 
@@ -203,6 +205,31 @@ GUEST = fn_src("_render_guest_guide") or ""
 check("게스트 가이드에 시작 화면", "🏠 시작" in GUEST)
 check("게스트 가이드에 실적 레이더", "실적 레이더" in GUEST)
 check("게스트 가이드에 매도 사유", "매도 사유" in GUEST)
+
+print("\n[9] 알림 점검 — 소비 탭에서만 자동 실행")
+# 2026-08-18 정정: 시작 화면에서만 건너뛰었더니 24초가 사라진 게 아니라
+# '첫 탭 이동' 시점으로 옮겨졌다. 계산이 전혀 없는 사용 가이드에서 20초를 맞았다.
+# 알림 결과를 쓰는 곳은 index 7(Buy Watchlist) 하나뿐이다.
+check("소비 탭 판정 존재", "_wl_needed" in SRC)
+check("index 7 을 본다",
+      re.search(r"_wl_needed = \(_nav_now == _MAIN_NAV_OPTIONS\[7\]\)", SRC)
+      is not None)
+check("게이트가 _wl_needed 를 쓴다",
+      re.search(r"_wl_defer = \(not _wl_needed\)", SRC) is not None)
+i_need = SRC.find("_wl_needed = (")
+i_use = SRC.find("_wl_defer = (not _wl_needed)")
+check("정의가 사용보다 앞", i_need != -1 and i_use != -1 and i_need < i_use)
+
+home9 = fn_src("_render_home") or ""
+check("시작 화면 안내가 소비 탭을 지목", "Buy Watchlist & Alert` 탭" in home9)
+
+print("\n[10] 매도 레이더 — 계측 누락 구간 없음")
+i_pf = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[6]:")
+j_pf = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[7]:", i_pf)
+PF = SRC[i_pf:j_pf] if (i_pf != -1 and j_pf > i_pf) else ""
+check("매도 레이더 구간 발견", len(PF) > 1000)
+for span in ("PF 배당 스캔", "PF 일봉 프리페치", "PF 매도레이더 계산"):
+    check(f"'{span}' 계측됨", f'_timed("{span}")' in PF)
 
 print("\n" + "=" * 66)
 if _fail:
