@@ -508,9 +508,24 @@ def _install_fmp_instrumentation() -> None:
         finally:
             if _is_fmp:
                 try:
+                    _el = time.perf_counter() - _t0
+                    # 엔드포인트별 집계 — '미계측 63콜'이 어디서 나오는지 알려면
+                    # 총합만으로는 부족하다. 스택 추적은 병렬에서 비싸고 불안정해
+                    # URL 경로만 뽑아 센다(쿼리스트링·apikey 제거).
+                    _ep = ""
+                    try:
+                        _u = str(url).split("?", 1)[0]
+                        _ep = _u.rsplit("/stable/", 1)[-1] if "/stable/" in _u else _u
+                        _ep = _ep.strip("/")[:48] or "?"
+                    except Exception:
+                        _ep = "?"
                     with _FMP_STATS_LOCK:
                         _FMP_STATS["n"] += 1
-                        _FMP_STATS["sec"] += time.perf_counter() - _t0
+                        _FMP_STATS["sec"] += _el
+                        _by = _FMP_STATS.setdefault("by_ep", {})
+                        _e = _by.setdefault(_ep, {"n": 0, "sec": 0.0})
+                        _e["n"] += 1
+                        _e["sec"] += _el
                 except Exception:
                     pass
 
@@ -15997,6 +16012,10 @@ if st.session_state.get("logged_in"):
                 with _FMP_STATS_LOCK:
                     _FMP_STATS["n"] = 0
                     _FMP_STATS["sec"] = 0.0
+                    try:
+                        _FMP_STATS.setdefault("by_ep", {}).clear()
+                    except Exception:
+                        pass
                 st.rerun()
 
             # ── 구간별 소요 시간 ──────────────────────────────────────────
@@ -16038,6 +16057,27 @@ if st.session_state.get("logged_in"):
                 _fc_tot = sum(int(v.get("fmp", 0)) for _, v in _rows)
                 with _FMP_STATS_LOCK:
                     _fc_all = int(_FMP_STATS.get("n", 0))
+                # 미계측 콜의 출처 — 총합만으로는 어느 경로인지 알 수 없다.
+                #   구간 계측은 우리가 감싼 곳만 덮는다. 감싸지 않은 경로가
+                #   전체의 3분의 1을 차지해도 '미계측 63콜'이라고만 뜬다.
+                #   엔드포인트별로 세면 어느 기능이 부르는지 바로 드러난다.
+                try:
+                    with _FMP_STATS_LOCK:
+                        _eps = sorted(
+                            dict(_FMP_STATS.get("by_ep") or {}).items(),
+                            key=lambda kv: -float(kv[1].get("sec", 0)))[:8]
+                    if _eps:
+                        with st.expander("FMP 엔드포인트별", expanded=False):
+                            for _ep, _v in _eps:
+                                st.caption(
+                                    f"`{_ep}` — {int(_v.get('n', 0))}콜 · "
+                                    f"{float(_v.get('sec', 0)):.2f}초")
+                            st.caption(
+                                "병렬 구간은 스레드별 소요를 더한 값이라 "
+                                "벽시계 시간보다 큽니다.")
+                except Exception:
+                    pass
+
                 st.caption(
                     f"계측 구간 합계 {_tot:.2f}초 · FMP {_fc_tot}콜"
                     + (f" · **미계측 {_fc_all - _fc_tot}콜**" if _fc_all > _fc_tot else "")
