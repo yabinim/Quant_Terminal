@@ -228,8 +228,23 @@ i_pf = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[6]:")
 j_pf = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[7]:", i_pf)
 PF = SRC[i_pf:j_pf] if (i_pf != -1 and j_pf > i_pf) else ""
 check("매도 레이더 구간 발견", len(PF) > 1000)
-for span in ("PF 배당 스캔", "PF 일봉 프리페치", "PF 매도레이더 계산"):
+for span in ("PF 배당 스캔", "PF 일봉 프리페치", "PF 매도레이더 계산",
+             "PF 실적 캘린더"):
     check(f"'{span}' 계측됨", f'_timed("{span}")' in PF)
+
+# 사이드바는 모든 탭에서 그려진다 — 여기서 FMP 를 부르면 문서 페이지까지 느려진다.
+check("사이드바 계좌 컨텍스트 계측", '_timed("사이드바 계좌 컨텍스트")' in SRC)
+
+print("\n[11] 실적 캘린더 — 종목별 캐시")
+# 티커 튜플 전체가 캐시 키면 계좌 필터를 하나 켜고 끌 때마다 전체를 다시 받는다.
+check("종목 단위 캐시 함수 존재", "def _earnings_cal_one" in SRC)
+check("종목별 캐시에 ttl", re.search(
+    r"@st\.cache_data\(ttl=\d+[^)]*\)\s*\ndef _earnings_cal_one", SRC) is not None)
+check("smart 래퍼 존재", "def fetch_earnings_calendar_smart" in SRC)
+check("매도 레이더가 smart 를 쓴다",
+      "fetch_earnings_calendar_smart(earn_tickers)" in PF)
+check("옛 일괄 호출 잔재 없음",
+      "fetch_earnings_calendar(earn_tickers)" not in PF)
 
 print("\n" + "=" * 66)
 if _fail:
