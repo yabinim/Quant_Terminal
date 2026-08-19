@@ -15656,12 +15656,23 @@ if st.session_state.get("logged_in"):
     #   ⚠️ 🏠 시작 화면에서는 건너뛴다. 사용자 눈에 보이는 산출물이 없는
     #      백그라운드 유지보수인데, 로그인 직후 첫 렌더를 붙잡고 있었다.
     #      다음에 다른 탭으로 이동하면 그때 돈다(세션당 1회 규칙은 그대로).
-    _on_home = (st.session_state.get("main_sidebar_nav") in (None, _MAIN_NAV_OPTIONS[16]))
-    if str(st.session_state.get("user_id") or "").strip() and not _on_home:
+    #   ⚠️ 2026-08-19 정정 — 시작 화면에서만 건너뛰게 했더니 0.003초로 찍혀
+    #      '무죄'로 오판했다. 실제로는 **첫 탭 이동 때** 돌면서 profile 60콜 17초를
+    #      쓴다(ipos-calendar → etf-list → 후보마다 /profile 로 AUM 확인).
+    #      워치리스트 첫 진입이 유독 길던 정체가 이것이다.
+    #
+    #      이건 **주 1회 유지보수**지 사용자가 기다릴 일이 아니다. 화면에서 떼어
+    #      2단계 섹터 탭(결과를 실제로 쓰는 곳)에서만 돌린다.
+    #      그 탭에 안 가면? 주말 자동화(run_scanner_scan)가 유니버스를 갱신하므로
+    #      앱에서 안 돌아도 데이터가 낡지 않는다.
+    _etf_tab = (st.session_state.get("main_sidebar_nav") == _MAIN_NAV_OPTIONS[3])
+    if str(st.session_state.get("user_id") or "").strip() and _etf_tab:
         if not st.session_state.get("_etf_auto_update_done_this_session"):
             st.session_state["_etf_auto_update_done_this_session"] = True
             try:
-                _added_cnt, _add_err = run_etf_auto_update_if_needed(silent=True)
+                # 계측 누락 구간이었다 — 어느 구간에도 안 잡혀 '미계측 63콜'로만 보였다.
+                with _timed("ETF 유니버스 갱신"):
+                    _added_cnt, _add_err = run_etf_auto_update_if_needed(silent=True)
                 if _added_cnt > 0:
                     st.session_state["_etf_new_added_count"] = _added_cnt
             except Exception:
