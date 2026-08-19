@@ -158,15 +158,12 @@ for bad in ("evaluate_entry_gate", "evaluate_trim", "compute_account_context"):
 print("\n[7] 시작 화면 무거운 작업 지연")
 # 계측 결과: 로그인 직후 28.67초 중 워치리스트 알림 점검이 24.34초(85%)였다.
 # ETF 자동 갱신은 0.003초로 무죄. 시작 화면에서만 건너뛰고 버튼으로 실행한다.
-check("_on_home 판정 존재", "_on_home = (" in SRC)
-check("_on_home 이 index 16 을 본다",
-      re.search(r"_on_home = \(.*_MAIN_NAV_OPTIONS\[16\]", SRC, re.S) is not None)
-i_on = SRC.find("_on_home = (")
 # _on_home 은 이제 ETF 자동 갱신 스킵에만 쓴다.
 # 워치리스트 게이트는 소비 탭 판정(_wl_needed)으로 옮겼다 — [9] 참고.
-for user in ("and not _on_home",):
-    j = SRC.find(user)
-    check(f"'{user[:22]}...' 가 _on_home 정의보다 뒤", j != -1 and i_on < j)
+# _on_home 은 더 이상 쓰지 않는다 — ETF 갱신은 소비 탭(index 3)으로 옮겼다.
+check("ETF 갱신이 섹터 탭 한정",
+      re.search(r"_etf_tab = \(.*_MAIN_NAV_OPTIONS\[3\]", SRC, re.S) is not None)
+check("ETF 갱신 계측됨", '_timed("ETF 유니버스 갱신")' in SRC)
 
 # 건너뛸 때 _watchlist_alert_checked 를 세우면 안 된다 —
 # 세우면 다른 탭으로 가도 영영 점검이 안 돌아 알림을 놓친다.
