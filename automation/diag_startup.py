@@ -332,6 +332,25 @@ check("과거값으로 정직하게 표기", "지난번" in SRC)
 check("탭 기록이 스크립트 말미에 있음",
       SRC.rstrip().endswith("_tab_record(main_nav)"))
 
+print("\n[17] FMP 엔드포인트별 집계")
+# '미계측 63콜'이 어느 경로인지 총합만으로는 알 수 없다. 엔드포인트별로 센다.
+check("by_ep 집계 존재", '"by_ep"' in SRC)
+check("초기화 시 by_ep 도 비운다",
+      re.search(r'_FMP_STATS\.setdefault\("by_ep", \{\}\)\.clear\(\)', SRC)
+      is not None)
+check("패널에 엔드포인트 내역 표시", "FMP 엔드포인트별" in SRC)
+check("병렬 합산 주의 문구", "벽시계 시간보다" in SRC)
+
+# ⚠️ apikey 가 화면에 새면 안 된다 — URL 을 통째로 쓰지 말고 경로만 남겨야 한다
+i_w = SRC.find("def _install_fmp_instrumentation")
+j_w = SRC.find("\n_install_fmp_instrumentation()", i_w)
+W = SRC[i_w:j_w] if i_w != -1 else ""
+check("래퍼 구간 발견", len(W) > 300)
+check("쿼리스트링 제거", 'split("?", 1)[0]' in W)
+check("경로 길이 상한", "[:48]" in W)
+# 잠금 안에서 갱신해야 병렬에서 카운트가 깨지지 않는다
+check("집계가 잠금 안에서", W.find("_FMP_STATS_LOCK") < W.find('setdefault("by_ep"'))
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
