@@ -886,8 +886,9 @@ def _render_home() -> None:
             st.rerun()
         st.caption(
             "종목별 일봉을 받아 조건을 평가하므로 워치리스트 크기에 따라 "
-            "20초 이상 걸릴 수 있습니다. **다른 탭으로 이동하면 자동으로 실행됩니다.** "
-            "5PM 자동 이메일로도 같은 알림을 받으므로 지금 누르지 않아도 놓치지 않습니다."
+            "20초 이상 걸릴 수 있습니다. **`🔔 Buy Watchlist & Alert` 탭에 들어가면 "
+            "자동으로 실행됩니다.** 평일 2PM·5PM 이메일로도 같은 알림을 받으므로 "
+            "지금 누르지 않아도 놓치지 않습니다."
         )
 
     if not _shown:
@@ -15493,7 +15494,17 @@ if st.session_state.get("logged_in"):
     #       → 다른 탭으로 이동하면 평소대로 자동 실행된다
     #     · 시작 화면에 '🔔 알림 확인' 버튼을 두어 원할 때 즉시 돌린다
     #   알림은 5PM 메일로도 오므로 앱이 유일한 경로가 아니다.
-    _wl_defer = _on_home and not bool(st.session_state.pop("_wl_check_now", False))
+    #   ⚠️ 2026-08-18 정정 — 원래는 시작 화면에서만 건너뛰었다. 그랬더니 24초가
+    #      사라진 게 아니라 **첫 탭 이동 시점으로 옮겨졌을 뿐**이었다. 실제로
+    #      사용 가이드(계산이 전혀 없는 문서 페이지)에서 20초를 맞았다.
+    #      알림 결과를 쓰는 곳은 🔔 Buy Watchlist & Alert 탭 하나뿐이므로,
+    #      **그 탭에 들어갈 때만** 자동 실행한다. 나머지 탭은 알림과 무관하다.
+    #      놓칠 걱정은 없다 — 평일 2PM·5PM 이메일이 같은 알림을 보내고,
+    #      시작 화면에 즉시 실행 버튼이 있다.
+    _nav_now = st.session_state.get("main_sidebar_nav")
+    _wl_needed = (_nav_now == _MAIN_NAV_OPTIONS[7])
+    _wl_defer = (not _wl_needed) and not bool(
+        st.session_state.pop("_wl_check_now", False))
 
     if (_wl_full or _wl_part) and not _wl_defer:
         st.session_state["_watchlist_alert_checked"] = True
@@ -20698,7 +20709,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
             if _need_scan:
                 try:
-                    with st.spinner("배당 내역 확인 중..."):
+                    # 계측 누락 구간이었다. 편집/필터 변경마다 재실행되는지 확인하려면
+                    # 사이드바 '구간별 소요' 패널에 이 이름이 뜨는지 봐야 한다.
+                    with _timed("PF 배당 스캔"), st.spinner("배당 내역 확인 중..."):
                         _div_prefs = load_dividend_prefs(puid)
                         _div_done = load_dividend_done_keys(puid)
                         _div_trades = load_trade_history(puid)
