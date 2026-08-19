@@ -179,6 +179,31 @@ check("시작 화면에 알림 확인 버튼", "_wl_check_now" in home7)
 check("소요 시간 사전 고지", "20초" in home7)
 check("놓치지 않는다는 안내", "5PM" in home7 or "이메일" in home7)
 
+print("\n[8] 사용 가이드 — 신규 기능이 문서화됐는가")
+# 시작 화면이 "가이드부터 보라"고 안내하므로 가이드가 낡으면 안내가 해가 된다.
+i_g = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[12]:")
+j_g = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[14]:", i_g)
+GUIDE = SRC[i_g:j_g] if (i_g != -1 and j_g > i_g) else ""
+check("가이드 구간 발견", len(GUIDE) > 1000)
+for topic, needle in (("🏠 시작", "**시작** — 로그인 직후 착지"),
+                      ("📅 실적 레이더", "**실적 레이더** — 방향 맞히기"),
+                      ("⚙️ 내 설정", "**내 설정** — 알림 토글"),
+                      ("👑 관리자·리마인더", "개발 리마인더"),
+                      ("매도 사유 태그", "매도 기록 — 사유 태그")):
+    check(f"{topic} 문서화", needle in GUIDE)
+
+# 자동 이메일 스케줄 표가 실제 워크플로와 맞는가 — 5PM 에 실적, 주말에 스캐너
+check("5PM 스케줄에 실적 레이더", "run_earnings_watch" in GUIDE)
+check("주말 스케줄에 스캐너", "run_scanner_scan" in GUIDE)
+check("주말 스케줄에 주간요약", "run_weekly_report" in GUIDE)
+check("가이드 버전 v4 표기", "v4" in GUIDE)
+
+# 게스트 가이드도 같이 갱신됐는가
+GUEST = fn_src("_render_guest_guide") or ""
+check("게스트 가이드에 시작 화면", "🏠 시작" in GUEST)
+check("게스트 가이드에 실적 레이더", "실적 레이더" in GUEST)
+check("게스트 가이드에 매도 사유", "매도 사유" in GUEST)
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
