@@ -257,6 +257,23 @@ i_init = SRC.find("_wl_an_n, _wl_t0 = 0")
 i_use = SRC.find('_b_wl["WL 레짐 평가"]')
 check("계측 변수 사전 초기화", i_init != -1 and i_use != -1 and i_init < i_use)
 
+print("\n[13] 현재가 조회 — 배치 청크 + 폴백 병렬")
+# 실측: 워치리스트 59종목에서 60콜 17.1초. 배치 1회 실패 + 단일 quote 59회 '순차'.
+# 같은 함수를 사이드바도 쓴다(13콜 3.8초) — 여기를 고치면 양쪽이 같이 빨라진다.
+i_q = SRC.find("def fetch_latest_prices_for_tickers")
+j_q = SRC.find("\ndef ", i_q + 10)
+Q = SRC[i_q:j_q] if i_q != -1 else ""
+check("함수 구간 발견", len(Q) > 500)
+check("배치를 청크로 나눈다", "_FMP_BATCH_CHUNK" in Q)
+check("배치 실패 사유를 남긴다", "_batch_fail" in Q)
+check("실패 시 경고 출력", "batch-quote 실패" in Q)
+check("단일 폴백이 병렬", "_cf.ThreadPoolExecutor(max_workers=_FMP_QUOTE_WORKERS)" in Q)
+check("스레드풀 실패 시 순차 폴백", "for tk in missing:" in Q)
+# 상수가 정의돼 있고 사용보다 앞서야 한다
+for c in ("_FMP_BATCH_CHUNK", "_FMP_QUOTE_WORKERS"):
+    d = SRC.find(f"{c} = ")
+    check(f"{c} 정의가 사용보다 앞", d != -1 and d < i_q)
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
