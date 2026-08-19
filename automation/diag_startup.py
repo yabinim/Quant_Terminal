@@ -307,6 +307,31 @@ j_fq = SRC.find("\ndef ", i_fq + 10)
 FQ = SRC[i_fq:j_fq] if i_fq != -1 else ""
 check("병렬 실패 시 경고 출력", "quote 병렬 실패" in FQ)
 
+print("\n[16] 진행률 바 · 탭 소요 안내")
+for f in ("_progress_ui", "_tab_hint", "_tab_record"):
+    check(f"{f} 모듈 레벨", f in TOPLEVEL)
+    d = SRC.find(f"def {f}")
+    u = SRC.find(f"{f}(", d + len(f) + 6)
+    check(f"{f} 정의 < 첫 사용", d != -1 and (u == -1 or d < u))
+
+# 총량을 아는 루프 4곳에 진행률이 붙어야 한다
+check("진행률 적용 지점 4곳 이상", SRC.count("_progress_ui(") >= 5,
+      f"{SRC.count('_progress_ui(')}회")
+for lbl in ("알림 조건 평가", "워치리스트 일봉", "보유 종목 일봉", "보유 종목 판정"):
+    check(f"'{lbl}' 진행률", f'_progress_ui("' in SRC and lbl in SRC)
+
+# 짧은 루프에는 바를 띄우지 않는다(깜빡임 방지)
+check("최소 항목 수 가드", "_PROGRESS_MIN" in SRC)
+# 캐시 함수 안에서 쓰면 캐시 히트 시 화면이 어긋난다
+i_fp = SRC.find("def fetch_latest_prices_for_tickers")
+j_fp = SRC.find("\ndef ", i_fp + 10)
+check("캐시 함수 안에서는 미사용",
+      "_progress_ui(" not in SRC[i_fp:j_fp])
+# '예상 시간'이라고 쓰면 안 된다 — 캐시 상태에 따라 몇 배씩 달라진다
+check("과거값으로 정직하게 표기", "지난번" in SRC)
+check("탭 기록이 스크립트 말미에 있음",
+      SRC.rstrip().endswith("_tab_record(main_nav)"))
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
