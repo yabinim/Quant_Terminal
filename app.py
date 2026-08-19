@@ -3730,6 +3730,36 @@ def fetch_earnings_calendar(tickers: tuple) -> list[dict]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _earnings_cal_one(ticker: str) -> dict | None:
+    """종목 1개짜리 캐시 단위. 위 함수를 그대로 재사용한다."""
+    r = fetch_earnings_calendar((str(ticker).strip().upper(),))
+    return r[0] if r else None
+
+
+def fetch_earnings_calendar_smart(tickers: tuple) -> list[dict]:
+    """종목별로 캐시된 결과를 모아 돌려준다.
+
+    ⚠️ 왜 이렇게 바꿨나
+       fetch_earnings_calendar 는 **티커 튜플 전체가 캐시 키**다. 그래서 매도
+       레이더에서 계좌 필터를 하나 켜고 끌 때마다 티커 집합이 달라져 캐시가
+       통째로 미스되고, 종목당 최대 3콜(3단 폴백)을 전부 다시 받았다.
+       종목 단위로 쪼개면 **새로 들어온 종목만** 조회한다. 필터를 되돌리면 0콜이다.
+
+    정렬은 여기서 다시 한다 — 종목별 캐시에는 순서 정보가 없다.
+    """
+    out = []
+    for _t in tickers:
+        try:
+            _r = _earnings_cal_one(_t)
+        except Exception:
+            _r = None
+        if _r:
+            out.append(_r)
+    out.sort(key=lambda x: x.get("days_until", 9999))
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fed_funds_rate() -> tuple[float, str]:
     """현재 기준금리.
     1순위: FRED FEDFUNDS  2순위: FMP federalFundsRate
@@ -15649,7 +15679,11 @@ if st.session_state.get("logged_in"):
         )
         st.session_state["_active_account"] = _active_acct
         try:
-            _ctx_side = account_context_memo(_uid_side, _active_acct)
+            # 계측 누락 구간. 사이드바는 **모든 탭에서** 그려지므로, 여기서 FMP 를
+            # 부르면 문서 페이지(사용 가이드)까지 느려진다. 실제로 가이드에서
+            # FMP 62콜 19.3초가 찍혔는데 본문에는 계산이 없었다.
+            with _timed("사이드바 계좌 컨텍스트"):
+                _ctx_side = account_context_memo(_uid_side, _active_acct)
             _psd = _ctx_side["profile"]
             st.sidebar.caption(_esc_md(
                 f"자본 ${_ctx_side['equity']:,.0f} "
@@ -22538,8 +22572,11 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         sell_radar_df["티커"].dropna().astype(str).unique().tolist()
                     )))
                     if earn_tickers:
-                        with st.spinner("실적 발표일 조회 중..."):
-                            earn_data = fetch_earnings_calendar(earn_tickers)
+                        # 계측 누락 구간이었다 — 사이드바 '구간별 소요'에 뜨지 않아
+                        # 1초로 보이는데 체감은 훨씬 길었다.
+                        with _timed("PF 실적 캘린더"), st.spinner("실적 발표일 조회 중..."):
+                            earn_data = fetch_earnings_calendar_smart(earn_tickers)
+                        _perf_note("PF 실적 캘린더", f"{len(earn_tickers)}종목")
 
                         if not earn_data:
                             st.info("실적 발표일 데이터를 가져오지 못했습니다.")
