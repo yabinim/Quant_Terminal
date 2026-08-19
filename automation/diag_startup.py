@@ -274,6 +274,16 @@ for c in ("_FMP_BATCH_CHUNK", "_FMP_QUOTE_WORKERS"):
     d = SRC.find(f"{c} = ")
     check(f"{c} 정의가 사용보다 앞", d != -1 and d < i_q)
 
+print("\n[14] batch-quote 진단이 화면에 보이는가")
+# print 로만 남기면 Streamlit Cloud 로그를 뒤져야 한다. 계측 패널에 띄운다.
+check("배치 결과 기록 구조 존재", "_FMP_BATCH_LAST" in SRC)
+check("성공/시도 청크 수 집계", '"n_ok"' in SRC and '"n_try"' in SRC)
+check("계측 패널에 표시", "batch-quote 실패" in SRC and "st.caption" in SRC)
+check("402 의미 안내", "플랜 제한" in SRC)
+d_b = SRC.find("_FMP_BATCH_LAST = {")
+u_b = SRC.find("dict(_FMP_BATCH_LAST)")
+check("정의가 표시부보다 앞", d_b != -1 and u_b != -1 and d_b < u_b)
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
