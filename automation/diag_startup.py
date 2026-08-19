@@ -246,6 +246,17 @@ check("매도 레이더가 smart 를 쓴다",
 check("옛 일괄 호출 잔재 없음",
       "fetch_earnings_calendar(earn_tickers)" not in PF)
 
+print("\n[12] 워치리스트 알림 점검 — 구간 계측")
+# 24초가 어디서 나는지 모른 채 손대지 않는다. 후보 셋을 나눠 잰다.
+for span in ("WL 가격 조회", "WL 일봉 프리페치"):
+    check(f"'{span}' 계측됨", f'_timed("{span}")' in SRC)
+check("'WL 레짐 평가' 계측됨", '"WL 레짐 평가"' in SRC)
+check("analyze_ticker 횟수 기록", "_wl_an_n" in SRC)
+# _wl_items 가 비어도 계측 블록이 참조하므로 미리 초기화돼야 한다
+i_init = SRC.find("_wl_an_n, _wl_t0 = 0")
+i_use = SRC.find('_b_wl["WL 레짐 평가"]')
+check("계측 변수 사전 초기화", i_init != -1 and i_use != -1 and i_init < i_use)
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
