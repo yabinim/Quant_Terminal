@@ -13013,6 +13013,15 @@ def hydrate_narrative_from_disk_once():
         st.session_state["_narrative_persist_loaded_v2"] = True
 
 
+# batch-quote 한 요청에 넣을 심볼 수. 59종목을 한 URL 에 밀어넣으면 거부될 수 있고,
+# 그때 조용히 전량 단일 폴백으로 떨어져 17초를 쓴다.
+_FMP_BATCH_CHUNK = 25
+# 단일 quote 폴백 병렬도. 일봉 프리페치(_wl_prefetch_histories)와 같은 수준으로 맞춘다.
+# FMP Starter 300/분 한도 안이며, 스캐너·Hidden Alpha 와 동시 실행하지 않는다는
+# 기존 운영 원칙은 그대로 유효하다.
+_FMP_QUOTE_WORKERS = 8
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
     """현재가 조회 — FMP stable batch-quote 우선, 누락분은 단일 quote, 그래도 없으면 historical 마지막 종가로 fallback.
@@ -13039,34 +13048,61 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
             price_map[sym] = price
 
     # ── 1차: stable batch-quote (실시간 호가, 한 번에 여러 종목) ─────────────
-    try:
-        symbols = ",".join(clean_tickers)
-        r = requests.get(
-            f"{_FMP_BASE}/batch-quote?symbols={symbols}&apikey={k}",
-            timeout=_FMP_TIMEOUT
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list):
-                for item in data:
-                    _extract(item)
-    except Exception:
-        pass
-
-    # ── 2차: 누락 종목은 단일 quote?symbol= 로 폴백 ─────────────────────────
-    missing = [tk for tk in clean_tickers if tk not in price_map or pd.isna(price_map.get(tk))]
-    for tk in missing:
+    #   ⚠️ 심볼을 청크로 나눈다. 59종목을 한 URL 에 밀어넣으면 서버가 거부할 수
+    #      있고, 그때 예전 코드는 **조용히 전량 폴백**으로 떨어졌다.
+    #      실측: 워치리스트 59종목에서 60콜 17.1초(= 배치 1회 실패 + 단일 59회 순차).
+    #   ⚠️ 실패 사유를 남긴다. 예전에는 except: pass 라 402(플랜 제한)인지
+    #      URL 문제인지 구분할 수 없었다 — 고칠 수 있는 것과 없는 것이 섞였다.
+    _batch_fail = ""
+    for _i in range(0, len(clean_tickers), _FMP_BATCH_CHUNK):
+        _chunk = clean_tickers[_i:_i + _FMP_BATCH_CHUNK]
         try:
             r = requests.get(
-                f"{_FMP_BASE}/quote?symbol={tk}&apikey={k}",
+                f"{_FMP_BASE}/batch-quote?symbols={','.join(_chunk)}&apikey={k}",
                 timeout=_FMP_TIMEOUT
             )
             if r.status_code == 200:
                 data = r.json()
-                if isinstance(data, list) and data:
-                    _extract(data[0])
+                if isinstance(data, list):
+                    for item in data:
+                        _extract(item)
+            elif not _batch_fail:
+                _batch_fail = f"HTTP {r.status_code}"
+        except Exception as _be:
+            if not _batch_fail:
+                _batch_fail = type(_be).__name__
+
+    # ── 2차: 누락 종목은 단일 quote?symbol= 로 폴백 (병렬) ──────────────────
+    #   ⚠️ 예전에는 순차였다. 59종목이면 왕복 지연이 그대로 59번 쌓여 17초가 됐다.
+    #      일봉 프리페치(_wl_prefetch_histories)가 이미 쓰는 것과 같은 8워커다.
+    #      네트워크 I/O 에만 병렬을 적용한다 — 계산은 호출부에 그대로 둔다.
+    missing = [tk for tk in clean_tickers if tk not in price_map or pd.isna(price_map.get(tk))]
+    if missing:
+        if _batch_fail:
+            print(f"[WARN] batch-quote 실패({_batch_fail}) — 단일 quote {len(missing)}건으로 폴백")
+
+        def _one_quote(tk):
+            try:
+                r = requests.get(
+                    f"{_FMP_BASE}/quote?symbol={tk}&apikey={k}",
+                    timeout=_FMP_TIMEOUT
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list) and data:
+                        return data[0]
+            except Exception:
+                pass
+            return None
+
+        try:
+            with _cf.ThreadPoolExecutor(max_workers=_FMP_QUOTE_WORKERS) as _ex:
+                for _res in _ex.map(_one_quote, missing):
+                    _extract(_res)
         except Exception:
-            pass
+            # 스레드풀 자체가 실패하면 순차로 안전하게 되돌린다
+            for tk in missing:
+                _extract(_one_quote(tk))
 
     # ── 3차 fallback: 그래도 없으면 historical 마지막 종가 ──────────────────
     missing = [tk for tk in clean_tickers if tk not in price_map or pd.isna(price_map.get(tk))]
