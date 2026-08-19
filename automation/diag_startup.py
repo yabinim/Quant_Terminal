@@ -359,6 +359,14 @@ for span in ("섹터 ETF 종가", "섹터 PER", "테마 ETF 수익률",
              "ETF 구성종목 분석", "위성 후보 풀"):
     check(f"'{span}' 계측됨", f'_timed("{span}")' in S3)
 
+# 위성 후보 풀이 탭 첫 진입의 75%(34.5초)를 썼다 → 버튼 게이트
+check("위성 Top10 버튼 게이트", "_sat_show" in S3)
+check("버튼에 소요 시간 고지", "약 35초" in S3)
+check("놓치지 않는다는 안내", "Hidden Alpha 이메일" in S3)
+i_gate3 = S3.find("_sat_go = bool(")
+i_call3 = S3.find("cached_satellite_top10()")
+check("게이트가 계산보다 앞", i_gate3 != -1 and i_call3 != -1 and i_gate3 < i_call3)
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
