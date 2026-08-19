@@ -15665,8 +15665,12 @@ if st.session_state.get("logged_in"):
     #      2단계 섹터 탭(결과를 실제로 쓰는 곳)에서만 돌린다.
     #      그 탭에 안 가면? 주말 자동화(run_scanner_scan)가 유니버스를 갱신하므로
     #      앱에서 안 돌아도 데이터가 낡지 않는다.
-    _etf_tab = (st.session_state.get("main_sidebar_nav") == _MAIN_NAV_OPTIONS[3])
-    if str(st.session_state.get("user_id") or "").strip() and _etf_tab:
+    #      2026-08-19 추가 — 섹터 탭으로 옮겼더니 이번엔 그 탭 첫 진입이 19초가 됐다.
+    #      주 1회 유지보수가 탭 진입을 막을 이유가 없다. 이제 **버튼을 눌렀을 때만**
+    #      돈다(섹터 탭의 'ETF Universe 관리' 안). 주말 자동화가 유니버스를
+    #      갱신하므로 앱에서 안 눌러도 데이터는 낡지 않는다.
+    _etf_go = bool(st.session_state.pop("_etf_update_now", False))
+    if str(st.session_state.get("user_id") or "").strip() and _etf_go:
         if not st.session_state.get("_etf_auto_update_done_this_session"):
             st.session_state["_etf_auto_update_done_this_session"] = True
             try:
@@ -18512,8 +18516,16 @@ if st.session_state.get("logged_in"):
         with st.expander("🆕 ETF Universe 관리 (자동 업데이트)", expanded=False):
             st.caption(
                 "FMP API로 최근 90일 내 신규 상장 ETF를 자동 스캔해 Google Sheets `ETF_Universe` 탭에 추가합니다. "
-                f"업데이트 주기: **{_ETF_AUTO_UPDATE_INTERVAL_DAYS}일마다 자동 실행**. 수동으로도 실행할 수 있어요."
+                f"업데이트 주기: **{_ETF_AUTO_UPDATE_INTERVAL_DAYS}일마다**. "
+                "예전에는 탭에 들어오면 자동으로 돌았는데, 후보마다 `/profile` 로 "
+                "AUM 을 확인하느라 **첫 진입에 19초**를 썼습니다. 이제 아래 버튼을 "
+                "눌렀을 때만 돕니다. 주말 자동화가 유니버스를 갱신하므로 "
+                "누르지 않아도 데이터는 낡지 않습니다."
             )
+            if st.button("🔄 신규 ETF 지금 확인 (약 20초)",
+                         key="etf_auto_update_now_btn", use_container_width=True):
+                st.session_state["_etf_update_now"] = True
+                st.rerun()
 
             eu_col1, eu_col2 = st.columns(2)
             with eu_col1:
@@ -18592,12 +18604,12 @@ if st.session_state.get("logged_in"):
         sector_holdings_map = {tk: _ETF_CONSTITUENTS.get(tk, []) for tk in sector_tickers}
 
         try:
-            with st.spinner("섹터 ETF 데이터를 불러오는 중..."):
+            with _timed("섹터 ETF 종가"), st.spinner("섹터 ETF 데이터를 불러오는 중..."):
                 close_df = cached_sector_etf_closes(tuple(sector_tickers))
             sector_returns_df = build_sector_returns_table(close_df, sector_etfs)
 
             # ── 섹터 현재 PER 매핑 (FMP sector-pe-snapshot) ──
-            with st.spinner("섹터 PER 조회 중..."):
+            with _timed("섹터 PER"), st.spinner("섹터 PER 조회 중..."):
                 _spe_data = _fmp_sector_pe_snapshot()
             pe_by_ticker = {}
             _sector_median_pe = None
@@ -18661,7 +18673,7 @@ if st.session_state.get("logged_in"):
                 # Tier 2: 하위 테마 ETF 상대 강도 (테마 3개 이상일 때만 표시)
                 if len(_themes) >= 3:
                     _theme_pairs = [(tk, lbl) for tk, lbl in _themes]
-                    with st.spinner(f"{_sel_label} 하위 테마 ETF 수익률 계산 중..."):
+                    with _timed("테마 ETF 수익률"), st.spinner(f"{_sel_label} 하위 테마 ETF 수익률 계산 중..."):
                         _theme_close = cached_sector_etf_closes(tuple([tk for tk, _ in _theme_pairs]))
                         _theme_df = build_sector_returns_table(_theme_close, _theme_pairs)
                     if _theme_df is not None and not _theme_df.empty:
@@ -18695,7 +18707,7 @@ if st.session_state.get("logged_in"):
                 )
 
                 # Tier 3: 주도주 + 저평가 후발주 (라이브 우선, 대표종목 폴백)
-                with st.spinner(f"{_sel_etf} 구성종목 분석 중..."):
+                with _timed("ETF 구성종목 분석"), st.spinner(f"{_sel_etf} 구성종목 분석 중..."):
                     _leaders_df, _lagg_df, _t3_src, _etf_sum = cached_etf_tier3_analysis(_sel_etf, _sector_median_pe)
                 if _t3_src == "fallback":
                     st.caption("ⓘ 라이브 구성종목 미수신(FMP holdings 엔드포인트) → 대표 종목 기준 폴백으로 계산했습니다.")
@@ -18740,7 +18752,7 @@ if st.session_state.get("logged_in"):
                 )
                 _sat = None
                 try:
-                    with st.spinner("위성 후보 풀 수익률 계산 중... (약 60개 ETF · 첫 계산은 1~2분, 이후 1시간 캐시)"):
+                    with _timed("위성 후보 풀"), st.spinner("위성 후보 풀 수익률 계산 중... (약 60개 ETF · 첫 계산은 1~2분, 이후 1시간 캐시)"):
                         _sat = cached_satellite_top10()
                 except Exception as _sat_exc:
                     st.warning(f"위성 Top10 계산 실패: {_sat_exc} — 잠시 후 새로고침해 주세요.")
