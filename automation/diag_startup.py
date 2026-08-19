@@ -161,8 +161,10 @@ print("\n[7] 시작 화면 무거운 작업 지연")
 # _on_home 은 이제 ETF 자동 갱신 스킵에만 쓴다.
 # 워치리스트 게이트는 소비 탭 판정(_wl_needed)으로 옮겼다 — [9] 참고.
 # _on_home 은 더 이상 쓰지 않는다 — ETF 갱신은 소비 탭(index 3)으로 옮겼다.
-check("ETF 갱신이 섹터 탭 한정",
-      re.search(r"_etf_tab = \(.*_MAIN_NAV_OPTIONS\[3\]", SRC, re.S) is not None)
+# 섹터 탭 한정으로 옮겼더니 이번엔 그 탭 첫 진입이 19초가 됐다 → 버튼 트리거로.
+check("ETF 갱신이 버튼 트리거", "_etf_update_now" in SRC)
+check("자동 실행 잔재 없음", "_etf_tab = (" not in SRC)
+check("버튼에 소요 시간 고지", "약 20초" in SRC)
 check("ETF 갱신 계측됨", '_timed("ETF 유니버스 갱신")' in SRC)
 
 # 건너뛸 때 _watchlist_alert_checked 를 세우면 안 된다 —
@@ -347,6 +349,15 @@ check("쿼리스트링 제거", 'split("?", 1)[0]' in W)
 check("경로 길이 상한", "[:48]" in W)
 # 잠금 안에서 갱신해야 병렬에서 카운트가 깨지지 않는다
 check("집계가 잠금 안에서", W.find("_FMP_STATS_LOCK") < W.find('setdefault("by_ep"'))
+
+print("\n[18] 섹터 탭 — 계측 누락 구간")
+i_s3 = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[3]:")
+j_s3 = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[5]:", i_s3)
+S3 = SRC[i_s3:j_s3] if (i_s3 != -1 and j_s3 > i_s3) else ""
+check("섹터 탭 구간 발견", len(S3) > 1000)
+for span in ("섹터 ETF 종가", "섹터 PER", "테마 ETF 수익률",
+             "ETF 구성종목 분석", "위성 후보 풀"):
+    check(f"'{span}' 계측됨", f'_timed("{span}")' in S3)
 
 print("\n" + "=" * 66)
 if _fail:
