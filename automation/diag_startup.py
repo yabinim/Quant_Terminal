@@ -284,6 +284,29 @@ d_b = SRC.find("_FMP_BATCH_LAST = {")
 u_b = SRC.find("dict(_FMP_BATCH_LAST)")
 check("정의가 표시부보다 앞", d_b != -1 and u_b != -1 and d_b < u_b)
 
+print("\n[15] 병렬 별칭 — _cf 를 쓰면 같은 함수 안에서 import 했는가")
+# 이 파일은 concurrent.futures 를 모듈 레벨로 import 하지 않는다.
+# 함수 안에서 import 를 빠뜨리면 NameError 가 except 에 삼켜져 **조용히 순차**로
+# 돌고, 병렬을 넣었는데 효과가 없는 상태가 된다(실제로 58종목 20초가 유지됐다).
+_bad_cf = []
+for _n in ast.walk(TREE):
+    if not isinstance(_n, ast.FunctionDef):
+        continue
+    _fs = ast.get_source_segment(SRC, _n) or ""
+    # ⚠️ 부분 문자열로 찾으면 _qt_cf·_cf_drg 같은 다른 별칭까지 잡아 오탐이 난다.
+    #    별칭을 정규식으로 뽑아 그 별칭의 import 가 같은 함수 안에 있는지 본다.
+    for _alias in set(re.findall(r"\b(\w+)\.ThreadPoolExecutor", _fs)):
+        if not re.search(r"import concurrent\.futures as " + _alias + r"\b", _fs):
+            _bad_cf.append(f"{_n.name}:{_alias}")
+check("_cf 사용 함수가 모두 자체 import", not _bad_cf, str(_bad_cf))
+check("모듈 레벨 _cf 별칭 없음(전제 확인)",
+      not re.search(r"^import concurrent\.futures as _cf", SRC, re.M))
+# 병렬 폴백은 침묵하면 안 된다 — 성능 퇴행이 계측에도 안 보인다
+i_fq = SRC.find("def fetch_latest_prices_for_tickers")
+j_fq = SRC.find("\ndef ", i_fq + 10)
+FQ = SRC[i_fq:j_fq] if i_fq != -1 else ""
+check("병렬 실패 시 경고 출력", "quote 병렬 실패" in FQ)
+
 print("\n" + "=" * 66)
 if _fail:
     print(f"❌ 실패 {len(_fail)}건 / 통과 {_pass}건")
