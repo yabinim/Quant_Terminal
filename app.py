@@ -13015,6 +13015,11 @@ def hydrate_narrative_from_disk_once():
 
 # batch-quote 한 요청에 넣을 심볼 수. 59종목을 한 URL 에 밀어넣으면 거부될 수 있고,
 # 그때 조용히 전량 단일 폴백으로 떨어져 17초를 쓴다.
+# batch-quote 실패 사유를 프로세스 레벨에 남긴다.
+#   ⚠️ print 로만 남기면 Streamlit Cloud 로그를 뒤져야 한다. 계측 패널에 띄워
+#      바로 보이게 한다 — 402(플랜 제한)면 코드로 못 고치고, 그 외면 고칠 수 있다.
+_FMP_BATCH_LAST = {"reason": "", "n_ok": 0, "n_try": 0}
+
 _FMP_BATCH_CHUNK = 25
 # 단일 quote 폴백 병렬도. 일봉 프리페치(_wl_prefetch_histories)와 같은 수준으로 맞춘다.
 # FMP Starter 300/분 한도 안이며, 스캐너·Hidden Alpha 와 동시 실행하지 않는다는
@@ -13053,9 +13058,10 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
     #      실측: 워치리스트 59종목에서 60콜 17.1초(= 배치 1회 실패 + 단일 59회 순차).
     #   ⚠️ 실패 사유를 남긴다. 예전에는 except: pass 라 402(플랜 제한)인지
     #      URL 문제인지 구분할 수 없었다 — 고칠 수 있는 것과 없는 것이 섞였다.
-    _batch_fail = ""
+    _batch_fail, _b_ok, _b_try = "", 0, 0
     for _i in range(0, len(clean_tickers), _FMP_BATCH_CHUNK):
         _chunk = clean_tickers[_i:_i + _FMP_BATCH_CHUNK]
+        _b_try += 1
         try:
             r = requests.get(
                 f"{_FMP_BASE}/batch-quote?symbols={','.join(_chunk)}&apikey={k}",
@@ -13064,13 +13070,21 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, list):
+                    _b_ok += 1
                     for item in data:
                         _extract(item)
+                elif not _batch_fail:
+                    _batch_fail = "200 이나 리스트가 아님"
             elif not _batch_fail:
                 _batch_fail = f"HTTP {r.status_code}"
         except Exception as _be:
             if not _batch_fail:
                 _batch_fail = type(_be).__name__
+    try:
+        _FMP_BATCH_LAST.update(
+            {"reason": _batch_fail, "n_ok": _b_ok, "n_try": _b_try})
+    except Exception:
+        pass
 
     # ── 2차: 누락 종목은 단일 quote?symbol= 로 폴백 (병렬) ──────────────────
     #   ⚠️ 예전에는 순차였다. 59종목이면 왕복 지연이 그대로 59번 쌓여 17초가 됐다.
@@ -15898,6 +15912,24 @@ if st.session_state.get("logged_in"):
                         + (f" · FMP {_fc}콜" if _fc else "")
                         + (f" · {_nt}" if _nt else "")
                     )
+                # batch-quote 진단 — 단일 quote 폴백이 시간을 먹는 근본 원인이다.
+                try:
+                    _bl = dict(_FMP_BATCH_LAST)
+                    if _bl.get("n_try"):
+                        if _bl.get("n_ok") == _bl.get("n_try"):
+                            st.caption(
+                                f"✅ batch-quote 정상 ({_bl['n_ok']}/{_bl['n_try']} 청크)")
+                        else:
+                            st.caption(
+                                f"⚠️ **batch-quote 실패** "
+                                f"{_bl['n_ok']}/{_bl['n_try']} 청크 · "
+                                f"사유 `{_bl.get('reason') or '불명'}`  \n"
+                                "→ 종목마다 단일 quote 로 폴백합니다. "
+                                "`HTTP 402` 면 플랜 제한이라 코드로 못 고칩니다."
+                            )
+                except Exception:
+                    pass
+
                 _fc_tot = sum(int(v.get("fmp", 0)) for _, v in _rows)
                 with _FMP_STATS_LOCK:
                     _fc_all = int(_FMP_STATS.get("n", 0))
