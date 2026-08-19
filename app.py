@@ -788,6 +788,81 @@ def _pv_money(v):
     return f"{n:,.0f}"
 
 
+import contextlib as _ctxlib
+
+
+# 진행률 바를 띄울 최소 항목 수. 짧은 루프에 바를 띄우면 깜빡임만 남고
+# 오히려 산만하다.
+_PROGRESS_MIN = 8
+# 이 초 이상 걸린 탭에만 "지난번 N초" 안내를 띄운다. 빠른 탭까지 알리면 잔소리가 된다.
+_TAB_HINT_MIN_SEC = 2.0
+
+
+@_ctxlib.contextmanager
+def _progress_ui(label: str, total: int):
+    """총량을 아는 루프용 진행률 바.
+
+    사람이 기다림을 견디는 건 '얼마나 남았나'를 볼 때다. 예상 시간이 아니라
+    실제 진행 개수를 보여준다.
+
+    ⚠️ @st.cache_data 로 감싼 함수 안에서는 쓰지 않는다 — 캐시 히트 시
+       위젯이 그려지지 않아 화면이 어긋난다.
+    """
+    _n = int(total or 0)
+    if _n < _PROGRESS_MIN:
+        yield lambda i=None: None
+        return
+    _ph = st.empty()
+    try:
+        _bar = _ph.progress(0.0, text=f"{label} 0/{_n}")
+    except Exception:
+        yield lambda i=None: None
+        return
+    _cnt = {"i": 0}
+
+    def _tick(i=None):
+        _cnt["i"] = int(i) if i is not None else _cnt["i"] + 1
+        try:
+            _bar.progress(min(1.0, _cnt["i"] / _n),
+                          text=f"{label} {_cnt['i']}/{_n}")
+        except Exception:
+            pass
+
+    try:
+        yield _tick
+    finally:
+        try:
+            _ph.empty()
+        except Exception:
+            pass
+
+
+def _tab_hint(nav_label: str) -> None:
+    """이 탭이 지난번 얼마나 걸렸는지 알린다.
+
+    ⚠️ '예상 시간'이라고 쓰지 않는다. Streamlit 은 스크립트를 통째로 다시 돌리고
+       캐시 상태에 따라 소요가 몇 배씩 달라진다. 틀린 예상치는 없느니만 못하다.
+       측정된 과거값을 과거값으로 제시한다.
+    """
+    try:
+        _prev = (st.session_state.get("_tab_last_sec") or {}).get(nav_label)
+        if _prev and float(_prev) >= _TAB_HINT_MIN_SEC:
+            st.caption(f"⏱️ 이 탭은 지난번 **{float(_prev):.1f}초** 걸렸습니다.")
+    except Exception:
+        pass
+
+
+def _tab_record(nav_label: str) -> None:
+    """탭 렌더 소요를 기록한다. st.stop() 으로 끝난 렌더는 기록되지 않는다."""
+    try:
+        _t0 = st.session_state.get("_boot_t0")
+        if _t0:
+            _d = st.session_state.setdefault("_tab_last_sec", {})
+            _d[str(nav_label)] = time.perf_counter() - float(_t0)
+    except Exception:
+        pass
+
+
 def _boot_mark(label: str) -> None:
     """기동 단계별 소요 시간 기록 (관리자 진단용).
 
@@ -12159,15 +12234,22 @@ def _wl_prefetch_histories(tickers: tuple, limit: int = 252) -> dict:
         except Exception:
             return tk, None
 
+    _pg = _progress_ui("📊 워치리스트 일봉", len(tks))
+    _tick = _pg.__enter__()
     try:
         import concurrent.futures as _cf
         with _cf.ThreadPoolExecutor(max_workers=8) as _ex:
             for _tk, _df in _ex.map(_one, tks):
+                _tick()
                 out[_tk] = _df
     except Exception:
         # 병렬 실패 시 순차 폴백 — 느릴 뿐 결과는 동일하다
         for tk in tks:
             out[tk] = _one(tk)[1]
+    try:
+        _pg.__exit__(None, None, None)
+    except Exception:
+        pass
     return out
 
 
@@ -12193,15 +12275,22 @@ def _pf_prefetch_histories(tickers: tuple, limit: int = 600) -> dict:
         except Exception:
             return tk, None
 
+    _pg = _progress_ui("📊 보유 종목 일봉", len(tks))
+    _tick = _pg.__enter__()
     try:
         import concurrent.futures as _cf
         _w = max(2, min(8, len(tks)))
         with _cf.ThreadPoolExecutor(max_workers=_w) as _ex:
             for _tk, _df in _ex.map(_one, tks):
+                _tick()
                 out[_tk] = _df
     except Exception:
         for tk in tks:                      # 병렬 실패 시 순차 폴백
             out[tk] = _one(tk)[1]
+    try:
+        _pg.__exit__(None, None, None)
+    except Exception:
+        pass
     return out
 
 
@@ -15641,7 +15730,10 @@ if st.session_state.get("logged_in"):
                 except Exception:
                     _spy_c = None
                 _wl_t0 = time.perf_counter()   # 프리페치 이후부터 잰다
+                _wl_pg = _progress_ui("🔔 알림 조건 평가", len(_wl_items))
+                _wl_tick = _wl_pg.__enter__()
                 for _it in _wl_items:
+                    _wl_tick()
                     _tk = _it["ticker"]
                     try:
                         _hist = _hist_map.get(_tk)
@@ -15672,6 +15764,11 @@ if st.session_state.get("logged_in"):
                             _alert_hits.append(_tk)
                     except Exception:
                         continue
+
+            try:
+                _wl_pg.__exit__(None, None, None)
+            except Exception:
+                pass
 
             # 순차 레짐 평가 소요 — 프리페치 후 남는 CPU 비중을 본다
             try:
@@ -15970,6 +16067,9 @@ if st.session_state.get("logged_in"):
     is_etf_mode = quote_type == "ETF"
     
     _boot_mark("사이드바 완료")
+
+    # 이 탭이 지난번 얼마나 걸렸는지 먼저 알린다(측정된 과거값, 예상치 아님).
+    _tab_hint(main_nav)
 
     # 🏠 시작 — 시트만 읽고 즉시 렌더. 어떤 계산도 트리거하지 않는다.
     if main_nav == _MAIN_NAV_OPTIONS[16]:
@@ -21101,10 +21201,14 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
             _t_acct0 = time.perf_counter()
             _n_an = 0
+            # 종목 단위로 진행률을 보여준다(계좌 단위는 너무 성겨서 체감이 안 난다).
+            _pf_pg = _progress_ui("🛡️ 보유 종목 판정", int(len(portfolio_df)))
+            _pf_tick = _pf_pg.__enter__()
             for acct in sorted(portfolio_df["Account"].astype(str).unique(), key=lambda x: str(x).lower()):
                 sub = portfolio_df[portfolio_df["Account"] == acct].sort_values("Ticker")
                 _acct_rows = []
                 for _, _h in sub.iterrows():
+                    _pf_tick()
                     _tk = str(_h["Ticker"]).strip().upper()
                     _avg = pd.to_numeric(_h.get("Purchase_Price"), errors="coerce")
                     _dadd = str(_h.get("Date_Added", "") or "")
@@ -21301,6 +21405,11 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                         else:
                                             st.error(f"저장 실패: {_e_sug}")
                         st.divider()
+
+            try:
+                _pf_pg.__exit__(None, None, None)
+            except Exception:
+                pass
 
             # 계좌 카드 렌더 전체 소요 — 프리페치 후 남는 CPU(analyze_ticker) 비중을 본다
             try:
@@ -26891,3 +27000,10 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                         st.error(err_tp)
             else:
                 st.caption("등록된 사용자가 없습니다.")
+
+    # ── 탭 렌더 소요 기록 ────────────────────────────────────────────────────
+    #   다음 방문 때 "이 탭은 지난번 N초 걸렸습니다"로 보여준다.
+    #   ⚠️ st.stop() 으로 끝난 렌더는 여기까지 오지 않아 기록되지 않는다.
+    #      지연 화면(실적 레이더 판정 미계산 등)이 그렇다 — 어차피 빠른 경로라
+    #      안내가 필요 없는 쪽이므로 문제되지 않는다.
+    _tab_record(main_nav)
