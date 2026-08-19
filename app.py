@@ -15557,11 +15557,24 @@ if st.session_state.get("logged_in"):
                 _prev_hits = []
 
             _alert_hits = []
+            # _wl_items 가 비어도 아래 계측 블록이 참조하므로 미리 잡아둔다.
+            _wl_an_n, _wl_t0 = 0, time.perf_counter()
             if _wl_items:
                 _wl_tickers = tuple(i["ticker"] for i in _wl_items)
-                _price_map = fetch_latest_prices_for_tickers(_wl_tickers)
+                # ── 구간 계측 ──────────────────────────────────────────────
+                #   이 블록 전체가 24초를 썼다. 어디가 느린지는 아직 모른다.
+                #   후보 셋을 나눠 재고, 숫자를 보고 나서 손댄다.
+                #     · 가격 조회   — batch 가 막히면 종목당 단일 quote 로 떨어진다
+                #     · 일봉 프리페치 — 이미 병렬(8워커)이지만 59종목이면 8라운드다
+                #     · 레짐 평가   — analyze_ticker 를 순차로 59회. CPU 바운드
+                #   "느린 쪽은 어차피 I/O"라는 기존 주석은 검증된 적이 없다.
+                with _timed("WL 가격 조회"):
+                    _price_map = fetch_latest_prices_for_tickers(_wl_tickers)
+                _perf_note("WL 가격 조회", f"{len(_wl_tickers)}종목")
                 # 일봉은 병렬로 미리 채운다 — 아래 루프는 전부 캐시 히트가 된다
-                _hist_map = _wl_prefetch_histories(_wl_tickers)
+                with _timed("WL 일봉 프리페치"):
+                    _hist_map = _wl_prefetch_histories(_wl_tickers)
+                _perf_note("WL 일봉 프리페치", f"{len(_wl_tickers)}종목 · 252봉")
                 try:
                     _spy_h = _fmp_price_history("SPY", limit=252)
                     _spy_c = (_spy_h["Close"]
@@ -15569,6 +15582,7 @@ if st.session_state.get("logged_in"):
                               else None)
                 except Exception:
                     _spy_c = None
+                _wl_t0 = time.perf_counter()   # 프리페치 이후부터 잰다
                 for _it in _wl_items:
                     _tk = _it["ticker"]
                     try:
@@ -15576,6 +15590,7 @@ if st.session_state.get("logged_in"):
                         if _hist is None or _hist.empty:
                             continue
                         _an2 = rc.analyze_ticker(_hist, spy_close=_spy_c)
+                        _wl_an_n += 1
                         if not _an2.get("regime", {}).get("enough_data"):
                             continue
                         _en = rc.resolve_alert_events(_it.get("alert_states"), _WL_ALERT_DEFAULT)
@@ -15599,6 +15614,16 @@ if st.session_state.get("logged_in"):
                             _alert_hits.append(_tk)
                     except Exception:
                         continue
+
+            # 순차 레짐 평가 소요 — 프리페치 후 남는 CPU 비중을 본다
+            try:
+                _b_wl = _perf_bucket()
+                _b_wl["WL 레짐 평가"] = {
+                    "n": 1, "sec": time.perf_counter() - _wl_t0, "fmp": 0,
+                    "note": f"analyze_ticker {_wl_an_n}회 · 순차",
+                }
+            except Exception:
+                pass
 
             _merged = _prev_hits + _alert_hits
             if _merged or _wl_part:
