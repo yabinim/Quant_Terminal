@@ -18750,12 +18750,30 @@ if st.session_state.get("logged_in"):
                     "점수 = 1M×40% + 3M×40% + 6M×20% (1주는 노이즈 — 표시만) · GICS 섹터당 1개 · "
                     "중복 % = 구성종목 상위 15개 교집합 · 주말 Hidden Alpha 이메일에도 동일 리스트 포함"
                 )
+                # ⚠️ 계측 결과 이 블록이 섹터 탭 첫 진입의 75%(34.5초 · 67콜)를 썼다.
+                #    월간 리밸런싱 후보라 탭을 열 때마다 계산할 이유가 없고,
+                #    같은 리스트가 주말 Hidden Alpha 이메일에도 들어간다.
+                #    → 버튼을 눌렀을 때만 계산한다. 한 번 계산하면 1시간 캐시라
+                #      같은 세션에서 다시 눌러도 즉시 나온다.
                 _sat = None
-                try:
-                    with _timed("위성 후보 풀"), st.spinner("위성 후보 풀 수익률 계산 중... (약 60개 ETF · 첫 계산은 1~2분, 이후 1시간 캐시)"):
-                        _sat = cached_satellite_top10()
-                except Exception as _sat_exc:
-                    st.warning(f"위성 Top10 계산 실패: {_sat_exc} — 잠시 후 새로고침해 주세요.")
+                _sat_go = bool(st.session_state.get("_sat_show"))
+                if not _sat_go:
+                    if st.button("🛰️ 위성 Top10 계산 (약 35초)",
+                                 key="sat_top10_btn", use_container_width=True):
+                        st.session_state["_sat_show"] = True
+                        st.rerun()
+                    st.caption(
+                        "약 60개 ETF의 1M·3M·6M 수익률을 받아 점수를 냅니다. "
+                        "**월간 리밸런싱 때만 필요한 계산**이라 탭 진입 시 자동으로 "
+                        "돌리지 않습니다. 주말 Hidden Alpha 이메일에도 같은 리스트가 "
+                        "들어가므로 누르지 않아도 놓치지 않습니다."
+                    )
+                else:
+                    try:
+                        with _timed("위성 후보 풀"), st.spinner("위성 후보 풀 수익률 계산 중... (약 60개 ETF · 첫 계산은 1~2분, 이후 1시간 캐시)"):
+                            _sat = cached_satellite_top10()
+                    except Exception as _sat_exc:
+                        st.warning(f"위성 Top10 계산 실패: {_sat_exc} — 잠시 후 새로고침해 주세요.")
                 if _sat and _sat.get("rows"):
                     _mf = _sat.get("market_filter")
                     if _mf:
