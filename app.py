@@ -13109,12 +13109,20 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
                 pass
             return None
 
+        # ⚠️ concurrent.futures 는 이 파일 전체에서 **함수 안에서** import 한다.
+        #    모듈 레벨 별칭이 없으므로 여기서도 반드시 import 해야 한다.
+        #    빠뜨렸더니 NameError 가 아래 except 에 삼켜져 조용히 순차로 돌았고,
+        #    58종목 20초가 그대로 유지됐다(병렬을 넣었는데 효과가 없던 이유).
+        import concurrent.futures as _cf
         try:
             with _cf.ThreadPoolExecutor(max_workers=_FMP_QUOTE_WORKERS) as _ex:
                 for _res in _ex.map(_one_quote, missing):
                     _extract(_res)
-        except Exception:
-            # 스레드풀 자체가 실패하면 순차로 안전하게 되돌린다
+        except Exception as _pe:
+            # 스레드풀 자체가 실패하면 순차로 되돌린다. **조용히 넘어가지 않는다** —
+            # 폴백이 침묵하면 성능 퇴행이 계측에서도 안 보인다.
+            print(f"[WARN] quote 병렬 실패({type(_pe).__name__}) — 순차 폴백 "
+                  f"{len(missing)}건")
             for tk in missing:
                 _extract(_one_quote(tk))
 
