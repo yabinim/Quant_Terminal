@@ -269,10 +269,129 @@ def do_daily(sh):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+def _spearman(a_map, b_map):
+    """두 순위의 스피어만 상관. 공통 키만 쓴다. 표본 부족이면 None."""
+    keys = [k for k in a_map if k in b_map
+            and a_map[k] is not None and b_map[k] is not None]
+    n = len(keys)
+    if n < 10:
+        return None
+    ra = sorted(keys, key=lambda k: a_map[k])
+    rb = sorted(keys, key=lambda k: b_map[k])
+    pa = {k: i for i, k in enumerate(ra)}
+    pb = {k: i for i, k in enumerate(rb)}
+    d2 = sum((pa[k] - pb[k]) ** 2 for k in keys)
+    return 1.0 - (6.0 * d2) / (n * (n * n - 1))
+
+
+def do_ranks(sh):
+    """현재 순위 조회 — **API 호출 0**. 시트만 읽는다.
+
+    왜 필요한가
+    ───────────
+    시트에 3년치가 들어갔는데 눈으로 확인할 방법이 없었다. 일일 append 의
+    `[RANK]` 요약은 append 가 성공해야 찍히는데, 백필 당일은 중복 가드에
+    걸려 SKIP 이라 안 나온다.
+
+    화면(Phase 3 표시)을 만들기 전에 **데이터가 말이 되는지** 먼저 본다.
+    여기서 이상하면 화면을 만들어봐야 헛수고다.
+    """
+    print("[MODE] 순위 조회 (API 호출 0 · 시트 읽기만)")
+    try:
+        ws = gsr.call(sh.worksheet, ic.PERF_SHEET)
+    except Exception:
+        print("[ABORT] " + ic.PERF_SHEET + " 시트가 없습니다. 먼저 --backfill.")
+        return 1
+
+    parsed = ic.parse_perf_values(gsr.call(ws.get_all_values) or [])
+    dates = parsed.get("dates") or []
+    if not dates:
+        print("[ABORT] 파싱 결과가 비었습니다. 헤더 첫 열이 'Date' 인지 확인.")
+        return 1
+
+    print("  행 " + str(len(dates)) + " · 열(업종) "
+          + str(len(parsed["industries"])))
+    print("  기간 " + dates[0] + " ~ " + dates[-1])
+
+    # ── 신선도 ──────────────────────────────────────────────────────────
+    last_td = cc.prev_trading_day(datetime.now(_ET).date() + timedelta(days=1))
+    gap = 0
+    d = last_td
+    while d.isoformat() != dates[-1] and gap < 15:
+        d = cc.prev_trading_day(d)
+        gap += 1
+    if gap == 0:
+        print("  ✅ 최신 (마지막 거래일까지 반영)")
+    elif gap < 15:
+        print("  ⚠️ " + str(gap) + " 거래일 뒤처짐 — 일일 append 확인 필요")
+    else:
+        print("  🔴 15 거래일 이상 뒤처짐 — 일일 append 가 안 돌고 있다")
+
+    ranks = ic.compute_ranks(parsed)
+
+    for lb in ic.LOOKBACKS:
+        key = "pct_%d" % lb
+        mkey = "mom_%d" % lb
+        rows = [(v[key], nm, v.get(mkey), ic.describe(v, lookback=lb))
+                for nm, v in ranks.items() if v.get(key) is not None]
+        n_excl = len(ranks) - len(rows)
+        print("")
+        print("  " + "=" * 74)
+        print("  " + str(lb) + "일 모멘텀 — 모집단 " + str(len(rows)) + "개"
+              + ("  (결측으로 제외 " + str(n_excl) + "개)" if n_excl else ""))
+        print("  " + "=" * 74)
+        if not rows:
+            print("    (산출 가능한 업종 없음)")
+            continue
+        rows.sort()
+        print("    ── 상위 15")
+        for p, nm, m, desc in rows[:15]:
+            print("      %5.1f%%  %-44s %+7.1f%%" % (p, nm[:44], 100.0 * m))
+        print("    ── 하위 5")
+        for p, nm, m, desc in rows[-5:]:
+            print("      %5.1f%%  %-44s %+7.1f%%" % (p, nm[:44], 100.0 * m))
+
+    # ── 온전성 검사 ─────────────────────────────────────────────────────
+    # 두 창의 순위가 완전히 같으면 창 하나가 무의미하다는 뜻이고,
+    # 완전히 무관하면 둘 중 하나가 잡음일 가능성이 있다.
+    if len(ic.LOOKBACKS) >= 2:
+        a, b = ic.LOOKBACKS[0], ic.LOOKBACKS[1]
+        ma = {nm: v.get("pct_%d" % a) for nm, v in ranks.items()}
+        mb = {nm: v.get("pct_%d" % b) for nm, v in ranks.items()}
+        rho = _spearman(ma, mb)
+        print("")
+        print("  ── 온전성 검사")
+        if rho is None:
+            print("     " + str(a) + "일 vs " + str(b) + "일 순위 상관: 표본 부족")
+        else:
+            print("     " + str(a) + "일 vs " + str(b) + "일 순위 상관: %.2f" % rho)
+            if rho > 0.95:
+                print("     ⚠️ 거의 동일 — 창을 둘 다 보여줄 실익이 없다")
+            elif rho < 0.10:
+                print("     ⚠️ 거의 무관 — 둘 중 하나가 잡음일 수 있다")
+            else:
+                print("     ✅ 적당히 다르다 — 두 창을 함께 보여줄 의미가 있다")
+
+    # 방향 표시가 실제로 작동하는지 (전부 '—' 면 DIRECTION_LAG 가 무의미)
+    lb0 = ic.LOOKBACKS[0]
+    descs = [ic.describe(v, lookback=lb0) for v in ranks.values()]
+    up = sum(1 for d_ in descs if "↑" in d_)
+    dn = sum(1 for d_ in descs if "↓" in d_)
+    fl = sum(1 for d_ in descs if "—" in d_)
+    print("     방향 분포(" + str(lb0) + "일): ↑" + str(up)
+          + " ↓" + str(dn) + " —" + str(fl))
+    if up + dn == 0 and fl > 0:
+        print("     ⚠️ 전부 '변화 없음' — DIRECTION_LAG 재검토 필요")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backfill", action="store_true",
                     help="149콜 일회성 백필. 시트를 전체 재구성한다.")
+    ap.add_argument("--ranks", action="store_true",
+                    help="현재 순위 출력. API 호출 0, 시트 읽기만.")
     args = ap.parse_args()
 
     print("=" * 60)
@@ -299,10 +418,15 @@ def main():
     elif args.backfill and DRY_RUN:
         print("[INFO] GSPREAD_KEY 없음 — 백필 계산만 리허설합니다.")
     else:
-        print("[ABORT] GSPREAD_KEY 없음. 일일 모드는 헤더를 읽어야 합니다.")
+        print("[ABORT] GSPREAD_KEY 없음. 일일/순위 모드는 시트를 읽어야 합니다.")
         return 1
 
-    rc = do_backfill(sh) if args.backfill else do_daily(sh)
+    if args.ranks:
+        rc = do_ranks(sh)
+    elif args.backfill:
+        rc = do_backfill(sh)
+    else:
+        rc = do_daily(sh)
     print("[END] 완료" if rc == 0 else "[END] 오류")
     return rc
 
