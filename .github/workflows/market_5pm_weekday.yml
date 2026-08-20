@@ -89,6 +89,29 @@ jobs:
         run: |
           python automation/run_watchlist_alerts.py
 
+      # ── 업종 성과 스냅샷 (일 1콜) ────────────────────────────────────────
+      # Phase 3 정밀진단의 '업종 백분위' 표시용 데이터를 하루 1행씩 쌓는다.
+      #
+      # 왜 스냅샷을 쌓나: industry-performance-snapshot 은 **하루치 변화율**이라
+      # 그것만으로 149개를 줄 세우면 잡음이다("상위 8%"가 내일 "하위 30%").
+      # 20일·120일 모멘텀이 필요한데 매일 API 로 받으면 149콜/일이 든다.
+      # 한 번 백필해 두면 이후 유지비가 하루 1콜이다.
+      #
+      # ⚠️ 최초 1회 refresh_industry_perf.py --backfill 을 수동 실행해야 한다.
+      #    시트가 없으면 이 스텝은 ABORT 로 안내만 하고 끝난다(실패 아님).
+      #
+      # if: always() + continue-on-error — 앞 스텝이 실패해도 독립적으로 돌고,
+      # 이 스텝이 실패해도 알림 경로에 아무 영향이 없으므로 워크플로를
+      # 실패시키지 않는다. 표시 데이터가 하루 낡을 뿐이다.
+      - name: 🏭 업종 성과 스냅샷 (일 1콜)
+        if: always()
+        continue-on-error: true
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/refresh_industry_perf.py
+
       - name: 📋 실행 로그 요약
         if: always()
         run: |

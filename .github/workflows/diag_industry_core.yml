@@ -1,0 +1,51 @@
+name: 🔬 진단 — 업종 모멘텀·백분위 회귀 검증 (수동 전용)
+
+# 언제 쓰나:
+#   industry_core.py 또는 refresh_industry_perf.py 를 수정한 직후, 배포 전에.
+#
+# 왜 필요한가:
+#   이 값은 Phase 3 화면에 "상위 8%" 로 찍힌다. 틀려도 **에러가 안 난다** —
+#   그럴듯한 숫자가 그대로 나간다. 기계로 확인하는 수밖에 없다.
+#
+#   특히 위험한 셋:
+#     1. 와이드 시트 열 정렬 붕괴 — A 업종 자리에 B 값이 들어간다.
+#        화면은 멀쩡하고 숫자만 틀린다. 가장 찾기 어렵다.
+#     2. 백분위 방향 반전 — 최악을 최고로 표시한다.
+#     3. 결측을 0 으로 채움 — "변화 없음"으로 읽혀 순위가 부풀려진다.
+#        (149개 중 10개는 아예 데이터가 없다)
+#
+# 검사 52항목:
+#   A 시트 파싱   — 날짜 정렬, 열 매핑, 빈 셀/짧은 행/불량 날짜 방어
+#   B 행 생성     — 응답 순서가 아닌 **헤더 순서**, 신규 업종 보고
+#   C 모멘텀      — 복리 누적, 데이터 부족, 결측 커버리지 70%
+#   D 백분위      — 방향, 1위/꼴찌 경계, 동점, None 제외
+#   E 통합·표시   — 두 창 산출, 방향 화살표(↑↓ 양쪽)
+#   F 뮤테이션    — 위 위험 5종에 버그를 심어 검출 확인
+#
+# 안전성: 네트워크·시트·시크릿 접근 없음. 표준 라이브러리만.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 🔬 industry_core 회귀 검증
+        run: python automation/diag_industry_core.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          industry_core.py
+          automation/diag_industry_core.py
+          automation/refresh_industry_perf.py
