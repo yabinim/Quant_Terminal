@@ -1,0 +1,60 @@
+name: 🔬 진단 — 데이터 미수신 감지 회귀 검증 (수동 전용)
+
+# 언제 쓰나:
+#   run_watchlist_alerts.py 의 미수신 감지(A-2a)를 수정한 직후, 배포 전에 돌린다.
+#
+# 왜 필요한가:
+#   이 기능은 '조용한 실패를 알리는' 기능이라, 기능 자체가 조용히 고장 날 수 있다.
+#   특히 위험한 세 가지:
+#     1. 미수신을 기록해도 발송 게이트(`if not _n_u: return`)가 걸러 버린다
+#        → 침묵을 알리는 메일이 같은 이유로 침묵
+#     2. 광범위 장애일 때 티커 수만큼 세어 제목이 부풀고 실제 신호가 묻힌다
+#     3. 같은 티커가 워치리스트·보유 양쪽에 있을 때 '보유' 표시가 사라진다
+#        → 심각도 정보 손실 (보유 미수신 = 매도 신호 영구 침묵)
+#   셋 다 로그에 에러를 남기지 않는다.
+#
+# 검사 54항목:
+#   A 기록·집계   — 정규화, 중복 병합, 사용자 격리, 빈 입력 방어
+#   B 광범위 판정 — 비율 임계치 30%, 최소 표본 5, 경계값, 0 나눗셈
+#   C 렌더링      — 개별/광범위 분기, 타 사용자 누출 없음
+#   D 소스 계약   — 실제 코드가 이 함수들을 호출하는지 AST 로 확인
+#   E 뮤테이션    — 임계치/표본/가중치/라벨병합에 버그를 심어 검출 확인
+#
+#   E 가 핵심이다. 개발 중 M4(라벨 덮어쓰기)가 검출되지 않아 **테스트 오라클이
+#   약한 것**을 발견했고("보유 in 라벨"만 보면 덮어써도 통과한다) 강화했다.
+#
+# 특징:
+#   run_watchlist_alerts.py 를 import 하지 않는다. 그 모듈은 최상단에서
+#   os.environ[...] 로 시크릿을 요구한다. 대신 AST 로 필요한 함수 정의만 떼어
+#   실행하므로, 검사 대상이 실제 배포 소스와 같은 것임이 보장된다.
+#
+# 안전성:
+#   · 네트워크·시트·시크릿 접근 없음 · FMP 호출 없음 · 이메일 없음
+#   · 부작용 전혀 없다.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # AST 로 함수만 떼어 쓰므로 pandas/gspread 가 필요 없다. 표준 라이브러리만.
+      - name: 🔬 미수신 감지 회귀 검증
+        run: python automation/diag_nodata_radar.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/run_watchlist_alerts.py
+          automation/diag_nodata_radar.py
