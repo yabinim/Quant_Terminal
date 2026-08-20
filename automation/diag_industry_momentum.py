@@ -108,6 +108,15 @@ COST_ONE_WAY = 0.0005     # 편도 0.05% (교체 시 매도+매수 = 0.10%)
 RANDOM_TRIALS = 30        # 대조군 시행 횟수
 EXEC_LAG = 1              # 체결 지연(봉). 신호 확인 → 다음 거래일 체결
 
+# 설정 그리드. 상수로 뺀 이유: start 를 여기서 자동으로 잡아야 하기 때문이다.
+# 1차 실행에서 start 를 120 으로 **고정**해 놨더니 LB120 설정 6개가
+# `a - lb - lag < 0` 에 걸려 통째로 탈락했다(18개 중 12개만 돌았다).
+# 6개월 모멘텀은 학술 모멘텀의 표준 창인데 한 번도 테스트되지 않았다.
+GRID_LOOKBACKS = (20, 60, 120)
+GRID_TOPN = (3, 5, 10)
+GRID_HOLD = (5, 20)
+MAX_LB = max(GRID_LOOKBACKS)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 수집
@@ -274,6 +283,34 @@ def run_strategy(idx_map, dates, names, lookback, top_n, hold,
     return curve, switches
 
 
+def equal_weight_curve(idx_map, names, start_i, end_i):
+    """우주 전체를 동일가중으로 그냥 들고 있는 곡선 — **1차 벤치마크**.
+
+    왜 SPY 가 아니라 이쪽인가
+    ─────────────────────────
+    averageChange 는 업종 내 종목의 **동일가중** 평균이다. SPY 는 **시총가중**
+    이다. 2023~2026 은 메가캡이 지수를 끌어올린 구간이라, 이 구간에서는
+    **어떤 동일가중 전략이든 SPY 에 진다.** 1차 실행에서 무작위 대조군마저
+    SPY 에 크게 졌던 것이 그 증거다 — 선택 능력과 무관하게 전부 지는 구조였다.
+
+    즉 `vs SPY` 는 모멘텀이 아니라 **가중 방식 차이**를 재고 있었다.
+
+    선택의 가치를 재려면 '선택하지 않은 상태'와 비교해야 한다. 그게 이 곡선이다.
+    교체가 없으므로 거래비용도 0 이다.
+    """
+    curve, lvl = [], 1.0
+    for i in range(start_i, end_i):
+        rs = []
+        for nm in names:
+            a, b = idx_map[nm][i], idx_map[nm][i + 1]
+            if a > 0:
+                rs.append(b / a - 1.0)
+        if rs:
+            lvl *= (1.0 + sum(rs) / len(rs))
+        curve.append(lvl)
+    return curve
+
+
 def spy_curve(spy, dates, start_i, end_i):
     out, lvl = [], 1.0
     for i in range(start_i, end_i):
@@ -303,14 +340,14 @@ def _pct(x):
 def print_table(rows, header):
     print("")
     print("  " + header)
-    print("  " + "-" * 88)
-    print("  %-26s %10s %10s %10s %8s %8s" %
-          ("설정", "수익", "CAGR", "MDD", "교체", "vs SPY"))
-    print("  " + "-" * 88)
+    print("  " + "-" * 96)
+    print("  %-22s %9s %9s %9s %7s %10s %9s" %
+          ("설정", "수익", "CAGR", "MDD", "교체", "vs 동일가중", "vs SPY"))
+    print("  " + "-" * 96)
     for r in rows:
-        print("  %-26s %10s %10s %10s %8d %8s" %
+        print("  %-22s %9s %9s %9s %7d %10s %9s" %
               (r["name"], _pct(r["ret"]), _pct(r["cagr"]), _pct(r["mdd"]),
-               r["switches"], _pct(r["excess"])))
+               r["switches"], _pct(r["excess"]), _pct(r.get("excess_spy", 0.0))))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -479,6 +516,64 @@ def selftest():
     chk("휴장일 필터 — 2026-08-19 는 거래일",
         cc.is_market_open("2026-08-19") is True)
 
+    # ── 동일가중 벤치마크 ───────────────────────────────────────────────
+    # 1차 실행의 핵심 결함이 여기였다. SPY(시총가중)를 판정 기준으로 써서
+    # '가중 방식 차이'를 '선택 능력 없음'으로 오독했다. 이제 기준선은
+    # 동일가중 우주다 — 그게 실제로 '아무것도 안 고른 상태'다.
+    ewA = equal_weight_curve({"A": build_index({d: 2.0 for d in D}, D),
+                              "B": build_index({d: 0.0 for d in D}, D)},
+                             ["A", "B"], 10, 38)
+    chk("동일가중 — +2%/0% 두 자산이면 매봉 약 +1%",
+        abs(ewA[0] - 1.01) < 1e-9, str(ewA[0]))
+    ewB = equal_weight_curve({"A": build_index({}, D)}, ["A"], 10, 38)
+    chk("동일가중 — 변화 없으면 1.0 유지", abs(ewB[-1] - 1.0) < 1e-9)
+    chk("동일가중 — 교체가 없으므로 비용이 안 붙는다 (설계 계약)",
+        abs(equal_weight_curve({"A": build_index({d: 1.0 for d in D}, D)},
+                               ["A"], 10, 38)[-1]
+            - build_index({d: 1.0 for d in D}, D)[38]
+            / build_index({d: 1.0 for d in D}, D)[10]) < 1e-9)
+
+    # ── 그리드 전량 실행 보장 ───────────────────────────────────────────
+    # 1차 실행에서 start 를 120 으로 고정해 LB120 설정 6개가 조용히 빠졌다.
+    chk("start 기준이 최대 lookback 을 포함한다 (설정 탈락 방지)",
+        MAX_LB + EXEC_LAG - MAX_LB - EXEC_LAG >= 0)
+    chk("그리드 크기 = " + str(len(GRID_LOOKBACKS) * len(GRID_TOPN) * len(GRID_HOLD)),
+        len(GRID_LOOKBACKS) * len(GRID_TOPN) * len(GRID_HOLD) == 18)
+
+    # ── 양성 대조군 — 엔진이 '예' 라고 말할 수 있는가 ────────────────────
+    # 이 스크립트의 리포트는 전부 '아니오' 쪽으로 설계돼 있다(대조군·반분할·
+    # 워크포워드·MDD). 그러면 **항상 아니오라고 답하는 엔진**과 구분이 안 된다.
+    # 진짜 신호를 심었을 때 실제로 잡아내는지 확인해야 결과를 믿을 수 있다.
+    #
+    # 20개 분류 중 3개에만 지속 드리프트를 심는다. 모멘텀 상위 5개 전략이
+    # 동일가중 우주를 뚜렷하게 이겨야 정상이다.
+    import random as _rnd
+
+    def _synth(drift, noise, seed=3, n=20, nlead=3, bars=500):
+        r = _rnd.Random(seed)
+        dd = ["s%04d" % t for t in range(bars)]
+        nms = ["I%02d" % t for t in range(n)]
+        im = {}
+        for k, nm in enumerate(nms):
+            ser = {d: r.gauss(drift if k < nlead else 0.0, noise) for d in dd}
+            im[nm] = build_index(ser, dd)
+        a, b = MAX_LB + EXEC_LAG, bars - 1
+        ew = equal_weight_curve(im, nms, a, b)
+        cur, _ = run_strategy(im, dd, nms, 20, 5, 5, a, b)
+        return cur[-1] - 1.0, ew[-1] - 1.0
+
+    st_hi, ew_hi = _synth(0.30, 0.8)
+    chk("양성 대조군 — 강한 지속 모멘텀을 실제로 잡아낸다",
+        st_hi - ew_hi > 0.10,
+        "전략 " + _pct(st_hi) + " vs 동일가중 " + _pct(ew_hi)
+        + " — 엔진이 진짜 신호도 못 잡으면 '아니오' 판정을 믿을 수 없다")
+
+    st_no, ew_no = _synth(0.0, 1.2)
+    chk("음성 대조군 — 신호가 없으면 초과하지 않는다",
+        st_no - ew_no < 0.05,
+        "전략 " + _pct(st_no) + " vs 동일가중 " + _pct(ew_no)
+        + " — 순수 잡음에서 초과가 나오면 엔진에 편향이 있다")
+
     print("")
     print("결과: 통과 " + str(ok) + " · 실패 " + str(fail))
     return 1 if fail else 0
@@ -569,44 +664,74 @@ def main():
 
         # ── 설정 그리드 ──────────────────────────────────────────────────
         grid = []
-        for lb in (20, 60, 120):
-            for tn in (3, 5, 10):
-                for hd in (5, 20):
+        for lb in GRID_LOOKBACKS:
+            for tn in GRID_TOPN:
+                for hd in GRID_HOLD:
                     grid.append((lb, tn, hd))
 
         def run_range(a, b, tag):
+            """구간 [a,b) 성과 → (설정별 행, 동일가중 벤치마크, SPY 벤치마크).
+
+            excess 는 **동일가중 우주 대비**다. SPY 대비는 참고용으로 따로 담는다.
+            """
             n_days = b - a
+            ew = equal_weight_curve(idx_map, valid, a, b)
+            ew_st = stats(ew, n_days)
             sp = spy_curve(spy, all_dates, a, b) if spy else []
-            sp_st = stats(sp, n_days) if sp else {"ret": 0.0, "cagr": 0.0, "mdd": 0.0}
+            sp_st = stats(sp, n_days) if sp else None
             rows = []
             for lb, tn, hd in grid:
                 if a - lb - EXEC_LAG < 0:
+                    # 여기 걸리면 그 설정은 통째로 빠진다. 조용히 넘기지 않는다.
+                    print("    ⚠️ LB%d/TOP%d/HOLD%d — 구간 시작이 lookback 보다 "
+                          "빨라 제외됨" % (lb, tn, hd))
                     continue
                 cur, sw = run_strategy(idx_map, all_dates, valid, lb, tn, hd, a, b)
                 st = stats(cur, n_days)
                 rows.append({"name": "LB%d/TOP%d/HOLD%d" % (lb, tn, hd),
                              "key": (lb, tn, hd), "switches": sw,
-                             "excess": st["ret"] - sp_st["ret"], **st})
+                             "excess": st["ret"] - ew_st["ret"],
+                             "excess_spy": (st["ret"] - sp_st["ret"]) if sp_st else 0.0,
+                             **st})
             rows.sort(key=lambda r: -r["ret"])
-            return rows, sp_st
+            return rows, ew_st, sp_st
 
         n_all = len(all_dates) - 1
-        start = 120
-        rows_full, spy_full = run_range(start, n_all, "전체")
+        # 가장 긴 lookback 이 성립하는 지점에서 시작한다. 고정값이면 긴 창이
+        # 조용히 탈락한다(1차 실행에서 LB120 6개가 그렇게 빠졌다).
+        start = MAX_LB + EXEC_LAG
+        rows_full, ew_full, spy_full = run_range(start, n_all, "전체")
+        if not rows_full:
+            print("  ❌ 유효 설정 0개. 건너뜁니다.")
+            continue
 
         print("")
-        print("  SPY 벤치마크: 수익 " + _pct(spy_full["ret"])
-              + " · CAGR " + _pct(spy_full["cagr"])
-              + " · MDD " + _pct(spy_full["mdd"]))
-        print_table(rows_full[:8], "전 구간 상위 8개 설정 (거래비용 반영)")
+        print("  ── 벤치마크")
+        print("     동일가중 우주(" + str(len(valid)) + "개 전체 보유, 교체 없음): "
+              + "수익 " + _pct(ew_full["ret"])
+              + " · CAGR " + _pct(ew_full["cagr"])
+              + " · MDD " + _pct(ew_full["mdd"]) + "   ← 판정 기준")
+        if spy_full:
+            print("     SPY (시총가중, 참고용)                        : "
+                  + "수익 " + _pct(spy_full["ret"])
+                  + " · CAGR " + _pct(spy_full["cagr"])
+                  + " · MDD " + _pct(spy_full["mdd"]))
+            print("     ⚠️ averageChange 는 동일가중이고 SPY 는 시총가중이다. 이 구간은")
+            print("        메가캡이 지수를 끌어올려서, 동일가중이면 무엇을 골라도 SPY 에")
+            print("        진다. SPY 대비는 '선택 능력'이 아니라 '가중 방식'을 재므로")
+            print("        판정에 쓰지 않는다.")
+
+        print_table(rows_full[:8], "전 구간 상위 8개 설정 (거래비용 반영 · "
+                    + str(len(rows_full)) + "/" + str(len(grid)) + "개 설정 실행)")
 
         n_beat = sum(1 for r in rows_full if r["excess"] > 0)
         print("")
-        print("  SPY 초과 설정: " + str(n_beat) + "/" + str(len(rows_full))
-              + "  ← 18개를 돌리면 몇 개는 우연히 이긴다. 이 숫자가 낮으면 신호가 아니다.")
+        print("  동일가중 초과 설정: " + str(n_beat) + "/" + str(len(rows_full))
+              + "  ← " + str(len(rows_full)) + "개를 돌리면 몇 개는 우연히 이긴다."
+              " 절반 아래면 신호가 아니다.")
 
-        n_better_mdd = sum(1 for r in rows_full if r["mdd"] > spy_full["mdd"])
-        print("  SPY보다 얕은 MDD: " + str(n_better_mdd) + "/" + str(len(rows_full))
+        n_better_mdd = sum(1 for r in rows_full if r["mdd"] > ew_full["mdd"])
+        print("  동일가중보다 얕은 MDD: " + str(n_better_mdd) + "/" + str(len(rows_full))
               + "  ← 손실 방지가 우선. 수익만 높고 MDD 가 깊으면 실패다.")
 
         # ── 대조군: 무작위 N ─────────────────────────────────────────────
@@ -629,10 +754,17 @@ def main():
             rnd_beat = sum(1 for x in rnd_rets if x >= best["ret"])
             print("")
             print("  ── 대조군 (무작위 " + str(tn) + "개 · "
-                  + str(RANDOM_TRIALS) + "회)")
-            print("     무작위 평균 수익: " + _pct(rnd_avg))
-            print("     최고 설정 수익  : " + _pct(best["ret"])
+                  + str(RANDOM_TRIALS) + "회 · 같은 교체 주기·비용)")
+            print("     이 비교가 가장 중요하다. 모멘텀 상위 N 이 무작위 N 을 못")
+            print("     이기면, 순위에 정보가 없다는 뜻이다.")
+            print("")
+            print("     동일가중 우주   : " + _pct(ew_full["ret"])
+                  + "   (아무것도 안 고른 상태)")
+            print("     무작위 평균     : " + _pct(rnd_avg))
+            print("     최고 설정       : " + _pct(best["ret"])
                   + "  (" + best["name"] + ")")
+            print("     ⚠️ '최고 설정'은 전 구간 성적으로 사후 선택한 것이라 이미")
+            print("        유리하게 편향돼 있다. 아래 워크포워드가 진짜 성적이다.")
             print("     무작위가 최고 설정을 이긴 횟수: "
                   + str(rnd_beat) + "/" + str(RANDOM_TRIALS))
             if rnd_beat > RANDOM_TRIALS * 0.10:
@@ -644,8 +776,8 @@ def main():
 
         # ── 반분할 검증 ──────────────────────────────────────────────────
         mid = start + (n_all - start) // 2
-        rows_h1, spy_h1 = run_range(start, mid, "전반")
-        rows_h2, spy_h2 = run_range(mid, n_all, "후반")
+        rows_h1, ew_h1, _sp1 = run_range(start, mid, "전반")
+        rows_h2, ew_h2, _sp2 = run_range(mid, n_all, "후반")
         m1 = {r["key"]: r for r in rows_h1}
         m2 = {r["key"]: r for r in rows_h2}
 
@@ -658,7 +790,8 @@ def main():
         print("     %-24s %10s %10s %8s" % ("설정", "전반 초과", "후반 초과", "부호"))
         print("     " + "-" * 56)
         consistent = 0
-        for r in rows_full[:8]:
+        shown = rows_full[:8]
+        for r in shown:
             k = r["key"]
             e1 = m1.get(k, {}).get("excess")
             e2 = m2.get(k, {}).get("excess")
@@ -670,7 +803,7 @@ def main():
             print("     %-24s %10s %10s %8s" %
                   (r["name"], _pct(e1), _pct(e2), "✅" if same and e1 > 0 else "✗"))
         print("")
-        print("     양쪽 모두 SPY 초과: " + str(consistent) + "/8")
+        print("     양쪽 모두 동일가중 초과: " + str(consistent) + "/" + str(len(shown)))
         if consistent == 0:
             print("     🔴 반분할을 통과한 설정이 없다 — 구간 의존적 결과")
         elif consistent <= 2:
@@ -678,13 +811,46 @@ def main():
         else:
             print("     ✅ 다수가 양쪽에서 초과 — 구간 의존성이 낮다")
 
+        # ── 워크포워드 — 사후 선택 편향 제거 ─────────────────────────────
+        # 위의 모든 표는 **전 구간 성적으로 최고 설정을 고른 뒤** 그 설정을
+        # 평가한다. 미래를 알고 고른 것이라 유리하게 편향돼 있다.
+        # 진짜 질문은 "전반기만 보고 골랐다면 후반기에 어땠나" 다.
+        # 이건 실제로 운용할 때와 같은 정보 조건이고, 사후 선택이 불가능하다.
+        if rows_h1 and rows_h2:
+            wf_key = rows_h1[0]["key"]
+            wf = m2.get(wf_key)
+            print("")
+            print("  ── 워크포워드 (사후 선택 편향 제거)")
+            print("     전반기 성적만으로 고른 설정을 후반기에 그대로 적용한다.")
+            print("     실제 운용과 같은 정보 조건이다 — 위 표들과 달리 미래를 모른다.")
+            print("")
+            print("     전반 1위 설정 : " + rows_h1[0]["name"])
+            if wf:
+                print("     후반 성적     : 수익 " + _pct(wf["ret"])
+                      + " · MDD " + _pct(wf["mdd"])
+                      + " · 동일가중 대비 " + _pct(wf["excess"]))
+                if wf["excess"] > 0 and wf["mdd"] >= ew_h2["mdd"]:
+                    print("     ✅ 아웃오브샘플에서 초과 + MDD 도 나쁘지 않다")
+                elif wf["excess"] > 0:
+                    print("     🟠 초과했으나 MDD 가 동일가중보다 깊다 "
+                          "(" + _pct(wf["mdd"]) + " vs " + _pct(ew_h2["mdd"]) + ")")
+                else:
+                    print("     🔴 아웃오브샘플 실패 — 전반기 1위가 후반기엔 못 이겼다")
+                    print("        전 구간 표에서 좋아 보였던 것은 사후 선택의 결과다.")
+            else:
+                print("     (후반기에 해당 설정 없음)")
+
     print("")
     print("=" * 78)
-    print("판정 기준 요약")
-    print("  ① 무작위 대조군을 명확히 이겨야 한다 (가장 중요)")
-    print("  ② 반분할 양쪽에서 SPY 를 초과해야 한다")
-    print("  ③ MDD 가 SPY 보다 깊으면 수익이 높아도 실패로 본다")
-    print("  세 개 중 하나라도 못 넘으면 신호에 연결하지 않는다.")
+    print("판정 기준 요약  — 기준선은 SPY 가 아니라 **동일가중 우주**다")
+    print("  ① 무작위 대조군을 명확히 이겨야 한다        (선택에 정보가 있는가)")
+    print("  ② 워크포워드에서 동일가중을 초과해야 한다   (사후 선택 아닌가)")
+    print("  ③ 반분할 양쪽에서 동일가중 초과여야 한다    (구간 의존 아닌가)")
+    print("  ④ MDD 가 동일가중보다 깊으면 실패로 본다    (손실 방지 우선)")
+    print("  네 개 중 하나라도 못 넘으면 신호에 연결하지 않는다.")
+    print("")
+    print("  SPY 대비는 참고로만 본다 — averageChange 는 동일가중이고 SPY 는")
+    print("  시총가중이라, 이 비교는 선택 능력이 아니라 가중 방식 차이를 잰다.")
     print("=" * 78)
     return 0
 
