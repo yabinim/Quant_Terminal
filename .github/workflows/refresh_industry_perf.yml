@@ -8,7 +8,11 @@ name: 🏭 업종 성과 히스토리 — 백필 / 수동 실행
 #      안내만 하고 끝나므로, 백필 없이는 데이터가 영영 안 쌓인다.
 #
 # 모드:
-#   dry_run_backfill  149콜, 시트 쓰기 없음. 행/열 수만 확인 (권장 첫 실행)
+#   ranks             **API 호출 0**. 시트만 읽어 현재 순위를 출력한다 (기본값)
+#                     20일·120일 상위 15 / 하위 5, 신선도, 두 창의 순위 상관,
+#                     방향 분포까지. 화면을 만들기 전에 데이터가 말이 되는지
+#                     눈으로 확인하는 용도다 — 여기서 이상하면 화면은 헛수고다.
+#   dry_run_backfill  149콜, 시트 쓰기 없음. 행/열 수만 확인
 #   backfill          149콜, 시트 전체 재구성
 #   daily             1콜, 오늘 1행 append (평일 워크플로가 놓쳤을 때 보충)
 #   dry_run_daily     1콜, 쓰기 없음
@@ -31,11 +35,12 @@ on:
         description: "실행 모드"
         type: choice
         options:
+          - ranks
           - dry_run_backfill
           - backfill
           - daily
           - dry_run_daily
-        default: dry_run_backfill
+        default: ranks
       confirm:
         description: "기존 데이터를 덮어쓸 때만 OVERWRITE 입력 (그 외 비워둘 것)"
         type: string
@@ -66,7 +71,9 @@ jobs:
           FORCE: ${{ inputs.confirm == 'OVERWRITE' && '1' || '' }}
           DRY_RUN: ${{ startsWith(inputs.mode, 'dry_run') && '1' || '' }}
         run: |
-          if [[ "${{ inputs.mode }}" == *backfill* ]]; then
+          if [[ "${{ inputs.mode }}" == "ranks" ]]; then
+            python automation/refresh_industry_perf.py --ranks
+          elif [[ "${{ inputs.mode }}" == *backfill* ]]; then
             python automation/refresh_industry_perf.py --backfill
           else
             python automation/refresh_industry_perf.py
