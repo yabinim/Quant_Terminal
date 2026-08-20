@@ -72,9 +72,10 @@ fmp_get 은 402/429 를 삼키고 None 을 돌려주는데, 프로브는 **원�
 ────
     PROBE_TIER=tierA   5콜  (기본)
     PROBE_TIER=tierB   9콜
+    PROBE_TIER=tierB2  5콜   ← tierB 후속 확인
     PROBE_TIER=tierC   4콜
     PROBE_TIER=grades  3콜
-    PROBE_TIER=all    21콜
+    PROBE_TIER=all    26콜
 
 실행
 ────
@@ -96,7 +97,7 @@ SLEEP_SEC = 0.35
 _KEY = str(os.environ.get("FMP_API_KEY", "") or "").strip()
 
 _TIER = str(os.environ.get("PROBE_TIER", "") or "tierA").strip().lower()
-if _TIER not in ("tiera", "tierb", "tierc", "grades", "all"):
+if _TIER not in ("tiera", "tierb", "tierb2", "tierc", "grades", "all"):
     _TIER = "tiera"
 
 
@@ -244,6 +245,70 @@ TIER_B = [
         "mergers-acquisitions-latest?page=0&limit=10",
         "피인수 발표는 포지션 판단을 통째로 바꾼다.",
         ["symbol", "targetedCompanyName"],
+        None,
+    ),
+]
+
+# ══════════════════════════════════════════════════════════════════════════
+# TIER B2 — tierB 실측 후 드러난 후속 확인 (2026-08-20)
+#
+# tierB 는 9/9 전부 LIVE 였지만, 응답을 보고 나서야 **실사용이 불가능한 것**이
+# 두 개 드러났다.
+#
+#   sec-filings-8k               symbol 파라미터가 없다 → 시장 전체 페이징
+#   mergers-acquisitions-latest  동일
+#
+# 내 종목 10~100개의 공시를 보려고 시장 전체를 페이징할 수는 없다. 문서에
+# symbol/이름 필터가 있는 대체 경로가 있어서 그걸 확인한다.
+#
+# 함께 확인하는 것: B-1(섹터/업종 성과) 설계에 반드시 필요한 **분류명 목록**.
+# historical-*-performance 는 sector/industry 파라미터에 FMP 가 정한 정확한
+# 문자열을 요구한다. "Semiconductors" 처럼 추측으로 맞춘 값으로 구현하면
+# 다른 업종에서 조용히 빈 배열이 온다.
+# ══════════════════════════════════════════════════════════════════════════
+TIER_B2 = [
+    (
+        "8-K 대체 경로 — 심볼 필터형",
+        "sec-filings-search/symbol?symbol=AAPL&from=" + _D_FROM_90 + "&to=" + _D_TO
+        + "&page=0&limit=10",
+        "sec-filings-8k 는 symbol 파라미터가 없어 시장 전체를 페이징해야 한다. "
+        "이쪽이 살아 있으면 종목당 1콜로 끝난다. formType 이 와야 8-K 만 "
+        "골라낼 수 있다.",
+        ["symbol", "formType", "filingDate", "acceptedDate"],
+        None,
+    ),
+    (
+        "8-K 대체 경로 — 폼타입 필터형",
+        "sec-filings-search/form-type?formType=8-K&from=" + _D_FROM_30 + "&to=" + _D_TO
+        + "&page=0&limit=10",
+        "심볼형이 종목당 1콜인 반면 이쪽은 기간당 N페이지다. 워치리스트가 "
+        "커질수록 어느 쪽이 싼지 갈리므로 둘 다 재서 비교한다.",
+        ["symbol", "formType", "filingDate"],
+        None,
+    ),
+    (
+        "M&A 대체 경로 — 이름 검색형",
+        "mergers-acquisitions-search?name=Apple",
+        "mergers-acquisitions-latest 도 symbol 필터가 없다. 다만 이쪽은 "
+        "**심볼이 아니라 회사명** 검색이라 티커→회사명 매핑이 필요하다. "
+        "응답에 symbol 이 와야 역매칭이 가능하다.",
+        ["symbol", "companyName", "targetedCompanyName"],
+        None,
+    ),
+    (
+        "B-1 전제 — 섹터 분류명 목록",
+        "available-sectors",
+        "historical-sector-performance 의 sector 파라미터에 넣을 정확한 문자열. "
+        "추측으로 맞추면 다른 섹터에서 조용히 빈 배열이 온다.",
+        ["sector"],
+        None,
+    ),
+    (
+        "B-1 전제 — 업종 분류명 목록",
+        "available-industries",
+        "industry-performance-snapshot 이 127건을 준 그 127개의 정확한 이름. "
+        "B-1 설계의 필수 입력이다.",
+        ["industry"],
         None,
     ),
 ]
@@ -476,10 +541,12 @@ def main():
 
     run_a = _TIER in ("tiera", "all")
     run_b = _TIER in ("tierb", "all")
+    run_b2 = _TIER in ("tierb2", "all")
     run_c = _TIER in ("tierc", "all")
     run_g = _TIER in ("grades", "all")
 
     ncalls = (len(TIER_A) if run_a else 0) + (len(TIER_B) if run_b else 0) \
+        + (len(TIER_B2) if run_b2 else 0) \
         + (len(TIER_C) if run_c else 0) + (len(GRADES) if run_g else 0)
 
     print("=" * 78)
@@ -495,6 +562,9 @@ def main():
         run_group("Tier A — 실제 결함 해결", TIER_A, results)
     if run_b:
         run_group("Tier B — 기존 기능 강화", TIER_B, results)
+    if run_b2:
+        run_group("Tier B2 — tierB 후속 확인 (심볼 필터 대체 경로 + 분류명)",
+                  TIER_B2, results)
     if run_c:
         run_group("Tier C — 탐색적 신규 기능", TIER_C, results)
     if run_g:
