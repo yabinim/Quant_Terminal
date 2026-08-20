@@ -113,6 +113,36 @@ def test_momentum():
         ic.momentum(ok, 20) is not None and abs(ic.momentum(ok, 20) - (1.01 ** 16 - 1)) < 1e-9)
     chk("MIN_COVERAGE 상수 70%", abs(ic.MIN_COVERAGE - 0.70) < 1e-9)
 
+    # ── 윈저화(clip) ────────────────────────────────────────────────────
+    wild = [30.0] * 5 + [1.0] * 15
+    raw = ic.momentum(wild, 20)
+    win = ic.momentum(wild, 20, clip=5.0)
+    chk("clip 없으면 극단값이 그대로 반영", raw > 2.0, str(raw))
+    chk("clip 주면 극단값이 잘린다", win < raw, str(win) + " vs " + str(raw))
+    chk("clip 이 정확히 ±clip 로 자른다",
+        abs(win - ((1.05 ** 5) * (1.01 ** 15) - 1)) < 1e-9, str(win))
+    chk("clip 범위 안의 값은 안 건드린다",
+        abs(ic.momentum([1.0] * 20, 20, clip=5.0)
+            - ic.momentum([1.0] * 20, 20)) < 1e-12)
+    chk("clip 은 음수 쪽도 자른다",
+        abs(ic.momentum([-30.0] * 20, 20, clip=5.0)
+            - ((0.95 ** 20) - 1)) < 1e-9)
+    chk("WINSOR_CLIP 상수 5.0", abs(ic.WINSOR_CLIP - 5.0) < 1e-9)
+
+    e, t = ic.count_extremes(wild, 5.0)
+    chk("count_extremes — 초과 5 / 전체 20", (e, t) == (5, 20), str((e, t)))
+    chk("count_extremes — 결측은 전체에서 제외",
+        ic.count_extremes([30.0, None, 1.0], 5.0) == (1, 2))
+    chk("count_extremes — lookback 창 적용",
+        ic.count_extremes(wild, 5.0, lookback=10) == (0, 10),
+        str(ic.count_extremes(wild, 5.0, lookback=10)))
+
+    chk("compute_ranks 에 clip 전달됨",
+        ic.compute_ranks({"data": {"A": wild}, "dates": ["d"] * 20},
+                         lookbacks=(20,), clip=5.0)["A"]["mom_20"]
+        != ic.compute_ranks({"data": {"A": wild}, "dates": ["d"] * 20},
+                            lookbacks=(20,))["A"]["mom_20"])
+
     # end 인자 — 과거 시점 백분위 계산에 쓰인다
     s2 = [1.0] * 10 + [50.0] * 10
     chk("end 인자로 과거 시점 산출 (방향 표시용)",
@@ -275,8 +305,20 @@ def test_mutation():
     ic.build_row = orig_br
     chk("M5 신규 업종 조용히 버림 → 검출 (보고 계약 위반)", caught)
 
+    # M6: clip 인자를 무시한다 → 윈저화 진단이 항상 "영향 없음"으로 나온다
+    def clip_ok():
+        w = [30.0] * 5 + [1.0] * 15
+        return ic.momentum(w, 20, clip=5.0) < ic.momentum(w, 20)
+
+    chk("기준 — clip 동작 정상", clip_ok())
+    orig_m2 = ic.momentum
+    ic.momentum = lambda s_, lb, end=None, clip=None: orig_m2(s_, lb, end=end)
+    caught = not clip_ok()
+    ic.momentum = orig_m2
+    chk("M6 clip 인자 무시 (윈저화 진단 무력화) → 검출", caught)
+
     chk("뮤테이션 원복 후 정상",
-        align_ok() and direction_ok() and missing_ok())
+        align_ok() and direction_ok() and missing_ok() and clip_ok())
 
 
 # ══════════════════════════════════════════════════════════════════════════

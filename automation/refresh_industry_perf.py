@@ -372,6 +372,83 @@ def do_ranks(sh):
             else:
                 print("     ✅ 적당히 다르다 — 두 창을 함께 보여줄 의미가 있다")
 
+    # ── 극단값 영향 진단 (윈저화) ───────────────────────────────────────
+    # averageChange 는 업종 내 상장 종목 전체의 **동일가중** 평균이라
+    # 마이크로캡·투기적 소형주가 업종 평균을 통째로 흔든다.
+    # 실측: Tobacco 120일 -51.8%, Agricultural Inputs -75.4% — 같은 기간
+    # 실제 담배 대형주(MO/PM/BTI)는 올랐다. 이 버킷은 그 업종이 아니다.
+    #
+    # 다만 '크기가 왜곡됐다'가 곧 '순서도 무작위다'는 아니다. 백테스트에서
+    # 무작위 30회 중 1회만 최고 설정을 이겼으므로 순위에는 정보가 있었다.
+    # 추측으로 정하지 말고 **재본다.**
+    clip = ic.WINSOR_CLIP
+    ranks_w = ic.compute_ranks(parsed, clip=clip)
+    print("")
+    print("  ── 극단값 영향 진단 (윈저화 ±%.0f%%/일)" % clip)
+
+    data = parsed.get("data") or {}
+    for lb in ic.LOOKBACKS:
+        ext = tot = 0
+        for sr in data.values():
+            e, t = ic.count_extremes(sr, clip, lookback=lb)
+            ext += e
+            tot += t
+        pctx = (100.0 * ext / tot) if tot else 0.0
+        key = "pct_%d" % lb
+        ra = {nm: v.get(key) for nm, v in ranks.items()}
+        rb = {nm: v.get(key) for nm, v in ranks_w.items()}
+        rho = _spearman(ra, rb)
+        print("")
+        print("     [" + str(lb) + "일] 클립 대상 일간값 " + str(ext) + "/"
+              + str(tot) + " (%.1f%%)" % pctx)
+        if rho is None:
+            print("            원본 vs 윈저화 순위 상관: 표본 부족")
+            continue
+        # ⚠️ 전체 순위 상관만 보면 안 된다.
+        #    합성 검증에서 rho=0.932 인데도 1위 업종이 2.0% → 91.3% 로
+        #    튀는 경우가 나왔다. 149개 중 대부분이 안 움직이면 전체 상관은
+        #    높게 유지되지만, **정작 화면에 뜨는 건 상위권**이다.
+        #    상위 K개 교집합을 따로 재서 둘 중 나쁜 쪽으로 판정한다.
+        K = 15
+        top_a = [nm for _, nm in sorted((ra[nm], nm) for nm in ra
+                                        if ra.get(nm) is not None)[:K]]
+        top_b = [nm for _, nm in sorted((rb[nm], nm) for nm in rb
+                                        if rb.get(nm) is not None)[:K]]
+        ov = len(set(top_a) & set(top_b))
+        ov_r = ov / float(K) if K else 0.0
+        print("            원본 vs 윈저화 순위 상관: %.3f" % rho)
+        print("            상위 %d 교집합: %d/%d (%.0f%%)  ← 화면에 뜨는 구간"
+              % (K, ov, K, 100.0 * ov_r))
+
+        if rho >= 0.90 and ov_r >= 0.80:
+            print("            ✅ 극단값이 **순서까지 흔들지는 않았다**")
+            print("               → 원본 유지. 화면에는 백분위만 표시하면 된다")
+        elif rho < 0.70 or ov_r < 0.50:
+            print("            🔴 순서가 크게 바뀐다 — 윈저화 채택 권장")
+            if rho >= 0.90:
+                print("               (전체 상관은 높지만 상위권이 갈린다."
+                      " 화면 기준으로는 이쪽이 결정적이다)")
+        else:
+            print("            🟠 일부 바뀐다 — 아래 변동 목록을 보고 판단")
+            if rho >= 0.90 > ov_r + 0.10:
+                print("               (전체 상관이 높은 것에 속으면 안 된다 —"
+                      " 상위권이 덜 겹친다)")
+
+        gone = [nm for nm in top_a if nm not in set(top_b)]
+        if gone:
+            print("            원본 상위 %d 중 윈저화하면 빠지는 업종: %s"
+                  % (K, ", ".join(g[:26] for g in gone[:6])))
+
+        # 순위가 가장 크게 움직인 업종 — 어떤 이름이 문제인지 눈으로 본다
+        moved = [(abs(ra[nm] - rb[nm]), nm, ra[nm], rb[nm])
+                 for nm in ra if ra.get(nm) is not None and rb.get(nm) is not None]
+        if moved:
+            moved.sort(reverse=True)
+            print("            순위 변동 상위 5 (원본 → 윈저화):")
+            for d_, nm, x, y in moved[:5]:
+                print("              %-40s %5.1f%% → %5.1f%%  (%+.1f%%p)"
+                      % (nm[:40], x, y, y - x))
+
     # 방향 표시가 실제로 작동하는지 (전부 '—' 면 DIRECTION_LAG 가 무의미)
     lb0 = ic.LOOKBACKS[0]
     descs = [ic.describe(v, lookback=lb0) for v in ranks.values()]
