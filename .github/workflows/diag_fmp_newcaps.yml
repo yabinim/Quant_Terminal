@@ -1,0 +1,97 @@
+name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보 · 수동 전용)
+
+# 언제 쓰나:
+#   공식 api-docs 242 경로 중 코드가 쓰는 것은 48개다. 남은 194개 중
+#   이 터미널의 철학에 직결되는 후보를 **설계 전에** 쓸 수 있는지 확인한다.
+#
+#   diag_fmp_endpoints.yml 과 목적이 다르다.
+#     · endpoints  = 이미 코드에 박힌 경로가 살아 있나 (쌍 비교)
+#     · newcaps    = 아직 안 쓰는 경로를 쓸 수 있나 + **필요 필드가 오나**
+#
+# ── 티어 ──────────────────────────────────────────────────────────────
+#
+#   tierA (5콜) — 실제 결함 해결
+#     holidays-by-exchange    🔴 _NYSE_HOLIDAYS 가 2026-12-25 에서 끝난다.
+#                                run_watchlist_alerts:165 / run_drg_predict:58
+#                                / run_drg_verify:54 — 3중 하드코딩 중복.
+#                                ★ from/to 를 내년으로 넣어 내년 데이터가
+#                                  실제로 오는지까지 확인한다.
+#     symbol-change           🔴 티커 변경 → hist 빈 배열 → :823 조용히 skip
+#     delisted-companies      🔴 상장폐지 종목의 매도 신호가 영구 침묵
+#     actively-trading-list      상장 여부 판정 대안 경로
+#     etf/asset-exposure      🟡 app.py:6450 스텁의 정답 후보
+#
+#   tierB (9콜) — 기존 기능 강화
+#     sector/industry performance (스냅샷·시계열 4종) · price-target-summary
+#     stock-peers · sec-filings-8k · dividends-calendar
+#     mergers-acquisitions-latest
+#
+#   tierC (4콜) — 탐색적
+#     senate-latest · house-latest
+#     institutional-ownership/holder-performance-summary · historical-industry-pe
+#
+#   grades (3콜) — 미결 과제
+#     grades / grades-consensus / ratings-snapshot 의 응답 키를 나란히 출력.
+#     "grades?symbol= 가 기존 등급 엔드포인트와 겹치는가"에 대한 직접 답.
+#
+#   all (21콜)
+#
+# ── 판정 읽는 법 ──────────────────────────────────────────────────────
+#   ✅ LIVE    200 + 데이터 + 필요 필드 전부 존재    → 설계 진행 가능
+#   🟠 FIELDS  200 이지만 필요 필드 누락/범위 밖     → 설계 전제 재검토
+#   ⚠️ EMPTY   200 + 빈 배열                         → 날짜 바꿔 재실행
+#   🔒 PLAN    402                                   → 후보에서 제외
+#   ❌ 404 등  경로 실패
+#
+#   402 와 404 를 뭉개면 엉뚱한 수정을 하게 된다 — 지난 감사의 교훈.
+#
+# 안전성:
+#   · 시트 접근 없음 — 읽지도 쓰지도 않는다
+#   · 이메일 없음 · 알림 상태 머신 미접촉
+#   · 프로젝트 모듈 import 없음 (requests 만 사용)
+#   → 사본 신선도와 무관하다. 몇 번을 돌려도 부작용이 없다.
+#
+# ⚠️ repository_dispatch / schedule 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierC=탐색 4콜 / grades=등급중복 3콜 / all=21콜)"
+        type: choice
+        options:
+          - tierA
+          - tierB
+          - tierC
+          - grades
+          - all
+        default: tierA
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # fmp_http 를 안 쓰므로 requests 만 있으면 된다.
+      - name: 📦 의존성
+        run: pip install requests
+
+      - name: 🔬 미사용 엔드포인트 실측
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          PROBE_TIER: ${{ inputs.tier }}
+        run: python automation/diag_fmp_newcaps.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_fmp_newcaps.py
