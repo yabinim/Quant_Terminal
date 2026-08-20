@@ -73,9 +73,10 @@ fmp_get 은 402/429 를 삼키고 None 을 돌려주는데, 프로브는 **원�
     PROBE_TIER=tierA   5콜  (기본)
     PROBE_TIER=tierB   9콜
     PROBE_TIER=tierB2  5콜   ← tierB 후속 확인
+    PROBE_TIER=tierB3  3콜   ← B-1 설계 직전 (이력 깊이 + 분류명 전체)
     PROBE_TIER=tierC   4콜
     PROBE_TIER=grades  3콜
-    PROBE_TIER=all    26콜
+    PROBE_TIER=all    29콜
 
 실행
 ────
@@ -97,7 +98,7 @@ SLEEP_SEC = 0.35
 _KEY = str(os.environ.get("FMP_API_KEY", "") or "").strip()
 
 _TIER = str(os.environ.get("PROBE_TIER", "") or "tierA").strip().lower()
-if _TIER not in ("tiera", "tierb", "tierb2", "tierc", "grades", "all"):
+if _TIER not in ("tiera", "tierb", "tierb2", "tierb3", "tierc", "grades", "all"):
     _TIER = "tiera"
 
 
@@ -123,6 +124,7 @@ def _recent_weekday(days_back=3):
 _D_RECENT = _recent_weekday(3)
 _D_FROM_30 = (_TODAY - timedelta(days=30)).isoformat()
 _D_FROM_90 = (_TODAY - timedelta(days=90)).isoformat()
+_D_FROM_3Y = (_TODAY - timedelta(days=365 * 3)).isoformat()
 _D_TO = _TODAY.isoformat()
 _Y_FROM = str(_NEXT_YEAR) + "-01-01"
 _Y_TO = str(_NEXT_YEAR) + "-12-31"
@@ -313,6 +315,61 @@ TIER_B2 = [
     ),
 ]
 
+# ══════════════════════════════════════════════════════════════════════════
+# TIER B3 — B-1 설계 직전 확인 (2026-08-20)
+#
+# tierB2 에서 available-industries 가 **159건**을 줬는데
+# industry-performance-snapshot 은 같은 날 **127건**이었다. 32개 차이다.
+# 그리고 이력을 API 에서 받을 수 있는지가 아직 미확인이다.
+#
+# 이 세 콜로 B-1 설계의 미결 사항이 전부 닫힌다.
+#
+#   1) 백필이 가능한가            → historical-* 를 3년 요청해 실측
+#        3년 오면  → 일회성 백필 → 즉시 백테스트 (대기 0)
+#        단기만    → 스냅샷 매일 누적이 유일 경로 (몇 달 대기)
+#      historical-price-eod 때도 같은 이유로 깊이를 따로 쟀다(diag_fmp_depth).
+#
+#   2) 어떤 이름을 쓰나           → 159개 전체 목록을 눈으로 확보
+#      파라미터 문자열이 틀리면 402 도 404 도 아니고 **조용히 빈 배열**이
+#      온다. 가장 찾기 어려운 실패다.
+#
+#   3) 159 vs 127 차이           → 목록을 받아야 어느 32개가 빠졌는지 대조 가능
+#
+# 상세 출력 렌더러를 붙인 6요소 튜플이다(다른 티어는 5요소).
+# ══════════════════════════════════════════════════════════════════════════
+TIER_B3 = [
+    (
+        "업종 분류명 — 159개 전체 목록",
+        "available-industries",
+        "historical-industry-performance 의 industry 파라미터에 넣을 정확한 "
+        "문자열 전부. 스냅샷 127건과 대조해 어느 32개가 비는지 확인한다.",
+        ["industry"],
+        None,
+        "names_industry",
+    ),
+    (
+        "업종 성과 이력 깊이 — 3년 요청",
+        "historical-industry-performance?industry=Semiconductors&from="
+        + _D_FROM_3Y + "&to=" + _D_TO,
+        "3년이 오면 159콜 일회성 백필 후 즉시 백테스트가 가능하다. "
+        "단기만 오면 스냅샷을 몇 달 쌓는 수밖에 없다. 이 한 줄이 "
+        "'지금 검증'과 '3개월 대기'를 가른다.",
+        ["date", "industry", "averageChange"],
+        None,
+        "depth",
+    ),
+    (
+        "섹터 성과 이력 깊이 — 3년 요청",
+        "historical-sector-performance?sector=Technology&from="
+        + _D_FROM_3Y + "&to=" + _D_TO,
+        "위 항목과 동일. 섹터는 11개뿐이라 백필 비용이 11콜로 싸다 — "
+        "업종이 단기만 주더라도 섹터는 백테스트가 가능할 수 있다.",
+        ["date", "sector", "averageChange"],
+        None,
+        "depth",
+    ),
+]
+
 TIER_C = [
     (
         "상원 거래 최신 피드",
@@ -381,8 +438,14 @@ def _mask(text):
     return str(text).replace(_KEY, "***")
 
 
-def probe(path, need=None, contains=None):
-    """단일 엔드포인트 호출 + 필드 검증. 판정 dict 를 돌려준다."""
+def probe(path, need=None, contains=None, keep_data=False):
+    """단일 엔드포인트 호출 + 필드 검증. 판정 dict 를 돌려준다.
+
+    keep_data: True 면 파싱된 원자료를 out["data"] 에 담는다. 이름 목록 덤프나
+      이력 깊이 측정처럼 **건수만으로는 답이 안 나오는** 확인에만 켠다.
+      기본값이 False 인 이유는 응답이 수천 건일 수 있어서다(dividends-calendar
+      는 30일치가 4000건이었다).
+    """
     sep = "&" if "?" in path else "?"
     url = FMP_BASE + "/" + path + sep + "apikey=" + _KEY
 
@@ -394,6 +457,7 @@ def probe(path, need=None, contains=None):
         "n": None,
         "keys": [],
         "missing": [],
+        "data": None,
     }
 
     try:
@@ -466,6 +530,8 @@ def probe(path, need=None, contains=None):
         return out
 
     out["keys"] = sample_keys[:14]
+    if keep_data:
+        out["data"] = data
 
     # ── 필드 검증 ────────────────────────────────────────────────────────
     # 200 + 데이터가 있어도 설계가 의존하는 키가 없으면 그대로 못 쓴다.
@@ -517,19 +583,115 @@ def show(res):
 # ══════════════════════════════════════════════════════════════════════════
 # 실행
 # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 상세 출력 — 건수만으로는 답이 안 나오는 확인들
+# ══════════════════════════════════════════════════════════════════════════
+def render_names(res, key):
+    """분류명 전체를 줄바꿈해서 찍는다.
+
+    왜 필요한가: historical-sector-performance / historical-industry-performance
+    는 sector/industry 파라미터에 **FMP 가 정한 정확한 문자열**을 요구한다.
+    틀리면 402 도 404 도 아니고 **조용히 빈 배열**이 온다 — 가장 찾기 어려운
+    실패다. 이름을 눈으로 확보해야 구현에 들어갈 수 있다.
+    """
+    data = res.get("data")
+    if not isinstance(data, list) or not data:
+        print("        └ (목록 없음)")
+        return
+    names = []
+    for rec in data:
+        if isinstance(rec, dict) and rec.get(key):
+            names.append(str(rec[key]))
+    names = sorted(set(names))
+    print("        └ 고유 " + str(len(names)) + "개:")
+    line = "           "
+    for nm in names:
+        if len(line) + len(nm) + 3 > 96:
+            print(line)
+            line = "           "
+        line += nm + " | "
+    if line.strip():
+        print(line.rstrip(" |"))
+
+
+def render_depth(res, date_key="date"):
+    """이력 깊이 — 최초/최종 날짜, 커버 기간, 요청 대비 충족 여부.
+
+    왜 필요한가: 3년을 요청해도 플랜이 90일만 줄 수 있다. 그러면 백필 전략이
+    통째로 달라진다(일회성 백필 vs 매일 스냅샷 누적 몇 달). historical-price-eod
+    때도 같은 이유로 깊이를 따로 쟀다.
+    """
+    data = res.get("data")
+    if not isinstance(data, list) or not data:
+        print("        └ (깊이 측정 불가)")
+        return
+    dates = []
+    for rec in data:
+        if isinstance(rec, dict):
+            d = str(rec.get(date_key) or "").strip()[:10]
+            if len(d) == 10:
+                dates.append(d)
+    if not dates:
+        print("        └ (날짜 필드 없음 — key=" + date_key + ")")
+        return
+    dates = sorted(set(dates))
+    first, last = dates[0], dates[-1]
+    try:
+        d0 = datetime.strptime(first, "%Y-%m-%d").date()
+        d1 = datetime.strptime(last, "%Y-%m-%d").date()
+        span_days = (d1 - d0).days
+    except Exception:
+        span_days = 0
+    yrs = span_days / 365.0
+    print("        └ 고유 날짜 " + str(len(dates)) + "일 · "
+          + first + " ~ " + last
+          + " · 커버 " + str(span_days) + "일(" + ("%.2f" % yrs) + "년)")
+    # 요청은 3년(1095일). 실제로 얼마나 왔는지가 백필 전략을 가른다.
+    if span_days >= 1000:
+        print("           ✅ 3년 백필 가능 — 일회성 백필 후 즉시 백테스트")
+    elif span_days >= 300:
+        print("           🟠 1년 안팎 — 백테스트 표본 제한적. 스냅샷 누적 병행 권장")
+    else:
+        print("           🔴 단기만 제공 — 일회성 백필 불가. 스냅샷 매일 누적이 유일 경로")
+    # 거래일 밀도 — 빈 구간이 있으면 백테스트가 왜곡된다
+    if span_days > 0:
+        dens = len(dates) / (span_days / 7.0 * 5.0) if span_days >= 7 else 0
+        if dens and dens < 0.7:
+            print("           ⚠️ 거래일 대비 밀도 " + ("%.0f" % (dens * 100))
+                  + "% — 결측 구간이 있다. 백테스트 전 확인 필요")
+
+
+_DETAIL = {
+    "names_sector": lambda r: render_names(r, "sector"),
+    "names_industry": lambda r: render_names(r, "industry"),
+    "depth": lambda r: render_depth(r, "date"),
+}
+
+
 def run_group(title, targets, results):
     print("")
     print("=" * 78)
     print(title)
     print("=" * 78)
-    for label, path, impact, need, contains in targets:
+    for t in targets:
+        # 기존 티어는 5요소, B3 는 상세 렌더러를 붙인 6요소다. 둘 다 받는다.
+        label, path, impact, need, contains = t[0], t[1], t[2], t[3], t[4]
+        detail_kind = t[5] if len(t) > 5 else None
         print("")
         print("── " + label)
         print("   용도: " + impact)
         if need:
             print("   필요 필드: " + ", ".join(need))
-        r = probe(path, need=need, contains=contains)
+        r = probe(path, need=need, contains=contains,
+                  keep_data=bool(detail_kind))
         show(r)
+        if detail_kind and r["verdict"] in ("LIVE", "FIELDS"):
+            fn_d = _DETAIL.get(detail_kind)
+            if fn_d:
+                try:
+                    fn_d(r)
+                except Exception as e:
+                    print("        └ (상세 출력 실패: " + str(e)[:60] + ")")
         results.append((label, path, impact, r))
         time.sleep(SLEEP_SEC)
 
@@ -542,11 +704,12 @@ def main():
     run_a = _TIER in ("tiera", "all")
     run_b = _TIER in ("tierb", "all")
     run_b2 = _TIER in ("tierb2", "all")
+    run_b3 = _TIER in ("tierb3", "all")
     run_c = _TIER in ("tierc", "all")
     run_g = _TIER in ("grades", "all")
 
     ncalls = (len(TIER_A) if run_a else 0) + (len(TIER_B) if run_b else 0) \
-        + (len(TIER_B2) if run_b2 else 0) \
+        + (len(TIER_B2) if run_b2 else 0) + (len(TIER_B3) if run_b3 else 0) \
         + (len(TIER_C) if run_c else 0) + (len(GRADES) if run_g else 0)
 
     print("=" * 78)
@@ -565,6 +728,9 @@ def main():
     if run_b2:
         run_group("Tier B2 — tierB 후속 확인 (심볼 필터 대체 경로 + 분류명)",
                   TIER_B2, results)
+    if run_b3:
+        run_group("Tier B3 — B-1 설계 직전 확인 (이력 깊이 + 분류명 전체)",
+                  TIER_B3, results)
     if run_c:
         run_group("Tier C — 탐색적 신규 기능", TIER_C, results)
     if run_g:
