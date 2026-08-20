@@ -38,6 +38,20 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #        (historical-*-performance 는 정확한 문자열을 요구한다. 추측으로 맞추면
 #         다른 분류에서 조용히 빈 배열이 온다.)
 #
+#   tierB3 (3콜) — B-1 설계 직전 확인
+#     ⚠️ tierB2 에서 available-industries 가 159건인데
+#        industry-performance-snapshot 은 같은 날 127건이었다. 32개 차이.
+#        그리고 이력을 API 로 받을 수 있는지가 미확인이다.
+#     available-industries            159개 **전체 이름 출력**
+#     historical-industry-performance 3년 요청 → 이력 깊이 실측
+#     historical-sector-performance   3년 요청 → 동일
+#
+#     이 3콜로 B-1 의 미결이 전부 닫힌다:
+#       3년 오면  → 일회성 백필 → 즉시 백테스트 (대기 0)
+#       단기만    → 스냅샷 매일 누적이 유일 경로 (몇 달 대기)
+#     파라미터 문자열이 틀리면 402 도 404 도 아닌 **빈 배열**이 온다 —
+#     가장 찾기 어려운 실패라 이름을 눈으로 확보해야 한다.
+#
 #   tierC (4콜) — 탐색적
 #     senate-latest · house-latest
 #     institutional-ownership/holder-performance-summary · historical-industry-pe
@@ -46,7 +60,7 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #     grades / grades-consensus / ratings-snapshot 의 응답 키를 나란히 출력.
 #     "grades?symbol= 가 기존 등급 엔드포인트와 겹치는가"에 대한 직접 답.
 #
-#   all (26콜)
+#   all (29콜)
 #
 # ── 판정 읽는 법 ──────────────────────────────────────────────────────
 #   ✅ LIVE    200 + 데이터 + 필요 필드 전부 존재    → 설계 진행 가능
@@ -69,12 +83,13 @@ on:
   workflow_dispatch:
     inputs:
       tier:
-        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierB2=B후속 5콜 / tierC=탐색 4콜 / grades=등급중복 3콜 / all=26콜)"
+        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierB2=B후속 5콜 / tierB3=B-1직전 3콜 / tierC=탐색 4콜 / grades=등급중복 3콜 / all=29콜)"
         type: choice
         options:
           - tierA
           - tierB
           - tierB2
+          - tierB3
           - tierC
           - grades
           - all
