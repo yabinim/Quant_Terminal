@@ -1,0 +1,81 @@
+name: 🏭 진단 — 업종 모멘텀 예측력 검증 (수동 전용)
+
+# 무엇을 답하나:
+#   단 하나. **업종 모멘텀에 예측력이 있는가.**
+#   industry-performance-snapshot 이 159개 업종(섹터의 14배 세분화)을 준다.
+#   신호에 붙일지 결정하기 전에, 붙일 가치가 있는지부터 잰다.
+#
+# 왜 지금 되나 (tierB3 실측):
+#   historical-industry-performance  777건 · 3.00년 → 일회성 백필 가능
+#   historical-sector-performance    772건 · 3.00년
+#   → 3개월 스냅샷 누적을 기다릴 필요가 없다.
+#
+# ⚠️ 휴장일 행이 섞여 있다 (실측):
+#   실제 거래일 754일인데 업종 응답 777건(+23), 섹터 772건(+18).
+#   휴장일에도 행이 생기고 그날 값은 무의미하다. 3년 중 3%.
+#   → calendar_core.is_market_open() 으로 걸러낸다 (A-1 모듈이 여기 쓰인다).
+#
+# ⚠️ 결과 해석:
+#   averageChange 기반 **가상 지수**다. 거래 가능한 수익률이 아니다.
+#   절대값은 무시하고 아래 세 관문만 본다.
+#     ① 무작위 대조군을 명확히 이기는가  (가장 중요)
+#     ② 반분할 양쪽에서 SPY 초과인가
+#     ③ MDD 가 SPY 보다 얕은가          (손실 방지 우선)
+#   하나라도 못 넘으면 신호에 연결하지 않는다.
+#
+# 호출 비용:
+#   full          업종 159 + 섹터 11 + SPY 1 = 171콜 (일회성)
+#   sectors-only  섹터 11 + SPY 1 = 12콜
+#   selftest      0콜 (네트워크 불필요)
+#
+# 안전성:
+#   · 시트 쓰기 없음 · 이메일 없음 · 알림 상태 머신 미접촉 — 완전 읽기 전용
+#   · repository_dispatch / schedule 없음 (일회성 검증이 매일 171콜을 태우면 안 된다)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "실행 모드 (selftest=엔진검증 0콜 / sectors=12콜 / full=171콜)"
+        type: choice
+        options:
+          - selftest
+          - sectors
+          - full
+        default: selftest
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # calendar_core 는 pytz 만, 본체는 requests 만 쓴다. pandas 불필요.
+      - name: 📦 의존성
+        run: pip install requests pytz
+
+      - name: 🏭 업종 모멘텀 검증
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: |
+          if [ "${{ inputs.mode }}" = "selftest" ]; then
+            python automation/diag_industry_momentum.py --selftest
+          elif [ "${{ inputs.mode }}" = "sectors" ]; then
+            python automation/diag_industry_momentum.py --sectors-only
+          else
+            python automation/diag_industry_momentum.py
+          fi
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          calendar_core.py
+          automation/diag_industry_momentum.py
