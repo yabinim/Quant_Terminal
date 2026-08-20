@@ -1,0 +1,79 @@
+name: 🏭 업종 성과 히스토리 — 백필 / 수동 실행
+
+# 무엇에 쓰나:
+#   Phase 3 '업종 백분위' 표시용 Industry_Perf 시트를 만들고 채운다.
+#
+#   ⚠️ 최초 1회 backfill 을 여기서 돌려야 한다. 평일 5PM 워크플로의
+#      '🏭 업종 성과 스냅샷' 스텝은 **일일 append 만** 한다 — 시트가 없으면
+#      안내만 하고 끝나므로, 백필 없이는 데이터가 영영 안 쌓인다.
+#
+# 모드:
+#   dry_run_backfill  149콜, 시트 쓰기 없음. 행/열 수만 확인 (권장 첫 실행)
+#   backfill          149콜, 시트 전체 재구성
+#   daily             1콜, 오늘 1행 append (평일 워크플로가 놓쳤을 때 보충)
+#   dry_run_daily     1콜, 쓰기 없음
+#
+# ── 반복 실행 방지 ────────────────────────────────────────────────────
+#   백필은 ws.clear() 후 전체를 다시 쓴다. 이미 쌓인 일일 append 가 날아간다.
+#   그래서 **스크립트가** 막는다 — 시트에 행이 있으면 FORCE 없이는 거부한다.
+#   (버튼을 없애는 방식은 쓰지 않는다. 실행 경로가 사라지면 정작 필요할 때
+#    돌릴 방법이 없어진다.)
+#
+#   덮어써야 할 때만 confirm 칸에 정확히  OVERWRITE  를 입력한다.
+#
+# 비용: backfill 149콜 (약 1~3분) · daily 1콜
+# 안전성: Industry_Perf 시트 외에는 아무것도 건드리지 않는다. 이메일 없음.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "실행 모드"
+        type: choice
+        options:
+          - dry_run_backfill
+          - backfill
+          - daily
+          - dry_run_daily
+        default: dry_run_backfill
+      confirm:
+        description: "기존 데이터를 덮어쓸 때만 OVERWRITE 입력 (그 외 비워둘 것)"
+        type: string
+        default: ''
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: pip install requests gspread google-auth pytz
+
+      - name: 🏭 실행
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          # confirm 이 정확히 OVERWRITE 일 때만 FORCE=1 이 넘어간다.
+          FORCE: ${{ inputs.confirm == 'OVERWRITE' && '1' || '' }}
+          DRY_RUN: ${{ startsWith(inputs.mode, 'dry_run') && '1' || '' }}
+        run: |
+          if [[ "${{ inputs.mode }}" == *backfill* ]]; then
+            python automation/refresh_industry_perf.py --backfill
+          else
+            python automation/refresh_industry_perf.py
+          fi
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          industry_core.py
+          automation/refresh_industry_perf.py
