@@ -35,7 +35,11 @@
 ────
     FMP_API_KEY=.. GSPREAD_KEY=.. python automation/refresh_industry_perf.py --backfill
     FMP_API_KEY=.. GSPREAD_KEY=.. python automation/refresh_industry_perf.py
-    DRY_RUN=1 ...     # 시트 쓰기 없이 계산만
+    DRY_RUN=1 ...     # 시트 쓰기 없이 계산만 (읽기는 한다)
+    FORCE=1 ...       # 이미 데이터가 있는 시트를 백필로 덮어쓸 때만
+
+⚠️ 백필은 시트를 **전체 교체**한다. 이미 행이 있으면 FORCE=1 없이는 거부한다 —
+   그동안 쌓인 일일 append 가 날아가는 것이 149콜을 다시 태우는 것보다 아프다.
 """
 import argparse
 import json
@@ -56,6 +60,10 @@ import gs_retry as gsr       # noqa: E402
 FMP_API_KEY = str(os.environ.get("FMP_API_KEY", "") or "").strip()
 GSPREAD_KEY_JSON = os.environ.get("GSPREAD_KEY", "")
 DRY_RUN = str(os.environ.get("DRY_RUN", "") or "").strip() in ("1", "true", "TRUE", "yes")
+# 백필은 시트를 **전체 교체**한다. 이미 데이터가 있으면 기본적으로 거부하고,
+# FORCE=1 일 때만 덮어쓴다. 실수로 반복 실행되는 것을 UI 가 아니라 코드가 막는다
+# (버튼을 없애면 실행 경로 자체가 사라져서, 정작 필요할 때 돌릴 방법이 없다).
+FORCE = str(os.environ.get("FORCE", "") or "").strip() in ("1", "true", "TRUE", "yes")
 
 _SPREADSHEET_TITLE = "Quant_DB"
 _ET = pytz.timezone("US/Eastern")
@@ -83,7 +91,29 @@ def _open_or_create(sh, title, rows, cols):
 
 # ══════════════════════════════════════════════════════════════════════════
 def do_backfill(sh):
-    print("[MODE] 백필 — historical-industry-performance")
+    print("[MODE] 백필 — historical-industry-performance"
+          + ("  (FORCE)" if FORCE else ""))
+
+    # ── 덮어쓰기 가드 ────────────────────────────────────────────────
+    # 백필은 ws.clear() 후 전체를 다시 쓴다. 이미 쌓인 일일 append 가
+    # 있으면 그게 날아간다. 149콜을 다시 태우는 것보다 그쪽이 더 아프다.
+    if sh is not None:
+        try:
+            ws0 = gsr.call(sh.worksheet, ic.PERF_SHEET)
+            n_exist = len([r for r in (gsr.call(ws0.get_all_values) or [])[1:]
+                           if r and str(r[0]).strip()])
+        except Exception:
+            n_exist = 0
+        if n_exist > 0 and not FORCE:
+            print("[ABORT] " + ic.PERF_SHEET + " 에 이미 " + str(n_exist)
+                  + "행이 있습니다.")
+            print("        백필은 시트를 전체 교체하므로 그동안 쌓인 일일")
+            print("        append 가 사라집니다. 정말 재구성하려면 FORCE=1.")
+            print("        (평소에는 백필이 아니라 일일 모드만 돌면 됩니다)")
+            return 1
+        if n_exist > 0:
+            print("  ⚠️ 기존 " + str(n_exist) + "행을 덮어씁니다 (FORCE).")
+
     today = datetime.now(_ET).date()
     d_to = today.isoformat()
     d_from = (today - timedelta(days=365 * BACKFILL_YEARS)).isoformat()
