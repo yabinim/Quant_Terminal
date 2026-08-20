@@ -26,6 +26,18 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #     stock-peers · sec-filings-8k · dividends-calendar
 #     mergers-acquisitions-latest
 #
+#   tierB2 (5콜) — tierB 실측 후 드러난 후속 확인
+#     ⚠️ tierB 는 9/9 LIVE 였지만 응답을 보고서야 두 개가 실사용 불가로 드러났다.
+#        sec-filings-8k / mergers-acquisitions-latest 둘 다 **symbol 파라미터가
+#        없다** — 내 종목 공시를 보려고 시장 전체를 페이징할 수는 없다.
+#     sec-filings-search/symbol      종목당 1콜 대체 경로
+#     sec-filings-search/form-type   기간당 N페이지 대체 경로 (비용 비교용)
+#     mergers-acquisitions-search    이름 검색형 (심볼 역매칭 가능한지)
+#     available-sectors              B-1 전제 — 정확한 섹터 분류명
+#     available-industries           B-1 전제 — 127개 업종의 정확한 이름
+#        (historical-*-performance 는 정확한 문자열을 요구한다. 추측으로 맞추면
+#         다른 분류에서 조용히 빈 배열이 온다.)
+#
 #   tierC (4콜) — 탐색적
 #     senate-latest · house-latest
 #     institutional-ownership/holder-performance-summary · historical-industry-pe
@@ -34,7 +46,7 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #     grades / grades-consensus / ratings-snapshot 의 응답 키를 나란히 출력.
 #     "grades?symbol= 가 기존 등급 엔드포인트와 겹치는가"에 대한 직접 답.
 #
-#   all (21콜)
+#   all (26콜)
 #
 # ── 판정 읽는 법 ──────────────────────────────────────────────────────
 #   ✅ LIVE    200 + 데이터 + 필요 필드 전부 존재    → 설계 진행 가능
@@ -57,11 +69,12 @@ on:
   workflow_dispatch:
     inputs:
       tier:
-        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierC=탐색 4콜 / grades=등급중복 3콜 / all=21콜)"
+        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierB2=B후속 5콜 / tierC=탐색 4콜 / grades=등급중복 3콜 / all=26콜)"
         type: choice
         options:
           - tierA
           - tierB
+          - tierB2
           - tierC
           - grades
           - all
