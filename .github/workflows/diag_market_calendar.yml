@@ -1,0 +1,62 @@
+name: 🔬 진단 — 시장 캘린더 회귀 검증 (수동 전용)
+
+# 언제 쓰나:
+#   calendar_core.py 를 수정한 직후, 배포 전에 돌린다.
+#
+# 왜 필요한가:
+#   휴장일 판정이 틀리면 **조용히** 틀린다.
+#     · 개장일을 휴장으로 오판 → 그날 알림이 통째로 안 나간다
+#     · 휴장일을 개장으로 오판 → 알림 상태머신 확정 카운터가 헛돌아 진행된다
+#   둘 다 로그에 에러가 남지 않는다. 기계로 확인하는 수밖에 없다.
+#
+# 무엇을 검사하나 (53항목):
+#   A 골든 재현  — 교체 전 5개 파일에 있던 2025·2026 휴장일 20개 완전 일치
+#   B 대체 휴일  — 토→금, 일→월, 신정 토요일 예외
+#   C 부활절     — 굿프라이데이 기준값 6개 연도 대조
+#   D 판정 계약  — 주말/휴장/개장/임시휴장 보강/폴백 방향
+#   E 시트 파싱  — 헤더 결손·깨진 행에도 예외 없이 빈 결과
+#   F FMP 대조   — 임시 휴장(국장일) 검출 경로
+#   G 뮤테이션   — 규칙 엔진에 버그를 심어 검사가 잡아내는지 확인
+#
+#   G 가 핵심이다. 실제로 M3(부활절 +1일)이 개발 중 **마스킹되는 것**을 잡아냈고,
+#   그 결과 굿프라이데이에 대체 휴일 규칙을 적용하던 코드를 제거했다.
+#
+# 안전성:
+#   · 네트워크 접근 없음 · 시트 접근 없음 · FMP 호출 없음
+#   · 부작용 전혀 없다. 몇 번을 돌려도 같은 결과.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # calendar_core 는 pytz 만 쓴다(그마저도 try/except 로 선택적).
+      - name: 📦 의존성
+        run: pip install pytz
+
+      - name: 🔬 calendar_core 회귀 검증
+        run: python automation/diag_market_calendar.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          calendar_core.py
+          automation/diag_market_calendar.py
+          automation/refresh_market_calendar.py
+          automation/run_watchlist_alerts.py
+          automation/run_drg_predict.py
+          automation/run_drg_verify.py
+          automation/run_earnings_watch.py
+          automation/run_narrative.py

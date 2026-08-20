@@ -118,6 +118,23 @@ jobs:
         run: |
           python automation/run_hidden_alpha.py
 
+      # ── 시장 캘린더 갱신 (주 1회) ────────────────────────────────────────
+      # 휴장일 판정 자체는 calendar_core 규칙 계산이라 FMP·시트 없이 동작한다.
+      # 이 스텝은 규칙으로 잡을 수 없는 **임시 휴장**(대통령 국장일 등)을 찾기
+      # 위한 것이다. FMP 캘린더를 받아 Market_Calendar 시트에 저장하고 규칙
+      # 계산과 대조한다. 불일치가 나오면 Reminders 에 점검 항목이 생긴다.
+      #
+      # if: always() — 앞 스텝이 실패해도 캘린더 갱신은 독립적으로 돌아야 한다.
+      # 실패해도 판정 경로에 영향이 없으므로 워크플로를 실패시키지 않는다.
+      - name: 🗓️ 시장 캘린더 갱신 + 규칙 대조
+        if: always()
+        continue-on-error: true
+        env:
+          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY:  ${{ secrets.GSPREAD_KEY }}
+        run: |
+          python automation/refresh_market_calendar.py
+
       - name: 📋 실행 로그 요약
         if: always()
         run: |
