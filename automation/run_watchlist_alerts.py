@@ -40,6 +40,7 @@ import users_core as uc   # noqa: E402  — Users 시트/수신자 SSOT (app.py�
 import accounts_core as ac  # noqa: E402  — 계좌 프로필/자본금 순수 로직 SSOT (app.py와 동일 모듈)
 import earnings_core as ec  # noqa: E402  — 실적 이벤트 리스크 SSOT (app.py와 동일 모듈)
 import watchlist_metrics_core as wm  # noqa: E402  — 워치리스트 표시 지표 SSOT (app.py와 동일 모듈)
+import calendar_core as cc  # noqa: E402  — 시장 캘린더(휴장일) SSOT
 
 # ── 환경변수 ───────────────────────────────────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -162,19 +163,15 @@ def _pf_hist(tk: str, hist_cache: dict):
 
 
 # NYSE 휴장일 (run_narrative.py 와 동일 목록)
-_NYSE_HOLIDAYS = {
-    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
-    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
-    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
-    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
-}
-
-
+# ── 휴장일 판정 — calendar_core SSOT 로 단일화 ────────────────────────────────
+# 기존 하드코딩 집합은 2026-12-25 에서 끝나 2027-01-01 부터 모든 휴장일을
+# 거래일로 오판했다(같은 상수가 5개 자동화 파일에 중복돼 있었다).
+#
+# calendar_core 는 **규칙 계산**이라 FMP·시트 접근이 없다. 이 가드는 시트를
+# 열기 전 main() 최상단에 있으므로, 네트워크나 시트 왕복을 붙이면 "휴장일이라
+# 즉시 종료"하는 실행에까지 비용이 생긴다. 호출 비용은 기존과 같은 0 이다.
 def is_market_open_today() -> bool:
-    et_now = datetime.now(_ET)
-    if et_now.weekday() >= 5:
-        return False
-    return et_now.strftime("%Y-%m-%d") not in _NYSE_HOLIDAYS
+    return cc.is_market_open_today()
 
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────

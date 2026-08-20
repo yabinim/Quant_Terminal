@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import narrative_core
 import gemini_core
 import users_core as uc  # Users 시트/수신자 SSOT
+import calendar_core as cc  # 시장 캘린더(휴장일) SSOT
 
 # ── 환경변수 로드 ──────────────────────────────────────────────────────────────
 GOOGLE_API_KEY   = os.environ["GOOGLE_API_KEY"]
@@ -51,29 +52,16 @@ _NARRATIVES_WORKSHEET = "Narratives"
 _ADMIN_USER_ID       = "yab"
 
 # ── FRED 공휴일 체크용 NYSE 휴장일 목록 (고정 + 동적) ────────────────────────
-_NYSE_FIXED_HOLIDAYS_2025 = {
-    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18",
-    "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01",
-    "2025-11-27", "2025-12-25",
-}
-_NYSE_FIXED_HOLIDAYS_2026 = {
-    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
-    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
-    "2026-11-26", "2026-12-25",
-}
-_NYSE_HOLIDAYS = _NYSE_FIXED_HOLIDAYS_2025 | _NYSE_FIXED_HOLIDAYS_2026
-
-
+# ── 휴장일 판정 — calendar_core SSOT 로 단일화 ────────────────────────────────
+# 기존 하드코딩 집합은 2026-12-25 에서 끝나 2027-01-01 부터 모든 휴장일을
+# 거래일로 오판했다(같은 상수가 5개 자동화 파일에 중복돼 있었다).
+#
+# calendar_core 는 **규칙 계산**이라 FMP·시트 접근이 없다. 이 가드는 시트를
+# 열기 전 최상단에 있으므로, 네트워크나 시트 왕복을 붙이면 "휴장일이라 즉시
+# 종료"하는 실행에까지 비용이 생긴다. 호출 비용은 기존과 같은 0 이다.
 def is_market_open_today() -> bool:
     """오늘(ET 기준)이 NYSE 개장일인지 확인."""
-    et_now = datetime.now(_ET)
-    weekday = et_now.weekday()   # 0=월 … 4=금
-    date_str = et_now.strftime("%Y-%m-%d")
-    if weekday >= 5:             # 토·일
-        return False
-    if date_str in _NYSE_HOLIDAYS:
-        return False
-    return True
+    return cc.is_market_open_today()
 
 
 # ── 경제지표 캘린더 (하드코딩 + FRED API 보조) ────────────────────────────────
