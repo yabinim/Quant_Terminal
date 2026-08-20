@@ -76,6 +76,20 @@ DIRECTION_LAG = 5          # 약 1주
 # 업종 데이터는 결측이 흔하다(159개 중 10개는 아예 데이터가 없었다).
 MIN_COVERAGE = 0.70
 
+# 윈저화 클립(일간 %). 극단값이 순위를 흔드는지 **재보기 위한** 진단용이다.
+#
+# 왜 필요한가: averageChange 는 업종 내 상장 종목 전체의 동일가중 평균이라
+# 마이크로캡·투기적 소형주가 업종 평균을 통째로 흔든다. 실측에서
+# Tobacco 120일 -51.8%, Agricultural Inputs -75.4% 가 나왔는데, 같은 기간
+# 실제 담배 대형주(MO/PM/BTI)는 올랐다. 즉 이 버킷은 우리가 아는 그 업종이
+# 아니다.
+#
+# ⚠️ 다만 '크기가 왜곡됐다'가 곧 '순서도 무작위다'는 아니다. 백테스트에서
+#    무작위 30회 중 1회만 최고 설정을 이겼으므로 순위에는 정보가 있었다.
+#    그래서 채택 여부를 추측으로 정하지 않고, 원본과 윈저화의 **순위 상관**을
+#    재서 결정한다.
+WINSOR_CLIP = 5.0
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 시트 파싱 — 순수 함수. gspread 를 모르는 채로 값 배열만 받는다.
@@ -157,11 +171,15 @@ def build_row(header, records, date_str) -> list:
 # ══════════════════════════════════════════════════════════════════════════
 # 모멘텀 · 백분위 — 순수 계산
 # ══════════════════════════════════════════════════════════════════════════
-def momentum(series, lookback, end=None):
+def momentum(series, lookback, end=None, clip=None):
     """최근 lookback 봉의 누적 수익률. 데이터가 모자라면 None.
 
     series 는 일간 변화율(%) 리스트다. 누적은 복리로 곱한다 —
     단순합은 20일만 돼도 눈에 띄게 어긋난다.
+
+    clip: 주어지면 일간 값을 ±clip(%) 으로 자른 뒤 누적한다(윈저화).
+      극단값이 순위에 얼마나 영향을 주는지 재기 위한 것이고, 채택 여부는
+      원본과의 순위 상관을 보고 결정한다.
     """
     n = len(series) if end is None else end
     if n <= 0 or lookback <= 0 or n < lookback:
@@ -172,9 +190,19 @@ def momentum(series, lookback, end=None):
         return None                          # 결측이 많으면 신뢰하지 않는다
     lvl = 1.0
     for v in window:
-        if v is not None:
-            lvl *= (1.0 + v / 100.0)
+        if v is None:
+            continue
+        if clip is not None:
+            v = max(-clip, min(clip, v))
+        lvl *= (1.0 + v / 100.0)
     return lvl - 1.0
+
+
+def count_extremes(series, clip, lookback=None):
+    """창 안에서 |값| > clip 인 일수와 전체 유효 일수 → (초과, 전체)."""
+    w = series if lookback is None else series[max(0, len(series) - lookback):]
+    seen = [v for v in w if v is not None]
+    return sum(1 for v in seen if abs(v) > clip), len(seen)
 
 
 def rank_percentile(mom_map) -> dict:
@@ -196,7 +224,8 @@ def rank_percentile(mom_map) -> dict:
     return out
 
 
-def compute_ranks(parsed, lookbacks=LOOKBACKS, direction_lag=DIRECTION_LAG) -> dict:
+def compute_ranks(parsed, lookbacks=LOOKBACKS, direction_lag=DIRECTION_LAG,
+                  clip=None) -> dict:
     """파싱 결과 → {업종: {mom_20, pct_20, pct_20_prev, mom_120, pct_120, ...}}.
 
     pct_*_prev 는 direction_lag 봉 전의 백분위다. "상위 8% (1주 전 24%)" 처럼
@@ -211,11 +240,12 @@ def compute_ranks(parsed, lookbacks=LOOKBACKS, direction_lag=DIRECTION_LAG) -> d
         return out
 
     for lb in lookbacks:
-        cur = {nm: momentum(s, lb) for nm, s in data.items()}
+        cur = {nm: momentum(s, lb, clip=clip) for nm, s in data.items()}
         pct = rank_percentile(cur)
         prev_end = n - direction_lag
         if prev_end >= lb:
-            prev = {nm: momentum(s, lb, end=prev_end) for nm, s in data.items()}
+            prev = {nm: momentum(s, lb, end=prev_end, clip=clip)
+                    for nm, s in data.items()}
             pct_prev = rank_percentile(prev)
         else:
             pct_prev = {}
@@ -227,7 +257,8 @@ def compute_ranks(parsed, lookbacks=LOOKBACKS, direction_lag=DIRECTION_LAG) -> d
     for nm in out:
         out[nm]["as_of"] = dates[-1]
         out[nm]["n_universe"] = len(
-            [1 for x in data.values() if momentum(x, lookbacks[0]) is not None])
+            [1 for x in data.values()
+             if momentum(x, lookbacks[0], clip=clip) is not None])
     return out
 
 
