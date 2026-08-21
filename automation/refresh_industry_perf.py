@@ -344,12 +344,18 @@ def do_ranks(sh):
             print("    (산출 가능한 업종 없음)")
             continue
         rows.sort()
-        print("    ── 상위 15")
+        n_uns = sum(1 for nm, v in ranks.items()
+                    if v.get("stable_%d" % lb) is False)
+        print("    안정성: 불안정 " + str(n_uns) + "개 (원본 vs 윈저화 백분위 "
+              + "%.0f%%p 초과 차이)" % ic.STABILITY_GAP)
+        print("    ── 상위 15   (⚠️ = 불안정 · 화면에서 걸러야 할 후보)")
         for p, nm, m, desc in rows[:15]:
-            print("      %5.1f%%  %-44s %+7.1f%%" % (p, nm[:44], 100.0 * m))
+            flag = "" if ranks[nm].get("stable_%d" % lb) is not False else "  ⚠️"
+            print("      %5.1f%%  %-42s %+7.1f%%%s" % (p, nm[:42], 100.0 * m, flag))
         print("    ── 하위 5")
         for p, nm, m, desc in rows[-5:]:
-            print("      %5.1f%%  %-44s %+7.1f%%" % (p, nm[:44], 100.0 * m))
+            flag = "" if ranks[nm].get("stable_%d" % lb) is not False else "  ⚠️"
+            print("      %5.1f%%  %-42s %+7.1f%%%s" % (p, nm[:42], 100.0 * m, flag))
 
     # ── 온전성 검사 ─────────────────────────────────────────────────────
     # 두 창의 순위가 완전히 같으면 창 하나가 무의미하다는 뜻이고,

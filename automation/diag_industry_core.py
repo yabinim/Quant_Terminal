@@ -194,10 +194,16 @@ def test_ranks_and_describe():
     #    변화가 안 잡혔다. **검사 대상이 아니라 검사가 틀렸던 것.**
     #    급등이 최근 DIRECTION_LAG 봉 안에서만 일어나야 t-5 시점 창에는
     #    안 들어간다. 그래야 순위 이동이 생긴다.
+    # ⚠️ 일간 값을 WINSOR_CLIP(±5%) 안에 둔다.
+    #    처음엔 급등을 30%/일 로 잡았다가 방향 검사가 실패했는데, 원인은
+    #    코드가 아니라 **테스트 데이터가 비현실적**이었던 것이다 —
+    #    안정성 플래그가 "극단값에 흔들리는 업종"으로 정확히 잡아냈고,
+    #    불안정 업종은 설계상 방향(↑↓)을 안 붙인다.
+    #    실제 일간 업종 평균이 30% 씩 움직일 리 없으므로 데이터를 고쳤다.
     others = [0.30, 0.25, 0.20, 0.15, 0.10, 0.05, 0.02, -0.05, -0.10]
     rows2 = []
     for i in range(200):
-        riser = -2.0 if i < 200 - ic.DIRECTION_LAG else 30.0
+        riser = -0.2 if i < 200 - ic.DIRECTION_LAG else 4.9
         rows2.append(("2026-%02d-%02d" % (1 + i // 28, 1 + i % 28),
                       [riser] + others))
     names2 = ["RISER"] + ["X%d" % k for k in range(len(others))]
@@ -210,7 +216,7 @@ def test_ranks_and_describe():
     # 반대 방향도 확인 — 검사가 한쪽만 잡으면 반쪽짜리다
     rows3 = []
     for i in range(200):
-        faller = 3.0 if i < 200 - ic.DIRECTION_LAG else -30.0
+        faller = 0.4 if i < 200 - ic.DIRECTION_LAG else -4.9
         rows3.append(("2026-%02d-%02d" % (1 + i // 28, 1 + i % 28),
                       [faller] + others))
     names3 = ["FALLER"] + ["X%d" % k for k in range(len(others))]
@@ -220,6 +226,62 @@ def test_ranks_and_describe():
 
     chk("데이터 0행이면 예외 없이 빈 결과",
         ic.compute_ranks({"data": {}, "dates": []}) == {})
+
+    # ── 안정성 플래그 ───────────────────────────────────────────────────
+    # 실측에서 Oil & Gas Energy 가 원본 9.6% → 윈저화 92.8% 로 튀었다.
+    # 집계 지표(순위 상관 0.941)로는 통과했지만 그 업종은 화면 상위 15 에
+    # 뜰 자리였다. 업종별로 남겨야 잡힌다.
+    # ⚠️ 이 검사도 처음엔 데이터가 틀렸다. spike 를 [0.5]*195 + [60]*5 로 잡았더니
+    #    gap=0 이 나왔는데, **맞는 결과였다** — 윈저화해도 여전히 1위였기
+    #    때문이다. 안정성은 **값이 아니라 순위**를 잰다. 값이 아무리 이상해도
+    #    순위가 안 바뀌면 화면(백분위)에는 영향이 없으므로 안정이다.
+    #    (실측의 Tobacco 가 정확히 이 경우다 — 값 -51.8% 인데 변동 목록에 없었다.)
+    #
+    #    순위가 흔들리려면 **기저가 남들보다 낮아야** 한다. 급등 덕분에 1위지만
+    #    급등을 자르면 중하위로 내려가는 형태 — 그게 Oil & Gas Energy 였다.
+    calm = [0.5] * 200
+    spike = [-1.5] * 195 + [60.0] * 5
+    ynames = ["Y%d" % k for k in range(9)]
+    rows4 = []
+    for i in range(200):
+        rows4.append(("2026-%02d-%02d" % (1 + i // 28, 1 + i % 28),
+                      [calm[i], spike[i]] + others))
+    r4 = ic.compute_ranks(ic.parse_perf_values(
+        _sheet(["CALM", "SPIKE"] + ynames, rows4)))
+    chk("극단값 업종은 불안정으로 표시", r4["SPIKE"]["stable_20"] is False,
+        "gap=" + str(r4["SPIKE"].get("gap_20")))
+    chk("평온한 업종은 안정", r4["CALM"]["stable_20"] is True,
+        "gap=" + str(r4["CALM"].get("gap_20")))
+    chk("gap 은 %p 단위 양수", (r4["SPIKE"].get("gap_20") or 0) > ic.STABILITY_GAP)
+    chk("STABILITY_GAP 상수 20%p", abs(ic.STABILITY_GAP - 20.0) < 1e-9)
+    chk("불안정이면 방향 화살표를 붙이지 않는다",
+        "⚠️불안정" in ic.describe(r4["SPIKE"])
+        and "↑" not in ic.describe(r4["SPIKE"]),
+        ic.describe(r4["SPIKE"]))
+    chk("is_stable — 안정 True", ic.is_stable(r4["CALM"]) is True)
+    chk("is_stable — 불안정 False", ic.is_stable(r4["SPIKE"]) is False)
+    chk("is_stable — 판정 불가(None)는 False (모르면 안 보여준다)",
+        ic.is_stable({"stable_20": None}) is False)
+
+    # Tobacco 형 — 값은 극단이지만 윈저화해도 순위가 그대로면 **안정**이다.
+    # 화면에 뜨는 건 백분위이므로 순위가 안 바뀌면 표시에 문제가 없다.
+    top_wild = [0.5] * 195 + [60.0] * 5       # 기저가 남들보다 높다
+    rows5 = []
+    for i in range(200):
+        rows5.append(("2026-%02d-%02d" % (1 + i // 28, 1 + i % 28),
+                      [top_wild[i]] + others))
+    r5 = ic.compute_ranks(ic.parse_perf_values(_sheet(["WILD"] + ynames, rows5)))
+    chk("값은 극단이나 순위가 안 바뀌면 안정 (Tobacco 형)",
+        r5["WILD"]["stable_20"] is True,
+        "gap=" + str(r5["WILD"].get("gap_20")))
+    chk("with_stability=False 면 gap 을 안 만든다",
+        ic.compute_ranks(ic.parse_perf_values(
+            _sheet(["CALM", "SPIKE"] + ynames, rows4)),
+            with_stability=False)["SPIKE"]["gap_20"] is None)
+    chk("clip 지정 시에도 안정성은 원본 대비로 잰다",
+        (ic.compute_ranks(ic.parse_perf_values(
+            _sheet(["CALM", "SPIKE"] + ynames, rows4)),
+            clip=ic.WINSOR_CLIP)["SPIKE"].get("gap_20") or 0) > 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -317,8 +379,28 @@ def test_mutation():
     ic.momentum = orig_m2
     chk("M6 clip 인자 무시 (윈저화 진단 무력화) → 검출", caught)
 
+    # M7: 안정성 판정을 항상 True 로 → 불안정 업종이 그냥 표시된다
+    def stability_ok():
+        others_ = [0.30, 0.25, 0.20, 0.15, 0.10, 0.05, 0.02, -0.05, -0.10]
+        yn = ["Y%d" % k for k in range(9)]
+        rows_ = []
+        for i in range(200):
+            rows_.append(("2026-%02d-%02d" % (1 + i // 28, 1 + i % 28),
+                          [0.5, (-1.5 if i < 195 else 60.0)] + others_))
+        rr = ic.compute_ranks(ic.parse_perf_values(
+            _sheet(["CALM", "SPIKE"] + yn, rows_)))
+        return rr["SPIKE"]["stable_20"] is False
+
+    chk("기준 — 안정성 판정 정상", stability_ok())
+    orig_s = ic.STABILITY_GAP
+    ic.STABILITY_GAP = 1e9
+    caught = not stability_ok()
+    ic.STABILITY_GAP = orig_s
+    chk("M7 안정성 임계 무한대 (전부 안정 처리) → 검출", caught)
+
     chk("뮤테이션 원복 후 정상",
-        align_ok() and direction_ok() and missing_ok() and clip_ok())
+        align_ok() and direction_ok() and missing_ok() and clip_ok()
+        and stability_ok())
 
 
 # ══════════════════════════════════════════════════════════════════════════
