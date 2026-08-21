@@ -90,6 +90,25 @@ MIN_COVERAGE = 0.70
 #    재서 결정한다.
 WINSOR_CLIP = 5.0
 
+# 원본 백분위와 윈저화 백분위가 이만큼(%p) 넘게 벌어지면 **불안정**으로 본다.
+#
+# 왜 전환이 아니라 플래그인가
+# ───────────────────────────
+# 실측(2026-08-21, 149업종 3년):
+#     [20일]  클립 3.8%  순위상관 0.989  상위15 교집합 14/15
+#     [120일] 클립 3.9%  순위상관 0.941  상위15 교집합 12/15
+# 집계로는 통과했다. 그런데 개별로 보면
+#     Oil & Gas Energy   원본 9.6% → 윈저화 92.8%  (+83.2%p)
+# 원본 상위 10% 인데 윈저화하면 하위 8% 다. 단일 종목 아티팩트가 거의
+# 확실한데, 이게 **화면 상위 15 에 뜰 자리**에 있었다.
+#
+# 반대로 Tobacco 는 변동 목록에 없었다 — 크기는 이상해도(120일 -51.8%)
+# 버킷 전체가 움직인 것이라 순위는 일관된다.
+#
+# 즉 원본을 통째로 버릴 근거도, 그냥 믿을 근거도 없다. 그래서 **불일치 자체를
+# 신뢰도 신호로** 쓴다. 모르는 것을 아는 척 표시하지 않는 쪽이 맞다.
+STABILITY_GAP = 20.0
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 시트 파싱 — 순수 함수. gspread 를 모르는 채로 값 배열만 받는다.
@@ -225,13 +244,33 @@ def rank_percentile(mom_map) -> dict:
 
 
 def compute_ranks(parsed, lookbacks=LOOKBACKS, direction_lag=DIRECTION_LAG,
-                  clip=None) -> dict:
-    """파싱 결과 → {업종: {mom_20, pct_20, pct_20_prev, mom_120, pct_120, ...}}.
+                  clip=None, with_stability=True,
+                  stability_gap=None) -> dict:
+    """파싱 결과 → {업종: {mom_20, pct_20, pct_20_prev, gap_20, stable_20, ...}}.
 
     pct_*_prev 는 direction_lag 봉 전의 백분위다. "상위 8% (1주 전 24%)" 처럼
     **방향**을 보여주기 위한 것이다. 지금 좋은 것보다 올라오는 중인 것이
     초기 수혜주 발굴 철학에 맞다.
+
+    with_stability=True 면 윈저화 백분위를 함께 구해 **불일치 폭**을 남긴다.
+
+        gap_{lb}     |원본 백분위 − 윈저화 백분위|  (%p)
+        stable_{lb}  gap <= stability_gap 인가
+
+    극단값이 특정 업종의 순위만 크게 흔드는 경우가 실제로 있다
+    (Oil & Gas Energy: 9.6% → 92.8%). 집계 지표로는 안 잡히므로 업종별로
+    남겨야 한다. 추가 API 호출은 없다 — 같은 시계열을 한 번 더 계산할 뿐이다.
+
+    clip 을 주면 **윈저화 쪽이 주 백분위**가 된다. 그 경우에도 안정성 비교는
+    원본 대비로 계산한다(윈저화끼리 비교하면 항상 0 이라 의미가 없다).
     """
+    # ⚠️ 기본값을 `stability_gap=STABILITY_GAP` 으로 쓰면 **정의 시점에 값이
+    #    박힌다.** 나중에 상수를 조정해도 반영되지 않아, 튜닝했다고 생각하는
+    #    사람과 실제 동작이 어긋난다(뮤테이션 M7 이 이걸 잡아냈다).
+    #    None 으로 받고 호출 시점에 읽는다.
+    if stability_gap is None:
+        stability_gap = STABILITY_GAP
+
     data = parsed.get("data") or {}
     dates = parsed.get("dates") or []
     n = len(dates)
@@ -239,9 +278,20 @@ def compute_ranks(parsed, lookbacks=LOOKBACKS, direction_lag=DIRECTION_LAG,
     if n == 0:
         return out
 
+    need_wins = with_stability or (clip is not None)
+
     for lb in lookbacks:
-        cur = {nm: momentum(s, lb, clip=clip) for nm, s in data.items()}
-        pct = rank_percentile(cur)
+        raw = {nm: momentum(s, lb) for nm, s in data.items()}
+        pct_raw = rank_percentile(raw)
+        pct_wins = {}
+        if need_wins:
+            wins = {nm: momentum(s, lb, clip=WINSOR_CLIP)
+                    for nm, s in data.items()}
+            pct_wins = rank_percentile(wins)
+
+        primary_mom = (wins if clip is not None else raw)
+        primary_pct = (pct_wins if clip is not None else pct_raw)
+
         prev_end = n - direction_lag
         if prev_end >= lb:
             prev = {nm: momentum(s, lb, end=prev_end, clip=clip)
@@ -249,10 +299,21 @@ def compute_ranks(parsed, lookbacks=LOOKBACKS, direction_lag=DIRECTION_LAG,
             pct_prev = rank_percentile(prev)
         else:
             pct_prev = {}
+
         for nm in data:
-            out[nm]["mom_%d" % lb] = cur.get(nm)
-            out[nm]["pct_%d" % lb] = pct.get(nm)
+            out[nm]["mom_%d" % lb] = primary_mom.get(nm)
+            out[nm]["pct_%d" % lb] = primary_pct.get(nm)
             out[nm]["pct_%d_prev" % lb] = pct_prev.get(nm)
+            a, b = pct_raw.get(nm), pct_wins.get(nm)
+            if need_wins and a is not None and b is not None:
+                g = abs(a - b)
+                out[nm]["gap_%d" % lb] = g
+                out[nm]["stable_%d" % lb] = bool(g <= stability_gap)
+            else:
+                out[nm]["gap_%d" % lb] = None
+                # 판정 불가는 '불안정'이 아니라 '모름'이다. 없는 정보를
+                # 안정으로 단정하면 과신이 된다 → None 으로 남긴다.
+                out[nm]["stable_%d" % lb] = None
 
     for nm in out:
         out[nm]["as_of"] = dates[-1]
@@ -263,10 +324,13 @@ def compute_ranks(parsed, lookbacks=LOOKBACKS, direction_lag=DIRECTION_LAG,
 
 
 def describe(rank_row, lookback=LOOKBACKS[0]) -> str:
-    """표시 문자열. '상위 8% (1주 전 24%)' 형태. 없으면 빈 문자열.
+    """표시 문자열. '상위 8% (↑ 1주 전 24%)' 형태. 없으면 빈 문자열.
 
     UI 문자열을 코어에 둔 이유: app 과 자동화(이메일)가 같은 표현을 쓰게
     하기 위함이다. 표현이 갈리면 같은 값을 두 곳에서 다르게 읽는다.
+
+    ⚠️ 불안정 업종은 방향(↑↓)을 붙이지 않는다. 백분위 자체가 극단값에
+       흔들리는데 그 변화를 방향으로 읽으면 잡음을 신호로 만든다.
     """
     if not rank_row:
         return ""
@@ -274,6 +338,8 @@ def describe(rank_row, lookback=LOOKBACKS[0]) -> str:
     if p is None:
         return ""
     s = "상위 %.0f%%" % p
+    if rank_row.get("stable_%d" % lookback) is False:
+        return s + " ⚠️불안정"
     q = rank_row.get("pct_%d_prev" % lookback)
     if q is not None:
         if q - p >= 3.0:
@@ -283,6 +349,12 @@ def describe(rank_row, lookback=LOOKBACKS[0]) -> str:
         else:
             s += " (— 1주 전 %.0f%%)" % q
     return s
+
+
+def is_stable(rank_row, lookback=LOOKBACKS[0]) -> bool:
+    """표시해도 되는가. **판정 불가(None)는 불안정으로 취급한다** —
+    모르는 것을 보여주지 않는 쪽이 과신 방지에 맞다."""
+    return rank_row.get("stable_%d" % lookback) is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
