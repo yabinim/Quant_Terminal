@@ -52,6 +52,21 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #     파라미터 문자열이 틀리면 402 도 404 도 아닌 **빈 배열**이 온다 —
 #     가장 찾기 어려운 실패라 이름을 눈으로 확보해야 한다.
 #
+#   tierB4 (3콜) — tierB3 의 깊이 판정 재측정
+#     ⚠️ tierB3 는 `from = today-3년` 을 보내 3년을 받았고, 그게 "플랜 한도
+#        3년"으로 기록됐다. **요청한 날짜부터 왔다는 건 한도를 못 쟀다는 뜻**
+#        이지 한도가 3년이라는 뜻이 아니다. 판별력 없는 지표를 판별자로 썼다.
+#        반례: historical-price-eod 의 진짜 한도는 실측 5년(1255봉)이었다.
+#     ① 좁은 창(20일) 요청   불량 입력 검사 — from/to 가 응답을 자르는가.
+#                            판별자는 건수가 아니라 응답 날짜 **범위 폭**.
+#                            여기가 🔴 면 ②③ 는 물론 tierB3 기록도 무효다.
+#     ② 업종 7년 요청        min(date) 가 요청 from 에서 멈추나, 그 뒤에서 멈추나
+#     ③ 섹터 7년 요청        동일
+#
+#     이 3콜이 롤링 워크포워드의 질을 가른다:
+#       3년이면 → 검증창 6개가 한 국면(상승장) 연속 6분기에 갇힌다
+#       5년이면 → 학습창에 2022 하락장이 들어온다
+#
 #   tierC (4콜) — 탐색적
 #     senate-latest · house-latest
 #     institutional-ownership/holder-performance-summary · historical-industry-pe
@@ -60,7 +75,7 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #     grades / grades-consensus / ratings-snapshot 의 응답 키를 나란히 출력.
 #     "grades?symbol= 가 기존 등급 엔드포인트와 겹치는가"에 대한 직접 답.
 #
-#   all (29콜)
+#   all (32콜)
 #
 # ── 판정 읽는 법 ──────────────────────────────────────────────────────
 #   ✅ LIVE    200 + 데이터 + 필요 필드 전부 존재    → 설계 진행 가능
@@ -83,13 +98,14 @@ on:
   workflow_dispatch:
     inputs:
       tier:
-        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierB2=B후속 5콜 / tierB3=B-1직전 3콜 / tierC=탐색 4콜 / grades=등급중복 3콜 / all=29콜)"
+        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierB2=B후속 5콜 / tierB3=B-1직전 3콜 / tierB4=깊이재측정 3콜 / tierC=탐색 4콜 / grades=등급중복 3콜 / all=32콜)"
         type: choice
         options:
           - tierA
           - tierB
           - tierB2
           - tierB3
+          - tierB4
           - tierC
           - grades
           - all
