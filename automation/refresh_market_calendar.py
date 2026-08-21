@@ -163,8 +163,34 @@ def main():
         print("  규칙 " + str(y) + ": " + str(n) + "일")
 
     if half:
-        print("  반일장 " + str(len(half)) + "일: "
+        print("  반일장(FMP) " + str(len(half)) + "일: "
               + ", ".join(d + "(" + t + ")" for d, t in sorted(half.items())))
+
+    # ── 반일장 대조 — 규칙이 판정하고 FMP 가 검증한다 ────────────────────────
+    # app.py 헤더와 2PM 가드는 규칙 계산으로 반일장을 판정한다(핫 패스라 시트를
+    # 못 읽는다). 그 규칙이 여전히 맞는지 확인하는 유일한 채널이 여기다.
+    # 전휴장의 [CALENDAR-ALERT] 와 같은 역할.
+    mm = diff.get("half_mismatch") or {}
+    _fo, _ro, _td = (mm.get("fmp_only") or {}, mm.get("rule_only") or {},
+                     mm.get("time_diff") or {})
+    for y in years:
+        n = len(cc.nyse_early_close_days(y))
+        print("  규칙 반일장 " + str(y) + ": " + str(n) + "일")
+    if _fo or _ro or _td:
+        print("  🔴 [HALFDAY-ALERT] 규칙과 FMP 가 어긋난다 — 규칙 수정 필요")
+        for d, t in sorted(_fo.items()):
+            print("     FMP 에만 있음  " + d + " (" + str(t) + ")"
+                  " — 규칙이 못 잡는 조기 마감")
+        for d, t in sorted(_ro.items()):
+            print("     규칙에만 있음  " + d + " (" + str(t) + ")"
+                  " — 규칙이 잘못 반일장이라고 한다")
+        for d, (rt, ft) in sorted(_td.items()):
+            print("     시각 불일치    " + d + " 규칙=" + str(rt)
+                  + " FMP=" + str(ft))
+        print("     ⚠️ app.py 헤더와 2PM 가드가 이 규칙을 쓴다. "
+              "calendar_core.nyse_early_close_days 를 확인할 것.")
+    else:
+        print("  ✅ [HALFDAY-OK] 반일장 규칙과 FMP 일치")
 
     if missing:
         # 규칙이 휴장이라는데 FMP 응답에 없다. 규칙 오류이거나 응답 범위 누락.

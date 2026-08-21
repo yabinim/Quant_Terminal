@@ -1461,6 +1461,28 @@ def main():
         print("[SKIP] 오늘은 NYSE 휴장일 — 평가 건너뜀(카운터 미진행).")
         return
 
+    # ── 반일장 가드 — intraday 전용 ──────────────────────────────────────────
+    # 2PM 잡은 반일장(13:00 마감)에도 그대로 돌았다. 그러면 /quote 가 돌려주는
+    # 13:00 **종가**를 _with_intraday_price 가 "잠정" 봉으로 주입하고 "장중
+    # 헤드업" 메일을 보낸다. 숫자는 맞고 라벨이 틀린다 — 장은 이미 끝났다.
+    # 3시간 뒤 5PM EOD 가 같은 숫자로 확정 메일을 또 보내므로 중복이기도 하다.
+    #
+    # eod 모드는 영향 없다(17:00 실행이라 반일장이든 아니든 마감 후다).
+    # fail-open: 판정 실패 시 기존 동작 유지 — 헤드업을 통째로 놓치는 쪽이 더 나쁘다.
+    if args.mode == "intraday" and args.scope != "metrics":
+        try:
+            _ct = cc.session_close_time(None)
+            if _ct and _ct != cc.REGULAR_CLOSE_TIME:
+                _n = datetime.now(_ET)
+                if (_n.hour * 60 + _n.minute) >= cc.close_minutes(_ct):
+                    print("[SKIP] 반일장(" + _ct + " 마감) — 이미 장 마감. "
+                          "장중 헤드업 생략(카운터 미진행).")
+                    print("       확정 결과는 5PM EOD 실행이 보낸다.")
+                    return
+                print("[INFO] 반일장(" + _ct + " 마감) — 아직 장중. 정상 진행.")
+        except Exception as e:
+            print("[INFO] 반일장 판정 생략(fail-open): " + str(e))
+
     today = datetime.now(_ET).strftime("%Y-%m-%d")
     do_wl = args.scope in ("watchlist", "both")
     do_pf = args.scope in ("portfolio", "both")
