@@ -58,11 +58,13 @@ SCEN["S1 정상"] = {
 # 초판 판별자(건수 비교)는 20 != 100 이라 이걸 놓쳤다 — 회귀로 고정한다.
 SCEN["S2 필터무시"] = dict(SCEN["S1 정상"])
 SCEN["S2 필터무시"].update({
-    # ⚠️ 핵심: 요청 심볼(OLD0/DEAD0)이 결과에 **없다.** 실측이 그랬다
-    #    (USGX 를 요청했는데 AAUM·ADIG.V·AGGI… 가 왔다).
-    "symbol-change?symbol=OLD0": ("OK", sc_feed(100, start=500), "100건"),
-    "delisted-companies?symbol=DEAD0": ("OK", dl_feed(100, start=500), "100건"),
-    "__from_to__": ("OK", sc_feed(100, start=500), "100건"),
+    # ⚠️ 2026-08-21 실측 형태: 100건 · 심볼 100종 · **시드도 그 안에 있다.**
+    #    시드를 같은 피드에서 뽑았으니 포함은 구조적으로 보장된다 —
+    #    그래서 '시드 포함 여부' 판별자는 이걸 놓쳤다(2차 오판). 회귀로 고정한다.
+    #    판별력이 있는 건 '심볼이 몇 종인가' 하나뿐이다.
+    "symbol-change?symbol=OLD0": ("OK", sc_feed(100), "100건"),
+    "delisted-companies?symbol=DEAD0": ("OK", dl_feed(100), "100건"),
+    "__from_to__": ("OK", sc_feed(100), "100건"),
 })
 
 SCEN["S3 시드없음"] = {

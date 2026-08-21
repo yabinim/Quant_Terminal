@@ -206,15 +206,16 @@ def main():
     print("\n[1단계] 심볼 필터 — '지원'과 '조용히 무시됨'을 구분한다")
 
     def filter_check(tag, path, seed, unfiltered, sym_fields):
-        """필터 결과가 요청 심볼을 담고 있는지로 판정한다.
+        """결과 심볼이 **한 종류인가**로 판정한다.
 
-        ⚠️ 초판은 **건수 비교**를 판별자로 썼다(무필터와 건수가 같으면 IGNORED).
-           그게 틀렸다. 무필터 호출은 limit=20 이고 필터 호출은 limit 이 없어
-           기본 100건이 온다 — 건수가 달라 IGNORED 분기를 그냥 빠져나갔고,
-           심볼이 하나도 안 맞는 전역 피드가 'PARTIAL(판단 보류)' 로 찍혔다.
-           제가 잡으려던 함정에 판별자가 걸렸다.
+        ⚠️ 판별자를 두 번 틀렸다. 기록해 둔다:
+          1차 — 건수 비교(무필터와 같으면 IGNORED). 무필터는 limit=20, 필터는
+                limit 없이 기본 100건이라 건수가 달랐고 분기를 그냥 빠져나갔다.
+          2차 — 시드 포함 여부. **시드를 그 피드에서 뽑았으니 포함은 구조적으로
+                보장된다.** 아무것도 증명하지 못하는 지표였다.
 
-           올바른 판별자는 **요청한 심볼이 결과에 들어 있는가**다. 건수는 무관하다.
+        판별력이 있는 건 하나뿐이다: 심볼 필터가 동작하면 결과 심볼은
+        **한 종류**여야 한다. 100건에 99종이 섞였으면 그건 전역 피드다.
         """
         if not seed:
             print(f"  ⏭️  {tag} — 시드 없음, 건너뜀")
@@ -227,18 +228,23 @@ def main():
         syms.discard("")
         seed_u = str(seed).strip().upper()
 
-        if seed_u not in syms:
+        if len(syms) > 1:
+            _others = sorted(syms - {seed_u})
             show(tag, "IGNORED",
-                 f"{len(d)}건 — **요청 심볼 {seed_u} 가 결과에 없다.** "
-                 f"파라미터가 무시되고 전역 피드가 왔다. 샘플: {sorted(syms)[:5]}")
+                 f"{len(d)}건 · 심볼 {len(syms)}종 — **필터가 먹으면 1종이어야 한다. "
+                 f"전역 피드가 왔다.** "
+                 f"시드 {seed_u} {'포함' if seed_u in syms else '미포함'}"
+                 f"(피드에서 뽑았으니 포함 자체는 무의미). 타 심볼 샘플: {_others[:5]}")
             return "IGNORED"
-        if syms <= {seed_u}:
+        if syms == {seed_u}:
             show(tag, "OK", f"{len(d)}건 — 전부 {seed_u}. 필터 정상 동작")
             return "FILTER_OK"
-        show(tag, "PARTIAL",
-             f"{len(d)}건 — {seed_u} 포함이나 다른 심볼 {len(syms) - 1}종 혼재. "
-             f"샘플: {sorted(syms - {seed_u})[:5]}")
-        return "PARTIAL"
+        if not syms:
+            show(tag, "ODD", f"{len(d)}건 — 심볼 필드를 읽지 못했다")
+            return "ODD"
+        show(tag, "ODD",
+             f"{len(d)}건 — 1종이지만 시드가 아니다: {sorted(syms)}")
+        return "ODD"
 
     FIND["sc_symbol_filter"] = filter_check(
         f"P3  symbol-change?symbol={seed_old}",
