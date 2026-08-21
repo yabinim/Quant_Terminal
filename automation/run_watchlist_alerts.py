@@ -399,6 +399,145 @@ def build_market_gate_banner(gate: dict | None, applied_users=None) -> str:
             f"<br><span style='font-size:12px;opacity:.8'>판정 신호: {names}</span></p>")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 데이터 미수신 추적 (A-2a)
+# ══════════════════════════════════════════════════════════════════════════
+# 왜 필요한가
+# ───────────
+# 가격 이력이 빈 배열로 오면 평가 루프가 `continue` 로 **조용히 건너뛴다.**
+# 티커 변경·상장폐지가 대표적 원인이고, 그 결과는 심각도가 다르다.
+#
+#   워치리스트에서 발생 → 매수 기회 상실
+#   보유에서 발생       → **매도 신호가 영구히 오지 않는다** (손실방지 직격)
+#
+# 지금까지는 로그에도 남지 않았다. 최소한 사용자에게 알리는 것이 이 블록이다.
+# FMP 추가 호출은 0 이다 — 이미 실패한 조회의 결과를 주워 담을 뿐이다.
+#
+# 왜 '연속 N일' 이 아니라 '비율' 인가
+# ──────────────────────────────────
+# 일시적 API 장애로 여러 티커가 한꺼번에 빌 수 있다. 그걸 종목별 경고로 쏟으면
+# 메일 폭탄이 된다. '연속 N일' 조건은 판별력이 좋지만 **상태 저장이 필요해서
+# 시트 쓰기가 생긴다.**
+#
+# 비율은 상태 없이 같은 판별을 한다 — 소수가 비면 종목 문제, 다수가 비면 API
+# 문제다. 시트 쓰기 0, 추가 호출 0.
+_NODATA_RATIO_ALERT = 0.30   # 이 비율을 넘으면 종목 문제가 아니라 API 장애로 본다
+_NODATA_MIN_SAMPLE = 5       # 표본이 이보다 적으면 비율이 의미 없다 → 개별 보고
+
+_nodata = {"by_user": {}, "attempted": 0, "missing": 0}
+
+
+def reset_nodata() -> None:
+    """평가 시작 전 초기화. main() 에서 한 번 호출한다."""
+    _nodata["by_user"] = {}
+    _nodata["attempted"] = 0
+    _nodata["missing"] = 0
+
+
+def record_attempt() -> None:
+    """이력 조회를 시도한 종목 1건. 비율의 분모가 된다."""
+    _nodata["attempted"] += 1
+
+
+def record_nodata(uid: str, ticker: str, where: str) -> None:
+    """이력이 비어 건너뛴 종목 기록.
+
+    같은 사용자가 같은 티커를 워치리스트와 보유 양쪽에 갖고 있으면 두 번
+    불린다. 티커 기준으로 합치되 발생 위치는 둘 다 남긴다 — 보유 쪽에서
+    발생했다는 사실이 심각도를 결정하므로 지워선 안 된다.
+    """
+    u = str(uid or "").strip()
+    tk = str(ticker or "").strip().upper()
+    if not u or not tk:
+        return
+    _nodata["missing"] += 1
+    slot = _nodata["by_user"].setdefault(u, {})
+    if tk in slot:
+        if where not in slot[tk]:
+            slot[tk].append(where)
+    else:
+        slot[tk] = [where]
+
+
+def nodata_is_systemic() -> bool:
+    """미수신이 광범위한가 — 종목 문제가 아니라 API 장애로 볼 것인가."""
+    n = _nodata["attempted"]
+    if n < _NODATA_MIN_SAMPLE:
+        return False
+    return (_nodata["missing"] / float(n)) > _NODATA_RATIO_ALERT
+
+
+def nodata_for_user(uid: str) -> list:
+    """해당 사용자의 미수신 목록 → [(티커, "워치리스트/보유"), ...] 정렬본."""
+    slot = _nodata["by_user"].get(str(uid or "").strip()) or {}
+    return [(tk, "·".join(slot[tk])) for tk in sorted(slot)]
+
+
+def nodata_total() -> int:
+    return sum(len(v) for v in _nodata["by_user"].values())
+
+
+def nodata_weight(uid: str) -> int:
+    """제목 건수에 더할 가중치.
+
+    광범위 장애일 때는 티커 수만큼 세면 제목이 부풀어 실제 매매 신호가 묻힌다.
+    그때는 '1건'으로만 센다.
+    """
+    n = len(nodata_for_user(uid))
+    if not n:
+        return 0
+    return 1 if nodata_is_systemic() else n
+
+
+def nodata_log_summary() -> None:
+    n_att, n_mis = _nodata["attempted"], _nodata["missing"]
+    if not n_mis:
+        print(f"[DATA-OK] 이력 미수신 0건 (조회 {n_att}건)")
+        return
+    pct = (100.0 * n_mis / n_att) if n_att else 0.0
+    tag = "DATA-SYSTEMIC" if nodata_is_systemic() else "DATA-MISSING"
+    print(f"[{tag}] 이력 미수신 {n_mis}/{n_att}건 ({pct:.0f}%)")
+    for u, slot in sorted(_nodata["by_user"].items()):
+        for tk in sorted(slot):
+            print(f"    {u}/{tk}: {'·'.join(slot[tk])}")
+
+
+def render_nodata_html(uid: str) -> str:
+    """미수신 섹션 HTML. 없으면 빈 문자열."""
+    items = nodata_for_user(uid)
+    if not items:
+        return ""
+    if nodata_is_systemic():
+        return (
+            "<h2 style='color:#b45309;border-bottom:2px solid #b45309;"
+            "padding-bottom:6px;margin-top:24px'>⚠️ 데이터 미수신 (광범위)</h2>"
+            "<div style='margin:10px 0;padding:12px;border:1px solid #fde68a;"
+            "border-radius:8px;background:#fffbeb'>"
+            f"<div style='font-weight:700'>{len(items)}개 종목의 가격 이력을 받지 못했습니다.</div>"
+            "<div style='color:#555;font-size:14px;margin-top:6px'>"
+            "미수신 비율이 높아 <b>개별 종목 문제가 아니라 데이터 공급 장애</b>로 "
+            "판단했습니다. 해당 종목들은 오늘 평가에서 제외됐습니다 — "
+            "매수·매도 신호가 나오지 않은 것이 '신호 없음'을 뜻하지 않습니다. "
+            "내일도 같은 경고가 반복되면 확인이 필요합니다.</div></div>"
+        )
+    rows = "".join(
+        f"<li style='margin:4px 0'><b>{tk}</b> "
+        f"<span style='color:#666;font-size:13px'>· {where}</span></li>"
+        for tk, where in items
+    )
+    return (
+        "<h2 style='color:#b45309;border-bottom:2px solid #b45309;"
+        "padding-bottom:6px;margin-top:24px'>⚠️ 데이터 미수신</h2>"
+        "<div style='margin:10px 0;padding:12px;border:1px solid #fde68a;"
+        "border-radius:8px;background:#fffbeb'>"
+        f"<ul style='margin:0;padding-left:20px'>{rows}</ul>"
+        "<div style='color:#555;font-size:14px;margin-top:10px'>"
+        "위 종목은 가격 이력이 비어 <b>오늘 평가에서 제외</b>됐습니다. "
+        "<b>보유</b> 종목이라면 매도 신호가 나오지 않습니다. "
+        "티커 변경·상장폐지가 흔한 원인이니 확인하세요.</div></div>"
+    )
+
+
 def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
                           subject_emoji: str, subject_label: str,
                           banner_html: str = "") -> None:
@@ -426,6 +565,9 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
     # 발동 건이 실제로 존재하는 uid 집합(소문자 기준) — 배달 누락 진단용
     _fired = {str(k).strip().lower() for k, v in wl_res.items() if v}
     _fired |= {str(k).strip().lower() for k, v in pf_res.items() if v}
+    # 미수신만 있는 사용자도 메일 대상이다. 배달 누락 진단에 포함시키지 않으면
+    # "미수신 경고가 나갔어야 하는데 안 나갔다"를 아무도 알아채지 못한다.
+    _fired |= {str(k).strip().lower() for k in _nodata["by_user"] if nodata_for_user(k)}
     _delivered: set[str] = set()
 
     def _send_one_user(uid_s: str, to_addr: str | None) -> None:
@@ -435,13 +577,19 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
         _k_pf = _pf_key.get(_u_l)
         _wl_u = {uid_s: wl_res[_k_wl]} if (_k_wl and wl_res.get(_k_wl)) else {}
         _pf_u = {uid_s: pf_res[_k_pf]} if (_k_pf and pf_res.get(_k_pf)) else {}
+        # 데이터 미수신은 **그 자체가 알림**이다. 발동 0건이어도 보유 종목이
+        # 침묵 중이라면 반드시 알려야 하므로 건수에 합산한다. 합산하지 않으면
+        # 침묵을 알리는 메일이 같은 이유로 침묵한다.
+        _nd_html = render_nodata_html(uid_s)
         _n_u = (sum(len(v) for v in _wl_u.values())
-                + sum(len(v) for v in _pf_u.values()))
+                + sum(len(v) for v in _pf_u.values())
+                + nodata_weight(uid_s))
         if not _n_u:
             print(f"[RADAR] '{uid_s}' 발동 0건 — 발송 생략.")
             return
         _ok = send_email(f"{subject_emoji} {subject_label} — {_n_u}건 ({today} ET)",
-                         banner_html + build_email_html(_wl_u, _pf_u, today),
+                         banner_html + build_email_html(_wl_u, _pf_u, today,
+                                                        nodata_html=_nd_html),
                          to_addr=to_addr)
         if _ok:
             _delivered.add(_u_l)
@@ -557,9 +705,14 @@ def _render_sizing_line(plan: dict, account=None) -> str:
     return line
 
 
-def build_email_html(wl_by_user: dict, pf_by_user: dict, today: str) -> str:
+def build_email_html(wl_by_user: dict, pf_by_user: dict, today: str,
+                     nodata_html: str = "") -> str:
     """매매 레이더 이메일 — 🔭 Watchlist(매수)와 💼 Portfolio(보유·매도) 섹션 분리,
-    Portfolio는 account별로 그룹핑."""
+    Portfolio는 account별로 그룹핑.
+
+    nodata_html: 데이터 미수신 섹션(render_nodata_html 결과). 기본값이 빈
+      문자열이라 기존 호출부(인자 3개)는 그대로 동작한다.
+    """
     wl_by_user = wl_by_user or {}
     pf_by_user = pf_by_user or {}
     wl_total = sum(len(v) for v in wl_by_user.values())
@@ -604,6 +757,12 @@ def build_email_html(wl_by_user: dict, pf_by_user: dict, today: str) -> str:
                 parts.append(f"<h4 style='margin:14px 0 4px;color:#444'>🏦 {acct}</h4>")
                 for h in ah:
                     parts.append(_render_hit_card(h))
+
+    # ⚠️ 데이터 미수신 — 매매 섹션 뒤, 푸터 앞.
+    #    맨 위가 아닌 이유: 실제 매매 신호가 우선이고, 미수신은 '평가되지 않은 것'
+    #    이라 신호와 성격이 다르다. 다만 발동 0건일 때는 이게 유일한 본문이 된다.
+    if nodata_html:
+        parts.append(nodata_html)
 
     parts.append(
         "<p style='color:#999;font-size:12px;margin-top:20px'>"
@@ -817,7 +976,11 @@ def eval_watchlist_eod(spy_close, hist_cache, today, earn_blocks=None, earn_user
             if tk not in hist_cache:
                 hist_cache[tk] = _fmp_price_history(tk)
             hist = hist_cache[tk]
+            record_attempt()
             if hist is None or hist.empty:
+                # 조용히 건너뛰지 않는다 — 티커 변경·상장폐지면 이 종목은
+                # 영구히 평가에서 빠진다. FMP 추가 호출은 없다.
+                record_nodata(uid, tk, "워치리스트")
                 laststate_col.append([prev_state]); continue
             an = rc.analyze_ticker(hist, spy_close=spy_close)
             _eblk = (_blocks.get(tk)
@@ -906,7 +1069,11 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
         prev = state_map.get(key, {}).get("last", "")
         try:
             hist = _pf_hist(tk, hist_cache)
+            record_attempt()
             if hist is None or hist.empty:
+                # 🔴 보유 종목의 미수신은 **매도 신호가 영구히 오지 않는다**는
+                #    뜻이다. 워치리스트보다 심각도가 높으므로 반드시 기록한다.
+                record_nodata(uid, tk, "보유")
                 new_rows.append([key, states_csv, prev, today]); continue
             _entry = float(avg) if pd.notna(avg) else None
             an = rc.analyze_ticker(hist, spy_close=spy_close,
@@ -1129,6 +1296,7 @@ def main():
     # metrics 스코프로 단독 백필한다. 장중에는 미완성 봉이 저장되므로 하지 않는다.
     do_metrics = (args.mode == "eod") and args.scope in ("watchlist", "both", "metrics")
 
+    reset_nodata()          # 실행마다 미수신 집계 초기화
     spy_hist = _fmp_price_history("SPY")
     spy_close = spy_hist["Close"] if (spy_hist is not None and not spy_hist.empty) else None
     hist_cache, quote_cache = {}, {}
@@ -1177,11 +1345,15 @@ def main():
                 pf_res = eval_portfolio_eod(spy_close, hist_cache, today)
             total = (sum(len(v) for v in wl_res.values())
                      + sum(len(v) for v in pf_res.values()))
-            if total:
+            nodata_log_summary()
+            # 발동 0건이어도 데이터 미수신이 있으면 발송한다. 미수신은 그 자체가
+            # 알림이고, 여기서 걸러 버리면 침묵을 알리는 경로가 같은 이유로
+            # 침묵한다. 개별 사용자 단위 판단은 _send_one_user 가 다시 한다.
+            if total or nodata_total():
                 dispatch_radar_emails(wl_res, pf_res, today, "🔔", "매매 레이더",
                                       banner_html=build_market_gate_banner(_m_gate, _m_users))
             else:
-                print("[INFO] 발동된 알림 없음 — 이메일 생략.")
+                print("[INFO] 발동된 알림 없음 · 미수신 없음 — 이메일 생략.")
     except Exception as e:
         print(f"[ERROR] 평가 실패: {e}")
         traceback.print_exc()
