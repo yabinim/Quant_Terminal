@@ -64,6 +64,17 @@ INDUSTRY_CORE_VERSION = "1.0.0"
 PERF_SHEET = "Industry_Perf"
 DATE_COL = "Date"
 
+# ── 앱이 읽는 요약 시트 ─────────────────────────────────────────────────
+# 왜 별도 시트인가: Industry_Perf 는 754행 × 150열(약 11만 셀)이다. 앱이
+# 그걸 직접 읽고 모멘텀을 계산하면 Phase 3 첫 진입에 몇 초가 붙는다.
+# 계산은 자동화가 하루 한 번 하고, 앱은 149행짜리 결과만 읽는다.
+# **로딩 시간을 늘리지 않는 것**이 이 프로젝트의 기본 제약이다.
+RANK_SHEET = "Industry_Rank"
+RANK_COLS = ["Industry",
+             "Pct_20", "Pct_20_Prev", "Stable_20",
+             "Pct_120", "Pct_120_Prev", "Stable_120",
+             "N_Universe", "As_Of", "Updated_At"]
+
 # 표시용 모멘텀 창(거래일). 백테스트에서 전 구간 최고는 LB20 이었고,
 # 반분할을 유일하게 통과한 것은 LB120 이었다. 어느 쪽이 맞는지 모르므로
 # 둘 다 보여주고 관찰한다 — 어차피 신호가 아니라 정보다.
@@ -355,6 +366,133 @@ def is_stable(rank_row, lookback=LOOKBACKS[0]) -> bool:
     """표시해도 되는가. **판정 불가(None)는 불안정으로 취급한다** —
     모르는 것을 보여주지 않는 쪽이 과신 방지에 맞다."""
     return rank_row.get("stable_%d" % lookback) is True
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Industry_Rank — 자동화가 쓰고 앱이 읽는 요약본
+# ══════════════════════════════════════════════════════════════════════════
+def _b(v):
+    """bool → 'Y'/'N'/'' . None 은 빈칸이다(판정 불가와 불안정은 다르다)."""
+    if v is None:
+        return ""
+    return "Y" if v else "N"
+
+
+def rank_rows(ranks, now_str: str = "") -> list:
+    """compute_ranks 결과 → Industry_Rank 시트 행(헤더 제외).
+
+    백분위가 두 창 모두 없는 업종은 **행을 만들지 않는다.** 빈 행을 넣으면
+    앱이 '데이터 있음'으로 오해한다.
+    """
+    rows = []
+    for nm in sorted(ranks):
+        v = ranks[nm]
+        p20, p120 = v.get("pct_20"), v.get("pct_120")
+        if p20 is None and p120 is None:
+            continue
+        rows.append([
+            nm,
+            "" if p20 is None else round(p20, 2),
+            "" if v.get("pct_20_prev") is None else round(v["pct_20_prev"], 2),
+            _b(v.get("stable_20")),
+            "" if p120 is None else round(p120, 2),
+            "" if v.get("pct_120_prev") is None else round(v["pct_120_prev"], 2),
+            _b(v.get("stable_120")),
+            v.get("n_universe") or "",
+            v.get("as_of") or "",
+            now_str,
+        ])
+    return rows
+
+
+def parse_rank_values(values) -> dict:
+    """Industry_Rank 시트 → {업종: compute_ranks 와 **같은 형태의 dict**}.
+
+    같은 형태로 맞추는 이유: `describe()` / `is_stable()` 이 앱과 자동화에서
+    똑같이 동작해야 한다. 형태가 갈리면 같은 값을 두 곳에서 다르게 읽는다.
+
+    깨진 입력에는 빈 dict 를 돌려준다 — 표시용이라 없어도 앱이 죽으면 안 된다.
+    """
+    out = {}
+    if not values or len(values) < 2:
+        return out
+    hdr = [str(c).strip() for c in values[0]]
+    if not hdr or hdr[0] != "Industry":
+        return out
+    idx = {c: i for i, c in enumerate(hdr)}
+
+    def _num(r, col):
+        i = idx.get(col)
+        if i is None or i >= len(r):
+            return None
+        return _f(r[i])
+
+    def _tri(r, col):
+        i = idx.get(col)
+        if i is None or i >= len(r):
+            return None
+        t = str(r[i]).strip().upper()
+        if t == "Y":
+            return True
+        if t == "N":
+            return False
+        return None                       # 빈칸 = 판정 불가
+
+    def _txt(r, col):
+        i = idx.get(col)
+        return str(r[i]).strip() if (i is not None and i < len(r)) else ""
+
+    for r in values[1:]:
+        if not r:
+            continue
+        nm = str(r[0]).strip()
+        if not nm:
+            continue
+        out[nm] = {
+            "pct_20": _num(r, "Pct_20"),
+            "pct_20_prev": _num(r, "Pct_20_Prev"),
+            "stable_20": _tri(r, "Stable_20"),
+            "pct_120": _num(r, "Pct_120"),
+            "pct_120_prev": _num(r, "Pct_120_Prev"),
+            "stable_120": _tri(r, "Stable_120"),
+            "n_universe": _num(r, "N_Universe"),
+            "as_of": _txt(r, "As_Of"),
+        }
+    return out
+
+
+def describe_compact(rank_row) -> str:
+    """Phase 3 한 줄 표시. 두 창을 함께 보여준다.
+
+    실측에서 20일 vs 120일 순위 상관이 0.30 이었다 — 서로 다른 정보를
+    담고 있어서 하나만 보여주면 절반을 버리는 셈이다.
+
+    ⚠️ 원시 % 는 넣지 않는다. averageChange 는 업종 내 상장 종목 **전체의
+       동일가중 평균**이라 '+46.5%' 같은 값이 그대로 나가면 오도한다
+       (Tobacco 20일 +46.5% 인데 MO/PM 은 그만큼 안 올랐다).
+       순위(백분위)만 쓴다.
+    """
+    if not rank_row:
+        return ""
+    parts = []
+    for lb, label in ((20, "20일"), (120, "120일")):
+        p = rank_row.get("pct_%d" % lb)
+        if p is None:
+            continue
+        seg = label + " 상위 %.0f%%" % p
+        if rank_row.get("stable_%d" % lb) is False:
+            seg += "⚠️"
+        else:
+            q = rank_row.get("pct_%d_prev" % lb)
+            if q is not None:
+                if q - p >= 3.0:
+                    seg += "↑"
+                elif p - q >= 3.0:
+                    seg += "↓"
+        parts.append(seg)
+    if not parts:
+        return ""
+    return " · ".join(parts)
 
 
 # ══════════════════════════════════════════════════════════════════════════

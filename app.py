@@ -42,6 +42,7 @@ import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 
 import earnings_core as ec
 import reminders_core as rmc  # 개발 로드맵 리마인더 SSOT — run_narrative 와 동일 모듈
 import watchlist_metrics_core as wm  # 워치리스트 표시 지표 SSOT — 자동화(run_watchlist_alerts)와 동일 모듈
+import industry_core as icore  # 업종 모멘텀·백분위 SSOT — 자동화(refresh_industry_perf)와 동일 모듈
 
 # ── 1.6 AI 종목 스캐너 SSOT (scanner_core) ───────────────────────────────────
 # 3버킷 스코어링·프롬프트·상수·표시 포맷·70점 판정은 전부 scanner_core 에만 존재한다.
@@ -114,6 +115,11 @@ _SSOT_NEEDS = (
       "classify", "active_reminders", "build_email_html", "make"),
      lambda m: "Snoozed_Until" in m.REMINDER_COLS,
      "개발 리마인더 v1(연기 컬럼 포함) 반영"),
+    ("industry_core", icore,
+     ("RANK_SHEET", "RANK_COLS", "parse_rank_values", "describe_compact",
+      "compute_ranks", "rank_rows", "LOOKBACKS", "STABILITY_GAP"),
+     lambda m: "Stable_20" in m.RANK_COLS,
+     "업종 순위 v1(안정성 플래그 포함) 반영"),
 )
 
 _ssot_bad = []
@@ -653,6 +659,57 @@ def _ws_handle(sheet_title: str):
         return sh.worksheet(str(sheet_title))
     except Exception:
         return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_industry_ranks() -> dict:
+    """Industry_Rank 탭 → {업종명: 백분위 dict}. 실패하면 빈 dict.
+
+    ⚠️ 로딩 시간 설계
+    ─────────────────
+    원본 히스토리(Industry_Perf)는 754행 × 150열, 약 11만 셀이다. 앱이 그걸
+    직접 읽고 모멘텀을 계산하면 Phase 3 첫 진입에 몇 초가 붙는다.
+    계산은 자동화(refresh_industry_perf)가 하루 한 번 하고, 앱은 **149행짜리
+    요약본만** 읽는다. ttl=1800 이라 30분에 한 번, 그것도 Phase 3 를 열었을
+    때만 실행된다. 앱 기동 경로에는 전혀 붙지 않는다.
+
+    표시 전용 데이터다 — 없어도 앱이 멈추면 안 되므로 모든 실패를 빈 dict 로
+    삼킨다. 대신 시트가 아직 없을 때와 값이 비었을 때를 구분하지 못하므로,
+    화면에서는 '아무것도 안 보임' 으로만 나타난다.
+    """
+    try:
+        ws = _ws_handle(icore.RANK_SHEET)
+        if ws is None:
+            return {}
+        return icore.parse_rank_values(ws.get_all_values() or [])
+    except Exception:
+        return {}
+
+
+def _industry_rank_caption(industry_en: str, is_etf: bool) -> str:
+    """Phase 3 '산업' 칸 아래에 붙일 한 줄. 못 만들면 빈 문자열.
+
+    ⚠️ ETF 는 표시하지 않는다.
+       FMP profile 기준으로 ETF 의 industry 는 'Asset Management' 계열이다
+       (VOO/QQQM → Asset Management, SCHD/JEPQ → Asset Management - Income).
+       운용사 업종이라 사실은 맞지만, **ETF 가 담고 있는 자산과는 무관**하다.
+       'VOO · 업종평균 상위 45%' 는 틀린 게 아니라 오도한다.
+       실측(워치리스트 90종목)에서 약 17% 가 이 경우였다.
+    """
+    if is_etf:
+        return ""
+    nm = str(industry_en or "").strip()
+    if not nm:
+        return ""
+    row = _load_industry_ranks().get(nm)
+    if not row:
+        return ""
+    body = icore.describe_compact(row)
+    if not body:
+        return ""
+    n = row.get("n_universe")
+    tail = ("  (동일가중 %d개 업종 중)" % int(n)) if n else "  (업종 동일가중 평균)"
+    return "📊 " + body + tail
 
 
 def _reminders_ws():
@@ -19280,6 +19337,13 @@ if st.session_state.get("logged_in"):
                 st.metric("산업", industry_display[:18] if industry_display else "N/A")
                 if industry_en and industry_en != industry_display:
                     st.caption(industry_en[:25])
+                # 업종 모멘텀 백분위 — 신호가 아니라 **정보**다.
+                # 백테스트에서 무작위 대조군은 이겼지만(순위에 정보 있음)
+                # 워크포워드는 실패했다(거래 규칙으로는 전환 안 됨).
+                # 그래서 매매 판정에는 연결하지 않고 보여주기만 한다.
+                _ind_cap = _industry_rank_caption(industry_en, bool(is_etf_co))
+                if _ind_cap:
+                    st.caption(_ind_cap)
             with info_c3:
                 mc = co.get("market_cap")
                 st.metric("시가총액", usd_short_str(mc) if mc else "N/A")
