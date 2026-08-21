@@ -74,9 +74,10 @@ fmp_get 은 402/429 를 삼키고 None 을 돌려주는데, 프로브는 **원�
     PROBE_TIER=tierB   9콜
     PROBE_TIER=tierB2  5콜   ← tierB 후속 확인
     PROBE_TIER=tierB3  3콜   ← B-1 설계 직전 (이력 깊이 + 분류명 전체)
+    PROBE_TIER=tierB4  3콜   ← tierB3 의 깊이 판정 재측정 (요청값 종속 착오 교정)
     PROBE_TIER=tierC   4콜
     PROBE_TIER=grades  3콜
-    PROBE_TIER=all    29콜
+    PROBE_TIER=all    32콜
 
 실행
 ────
@@ -98,7 +99,8 @@ SLEEP_SEC = 0.35
 _KEY = str(os.environ.get("FMP_API_KEY", "") or "").strip()
 
 _TIER = str(os.environ.get("PROBE_TIER", "") or "tierA").strip().lower()
-if _TIER not in ("tiera", "tierb", "tierb2", "tierb3", "tierc", "grades", "all"):
+if _TIER not in ("tiera", "tierb", "tierb2", "tierb3", "tierb4",
+                 "tierc", "grades", "all"):
     _TIER = "tiera"
 
 
@@ -125,6 +127,12 @@ _D_RECENT = _recent_weekday(3)
 _D_FROM_30 = (_TODAY - timedelta(days=30)).isoformat()
 _D_FROM_90 = (_TODAY - timedelta(days=90)).isoformat()
 _D_FROM_3Y = (_TODAY - timedelta(days=365 * 3)).isoformat()
+# tierB4 — 깊이 재측정용. 3년(tierB3)은 **요청한 만큼만 돌아와서** 한도를 재지
+# 못했다. 넉넉히 요청해야 min(date) 가 어디서 멈추는지 보인다.
+# 가격 엔드포인트의 실측 한도가 5년(1255봉)이었으므로 그보다 넉넉한 7년을 쓴다.
+_D_FROM_7Y = (_TODAY - timedelta(days=365 * 7)).isoformat()
+# 불량 입력 검사용 좁은 창. from/to 가 응답을 실제로 자르는지 본다.
+_D_NARROW_FROM = (_TODAY - timedelta(days=20)).isoformat()
 _D_TO = _TODAY.isoformat()
 _Y_FROM = str(_NEXT_YEAR) + "-01-01"
 _Y_TO = str(_NEXT_YEAR) + "-12-31"
@@ -367,6 +375,74 @@ TIER_B3 = [
         ["date", "sector", "averageChange"],
         None,
         "depth",
+    ),
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Tier B4 — tierB3 의 깊이 판정을 다시 잰다 (3콜)
+#
+# 왜 다시 재나
+# ────────────
+# tierB3 는 `from = today - 365*3` 을 보냈고 `2023-08-21 ~ 2026-08-20 · 3.00년`
+# 을 받았다. 그 결과가 "이 플랜은 업종 이력 3년까지"로 기록됐다.
+#
+# **그건 한도의 증거가 아니다.** 요청한 날짜부터 데이터가 왔다는 것은
+# `from` 이 먹었다는 뜻일 뿐, 4년을 요청하면 어땠는지는 아무도 안 봤다.
+# 판별력 없는 지표를 판별자로 쓴 것이다 — 이 프로젝트에서 반복된 실수다
+# (무필터 대비 건수, 시드 포함 여부에 이어 세 번째).
+#
+# 반례가 이미 있다: `historical-price-eod/full` 의 진짜 한도는 실측 결과
+# **5년(1255봉, limit 무관 롤링)** 이었다(diag_fmp_depth → run_signal_backtest:152).
+# 계정 플랜 차원의 한도라면 업종도 3년이 아닐 수 있다.
+#
+# 3년과 5년의 차이가 판정을 가른다
+# ────────────────────────────────
+#   3년 → 롤링 워크포워드 6창이 한 국면(상승장) 연속 6분기에 갇힌다
+#   5년 → 학습창에 2022 하락장이 들어온다. 질문의 질이 달라진다
+#
+# 설계
+# ────
+#   ① 좁은 창(20일)  — **불량 입력 검사**. from/to 가 응답을 자르는가.
+#                       판별자는 건수가 아니라 응답 날짜 **범위 폭**이다.
+#                       여기가 🔴 면 ②③ 판정은 전부 무효다.
+#   ② 업종 7년 요청  — min(date) 가 요청 from 에서 멈추는가, 그 뒤에서 멈추는가
+#   ③ 섹터 7년 요청  — 동일
+#
+# ⚠️ TIER_B3 는 그대로 둔다. "3년 요청" 기록이 이 착오의 증거다.
+# ══════════════════════════════════════════════════════════════════════════
+TIER_B4 = [
+    (
+        "① 불량 입력 검사 — 좁은 창(20일) 요청",
+        "historical-industry-performance?industry=Semiconductors&from="
+        + _D_NARROW_FROM + "&to=" + _D_TO,
+        "20일을 요청했는데 3년이 돌아오면 from/to 가 무시된다는 뜻이고, "
+        "그러면 ②③ 의 깊이 판정은 전부 무효다. 진단을 믿기 전에 알려진 "
+        "불량 입력에서 실패하는지부터 확인한다.",
+        ["date", "industry", "averageChange"],
+        None,
+        "range_check",
+    ),
+    (
+        "② 업종 성과 이력 깊이 — 7년 요청",
+        "historical-industry-performance?industry=Semiconductors&from="
+        + _D_FROM_7Y + "&to=" + _D_TO,
+        "tierB3 는 3년을 요청해 3년을 받았고 그게 '플랜 한도 3년'으로 "
+        "기록됐다. 요청한 날짜부터 왔다는 건 한도를 못 쟀다는 뜻이다. "
+        "넉넉히 요청해 min(date) 가 어디서 멈추는지 본다.",
+        ["date", "industry", "averageChange"],
+        None,
+        "depth_req",
+    ),
+    (
+        "③ 섹터 성과 이력 깊이 — 7년 요청",
+        "historical-sector-performance?sector=Technology&from="
+        + _D_FROM_7Y + "&to=" + _D_TO,
+        "위와 동일. 업종과 섹터가 다른 깊이를 줄 수 있다 — tierB3 에서도 "
+        "같은 구간에 777 vs 772 로 건수가 달랐다(생성 규칙이 다르다는 신호).",
+        ["date", "sector", "averageChange"],
+        None,
+        "depth_req",
     ),
 ]
 
@@ -661,10 +737,150 @@ def render_depth(res, date_key="date"):
                   + "% — 결측 구간이 있다. 백테스트 전 확인 필요")
 
 
+def _req_param(path, key):
+    """요청 경로에서 쿼리 파라미터 값을 꺼낸다. 없으면 빈 문자열.
+
+    렌더러가 **자기 요청**을 알아야 응답과 대조할 수 있다. res["path"] 에
+    요청 경로가 그대로 들어 있으므로 스키마 변경 없이 된다.
+    """
+    tail = path.split("?", 1)[1] if "?" in path else ""
+    for part in tail.split("&"):
+        if part.startswith(key + "="):
+            return part[len(key) + 1:]
+    return ""
+
+
+def _date_span(res, date_key="date"):
+    """응답 → (정렬된 고유 날짜, 첫 date, 끝 date, 폭). 못 재면 None."""
+    data = res.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+    dates = []
+    for rec in data:
+        if isinstance(rec, dict):
+            d = str(rec.get(date_key) or "").strip()[:10]
+            if len(d) == 10:
+                dates.append(d)
+    if not dates:
+        return None
+    dates = sorted(set(dates))
+    try:
+        d0 = datetime.strptime(dates[0], "%Y-%m-%d").date()
+        d1 = datetime.strptime(dates[-1], "%Y-%m-%d").date()
+    except Exception:
+        return None
+    return dates, d0, d1, (d1 - d0).days
+
+
+def render_range_check(res, date_key="date"):
+    """좁은 창을 요청해 from/to 가 실제로 응답을 자르는지 본다 — 불량 입력 검사.
+
+    판별자가 왜 '건수'가 아니라 '범위 폭'인가
+    ─────────────────────────────────────────
+    건수는 다른 이유로도 달라진다(휴장일 행 생성, 결측, 기본 limit).
+    20일을 요청했는데 3년 폭이 돌아오면 필터가 안 먹은 것 말고 해석의 여지가
+    없다. 이 프로젝트에서 건수를 판별자로 썼다가 두 번 틀린 전례가 있다.
+
+    이 검사가 🔴 면 depth_req 판정은 전부 무효다 — 진단을 믿기 전에
+    알려진 불량 입력에서 실패하는지부터 확인한다는 규칙의 적용이다.
+    """
+    got = _date_span(res, date_key)
+    if not got:
+        print("        └ (날짜 없음 — 범위 검사 불가)")
+        return
+    dates, _d0, _d1, span = got
+    f_s = _req_param(res.get("path", ""), "from")
+    t_s = _req_param(res.get("path", ""), "to")
+    try:
+        req_span = (datetime.strptime(t_s, "%Y-%m-%d").date()
+                    - datetime.strptime(f_s, "%Y-%m-%d").date()).days
+    except Exception:
+        print("        └ (요청 from/to 파싱 실패 — 범위 검사 불가)")
+        return
+    print("        └ 요청 " + f_s + " ~ " + t_s
+          + "  (폭 " + str(req_span) + "일)")
+    print("           응답 " + dates[0] + " ~ " + dates[-1]
+          + "  (폭 " + str(span) + "일 · " + str(len(dates)) + "건)")
+    if req_span <= 0:
+        print("           🟠 요청 폭이 0 이하 — 판정 불가")
+    elif span > req_span * 3:
+        print("           🔴 from/to 무시됨 — 요청 폭의 "
+              + ("%.1f" % (span / float(req_span))) + "배가 돌아왔다")
+        print("              ⛔ 아래 ②③ 이력 깊이 판정은 전부 무효다.")
+        print("                 (tierB3 의 '3년' 기록도 같이 무효가 된다)")
+    else:
+        print("           ✅ from/to 존중됨 — ②③ 깊이 판정의 전제가 성립한다")
+
+
+def render_depth_req(res, date_key="date"):
+    """이력 깊이 — **요청한 from 과 실제 min(date) 를 대조한다.**
+
+    render_depth 와 분리한 이유
+    ───────────────────────────
+    render_depth 는 판정 문구에 요청값이 박혀 있다:
+
+        if span_days >= 1000:
+            print("✅ 3년 백필 가능 — ...")
+
+    7년을 요청해서 3년만 와도 이 문구가 나온다. **한도에 걸린 상황을 성공으로
+    표시한다.** 실제로 그 착오가 났다 — tierB3 가 3년을 요청해 3년을 받았고,
+    그게 "플랜 한도 3년"으로 기록됐다.
+
+    요청한 날짜부터 데이터가 왔다는 것은 **한도를 재지 못했다**는 뜻이지
+    한도가 그 값이라는 뜻이 아니다. 반례가 있다: historical-price-eod 의 진짜
+    한도는 5년(1255봉, limit 무관)이었다.
+
+    판별자: min(date) − 요청 from
+        ≈ 0  → 한도 미도달. 이 요청으로는 상한을 못 잰다
+        ≫ 0  → 한도 발견. min(date) 가 실제 상한이다
+    """
+    got = _date_span(res, date_key)
+    if not got:
+        print("        └ (깊이 측정 불가 — 날짜 없음)")
+        return
+    dates, d0, d1, span = got
+    f_s = _req_param(res.get("path", ""), "from")
+    try:
+        req_from = datetime.strptime(f_s, "%Y-%m-%d").date()
+    except Exception:
+        print("        └ (요청 from 파싱 실패 — 대조 불가)")
+        return
+    gap = (d0 - req_from).days
+    print("        └ 요청 from : " + f_s)
+    print("           실제 최초 : " + dates[0] + "   (요청 대비 "
+          + ("%+d" % gap) + "일)")
+    print("           실제 최종 : " + dates[-1] + " · 고유 날짜 "
+          + str(len(dates)) + "일 · 폭 " + str(span) + "일")
+
+    if gap <= 7:
+        print("           🟢 한도 미도달 — 요청한 만큼 전부 왔다")
+        print("              상한은 여전히 미측정이다. 다만 "
+              + ("%.1f" % (span / 365.0)) + "년 확보되므로")
+        print("              롤링 워크포워드에는 충분하다")
+    elif gap > 30:
+        roll = (d1 - d0).days / 365.0
+        print("           🔵 한도 발견 — " + dates[0] + " 에서 멈춘다")
+        print("              실제 상한 ≈ " + ("%.1f" % roll)
+              + "년 (롤링). 요청을 더 늘려도 이보다 앞은 안 온다")
+    else:
+        print("           🟠 판정 보류 — 차이가 " + str(gap)
+              + "일. 휴일·데이터 시작일 경계일 수 있다")
+        print("              from 을 더 앞으로 밀어 재확인 필요")
+
+    # 밀도 — 1년이 와도 주 1건씩만 오면 백테스트가 왜곡된다
+    if span >= 7:
+        dens = len(dates) / (span / 7.0 * 5.0)
+        if dens < 0.7:
+            print("           ⚠️ 거래일 대비 밀도 " + ("%.0f" % (dens * 100))
+                  + "% — 결측 구간이 있다. 백테스트 전 확인 필요")
+
+
 _DETAIL = {
     "names_sector": lambda r: render_names(r, "sector"),
     "names_industry": lambda r: render_names(r, "industry"),
     "depth": lambda r: render_depth(r, "date"),
+    "range_check": lambda r: render_range_check(r, "date"),
+    "depth_req": lambda r: render_depth_req(r, "date"),
 }
 
 
@@ -705,11 +921,13 @@ def main():
     run_b = _TIER in ("tierb", "all")
     run_b2 = _TIER in ("tierb2", "all")
     run_b3 = _TIER in ("tierb3", "all")
+    run_b4 = _TIER in ("tierb4", "all")
     run_c = _TIER in ("tierc", "all")
     run_g = _TIER in ("grades", "all")
 
     ncalls = (len(TIER_A) if run_a else 0) + (len(TIER_B) if run_b else 0) \
         + (len(TIER_B2) if run_b2 else 0) + (len(TIER_B3) if run_b3 else 0) \
+        + (len(TIER_B4) if run_b4 else 0) \
         + (len(TIER_C) if run_c else 0) + (len(GRADES) if run_g else 0)
 
     print("=" * 78)
@@ -731,6 +949,9 @@ def main():
     if run_b3:
         run_group("Tier B3 — B-1 설계 직전 확인 (이력 깊이 + 분류명 전체)",
                   TIER_B3, results)
+    if run_b4:
+        run_group("Tier B4 — 이력 깊이 재측정 (tierB3 의 요청값 종속 판정 교정)",
+                  TIER_B4, results)
     if run_c:
         run_group("Tier C — 탐색적 신규 기능", TIER_C, results)
     if run_g:
