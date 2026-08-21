@@ -19,13 +19,14 @@
   D. 판정 계약    — 주말/휴장/개장/임시휴장 보강/폴백
   E. 시트 파싱    — 헤더 결손·깨진 행에도 예외 없이 빈 결과
   F. FMP 대조     — 임시 휴장(국장일) 검출 경로가 실제로 동작하는가
+  H. 반일장       — 조기 마감(13:00) 규칙 골든 7년 + 마감시각 계약
   G. 뮤테이션     — 규칙 엔진에 의도적 버그를 심어 검사가 **잡아내는지** 확인
 
 G 가 핵심이다. 통과만 하는 테스트는 통과만 하는 코드를 보증하지 않는다.
 """
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta   # timedelta: 반일장 뮤테이션에서 사용
 
 # automation/ 에서 실행돼도 repo root 의 calendar_core 를 찾도록 한다
 # (diag_reminders.py / diag_watchlist_metrics.py 와 동일한 관용구).
@@ -205,6 +206,92 @@ def test_diff():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# H. 반일장(조기 마감) — 규칙 골든 + 마감시각 계약
+#
+# 왜 여기 있어야 하나
+# ───────────────────
+# 반일장 판정은 **규칙 계산**이다(app.py 핫 패스라 시트를 못 읽는다).
+# refresh_market_calendar 가 배포 전 게이트로 이 스위트를 돈다. 골든이 여기
+# 없으면 calendar_core 를 고쳐 반일장 규칙을 깨뜨려도 게이트를 통과한다.
+#
+# 골든 출처
+# ─────────
+#   2020~2024  NYSE 공개 이력
+#   2025~2026  FMP 실측 (diag_halfday, adjCloseTime='13:00')
+#
+# 2020~2030 구간에서 7/4 와 12/25 의 요일 7가지가 전부 등장하므로 규칙의
+# 모든 분기가 이 골든으로 검증된다.
+# ══════════════════════════════════════════════════════════════════════════
+GOLDEN_HALF = {
+    2020: {"2020-11-27", "2020-12-24"},
+    2021: {"2021-11-26"},
+    2022: {"2022-11-25"},
+    2023: {"2023-07-03", "2023-11-24"},
+    2024: {"2024-07-03", "2024-11-29", "2024-12-24"},
+    2025: {"2025-07-03", "2025-11-28", "2025-12-24"},
+    2026: {"2026-11-27", "2026-12-24"},
+}
+
+
+def test_halfday():
+    print("\n── H. 반일장 (조기 마감 13:00)")
+
+    for y, gold in sorted(GOLDEN_HALF.items()):
+        got = set(cc.nyse_early_close_days(y))
+        ok = got == gold
+        detail = ""
+        if not ok:
+            detail = "누락=" + str(sorted(gold - got)) + " 초과=" + str(sorted(got - gold))
+        check("골든 " + str(y), ok, detail)
+
+    # 요일 조건 — 규칙의 핵심. 7/4·12/25 가 화~금일 때만 전날이 반일장이다.
+    # 토요일이면 전날이 **관측 휴일**(전휴장)이지 반일장이 아니다.
+    check("7/4 토요일(2026) → 7/3 은 전휴장, 반일장 아님",
+          "2026-07-03" not in cc.nyse_early_close_days(2026)
+          and "2026-07-03" in cc.nyse_regular_holidays(2026))
+    check("7/4 일요일(2027) → 7/3 은 토요일, 반일장 아님",
+          "2027-07-03" not in cc.nyse_early_close_days(2027))
+    check("12/25 토요일(2027) → 12/24 는 전휴장, 반일장 아님",
+          "2027-12-24" not in cc.nyse_early_close_days(2027))
+    check("추수감사절 다음 금요일은 매년 반일장",
+          all(any(d.startswith(str(y) + "-11") for d in cc.nyse_early_close_days(y))
+              for y in range(2020, 2031)))
+    # 전휴장과 반일장이 동시에 참인 날이 있으면 두 판정이 모순된다
+    check("반일장이 전휴장과 겹치지 않는다 (2020~2030)",
+          all(not (set(cc.nyse_early_close_days(y))
+                   & set(cc.nyse_regular_holidays(y)))
+              for y in range(2020, 2031)))
+
+    # ── 마감시각 계약 ────────────────────────────────────────────────────
+    # ⚠️ 이 파일의 check() 는 (name, cond, detail) 이다 — (name, got, want) 가
+    #    아니다. 값을 그대로 넘기면 truthy 인 한 무조건 통과한다(판별력 0).
+    #    반드시 == 비교 결과를 넘긴다.
+    def eq(name, got, want):
+        check(name, got == want, "기대=" + repr(want) + " 실제=" + repr(got))
+
+    eq("session_close_time — 반일장", cc.session_close_time("2026-11-27"), "13:00")
+    eq("session_close_time — 평일", cc.session_close_time("2026-11-25"), "16:00")
+    eq("session_close_time — 휴장", cc.session_close_time("2026-11-26"), None)
+    eq("session_close_time — 주말", cc.session_close_time("2026-08-22"), None)
+    eq("session_close_time — 임시휴장 보강이 우선",
+       cc.session_close_time("2026-11-27", extra_closed={"2026-11-27"}), None)
+    eq("session_close_time — half_map 이 규칙보다 우선",
+       cc.session_close_time("2026-11-25", half_map={"2026-11-25": "12:00"}), "12:00")
+    eq("session_close_time — half_map 은 휴장을 뒤집지 못한다",
+       cc.session_close_time("2026-11-26", half_map={"2026-11-26": "13:00"}), None)
+    eq("is_early_close — 반일장", cc.is_early_close("2026-11-27"), True)
+    eq("is_early_close — 평일", cc.is_early_close("2026-11-25"), False)
+    eq("is_early_close — 휴장일은 False (열려야 조기마감이 의미)",
+       cc.is_early_close("2026-11-26"), False)
+    eq("close_minutes — 13:00", cc.close_minutes("13:00"), 780)
+    eq("close_minutes — 16:00", cc.close_minutes("16:00"), 960)
+    eq("close_minutes — 쓰레기 입력은 정규 마감으로 폴백",
+       cc.close_minutes("nope"), 960)
+    eq("close_minutes — None 폴백", cc.close_minutes(None), 960)
+    eq("close_minutes — 범위 밖(25:00)은 폴백", cc.close_minutes("25:00"), 960)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # G. 뮤테이션 — 의도적 버그를 검사가 잡는가
 # ══════════════════════════════════════════════════════════════════════════
 def test_mutation():
@@ -251,7 +338,96 @@ def test_mutation():
     leaked = cc.is_market_open("2025-01-09", extra_closed=set()) is True
     check("M5 extra_closed 비었을 때 개장 (설계대로)", leaked)
 
+    # ── 반일장 뮤테이션 — 골든 H 가 실제로 잡는가 ────────────────────────
+    _orig_nth = cc._nth_weekday
+    _orig_early = cc.nyse_early_close_days
+
+    def _half_fails():
+        # ⚠️ 두 캐시를 **모두** 비운다.
+        #    nyse_early_close_days 는 내부에서 regular_holidays_cached 를 부른다
+        #    (전휴장 충돌 가드). _EARLY_CACHE 만 비우면, 변이된 _nth_weekday 로
+        #    계산된 휴일이 _RULE_CACHE 에 남아 원복 후에도 오염이 이어진다.
+        #    실제로 이 원복 검사가 그 누수를 잡아냈다.
+        cc._EARLY_CACHE.clear()
+        cc._RULE_CACHE.clear()
+        for y, gold in GOLDEN_HALF.items():
+            if set(cc.nyse_early_close_days(y)) != gold:
+                return True
+        return False
+
+    # H-M1: 추수감사절 다음날을 +2일로 (금요일 → 토요일)
+    cc._nth_weekday = lambda y, m, w, n: _orig_nth(y, m, w, n) + timedelta(days=1)
+    check("H-M1 추수감사절 +1일 → 검출됨", _half_fails(),
+          "반일장 골든이 추수감사절 이동을 못 잡았다")
+    cc._nth_weekday = _orig_nth
+    cc._EARLY_CACHE.clear()
+    cc._RULE_CACHE.clear()
+
+    # ⚠️ 여기서 배운 것 — 삼중 중복은 단일 지점 뮤테이션으로 판별할 수 없다
+    # ────────────────────────────────────────────────────────────────────
+    # nyse_early_close_days 의 방어는 셋이다:
+    #   (a) 요일 조건 — 다음날이 화~금
+    #   (b) 주말 가드 — 결과가 토·일이면 제외
+    #   (c) 휴일 가드 — 결과가 전휴장이면 제외
+    #
+    # 셋이 **상호 중복**이다. 실측 결과 골든 7년 기준:
+    #   (a)만 제거 → 일치   (b)만 제거 → 일치   (c)만 제거 → 일치
+    #   (a)+(c) 제거 → 불일치 [2020, 2021, 2026]
+    #   셋 다 제거   → 불일치 [2020, 2021, 2022, 2023, 2026]
+    #
+    # 처음엔 (a) 하나만 넓히는 뮤턴트를 썼는데 검출되지 않았다. 골든이 부실한
+    # 게 아니라 **뮤턴트가 판별력이 없었다** — (b)(c)가 덮어버린다.
+    # 그래서 2개 이상을 동시에 제거하는 뮤턴트를 쓴다.
+    def _mk_broken(weekday_cond, guard_weekend, guard_holiday):
+        def _f(year):
+            out = {}
+            tg = _orig_nth(year, 11, 3, 4)
+            out[(tg + timedelta(days=1)).isoformat()] = cc.EARLY_CLOSE_TIME
+            for mm, dd_ in ((7, 3), (12, 24)):
+                nxt = date(year, mm, dd_) + timedelta(days=1)
+                if (not weekday_cond) or nxt.weekday() in (1, 2, 3, 4):
+                    out[date(year, mm, dd_).isoformat()] = cc.EARLY_CLOSE_TIME
+            hol = cc.nyse_regular_holidays(year)
+            res = {}
+            for ds, t in out.items():
+                if guard_holiday and ds in hol:
+                    continue
+                if guard_weekend and date.fromisoformat(ds).weekday() >= 5:
+                    continue
+                res[ds] = t
+            return res
+        return _f
+
+    cc.nyse_early_close_days = _mk_broken(False, True, False)
+    check("H-M2 요일조건 + 휴일가드 동시 제거 → 검출됨", _half_fails(),
+          "2020·2021·2026 이 어긋나야 한다")
+    cc.nyse_early_close_days = _orig_early
+    cc._EARLY_CACHE.clear()
+    cc._RULE_CACHE.clear()
+
+    cc.nyse_early_close_days = _mk_broken(False, False, False)
+    check("H-M3 세 방어 전부 제거 → 검출됨", _half_fails())
+    cc.nyse_early_close_days = _orig_early
+    cc._EARLY_CACHE.clear()
+    cc._RULE_CACHE.clear()
+
+    # 중복성 자체를 기록해 둔다 — 이게 '검출 실패'가 아니라 '설계'임을 명시.
+    # 미래에 누구든 "요일 조건이 중복이니 지우자" 고 생각할 수 있는데, 하나만
+    # 남기면 그 하나가 틀렸을 때 잡을 게 없어진다.
+    _single = [cc.nyse_early_close_days]
+    for nm, args_ in (("요일조건만 제거", (False, True, True)),
+                      ("주말가드만 제거", (True, False, True)),
+                      ("휴일가드만 제거", (True, True, False))):
+        cc.nyse_early_close_days = _mk_broken(*args_)
+        _same = not _half_fails()
+        cc.nyse_early_close_days = _orig_early
+        cc._EARLY_CACHE.clear()
+        cc._RULE_CACHE.clear()
+        check("H-R " + nm + " → 골든 여전히 통과 (삼중 중복, 설계대로)", _same,
+              "중복이 깨졌다면 방어 하나가 실제로 사라진 것이다 — 확인 필요")
+
     # 원복 확인 — 뮤테이션 뒤에도 골든이 통과해야 한다
+    check("반일장 뮤테이션 원복 후 골든 정상", not _half_fails())
     check("뮤테이션 원복 후 골든 정상", not golden_fails())
 
 
@@ -268,6 +444,7 @@ def main():
     test_contract()
     test_parse()
     test_diff()
+    test_halfday()
     test_mutation()
 
     print("")
