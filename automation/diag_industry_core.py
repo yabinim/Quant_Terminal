@@ -284,6 +284,73 @@ def test_ranks_and_describe():
             clip=ic.WINSOR_CLIP)["SPIKE"].get("gap_20") or 0) > 0)
 
 
+def test_rank_sheet():
+    """Industry_Rank 왕복 — 자동화가 쓰고 앱이 읽는다. 여기가 어긋나면
+    화면에 조용히 아무것도 안 뜬다."""
+    print("\n── G. Industry_Rank 왕복 (자동화 → 앱)")
+    src = {
+        "Semiconductors": {"pct_20": 8.0, "pct_20_prev": 24.0, "stable_20": True,
+                           "pct_120": 12.0, "pct_120_prev": 12.5,
+                           "stable_120": True, "n_universe": 127,
+                           "as_of": "2026-08-20"},
+        "Oil & Gas Energy": {"pct_20": 40.0, "pct_20_prev": 40.0,
+                             "stable_20": True, "pct_120": 9.6,
+                             "pct_120_prev": 9.0, "stable_120": False,
+                             "n_universe": 127, "as_of": "2026-08-20"},
+        "Copper": {"pct_20": None, "pct_20_prev": None, "stable_20": None,
+                   "pct_120": None, "pct_120_prev": None, "stable_120": None,
+                   "n_universe": 127, "as_of": "2026-08-20"},
+    }
+    rows = ic.rank_rows(src, now_str="t")
+    chk("백분위가 전부 없는 업종은 행을 안 만든다 (앱 오해 방지)",
+        len(rows) == 2, str(len(rows)))
+    chk("행 길이 = RANK_COLS", all(len(r) == len(ic.RANK_COLS) for r in rows))
+    chk("업종명 정렬", [r[0] for r in rows] == sorted(r[0] for r in rows))
+
+    back = ic.parse_rank_values([ic.RANK_COLS] + rows)
+    chk("왕복 후 업종 수 보존", len(back) == 2, str(len(back)))
+    sem = back.get("Semiconductors") or {}
+    chk("백분위 왕복", abs((sem.get("pct_20") or -1) - 8.0) < 1e-9)
+    chk("이전 백분위 왕복", abs((sem.get("pct_20_prev") or -1) - 24.0) < 1e-9)
+    chk("안정 True 왕복", sem.get("stable_20") is True)
+    oil = back.get("Oil & Gas Energy") or {}
+    chk("불안정 False 왕복", oil.get("stable_120") is False)
+    chk("as_of 왕복", sem.get("as_of") == "2026-08-20")
+    chk("모집단 왕복", (sem.get("n_universe") or 0) == 127)
+
+    chk("헤더 첫 열이 Industry 가 아니면 거부 (열 정렬 붕괴 방지)",
+        ic.parse_rank_values([["업종", "Pct_20"], ["X", 1]]) == {})
+    chk("빈 입력 → 빈 결과", ic.parse_rank_values([]) == {})
+    chk("헤더만 → 빈 결과", ic.parse_rank_values([ic.RANK_COLS]) == {})
+    chk("짧은 행에도 예외 없음",
+        ic.parse_rank_values([ic.RANK_COLS, ["OnlyName"]]).get("OnlyName")
+        is not None)
+
+    # 판정 불가(빈칸)와 불안정(N)은 다르다
+    r_blank = [ic.RANK_COLS,
+               ["X", 5.0, "", "", "", "", "", 100, "2026-08-20", "t"]]
+    xb = ic.parse_rank_values(r_blank)["X"]
+    chk("빈칸 Stable → None (판정 불가)", xb["stable_20"] is None)
+    chk("판정 불가는 is_stable False", ic.is_stable(xb) is False)
+
+    # describe_compact — 화면 문자열
+    chk("compact — 두 창을 함께",
+        "20일" in ic.describe_compact(sem) and "120일" in ic.describe_compact(sem),
+        ic.describe_compact(sem))
+    chk("compact — 상승 화살표", "↑" in ic.describe_compact(sem),
+        ic.describe_compact(sem))
+    chk("compact — 불안정 창에 ⚠️", "⚠️" in ic.describe_compact(oil),
+        ic.describe_compact(oil))
+    chk("compact — 불안정 창에는 화살표를 안 붙인다",
+        ic.describe_compact(oil).split("·")[1].count("↑") == 0,
+        ic.describe_compact(oil))
+    chk("compact — 원시 %는 넣지 않는다 (동일가중 평균이라 오도)",
+        "+" not in ic.describe_compact(sem), ic.describe_compact(sem))
+    chk("compact — 빈 입력이면 빈 문자열", ic.describe_compact({}) == "")
+    chk("compact — 백분위 전무면 빈 문자열",
+        ic.describe_compact({"pct_20": None, "pct_120": None}) == "")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 def test_mutation():
     print("\n── F. 뮤테이션")
@@ -414,6 +481,7 @@ def main():
     test_momentum()
     test_percentile()
     test_ranks_and_describe()
+    test_rank_sheet()
     test_mutation()
     print("")
     print("=" * 70)

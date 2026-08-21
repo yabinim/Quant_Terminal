@@ -89,6 +89,43 @@ def _open_or_create(sh, title, rows, cols):
         return gsr.call(sh.add_worksheet, title=title, rows=rows, cols=cols)
 
 
+def write_ranks(sh, parsed, label=""):
+    """계산된 순위를 Industry_Rank 시트에 **전체 교체**로 쓴다.
+
+    앱은 이 시트만 읽는다. Industry_Perf(754×150)를 앱이 직접 읽으면 Phase 3
+    첫 진입에 몇 초가 붙는데, 149행짜리 요약이면 사실상 0 이다.
+
+    누적이 아니라 스냅샷이라 append 하지 않는다. 업종이 줄어드는 경우를
+    대비해 clear 부터 한다 — 안 하면 예전 꼬리가 남아 사라진 업종이
+    계속 표시된다.
+    """
+    ranks = ic.compute_ranks(parsed)
+    now_str = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
+    rows = ic.rank_rows(ranks, now_str=now_str)
+    if not rows:
+        print("  [WARN] 순위 산출 결과 0행 — Industry_Rank 갱신 생략")
+        return 0
+
+    n_uns = sum(1 for r in rows if r[3] == "N") + sum(1 for r in rows if r[6] == "N")
+    print("  [RANK] " + (label + " " if label else "") + str(len(rows))
+          + "개 업종 · 불안정 표시 " + str(n_uns) + "건")
+
+    if DRY_RUN:
+        print("  [DRY_RUN] Industry_Rank 쓰기 생략")
+        return 0
+    try:
+        ws = _open_or_create(sh, ic.RANK_SHEET, len(rows) + 50, len(ic.RANK_COLS) + 5)
+        gsr.call(ws.clear)
+        gsr.call(ws.update, [ic.RANK_COLS] + rows, range_name="A1",
+                 value_input_option="USER_ENTERED")
+        print("  [RANK] " + ic.RANK_SHEET + " 저장 " + str(len(rows)) + "행")
+    except Exception as e:
+        # 순위 갱신 실패가 히스토리 append 를 되돌리게 하면 안 된다.
+        # 표시가 하루 낡을 뿐이다.
+        print("  [WARN] Industry_Rank 저장 실패(계속 진행): " + str(e)[:80])
+    return 0
+
+
 # ══════════════════════════════════════════════════════════════════════════
 def do_backfill(sh):
     print("[MODE] 백필 — historical-industry-performance"
@@ -184,6 +221,10 @@ def do_backfill(sh):
     gsr.call(ws.update, [header] + body, range_name="A1",
              value_input_option="USER_ENTERED")
     print("  저장 완료 " + str(len(body)) + "행")
+
+    # 백필 직후에도 순위를 만들어 둔다. 안 하면 다음 평일 5PM 까지 앱에
+    # 아무것도 안 뜨고, 그 사이 "왜 안 나오지" 를 디버깅하게 된다.
+    write_ranks(sh, ic.parse_perf_values([header] + body), label="(백필 직후)")
     return 0
 
 
@@ -250,9 +291,10 @@ def do_daily(sh):
              table_range="A1")
     print("  append 완료: " + ds)
 
-    # 참고 출력 — 상위/하위 몇 개를 로그에 남겨 눈으로 확인 가능하게
+    # 순위 갱신 + 로그 요약. 앱이 읽는 것은 여기서 만들어지는 Industry_Rank 다.
     try:
         parsed = ic.parse_perf_values(gsr.call(ws.get_all_values) or [])
+        write_ranks(sh, parsed)
         ranks = ic.compute_ranks(parsed)
         lb = ic.LOOKBACKS[0]
         ok = [(v["pct_%d" % lb], nm) for nm, v in ranks.items()
@@ -260,11 +302,11 @@ def do_daily(sh):
         if ok:
             ok.sort()
             print("  [RANK] 기준일 " + str(parsed["dates"][-1])
-                  + " · 모집단 " + str(len(ok)) + "개 (" + str(lb) + "일 모멘텀)")
+                  + " · " + str(lb) + "일 상위 5")
             for p, nm in ok[:5]:
                 print("     상위 %5.1f%%  %s" % (p, nm))
     except Exception as e:
-        print("  (순위 요약 생략: " + str(e)[:60] + ")")
+        print("  (순위 갱신 생략: " + str(e)[:60] + ")")
     return 0
 
 
@@ -465,6 +507,11 @@ def do_ranks(sh):
           + " ↓" + str(dn) + " —" + str(fl))
     if up + dn == 0 and fl > 0:
         print("     ⚠️ 전부 '변화 없음' — DIRECTION_LAG 재검토 필요")
+
+    # 조회 모드에서도 Industry_Rank 를 갱신한다. 앱 표시가 안 뜰 때
+    # "일단 ranks 한 번 돌려보세요" 로 복구할 수 있게 하기 위함이다.
+    print("")
+    write_ranks(sh, parsed, label="(조회 모드 갱신)")
     return 0
 
 
