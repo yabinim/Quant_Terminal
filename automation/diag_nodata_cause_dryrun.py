@@ -23,15 +23,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import diag_nodata_cause as P  # noqa: E402
 
 
-def sc_feed(n=20):
-    return [{"date": f"2026-0{(i % 8) + 1}-1{i % 9}", "oldSymbol": f"OLD{i}",
-             "newSymbol": f"NEW{i}", "companyName": f"Co {i}"} for i in range(n)]
+def sc_feed(n=20, start=0):
+    return [{"date": f"2026-{((i % 8) + 1):02d}-{((i % 27) + 1):02d}",
+             "oldSymbol": f"OLD{i}", "newSymbol": f"NEW{i}",
+             "companyName": f"Co {i}"} for i in range(start, start + n)]
 
 
-def dl_feed(n=20, base_month=8, day0=19):
+def dl_feed(n=20, base_month=8, day0=19, start=0):
     return [{"symbol": f"DEAD{i}", "companyName": f"Gone {i}",
-             "delistedDate": f"2026-0{base_month}-{max(1, day0 - i):02d}",
-             "exchange": "NASDAQ"} for i in range(n)]
+             "delistedDate": f"2026-{base_month:02d}-{max(1, day0 - (i % 27)):02d}",
+             "exchange": "NASDAQ"} for i in range(start, start + n)]
 
 
 SCEN = {}
@@ -42,7 +43,7 @@ SCEN["S1 정상"] = {
     "symbol-change?symbol=OLD0": ("OK", [sc_feed()[0]], "1건"),
     "__from_to__": ("OK", [{"date": "2026-07-01", "oldSymbol": "A", "newSymbol": "B"}], "1건"),
     "delisted-companies?symbol=DEAD0": ("OK", [dl_feed()[0]], "1건"),
-    "delisted-companies?page=5&limit=20": ("OK", dl_feed(20, 5, 28), "20건"),
+    "delisted-companies?page=5&limit=20": ("OK", dl_feed(20, 5, 28, start=200), "20건"),
     "__profile_dead__": ("OK", [{"symbol": "DEAD0", "companyName": "Gone 0",
                                  "isActivelyTrading": False}], "1건"),
     "__profile_old__": ("OK", [{"symbol": "OLD0", "companyName": "Co 0",
@@ -52,11 +53,16 @@ SCEN["S1 정상"] = {
     "__search__": ("OK", [{"symbol": "NEW0"}], "1건"),
 }
 
+# 2026-08-21 실측에서 실제로 나온 형태를 재현한다.
+# 필터 호출은 limit 이 없어 **기본 100건**이 오고 요청 심볼은 들어 있지도 않다.
+# 초판 판별자(건수 비교)는 20 != 100 이라 이걸 놓쳤다 — 회귀로 고정한다.
 SCEN["S2 필터무시"] = dict(SCEN["S1 정상"])
 SCEN["S2 필터무시"].update({
-    "symbol-change?symbol=OLD0": ("OK", sc_feed(), "20건"),        # 무필터와 동일
-    "delisted-companies?symbol=DEAD0": ("OK", dl_feed(), "20건"),  # 무필터와 동일
-    "__from_to__": ("OK", sc_feed(), "20건"),                      # 범위 밖 포함
+    # ⚠️ 핵심: 요청 심볼(OLD0/DEAD0)이 결과에 **없다.** 실측이 그랬다
+    #    (USGX 를 요청했는데 AAUM·ADIG.V·AGGI… 가 왔다).
+    "symbol-change?symbol=OLD0": ("OK", sc_feed(100, start=500), "100건"),
+    "delisted-companies?symbol=DEAD0": ("OK", dl_feed(100, start=500), "100건"),
+    "__from_to__": ("OK", sc_feed(100, start=500), "100건"),
 })
 
 SCEN["S3 시드없음"] = {

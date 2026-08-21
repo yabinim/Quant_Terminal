@@ -424,7 +424,7 @@ def build_market_gate_banner(gate: dict | None, applied_users=None) -> str:
 _NODATA_RATIO_ALERT = 0.30   # 이 비율을 넘으면 종목 문제가 아니라 API 장애로 본다
 _NODATA_MIN_SAMPLE = 5       # 표본이 이보다 적으면 비율이 의미 없다 → 개별 보고
 
-_nodata = {"by_user": {}, "attempted": 0, "missing": 0}
+_nodata = {"by_user": {}, "attempted": 0, "missing": 0, "cause": {}}
 
 
 def reset_nodata() -> None:
@@ -432,6 +432,7 @@ def reset_nodata() -> None:
     _nodata["by_user"] = {}
     _nodata["attempted"] = 0
     _nodata["missing"] = 0
+    _nodata["cause"] = {}
 
 
 def record_attempt() -> None:
@@ -489,6 +490,140 @@ def nodata_weight(uid: str) -> int:
     return 1 if nodata_is_systemic() else n
 
 
+# ── A-2b: 미수신 '원인' 판정 ─────────────────────────────────────────────────
+# A-2a 는 침묵을 깼지만 원인은 추측해서 사용자에게 떠넘겼다("티커 변경·상장폐지가
+# 흔한 원인이니 확인하세요"). 보유 종목이 죽은 건지 FMP 가 하루 삐끗한 건지
+# 사람이 직접 확인해야 했다. A-2b 는 그걸 기계가 판정한다.
+#
+# ⚠️ 경로 선택 근거 (2026-08-21 프로브 실측, diag_nodata_cause.py):
+#   · delisted-companies 는 page=5 에서 **402** — 페이지네이션 불가. 최신 ~100건이
+#     전부이고 그마저 082640.KS / 2958.HK / 6197.T 같은 비US 종목이 대부분이다.
+#     심볼 필터도 조용히 무시된다(요청 심볼이 결과에 없고 전역 피드가 그대로 온다).
+#     → US 유니버스에는 사실상 커버리지가 없다. 전역 목록 대조 경로는 폐기했다.
+#   · profile?symbol=X 는 isActivelyTrading 을 직접 준다(NB2.F → False + 회사명).
+#     → 종목별 1콜 경로를 채택했다.
+#   · symbol-change 는 심볼 필터가 무시되고 날짜 필터 도달 범위가 미입증이라
+#     **개명 후 신규 티커는 알려주지 않는다.** 불확실한 커버리지 위에 기능을 얹으면
+#     A-2a 가 없애려던 침묵을 다시 만든다. '티커 소멸'까지만 알린다.
+_NODATA_CAUSE_MAX = 25       # 최악의 경우 호출 상한. 비율 게이트가 이미 걸러주지만
+                             # 결정적 상한이 없으면 예산이 입력에 좌우된다.
+
+_NODATA_CAUSE_LABEL = {
+    "delisted":  ("🔴", "상장폐지·거래중지"),
+    "gone":      ("🟠", "티커 소멸(개명 추정)"),
+    "transient": ("🟡", "일시적 데이터 공백"),
+    "unknown":   ("⬜", "원인 미확인"),
+}
+
+
+def _fmp_profile_status(ticker: str):
+    """profile 1콜 → (원인, 회사명, 비고). 예외를 밖으로 내보내지 않는다.
+
+    이 함수만 네트워크를 만진다. 판정 로직(classify_nodata_causes)과 분리해야
+    회귀 스위트가 네트워크 없이 검사할 수 있다.
+    """
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/profile?symbol={ticker}&apikey={FMP_API_KEY}",
+            timeout=_FMP_TIMEOUT,
+        )
+    except Exception as e:
+        return "unknown", "", f"요청 실패({type(e).__name__})"
+
+    if r.status_code == 402:
+        # 해외 거래소(.F/.KS/.T 등)에서 실제로 발생한다. 플랜 제한이지
+        # 상장폐지가 아니다 — 단정하면 안 된다.
+        return "unknown", "", "플랜 미포함(해외 상장 가능성)"
+    if r.status_code != 200:
+        return "unknown", "", f"HTTP {r.status_code}"
+
+    try:
+        data = r.json()
+    except Exception:
+        return "unknown", "", "JSON 파싱 실패"
+
+    if isinstance(data, dict):
+        low = [str(k).lower() for k in data.keys()]
+        if any(k.startswith("error") for k in low):
+            return "unknown", "", "FMP 오류 응답"
+        row = data
+    elif isinstance(data, list):
+        if not data:
+            # 200 + 빈 배열 = FMP 가 이 심볼을 모른다. 개명·소멸이 유력하다.
+            return "gone", "", "profile 빈 배열"
+        row = data[0]
+    else:
+        return "unknown", "", "예상 밖 응답 타입"
+
+    if not isinstance(row, dict):
+        return "unknown", "", "예상 밖 행 타입"
+
+    name = str(row.get("companyName") or row.get("name") or "").strip()
+    act = row.get("isActivelyTrading")
+    if act is False:
+        return "delisted", name, ""
+    if act is True:
+        # 거래는 되는데 이력이 비었다 → 종목 문제가 아니라 데이터 공백이다.
+        # **이게 A-2b 의 핵심 가치다.** "보유 유지해도 된다"를 말할 수 있게 된다.
+        return "transient", name, ""
+    return "unknown", name, "isActivelyTrading 필드 없음"
+
+
+def classify_nodata_causes(probe=None) -> int:
+    """미수신 종목의 원인을 종목당 profile 1콜로 판정. 소비한 콜 수를 반환.
+
+    게이트 (호출 비용 설계):
+      · 미수신 0건        → 0콜. 해피 패스에 비용이 전혀 없다.
+      · 광범위 장애       → 0콜. 장애 중인 API 를 더 때릴 이유가 없고, 이미
+                            '광범위' 안내가 따로 나간다.
+      · 사용자 간 중복    → 티커 합집합으로 1콜. 같은 종목을 두 번 묻지 않는다.
+      · 상한 _NODATA_CAUSE_MAX 초과분은 'unknown' 으로 남긴다.
+
+    probe: 테스트 주입용. 기본값은 실제 FMP 호출.
+    """
+    if not nodata_total():
+        return 0
+    if nodata_is_systemic():
+        print("[DATA-CAUSE] 광범위 장애 — 원인 판정 생략 (0콜)")
+        return 0
+
+    fn = probe or _fmp_profile_status
+    tickers = sorted({tk for slot in _nodata["by_user"].values() for tk in slot})
+    used = 0
+    for tk in tickers:
+        if used >= _NODATA_CAUSE_MAX:
+            _nodata["cause"][tk] = ("unknown", "", "판정 상한 초과")
+            continue
+        try:
+            cause, name, note = fn(tk)
+        except Exception as e:
+            cause, name, note = "unknown", "", f"판정 실패({type(e).__name__})"
+        if cause not in _NODATA_CAUSE_LABEL:
+            cause = "unknown"
+        _nodata["cause"][tk] = (cause, str(name or ""), str(note or ""))
+        used += 1
+    print(f"[DATA-CAUSE] 원인 판정 {len(tickers)}종목 · {used}콜 소비")
+    return used
+
+
+def nodata_cause(ticker: str):
+    """(원인, 회사명, 비고). 판정 전이거나 미기록이면 unknown."""
+    tk = str(ticker or "").strip().upper()
+    got = _nodata["cause"].get(tk)
+    if not got:
+        return ("unknown", "", "")
+    return got
+
+
+def nodata_cause_counts() -> dict:
+    """원인별 종목 수. 문안 분기와 로그에 쓴다."""
+    out = {}
+    for tk in {t for slot in _nodata["by_user"].values() for t in slot}:
+        c = nodata_cause(tk)[0]
+        out[c] = out.get(c, 0) + 1
+    return out
+
+
 def nodata_log_summary() -> None:
     n_att, n_mis = _nodata["attempted"], _nodata["missing"]
     if not n_mis:
@@ -499,7 +634,15 @@ def nodata_log_summary() -> None:
     print(f"[{tag}] 이력 미수신 {n_mis}/{n_att}건 ({pct:.0f}%)")
     for u, slot in sorted(_nodata["by_user"].items()):
         for tk in sorted(slot):
-            print(f"    {u}/{tk}: {'·'.join(slot[tk])}")
+            _c, _nm, _note = nodata_cause(tk)
+            _icon, _lab = _NODATA_CAUSE_LABEL.get(_c, ("⬜", _c))
+            _tail = f" [{_icon} {_lab}"
+            if _nm:
+                _tail += f" · {_nm}"
+            if _note:
+                _tail += f" · {_note}"
+            _tail += "]"
+            print(f"    {u}/{tk}: {'·'.join(slot[tk])}{_tail}")
 
 
 def render_nodata_html(uid: str) -> str:
@@ -520,21 +663,50 @@ def render_nodata_html(uid: str) -> str:
             "매수·매도 신호가 나오지 않은 것이 '신호 없음'을 뜻하지 않습니다. "
             "내일도 같은 경고가 반복되면 확인이 필요합니다.</div></div>"
         )
-    rows = "".join(
-        f"<li style='margin:4px 0'><b>{tk}</b> "
-        f"<span style='color:#666;font-size:13px'>· {where}</span></li>"
-        for tk, where in items
-    )
+    rows = ""
+    for tk, where in items:
+        _c, _nm, _note = nodata_cause(tk)
+        _icon, _lab = _NODATA_CAUSE_LABEL.get(_c, ("⬜", _c))
+        _name_html = (f" <span style='color:#666;font-size:13px'>({_nm})</span>"
+                      if _nm else "")
+        _note_html = (f" <span style='color:#999;font-size:12px'>· {_note}</span>"
+                      if _note else "")
+        rows += (
+            f"<li style='margin:6px 0'><b>{tk}</b>{_name_html} "
+            f"<span style='color:#666;font-size:13px'>· {where}</span><br>"
+            f"<span style='font-size:13px'>{_icon} <b>{_lab}</b>{_note_html}</span></li>"
+        )
+
+    # 원인별로 사용자가 해야 할 행동이 다르다. 전부 일시적 공백인데 "즉시 확인"을
+    # 띄우면 늑대소년이 되고, 상폐가 섞였는데 "유지해도 된다"를 띄우면 손실이 난다.
+    _cnt = nodata_cause_counts()
+    _urgent = _cnt.get("delisted", 0) + _cnt.get("gone", 0)
+    if _urgent:
+        _foot = ("<b style='color:#b91c1c'>확인이 필요합니다.</b> 상장폐지·티커 소멸로 "
+                 "보이는 종목이 있습니다. <b>보유</b> 종목이라면 매도 신호가 영구히 "
+                 "오지 않으므로 증권사 계좌에서 직접 확인하세요. 개명된 경우 새 티커로 "
+                 "다시 등록해야 합니다.")
+    elif _cnt.get("transient", 0) and not _cnt.get("unknown", 0):
+        _foot = ("종목은 <b>정상 거래 중</b>이고 가격 이력만 오지 않았습니다. "
+                 "데이터 공급 측 일시 공백으로 보이므로 <b>보유는 유지해도 됩니다.</b> "
+                 "다만 오늘 평가에서는 빠졌으니 신호 없음이 '안전'을 뜻하지 않습니다. "
+                 "내일도 반복되면 확인하세요.")
+    else:
+        # ⚠️ 원인을 모를 때야말로 경고가 가장 세야 한다. A-2b 이전 문안이 여기서
+        #    더 강했다(매도 신호 경고 + 가능 원인 명시). 판정이 실패했다고 해서
+        #    사용자가 받는 정보가 A-2a 때보다 약해지면 그건 회귀다.
+        _foot = ("원인을 확인하지 못한 종목이 있습니다. <b>보유</b> 종목이라면 "
+                 "<b>매도 신호가 나오지 않습니다</b> — 티커 변경·상장폐지 가능성이 "
+                 "있으니 직접 확인하세요.")
+
     return (
         "<h2 style='color:#b45309;border-bottom:2px solid #b45309;"
         "padding-bottom:6px;margin-top:24px'>⚠️ 데이터 미수신</h2>"
         "<div style='margin:10px 0;padding:12px;border:1px solid #fde68a;"
         "border-radius:8px;background:#fffbeb'>"
-        f"<ul style='margin:0;padding-left:20px'>{rows}</ul>"
+        f"<ul style='margin:0;padding-left:20px;list-style:none'>{rows}</ul>"
         "<div style='color:#555;font-size:14px;margin-top:10px'>"
-        "위 종목은 가격 이력이 비어 <b>오늘 평가에서 제외</b>됐습니다. "
-        "<b>보유</b> 종목이라면 매도 신호가 나오지 않습니다. "
-        "티커 변경·상장폐지가 흔한 원인이니 확인하세요.</div></div>"
+        f"위 종목은 가격 이력이 비어 <b>오늘 평가에서 제외</b>됐습니다. {_foot}</div></div>"
     )
 
 
@@ -1345,6 +1517,9 @@ def main():
                 pf_res = eval_portfolio_eod(spy_close, hist_cache, today)
             total = (sum(len(v) for v in wl_res.values())
                      + sum(len(v) for v in pf_res.values()))
+            # A-2b: 미수신 원인 판정. 미수신 0건이면 0콜, 광범위 장애면 건너뛴다.
+            #   로그 요약보다 **먼저** 불러야 요약에 원인이 함께 찍힌다.
+            classify_nodata_causes()
             nodata_log_summary()
             # 발동 0건이어도 데이터 미수신이 있으면 발송한다. 미수신은 그 자체가
             # 알림이고, 여기서 걸러 버리면 침묵을 알리는 경로가 같은 이유로

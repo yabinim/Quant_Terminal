@@ -47,8 +47,12 @@ def check(name, cond, detail=""):
 # ══════════════════════════════════════════════════════════════════════════
 _WANT_FUNCS = ["reset_nodata", "record_attempt", "record_nodata",
                "nodata_is_systemic", "nodata_for_user", "nodata_total",
-               "nodata_weight", "nodata_log_summary", "render_nodata_html"]
-_WANT_CONSTS = ["_NODATA_RATIO_ALERT", "_NODATA_MIN_SAMPLE", "_nodata"]
+               "nodata_weight", "nodata_log_summary", "render_nodata_html",
+               # A-2b — 원인 판정. _fmp_profile_status 는 **일부러 뺀다**:
+               # 그 함수만 네트워크를 만지고, classify 는 probe 주입으로 테스트한다.
+               "classify_nodata_causes", "nodata_cause", "nodata_cause_counts"]
+_WANT_CONSTS = ["_NODATA_RATIO_ALERT", "_NODATA_MIN_SAMPLE", "_nodata",
+                "_NODATA_CAUSE_LABEL", "_NODATA_CAUSE_MAX"]
 
 
 def load_module_slice():
@@ -212,8 +216,10 @@ def test_render():
     M["record_nodata"]("yab", "CCIX", "워치리스트")
     h = M["render_nodata_html"]("yab")
     check("개별 보고 — 티커가 본문에 있다", "VYNE" in h and "CCIX" in h)
-    check("개별 보고 — 보유 경고 문구 포함", "매도 신호가 나오지 않습니다" in h)
-    check("개별 보고 — 원인 안내 포함", "상장폐지" in h)
+    # A-2b 이후 이 경로는 '원인 미판정(unknown)' 분기를 탄다. 판정이 실패해도
+    # 보유 심각도 경고와 가능 원인 안내가 **A-2a 수준 밑으로 내려가면 안 된다.**
+    check("개별 보고(미판정) — 보유 경고 문구 유지", "매도 신호가 나오지 않습니다" in h)
+    check("개별 보고(미판정) — 가능 원인 안내 유지", "상장폐지" in h)
     check("개별 보고 — 광범위 문구 없음", "광범위" not in h)
     check("타 사용자 티커 누출 없음", "TSLA" not in h)
 
@@ -264,6 +270,32 @@ def test_source_contract():
     check("보유 EOD 가 record_attempt 호출", "record_attempt" in pf)
     check("main 이 reset_nodata 호출 (실행 간 오염 방지)", "reset_nodata" in mn)
     check("main 이 nodata_log_summary 호출", "nodata_log_summary" in mn)
+    check("main 이 classify_nodata_causes 호출 (A-2b 훅 배선)",
+          "classify_nodata_causes" in mn)
+    _order_src = src[src.find("def main("):]
+    _i_cls = _order_src.find("classify_nodata_causes()")
+    _i_log = _order_src.find("nodata_log_summary()")
+    check("원인 판정이 로그 요약보다 먼저 (요약에 원인이 찍히도록)",
+          _i_cls != -1 and _i_log != -1 and _i_cls < _i_log)
+    check("classify 가 _fmp_profile_status 를 쓴다 (경로 A)",
+          "_fmp_profile_status" in calls_in("classify_nodata_causes")
+          or "_fmp_profile_status" in src)
+    # ⚠️ src 전체를 grep 하면 **'이 경로를 쓰지 않는다'고 설명한 주석**에 반응한다
+    #    (실제로 초판이 그렇게 오탐했다). 주석은 AST 에 남지 않으므로 문자열
+    #    상수만 본다. 독스트링도 설명문이라 제외한다.
+    _docs = set()
+    for _n in ast.walk(tree):
+        if isinstance(_n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _d = ast.get_docstring(_n, clean=False)
+            if _d:
+                _docs.add(_d)
+    _lits = [n.value for n in ast.walk(tree)
+             if isinstance(n, ast.Constant) and isinstance(n.value, str)
+             and n.value not in _docs]
+    check("전역 목록 대조 경로를 실제로 호출하지 않는다 (프로브: 402·US 커버리지 없음)",
+          not any(("delisted-companies" in s) or ("symbol-change" in s) for s in _lits))
+    check("profile 엔드포인트를 실제로 호출한다 (경로 A)",
+          any("profile?symbol=" in s for s in _lits))
     check("main 게이트가 nodata_total 을 본다 (침묵의 침묵 방지)",
           "nodata_total" in mn)
     check("발송부가 nodata_weight 를 본다", "nodata_weight" in dp)
@@ -359,17 +391,270 @@ def test_mutation():
     check("뮤테이션 원복 후 정상",
           systemic_check_works() and merge_check_works())
 
+    # ── A-2b 뮤테이션 ─────────────────────────────────────────────────────
+    orig_cls = M["classify_nodata_causes"]
+    orig_render = M["render_nodata_html"]
+
+    def _setup(causes, attempted=60):
+        _fresh()
+        for _ in range(attempted):
+            M["record_attempt"]()
+        for tk in causes:
+            M["record_nodata"]("yab", tk, "보유")
+
+    def budget_gate_works():
+        """광범위 장애면 0콜이어야 한다."""
+        _fresh()
+        for _ in range(10):
+            M["record_attempt"]()
+        for i in range(6):
+            M["record_nodata"]("yab", f"T{i}", "보유")
+        calls = []
+
+        def _p(tk):
+            calls.append(tk)
+            return ("delisted", "", "")
+        M["classify_nodata_causes"](probe=_p)
+        return calls == []
+
+    def dedupe_works():
+        """같은 티커를 두 사용자가 가져도 1콜."""
+        _fresh()
+        for _ in range(60):
+            M["record_attempt"]()
+        M["record_nodata"]("yab", "AAPL", "보유")
+        M["record_nodata"]("guest1", "AAPL", "워치리스트")
+        calls = []
+
+        def _p(tk):
+            calls.append(tk)
+            return ("transient", "", "")
+        M["classify_nodata_causes"](probe=_p)
+        return len(calls) == 1
+
+    def loss_guard_works():
+        """상폐가 섞였는데 '유지해도 됩니다'가 뜨면 안 된다 — 매도 시점 상실."""
+        tbl = {"OK1": ("transient", "", ""), "DEAD": ("delisted", "", "")}
+        _setup(tbl)
+        M["classify_nodata_causes"](probe=lambda tk: tbl[tk])
+        h = M["render_nodata_html"]("yab")
+        return ("유지해도 됩니다" not in h) and ("확인이 필요합니다" in h)
+
+    check("A-2b 기준 상태 — 예산 게이트 정상", budget_gate_works())
+    check("A-2b 기준 상태 — 중복 제거 정상", dedupe_works())
+    check("A-2b 기준 상태 — 손실 가드 정상", loss_guard_works())
+
+    # M5: systemic 게이트 무시 → 장애 중 API 를 티커 수만큼 재타격
+    def _no_gate(probe=None):
+        fn = probe
+        for tk in sorted({t for s in M["_nodata"]["by_user"].values() for t in s}):
+            M["_nodata"]["cause"][tk] = fn(tk)
+        return 0
+    M["classify_nodata_causes"] = _no_gate
+    caught = not budget_gate_works()
+    M["classify_nodata_causes"] = orig_cls
+    check("M5 systemic 게이트 제거 (장애 중 재타격) → 검출됨", caught)
+
+    # M6: 사용자별로 돌아 중복 티커를 두 번 조회
+    def _dupe(probe=None):
+        fn = probe
+        for slot in M["_nodata"]["by_user"].values():
+            for tk in sorted(slot):
+                M["_nodata"]["cause"][tk] = fn(tk)
+        return 0
+    M["classify_nodata_causes"] = _dupe
+    caught = not dedupe_works()
+    M["classify_nodata_causes"] = orig_cls
+    check("M6 사용자별 중복 조회 (콜 낭비) → 검출됨", caught)
+
+    # M7: 안심 문구를 무조건 붙임 — 상폐인데 '유지해도 됩니다'
+    def _always_calm(uid):
+        return orig_render(uid) + "보유는 유지해도 됩니다."
+    M["render_nodata_html"] = _always_calm
+    caught = not loss_guard_works()
+    M["render_nodata_html"] = orig_render
+    check("M7 상폐에도 안심 문구 (매도 시점 상실) → 검출됨", caught)
+
+    # M8: 호출 상한 제거
+    def _no_cap(probe=None):
+        fn = probe
+        n = 0
+        for tk in sorted({t for s in M["_nodata"]["by_user"].values() for t in s}):
+            M["_nodata"]["cause"][tk] = fn(tk)
+            n += 1
+        return n
+
+    def cap_works():
+        _fresh()
+        for _ in range(400):
+            M["record_attempt"]()
+        for i in range(M["_NODATA_CAUSE_MAX"] + 9):
+            M["record_nodata"]("yab", f"S{i:03d}", "보유")
+        return M["classify_nodata_causes"](
+            probe=lambda tk: ("unknown", "", "")) <= M["_NODATA_CAUSE_MAX"]
+
+    check("A-2b 기준 상태 — 호출 상한 정상", cap_works())
+    M["classify_nodata_causes"] = _no_cap
+    caught = not cap_works()
+    M["classify_nodata_causes"] = orig_cls
+    check("M8 호출 상한 제거 (예산이 입력에 좌우됨) → 검출됨", caught)
+
+    check("A-2b 뮤테이션 원복 후 정상",
+          budget_gate_works() and dedupe_works() and loss_guard_works() and cap_works())
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# C-2. 원인 판정 (A-2b)
+# ══════════════════════════════════════════════════════════════════════════
+def test_cause():
+    print("\n── C-2. 원인 판정 (A-2b)")
+
+    def fake(table, log=None):
+        def _f(tk):
+            if log is not None:
+                log.append(tk)
+            return table.get(tk, ("unknown", "", "미정의"))
+        return _f
+
+    # --- 호출 예산: 해피 패스는 반드시 0콜이어야 한다 ---
+    _fresh()
+    for _ in range(20):
+        M["record_attempt"]()
+    calls = []
+    n = M["classify_nodata_causes"](probe=fake({}, calls))
+    check("미수신 0건 → 0콜 (해피 패스 비용 없음)", n == 0 and calls == [], str(n))
+
+    # --- 광범위 장애면 판정 자체를 건너뛴다 ---
+    _fresh()
+    for _ in range(10):
+        M["record_attempt"]()
+    for i in range(5):                     # 5/10 = 50% > 30% → systemic
+        M["record_nodata"]("yab", f"T{i}", "보유")
+    calls = []
+    n = M["classify_nodata_causes"](probe=fake({}, calls))
+    check("광범위 장애 → 0콜 (장애 중 API 재타격 방지)", n == 0 and calls == [], str(n))
+
+    # --- 사용자 간 중복 티커는 1콜 ---
+    _fresh()
+    for _ in range(50):
+        M["record_attempt"]()
+    M["record_nodata"]("yab", "AAPL", "보유")
+    M["record_nodata"]("guest1", "AAPL", "워치리스트")
+    M["record_nodata"]("yab", "TSLA", "워치리스트")
+    calls = []
+    M["classify_nodata_causes"](probe=fake(
+        {"AAPL": ("transient", "Apple Inc.", ""),
+         "TSLA": ("delisted", "Tesla", "")}, calls))
+    check("사용자 간 중복 티커 → 1콜로 합침", sorted(calls) == ["AAPL", "TSLA"], str(calls))
+    check("판정 결과 저장", M["nodata_cause"]("AAPL")[0] == "transient")
+    check("회사명 보존", M["nodata_cause"]("AAPL")[1] == "Apple Inc.")
+    check("미판정 티커 → unknown", M["nodata_cause"]("ZZZZ")[0] == "unknown")
+
+    # --- 호출 상한 ---
+    _fresh()
+    for _ in range(400):
+        M["record_attempt"]()
+    for i in range(M["_NODATA_CAUSE_MAX"] + 7):
+        M["record_nodata"]("yab", f"S{i:03d}", "워치리스트")
+    calls = []
+    n = M["classify_nodata_causes"](probe=fake({}, calls))
+    check("호출 상한 준수 (예산이 입력에 좌우되지 않음)",
+          n == M["_NODATA_CAUSE_MAX"], f"{n} vs {M['_NODATA_CAUSE_MAX']}")
+
+    # --- probe 가 예외를 던져도 판정이 멈추지 않아야 한다 ---
+    _fresh()
+    for _ in range(50):
+        M["record_attempt"]()
+    M["record_nodata"]("yab", "AAA", "보유")
+    M["record_nodata"]("yab", "BBB", "보유")
+
+    def _boom(tk):
+        if tk == "AAA":
+            raise RuntimeError("네트워크 폭발")
+        return ("delisted", "B Corp", "")
+
+    M["classify_nodata_causes"](probe=_boom)
+    check("probe 예외 → unknown 으로 격리, 다음 종목 계속",
+          M["nodata_cause"]("AAA")[0] == "unknown"
+          and M["nodata_cause"]("BBB")[0] == "delisted")
+
+    # --- 알 수 없는 원인 문자열은 unknown 으로 정규화 ---
+    _fresh()
+    for _ in range(50):
+        M["record_attempt"]()
+    M["record_nodata"]("yab", "CCC", "보유")
+    M["classify_nodata_causes"](probe=lambda tk: ("좀비", "", ""))
+    check("미정의 원인 라벨 → unknown 정규화", M["nodata_cause"]("CCC")[0] == "unknown")
+
+    # ── 문안 분기 — 여기서 틀리면 손실로 이어진다 ────────────────────────
+    # 전부 일시적인데 "즉시 확인"을 띄우면 늑대소년이 되고,
+    # 상폐가 섞였는데 "유지해도 된다"를 띄우면 매도 시점을 놓친다.
+    def html_for(causes):
+        _fresh()
+        for _ in range(60):
+            M["record_attempt"]()
+        for tk in causes:
+            M["record_nodata"]("yab", tk, "보유")
+        M["classify_nodata_causes"](probe=lambda tk: causes[tk])
+        return M["render_nodata_html"]("yab")
+
+    h = html_for({"AAPL": ("transient", "Apple Inc.", "")})
+    check("전부 정상거래 → '유지해도 됩니다' 안내", "유지해도 됩니다" in h)
+    check("전부 정상거래 → '확인이 필요합니다' 없음", "확인이 필요합니다" not in h)
+    check("정상거래 라벨 표시", "일시적 데이터 공백" in h)
+    check("회사명 렌더", "Apple Inc." in h)
+
+    h = html_for({"AAPL": ("transient", "Apple Inc.", ""),
+                  "DEAD": ("delisted", "Dead Co", "")})
+    check("상폐 1건 섞이면 → '확인이 필요합니다'", "확인이 필요합니다" in h)
+    check("상폐 섞이면 '유지해도 됩니다' 억제 (손실 방지)", "유지해도 됩니다" not in h)
+    check("상폐 라벨 표시", "상장폐지·거래중지" in h)
+
+    h = html_for({"OLDX": ("gone", "", "profile 빈 배열")})
+    check("티커 소멸 → '확인이 필요합니다'", "확인이 필요합니다" in h)
+    check("티커 소멸 라벨 표시", "티커 소멸" in h)
+    check("비고 렌더", "profile 빈 배열" in h)
+
+    h = html_for({"XXXX": ("unknown", "", "플랜 미포함(해외 상장 가능성)")})
+    check("원인 미확인 → 단정하지 않고 확인 요청", "확인하세요" in h)
+    check("원인 미확인 → '유지해도 됩니다' 없음", "유지해도 됩니다" not in h)
+
+    h = html_for({"AAPL": ("transient", "Apple Inc.", ""),
+                  "XXXX": ("unknown", "", "HTTP 500")})
+    check("정상거래+미확인 혼재 → 안심 문구 억제", "유지해도 됩니다" not in h)
+
+    # --- 광범위 장애 렌더는 원인 없이도 동작해야 한다 ---
+    _fresh()
+    for _ in range(10):
+        M["record_attempt"]()
+    for i in range(6):
+        M["record_nodata"]("yab", f"G{i}", "보유")
+    h = M["render_nodata_html"]("yab")
+    check("광범위 장애 렌더 정상 (원인 판정 생략 상태)", "광범위" in h and h != "")
+
+    # --- 원인 집계 ---
+    _fresh()
+    for _ in range(60):
+        M["record_attempt"]()
+    for tk, c in [("A", "delisted"), ("B", "delisted"), ("C", "transient")]:
+        M["record_nodata"]("yab", tk, "보유")
+    M["classify_nodata_causes"](
+        probe=lambda tk: ({"A": "delisted", "B": "delisted", "C": "transient"}[tk], "", ""))
+    cnt = M["nodata_cause_counts"]()
+    check("원인별 집계", cnt.get("delisted") == 2 and cnt.get("transient") == 1, str(cnt))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 70)
-    print("데이터 미수신 감지(A-2a) 회귀 검증")
+    print("데이터 미수신 감지(A-2a) + 원인 판정(A-2b) 회귀 검증")
     print("  네트워크·시트·시크릿 없음 · 부작용 없음")
     print("=" * 70)
 
     test_record()
     test_systemic()
     test_render()
+    test_cause()
     test_source_contract()
     test_mutation()
 
