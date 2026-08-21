@@ -5,15 +5,31 @@ name: 🏭 진단 — 업종 모멘텀 예측력 검증 (수동 전용)
 #   industry-performance-snapshot 이 159개 업종(섹터의 14배 세분화)을 준다.
 #   신호에 붙일지 결정하기 전에, 붙일 가치가 있는지부터 잰다.
 #
-# 왜 지금 되나 (tierB3 실측):
-#   historical-industry-performance  777건 · 3.00년 → 일회성 백필 가능
-#   historical-sector-performance    772건 · 3.00년
-#   → 3개월 스냅샷 누적을 기다릴 필요가 없다.
+# 왜 지금 되나 (tierB4 실측 — tierB3 의 "3년 한도"는 착오였다):
+#   historical-industry-performance  1782건 · 2019-08-23 ~ 2026-08-21 · 7.0년
+#   historical-sector-performance    1777건 · 동일 구간
+#   tierB3 는 `from = today-3년` 을 보내 3년을 받았고 그게 "플랜 한도 3년"으로
+#   기록됐다. 요청한 날짜부터 왔다는 건 **한도를 못 쟀다**는 뜻이다.
+#   7년을 요청하니 7년이 왔고 여전히 한도 미도달이다.
+#   → 2020 COVID 폭락과 2022 하락장이 검증 구간에 들어온다.
 #
-# ⚠️ 휴장일 행이 섞여 있다 (실측):
-#   실제 거래일 754일인데 업종 응답 777건(+23), 섹터 772건(+18).
-#   휴장일에도 행이 생기고 그날 값은 무의미하다. 3년 중 3%.
+# ⚠️ 휴장일 행이 섞여 있다 — 최근 3년에만 몰려 있다 (실측):
+#   전체 7년: 거래일 1757 · 업종 1782(+25) · 섹터 1777(+20)
+#   최근 3년: 거래일  754 · 업종  777(+23) · 섹터  772(+18)
+#   앞선 4년: 거래일 1003 · 업종 1005 (+2) · 섹터 1005 (+2)
+#   오염이 거의 전부 최근 3년에 있다. 앞선 4년은 깨끗하고 **결측도 없다**.
 #   → calendar_core.is_market_open() 으로 걸러낸다 (A-1 모듈이 여기 쓰인다).
+#
+# 롤링 워크포워드 (full-rolling · 추가 API 콜 0):
+#   B(업종 모멘텀 신호화) 생사 판정. 학습 252일 → 검증 63일.
+#   ① 분산 6창 — 사전 확정 4/6 통과 시 채택 (구간 전체에 균등 배치)
+#   ② 연속 21창 — 보조. 같은 데이터의 무작위 대조군 30회와 비교해
+#      무작위가 전략 이상을 10% 넘게 내면 ①통과도 무효
+#   보조는 **죽일 수만 있고 살릴 수는 없다** — 사전에 정한 비대칭이다.
+#
+#   ⚠️ 창별 통과는 "초과수익 > 0" 하나다. MDD 조건을 넣었다가 뺐다 —
+#      집중 포트폴리오는 동일가중보다 MDD 가 구조적으로 깊어서, 그 비교는
+#      실력이 아니라 집중도를 잰다. 진짜 신호를 심은 대조군이 0/4 로 죽었다.
 #
 # ⚠️ 결과 해석:
 #   averageChange 기반 **가상 지수**다. 거래 가능한 수익률이 아니다.
@@ -37,6 +53,7 @@ name: 🏭 진단 — 업종 모멘텀 예측력 검증 (수동 전용)
 #   lookback 에서 자동 산출하고, 탈락하는 설정이 있으면 로그에 찍는다.
 #
 # 호출 비용:
+#   full-rolling  업종 159 + 섹터 11 + SPY 1 = 171콜 (롤링은 같은 데이터 재사용)
 #   full          업종 159 + 섹터 11 + SPY 1 = 171콜 (일회성)
 #   sectors-only  섹터 11 + SPY 1 = 12콜
 #   selftest      0콜 (네트워크 불필요)
@@ -49,12 +66,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "실행 모드 (selftest=엔진검증 0콜 / sectors=12콜 / full=171콜)"
+        description: "실행 모드 (selftest=엔진검증 0콜 / sectors=12콜 / full=171콜 / full-rolling=171콜 + B 생사판정)"
         type: choice
         options:
           - selftest
           - sectors
           - full
+          - full-rolling
         default: selftest
 
 jobs:
@@ -83,6 +101,8 @@ jobs:
             python automation/diag_industry_momentum.py --selftest
           elif [ "${{ inputs.mode }}" = "sectors" ]; then
             python automation/diag_industry_momentum.py --sectors-only
+          elif [ "${{ inputs.mode }}" = "full-rolling" ]; then
+            python automation/diag_industry_momentum.py --rolling
           else
             python automation/diag_industry_momentum.py
           fi
