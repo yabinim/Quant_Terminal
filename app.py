@@ -43,6 +43,13 @@ import earnings_core as ec
 import reminders_core as rmc  # 개발 로드맵 리마인더 SSOT — run_narrative 와 동일 모듈
 import watchlist_metrics_core as wm  # 워치리스트 표시 지표 SSOT — 자동화(run_watchlist_alerts)와 동일 모듈
 import industry_core as icore  # 업종 모멘텀·백분위 SSOT — 자동화(refresh_industry_perf)와 동일 모듈
+# NYSE 시장 캘린더(휴장일) SSOT — 자동화 5개 파일(run_narrative·run_drg_predict·
+# run_drg_verify·run_watchlist_alerts·refresh_industry_perf)과 **동일 모듈**.
+# ⚠️ 별칭이 자동화와 달리 `cc` 가 아닌 이유: app.py 안에 지역변수 cc = "close" 가
+#    3곳(이 커밋 기준 3523·3761·4002) 있다. `as cc` 로 두면 그 함수 스코프에서만
+#    모듈이 조용히
+#    가려져, 나중에 거기서 cc.is_market_open() 을 부르는 순간 AttributeError 가 난다.
+import calendar_core as mcal
 
 # ── 1.6 AI 종목 스캐너 SSOT (scanner_core) ───────────────────────────────────
 # 3버킷 스코어링·프롬프트·상수·표시 포맷·70점 판정은 전부 scanner_core 에만 존재한다.
@@ -12700,6 +12707,24 @@ def get_market_status(et_now):
         return "🌑 Market Closed"
     if et_now.weekday() >= 5:
         return "🌑 Market Closed (Weekend)"
+
+    # ── 휴장일 판정 — calendar_core SSOT ──────────────────────────────────────
+    # 이 검사가 없으면 추수감사절 10:00 에도 "🟢 Regular Market (Open)" 이 떴다.
+    # A-1 에서 자동화 5개 파일은 연결됐고 앱만 빠져 있던 자리다.
+    #
+    # 규칙 계산이라 FMP·시트 접근이 0 이다. 이 헤더는 매 rerun 마다 그려지는
+    # 핫 패스이므로 여기에 I/O 를 붙이면 안 된다. 연도당 1회 계산 후
+    # calendar_core._RULE_CACHE 재사용 → 실질 비용은 dict 조회 1회.
+    #
+    # ⚠️ 반일장(13:00 조기 마감)은 여기서 다루지 않는다. Market_Calendar 시트의
+    #    Adj_Close 컬럼이 필요해 시트 왕복이 생긴다 — 별도 미결 항목이다.
+    #    따라서 조기 마감일 14:00 에는 아직 "Regular Market (Open)" 이 뜬다.
+    try:
+        if not mcal.is_market_open(et_now):
+            _hn = mcal.holiday_name(et_now)
+            return f"🌑 Market Closed ({_hn})" if _hn else "🌑 Market Closed (Holiday)"
+    except Exception:
+        pass  # 판정 불가 → 기존 시간대 로직으로 진행(개장 가정). 회귀 없음.
 
     m = et_now.hour * 60 + et_now.minute
     if 240 <= m <= 569:  # 04:00 ~ 09:29
