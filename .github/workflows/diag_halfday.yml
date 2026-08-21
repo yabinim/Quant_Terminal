@@ -1,0 +1,83 @@
+name: 🕐 진단 — 반일장(조기 마감) 실측 (수동 전용)
+
+# 무엇을 답하나:
+#   단 하나. **FMP holidays-by-exchange 가 반일장을 싣는가, 어떤 형식인가.**
+#
+# 왜 지금 재나:
+#   calendar_core 에 배관은 이미 있다 — parse_calendar_values() 가 half 를,
+#   diff_against_rules() 가 half_days 를 돌려준다. 그런데 **그 값을 읽고
+#   판정하는 코드가 하나도 없다.** rows_from_fmp 는 adjCloseTime 을 str() 로
+#   그냥 저장할 뿐이라, 실제로 무엇이 오는지 아무도 확인한 적이 없다.
+#
+#   엔드포인트 이름이 "holidays" 다. 반일장은 휴일이 아니다. 안 실릴 수도 있다.
+#
+# 무엇이 걸려 있나 (반일장 14:00 에 두 곳이 틀린 말을 한다):
+#   · app.py get_market_status()  → "🟢 Regular Market (Open)" (49행 주석이 인정)
+#   · 2PM 잡 (--mode intraday)    → 13:00 종가를 "잠정" 봉으로 주입하고
+#                                    "장중 헤드업" 메일 발송. 숫자는 맞고 라벨이 틀림
+#
+#   고치는 방식이 이 결과로 갈린다:
+#     실린다   → 규칙 계산(핫 패스) + 시트 주간 대조. A-1 과 동일한 패턴
+#     안 실린다 → 검증 채널이 없다. 규칙 계산만 남고 뮤테이션 테스트로만 방어
+#
+# ⚠️ 판별 설계 — 정답을 아는 날짜로 검사한다:
+#   ① 2025-11-28 (추수감사절 다음날) = 반일장. adjCloseTime 이 있어야 한다
+#   ② 2025-11-27 (추수감사절)        = 전휴장. isClosed=True 여야 한다
+#   ③ 2025-11-25 (평범한 화요일)     = **응답에 없어야 한다**
+#
+#   ③이 핵심이다. 모든 날짜가 다 실려 오면 "응답에 있다"는 사실이 아무 정보도
+#   아니게 되고, ①의 결과를 신뢰할 수 없다. 이 프로젝트에서 판별력 없는 지표를
+#   판별자로 고른 전례가 세 번 있어서 이번엔 먼저 박아 넣었다.
+#
+#   추가로 **왕복 검사** — 응답을 rows_from_fmp → parse_calendar_values 실제
+#   파이프라인에 통과시켜 half 가 채워지는지 본다. 필드가 있어도 형식이 안 맞으면
+#   조용히 빈 dict 가 되고, 그건 배포 후에나 드러난다.
+#
+# 호출 비용: 2콜 (2025년 1콜 + 2026년 1콜)
+#
+# 안전성:
+#   · 시트 쓰기 없음 · 이메일 없음 · 상태머신 미접촉 — 완전 읽기 전용
+#   · repository_dispatch / schedule 없음 (일회성 확인)
+
+on:
+  workflow_dispatch:
+    inputs:
+      exchange:
+        description: "거래소 (NYSE 권장 / NASDAQ 은 calendar_core 기본값)"
+        type: choice
+        options:
+          - NYSE
+          - NASDAQ
+        default: NYSE
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install requests
+
+      - name: 🕐 반일장 실측
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          PROBE_EXCHANGE: ${{ inputs.exchange }}
+        run: |
+          python automation/diag_halfday.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          calendar_core.py
+          automation/diag_halfday.py
