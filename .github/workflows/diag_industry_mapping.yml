@@ -1,0 +1,74 @@
+name: 🔬 진단 — 업종명 매칭 검증 (Phase 3 구현 전제)
+
+# 왜 필요한가:
+#   Phase 3 화면은 종목의 업종명으로 순위표를 조회한다.
+#
+#     app.py:19278   industry_en  ← profile 엔드포인트 원본값
+#                    ↓ 이 문자열로
+#     Industry_Rank  {업종명: 백분위}  ← available-industries 기준
+#
+#   두 문자열 체계가 같은지 **검증된 적이 없다.** 다르면 화면에 영원히
+#   아무것도 안 뜨는데 **에러도 안 난다** — 조용히 빈 칸이 될 뿐이다.
+#
+#   이 프로젝트에서 가장 많이 당한 실패 유형이라(402 vs 404, 필드명 대소문자,
+#   와이드 시트 열 정렬) 구현 전에 실측한다.
+#
+# 값의 출처 (추적 완료):
+#   app.py:19278 → app.py:7333 → scanner_core.py:611 → _fmp_profile
+#   → /stable/profile 의 industry 원본값
+#
+# 판정:
+#   exact 100%       → 정규화 불필요, 바로 구현
+#   case/space 섞임  → industry_core 에 정규화 함수 추가
+#   none 다수        → 매핑 테이블 필요. 화면 설계 재검토
+#
+# 모드:
+#   sample     기본 표본 15종목 (16콜). Tobacco·Oil&Gas 등 의심 업종 포함
+#   watchlist  Watchlist + Portfolios 실제 티커 (진짜 매칭률은 이쪽이 답이다)
+#
+# 안전성: 시트 쓰기 없음 · 이메일 없음 · 읽기 전용
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "검증 대상 (sample=기본표본 16콜 / watchlist=실제 보유·관심 종목)"
+        type: choice
+        options:
+          - sample
+          - watchlist
+        default: sample
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성
+        run: pip install requests gspread google-auth
+
+      - name: 🔬 업종명 매칭 검증
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+        run: |
+          if [ "${{ inputs.mode }}" = "watchlist" ]; then
+            python automation/diag_industry_mapping.py --watchlist
+          else
+            python automation/diag_industry_mapping.py
+          fi
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          industry_core.py
+          automation/diag_industry_mapping.py
