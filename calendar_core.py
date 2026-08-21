@@ -257,8 +257,15 @@ def nyse_early_close_days(year: int) -> dict:
                 out[date(year, mm, dd_).isoformat()] = EARLY_CLOSE_TIME
     except Exception:
         return {}
-    # 전휴장·주말과 겹치면 반일장이 아니다. 요일 조건상 발생하지 않지만,
-    # 두 판정이 모순되는 상태를 구조적으로 막는다.
+    # 전휴장·주말과 겹치면 반일장이 아니다.
+    #
+    # ⚠️ 이 가드는 위 요일 조건과 **중복이다. 의도된 삼중 방어다.**
+    #    (a) 요일 조건  (b) 주말 가드  (c) 휴일 가드 — 셋 중 **하나만 있어도**
+    #    골든 7년이 통과한다(diag_market_calendar H-R 로 실측·고정).
+    #    "중복이니 지우자" 는 유혹이 생기는 자리인데, 하나만 남기면 그 하나가
+    #    틀렸을 때 잡을 게 없어진다. 셋 다 유지한다.
+    #    (부수 효과: 단일 지점 뮤테이션으로는 이 함수를 검증할 수 없다.
+    #     뮤턴트는 2개 이상을 동시에 제거해야 한다 — H-M2/H-M3 참조)
     hol = regular_holidays_cached(year)
     clean = {}
     for ds, t in out.items():
