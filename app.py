@@ -46,8 +46,8 @@ import industry_core as icore  # 업종 모멘텀·백분위 SSOT — 자동화(
 # NYSE 시장 캘린더(휴장일) SSOT — 자동화 5개 파일(run_narrative·run_drg_predict·
 # run_drg_verify·run_watchlist_alerts·refresh_industry_perf)과 **동일 모듈**.
 # ⚠️ 별칭이 자동화와 달리 `cc` 가 아닌 이유: app.py 안에 지역변수 cc = "close" 가
-#    3곳(이 커밋 기준 3523·3761·4002) 있다. `as cc` 로 두면 그 함수 스코프에서만
-#    모듈이 조용히
+#    여러 곳 있다(`grep -n 'cc = "close"' app.py`). 줄 번호를 적으면 편집할 때마다
+#    어긋나므로 패턴으로 고정한다. `as cc` 로 두면 그 함수 스코프에서만 모듈이
 #    가려져, 나중에 거기서 cc.is_market_open() 을 부르는 순간 AttributeError 가 난다.
 import calendar_core as mcal
 
@@ -12716,23 +12716,36 @@ def get_market_status(et_now):
     # 핫 패스이므로 여기에 I/O 를 붙이면 안 된다. 연도당 1회 계산 후
     # calendar_core._RULE_CACHE 재사용 → 실질 비용은 dict 조회 1회.
     #
-    # ⚠️ 반일장(13:00 조기 마감)은 여기서 다루지 않는다. Market_Calendar 시트의
-    #    Adj_Close 컬럼이 필요해 시트 왕복이 생긴다 — 별도 미결 항목이다.
-    #    따라서 조기 마감일 14:00 에는 아직 "Regular Market (Open)" 이 뜬다.
+    # ── 반일장(조기 마감) — calendar_core 규칙 계산 ──────────────────────────
+    # 예전엔 여기서 안 다뤄서 11/27 14:00 에도 "Regular Market (Open)" 이 떴다.
+    # 시트(Market_Calendar.Adj_Close)를 읽어야 하는 줄 알았으나, 반일장은
+    # 규칙이 확정적이라 I/O 가 필요 없다:
+    #     추수감사절 다음 금요일 · 7/3(7/4 가 화~금) · 12/24(12/25 가 화~금)
+    # 7년(FMP 실측 2년 + NYSE 이력 5년) 전부 일치 확인 — nyse_early_close_days 참조.
+    #
+    # 이 헤더는 매 rerun 마다 그려지는 핫 패스다. 규칙 계산이라 FMP·시트 접근이
+    # 0 이고, 연도당 1회 계산 후 calendar_core._EARLY_CACHE 재사용 →
+    # 실질 비용은 dict 조회 1회.
+    _close_m = 960  # 16:00 — 판정 실패 시 폴백(정상 마감 가정)
+    _early = False
     try:
-        if not mcal.is_market_open(et_now):
+        _ct = mcal.session_close_time(et_now)
+        if _ct is None:
             _hn = mcal.holiday_name(et_now)
             return f"🌑 Market Closed ({_hn})" if _hn else "🌑 Market Closed (Holiday)"
+        _close_m = mcal.close_minutes(_ct)
+        _early = (_ct != mcal.REGULAR_CLOSE_TIME)
     except Exception:
-        pass  # 판정 불가 → 기존 시간대 로직으로 진행(개장 가정). 회귀 없음.
+        pass  # 판정 불가 → 정규 마감 기준으로 진행. 회귀 없음.
 
     m = et_now.hour * 60 + et_now.minute
     if 240 <= m <= 569:  # 04:00 ~ 09:29
-        return "🌅 Pre-market"
-    if 570 <= m <= 959:  # 09:30 ~ 15:59
-        return "🟢 Regular Market (Open)"
-    if 960 <= m <= 1199:  # 16:00 ~ 19:59
-        return "🌙 After-hours"
+        return "🌅 Pre-market (반일장)" if _early else "🌅 Pre-market"
+    if 570 <= m < _close_m:  # 09:30 ~ 마감 직전
+        return ("🟢 Regular Market (반일장 · 13:00 마감)" if _early
+                else "🟢 Regular Market (Open)")
+    if _close_m <= m < _close_m + 240:  # 마감 ~ +4시간
+        return "🌙 After-hours (반일장)" if _early else "🌙 After-hours"
     return "🌑 Market Closed"
 
 

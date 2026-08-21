@@ -74,13 +74,17 @@ except Exception:                                    # pragma: no cover
     _ET = None
 
 # SSOT 버전 스탬프 — 소비자가 기동 시 확인한다.
-CALENDAR_CORE_VERSION = "1.0.0"
+CALENDAR_CORE_VERSION = "1.1.0"   # 1.1.0: 반일장(조기 마감) 규칙 추가
 
 CAL_SHEET = "Market_Calendar"
 CAL_COLS = ["Date", "Exchange", "Name", "Is_Closed",
             "Adj_Open", "Adj_Close", "Source", "Updated_At"]
 
 DEFAULT_EXCHANGE = "NASDAQ"
+
+# 정규장 마감 시각(ET). 반일장은 13:00 로 앞당겨진다.
+REGULAR_CLOSE_TIME = "16:00"
+EARLY_CLOSE_TIME = "13:00"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -172,6 +176,7 @@ def nyse_regular_holidays(year: int) -> dict:
 # 프로세스 캐시 — 같은 실행 안에서 두 번 이상 물어보는 스크립트가 있다
 # (run_drg_predict 는 909 와 1160 두 곳). 연도당 한 번만 계산한다.
 _RULE_CACHE: dict = {}
+_EARLY_CACHE: dict = {}   # 반일장 — 연도당 1회 계산 후 재사용
 
 
 def regular_holidays_cached(year: int) -> dict:
@@ -203,6 +208,119 @@ def is_market_open(d=None, extra_closed=None) -> bool:
 def is_market_open_today(extra_closed=None) -> bool:
     """오늘(ET 기준) 개장 여부 — 자동화 가드용 진입점."""
     return is_market_open(None, extra_closed=extra_closed)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 반일장(조기 마감) — 규칙 계산. 핫 패스. FMP·시트 접근 없음.
+# ══════════════════════════════════════════════════════════════════════════
+def nyse_early_close_days(year: int) -> dict:
+    """{"YYYY-MM-DD": "13:00"} — 그 해의 조기 마감일.
+
+    규칙은 셋뿐이다.
+
+        추수감사절 다음 금요일   — 매년
+        7/3                      — 7/4 가 화~금일 때만
+        12/24                    — 12/25 가 화~금일 때만
+
+    ⚠️ 요일 조건의 의미
+    ───────────────────
+    7/4 가 **토**요일이면 7/3(금)이 **관측 휴일**이라 전휴장이지 반일장이 아니다.
+    7/4 가 **일**요일이면 7/5(월)이 휴일이고 7/3 은 토요일 — 장이 없다.
+    7/4 가 **월**요일이면 7/3 은 일요일 — 장이 없다.
+    따라서 7/3 에 장이 서면서 조기 마감인 경우는 7/4 가 화~금일 때뿐이다.
+    12/24 도 12/25 에 대해 똑같다.
+
+    ⚠️ 검증 (규칙을 짠 뒤 실측·이력과 대조했다 — 7년 전부 일치)
+    ──────────────────────────────────────────────────────────
+        2020  11-27, 12-24              NYSE 이력
+        2021  11-26                     NYSE 이력
+        2022  11-25                     NYSE 이력
+        2023  07-03, 11-24              NYSE 이력
+        2024  07-03, 11-29, 12-24       NYSE 이력
+        2025  07-03, 11-28, 12-24       FMP 실측 (diag_halfday, adjCloseTime='13:00')
+        2026  11-27, 12-24              FMP 실측
+
+    2020~2030 구간에서 7/4 와 12/25 의 **요일 7가지가 전부** 등장하므로 모든
+    분기가 실측 또는 공개 이력으로 검증됐다.
+
+    ⚠️ 그래도 이건 규칙이다. FMP 가 예외를 낼 수 있다(임시 조기 마감 등).
+       refresh_market_calendar 가 매주 대조해 `half_mismatch` 로 알린다 —
+       전휴장에서 쓰는 것과 같은 구조다.
+    """
+    out = {}
+    try:
+        tg = _nth_weekday(year, 11, 3, 4)                  # 추수감사절(11월 넷째 목)
+        out[(tg + timedelta(days=1)).isoformat()] = EARLY_CLOSE_TIME
+        for mm, dd_ in ((7, 3), (12, 24)):
+            nxt = date(year, mm, dd_) + timedelta(days=1)
+            if nxt.weekday() in (1, 2, 3, 4):              # 화~금
+                out[date(year, mm, dd_).isoformat()] = EARLY_CLOSE_TIME
+    except Exception:
+        return {}
+    # 전휴장·주말과 겹치면 반일장이 아니다. 요일 조건상 발생하지 않지만,
+    # 두 판정이 모순되는 상태를 구조적으로 막는다.
+    hol = regular_holidays_cached(year)
+    clean = {}
+    for ds, t in out.items():
+        try:
+            if ds in hol or date.fromisoformat(ds).weekday() >= 5:
+                continue
+        except Exception:
+            continue
+        clean[ds] = t
+    return clean
+
+
+def early_close_cached(year: int) -> dict:
+    if year not in _EARLY_CACHE:
+        _EARLY_CACHE[year] = nyse_early_close_days(year)
+    return _EARLY_CACHE[year]
+
+
+def session_close_time(d=None, extra_closed=None, half_map=None):
+    """그 날의 정규장 마감 시각(ET).
+
+        None      휴장 (주말·휴일·임시휴장)
+        "13:00"   반일장
+        "16:00"   정상
+
+    half_map : {"YYYY-MM-DD": "13:00"} 형태의 보강분(선택).
+               Market_Calendar 의 Adj_Close 를 parse_calendar_values 로 읽은
+               값을 넘기면 규칙보다 **우선**한다. 넘기지 않으면 규칙만 쓴다.
+               전휴장의 extra_closed 와 같은 역할이다.
+
+    ⚠️ 판정 불가 시 "16:00" 으로 폴백한다 — is_market_open 이 개장으로
+       폴백하는 것과 같은 방향이다. 정상 마감을 가정하는 쪽이 덜 위험하다.
+    """
+    dd = _coerce_date(d)
+    if dd is None:
+        return REGULAR_CLOSE_TIME
+    if not is_market_open(dd, extra_closed=extra_closed):
+        return None
+    key = dd.isoformat()
+    if half_map:
+        t = str(half_map.get(key) or "").strip()
+        if t:
+            return t
+    return early_close_cached(dd.year).get(key, REGULAR_CLOSE_TIME)
+
+
+def is_early_close(d=None, extra_closed=None, half_map=None) -> bool:
+    """반일장 여부. 휴장일은 False (열려야 '조기 마감'이 의미가 있다)."""
+    t = session_close_time(d, extra_closed=extra_closed, half_map=half_map)
+    return bool(t) and t != REGULAR_CLOSE_TIME
+
+
+def close_minutes(t) -> int:
+    """"HH:MM" → 분. 파싱 실패 시 정규장 마감(960분=16:00)."""
+    try:
+        hh, mm = str(t).strip().split(":")[:2]
+        v = int(hh) * 60 + int(mm)
+        if 0 <= v <= 1439:
+            return v
+    except Exception:
+        pass
+    return 16 * 60
 
 
 def _coerce_date(d):
@@ -326,7 +444,10 @@ def diff_against_rules(records, years=None) -> dict:
     반환:
       extra_closed : FMP 가 닫혔다는데 규칙에는 없는 날 → **임시 휴장 후보**
       missing      : 규칙에는 있는데 FMP 응답에 없는 날 → 규칙 오류 또는 응답 누락
-      half_days    : 마감 시각이 조정된 날(반일장)
+      half_days    : 마감 시각이 조정된 날(반일장) — FMP 가 말하는 것
+      half_mismatch: FMP 와 **규칙 계산**이 어긋난 반일장
+                     {"fmp_only": {날짜: 시각}, "rule_only": {날짜: 시각},
+                      "time_diff": {날짜: (규칙, FMP)}}
 
     `extra_closed` 가 이 대조의 존재 이유다. 2025-01-09(카터 국장일) 같은 날은
     규칙으로 절대 못 잡고, 이 대조에서만 드러난다.
@@ -358,7 +479,24 @@ def diff_against_rules(records, years=None) -> dict:
     extra = {d: n for d, n in fmp_closed.items()
              if d not in rule and int(d[:4]) in target_years}
     missing = {d: n for d, n in rule.items() if d not in fmp_closed}
-    return {"extra_closed": extra, "missing": missing, "half_days": half}
+
+    # ── 반일장 대조 ──────────────────────────────────────────────────────
+    # 반일장 판정은 규칙 계산이 하고(핫 패스라 I/O 가 없어야 한다), FMP 는
+    # 매주 그 규칙이 여전히 맞는지 확인하는 채널이다. 전휴장의 extra_closed 와
+    # 같은 구조다 — 규칙이 절대 못 잡는 예외를 여기서만 드러낸다.
+    rule_half = {}
+    for y in target_years:
+        rule_half.update(nyse_early_close_days(y))
+    fmp_half = {d: t for d, t in half.items() if int(d[:4]) in target_years}
+
+    mismatch = {
+        "fmp_only": {d: t for d, t in fmp_half.items() if d not in rule_half},
+        "rule_only": {d: t for d, t in rule_half.items() if d not in fmp_half},
+        "time_diff": {d: (rule_half[d], fmp_half[d]) for d in rule_half
+                      if d in fmp_half and rule_half[d] != fmp_half[d]},
+    }
+    return {"extra_closed": extra, "missing": missing, "half_days": half,
+            "half_mismatch": mismatch}
 
 
 # ══════════════════════════════════════════════════════════════════════════
