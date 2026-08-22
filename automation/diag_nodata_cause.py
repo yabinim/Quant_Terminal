@@ -196,6 +196,16 @@ _MEM_FOREIGN_TRUTH = "NB2.F"                           # 지상진실 1콜
 _MEM_FOREIGN_PANEL = ["005930.KS", "7203.T", "NB2.F"]  # 멤버십만 — 0콜
 _MEM_NEG = "ZZZZQQ9"                                   # 음성 대조군 — 0콜
 
+# ⚠️ 2026-08-22 실측 후 기록 — 이 모드의 `mem_neg_case_exercised` 는 **믿으면 안 된다.**
+#    그날 결과: 점(.) 포함 심볼이 리스트에 0종 → 해외는 통째로 미커버.
+#    그런데 유일한 '사망' 픽스처가 NB2.F 였다. 사망이면서 동시에 해외다.
+#    부재의 이유가 '해외라서'로 완전히 설명되므로 **'사망이면 부재' 조항은 한 번도
+#    시험되지 않았다.** 그런데도 플래그는 True 를 찍었다 — 판별력 실패 6차.
+#    **교락된 픽스처는 픽스처가 아니다.**
+#
+#    이 모드는 **그 착오의 기록**으로 동작을 바꾸지 않고 그대로 둔다(tierB3 와 동일).
+#    교정된 판정은 PROBE_MODE=membership2 에 있다. 새로 판단할 때는 그쪽을 쓴다.
+
 
 def truth_of(sym):
     """profile 1콜 → ('생존'|'사망'|'소멸'|'판정불가', 회사명, 비고).
@@ -356,20 +366,193 @@ def run_membership():
         FIND["mem_neg_case_exercised"] = True
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 멤버십 판별 모드 2 (PROBE_MODE=membership2 · 최대 12콜)
+# ══════════════════════════════════════════════════════════════════════════
+# 왜 2가 필요한가 — 1차(2026-08-22)가 무엇에 실패했나
+#
+#   1차는 '부분 채택 — 해외 제외' 를 냈다. 확인된 건 맞다:
+#       리스트 26,252건 · 필드는 name/symbol 뿐 · ETF 5/5 존재
+#       점(.) 포함 심볼 **0종** → 해외 표기 통째로 미커버
+#   그런데 **핵심 조항이 미시험이었다.** 유일한 '사망' 픽스처 NB2.F 가
+#   사망이면서 동시에 해외였다. 점 심볼이 0종인 이상 그게 부재한 건 '해외라서'
+#   로 완전히 설명된다 — '사망이라서 부재' 라는 증거는 하나도 없었다.
+#   **교락된 픽스처는 픽스처가 아니다.**
+#
+#   그리고 더 큰 게 딸려 나왔다. 시드 ADWPF 는
+#       delisted-companies 에 있고 · profile 은 생존이라 하고 · 리스트에도 있다.
+#   **delisted-companies 는 내용 자체가 신뢰 불가다.** 이미 페이지네이션 402 ·
+#   심볼필터 무시 · 비US 위주로 감점돼 있었는데 여기에 '있다고 죽은 게 아님'
+#   이 추가됐다. "점 없음 = 미국형" 휴리스틱도 틀렸다 — ADWPF 는 5자 + F 끝,
+#   외국 보통주의 OTC 표기 관행이다.
+#
+# 그래서 2차가 하는 일
+#   **해외 교락과 분리된** 미국 표기 + 지상진실 사망/소멸 티커를 실제로 확보하고,
+#   그것이 리스트에 부재하는지 본다. 확보하지 못하면 **'판정불가'** 로 끝난다 —
+#   1차처럼 '통과처럼 보이는 미시험'을 만들지 않는다. 이게 이 모드의 존재 이유다.
+#
+# 후보 풀
+#   delisted-companies 가 신뢰를 잃었으므로 symbol-change 의 oldSymbol(개명 전
+#   티커 — 소멸했을 것)을 합친다. 어느 피드에서 왔든 **생사는 profile 로 다시
+#   확정한다.** 피드는 후보를 주는 역할만 한다.
+#
+# 순위 (외국 OTC 표기를 뒤로 미룬다)
+#   1) 점 없음 · 4자 이하                ← 가장 깨끗한 미국 표기
+#   2) 점 없음 · 5자 · F/Y 로 안 끝남
+#   3) 점 없음 · 5자 · F/Y 로 끝남       ← ADWPF 부류. 교락 위험
+#   4) 점 포함                            ← 해외 확정. 교락되므로 사실상 무의미
+#
+# 사전 확정 기준 (결과를 보고 고치지 않는다)
+#   · 확보한 불량입력이 하나라도 리스트에 **존재** → 전면 폐기 · 재실험 금지
+#   · 강한 불량입력(사망 · 점 없음 · F/Y 아님) ≥1 확보 + 전부 부재
+#                                          → 판별력 확인. 채택(해외 제외)
+#   · 약한 것(소멸, 또는 F/Y 표기)만 확보  → 조건부 채택. 한계를 명시해 기록
+#   · 하나도 확보 못 함                    → **판정불가.** 채택 아님
+_MEM2_PROFILE_MAX = 9        # 1(리스트) + 2(피드) + 9 = 12콜 상한
+_MEM2_NEED = 2               # 불량입력 2개 확보하면 즉시 중단(콜 절약)
+
+
+def us_rank(sym):
+    """미국 표기 순위. 낮을수록 교락이 적다."""
+    s = str(sym or "").upper()
+    if "." in s:
+        return 4
+    if len(s) <= 4:
+        return 1
+    if len(s) == 5 and s.endswith(("F", "Y")):
+        return 3
+    return 2
+
+
+def run_membership2():
+    """해외 교락과 분리된 불량입력으로 리스트의 판별력을 실제로 시험한다."""
+    print("=" * 78)
+    print("멤버십 판별 프로브 2 — 교락 없는 불량입력으로 재시험")
+    print(f"실행일 {_D_TO} · 예산 최대 12콜 · 시트/이메일 접촉 없음")
+    print("=" * 78)
+
+    # ── 1단계 — 집합 (1콜) ──────────────────────────────────────────────
+    print("\n[1단계] actively-trading-list")
+    v1, d1, det1 = call("actively-trading-list")
+    show("N1 actively-trading-list", v1, det1)
+    if v1 != "OK":
+        FIND["mem2_verdict"] = "판정불가(리스트 미수신)"
+        print("  ⛔ 리스트 미수신 — 잔여 콜 미사용으로 중단")
+        return
+    universe = symbols_of(d1)
+    dotted = [s for s in universe if "." in s]
+    neg_hit = _MEM_NEG in universe
+    FIND["mem2_count"] = len(universe)
+    FIND["mem2_dotted"] = len(dotted)
+    FIND["mem2_neg_control"] = "FAIL(존재)" if neg_hit else "OK(부재)"
+    print(f"       심볼 {len(universe)}종 · 점 포함 {len(dotted)}종 · "
+          f"음성대조 {_MEM_NEG}: " + ("❌ 존재" if neg_hit else "✅ 부재"))
+
+    # ── 2단계 — 후보 풀 (2콜) ───────────────────────────────────────────
+    print("\n[2단계] 후보 풀 — 두 피드를 합치되 생사는 여기서 판단하지 않는다")
+    pool = {}
+    v2, d2, det2 = call("delisted-companies?page=0&limit=20")
+    show("N2 delisted-companies?page=0", v2, det2)
+    if v2 == "OK":
+        for s in symbols_of(d2):
+            pool.setdefault(s, "delisted")
+    v3, d3, det3 = call("symbol-change?limit=20")
+    show("N3 symbol-change?limit=20", v3, det3)
+    if v3 == "OK":
+        for row in (d3 or []):
+            s = str(pick(row, "oldSymbol", "old_symbol") or "").strip().upper()
+            if s:
+                pool.setdefault(s, "renamed-old")
+
+    cands = sorted(pool.keys(), key=lambda s: (us_rank(s), s))
+    FIND["mem2_pool"] = len(cands)
+    by_rank = {}
+    for s in cands:
+        by_rank[us_rank(s)] = by_rank.get(us_rank(s), 0) + 1
+    print(f"       후보 {len(cands)}종 · 순위분포 {by_rank}")
+    if not cands:
+        FIND["mem2_verdict"] = "판정불가(후보 풀 없음)"
+        print("  ⛔ 후보를 못 만들었다 — 잔여 콜 미사용으로 중단")
+        return
+
+    # ── 3단계 — 지상진실 확정 (최대 9콜) ────────────────────────────────
+    print("\n[3단계] 지상진실 — profile 로 다시 확정. 피드 주장은 근거가 아니다")
+    bad, alive_in_feed, used = [], [], 0
+    for sym in cands:
+        if used >= _MEM2_PROFILE_MAX or len(bad) >= _MEM2_NEED:
+            break
+        st, name, note = truth_of(sym)
+        used += 1
+        inlist = sym in universe
+        src = pool.get(sym, "")
+        if st in ("사망", "소멸"):
+            bad.append((sym, st, inlist, src))
+            mark = "✅" if not inlist else "❌"
+            print(f"  {mark} {sym:10} r{us_rank(sym)} {src:11} 지상진실={st:4} "
+                  f"리스트={'있음' if inlist else '없음'}"
+                  + (f" · {name[:24]}" if name else ""))
+        else:
+            if st == "생존":
+                alive_in_feed.append((sym, src))
+            print(f"  ·  {sym:10} r{us_rank(sym)} {src:11} 지상진실={st:4}"
+                  + (f" · {note}" if note else "")
+                  + ("   ← 피드와 모순" if st == "생존" and src == "delisted" else ""))
+
+    FIND["mem2_profile_calls"] = used
+    FIND["mem2_bad_found"] = len(bad)
+    FIND["mem2_feed_contradiction"] = len([1 for _s, src in alive_in_feed
+                                           if src == "delisted"])
+    print(f"       profile {used}콜 · 불량입력 {len(bad)}개 확보 · "
+          f"delisted 인데 생존 {FIND['mem2_feed_contradiction']}건")
+
+    # ── 4단계 — 사전 확정 기준 ──────────────────────────────────────────
+    print("\n[4단계] 사전 확정 기준 적용 (결과를 보고 고치지 않는다)")
+    present = [b for b in bad if b[2]]
+    strong = [b for b in bad if b[1] == "사망" and us_rank(b[0]) <= 2]
+    weak = [b for b in bad if b not in strong]
+
+    if neg_hit:
+        verdict = "폐기 — 음성 대조 실패(구현 결함)"
+    elif present:
+        verdict = "폐기 — " + ", ".join(f"{s}({st}) 가 리스트에 존재"
+                                       for s, st, _i, _r in present)
+    elif strong:
+        verdict = "채택(해외 제외) — 강한 불량입력 " + str(len(strong)) + "개가 부재로 확인"
+    elif weak:
+        verdict = "조건부 채택(해외 제외) — 약한 불량입력만 확보(" + \
+                  ", ".join(f"{s}:{st}" for s, st, _i, _r in weak) + ")"
+    else:
+        verdict = "판정불가 — 교락 없는 불량입력을 확보하지 못함(채택 아님)"
+
+    FIND["mem2_strong"] = len(strong)
+    FIND["mem2_weak"] = len(weak)
+    FIND["mem2_verdict"] = verdict
+    FIND["mem2_neg_case_exercised"] = bool(strong or weak)
+    print("  → " + verdict)
+    if not strong:
+        print("  ⚠️ 강한 불량입력(사망 · 점 없음 · F/Y 아님)이 없다. "
+              "'사망이면 부재' 조항은 아직 완전히 시험되지 않았다.")
+
+
 def main():
     if not _KEY:
         print("❌ FMP_API_KEY 없음 — 중단")
         return 1
 
-    if _MODE == "membership":
-        run_membership()
+    if _MODE in ("membership", "membership2"):
+        if _MODE == "membership2":
+            run_membership2()
+            key = "MEMBERSHIP2_JSON "
+        else:
+            run_membership()
+            key = "MEMBERSHIP_JSON "
         print("\n" + "=" * 78)
         print(f"총 {_CALLS} 콜 소비")
         print("=" * 78)
         for k, v in FIND.items():
             print(f"  {k:26} = {v!r}")
         print("")
-        print("MEMBERSHIP_JSON " + json.dumps(FIND, ensure_ascii=False, default=str))
+        print(key + json.dumps(FIND, ensure_ascii=False, default=str))
         return 0
 
     print("=" * 78)

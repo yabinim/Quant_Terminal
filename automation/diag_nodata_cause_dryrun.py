@@ -294,3 +294,146 @@ if bad:
     print("❌ 판별에 실패한 케이스: " + ", ".join(bad))
     sys.exit(1)
 print("✅ 멤버십 6시나리오 — 사망포함·음성대조 두 불량 입력에서 정상적으로 뒤집힘")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 멤버십 모드 2 (PROBE_MODE=membership2) 사전 검증
+# ══════════════════════════════════════════════════════════════════════════
+# 1차의 실패는 "불량입력이 없는데 통과처럼 보인 것" 이었다. 그래서 여기서 가장
+# 중요한 케이스는 N3 다 — 후보가 전부 생존이라 **불량입력을 하나도 못 구한**
+# 세계에서 판정이 '판정불가'로 떨어져야 한다. '채택'이 나오면 1차 실패의 재발이다.
+
+
+def atl2(symbols):
+    return [{"symbol": s, "name": f"Co {s}"} for s in symbols]
+
+
+def scfeed(olds):
+    return [{"date": "2026-08-01", "oldSymbol": o, "newSymbol": o + "N"} for o in olds]
+
+
+MEM2 = {}
+
+# 깨끗한 미국 표기(r1) 사망 티커 DEAD 가 리스트에 없다 → 강한 불량입력 확인
+MEM2["N1 강한불량→채택"] = {
+    "atl": ("OK", atl2(["AAPL", "MSFT"] + [f"T{i}" for i in range(40)]), "42건"),
+    "dl": ("OK", atl2(["DEAD", "ADWPF", "AAA.KS"]), "3건"),
+    "sc": ("OK", scfeed(["OLDX"]), "1건"),
+    "profile:DEAD": ("OK", [{"symbol": "DEAD", "name": "Gone", "isActivelyTrading": False}], "1건"),
+    "profile:OLDX": ("EMPTY", [], "빈 배열"),
+    "profile:ADWPF": ("OK", [{"symbol": "ADWPF", "isActivelyTrading": True}], "1건"),
+}
+
+# ★ 핵심 — 죽은 티커가 '거래 중' 목록에 있다 → 폐기
+MEM2["N2 사망포함→폐기"] = dict(MEM2["N1 강한불량→채택"])
+MEM2["N2 사망포함→폐기"]["atl"] = ("OK", atl2(["AAPL", "DEAD", "OLDX"]), "3건")
+
+# ★ 핵심 — 2026-08-22 재현. 후보가 전부 생존이라 불량입력 0개.
+#   반드시 '판정불가'. '채택'이 나오면 1차 실패의 재발이다.
+MEM2["N3 불량입력0→판정불가"] = {
+    "atl": ("OK", atl2(["AAPL", "ADWPF", "BBBBF", "CCCCY"]), "4건"),
+    "dl": ("OK", atl2(["ADWPF", "BBBBF", "CCCCY"]), "3건"),
+    "sc": ("EMPTY", [], "빈 배열"),
+    "profile:ADWPF": ("OK", [{"symbol": "ADWPF", "isActivelyTrading": True}], "1건"),
+    "profile:BBBBF": ("OK", [{"symbol": "BBBBF", "isActivelyTrading": True}], "1건"),
+    "profile:CCCCY": ("OK", [{"symbol": "CCCCY", "isActivelyTrading": True}], "1건"),
+}
+
+MEM2["N4 리스트미수신"] = {"atl": ("PLAN", None, "플랜 미포함")}
+
+# 소멸(빈 배열)만 잡히고 사망은 없음 → 조건부 채택
+MEM2["N5 약한불량만→조건부"] = {
+    "atl": ("OK", atl2(["AAPL", "MSFT"]), "2건"),
+    "dl": ("EMPTY", [], "빈 배열"),
+    "sc": ("OK", scfeed(["OLDX", "OLDY"]), "2건"),
+    "profile:OLDX": ("EMPTY", [], "빈 배열"),
+    "profile:OLDY": ("EMPTY", [], "빈 배열"),
+}
+
+MEM2["N6 이상값"] = {
+    "atl": ("OK", atl2(["AAPL"]), "1건"),
+    "dl": ("OK", [{"noSymbolField": 1}], "1건"),
+    "sc": ("OK", [{"date": None}], "1건"),
+}
+
+# 사망이지만 5자 + F 끝(ADWPF 부류) → 교락 위험. '강한'으로 세면 안 된다.
+MEM2["N8 F끝사망→조건부"] = {
+    "atl": ("OK", atl2(["AAPL", "MSFT"]), "2건"),
+    "dl": ("OK", atl2(["XYZQF"]), "1건"),
+    "sc": ("EMPTY", [], "빈 배열"),
+    "profile:XYZQF": ("OK", [{"symbol": "XYZQF", "isActivelyTrading": False}], "1건"),
+}
+
+MEM2["N7 음성대조실패"] = dict(MEM2["N1 강한불량→채택"])
+MEM2["N7 음성대조실패"]["atl"] = ("OK", atl2(["AAPL", "ZZZZQQ9"]), "2건")
+
+
+def make_fake_mem2(table):
+    def fake_call(path, keep=False):
+        P._CALLS += 1
+        if path.startswith("actively-trading-list"):
+            return table.get("atl", ("EMPTY", [], "빈 배열"))
+        if path.startswith("delisted-companies"):
+            return table.get("dl", ("EMPTY", [], "빈 배열"))
+        if path.startswith("symbol-change"):
+            return table.get("sc", ("EMPTY", [], "빈 배열"))
+        if path.startswith("profile?symbol="):
+            sym = path.split("=", 1)[1]
+            return table.get("profile:" + sym, ("EMPTY", [], "빈 배열"))
+        return ("EMPTY", [], "미정의 경로 — 빈 배열")
+    return fake_call
+
+
+print()
+print("── 멤버십 모드 2 (PROBE_MODE=membership2) ──")
+m2_fails, m2_v = [], {}
+for name, table in MEM2.items():
+    P._CALLS = 0
+    P.FIND = {}
+    P._MODE = "membership2"
+    P.call = make_fake_mem2(table)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = P.main()
+        v = P.FIND.get("mem2_verdict", "(없음)")
+        m2_v[name] = (v, P._CALLS, P.FIND.get("mem2_neg_case_exercised"))
+        print(f"{name:22} ✅ rc={rc} · {P._CALLS}콜 · {v}")
+    except Exception as e:
+        m2_fails.append((name, e))
+        print(f"{name:22} ❌ 예외 {type(e).__name__}: {e}")
+        print(buf.getvalue()[-900:])
+
+if m2_fails:
+    print(f"❌ {len(m2_fails)}개 시나리오에서 예외")
+    sys.exit(1)
+
+checks2 = [
+    ("N1 강한불량→채택", lambda v: v.startswith("채택")),
+    ("N2 사망포함→폐기", lambda v: v.startswith("폐기")),
+    ("N3 불량입력0→판정불가", lambda v: v.startswith("판정불가")),
+    ("N4 리스트미수신", lambda v: v.startswith("판정불가")),
+    ("N5 약한불량만→조건부", lambda v: v.startswith("조건부 채택")),
+    ("N7 음성대조실패", lambda v: v.startswith("폐기")),
+    ("N8 F끝사망→조건부", lambda v: v.startswith("조건부 채택")),
+]
+bad2 = [n for n, fn in checks2 if not fn(m2_v.get(n, ("",))[0])]
+
+# 예산 상한 — 어떤 시나리오도 12콜을 넘으면 안 된다
+over = [n for n, (_v, c, _e) in m2_v.items() if c > 12]
+if over:
+    bad2 += ["예산초과:" + ",".join(over)]
+# 리스트 미수신은 1콜에서 끊어야 한다
+if m2_v.get("N4 리스트미수신", ("", 99, None))[1] != 1:
+    bad2.append("N4 조기중단(1콜)")
+# 불량입력 0개면 '시험됨' 플래그가 False 여야 한다 — 1차 실패의 정확한 재발 방지
+if m2_v.get("N3 불량입력0→판정불가", ("", 0, True))[2] is not False:
+    bad2.append("N3 exercised 플래그가 False 가 아님")
+
+print()
+print(("✅" if not bad2 else "❌") + " 판별력 검사 2 — "
+      + repr({n: m2_v.get(n, ("(없음)",))[0][:30] for n, _ in checks2}))
+if bad2:
+    print("❌ 실패: " + ", ".join(bad2))
+    sys.exit(1)
+print("✅ 멤버십2 8시나리오 — 불량입력 0개 세계에서 '판정불가'로 떨어짐(1차 실패 재발 방지)")
