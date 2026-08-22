@@ -145,6 +145,15 @@ jobs:
       - name: 📦 의존성
         run: pip install requests
 
+      # ── 임포트 스모크 (콜 0) ──────────────────────────────────────────
+      # 2026-08-22: _DETAIL 이 아래에 정의된 렌더러를 참조해 NameError 로 죽었다.
+      # **ast.parse 와 check_py311 은 둘 다 통과했다** — 문법은 멀쩡했고 모듈
+      # 최상단을 아무도 실행하지 않았기 때문이다. 여기서 실제로 임포트한다.
+      # FMP_API_KEY 를 주지 않으므로 네트워크는 만지지 않는다(main 미실행).
+      - name: 🧪 임포트 스모크 (콜 0)
+        run: |
+          python -c "import sys; sys.path.insert(0,'automation'); import diag_fmp_newcaps; print('import OK')"
+
       - name: 🔬 미사용 엔드포인트 실측
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
