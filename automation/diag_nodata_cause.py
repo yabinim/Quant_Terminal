@@ -54,6 +54,11 @@ SLEEP_SEC = 0.35
 _KEY = str(os.environ.get("FMP_API_KEY", "") or "").strip()
 _HEAVY = str(os.environ.get("PROBE_HEAVY", "") or "").strip() in ("1", "true", "yes")
 
+# PROBE_MODE=membership 이면 아래 '멤버십 판별' 블록만 돈다(6콜).
+# 빈 값이면 기존 11콜 프로브가 **한 글자도 바뀌지 않은 채** 그대로 돈다.
+# 기존 경로를 건드리지 않는 이유: 그 실측 결과가 A-2b 설계의 근거 기록이다.
+_MODE = str(os.environ.get("PROBE_MODE", "") or "").strip().lower()
+
 _TODAY = datetime.now(timezone.utc).date()
 _D_TO = _TODAY.isoformat()
 _D_FROM_90 = (_TODAY - timedelta(days=90)).isoformat()
@@ -152,10 +157,220 @@ def dates_in(data, *fields):
 FIND = {}   # 최종 판정 누적
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 멤버십 판별 모드 (PROBE_MODE=membership · 6콜)
+# ══════════════════════════════════════════════════════════════════════════
+# 무엇을 결정하나
+#   actively-trading-list(2.6만건, 1콜)를 **생사 판별자**로 쓸 수 있는가.
+#   쓸 수 있다면 A-2b 의 종목당 profile N콜을 "리스트 1콜 + 잔여만 profile"
+#   로 줄이고, 나아가 데이터가 비기를 기다리지 않는 **선제 점검**이 가능해진다.
+#
+# ⚠️ 이 프로브가 답해야 하는 건 "리스트가 오는가" 가 아니다. 그건 이미 안다
+#    (2026-08-21 실측 26,247건 · 1.5MB · 0.8초). 답해야 하는 건 **부재가 사망을
+#    뜻하는가** 다. 부재의 이유가 사망 말고도 있으면(해외 미커버·ETF 미포함)
+#    정상 보유 종목에 사망 딱지가 붙는다 — 원인을 모르는 것보다 나쁘다.
+#
+# 판별력 설계 (같은 함정을 다섯 번 밟았으므로 명시한다)
+#   · 통과만 보면 안 된다. **알려진 불량 입력에서 실패해야** 판별자다.
+#     → 지상진실이 '사망'인 티커가 리스트에 **있으면** 이 경로는 죽는다.
+#   · 지상진실을 내 기억에서 가져오지 않는다. TWTR·ATVI 류 기억은 낡는다.
+#     사망 픽스처는 delisted-companies 피드에서 **뽑고**, 생사는 리스트가 아니라
+#     profile.isActivelyTrading 으로 **따로** 확정한다. 판별자와 정답지를 분리한다.
+#   · 음성 대조군: 존재할 수 없는 심볼이 집합에 잡히면 조회 자체가 틀린 것이다.
+#     이건 0콜이고, 없으면 "전부 통과" 가 구현 결함을 숨긴다.
+#   · 단일 픽스처는 약하다. 해외·ETF 는 **패널**로 보고, 추가로 집합 전체의
+#     점(.) 포함 심볼 수라는 **총계 통계**를 본다. 점 심볼이 0이면 픽스처가
+#     무엇이든 해외는 커버되지 않는다.
+#
+# 사전 확정 채택 기준 (결과를 보기 전에 못 박는다 — 사후 재협상 금지)
+#   · 음성 대조 실패                      → 판정 무효. 구현부터 고친다
+#   · 지상진실 '사망'이 리스트에 존재      → 전면 폐기. 재실험 금지
+#   · 지상진실 '생존'인 미국 보통주가 부재 → 전면 폐기
+#   · ETF 패널 전멸                        → ETF 제외하고 부분 채택
+#   · 해외 패널 전멸 또는 점 심볼 0        → 해외 제외하고 부분 채택
+#   · 그 외                                → 채택. (a)하이브리드 + (b)선제 점검 설계로
+_MEM_LIVE_US = "AAPL"                                  # 지상진실 1콜
+_MEM_ETF_TRUTH = "SPY"                                 # 지상진실 1콜
+_MEM_ETF_PANEL = ["SPY", "QQQ", "IWM", "XLK", "SMH"]   # 멤버십만 — 0콜
+_MEM_FOREIGN_TRUTH = "NB2.F"                           # 지상진실 1콜
+_MEM_FOREIGN_PANEL = ["005930.KS", "7203.T", "NB2.F"]  # 멤버십만 — 0콜
+_MEM_NEG = "ZZZZQQ9"                                   # 음성 대조군 — 0콜
+
+
+def truth_of(sym):
+    """profile 1콜 → ('생존'|'사망'|'소멸'|'판정불가', 회사명, 비고).
+
+    리스트와 **독립된** 정답지다. 이 함수가 리스트를 참조하면 판별이 자기순환이
+    된다. 절대 섞지 않는다.
+    """
+    v, d, det = call("profile?symbol=" + str(sym))
+    if v == "EMPTY":
+        return "소멸", "", "200 + 빈 배열 — FMP 가 이 심볼을 모른다"
+    if v != "OK":
+        return "판정불가", "", det
+    row = None
+    if isinstance(d, list) and d:
+        row = d[0]
+    elif isinstance(d, dict):
+        row = d
+    if not isinstance(row, dict):
+        return "판정불가", "", "예상 밖 행 타입"
+    name = str(pick(row, "companyName", "name") or "").strip()
+    act = pick(row, "isActivelyTrading")
+    if isinstance(act, str):
+        s = act.strip().lower()
+        act = True if s in ("true", "1", "yes") else (False if s in ("false", "0", "no") else None)
+    if act is True:
+        return "생존", name, ""
+    if act is False:
+        return "사망", name, ""
+    return "판정불가", name, "isActivelyTrading 필드 없음"
+
+
+def symbols_of(data):
+    """리스트 응답 → 대문자 심볼 집합. 원소가 dict 이든 문자열이든 견딘다."""
+    out = set()
+    for row in (data or []):
+        if isinstance(row, dict):
+            s = pick(row, "symbol", "ticker")
+        else:
+            s = row
+        s = str(s or "").strip().upper()
+        if s:
+            out.add(s)
+    return out
+
+
+def run_membership():
+    """actively-trading-list 를 생사 판별자로 쓸 수 있는지 판정한다. 6콜."""
+    print("=" * 78)
+    print("멤버십 판별 프로브 — actively-trading-list 가 생사 판별자가 되는가")
+    print(f"실행일 {_D_TO} · 예산 6콜 · 시트/이메일 접촉 없음")
+    print("=" * 78)
+
+    # ── 1단계 — 집합 확보 (1콜) ──────────────────────────────────────────
+    print("\n[1단계] actively-trading-list — 구조·크기·해외 커버리지")
+    t0 = time.time()
+    v1, d1, det1 = call("actively-trading-list")
+    el = time.time() - t0
+    size_mb = len(json.dumps(d1, default=str)) / 1048576.0 if d1 else 0.0
+    shape = "dict" if (isinstance(d1, list) and d1 and isinstance(d1[0], dict)) else "scalar"
+    show("M1 actively-trading-list", v1,
+         det1 + f" · 약 {size_mb:.1f}MB · {el:.1f}초 · 원소={shape}",
+         ("필드: " + ", ".join(keys_of(d1))) if shape == "dict" else "")
+
+    if v1 != "OK":
+        FIND["mem_verdict"] = "판정불가(리스트 미수신)"
+        print("  ⛔ 리스트를 못 받았다 — 나머지 검사는 의미가 없어 중단한다(잔여 콜 미사용)")
+        return
+
+    universe = symbols_of(d1)
+    dotted = sorted(s for s in universe if "." in s)
+    FIND["mem_count"] = len(universe)
+    FIND["mem_shape"] = shape
+    FIND["mem_dotted"] = len(dotted)
+    print(f"       심볼 {len(universe)}종 · 점(.) 포함 {len(dotted)}종"
+          + (" · 예: " + ", ".join(dotted[:5]) if dotted else " ← 해외 표기 전무"))
+
+    # 음성 대조군 — 0콜. 이게 잡히면 조회가 틀린 것이고 다른 통과는 전부 무의미하다.
+    neg_hit = _MEM_NEG in universe
+    FIND["mem_neg_control"] = "FAIL(존재)" if neg_hit else "OK(부재)"
+    print(f"       음성 대조 {_MEM_NEG}: " + ("❌ 존재 — 조회 결함" if neg_hit else "✅ 부재"))
+
+    # ── 2단계 — 사망 픽스처 자기 시드 (1콜) ──────────────────────────────
+    print("\n[2단계] 사망 픽스처 확보 — 기억이 아니라 피드에서 뽑는다")
+    v2, d2, det2 = call("delisted-companies?page=0&limit=20")
+    show("M2 delisted-companies?page=0", v2, det2)
+    seed_dead = None
+    if v2 == "OK" and d2:
+        cands = [s for s in symbols_of(d2) if s]
+        us_like = sorted(s for s in cands if "." not in s)
+        seed_dead = (us_like or sorted(cands) or [None])[0]
+        print(f"       후보 {len(cands)}종 · 미국형(점 없음) {len(us_like)}종"
+              f" → 시드 = {seed_dead!r}")
+    if not seed_dead:
+        print("       ⚠️ 시드 확보 실패 — '사망이 리스트에 있는가' 검정은 판정불가로 남는다")
+
+    # ── 3단계 — 지상진실 확립 (최대 4콜) ────────────────────────────────
+    print("\n[3단계] 지상진실 — profile.isActivelyTrading (리스트와 독립)")
+    fixtures = [("미국 생존", _MEM_LIVE_US), ("ETF", _MEM_ETF_TRUTH),
+                ("해외", _MEM_FOREIGN_TRUTH)]
+    if seed_dead:
+        fixtures.append(("시드 사망", seed_dead))
+
+    rows = []
+    for label, sym in fixtures:
+        st, name, note = truth_of(sym)
+        inlist = sym.upper() in universe
+        expect = {"생존": "존재", "사망": "부재", "소멸": "부재"}.get(st)
+        if expect is None:
+            mark = "—"
+        else:
+            ok = (inlist and expect == "존재") or ((not inlist) and expect == "부재")
+            mark = "✅" if ok else "❌"
+        rows.append((label, sym, st, inlist, mark, name, note))
+        print(f"  {mark} {label:9} {sym:12} 지상진실={st:5} 리스트={'있음' if inlist else '없음'}"
+              + (f" · {name[:28]}" if name else "") + (f" · {note}" if note else ""))
+        FIND["mem_truth_" + label.replace(" ", "_")] = (sym, st, inlist)
+
+    # ── 4단계 — 패널 (0콜) ──────────────────────────────────────────────
+    print("\n[4단계] 패널 대조 — 단일 픽스처의 우연을 배제한다 (0콜)")
+    etf_hit = [s for s in _MEM_ETF_PANEL if s.upper() in universe]
+    fx_hit = [s for s in _MEM_FOREIGN_PANEL if s.upper() in universe]
+    FIND["mem_etf_hit"] = f"{len(etf_hit)}/{len(_MEM_ETF_PANEL)}"
+    FIND["mem_foreign_hit"] = f"{len(fx_hit)}/{len(_MEM_FOREIGN_PANEL)}"
+    print(f"  ETF  {len(etf_hit)}/{len(_MEM_ETF_PANEL)} 존재"
+          + (" — " + ", ".join(etf_hit) if etf_hit else " ← 전멸"))
+    print(f"  해외 {len(fx_hit)}/{len(_MEM_FOREIGN_PANEL)} 존재"
+          + (" — " + ", ".join(fx_hit) if fx_hit else " ← 전멸"))
+
+    # ── 5단계 — 사전 확정 기준 적용 ─────────────────────────────────────
+    print("\n[5단계] 사전 확정 기준 적용 (결과를 보고 고치지 않는다)")
+    fails, partial = [], []
+    if neg_hit:
+        fails.append("음성 대조 실패 — 구현 결함")
+    for label, sym, st, inlist, mark, _n, _o in rows:
+        if st in ("사망", "소멸") and inlist:
+            fails.append(f"{label}({sym}) 지상진실 {st} 인데 리스트에 존재")
+        if st == "생존" and not inlist and label == "미국 생존":
+            fails.append(f"미국 보통주 {sym} 이 리스트에 부재")
+    if not etf_hit:
+        partial.append("ETF 제외")
+    if not fx_hit or len(dotted) == 0:
+        partial.append("해외 제외")
+
+    if fails:
+        verdict = "폐기 — " + " · ".join(fails)
+    elif partial:
+        verdict = "부분 채택 — " + " · ".join(partial)
+    else:
+        verdict = "채택 — (a)하이브리드 + (b)선제 점검 설계 진행"
+    FIND["mem_verdict"] = verdict
+    print("  → " + verdict)
+
+    if not any(st in ("사망", "소멸") for _l, _s, st, _i, _m, _n, _o in rows):
+        print("  ⚠️ 지상진실 '사망' 픽스처가 하나도 없었다. 통과처럼 보여도 이 실행은")
+        print("     **알려진 불량 입력을 밟지 못했다** — 판별력이 검증되지 않았다.")
+        FIND["mem_neg_case_exercised"] = False
+    else:
+        FIND["mem_neg_case_exercised"] = True
+
+
 def main():
     if not _KEY:
         print("❌ FMP_API_KEY 없음 — 중단")
         return 1
+
+    if _MODE == "membership":
+        run_membership()
+        print("\n" + "=" * 78)
+        print(f"총 {_CALLS} 콜 소비")
+        print("=" * 78)
+        for k, v in FIND.items():
+            print(f"  {k:26} = {v!r}")
+        print("")
+        print("MEMBERSHIP_JSON " + json.dumps(FIND, ensure_ascii=False, default=str))
+        return 0
 
     print("=" * 78)
     print("A-2b 프로브 — 미수신 원인 판정 경로 실측")

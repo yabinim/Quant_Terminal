@@ -172,3 +172,125 @@ print(f"✅ 정상 시나리오 판정: sc_filter={P.FIND.get('sc_symbol_filter'
       f"· 1년커버={P.FIND.get('dl_pages_for_1y')}페이지 "
       f"· profile상폐={P.FIND.get('profile_delisted')!r} "
       f"· 구티커이력={P.FIND.get('hist_old')}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 멤버십 모드 (PROBE_MODE=membership) 사전 검증
+# ══════════════════════════════════════════════════════════════════════════
+# 여기서 가장 중요한 건 M2 다. **알려진 불량 입력**(지상진실 사망인데 리스트에
+# 존재)을 물렸을 때 판정이 '폐기'로 뒤집히지 않으면, 나머지 통과는 전부 의미가
+# 없다. 통과만 확인하는 스위트는 이 프로젝트에서 다섯 번 틀렸다.
+_ETF = ["SPY", "QQQ", "IWM", "XLK", "SMH"]
+_FX = ["005930.KS", "7203.T", "NB2.F"]
+
+
+def atl(symbols, as_dict=True):
+    if as_dict:
+        return [{"symbol": s, "companyName": f"Co {s}", "exchange": "NASDAQ"}
+                for s in symbols]
+    return list(symbols)
+
+
+def dl20(sym="DEADX"):
+    return [{"symbol": sym, "companyName": "Gone", "delistedDate": "2026-08-01",
+             "exchange": "NASDAQ"}]
+
+
+MEM = {}
+
+MEM["M1 채택"] = {
+    "atl": ("OK", atl(["AAPL"] + _ETF + _FX + [f"T{i}" for i in range(50)]), "58건"),
+    "dl": ("OK", dl20(), "1건"),
+    "profile:AAPL": ("OK", [{"symbol": "AAPL", "companyName": "Apple", "isActivelyTrading": True}], "1건"),
+    "profile:SPY": ("OK", [{"symbol": "SPY", "companyName": "SPDR", "isActivelyTrading": True}], "1건"),
+    "profile:NB2.F": ("OK", [{"symbol": "NB2.F", "companyName": "Foreign", "isActivelyTrading": True}], "1건"),
+    "profile:DEADX": ("OK", [{"symbol": "DEADX", "companyName": "Gone", "isActivelyTrading": False}], "1건"),
+}
+
+# ★ 핵심 회귀 — 죽은 티커가 '거래 중' 목록에 들어 있는 세계.
+#   이 경우 리스트는 생사 판별자가 아니다. 반드시 '폐기'가 나와야 한다.
+MEM["M2 사망포함→폐기"] = dict(MEM["M1 채택"])
+MEM["M2 사망포함→폐기"]["atl"] = (
+    "OK", atl(["AAPL", "DEADX"] + _ETF + _FX), "10건")
+
+MEM["M3 ETF해외전멸→부분"] = dict(MEM["M1 채택"])
+MEM["M3 ETF해외전멸→부분"]["atl"] = (
+    "OK", atl(["AAPL"] + [f"T{i}" for i in range(50)]), "51건")
+MEM["M3 ETF해외전멸→부분"]["profile:SPY"] = ("PLAN", None, "플랜 미포함")
+MEM["M3 ETF해외전멸→부분"]["profile:NB2.F"] = ("PLAN", None, "플랜 미포함")
+
+MEM["M4 리스트미수신"] = {"atl": ("PLAN", None, "플랜 미포함")}
+
+MEM["M5 이상값"] = {
+    "atl": ("OK", atl(["AAPL", "SPY"], as_dict=False), "2건"),   # 원소가 문자열
+    "dl": ("EMPTY", [], "빈 배열"),                              # 시드 실패
+    "profile:AAPL": ("ODD", None, "예상 밖 타입"),
+    "profile:SPY": ("OK", [{"symbol": "SPY"}], "1건"),           # 필드 결손
+    "profile:NB2.F": ("RATE", None, "레이트리밋"),
+}
+
+MEM["M6 음성대조실패"] = dict(MEM["M1 채택"])
+MEM["M6 음성대조실패"]["atl"] = (
+    "OK", atl(["AAPL", "ZZZZQQ9"] + _ETF + _FX), "10건")
+
+
+def make_fake_mem(table):
+    def fake_call(path, keep=False):
+        P._CALLS += 1
+        if path.startswith("actively-trading-list"):
+            return table.get("atl", ("EMPTY", [], "빈 배열"))
+        if path.startswith("delisted-companies"):
+            return table.get("dl", ("EMPTY", [], "빈 배열"))
+        if path.startswith("profile?symbol="):
+            sym = path.split("=", 1)[1]
+            return table.get("profile:" + sym, ("EMPTY", [], "빈 배열"))
+        return ("EMPTY", [], "미정의 경로 — 빈 배열")
+    return fake_call
+
+
+print()
+print("── 멤버십 모드 (PROBE_MODE=membership) ──")
+mem_fails = []
+mem_verdict = {}
+for name, table in MEM.items():
+    P._CALLS = 0
+    P.FIND = {}
+    P._MODE = "membership"
+    P.call = make_fake_mem(table)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = P.main()
+        v = P.FIND.get("mem_verdict", "(없음)")
+        mem_verdict[name] = (v, P._CALLS)
+        print(f"{name:18} ✅ rc={rc} · {P._CALLS}콜 · {v}")
+    except Exception as e:
+        mem_fails.append((name, e))
+        print(f"{name:18} ❌ 예외 {type(e).__name__}: {e}")
+        print(buf.getvalue()[-800:])
+
+if mem_fails:
+    print(f"❌ {len(mem_fails)}개 멤버십 시나리오에서 예외")
+    sys.exit(1)
+
+# 판별력 검사 — 통과만으로는 부족하다. 불량 입력에서 뒤집히는지 본다.
+checks = [
+    ("M1 채택", lambda v: v.startswith("채택")),
+    ("M2 사망포함→폐기", lambda v: v.startswith("폐기")),
+    ("M3 ETF해외전멸→부분", lambda v: v.startswith("부분 채택")),
+    ("M4 리스트미수신", lambda v: v.startswith("판정불가")),
+    ("M6 음성대조실패", lambda v: v.startswith("폐기")),
+]
+bad = [n for n, fn in checks if not fn(mem_verdict.get(n, ("",))[0])]
+
+# M4 는 리스트를 못 받은 순간 잔여 콜을 쓰지 않아야 한다(재실행 비용 절약).
+if mem_verdict.get("M4 리스트미수신", ("", 99))[1] != 1:
+    bad.append("M4 조기중단(1콜)")
+
+print()
+print(("✅" if not bad else "❌") + " 판별력 검사 — "
+      + repr({n: mem_verdict.get(n, ("(없음)",))[0][:34] for n, _ in checks}))
+if bad:
+    print("❌ 판별에 실패한 케이스: " + ", ".join(bad))
+    sys.exit(1)
+print("✅ 멤버십 6시나리오 — 사망포함·음성대조 두 불량 입력에서 정상적으로 뒤집힘")
