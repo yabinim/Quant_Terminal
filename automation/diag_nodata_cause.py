@@ -58,6 +58,10 @@ _HEAVY = str(os.environ.get("PROBE_HEAVY", "") or "").strip() in ("1", "true", "
 # 빈 값이면 기존 11콜 프로브가 **한 글자도 바뀌지 않은 채** 그대로 돈다.
 # 기존 경로를 건드리지 않는 이유: 그 실측 결과가 A-2b 설계의 근거 기록이다.
 _MODE = str(os.environ.get("PROBE_MODE", "") or "").strip().lower()
+# 모르는 값이면 **조용히 기본 모드로 떨어지지 않는다.** 2026-08-22 에 워크플로가
+# membership2 를 빈 문자열로 매핑해 기본 11콜을 태웠고, 로그만 봐서는 다른 게
+# 돌았다는 걸 알기 어려웠다. 조용한 폴백은 이 프로젝트가 내내 싸워온 실패 유형이다.
+_VALID_MODES = ("", "membership", "membership2")
 
 _TODAY = datetime.now(timezone.utc).date()
 _D_TO = _TODAY.isoformat()
@@ -255,7 +259,7 @@ def run_membership():
     """actively-trading-list 를 생사 판별자로 쓸 수 있는지 판정한다. 6콜."""
     print("=" * 78)
     print("멤버십 판별 프로브 — actively-trading-list 가 생사 판별자가 되는가")
-    print(f"실행일 {_D_TO} · 예산 6콜 · 시트/이메일 접촉 없음")
+    print(f"실행일 {_D_TO} · MODE=membership · 예산 6콜 · 시트/이메일 접촉 없음")
     print("=" * 78)
 
     # ── 1단계 — 집합 확보 (1콜) ──────────────────────────────────────────
@@ -428,7 +432,7 @@ def run_membership2():
     """해외 교락과 분리된 불량입력으로 리스트의 판별력을 실제로 시험한다."""
     print("=" * 78)
     print("멤버십 판별 프로브 2 — 교락 없는 불량입력으로 재시험")
-    print(f"실행일 {_D_TO} · 예산 최대 12콜 · 시트/이메일 접촉 없음")
+    print(f"실행일 {_D_TO} · MODE=membership2 · 예산 최대 12콜 · 시트/이메일 접촉 없음")
     print("=" * 78)
 
     # ── 1단계 — 집합 (1콜) ──────────────────────────────────────────────
@@ -535,12 +539,20 @@ def run_membership2():
 
 
 def main():
+    # 정규화를 여기서 한다. import 시점에 하면 검증 계층 밖이라 테스트가 닿지
+    # 않고, 모듈을 먼저 import 한 뒤 값을 넣는 경로에서도 안 먹는다.
+    mode = "" if _MODE == "default" else _MODE
+    if mode not in _VALID_MODES:
+        print(f"❌ PROBE_MODE={_MODE!r} — 모르는 모드다. 콜을 태우지 않고 중단한다.")
+        print("   가능한 값: default(=빈값) · membership · membership2")
+        return 2
+
     if not _KEY:
         print("❌ FMP_API_KEY 없음 — 중단")
         return 1
 
-    if _MODE in ("membership", "membership2"):
-        if _MODE == "membership2":
+    if mode in ("membership", "membership2"):
+        if mode == "membership2":
             run_membership2()
             key = "MEMBERSHIP2_JSON "
         else:
@@ -557,7 +569,7 @@ def main():
 
     print("=" * 78)
     print("A-2b 프로브 — 미수신 원인 판정 경로 실측")
-    print(f"실행일 {_D_TO} · HEAVY={'ON' if _HEAVY else 'OFF'}")
+    print(f"실행일 {_D_TO} · MODE=default · HEAVY={'ON' if _HEAVY else 'OFF'}")
     print("=" * 78)
 
     # ══════════════════════════════════════════════════════════════════

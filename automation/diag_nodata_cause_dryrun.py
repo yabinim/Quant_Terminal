@@ -437,3 +437,45 @@ if bad2:
     print("❌ 실패: " + ", ".join(bad2))
     sys.exit(1)
 print("✅ 멤버십2 8시나리오 — 불량입력 0개 세계에서 '판정불가'로 떨어짐(1차 실패 재발 방지)")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 모드 유효성 — 조용한 폴백 방지 (2026-08-22 회귀)
+# ══════════════════════════════════════════════════════════════════════════
+# 워크플로가 membership2 를 빈 문자열로 매핑해 **기본 11콜이 조용히 돌았다.**
+# 로그만 봐서는 다른 게 실행됐다는 걸 알기 어려웠다. 다시는 조용히 떨어지지 않게
+# 모르는 모드는 콜 0으로 즉시 죽어야 한다. 그리고 'default' 는 정상 통과해야 한다.
+print()
+print("── 모드 유효성 (조용한 폴백 방지) ──")
+mode_bad = []
+
+
+def _run_mode(mode, table):
+    P._CALLS = 0
+    P.FIND = {}
+    P._MODE = mode
+    P.call = make_fake_mem2(table)
+    with contextlib.redirect_stdout(io.StringIO()) as b:
+        rc = P.main()
+    return rc, P._CALLS, b.getvalue()
+
+
+for mode, want_rc, want_calls in [("membershp2", 2, 0),   # 오타
+                                  ("MEMBERSHIP2", 2, 0),  # 대문자(정규화는 env 단계)
+                                  ("", None, None),       # 기본(빈값) — 통과해야 함
+                                  ("default", 0, 11),     # 워크플로가 실제로 보내는 값
+                                  ("membership2", 0, None)]:
+    rc, calls, _out = _run_mode(mode, MEM2["N1 강한불량→채택"])
+    ok = True
+    if want_rc is not None and rc != want_rc:
+        ok = False
+    if want_calls is not None and calls != want_calls:
+        ok = False
+    print(f"  PROBE_MODE={mode!r:14} rc={rc} · {calls}콜 " + ("✅" if ok else "❌"))
+    if not ok:
+        mode_bad.append(mode)
+
+if mode_bad:
+    print("❌ 모드 유효성 실패: " + ", ".join(repr(m) for m in mode_bad))
+    sys.exit(1)
+print("✅ 모르는 모드는 콜 0으로 즉시 중단 · 유효 모드는 정상 실행")
