@@ -107,5 +107,11 @@ jobs:
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           PROBE_HEAVY: ${{ inputs.heavy && '1' || '' }}
-          PROBE_MODE: ${{ inputs.mode == 'membership' && 'membership' || '' }}
+          # ⚠️ 값을 그대로 넘긴다. 이전 판은
+          #    `inputs.mode == 'membership' && 'membership' || ''` 였는데,
+          #    membership2 를 options 에만 추가하고 이 줄을 안 고쳐서
+          #    membership2 선택이 **조용히 기본 11콜로 떨어졌다**(2026-08-22).
+          #    선택지가 늘 때마다 고쳐야 하는 표현식은 언젠가 안 고쳐진다.
+          #    유효성 검사는 파이썬이 하고, 모르는 값이면 콜 0으로 즉시 죽는다.
+          PROBE_MODE: ${{ inputs.mode }}
         run: python automation/diag_nodata_cause.py
