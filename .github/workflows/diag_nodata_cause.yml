@@ -20,6 +20,22 @@ name: 🔬 진단 — A-2b 미수신 원인 판정 경로 프로브 (수동 전�
 # 호출 예산:
 #   기본 11 콜. 시드 확보(P1/P2) 가 실패하면 4 콜에서 조기 종료한다.
 #   PROBE_HEAVY=1 이면 +1 (actively-trading-list, 2.6만건 — 크기 실측용).
+#   mode=membership 이면 기존 11콜 대신 **멤버십 판별 6콜**만 돈다.
+#
+# 멤버십 판별 모드 (2026-08-22 추가):
+#   actively-trading-list 를 **생사 판별자**로 쓸 수 있는지 판정한다.
+#   답해야 하는 건 "리스트가 오는가"(이미 안다)가 아니라 **"부재가 사망을
+#   뜻하는가"** 다. 해외 미커버·ETF 미포함 때문에 부재할 수도 있고, 그러면
+#   정상 보유 종목에 사망 딱지가 붙는다 — 원인을 모르는 것보다 나쁘다.
+#
+#   지상진실은 리스트가 아니라 profile.isActivelyTrading 으로 따로 세운다.
+#   사망 픽스처는 기억(TWTR·ATVI 류)이 아니라 delisted 피드에서 뽑는다.
+#   음성 대조군(존재할 수 없는 심볼)이 잡히면 다른 통과는 전부 무효다.
+#
+#   사전 확정 기준 — 결과를 보고 고치지 않는다:
+#     사망이 리스트에 존재 / 미국 보통주 부재 → 전면 폐기
+#     ETF 전멸 → ETF 제외 · 해외 전멸 → 해외 제외 (부분 채택)
+#     그 외 → 채택
 #
 # 안전성:
 #   · 시트 접근 없음 · 쓰기 없음 · Gemini 호출 없음 · 읽기 전용 GET 뿐
@@ -32,6 +48,13 @@ on:
         description: 'actively-trading-list 크기도 실측 (+1콜, 2.6만건)'
         type: boolean
         default: false
+      mode:
+        description: '실행 모드'
+        type: choice
+        default: default
+        options:
+          - default        # 기존 A-2b 경로 프로브 (11콜)
+          - membership     # actively-trading-list 생사 판별력 (6콜)
 
 jobs:
   probe:
@@ -68,4 +91,5 @@ jobs:
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           PROBE_HEAVY: ${{ inputs.heavy && '1' || '' }}
+          PROBE_MODE: ${{ inputs.mode == 'membership' && 'membership' || '' }}
         run: python automation/diag_nodata_cause.py
