@@ -8071,35 +8071,19 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
         except Exception:
             pass
 
-    # I: 애널리스트 매수 컨센서스 (ratings-snapshot) — FMP Starter 제공
-    # 기관 보유 API가 Starter 플랜 차단이므로 ratings-snapshot으로 대체
+    # I: 애널리스트 매수 컨센서스 — grades-consensus (단일 소스)
+    #
+    # ⚠️ ratings-snapshot 을 쓰지 말 것. 이름과 달리 **애널리스트 등급이 아니다.**
+    #    FMP 자체 재무 스코어이며 공식 문서상 응답 필드는
+    #      rating / overallScore / discountedCashFlowScore / returnOnEquityScore
+    #      returnOnAssetsScore / debtToEquityScore / priceToEarningsScore / priceToBookScore
+    #    strongBuy·buy·hold·sell·strongSell 은 **존재하지 않는다**. 과거 이 자리에서
+    #    그 5개를 뽑아 tot=0 → 조용히 폴백하는 헛도는 1콜이 매 렌더마다 나갔다.
+    #    애널리스트 등급 카운트는 grades-consensus 가 유일한 소스다.
     analyst_buy_pct = np.nan
     analyst_label   = ""
-    if k_val:
-        try:
-            r_rat = requests.get(
-                f"{_FMP_BASE}/ratings-snapshot?symbol={ticker_upper}&apikey={k_val}",
-                timeout=_FMP_TIMEOUT
-            )
-            if r_rat.status_code == 200:
-                rat_data = r_rat.json()
-                rat = rat_data[0] if isinstance(rat_data, list) and rat_data else (rat_data if isinstance(rat_data, dict) else {})
-                if rat:
-                    sb  = to_float(rat.get("strongBuy")  or 0)
-                    b   = to_float(rat.get("buy")        or 0)
-                    h   = to_float(rat.get("hold")       or 0)
-                    s   = to_float(rat.get("sell")       or 0)
-                    ss  = to_float(rat.get("strongSell") or 0)
-                    tot = (sb or 0)+(b or 0)+(h or 0)+(s or 0)+(ss or 0)
-                    if tot > 0:
-                        bc = (sb or 0)+(b or 0)
-                        analyst_buy_pct = round(float(bc / tot * 100), 1)
-                        analyst_label = f"매수의견 {analyst_buy_pct:.0f}% ({int(bc)}/{int(tot)}명)"
-        except Exception:
-            pass
 
-    # grades-consensus fallback
-    if pd.isna(analyst_buy_pct) and k_val:
+    if k_val:
         try:
             r_gc = requests.get(
                 f"{_FMP_BASE}/grades-consensus?symbol={ticker_upper}&apikey={k_val}",
@@ -20615,34 +20599,40 @@ if st.session_state.get("logged_in"):
 
                 with st.spinner("애널리스트 데이터 불러오는 중..."):
                     if _k_inst:
-                        # 1) ratings-snapshot 시도
+                        # grades-consensus 단일 소스.
+                        # ratings-snapshot 선행 시도를 제거했다 — 그 엔드포인트에는
+                        # strongBuy/buy/hold/sell/strongSell 이 없어 항상 _tot=0 으로
+                        # 떨어졌고, 결국 매번 1콜을 버리고 여기로 내려왔다.
+                        # (상세 근거는 8074 주석)
                         try:
-                            _r1 = requests.get(
-                                f"{_FMP_BASE}/ratings-snapshot?symbol={_tk_inst}&apikey={_k_inst}",
+                            _r2 = requests.get(
+                                f"{_FMP_BASE}/grades-consensus?symbol={_tk_inst}&apikey={_k_inst}",
                                 timeout=_FMP_TIMEOUT
                             )
-                            if _r1.status_code == 200:
-                                _rd1 = _r1.json()
-                                _ri  = _rd1[0] if isinstance(_rd1, list) and _rd1 else (
-                                       _rd1 if isinstance(_rd1, dict) else {})
-                                if _ri:
-                                    # FMP ratings-snapshot 실제 필드명 모두 시도
-                                    _sb  = int(to_float(_ri.get("strongBuy")  or _ri.get("ratingDetailsStrongBuyCount") or _ri.get("ratingStrongBuy")  or 0) or 0)
-                                    _b   = int(to_float(_ri.get("buy")        or _ri.get("ratingDetailsBuyCount")       or _ri.get("ratingBuy")        or 0) or 0)
-                                    _h   = int(to_float(_ri.get("hold")       or _ri.get("ratingDetailsHoldCount")      or _ri.get("ratingHold")       or 0) or 0)
-                                    _s   = int(to_float(_ri.get("sell")       or _ri.get("ratingDetailsSellCount")      or _ri.get("ratingSell")       or 0) or 0)
-                                    _ss  = int(to_float(_ri.get("strongSell") or _ri.get("ratingDetailsStrongSellCount")or _ri.get("ratingStrongSell") or 0) or 0)
-                                    _tot = _sb + _b + _h + _s + _ss
-                                    if _tot > 0:
-                                        _buy_pct = round((_sb + _b) / _tot * 100, 1)
+                            if _r2.status_code == 200:
+                                _rd2 = _r2.json()
+                                _gc  = _rd2[0] if isinstance(_rd2, list) and _rd2 else (
+                                       _rd2 if isinstance(_rd2, dict) else {})
+                                if _gc:
+                                    _sb2 = int(to_float(_gc.get("strongBuy")  or 0) or 0)
+                                    _b2  = int(to_float(_gc.get("buy")        or 0) or 0)
+                                    _h2  = int(to_float(_gc.get("hold")       or 0) or 0)
+                                    _s2  = int(to_float(_gc.get("sell")       or 0) or 0)
+                                    _ss2 = int(to_float(_gc.get("strongSell") or 0) or 0)
+                                    _tot2 = _sb2+_b2+_h2+_s2+_ss2
+                                    if _tot2 > 0:
+                                        _bp2 = round((_sb2+_b2)/_tot2*100, 1)
                                         ic1, ic2, ic3 = st.columns(3)
-                                        ic1.metric("매수 의견 비율", f"{_buy_pct:.0f}%", f"Strong Buy {_sb} + Buy {_b}명")
-                                        ic2.metric("Hold", f"{_h}명")
-                                        ic3.metric("Sell / Strong Sell", f"{_s+_ss}명", f"총 {_tot}명")
-                                        _rlabel = (_ri.get("ratingRecommendation") or _ri.get("rating") or
-                                                   _ri.get("ratingScore") or "")
+                                        ic1.metric("매수 의견 비율", f"{_bp2:.0f}%", f"Strong Buy {_sb2} + Buy {_b2}명")
+                                        ic2.metric("Hold", f"{_h2}명")
+                                        ic3.metric("Sell / Strong Sell", f"{_s2+_ss2}명", f"총 {_tot2}명")
+                                        # 종합 의견 배지 — grades-consensus 의 consensus 필드가
+                                        # 진짜 애널리스트 컨센서스 라벨("Buy"/"Hold" 등)이다.
+                                        # 구버전은 이 배지를 ratings-snapshot 쪽에만 달아 놨고
+                                        # 그 분기는 한 번도 실행된 적이 없다 → 배지가 영영 안 떴다.
+                                        _rlabel = str(_gc.get("consensus") or "").strip()
                                         if _rlabel:
-                                            _col = "#16a34a" if _buy_pct >= 60 else ("#f59e0b" if _buy_pct >= 40 else "#dc2626")
+                                            _col = "#16a34a" if _bp2 >= 60 else ("#f59e0b" if _bp2 >= 40 else "#dc2626")
                                             st.markdown(
                                                 f"<div style='background:#1e293b;border-radius:8px;padding:10px 16px;"
                                                 f"border-left:4px solid {_col};margin-top:8px;'>"
@@ -20651,34 +20641,6 @@ if st.session_state.get("logged_in"):
                                         _shown = True
                         except Exception:
                             pass
-
-                        # 2) grades-consensus fallback
-                        if not _shown:
-                            try:
-                                _r2 = requests.get(
-                                    f"{_FMP_BASE}/grades-consensus?symbol={_tk_inst}&apikey={_k_inst}",
-                                    timeout=_FMP_TIMEOUT
-                                )
-                                if _r2.status_code == 200:
-                                    _rd2 = _r2.json()
-                                    _gc  = _rd2[0] if isinstance(_rd2, list) and _rd2 else (
-                                           _rd2 if isinstance(_rd2, dict) else {})
-                                    if _gc:
-                                        _sb2 = int(to_float(_gc.get("strongBuy")  or 0) or 0)
-                                        _b2  = int(to_float(_gc.get("buy")        or 0) or 0)
-                                        _h2  = int(to_float(_gc.get("hold")       or 0) or 0)
-                                        _s2  = int(to_float(_gc.get("sell")       or 0) or 0)
-                                        _ss2 = int(to_float(_gc.get("strongSell") or 0) or 0)
-                                        _tot2 = _sb2+_b2+_h2+_s2+_ss2
-                                        if _tot2 > 0:
-                                            _bp2 = round((_sb2+_b2)/_tot2*100, 1)
-                                            ic1, ic2, ic3 = st.columns(3)
-                                            ic1.metric("매수 의견 비율", f"{_bp2:.0f}%", f"Strong Buy {_sb2} + Buy {_b2}명")
-                                            ic2.metric("Hold", f"{_h2}명")
-                                            ic3.metric("Sell / Strong Sell", f"{_s2+_ss2}명", f"총 {_tot2}명")
-                                            _shown = True
-                            except Exception:
-                                pass
 
                 if not _shown:
                     # FMP API에서 데이터 없음 — 직접 응답 내용 디버그
@@ -20774,7 +20736,9 @@ if st.session_state.get("logged_in"):
             # ── 상원/하원 의원 거래 ──────────────────────────────────────────
             st.divider()
             st.markdown("### 🏛️ 상원/하원 의원 거래")
-            st.caption("미국 의회 의원들의 주식 거래 공시. 정책 방향 선행 지표로 활용됩니다.")
+            st.caption("미국 의회 의원 주식 거래 공시. ⚠️ 공시 지연이 큽니다 — 실측 중앙값 "
+                       "상원 약 1.5년 · 하원 약 1개월(최근 100건 기준). 선행 지표가 아니라 "
+                       "사후 참고용이며, 반드시 아래 표의 `거래일`을 함께 보십시오.")
             try:
                 with st.spinner("의회 거래 데이터 불러오는 중..."):
                     with _timed("정밀 의회거래"):
@@ -20937,7 +20901,12 @@ if st.session_state.get("logged_in"):
                         _diag_rec_list = [f"{r.get('기관','')}: {r.get('등급','')}" for r in _dan.get("recent",[])[:3]]
                     _k_r = _fmp_key()
                     if _k_r:
-                        _r_r = requests.get(f"{_FMP_BASE}/ratings-snapshot?symbol={str(selected_ticker).strip().upper()}&apikey={_k_r}", timeout=_FMP_TIMEOUT)
+                        # grades-consensus. 구버전은 ratings-snapshot 을 불렀고 폴백이
+                        # 없어서 _rt 가 늘 0 이었다 → 아래 세 변수가 영구히 ""로 남아
+                        # AI 프롬프트에 "애널리스트 매수의견:  () | 종합의견: " 처럼
+                        # 빈 필드가 나갔다. 애널리스트 컨센서스가 정밀검사에 한 번도
+                        # 들어간 적이 없다. (상세 근거는 8074 주석)
+                        _r_r = requests.get(f"{_FMP_BASE}/grades-consensus?symbol={str(selected_ticker).strip().upper()}&apikey={_k_r}", timeout=_FMP_TIMEOUT)
                         if _r_r.status_code == 200:
                             _rrd = _r_r.json()
                             _rri = _rrd[0] if isinstance(_rrd, list) and _rrd else {}
@@ -20947,21 +20916,27 @@ if st.session_state.get("logged_in"):
                                 _rt=_rsb+_rb+_rh+_rs+_rss
                                 if _rt > 0:
                                     _diag_buy_pct   = f"{round((_rsb+_rb)/_rt*100,1):.0f}%"
-                                    _diag_rat_label = _rri.get("ratingRecommendation") or _rri.get("rating") or ""
+                                    _diag_rat_label = str(_rri.get("consensus") or "").strip()
                                     _diag_rat_tot   = f"{_rsb+_rb}/{_rt}명"
                 except Exception:
                     pass
 
-                # 의회 거래
-                _diag_cg_buy = _diag_cg_sell = 0
-                try:
-                    with _timed("정밀 의회거래"):
-                        _dcg = fetch_senate_house_trading(str(selected_ticker).strip().upper())
-                    if not _dcg.empty:
-                        _diag_cg_buy  = len(_dcg[_dcg["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)])
-                        _diag_cg_sell = len(_dcg[_dcg["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)])
-                except Exception:
-                    pass
+                # 의회 거래 — AI 프롬프트에서 **의도적으로 제외**했다. 되돌리지 말 것.
+                #
+                # tierD 실측(VERDICT_2026-08-22_congress_trades_terminated.md):
+                #   상원  공시 지연 중앙값 572일 · p90 875일 · **최소 15일** · 7일이내 0%
+                #   하원  중앙값 27일 · p90 704일 · 최소 6일 · 7일이내 3%
+                #
+                # 여기서 넘기던 건 건수뿐이라 날짜가 없었다. 평균 1.5년 묵은 거래가
+                # 시점 표기 없이 "매수 N건 vs 매도 M건"으로 들어가면, 판단을 요구받는
+                # LLM 은 그걸 현재 신호로 취급할 수밖에 없다. 표시가 아니라 판단 입력이다.
+                #
+                # 화면 표(위 '🏛️ 상원/하원 의원 거래' 섹션)는 **그대로 유지**한다.
+                # 거기엔 `거래일` 컬럼이 있어 사람이 지연을 직접 보고 할인할 수 있다.
+                # VERDICT 108행의 "표시 전용으로 유지"가 가리키는 게 그쪽이다.
+                #
+                # 부수 효과: 같은 데이터를 두 번 가져오던 중복이 사라져 정밀검사
+                # 1회당 FMP 2콜(senate-trades + house-trades)이 절감된다.
 
                 def _nv(v, fmt=".2f", pre="", suf=""):
                     return f"{pre}{v:{fmt}}{suf}" if pd.notna(v) else "N/A"
@@ -20999,10 +20974,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
 [수급 시그널]
 인사이더: 매수 {_diag_ins_buy}건 vs 매도 {_diag_ins_sell}건 → {"매수 우세" if _diag_ins_buy > _diag_ins_sell else "매도 우세" if _diag_ins_sell > _diag_ins_buy else "중립"}
-애널리스트 매수의견: {_diag_buy_pct} ({_diag_rat_tot}) | 종합의견: {_diag_rat_label}
+애널리스트 매수의견: {_diag_buy_pct or "N/A"} ({_diag_rat_tot or "N/A"}) | 종합의견: {_diag_rat_label or "N/A"}
 애널리스트 목표가: 평균 {_nv(_diag_tgt_mean,".2f","$")} / 최고 {_nv(_diag_tgt_high,".2f","$")} / 최저 {_nv(_diag_tgt_low,".2f","$")}
 최근 추천: {" | ".join(_diag_rec_list) if _diag_rec_list else "N/A"}
-의회 거래: 매수 {_diag_cg_buy}건 vs 매도 {_diag_cg_sell}건
 
 --- 작성 지침 ---
 아래 형식으로 작성하되, 각 섹션에서 데이터를 나열하지 말고 해석과 판단만 쓰세요.
