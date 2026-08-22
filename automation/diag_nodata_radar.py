@@ -50,9 +50,21 @@ _WANT_FUNCS = ["reset_nodata", "record_attempt", "record_nodata",
                "nodata_weight", "nodata_log_summary", "render_nodata_html",
                # A-2b — 원인 판정. _fmp_profile_status 는 **일부러 뺀다**:
                # 그 함수만 네트워크를 만지고, classify 는 probe 주입으로 테스트한다.
-               "classify_nodata_causes", "nodata_cause", "nodata_cause_counts"]
+               "classify_nodata_causes", "nodata_cause", "nodata_cause_counts",
+               # A-2c — 선제 상장상태 점검. _fmp_actively_trading_symbols 와
+               # _collect_user_tickers 는 **일부러 뺀다**: 그 둘만 네트워크/시트를
+               # 만지고, run_liveness_scan 은 주입으로 테스트한다.
+               "reset_liveness", "liveness_due", "run_liveness_scan",
+               "liveness_for_user", "liveness_total", "liveness_weight",
+               "liveness_log_summary", "render_liveness_html",
+               # 발송 게이트 자체를 실제로 돌려본다(계약 검사만으로는 부족했다)
+               "dispatch_radar_emails"]
 _WANT_CONSTS = ["_NODATA_RATIO_ALERT", "_NODATA_MIN_SAMPLE", "_nodata",
-                "_NODATA_CAUSE_LABEL", "_NODATA_CAUSE_MAX"]
+                "_NODATA_CAUSE_LABEL", "_NODATA_CAUSE_MAX",
+                "_LIVENESS_WEEKDAY", "_LIVENESS_MIN_UNIVERSE",
+                "_LIVENESS_ABSENT_RATIO", "_LIVENESS_MIN_SAMPLE",
+                "_LIVENESS_PROFILE_MAX",
+                "_LIVENESS_LABEL", "_liveness"]
 
 
 def load_module_slice():
@@ -89,7 +101,29 @@ def load_module_slice():
 
     picked.sort(key=lambda n: n.lineno)
     mod = ast.Module(body=picked, type_ignores=[])
-    ns = {"print": print}
+    # dispatch_radar_emails 를 **실제로 실행**하기 위한 최소 스텁.
+    # 계약(AST) 검사만으로는 부족하다 — 함수 안의 조기 반환 가드는 호출 여부가
+    # 아니라 조건식이라 AST 로는 안 잡힌다(실제로 그 결함이 있었다).
+    class _UC:
+        ADMIN_CONTENT_OWNER_ID = "yab"
+
+    _SENT = []
+
+    ns = {
+        "print": print,
+        "datetime": __import__("datetime").datetime,
+        "uc": _UC(),
+        "GMAIL_TO": "admin@example.com",
+        "_ET": None,
+        "SENT": _SENT,
+        "send_email": lambda subj, html, to_addr=None: (
+            _SENT.append({"subject": subj, "html": html, "to": to_addr}) or True),
+        "build_email_html": (lambda wl, pf, today, nodata_html="", liveness_html="":
+                             "WL" * sum(len(v) for v in (wl or {}).values())
+                             + "PF" * sum(len(v) for v in (pf or {}).values())
+                             + nodata_html + liveness_html),
+        "_radar_recipients": lambda: [("yab", None)],
+    }
     exec(compile(ast.fix_missing_locations(mod), "<slice>", "exec"), ns)
     print("  소스: " + os.path.relpath(path, _ROOT))
     print("  추출: 함수 " + str(len(found_f)) + " · 상수 " + str(len(found_c)))
@@ -299,6 +333,31 @@ def test_source_contract():
     check("main 게이트가 nodata_total 을 본다 (침묵의 침묵 방지)",
           "nodata_total" in mn)
     check("발송부가 nodata_weight 를 본다", "nodata_weight" in dp)
+    # ── A-2c 배선 계약 ────────────────────────────────────────────────────
+    check("main 이 reset_liveness 호출 (실행 간 오염 방지)", "reset_liveness" in mn)
+    check("main 이 liveness_due 로 요일 게이트 (매 실행 1.5MB 방지)",
+          "liveness_due" in mn)
+    check("main 이 run_liveness_scan 호출", "run_liveness_scan" in mn)
+    check("main 이 liveness_log_summary 호출", "liveness_log_summary" in mn)
+    check("main 게이트가 liveness_total 을 본다 (경고의 침묵 방지)",
+          "liveness_total" in mn)
+    check("발송부가 liveness_weight 를 본다", "liveness_weight" in dp)
+    check("발송부가 render_liveness_html 을 본다", "render_liveness_html" in dp)
+    check("발송 게이트가 liveness_total/nodata_total 을 함께 본다",
+          "liveness_total" in dp and "nodata_total" in dp)
+    # A-2c 는 부가 기능이다. 예외가 레이더 본체를 죽이면 안 된다.
+    _lv_wrapped = False
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.FunctionDef) and _n.name == "main":
+            for _t in ast.walk(_n):
+                if isinstance(_t, ast.Try):
+                    _names = {c.func.id for c in ast.walk(_t)
+                              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+                    if "run_liveness_scan" in _names and _t.handlers:
+                        _lv_wrapped = True
+    check("run_liveness_scan 이 try/except 로 감싸져 있다 (fail-open)", _lv_wrapped)
+    check("actively-trading-list 를 실제로 호출한다",
+          any("actively-trading-list" in s2 for s2 in _lits))
     check("발송부가 render_nodata_html 을 본다", "render_nodata_html" in dp)
 
     # build_email_html 이 nodata_html 를 받고 쓰는가
@@ -308,6 +367,14 @@ def test_source_contract():
             ok_sig = any(a.arg == "nodata_html" for a in n.args.args)
             ok_use = any(isinstance(x, ast.Name) and x.id == "nodata_html"
                          for x in ast.walk(n))
+    _lv_sig = _lv_use = False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef) and n.name == "build_email_html":
+            _lv_sig = any(a.arg == "liveness_html" for a in n.args.args)
+            _lv_use = any(isinstance(x, ast.Name) and x.id == "liveness_html"
+                          for x in ast.walk(n))
+    check("build_email_html 이 liveness_html 인자를 받는다", _lv_sig)
+    check("build_email_html 이 liveness_html 을 본문에 쓴다", _lv_use)
     check("build_email_html 이 nodata_html 인자를 받는다", ok_sig)
     check("build_email_html 이 nodata_html 을 본문에 쓴다", ok_use)
 
@@ -644,6 +711,261 @@ def test_cause():
     check("원인별 집계", cnt.get("delisted") == 2 and cnt.get("transient") == 1, str(cnt))
 
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# F. A-2c 선제 상장상태 점검
+# ══════════════════════════════════════════════════════════════════════════
+# 이 기능이 조용히 고장 나는 방식은 미수신과 다르다. 미수신은 "알려야 할 걸 안
+# 알리는" 쪽이지만, 선제 점검은 **"알리지 말아야 할 걸 알리는"** 쪽이 더 위험하다.
+# 거래 종목 목록이 잘려 오거나 커버리지 구멍(해외·OTC)에 걸리면 정상 보유
+# 종목에 상장폐지 경고가 나간다 — 그 메일은 사용자를 실제로 잘못 움직이게 한다.
+def _lv_fresh():
+    M["reset_liveness"]()
+
+
+def _tk(mapping):
+    return lambda: mapping
+
+
+def _uni(symbols):
+    return lambda: set(symbols)
+
+
+def _probe_map(m):
+    def fn(t):
+        return m.get(t, ("transient", "", ""))
+    return fn
+
+
+_BIG = {f"T{i}" for i in range(6000)}
+
+
+def test_liveness():
+    print("\n── F. A-2c 선제 상장상태 점검")
+
+    # F-1 정상 — 부재 1종이 profile 로 사망 확정
+    _lv_fresh()
+    calls = M["run_liveness_scan"](
+        universe_fn=_uni(_BIG | {"AAPL", "MSFT"}),
+        tickers_fn=_tk({"yab": {"AAPL": "워치리스트", "DEAD": "보유"}}),
+        probe=_probe_map({"DEAD": ("delisted", "Dead Co", "")}))
+    check("F-1 사망 1종 확정 · 2콜(목록1+profile1)", calls == 2, f"calls={calls}")
+    check("F-1 경고 1건", M["liveness_total"]() == 1)
+    check("F-1 보유 표기 유지",
+          M["liveness_for_user"]("yab")[0][3] == "보유")
+
+    # F-2 ★ 최악 — 목록 미수신. 전 종목이 사망으로 뒤집히면 절대 안 된다
+    _lv_fresh()
+    calls = M["run_liveness_scan"](
+        universe_fn=lambda: None,
+        tickers_fn=_tk({"yab": {"AAPL": "보유", "MSFT": "보유"}}),
+        probe=_probe_map({}))
+    check("F-2 목록 미수신 → 경고 0건 (오탐 없음)", M["liveness_total"]() == 0)
+    check("F-2 목록 미수신 → profile 미호출(1콜)", calls == 1, f"calls={calls}")
+
+    # F-3 ★ 목록이 잘려 옴 — 하한선 가드
+    _lv_fresh()
+    calls = M["run_liveness_scan"](
+        universe_fn=_uni({"AAPL"}),
+        tickers_fn=_tk({"yab": {"AAPL": "보유", "MSFT": "보유", "TSLA": "보유"}}),
+        probe=_probe_map({"MSFT": ("delisted", "", ""), "TSLA": ("delisted", "", "")}))
+    check("F-3 목록 이상(하한 미달) → 경고 0건", M["liveness_total"]() == 0)
+    check("F-3 목록 이상 → profile 미호출", calls == 1, f"calls={calls}")
+
+    # F-4 부재 과다 — 커버리지 구멍이지 떼죽음이 아니다
+    _lv_fresh()
+    many = {f"X{i}": "보유" for i in range(12)}   # 표본 ≥ _LIVENESS_MIN_SAMPLE
+    calls = M["run_liveness_scan"](
+        universe_fn=_uni(_BIG),
+        tickers_fn=_tk({"yab": many}),
+        probe=_probe_map({f"X{i}": ("delisted", "", "") for i in range(12)}))
+    check("F-4 부재 100% → 경고 0건 (커버리지로 판단)", M["liveness_total"]() == 0)
+    check("F-4 부재 과다 → profile 미호출", calls == 1, f"calls={calls}")
+
+    # F-4b ★ 작은 표본 — 비율이 높아도 게이트가 진짜 상폐를 삼키면 안 된다
+    _lv_fresh()
+    M["run_liveness_scan"](
+        universe_fn=_uni(_BIG | {"AAPL"}),
+        tickers_fn=_tk({"yab": {"AAPL": "보유", "DEAD": "보유"}}),
+        probe=_probe_map({"DEAD": ("delisted", "Dead Co", "")}))
+    check("F-4b 표본 2종(부재 50%) → 비율 게이트 미적용, 경고 1건",
+          M["liveness_total"]() == 1)
+
+    # F-5 ★ 부재인데 profile 이 '거래 중' — 부재만으로 단정하지 않는다
+    _lv_fresh()
+    M["run_liveness_scan"](
+        universe_fn=_uni(_BIG),
+        tickers_fn=_tk({"yab": {"OTCX": "보유"}}),
+        probe=_probe_map({"OTCX": ("transient", "Live Co", "")}))
+    check("F-5 부재+거래중 → 경고 0건 (한 방향 판정)", M["liveness_total"]() == 0)
+
+    # F-6 unknown(402 등)도 알리지 않는다
+    _lv_fresh()
+    M["run_liveness_scan"](
+        universe_fn=_uni(_BIG),
+        tickers_fn=_tk({"yab": {"AAA.KS": "보유"}}),
+        probe=_probe_map({"AAA.KS": ("unknown", "", "플랜 미포함")}))
+    check("F-6 원인 불명 → 경고 0건", M["liveness_total"]() == 0)
+
+    # F-7 호출 상한
+    _lv_fresh()
+    lots = {f"D{i}": "보유" for i in range(40)}
+    calls = M["run_liveness_scan"](
+        universe_fn=_uni(_BIG | {f"L{i}" for i in range(200)}),
+        tickers_fn=_tk({"yab": dict(lots, **{f"L{i}": "보유" for i in range(200)})}),
+        probe=_probe_map({f"D{i}": ("delisted", "", "") for i in range(40)}))
+    check("F-7 profile 상한 25 준수", calls <= 1 + M["_LIVENESS_PROFILE_MAX"],
+          f"calls={calls}")
+
+    # F-8 사용자 격리
+    _lv_fresh()
+    M["run_liveness_scan"](
+        universe_fn=_uni(_BIG),
+        tickers_fn=_tk({"yab": {"DEAD": "보유"}, "guest": {"GONE": "워치리스트"}}),
+        probe=_probe_map({"DEAD": ("delisted", "", ""), "GONE": ("gone", "", "")}))
+    check("F-8 유저 격리 — yab 1건", M["liveness_weight"]("yab") == 1)
+    check("F-8 유저 격리 — guest 1건", M["liveness_weight"]("guest") == 1)
+    check("F-8 교차 오염 없음",
+          M["liveness_for_user"]("yab")[0][0] == "DEAD"
+          and M["liveness_for_user"]("guest")[0][0] == "GONE")
+
+    # F-9 요일 게이트
+    import datetime as _dt
+    fri = _dt.datetime(2026, 8, 21)   # 금
+    mon = _dt.datetime(2026, 8, 24)   # 월
+    check("F-9 금요일에 실행", M["liveness_due"](fri) is True)
+    check("F-9 월요일엔 미실행", M["liveness_due"](mon) is False)
+    check("F-9 강제 플래그는 요일 무시", M["liveness_due"](mon, forced=True) is True)
+
+    # F-10 렌더 — 보유 포함 여부로 문구가 갈린다
+    _lv_fresh()
+    M["run_liveness_scan"](
+        universe_fn=_uni(_BIG),
+        tickers_fn=_tk({"yab": {"DEAD": "보유"}}),
+        probe=_probe_map({"DEAD": ("delisted", "Dead Co", "")}))
+    html = M["render_liveness_html"]("yab")
+    check("F-10 보유 경고 문구", "매도 신호가 영구히" in html)
+    check("F-10 경고 없는 유저는 빈 문자열", M["render_liveness_html"]("nobody") == "")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# F2. 목록 조회 함수의 계약 — None 과 빈 집합을 구분하는가
+# ══════════════════════════════════════════════════════════════════════════
+# ⚠️ 이 검사는 run_liveness_scan 의 하한선 가드(_LIVENESS_MIN_UNIVERSE)와
+#    **의도적으로 중복**이다. 목록 조회가 실패했을 때 빈 집합을 돌려주면
+#    호출부가 '전 종목 부재'로 읽어 모든 보유에 사망 경고를 보낸다.
+#    지금은 하한선이 그걸 막지만, 하한선을 '중복이니 지우자'고 없애는 순간
+#    이 결함이 되살아난다. 둘 다 못으로 박아둔다.
+#
+#    이 함수만 requests 를 만지므로 가짜 requests 를 물려 따로 실행한다.
+def _extract_fetcher():
+    path = None
+    for cand in (os.path.join(_HERE, "run_watchlist_alerts.py"),
+                 os.path.join(_ROOT, "automation", "run_watchlist_alerts.py"),
+                 os.path.join(_ROOT, "run_watchlist_alerts.py")):
+        if os.path.exists(cand):
+            path = cand
+            break
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    node = None
+    for n in tree.body:
+        if isinstance(n, ast.FunctionDef) and n.name == "_fmp_actively_trading_symbols":
+            node = n
+    if node is None:
+        print("❌ _fmp_actively_trading_symbols 를 찾을 수 없습니다.")
+        sys.exit(2)
+    return node, path
+
+
+class _FakeResp:
+    def __init__(self, status=200, payload=None, raise_json=False):
+        self.status_code = status
+        self._p = payload
+        self._raise = raise_json
+
+    def json(self):
+        if self._raise:
+            raise ValueError("bad json")
+        return self._p
+
+
+class _FakeRequests:
+    def __init__(self, resp=None, exc=None):
+        self._resp, self._exc = resp, exc
+
+    def get(self, *a, **k):
+        if self._exc:
+            raise self._exc
+        return self._resp
+
+
+def test_fetcher_contract():
+    print("\n── F2. 목록 조회 계약 (None ≠ 빈 집합)")
+    node, _path = _extract_fetcher()
+
+    def run(fake):
+        ns = {"print": lambda *a, **k: None, "requests": fake,
+              "_FMP_BASE": "https://x", "FMP_API_KEY": "k", "_FMP_TIMEOUT": 5}
+        mod = ast.Module(body=[node], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(mod), "<f>", "exec"), ns)
+        return ns["_fmp_actively_trading_symbols"]()
+
+    check("F2-1 네트워크 예외 → None (빈 집합 아님)",
+          run(_FakeRequests(exc=RuntimeError("boom"))) is None)
+    check("F2-2 HTTP 402 → None",
+          run(_FakeRequests(resp=_FakeResp(402))) is None)
+    check("F2-3 JSON 파싱 실패 → None",
+          run(_FakeRequests(resp=_FakeResp(200, raise_json=True))) is None)
+    check("F2-4 응답 타입 이상(dict) → None",
+          run(_FakeRequests(resp=_FakeResp(200, {"a": 1}))) is None)
+    got = run(_FakeRequests(resp=_FakeResp(200, [{"symbol": "aapl"}, {"symbol": "MSFT"}])))
+    check("F2-5 정상 → 대문자 심볼 집합", got == {"AAPL", "MSFT"}, repr(got))
+    got2 = run(_FakeRequests(resp=_FakeResp(200, ["aapl", "msft"])))
+    check("F2-6 원소가 문자열이어도 견딤", got2 == {"AAPL", "MSFT"}, repr(got2))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# G. 발송 게이트 — 실제로 돌려본다
+# ══════════════════════════════════════════════════════════════════════════
+# ⚠️ 이 검사가 없어서 **기존 결함을 92/92 통과 상태로 놓쳤다.**
+#    dispatch_radar_emails 최상단의 `if not total: return` 는 발동 0건이면
+#    즉시 반환한다. main 이 `if total or nodata_total():` 로 불러도 여기서
+#    잘린다 — 미수신만 있는 날의 메일이 나가지 않았다.
+#    계약(AST) 검사는 '호출 여부'만 보므로 조건식을 못 잡는다. 실행해야 잡힌다.
+def test_dispatch_gate():
+    print("\n── G. 발송 게이트 (실제 실행)")
+    _fresh()
+    _lv_fresh()
+    M["SENT"].clear()
+
+    # G-1 미수신만 있고 발동 0건 → 메일이 나가야 한다
+    M["record_attempt"]()
+    M["record_nodata"]("yab", "DEAD", "보유")
+    M["dispatch_radar_emails"]({}, {}, "2026-08-22", "🔔", "매매 레이더")
+    check("G-1 발동 0건 + 미수신 1건 → 발송됨", len(M["SENT"]) == 1,
+          f"sent={len(M['SENT'])}")
+
+    # G-2 선제 경고만 있고 발동·미수신 0건 → 메일이 나가야 한다
+    _fresh()
+    _lv_fresh()
+    M["SENT"].clear()
+    M["run_liveness_scan"](
+        universe_fn=_uni(_BIG),
+        tickers_fn=_tk({"yab": {"DEAD": "보유"}}),
+        probe=_probe_map({"DEAD": ("delisted", "Dead Co", "")}))
+    M["dispatch_radar_emails"]({}, {}, "2026-08-22", "🔔", "매매 레이더")
+    check("G-2 선제 경고만 → 발송됨", len(M["SENT"]) == 1, f"sent={len(M['SENT'])}")
+    check("G-2 본문에 경고 섹션 포함",
+          bool(M["SENT"]) and "상장 상태 경고" in M["SENT"][0]["html"])
+
+    # G-3 아무것도 없으면 발송하지 않는다 (반대 방향 — 늑대소년 방지)
+    _fresh()
+    _lv_fresh()
+    M["SENT"].clear()
+    M["dispatch_radar_emails"]({}, {}, "2026-08-22", "🔔", "매매 레이더")
+    check("G-3 전부 0건 → 발송 안 함", len(M["SENT"]) == 0, f"sent={len(M['SENT'])}")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 70)
@@ -655,6 +977,9 @@ def main():
     test_systemic()
     test_render()
     test_cause()
+    test_liveness()
+    test_fetcher_contract()
+    test_dispatch_gate()
     test_source_contract()
     test_mutation()
 

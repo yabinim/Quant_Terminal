@@ -710,6 +710,264 @@ def render_nodata_html(uid: str) -> str:
     )
 
 
+# ── A-2c: 선제 상장상태 점검 (주 1회) ────────────────────────────────────────
+# A-2a/A-2b 는 **데이터가 빈 뒤에** 움직인다. 상장폐지된 종목이 이력을 며칠 더
+# 흘려보내면 그동안 매도 신호는 오지 않는데 경고도 없다. A-2c 는 그 앞으로 간다:
+# 미수신을 기다리지 않고 워치리스트·보유 전체를 주 1회 대조한다.
+#
+# ⚠️ 판정 방향이 **한 쪽뿐이다** (2026-08-22 membership2 실측 결과 반영):
+#     ∈ actively-trading-list → 거래 중 확정. 아무것도 안 한다.
+#     ∉ actively-trading-list → **아무것도 단정하지 않는다.** profile 로 다시
+#                               물어 '사망/소멸'이 확인된 것만 알린다.
+#   부재를 사망으로 읽으면 안 되는 이유: 그 리스트에 점(.) 포함 심볼이 0종이라
+#   해외 표기는 통째로 빠져 있고, 소형주·OTC 커버리지는 아직 미검증이다.
+#   부재만으로 딱지를 붙이면 **정상 보유 종목에 사망 경고**가 간다 —
+#   원인을 모르는 것보다 틀린 원인을 붙이는 게 나쁘다(A-2b 와 같은 원칙).
+#
+# 검증 근거 (membership2, 2026-08-22):
+#   리스트 26,252종 · BBBY(사망)·BNRG(사망) 둘 다 부재 · AAPL·ETF 5/5 존재
+#   → 양방향 확인. 단 '미국 보통주 + 주요 ETF' 범위 안에서만이다.
+_LIVENESS_WEEKDAY = 4          # 0=월 … 4=금. 주말 전에 손 쓸 시간을 남긴다.
+_LIVENESS_FORCE = str(os.environ.get("LIVENESS_FORCE", "")).strip() in ("1", "true", "TRUE")
+_LIVENESS_MIN_UNIVERSE = 5000  # 이보다 작으면 리스트가 깨진 것 — 통째로 중단
+_LIVENESS_ABSENT_RATIO = 0.30  # 부재 비율이 이보다 크면 커버리지 문제로 보고 중단
+_LIVENESS_MIN_SAMPLE = 10      # 표본이 이보다 적으면 비율이 의미 없다 → 개별 판정
+                               # (A-2a 의 _NODATA_MIN_SAMPLE=5 와 같은 이유.
+                               #  3종목 중 1종목이 죽으면 33% 라 비율 게이트가
+                               #  진짜 상폐를 삼킨다. 표본이 작으면 콜도 싸다.)
+_LIVENESS_PROFILE_MAX = 25     # 최악의 경우 profile 호출 상한
+_LIVENESS_LABEL = {
+    "delisted": ("🔴", "상장폐지·거래중지"),
+    "gone":     ("🟠", "티커 소멸(개명 추정)"),
+}
+
+_liveness = {"by_user": {}, "checked": 0, "absent": 0, "calls": 0, "note": ""}
+
+
+def reset_liveness() -> None:
+    _liveness["by_user"] = {}
+    _liveness["checked"] = 0
+    _liveness["absent"] = 0
+    _liveness["calls"] = 0
+    _liveness["note"] = ""
+
+
+def liveness_due(now_et=None, forced: bool = False) -> bool:
+    """오늘 선제 점검을 돌릴 날인가. 순수 함수 — 회귀에서 네트워크 없이 검사한다."""
+    if forced:
+        return True
+    n = now_et or datetime.now(_ET)
+    return n.weekday() == _LIVENESS_WEEKDAY
+
+
+def _fmp_actively_trading_symbols():
+    """actively-trading-list 1콜 → 심볼 집합. 실패하면 None(=판정 포기).
+
+    None 과 빈 집합을 반드시 구분한다. 빈 집합을 돌려주면 호출부가
+    '전 종목 부재'로 읽어 **모든 보유에 사망 경고**를 보낸다.
+    """
+    try:
+        r = requests.get(
+            f"{_FMP_BASE}/actively-trading-list?apikey={FMP_API_KEY}",
+            timeout=max(_FMP_TIMEOUT, 30),
+        )
+    except Exception as e:
+        print(f"[LIVE] 목록 조회 실패({type(e).__name__}) — 점검 생략")
+        return None
+    if r.status_code != 200:
+        print(f"[LIVE] 목록 HTTP {r.status_code} — 점검 생략")
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        print("[LIVE] 목록 JSON 파싱 실패 — 점검 생략")
+        return None
+    if not isinstance(data, list):
+        print("[LIVE] 목록 응답 타입 이상 — 점검 생략")
+        return None
+    out = set()
+    for row in data:
+        sym = row.get("symbol") if isinstance(row, dict) else row
+        sym = str(sym or "").strip().upper()
+        if sym:
+            out.add(sym)
+    return out
+
+
+def _collect_user_tickers() -> dict:
+    """{uid: {ticker: '워치리스트'|'보유'|'워치리스트·보유'}}.
+
+    시트 2회 읽기. 주 1회만 호출되므로 비용은 무시할 수 있다. 평가 루프와
+    분리해 둬야 이 블록 전체를 fail-open 으로 감쌀 수 있다.
+    """
+    out = {}
+
+    def _add(uid, tk, where):
+        u = str(uid or "").strip()
+        t = str(tk or "").strip().upper()
+        if not u or not t:
+            return
+        slot = out.setdefault(u, {})
+        cur = slot.get(t)
+        slot[t] = where if not cur else (cur if where in cur else cur + "·" + where)
+
+    try:
+        _sh, _ws = _open_ws(_WATCHLIST_WORKSHEET)
+        for r in (_ws.get_all_values() or [])[1:]:
+            r = list(r) + [""] * 2
+            _add(r[0], r[1], "워치리스트")
+    except Exception as e:
+        print(f"[LIVE] Watchlist 읽기 실패(계속): {e}")
+
+    try:
+        _sh2, _pw = _open_ws(_PF_WORKSHEET)
+        for r in (_pw.get_all_values() or [])[1:]:
+            r = list(r) + [""] * 3
+            _add(r[0], r[2], "보유")
+    except Exception as e:
+        print(f"[LIVE] Portfolios 읽기 실패(계속): {e}")
+
+    return out
+
+
+def run_liveness_scan(universe_fn=None, tickers_fn=None, probe=None) -> int:
+    """선제 상장상태 점검. 소비한 FMP 콜 수를 반환한다.
+
+    universe_fn / tickers_fn / probe 는 테스트 주입용. 기본값이 실제 경로다.
+    """
+    tickers_fn = tickers_fn or _collect_user_tickers
+    by_user_tk = tickers_fn() or {}
+    all_tk = sorted({t for slot in by_user_tk.values() for t in slot})
+    _liveness["checked"] = len(all_tk)
+    if not all_tk:
+        _liveness["note"] = "대상 종목 없음"
+        print("[LIVE] 대상 종목 0개 — 점검 생략 (0콜)")
+        return 0
+
+    universe = (universe_fn or _fmp_actively_trading_symbols)()
+    calls = 1
+    if universe is None:
+        _liveness["note"] = "목록 미수신"
+        _liveness["calls"] = calls
+        print("[LIVE] 목록을 못 받았다 — 아무것도 단정하지 않고 종료")
+        return calls
+
+    # 리스트가 깨졌을 때 전 종목을 사망으로 뒤집지 않기 위한 하한선.
+    # 이 가드가 없으면 FMP 가 잘린 응답을 준 날 모든 보유에 사망 경고가 나간다.
+    if len(universe) < _LIVENESS_MIN_UNIVERSE:
+        _liveness["note"] = f"목록 이상({len(universe)}종)"
+        _liveness["calls"] = calls
+        print(f"[LIVE] 목록이 {len(universe)}종뿐 — 신뢰 불가로 중단 "
+              f"(하한 {_LIVENESS_MIN_UNIVERSE})")
+        return calls
+
+    absent = [t for t in all_tk if t not in universe]
+    _liveness["absent"] = len(absent)
+    if not absent:
+        _liveness["note"] = "전 종목 거래 중"
+        _liveness["calls"] = calls
+        print(f"[LIVE] {len(all_tk)}종목 전부 거래 중 (1콜)")
+        return calls
+
+    # 부재가 너무 많으면 죽은 게 아니라 커버리지 구멍이다(해외·OTC).
+    # 단 표본이 작으면 비율은 신호가 아니라 잡음이다 — 그때는 그냥 개별 판정한다.
+    ratio = len(absent) / float(len(all_tk))
+    if len(all_tk) >= _LIVENESS_MIN_SAMPLE and ratio > _LIVENESS_ABSENT_RATIO:
+        _liveness["note"] = f"부재 과다 {len(absent)}/{len(all_tk)}"
+        _liveness["calls"] = calls
+        print(f"[LIVE] 부재 {len(absent)}/{len(all_tk)}종목({ratio:.0%}) — "
+              f"커버리지 문제로 보고 판정 생략")
+        return calls
+
+    fn = probe or _fmp_profile_status
+    confirmed = {}
+    for t in absent:
+        if calls - 1 >= _LIVENESS_PROFILE_MAX:
+            break
+        try:
+            cause, name, note = fn(t)
+        except Exception as e:
+            cause, name, note = "unknown", "", f"판정 실패({type(e).__name__})"
+        calls += 1
+        # 'transient'(거래 중)·'unknown'은 알리지 않는다. 리스트에 없다는 것만으로는
+        # 아무 말도 하지 않겠다는 설계가 여기서 실제로 지켜진다.
+        if cause in _LIVENESS_LABEL:
+            confirmed[t] = (cause, str(name or ""), str(note or ""))
+
+    for uid, slot in by_user_tk.items():
+        for t, where in slot.items():
+            if t in confirmed:
+                cause, name, note = confirmed[t]
+                _liveness["by_user"].setdefault(uid, []).append(
+                    (t, cause, name, where))
+
+    _liveness["calls"] = calls
+    print(f"[LIVE] 대상 {len(all_tk)}종목 · 부재 {len(absent)} · "
+          f"확정 {len(confirmed)} · {calls}콜")
+    return calls
+
+
+def liveness_for_user(uid: str) -> list:
+    return list(_liveness["by_user"].get(str(uid or "").strip()) or [])
+
+
+def liveness_total() -> int:
+    return sum(len(v) for v in _liveness["by_user"].values())
+
+
+def liveness_weight(uid: str) -> int:
+    return len(liveness_for_user(uid))
+
+
+def liveness_log_summary() -> None:
+    n = liveness_total()
+    if not n:
+        print(f"[LIVE-OK] 선제 점검 — 경고 0건"
+              + (f" ({_liveness['note']})" if _liveness["note"] else ""))
+        return
+    print(f"[LIVE-ALERT] 선제 점검 경고 {n}건")
+    for u, items in sorted(_liveness["by_user"].items()):
+        for tk, cause, name, where in items:
+            icon, lab = _LIVENESS_LABEL.get(cause, ("⬜", cause))
+            print(f"    {u}/{tk}: {where} [{icon} {lab}"
+                  + (f" · {name}" if name else "") + "]")
+
+
+def render_liveness_html(uid: str) -> str:
+    """선제 경고 섹션 HTML. 없으면 빈 문자열."""
+    items = liveness_for_user(uid)
+    if not items:
+        return ""
+    rows = ""
+    has_holding = False
+    for tk, cause, name, where in items:
+        icon, lab = _LIVENESS_LABEL.get(cause, ("⬜", cause))
+        if "보유" in where:
+            has_holding = True
+        name_html = (f" <span style='color:#666;font-size:13px'>({name})</span>"
+                     if name else "")
+        rows += (
+            f"<li style='margin:6px 0'><b>{tk}</b>{name_html} "
+            f"<span style='color:#666;font-size:13px'>· {where}</span><br>"
+            f"<span style='font-size:13px'>{icon} <b>{lab}</b></span></li>"
+        )
+    foot = ("<b style='color:#b91c1c'>보유 종목이 포함돼 있습니다.</b> "
+            "매도 신호가 영구히 오지 않으므로 증권사 계좌에서 직접 확인하세요. "
+            "개명된 경우 새 티커로 다시 등록해야 합니다."
+            if has_holding else
+            "워치리스트에서 정리하거나, 개명된 경우 새 티커로 다시 등록하세요.")
+    return (
+        "<h2 style='color:#b91c1c;border-bottom:2px solid #b91c1c;"
+        "padding-bottom:6px;margin-top:24px'>💀 상장 상태 경고</h2>"
+        "<div style='margin:10px 0;padding:12px;border:1px solid #fecaca;"
+        "border-radius:8px;background:#fef2f2'>"
+        f"<ul style='margin:0;padding-left:20px;list-style:none'>{rows}</ul>"
+        "<div style='color:#555;font-size:14px;margin-top:10px'>"
+        "주 1회 거래 종목 목록과 대조해 <b>가격 이력이 비기 전에</b> 찾아낸 "
+        f"항목입니다. {foot}</div></div>"
+    )
+
+
 def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
                           subject_emoji: str, subject_label: str,
                           banner_html: str = "") -> None:
@@ -725,7 +983,9 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
     pf_res = pf_res or {}
     total = (sum(len(v) for v in wl_res.values())
              + sum(len(v) for v in pf_res.values()))
-    if not total:
+    # 발동 0건이어도 미수신·선제 경고가 있으면 발송해야 한다. 여기서 끊으면
+    # 침묵을 알리는 경로가 같은 이유로 침묵한다(A-2a 설계 원칙).
+    if not total and not nodata_total() and not liveness_total():
         print("[INFO] 발동/활성 건 없음 — 이메일 생략.")
         return
 
@@ -740,6 +1000,9 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
     # 미수신만 있는 사용자도 메일 대상이다. 배달 누락 진단에 포함시키지 않으면
     # "미수신 경고가 나갔어야 하는데 안 나갔다"를 아무도 알아채지 못한다.
     _fired |= {str(k).strip().lower() for k in _nodata["by_user"] if nodata_for_user(k)}
+    # 선제 경고만 있는 사용자도 대상이다. 빠뜨리면 "경고가 나갔어야 하는데
+    # 안 나갔다"를 아무도 알아채지 못한다(미수신과 동일한 이유).
+    _fired |= {str(k).strip().lower() for k in _liveness["by_user"] if liveness_for_user(k)}
     _delivered: set[str] = set()
 
     def _send_one_user(uid_s: str, to_addr: str | None) -> None:
@@ -753,15 +1016,20 @@ def dispatch_radar_emails(wl_res: dict, pf_res: dict, today: str,
         # 침묵 중이라면 반드시 알려야 하므로 건수에 합산한다. 합산하지 않으면
         # 침묵을 알리는 메일이 같은 이유로 침묵한다.
         _nd_html = render_nodata_html(uid_s)
+        # A-2c 선제 경고도 같은 이유로 건수에 합산한다. 합산하지 않으면 발동
+        # 0건인 사용자에게 상장폐지 경고가 **발송 게이트에서 조용히 잘린다.**
+        _lv_html = render_liveness_html(uid_s)
         _n_u = (sum(len(v) for v in _wl_u.values())
                 + sum(len(v) for v in _pf_u.values())
-                + nodata_weight(uid_s))
+                + nodata_weight(uid_s)
+                + liveness_weight(uid_s))
         if not _n_u:
             print(f"[RADAR] '{uid_s}' 발동 0건 — 발송 생략.")
             return
         _ok = send_email(f"{subject_emoji} {subject_label} — {_n_u}건 ({today} ET)",
                          banner_html + build_email_html(_wl_u, _pf_u, today,
-                                                        nodata_html=_nd_html),
+                                                        nodata_html=_nd_html,
+                                                        liveness_html=_lv_html),
                          to_addr=to_addr)
         if _ok:
             _delivered.add(_u_l)
@@ -878,12 +1146,15 @@ def _render_sizing_line(plan: dict, account=None) -> str:
 
 
 def build_email_html(wl_by_user: dict, pf_by_user: dict, today: str,
-                     nodata_html: str = "") -> str:
+                     nodata_html: str = "", liveness_html: str = "") -> str:
     """매매 레이더 이메일 — 🔭 Watchlist(매수)와 💼 Portfolio(보유·매도) 섹션 분리,
     Portfolio는 account별로 그룹핑.
 
     nodata_html: 데이터 미수신 섹션(render_nodata_html 결과). 기본값이 빈
       문자열이라 기존 호출부(인자 3개)는 그대로 동작한다.
+    liveness_html: A-2c 선제 상장상태 경고 섹션(render_liveness_html 결과).
+      미수신 섹션보다 **뒤에** 붙인다 — 미수신은 오늘 평가에서 빠졌다는 사실이라
+      즉시성이 있고, 선제 경고는 주 1회 점검 결과라 성격이 다르다.
     """
     wl_by_user = wl_by_user or {}
     pf_by_user = pf_by_user or {}
@@ -935,6 +1206,10 @@ def build_email_html(wl_by_user: dict, pf_by_user: dict, today: str,
     #    이라 신호와 성격이 다르다. 다만 발동 0건일 때는 이게 유일한 본문이 된다.
     if nodata_html:
         parts.append(nodata_html)
+
+    # A-2c 선제 상장상태 경고 — 미수신 뒤, 푸터 앞.
+    if liveness_html:
+        parts.append(liveness_html)
 
     parts.append(
         "<p style='color:#999;font-size:12px;margin-top:20px'>"
@@ -1491,6 +1766,7 @@ def main():
     do_metrics = (args.mode == "eod") and args.scope in ("watchlist", "both", "metrics")
 
     reset_nodata()          # 실행마다 미수신 집계 초기화
+    reset_liveness()        # A-2c 선제 점검 집계도 실행 간 오염을 막는다
     spy_hist = _fmp_price_history("SPY")
     spy_close = spy_hist["Close"] if (spy_hist is not None and not spy_hist.empty) else None
     hist_cache, quote_cache = {}, {}
@@ -1543,10 +1819,21 @@ def main():
             #   로그 요약보다 **먼저** 불러야 요약에 원인이 함께 찍힌다.
             classify_nodata_causes()
             nodata_log_summary()
+            # A-2c: 선제 상장상태 점검. 주 1회(기본 금요일)만 돈다.
+            #   **완전 fail-open** — 여기서 무슨 일이 나도 레이더 본체는 계속
+            #   간다. 부가 기능이 주 기능을 죽이면 안 된다.
+            try:
+                if liveness_due(forced=_LIVENESS_FORCE):
+                    run_liveness_scan()
+                    liveness_log_summary()
+                else:
+                    print("[LIVE] 오늘은 선제 점검 요일이 아님 — 생략 (0콜)")
+            except Exception as _e_lv:
+                print(f"[WARN] 선제 점검 실패(레이더는 계속): {_e_lv}")
             # 발동 0건이어도 데이터 미수신이 있으면 발송한다. 미수신은 그 자체가
             # 알림이고, 여기서 걸러 버리면 침묵을 알리는 경로가 같은 이유로
             # 침묵한다. 개별 사용자 단위 판단은 _send_one_user 가 다시 한다.
-            if total or nodata_total():
+            if total or nodata_total() or liveness_total():
                 dispatch_radar_emails(wl_res, pf_res, today, "🔔", "매매 레이더",
                                       banner_html=build_market_gate_banner(_m_gate, _m_users))
             else:
