@@ -939,18 +939,6 @@ def render_depth_req(res, date_key="date"):
                   + "% — 결측 구간이 있다. 백테스트 전 확인 필요")
 
 
-_DETAIL = {
-    "names_sector": lambda r: render_names(r, "sector"),
-    "names_industry": lambda r: render_names(r, "industry"),
-    "depth": lambda r: render_depth(r, "date"),
-    "range_check": lambda r: render_range_check(r, "date"),
-    "depth_req": lambda r: render_depth_req(r, "date"),
-    "cong_lag": render_cong_lag,
-    "grades_limit": render_grades_limit,
-    "grades_range": render_grades_range,
-}
-
-
 def _pick(d, *names):
     """대소문자 흔들림에 견디는 필드 추출."""
     if not isinstance(d, dict):
@@ -1062,6 +1050,23 @@ def render_grades_range(res):
               "우연히 전부 구간 안일 수 있다. 단정하지 않는다.")
     else:
         print("           ✅ from/to 존중됨 — '최근 30일 상향−하향' 실사용 가능")
+
+
+_DETAIL = {
+    "names_sector": lambda r: render_names(r, "sector"),
+    "names_industry": lambda r: render_names(r, "industry"),
+    "depth": lambda r: render_depth(r, "date"),
+    "range_check": lambda r: render_range_check(r, "date"),
+    "depth_req": lambda r: render_depth_req(r, "date"),
+    # ⚠️ lambda 로 감싼다. 위 기존 항목들과 같은 형태이고, 그게 우연이 아니다 —
+    #    함수 객체를 직접 넣으면 **이 dict 를 만드는 시점에** 이름을 찾는다.
+    #    2026-08-22 에 렌더러를 이 dict 아래에 정의했다가 NameError 로 죽었다.
+    #    ast.parse 도 check_py311 도 통과한다(문법은 멀쩡하다). 임포트만 깨진다.
+    #    lambda 면 호출 시점에 찾으므로 정의 순서가 바뀌어도 안 깨진다.
+    "cong_lag": lambda r: render_cong_lag(r),
+    "grades_limit": lambda r: render_grades_limit(r),
+    "grades_range": lambda r: render_grades_range(r),
+}
 
 
 def run_group(title, targets, results):
