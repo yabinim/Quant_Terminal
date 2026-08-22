@@ -76,6 +76,7 @@ fmp_get 은 402/429 를 삼키고 None 을 돌려주는데, 프로브는 **원�
     PROBE_TIER=tierB3  3콜   ← B-1 설계 직전 (이력 깊이 + 분류명 전체)
     PROBE_TIER=tierB4  3콜   ← tierB3 의 깊이 판정 재측정 (요청값 종속 착오 교정)
     PROBE_TIER=tierC   4콜
+    PROBE_TIER=tierD   4콜   ← 공시 지연 실측 + grades 파라미터 지원
     PROBE_TIER=grades  3콜
     PROBE_TIER=all    32콜
 
@@ -100,7 +101,7 @@ _KEY = str(os.environ.get("FMP_API_KEY", "") or "").strip()
 
 _TIER = str(os.environ.get("PROBE_TIER", "") or "tierA").strip().lower()
 if _TIER not in ("tiera", "tierb", "tierb2", "tierb3", "tierb4",
-                 "tierc", "grades", "all"):
+                 "tierc", "tierd", "grades", "all"):
     _TIER = "tiera"
 
 
@@ -476,6 +477,69 @@ TIER_C = [
         None,
     ),
 ]
+
+# ══════════════════════════════════════════════════════════════════════════
+# Tier D — 설계 전에 재야 하는 두 가지 (2026-08-22, 4콜)
+# ══════════════════════════════════════════════════════════════════════════
+# D-1/D-2 의회 거래 피드 — **지연을 재기 전에는 설계하지 않는다.**
+#   tierC 에서 senate-latest / house-latest 가 살아 있고 symbol 도 온다는 건
+#   확인했다. 그런데 '역방향 조기 발굴 입력'이라는 용도는 **공시가 빨라야**
+#   성립한다. 미 의회는 법정 공시 기한이 최대 45일이다. 응답에
+#   transactionDate 와 disclosureDate 가 **둘 다** 오므로 실측이 가능하다.
+#
+#   판별자: 중앙값(disclosureDate − transactionDate)
+#     건수나 "최신 피드가 온다"는 판별력이 없다 — 45일 늦은 것도 최신 피드다.
+#
+#   사전 확정 기준 (결과를 보고 고치지 않는다):
+#     중앙값 14일 이하 → 조기 발굴 입력으로 유효. 설계 진행
+#     15~30일          → 조건부. '조기 발굴'이 아니라 '누적 관찰'로만
+#     30일 초과        → **종결.** 이 터미널의 모멘텀 철학에 맞지 않는다
+#
+# D-3/D-4 grades 파라미터 — 쓸 수 있느냐가 아니라 **감당되느냐**다.
+#   grades?symbol=AAPL 은 200 이지만 **1787건**이다. 워치리스트 전체에 쓰면
+#   종목당 수백 KB 다. limit 또는 from/to 가 먹어야 실사용이 가능하다.
+#
+#   판별자: 무필터 1787건이라는 **측정된 기준선**이 있으므로 여기서는 건수
+#     비교가 유효하다(기준선 없이 건수를 판별자로 쓴 게 1차 오판이었다).
+#     from/to 는 건수만으로 부족하다 — 응답 날짜가 요청 구간 안인지도 본다.
+_GRADES_BASELINE = 1787       # grades?symbol=AAPL 무필터 실측 (2026-08-22)
+_D_FROM_365 = (_TODAY - timedelta(days=365)).isoformat()
+
+TIER_D = [
+    (
+        "상원 거래 — 공시 지연 실측",
+        "senate-latest?page=0&limit=100",
+        "'조기 발굴 입력' 전제 검정. transactionDate → disclosureDate 간격.",
+        ["symbol", "transactionDate", "disclosureDate"],
+        None,
+        "cong_lag",
+    ),
+    (
+        "하원 거래 — 공시 지연 실측",
+        "house-latest?page=0&limit=100",
+        "위와 동일. 상·하원이 다를 수 있어 따로 잰다.",
+        ["symbol", "transactionDate", "disclosureDate"],
+        None,
+        "cong_lag",
+    ),
+    (
+        "등급 이력 — limit 지원 여부",
+        "grades?symbol=AAPL&limit=10",
+        "무필터 1787건(측정됨)이 10건으로 줄면 limit 이 먹는 것이다.",
+        ["symbol", "date"],
+        None,
+        "grades_limit",
+    ),
+    (
+        "등급 이력 — from/to 지원 여부",
+        "grades?symbol=AAPL&from=" + _D_FROM_365 + "&to=" + _D_TO,
+        "최근 1년만 받을 수 있으면 '30일 상향−하향'이 실사용 가능해진다.",
+        ["symbol", "date"],
+        None,
+        "grades_range",
+    ),
+]
+
 
 # 미결 과제 — 등급 계열 3종의 필드 집합을 나란히 본다.
 GRADES = [
@@ -881,7 +945,123 @@ _DETAIL = {
     "depth": lambda r: render_depth(r, "date"),
     "range_check": lambda r: render_range_check(r, "date"),
     "depth_req": lambda r: render_depth_req(r, "date"),
+    "cong_lag": render_cong_lag,
+    "grades_limit": render_grades_limit,
+    "grades_range": render_grades_range,
 }
+
+
+def _pick(d, *names):
+    """대소문자 흔들림에 견디는 필드 추출."""
+    if not isinstance(d, dict):
+        return None
+    low = {str(k).lower(): v for k, v in d.items()}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
+
+
+def render_cong_lag(res):
+    """의회 거래 공시 지연 — 중앙값(disclosureDate − transactionDate).
+
+    왜 중앙값인가
+    ─────────────
+    평균은 한 건의 극단값(몇 년 전 거래를 뒤늦게 정정 공시)에 끌려간다.
+    판정은 '보통 며칠 늦는가'라서 중앙값이 맞다. p90 은 꼬리 확인용으로만 찍는다.
+
+    ⚠️ 건수·최신 여부는 판별자가 아니다. 45일 늦은 것도 '최신 피드'다.
+       이 프로젝트에서 판별력 없는 판별자를 고른 게 여섯 번이다.
+    """
+    rows = res.get("data") or []
+    if not isinstance(rows, list) or not rows:
+        print("        └ (레코드 없음 — 지연 측정 불가)")
+        return
+    lags, bad = [], 0
+    for r in rows:
+        t = str(_pick(r, "transactionDate", "transaction_date") or "")[:10]
+        d = str(_pick(r, "disclosureDate", "disclosure_date") or "")[:10]
+        try:
+            dt_t = datetime.strptime(t, "%Y-%m-%d").date()
+            dt_d = datetime.strptime(d, "%Y-%m-%d").date()
+        except Exception:
+            bad += 1
+            continue
+        lags.append((dt_d - dt_t).days)
+    if not lags:
+        print("        └ (날짜 파싱 전멸 " + str(bad) + "건 — 측정 불가)")
+        return
+    lags.sort()
+    n = len(lags)
+    med = lags[n // 2] if n % 2 else (lags[n // 2 - 1] + lags[n // 2]) / 2.0
+    p90 = lags[min(n - 1, int(n * 0.9))]
+    within7 = 100.0 * sum(1 for x in lags if x <= 7) / n
+    neg = sum(1 for x in lags if x < 0)
+    print("        └ 표본 " + str(n) + "건"
+          + (" (날짜 불량 " + str(bad) + "건 제외)" if bad else ""))
+    print("           지연 중앙값 " + ("%.0f" % med) + "일 · p90 "
+          + str(p90) + "일 · 최소 " + str(lags[0]) + "일 · 최대 "
+          + str(lags[-1]) + "일")
+    print("           7일 이내 " + ("%.0f" % within7) + "%"
+          + (" · 음수(공시가 거래보다 빠름) " + str(neg) + "건" if neg else ""))
+    # 사전 확정 기준 — 결과를 보고 고치지 않는다.
+    if med <= 14:
+        print("           🟢 조기 발굴 입력으로 유효 — 설계 진행 가능")
+    elif med <= 30:
+        print("           🟡 조건부 — '조기 발굴'이 아니라 '누적 관찰'로만")
+    else:
+        print("           🔴 종결 — 중앙값 " + ("%.0f" % med) + "일은 모멘텀 "
+              "철학에 맞지 않는다")
+        print("              (이 판정은 사전 확정이다. 재협상하지 않는다)")
+
+
+def render_grades_limit(res):
+    """limit 이 먹는가. 무필터 기준선 1787건과 대조한다."""
+    rows = res.get("data") or []
+    n = len(rows) if isinstance(rows, list) else 0
+    want = _req_param(res.get("path", ""), "limit")
+    print("        └ 요청 limit=" + str(want) + " · 응답 " + str(n) + "건"
+          + " · 무필터 기준선 " + str(_GRADES_BASELINE) + "건")
+    try:
+        want_n = int(want)
+    except Exception:
+        print("           (limit 파싱 실패 — 판정 불가)")
+        return
+    if n == want_n:
+        print("           ✅ limit 존중됨 — 워치리스트 실사용 가능")
+    elif n >= _GRADES_BASELINE * 0.9:
+        print("           🔴 limit 무시됨 — 전체 이력이 그대로 왔다")
+        print("              종목당 수백 KB. 워치리스트 전체 적용 불가.")
+    else:
+        print("           🟠 요청과도 기준선과도 다르다(" + str(n) + "건) — "
+              "다른 기본 상한이 걸렸을 수 있다. 단정하지 않는다.")
+
+
+def render_grades_range(res):
+    """from/to 가 먹는가. **건수만으로 판정하지 않는다** — 날짜가 구간 안인지 본다."""
+    rows = res.get("data") or []
+    n = len(rows) if isinstance(rows, list) else 0
+    f_s = _req_param(res.get("path", ""), "from")
+    t_s = _req_param(res.get("path", ""), "to")
+    ds = sorted(str(_pick(r, "date") or "")[:10] for r in rows
+                if isinstance(r, dict) and _pick(r, "date"))
+    ds = [d for d in ds if len(d) == 10]
+    print("        └ 요청 " + str(f_s) + " ~ " + str(t_s)
+          + " · 응답 " + str(n) + "건 · 무필터 기준선 "
+          + str(_GRADES_BASELINE) + "건")
+    if not ds:
+        print("           (날짜 없음 — 판정 불가)")
+        return
+    print("           응답 날짜 " + ds[0] + " ~ " + ds[-1])
+    outside = sum(1 for d in ds if d < str(f_s) or d > str(t_s))
+    if outside:
+        print("           🔴 from/to 무시됨 — 구간 밖 " + str(outside) + "건")
+        print("              건수가 줄었더라도 무시된 것이다(다른 상한일 뿐).")
+    elif n >= _GRADES_BASELINE * 0.9:
+        print("           🟠 구간 밖은 없는데 건수가 기준선과 같다 — "
+              "우연히 전부 구간 안일 수 있다. 단정하지 않는다.")
+    else:
+        print("           ✅ from/to 존중됨 — '최근 30일 상향−하향' 실사용 가능")
 
 
 def run_group(title, targets, results):
@@ -923,12 +1103,14 @@ def main():
     run_b3 = _TIER in ("tierb3", "all")
     run_b4 = _TIER in ("tierb4", "all")
     run_c = _TIER in ("tierc", "all")
+    run_d = _TIER in ("tierd", "all")
     run_g = _TIER in ("grades", "all")
 
     ncalls = (len(TIER_A) if run_a else 0) + (len(TIER_B) if run_b else 0) \
         + (len(TIER_B2) if run_b2 else 0) + (len(TIER_B3) if run_b3 else 0) \
         + (len(TIER_B4) if run_b4 else 0) \
-        + (len(TIER_C) if run_c else 0) + (len(GRADES) if run_g else 0)
+        + (len(TIER_C) if run_c else 0) + (len(TIER_D) if run_d else 0) \
+        + (len(GRADES) if run_g else 0)
 
     print("=" * 78)
     print("FMP 미사용 엔드포인트 실측 프로브 — 신규 기능 후보")
@@ -954,6 +1136,9 @@ def main():
                   TIER_B4, results)
     if run_c:
         run_group("Tier C — 탐색적 신규 기능", TIER_C, results)
+    if run_d:
+        run_group("Tier D — 공시 지연 실측 + grades 파라미터 지원",
+                  TIER_D, results)
     if run_g:
         run_group("등급 계열 중복 확인 — 필드 집합 비교", GRADES, results)
 
