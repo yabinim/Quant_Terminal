@@ -68,6 +68,21 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #       5년이면 → 학습창에 2022 하락장이 들어온다
 #
 #   tierC (4콜) — 탐색적
+#
+#   tierD (4콜) — 설계 전에 재야 하는 두 가지 (2026-08-22)
+#     D-1/D-2 의회 거래 공시 지연 실측
+#       tierC 에서 senate/house-latest 가 살아 있고 symbol 도 온다는 건 확인했다.
+#       그런데 '조기 발굴 입력'은 **공시가 빨라야** 성립한다. 미 의회 법정 공시
+#       기한은 최대 45일이다. 응답에 transactionDate 와 disclosureDate 가 둘 다
+#       오므로 실측이 가능하다.
+#       ⚠️ 판별자는 중앙값(disclosure − transaction)이다. 건수나 '최신 피드가
+#          온다'는 판별력이 없다 — 45일 늦은 것도 최신 피드다.
+#       사전 확정: 14일 이하 유효 / 15~30일 조건부 / 30일 초과 **종결**
+#     D-3/D-4 grades 파라미터
+#       grades?symbol=AAPL 은 200 이지만 1787건이다. limit 또는 from/to 가
+#       먹어야 워치리스트 실사용이 가능하다. 무필터 1787건이라는 **측정된
+#       기준선**이 있어서 여기서는 건수 비교가 유효하다.
+#       from/to 는 건수만 보지 않는다 — 응답 날짜가 요청 구간 안인지도 본다.
 #     senate-latest · house-latest
 #     institutional-ownership/holder-performance-summary · historical-industry-pe
 #
@@ -98,7 +113,7 @@ on:
   workflow_dispatch:
     inputs:
       tier:
-        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierB2=B후속 5콜 / tierB3=B-1직전 3콜 / tierB4=깊이재측정 3콜 / tierC=탐색 4콜 / grades=등급중복 3콜 / all=32콜)"
+        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierB2=B후속 5콜 / tierB3=B-1직전 3콜 / tierB4=깊이재측정 3콜 / tierC=탐색 4콜 / tierD=공시지연·grades파라미터 4콜 / grades=등급중복 3콜 / all=36콜)"
         type: choice
         options:
           - tierA
@@ -107,6 +122,7 @@ on:
           - tierB3
           - tierB4
           - tierC
+          - tierD
           - grades
           - all
         default: tierA
