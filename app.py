@@ -1866,6 +1866,15 @@ def save_account_profile(user_id: str, account: str, prof: dict):
             keep.append(r)
         new_row = ac.to_row(uid, acct, prof, _narrative_now_et_string())
         rows = [_ACCOUNT_PROFILE_SHEET_COLS] + keep + [new_row]
+        # ⚠️ 그리드 폭 가드 — 이 시트는 add_worksheet(cols=len(COLS)) 로 생성됐다.
+        #    스키마가 늘어난 뒤 그리드가 옛 폭 그대로면 A1:N 쓰기가 범위를 벗어나
+        #    저장 전체가 실패한다(열 추가 때마다 재발하는 함정).
+        try:
+            if int(getattr(ws, "col_count", 0) or 0) < ncol:
+                ws.resize(rows=max(int(getattr(ws, "row_count", 0) or 0), len(rows) + 50),
+                          cols=ncol)
+        except Exception as _rex:
+            return False, f"시트 열 확장 실패({ncol}열 필요): {_rex}"
         ws.clear()
         ws.update(rows, range_name=f"A1:{_ACCT_PROF_LAST_COL}{len(rows)}",
                   value_input_option="USER_ENTERED")
@@ -21191,7 +21200,9 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 st.warning(f"💰 확인이 필요한 배당 **{len(_ask_items)}건**이 있습니다.")
             with st.expander(
                 f"💰 배당 처리 ({len(_ask_items)}건 대기)" if _ask_items else "💰 배당 처리 · 종목별 설정",
-                expanded=bool(_ask_items),
+                # 기본 접힘. 대기 건은 바로 위 st.warning 이 이미 알려주므로
+                # 펼쳐 둘 필요가 없다(페이지 상단이 길어지는 것만 손해).
+                expanded=False,
             ):
                 st.caption(_esc_md(
                     "배당락일(ex-date) 개장 시점에 보유 중이었다면 배당을 받습니다. 재투자 체결가는 "
@@ -21436,7 +21447,10 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 if not _n_exit and not _n_risk:
                     _hdr += " · ✅ 양호"
 
-                with st.expander(_hdr, expanded=bool(_n_exit)):
+                # 기본 접힘. 청산신호 개수는 헤더(_hdr)에 이미 찍혀 있어 접힌
+                # 상태에서도 보인다. 계좌가 여러 개면 자동 펼침이 스크롤을
+                # 폭발시킨다.
+                with st.expander(_hdr, expanded=False):
                     # ── 계좌 일괄 알림 설정 (호라이즌 전환용) ──────────────────
                     #   스윙(exit) ↔ 포지션(pexit/ptrim) 을 보유 전체에 한 번에 적용.
                     _bulk_opts = ["exit", "risk", "pexit", "ptrim", "regime"]
@@ -21762,21 +21776,27 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     # ── ✂️ 매도 규모 (트랜치 사이징) ────────────────────
                     st.markdown("**✂️ 매도 규모 (트랜치)**")
                     _sw_saved = _p.get("Swing_Weight_Pct")
+                    # ⚠️ st.form 안에서는 위젯을 조건부로 감싸면 안 된다. 폼 내부
+                    #    위젯은 제출 전까지 rerun 을 일으키지 않으므로 체크박스를
+                    #    켜도 슬라이더가 그 자리에서 나타나지 않고, 제출 시점에
+                    #    처음 생성되면서 사용자가 만진 적 없는 기본값이 저장된다.
+                    #    항상 렌더하고 체크박스는 저장 시 None 여부만 결정한다.
                     _v_swuse = st.checkbox(
                         "매도 권장 수량 표시", value=(_sw_saved is not None),
                         key=f"_prof_swuse_{_pa}",
-                        help="끄면 지금처럼 판정 라벨만 표시하고 수량은 제안하지 않습니다.")
+                        help="끄면 지금처럼 판정 라벨만 표시하고 수량은 제안하지 않습니다. "
+                             "아래 값은 켤 때 함께 저장됩니다.")
+                    _v_sw = float(st.slider(
+                        "스윙 몫 (%) — 나머지는 포지션 몫", min_value=0, max_value=100, step=5,
+                        value=int(_sw_saved if _sw_saved is not None else 0),
+                        key=f"_prof_sw_{_pa}"))
+                    _v_trim = float(st.number_input(
+                        "줄이기 1회 축소폭 (해당 몫의 %)",
+                        min_value=float(rc.TRIM_RATIO_MIN_PCT),
+                        max_value=float(rc.TRIM_RATIO_MAX_PCT), step=1.0,
+                        value=float(_p.get("Trim_Ratio_Pct", rc.TRIM_RATIO_DEFAULT_PCT)),
+                        key=f"_prof_trim_{_pa}"))
                     if _v_swuse:
-                        _v_sw = float(st.slider(
-                            "스윙 몫 (%) — 나머지는 포지션 몫", min_value=0, max_value=100, step=5,
-                            value=int(_sw_saved if _sw_saved is not None else 0),
-                            key=f"_prof_sw_{_pa}"))
-                        _v_trim = float(st.number_input(
-                            "줄이기 1회 축소폭 (해당 몫의 %)",
-                            min_value=float(rc.TRIM_RATIO_MIN_PCT),
-                            max_value=float(rc.TRIM_RATIO_MAX_PCT), step=1.0,
-                            value=float(_p.get("Trim_Ratio_Pct", rc.TRIM_RATIO_DEFAULT_PCT)),
-                            key=f"_prof_trim_{_pa}"))
                         st.caption(
                             f"스윙 {_v_sw:.0f}% / 포지션 {100 - _v_sw:.0f}% · "
                             f"줄이기 = 해당 몫의 {_v_trim:.0f}% · "
@@ -21794,8 +21814,10 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                 "소액 계좌라면 값을 지정하는 편이 좋습니다."
                             )
                     else:
-                        _v_sw, _v_trim = None, float(
-                            _p.get("Trim_Ratio_Pct", rc.TRIM_RATIO_DEFAULT_PCT))
+                        st.caption("체크를 켜야 위 비율이 저장·적용됩니다. "
+                                   "지금은 판정 라벨만 표시합니다.")
+                    if not _v_swuse:
+                        _v_sw = None
 
                     # ── 📅 실적 축소 한도 ──────────────────────────────
                     st.markdown("**📅 실적 축소 한도**")
