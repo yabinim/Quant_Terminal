@@ -289,7 +289,13 @@ def _load_account_profile_values():
     try:
         gc = get_gspread_client()
         ws = gc.open(_SPREADSHEET_TITLE).worksheet(ac.WORKSHEET_TITLE)
-        vals = ws.get_all_values() or []
+        # ⚠️ 서식 무시로 읽는다. 숫자열에 날짜 서식이 걸리면 get_all_values 가
+        #    0 을 "1899-12-30 0:00" 으로 돌려줘 프로필 값이 통째로 NaN 이 된다.
+        #    앱(app.py)과 반드시 같은 방식으로 읽어야 판정이 갈리지 않는다.
+        try:
+            vals = ws.get_values(value_render_option="UNFORMATTED_VALUE") or []
+        except Exception:
+            vals = ws.get_all_values() or []
     except Exception as e:
         print(f"[INFO] Account_Profile 시트 없음/실패 — 기본값으로 사이징: {e}")
     _ACCOUNT_PROFILE_CACHE["loaded"] = True

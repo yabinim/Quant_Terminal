@@ -65,8 +65,16 @@ chk("A-8 resolve: 범위 클램프",
     (100.0, 0.0))
 
 # ── B군: 수량 계산 (I4, I5) ──────────────────────────────────────────────
-chk("B-1 0:100 · 포지션 줄이기 → 30주의 33%",
-    plan(swing_weight_pct=0, position_label=TRIM_P)["qty"], 9.9)
+# 기본 트림폭은 제품 결정이다. 상수를 조용히 바꾸면 전 사용자의 매도 규모가
+# 바뀌므로 값 자체를 고정한다(아래 B-1 은 자기참조라 값 변경을 못 잡는다).
+chk("B-0 기본 트림폭 = 50%", rc.TRIM_RATIO_DEFAULT_PCT, 50.0)
+chk("B-1 0:100 · 포지션 줄이기 → 30주의 기본 트림폭",
+    plan(swing_weight_pct=0, position_label=TRIM_P)["qty"],
+    round(30.0 * rc.TRIM_RATIO_DEFAULT_PCT / 100.0, 4))
+chk("B-1b 기본 트림폭이 명시 트림폭과 같은 결과를 낸다(자기참조 방지)",
+    plan(swing_weight_pct=0, position_label=TRIM_P,
+         trim_ratio_pct=rc.TRIM_RATIO_DEFAULT_PCT)["qty"],
+    plan(swing_weight_pct=0, position_label=TRIM_P)["qty"])
 chk("B-2 0:100 · 스윙 청산은 무시 (스윙 몫 0)",
     plan(swing_weight_pct=0, swing_label=EXIT_S)["qty"], 0.0)
 chk("B-3 100:0 · 포지션 청산은 무시",
@@ -78,18 +86,19 @@ chk("B-5 50:50 · 둘 다 청산 → 전량",
          position_label=EXIT_P)["full_exit"], True)
 chk("B-6 둘 다 보유 → 0",
     plan(swing_weight_pct=50)["qty"], 0.0)
-chk("B-7 50:50 · 스윙 청산 + 포지션 줄이기 → 15 + 4.95",
+chk("B-7 50:50 · 스윙 청산 + 포지션 줄이기 → 15 + 15×기본트림폭",
     plan(swing_weight_pct=50, swing_label=EXIT_S,
-         position_label=TRIM_P)["qty"], 19.95)
-chk("B-8 트림폭 50% 적용",
+         position_label=TRIM_P)["qty"],
+    round(15.0 + 15.0 * rc.TRIM_RATIO_DEFAULT_PCT / 100.0, 4))
+chk("B-8 트림폭 25% 적용 (기본값과 다른 값으로 판별)",
     plan(swing_weight_pct=0, position_label=TRIM_P,
-         trim_ratio_pct=50)["qty"], 15.0)
+         trim_ratio_pct=25)["qty"], 7.5)
 chk("B-9 트림폭 범위 밖은 클램프(200 → 90)",
     plan(swing_weight_pct=0, position_label=TRIM_P,
          trim_ratio_pct=200)["qty"], 27.0)
-chk("B-10 소수점 주식 반올림 안 함",
-    plan(qty=0.185, price=53.89, swing_weight_pct=0,
-         position_label=TRIM_P)["qty"], 0.0611)
+chk("B-10 소수점 주식 반올림 안 함 (정수가 되면 실패)",
+    plan(qty=0.185, price=53.89, swing_weight_pct=0, position_label=TRIM_P,
+         trim_ratio_pct=33)["qty"], 0.0611)
 
 # ── C군: 최소 거래금액 게이트 (I3) ───────────────────────────────────────
 _g = plan(swing_weight_pct=0, position_label=TRIM_P, min_trade_dollars=200.0)
@@ -152,6 +161,12 @@ chk("F-6 to_row 왕복: 0 은 0 으로", ac.to_row("yab", "Roth", _p0, "n")[-2],
 chk("F-7 to_row 왕복: None 은 빈칸으로",
     ac.to_row("yab", "Roth", ac.default_profile("Roth"), "n")[-2], "")
 chk("F-8 COLS 폭", ac.NCOL, 14)
+# 날짜 서식 함정: get_all_values 가 0 을 "1899-12-30 0:00" 로 돌려주던 케이스.
+# 파서는 이를 숫자로 오인하지 않고 미설정(None)으로 떨어뜨려야 한다.
+chk("F-9 날짜 문자열은 비율로 해석되지 않는다",
+    ac._coerce_row(_base + ["1899-12-30 0:00", ""])["Swing_Weight_Pct"], None)
+chk("F-10 숫자 0(문자열 아님)도 정상 파싱",
+    ac._coerce_row(_base + [0, ""])["Swing_Weight_Pct"], 0.0)
 
 # ── G군: 양성 대조 — 하네스가 진짜 결함을 잡는지 ─────────────────────────
 # 게이트를 전량 청산까지 걸도록 '고장낸' 구현이 C-4 를 실제로 깨뜨리는지 확인.
