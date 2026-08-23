@@ -72,12 +72,18 @@ _COL_ALERT_LASTSTATE = 11   # 0-index → 시트 L열
 # 보유(Portfolio) — app.py 와 lockstep
 _PF_WORKSHEET = "Portfolios"                  # [ID, Account, Ticker, AvgPrice, Quantity, Date_Added]
 _PFSTATE_WORKSHEET = "Portfolio_Alert_State"  # [Key, Alert_States, Alert_LastState, Updated_At]
-_PFSTATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At", "Stop_Loss", "Target_Price"]
+# ⚠️ 이 리스트가 시트 폭의 SSOT 다. _NPF = len(_PFSTATE_COLS) 로 파생되므로
+#    열을 늘리면 읽기·병합·패딩·쓰기 범위가 자동으로 따라온다. 폭을 상수로
+#    하드코딩하지 말 것.
+_PFSTATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At",
+                 "Stop_Loss", "Target_Price", "Swing_Weight_Pct"]
+_PFSTATE_IX_SWING_W = 2      # extra(= E열 이후) 안에서의 Swing_Weight_Pct 위치
 _PF_ALERT_DEFAULT = "exit,risk"               # 보유 기본 알림 (손절은 exit의 ATR 트레일링에 포함)
 _PF_INTRADAY_EVENTS = ("exit", "risk")        # 장중 보유 행동 가능 이벤트
 # Portfolios 시트 열 인덱스(0-base). D=평단, F=Date_Added.
 # Date_Added 는 포지션(중장기) 트레일링 스톱의 '보유 고점' 기준일 → 매도 판정에 직접 영향.
 _PF_COL_AVG = 3
+_PF_COL_QTY = 4
 _PF_COL_DATE_ADDED = 5
 
 # 진입 시점 baseline(2A) 재구성용 — Date_Added 이전 200봉이 있어야 MA200 이 나온다.
@@ -289,6 +295,28 @@ def _load_account_profile_values():
     _ACCOUNT_PROFILE_CACHE["loaded"] = True
     _ACCOUNT_PROFILE_CACHE["values"] = vals
     return vals
+
+
+_PROFILE_LOOKUP_CACHE = {}
+
+
+def _profile_for(uid: str, account: str) -> dict:
+    """(uid, account) → 계좌 프로필. Portfolios 를 다시 읽지 않는 가벼운 경로.
+
+    _account_context_for 는 자본금 산출을 위해 Portfolios 를 통째로 읽는다.
+    트랜치 사이징은 비율·트림폭·최소거래금액만 필요하므로 별도 캐시를 쓴다.
+    """
+    ck = (str(uid or "").strip().upper(), str(account or "").strip().lower())
+    if ck in _PROFILE_LOOKUP_CACHE:
+        return _PROFILE_LOOKUP_CACHE[ck]
+    try:
+        profs = ac.parse_profiles(_load_account_profile_values(), uid)
+        prof = ac.get_profile(profs, account)
+    except Exception as e:
+        print(f"[INFO] 계좌 프로필 조회 실패 — 기본값 사용 ({uid}/{account}): {e}")
+        prof = ac.default_profile(account)
+    _PROFILE_LOOKUP_CACHE[ck] = prof
+    return prof
 
 
 def _account_context_for(uid: str, account: str, hist_cache: dict) -> dict:
@@ -1111,6 +1139,18 @@ def _render_hit_card(h) -> str:
             html += (f"<div style='margin-top:2px'>🛡 <b>포지션(중장기)</b>: "
                      f"<span style='color:{_vcolor(po[0])};font-weight:700'>{po[0]}</span>"
                      + (f" — {po[1]}" if po[1] else "") + "</div>")
+        # 권장 매도 수량 — 트랜치 비율이 설정된 계좌·종목만 표시한다.
+        _tp = h.get("trim") or {}
+        if _tp.get("enabled") and _tp.get("label"):
+            _tc = "#d62728" if _tp.get("full_exit") else (
+                "#6b7280" if _tp.get("blocked") else "#f59e0b")
+            html += (f"<div style='margin-top:6px;padding:6px 8px;border-radius:6px;"
+                     f"background:#f8f9fa'>✂️ <b>매도 규모</b>: "
+                     f"<span style='color:{_tc};font-weight:700'>{_tp['label']}</span>")
+            if _tp.get("note"):
+                html += (f"<div style='font-size:12px;color:#888;margin-top:2px'>"
+                         f"{_tp['note']}</div>")
+            html += "</div>"
         html += "</div>"
     return html + "</div>"
 
@@ -1532,7 +1572,17 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
         date_added = str(r[_PF_COL_DATE_ADDED]).strip()
         key = f"{uid}|{account}|{tk}"
         states_csv = state_map.get(key, {}).get("states", "")
-        enabled = rc.resolve_alert_events(states_csv, _PF_ALERT_DEFAULT)
+        # 트랜치 비율: 종목 오버라이드(G열) > 계좌 기본 > 미설정(None)
+        _ex_row = state_map.get(key, {}).get("extra") or []
+        _tk_w = (_ex_row[_PFSTATE_IX_SWING_W]
+                 if len(_ex_row) > _PFSTATE_IX_SWING_W else "")
+        _prof = _profile_for(uid, account)
+        _swing_w = rc.resolve_swing_weight(_tk_w, _prof.get("Swing_Weight_Pct"))
+        # 비율이 설정된 계좌·종목만 기본 이벤트가 비율에서 파생된다.
+        # 미설정이면 _PF_ALERT_DEFAULT 그대로 → 기존 사용자 동작 불변.
+        # 명시 저장된 states_csv 는 어느 경우에도 그대로 존중된다.
+        enabled = rc.resolve_alert_events(
+            states_csv, rc.default_events_for_weight(_swing_w, _PF_ALERT_DEFAULT))
         prev = state_map.get(key, {}).get("last", "")
         try:
             hist = _pf_hist(tk, hist_cache)
@@ -1560,10 +1610,19 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
             new_rows.append(_pf_row(key, states_csv, new_state)); n_eval += 1
             if fired:
                 _swc = rc.build_sell_card(an, None)
+                _px = float(hist["Close"].iloc[-1])
+                _qty = pd.to_numeric(r[_PF_COL_QTY], errors="coerce")
+                _trim = rc.trim_size_plan(
+                    qty=(float(_qty) if pd.notna(_qty) else None), price=_px,
+                    swing_weight_pct=_swing_w,
+                    trim_ratio_pct=_prof.get("Trim_Ratio_Pct",
+                                             rc.TRIM_RATIO_DEFAULT_PCT),
+                    swing_label=_swc["label"], position_label=_posv[0],
+                    min_trade_dollars=_prof.get("Min_Trade_Dollars", 0.0))
                 fired_by_user.setdefault(uid, []).append(
                     {"ticker": tk, "account": account, "fired": fired, "an": an,
                      "swing": (_swc["label"], _swc["detail"] or _swc["headline"]),
-                     "position": _posv})
+                     "position": _posv, "trim": _trim})
                 print(f"  [FIRE-PF] {uid}/{account}/{tk}: {[e['event'] for e in fired]}")
         except Exception as e:
             print(f"  [WARN] {uid}/{account}/{tk} 평가 실패: {e}")
