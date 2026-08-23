@@ -695,7 +695,7 @@ def resolve_alert_events(raw, default_csv: str = "entry,risk") -> list:
 # 두 호흡(스윙/포지션) 판정은 이미 독립적으로 계산된다. 지금까지는 '정보'로만
 # 표시하고 수량과 연결되지 않아, 사용자가 "줄이기"를 보고도 얼마를 팔지 스스로
 # 정해야 했다. 보유를 두 몫으로 나눠 각 몫에 해당 호흡의 판정을 적용한다.
-TRIM_RATIO_DEFAULT_PCT = 33.0
+TRIM_RATIO_DEFAULT_PCT = 50.0
 TRIM_RATIO_MIN_PCT = 10.0
 TRIM_RATIO_MAX_PCT = 90.0
 

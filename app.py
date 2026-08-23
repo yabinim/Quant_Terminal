@@ -1782,13 +1782,27 @@ def open_account_profile_worksheet():
         return None, f"`{_ACCOUNT_PROFILE_WORKSHEET_TITLE}` 워크시트를 열 수 없습니다: {exc}"
 
 
+def _acct_prof_raw_values(ws):
+    """Account_Profile 시트값 — **서식 무시(UNFORMATTED_VALUE)**.
+
+    ⚠️ get_all_values() 는 셀의 '표시 문자열'을 준다. 숫자열에 날짜 서식이
+       걸려 있으면 0 이 "1899-12-30 0:00" 으로 돌아와 pd.to_numeric 이 NaN 을
+       내고, 저장된 값이 사라진 것처럼 보인다. 실제로 그렇게 됐다.
+       원값으로 읽으면 서식이 무엇이든 0 은 0 이다.
+    """
+    try:
+        return ws.get_values(value_render_option="UNFORMATTED_VALUE") or []
+    except Exception:
+        return ws.get_all_values() or []      # 구버전 gspread 폴백
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _account_profile_all_values_cached():
     ws, err = open_account_profile_worksheet()
     if err:
         return [], err
     try:
-        return ws.get_all_values() or [], None
+        return _acct_prof_raw_values(ws), None
     except Exception as exc:
         return [], str(exc)
 
@@ -1876,8 +1890,18 @@ def save_account_profile(user_id: str, account: str, prof: dict):
         except Exception as _rex:
             return False, f"시트 열 확장 실패({ncol}열 필요): {_rex}"
         ws.clear()
+        # ⚠️ RAW 로 쓴다. USER_ENTERED 는 셀 서식을 보고 값을 재해석하므로,
+        #    날짜 서식이 걸린 칸에 0 을 쓰면 1899-12-30 이 된다.
         ws.update(rows, range_name=f"A1:{_ACCT_PROF_LAST_COL}{len(rows)}",
-                  value_input_option="USER_ENTERED")
+                  value_input_option="RAW")
+        # ws.clear() 는 값만 지우고 서식은 남긴다. 이미 날짜로 굳은 칸을
+        # 일반 숫자로 되돌려 사람이 시트를 봐도 읽을 수 있게 한다.
+        # 실패해도 저장 자체는 유효하므로 조용히 넘어간다(RAW 가 이미 보호).
+        try:
+            ws.format(f"A2:{_ACCT_PROF_LAST_COL}{len(rows)}",
+                      {"numberFormat": {"type": "NUMBER", "pattern": "0.####"}})
+        except Exception as _fex:
+            print(f"[INFO] Account_Profile 숫자 서식 복구 실패(무해): {_fex}")
         _invalidate_account_profile_cache()
         return True, ""
     except Exception as exc:
