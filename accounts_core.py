@@ -23,6 +23,8 @@ COLS = [
     "Max_Positions", "Cash_Reserve_Pct", "Min_Trade_Dollars", "Updated_At",
     # ── 실적 레이더 (맨 뒤 append — Updated_At 인덱스 9 하드코딩을 깨지 않는다) ──
     "Earn_Preset", "Earn_Trim_Cap_Pct",
+    # ── 트랜치 매도 사이징 (동일하게 맨 뒤 append) ──
+    "Swing_Weight_Pct", "Trim_Ratio_Pct",
 ]
 NCOL = len(COLS)
 
@@ -37,6 +39,11 @@ DEFAULTS = {
     "Min_Trade_Dollars": rc.DEFAULT_MIN_TRADE_DOLLARS,
     "Earn_Preset": "",          # 미설정 — 아래 EARN_PRESET_FALLBACK 이 임시 적용된다
     "Earn_Trim_Cap_Pct": 0.0,   # 0 = 미저장 → 프리셋 기본값을 계산해서 쓴다
+    # ⚠️ None 과 0 은 다르다. None = 트랜치 사이징 미사용(수량 권고 표시 안 함),
+    #    0 = '스윙 0% / 포지션 100%' 라는 명시적 선택. 0 을 기본값으로 두면
+    #    설정한 적 없는 계좌가 포지션 전용으로 오해된다.
+    "Swing_Weight_Pct": None,
+    "Trim_Ratio_Pct": rc.TRIM_RATIO_DEFAULT_PCT,
 }
 
 SIZING_MODE_LABELS = {
@@ -113,6 +120,16 @@ def _coerce_row(row: list) -> dict:
     p = str(r[idx["Earn_Preset"]]).strip().lower()
     if p in EARN_PRESETS:
         prof["Earn_Preset"] = p
+
+    # 트랜치 비율 — 빈 칸이면 NaN 이 되어 건너뛰고 기본값 None 이 유지된다.
+    # 0 은 유효한 명시값이므로 >= 0 조건으로 통과시킨다.
+    v = pd.to_numeric(r[idx["Swing_Weight_Pct"]], errors="coerce")
+    if pd.notna(v) and 0 <= float(v) <= 100:
+        prof["Swing_Weight_Pct"] = float(v)
+    v = pd.to_numeric(r[idx["Trim_Ratio_Pct"]], errors="coerce")
+    if pd.notna(v) and float(v) > 0:
+        prof["Trim_Ratio_Pct"] = float(
+            max(rc.TRIM_RATIO_MIN_PCT, min(rc.TRIM_RATIO_MAX_PCT, float(v))))
     return prof
 
 
@@ -160,6 +177,12 @@ def to_row(user_id: str, account: str, prof: dict, now_et: str) -> list:
         str(now_et or ""),
         str(prof.get("Earn_Preset", "") or ""),
         float(prof.get("Earn_Trim_Cap_Pct", 0.0) or 0.0),
+        # 미설정은 빈 문자열로 저장한다. 0.0 으로 쓰면 '포지션 100%' 라는
+        # 명시적 선택과 구분되지 않는다.
+        ("" if prof.get("Swing_Weight_Pct") is None
+         else float(prof.get("Swing_Weight_Pct"))),
+        float(prof.get("Trim_Ratio_Pct", rc.TRIM_RATIO_DEFAULT_PCT)
+              or rc.TRIM_RATIO_DEFAULT_PCT),
     ]
 
 

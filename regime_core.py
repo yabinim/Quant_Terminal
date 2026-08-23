@@ -691,6 +691,199 @@ def resolve_alert_events(raw, default_csv: str = "entry,risk") -> list:
     return [t for t in toks if t in ALERT_EVENTS]
 
 
+# ── 트랜치 사이징 (스윙 몫 / 포지션 몫) — app.py·automation 공유 SSOT ──────
+# 두 호흡(스윙/포지션) 판정은 이미 독립적으로 계산된다. 지금까지는 '정보'로만
+# 표시하고 수량과 연결되지 않아, 사용자가 "줄이기"를 보고도 얼마를 팔지 스스로
+# 정해야 했다. 보유를 두 몫으로 나눠 각 몫에 해당 호흡의 판정을 적용한다.
+TRIM_RATIO_DEFAULT_PCT = 33.0
+TRIM_RATIO_MIN_PCT = 10.0
+TRIM_RATIO_MAX_PCT = 90.0
+
+
+def resolve_swing_weight(ticker_override=None, account_default=None):
+    """종목 오버라이드 > 계좌 기본 > None(미설정). 0~100 으로 클램프.
+
+    ⚠️ None 과 0 은 다르다.
+       None = '이 기능 안 씀' → 수량 권고를 아예 표시하지 않는다(기존 동작 유지).
+       0    = '포지션 100%' 라는 명시적 선택.
+       빈 문자열·공백·파싱 실패는 미설정으로 본다.
+    """
+    for v in (ticker_override, account_default):
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(f):
+            continue
+        return max(0.0, min(100.0, f))
+    return None
+
+
+def default_events_for_weight(w, fallback_csv: str = "exit,risk") -> str:
+    """트랜치 비율 → 빈 Alert_States 종목에 적용할 기본 이벤트 CSV.
+
+    ⚠️ 명시적으로 저장된 Alert_States 는 이 함수를 거치지 않는다. 바뀌는 것은
+       '미설정'의 해석뿐이다. 사용자가 켜 둔 토글을 코드가 조용히 끄면 알림이
+       사라진 것을 알아챌 방법이 없다.
+
+    비율 미설정(None)이면 종전 기본값을 그대로 돌려준다 → 기존 사용자 무영향.
+    """
+    if w is None:
+        return fallback_csv
+    try:
+        f = float(w)
+    except (TypeError, ValueError):
+        return fallback_csv
+    if not np.isfinite(f):
+        return fallback_csv
+    if f <= 0:
+        return "pexit,ptrim"
+    if f >= 100:
+        return "exit,risk"
+    return "exit,risk,pexit,ptrim"
+
+
+def verdict_action(label) -> str:
+    """판정 라벨 → 'exit' / 'trim' / 'hold'.
+
+    ⚠️ 부분 문자열 검색을 쓰지 않는다. 매도 어휘에서 '청산' 은 축소 문구 안에도
+       등장한다("분할 청산", "일부 청산"). `"청산" in label` 로 판정하면 줄이기
+       라벨이 전량 청산으로 분류되어 **보유 전량을 팔라고 권고**한다.
+       라벨은 항상 `<이모지> <동사>...` 형태이므로 이모지를 떼고 앞머리로 본다.
+       (SELL_DECISION_LABELS · integrated_sell_verdict 양쪽 모두 이 형태다.)
+
+    알 수 없는 라벨은 'hold' 로 떨어뜨린다 — 판정을 못 읽었을 때 매도 수량을
+    만들어내는 것보다 아무 말도 안 하는 쪽이 안전하다.
+    """
+    t = str(label or "").strip()
+    core = t.split(maxsplit=1)[-1] if " " in t else t
+    if core.startswith("청산"):
+        return "exit"
+    if core.startswith("줄이기"):
+        return "trim"
+    return "hold"
+
+
+def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
+                   trim_ratio_pct=TRIM_RATIO_DEFAULT_PCT,
+                   swing_label=None, position_label=None,
+                   min_trade_dollars: float = 0.0) -> dict:
+    """두 호흡 판정 + 트랜치 비율 → 권장 매도 수량.
+
+    반환 dict:
+      enabled   : 비율 미설정이면 False (권고 자체를 표시하지 않는다)
+      qty/pct   : 권장 매도 주식 수 · 현재 보유 대비 %
+      dollars   : 권장 금액 (price 없으면 None)
+      full_exit : 전량 청산 여부
+      blocked   : 최소 거래금액 미달로 '전량 또는 보유' 선택으로 전환됐는지
+      label     : 표시용 한 줄
+      note      : 가정/제약 설명 (없으면 "")
+
+    ⚠️ 최소 거래금액 게이트는 **부분 축소에만** 건다. 전량 청산에는 절대 걸지
+       않는다 — 금액이 작다고 청산 신호를 숨기는 것은 손실 방지의 정반대다.
+
+    ⚠️ 중간 비율(예 30:70)에서 한쪽 몫만 먼저 판 경우, 잔여가 여전히 설정 비율대로
+       갈려 있다고 가정한다(트랜치 실행 추적 미구현 — note 로 고지한다).
+       0 또는 100 에서는 몫이 하나뿐이라 이 가정이 개입하지 않는다.
+
+    ⚠️ 주식 수를 정수로 반올림하지 않는다. 소수점 주식 보유가 실제로 존재한다.
+    """
+    out = {"enabled": False, "qty": 0.0, "pct": 0.0, "dollars": None,
+           "full_exit": False, "blocked": False, "label": "", "note": ""}
+
+    w = resolve_swing_weight(swing_weight_pct, None)
+    if w is None:
+        return out
+    try:
+        q = float(qty)
+    except (TypeError, ValueError):
+        return out
+    if not (np.isfinite(q) and q > 0):
+        return out
+    out["enabled"] = True
+
+    try:
+        tr = float(trim_ratio_pct)
+    except (TypeError, ValueError):
+        tr = TRIM_RATIO_DEFAULT_PCT
+    if not np.isfinite(tr):
+        tr = TRIM_RATIO_DEFAULT_PCT
+    tr = max(TRIM_RATIO_MIN_PCT, min(TRIM_RATIO_MAX_PCT, tr)) / 100.0
+
+    s_share = q * (w / 100.0)      # 스윙 몫
+    p_share = q - s_share          # 포지션 몫
+    sa = verdict_action(swing_label)
+    pa = verdict_action(position_label)
+
+    sell, parts = 0.0, []
+    if s_share > 0:
+        if sa == "exit":
+            sell += s_share
+            parts.append("스윙 몫 전량")
+        elif sa == "trim":
+            sell += s_share * tr
+            parts.append(f"스윙 몫의 {tr * 100:.0f}%")
+    if p_share > 0:
+        if pa == "exit":
+            sell += p_share
+            parts.append("포지션 몫 전량")
+        elif pa == "trim":
+            sell += p_share * tr
+            parts.append(f"포지션 몫의 {tr * 100:.0f}%")
+
+    if sell <= 0:
+        out["label"] = "권장 매도 없음 — 해당 호흡에 매도 신호 없음"
+        return out
+
+    full = bool(sell >= q * 0.999)
+    if full:
+        sell = q
+    out["full_exit"] = full
+
+    dollars = None
+    try:
+        pr = float(price) if price is not None else None
+        if pr is not None and np.isfinite(pr) and pr > 0:
+            dollars = sell * pr
+    except (TypeError, ValueError):
+        dollars = None
+
+    try:
+        mind = float(min_trade_dollars)
+    except (TypeError, ValueError):
+        mind = 0.0
+    if not np.isfinite(mind):
+        mind = 0.0
+
+    # 부분 축소가 최소 거래금액에 미달 → 숨기지 않고 이분 선택으로 전환한다.
+    # 조용히 감추면 사용자는 신호가 없었다고 오해한다.
+    if (not full) and dollars is not None and mind > 0 and dollars < mind:
+        out.update({
+            "blocked": True, "dollars": dollars,
+            "label": (f"부분 축소 ${dollars:,.0f} < 최소 거래 ${mind:,.0f}"
+                      " — 전량 또는 보유 중 선택"),
+            "note": "이 규모에서는 일부만 파는 것이 의미가 없습니다.",
+        })
+        return out
+
+    out["qty"] = round(sell, 4)
+    out["pct"] = round(sell / q * 100.0, 1)
+    out["dollars"] = dollars
+    _d = f" (약 ${dollars:,.0f})" if dollars is not None else ""
+    if full:
+        out["label"] = f"전량 매도 — {sell:g}주{_d}"
+    else:
+        out["label"] = (f"권장 매도 {sell:g}주 · 보유의 {out['pct']:.0f}%{_d}"
+                        f" — {' + '.join(parts)}")
+    if 0 < w < 100:
+        out["note"] = "잔여 물량이 설정 비율대로 남아 있다고 가정합니다."
+    return out
+
+
 def watch_condition_msgs(price=None, rsi=None, ma200=None,
                          alert_price=None, alert_rsi=None, alert_ma200=False) -> list:
     """수동 관심 조건(목표 매수가·RSI·200일선 근접) 충족 메시지 리스트.

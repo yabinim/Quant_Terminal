@@ -1260,16 +1260,22 @@ def load_portfolio_alert_states() -> dict:
         return {}
     out = {}
     for r in vals[1:]:
-        r = (list(r) + [""] * 6)[:6]
+        r = (list(r) + [""] * 7)[:7]
         key = str(r[0]).strip()
         if key:
             _sl = to_float(r[4])
             _tp = to_float(r[5])
+            # G열 = 종목별 스윙 비중 오버라이드. 빈칸이면 None(계좌 기본 상속).
+            # 0 은 유효한 명시값('포지션 100%')이므로 None 과 반드시 구분한다.
+            _sw = to_float(r[6])
             out[key] = {
                 "states": str(r[1]).strip(),
                 "last_state": str(r[2]).strip(),
                 "stop_loss": float(_sl) if pd.notna(_sl) else None,
                 "target_price": float(_tp) if pd.notna(_tp) else None,
+                "swing_weight": (float(_sw)
+                                 if (pd.notna(_sw) and 0 <= float(_sw) <= 100)
+                                 else None),
             }
     return out
 
@@ -1330,6 +1336,42 @@ def save_portfolio_alert_states_setting(user_id: str, account: str, ticker: str,
             ws.update([[now_str]], range_name=f"D{row_idx}", value_input_option="RAW")
         else:
             _safe_append_rows(ws, [key, states_csv, "", now_str], value_input_option="RAW")
+        load_portfolio_alert_states.clear()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def save_portfolio_swing_weight_setting(user_id: str, account: str, ticker: str,
+                                        swing_weight) -> tuple[bool, str]:
+    """보유 종목의 스윙 비중 오버라이드(G열)만 upsert. 나머지 열은 보존.
+
+    swing_weight=None 이면 빈칸으로 저장 → 계좌 기본값을 상속한다.
+    0 은 유효한 명시값이므로 빈칸으로 바꾸지 않는다.
+    """
+    ws, err = open_portfolio_alert_state_worksheet()
+    if ws is None:
+        return False, err or "시트 열기 실패"
+    key = _pf_alert_key(user_id, account, ticker)
+    try:
+        f = float(swing_weight)
+        cell = f if (f == f and 0 <= f <= 100) else ""
+    except (TypeError, ValueError):
+        cell = ""
+    try:
+        vals = ws.get_all_values() or []
+        row_idx = None
+        for i, r in enumerate(vals[1:], start=2):
+            if r and str(r[0]).strip() == key:
+                row_idx = i
+                break
+        now_str = _narrative_now_et_string()
+        if row_idx:
+            ws.update([[cell]], range_name=f"G{row_idx}", value_input_option="RAW")
+            ws.update([[now_str]], range_name=f"D{row_idx}", value_input_option="RAW")
+        else:
+            _safe_append_rows(ws, [key, "", "", now_str, "", "", cell],
+                              value_input_option="RAW")
         load_portfolio_alert_states.clear()
         return True, ""
     except Exception as exc:
@@ -21441,14 +21483,47 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             _po_lbl, _po_why = "⚪ 판정 보류", "데이터 부족"
                         _swing_by_ticker[(acct, _tk)] = (_sw_lbl, _sw_why)
                         _swing_by_ticker_tk[_tk] = (_sw_lbl, _sw_why)
+                        # ── 매도 규모 (트랜치) — 비율이 설정된 경우에만 계산 ──
+                        _key0 = _pf_alert_key(puid, acct, _tk)
+                        _prof_tr = get_account_profile(puid, acct)
+                        _w_eff = rc.resolve_swing_weight(
+                            _pf_states.get(_key0, {}).get("swing_weight"),
+                            _prof_tr.get("Swing_Weight_Pct"))
+                        try:
+                            _px_tr = float(pd.to_numeric(
+                                _pf_hist_cache[_tk]["Close"], errors="coerce"
+                            ).dropna().iloc[-1])
+                        except Exception:
+                            _px_tr = None
+                        _trim_plan = rc.trim_size_plan(
+                            qty=pd.to_numeric(_qty, errors="coerce"), price=_px_tr,
+                            swing_weight_pct=_w_eff,
+                            trim_ratio_pct=_prof_tr.get("Trim_Ratio_Pct",
+                                                        rc.TRIM_RATIO_DEFAULT_PCT),
+                            swing_label=_sw_lbl, position_label=_po_lbl,
+                            min_trade_dollars=_prof_tr.get("Min_Trade_Dollars", 0.0))
+
                         with st.container(border=True):
                             st.markdown(f"**{_tk}** · {_rlabel} · 평단 {_avg_s} {_qty_s}")
                             st.markdown(f"📈 스윙(단기): {_verdict_md(_sw_lbl)} — {_sw_why}")
                             st.markdown(f"🛡 포지션(중장기): {_verdict_md(_po_lbl)} — {_po_why}")
+                            if _trim_plan.get("enabled") and _trim_plan.get("label"):
+                                if _trim_plan.get("blocked"):
+                                    st.info(f"✂️ {_trim_plan['label']}")
+                                elif _trim_plan.get("full_exit"):
+                                    st.error(f"✂️ {_trim_plan['label']}")
+                                elif _trim_plan.get("qty", 0) > 0:
+                                    st.warning(f"✂️ {_trim_plan['label']}")
+                                if _trim_plan.get("note"):
+                                    st.caption(_trim_plan["note"])
 
                         # 종목별 알림 토글 (Portfolio_Alert_State 에 저장)
                         _key = _pf_alert_key(puid, acct, _tk)
-                        _cur = rc.resolve_alert_events(_pf_states.get(_key, {}).get("states"), _PORTFOLIO_ALERT_DEFAULT)
+                        # 미설정 종목의 기본 이벤트를 트랜치 비율에서 파생한다.
+                        # 명시 저장된 states 는 그대로 존중된다(자동 변경 없음).
+                        _cur = rc.resolve_alert_events(
+                            _pf_states.get(_key, {}).get("states"),
+                            rc.default_events_for_weight(_w_eff, _PORTFOLIO_ALERT_DEFAULT))
                         # 스윙(exit) / 포지션(pexit·ptrim) 호라이즌을 보유별로 선택.
                         # 기본값은 기존 그대로 exit,risk — 중장기로 운용하면 pexit 로 교체.
                         _opts = ["exit", "risk", "pexit", "ptrim", "regime"]
@@ -21469,6 +21544,56 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                                     st.toast(f"{_tk} 알림 저장됨")
                                 else:
                                     st.error(f"저장 실패: {_e}")
+
+                        # 비율 ↔ 알림 이벤트 충돌 경고 — 자동으로 바꾸지 않는다.
+                        # 사용자가 켜 둔 토글을 코드가 조용히 끄면 알림이 사라진 것을
+                        # 알아챌 방법이 없다. 경고만 띄우고 판단은 사용자에게 맡긴다.
+                        if _w_eff is not None:
+                            _sw_on = any(e in _sel for e in ("exit", "risk"))
+                            _po_on = any(e in _sel for e in ("pexit", "ptrim"))
+                            if _w_eff <= 0 and _sw_on:
+                                st.caption("⚠️ 스윙 몫 0%인데 스윙 알림(청산·줄이기)이 "
+                                           "켜져 있습니다 — 울려도 매도 수량이 0입니다.")
+                            elif _w_eff >= 100 and _po_on:
+                                st.caption("⚠️ 포지션 몫 0%인데 포지션 알림이 켜져 "
+                                           "있습니다 — 울려도 매도 수량이 0입니다.")
+
+                        # ── 종목별 스윙 비중 오버라이드 (G열) ──────────────
+                        _sw_ov = _pf_states.get(_key, {}).get("swing_weight")
+                        with st.expander(
+                            "✂️ 이 종목만 다른 비율 쓰기"
+                            + (f" — 현재 스윙 {_sw_ov:.0f}%" if _sw_ov is not None
+                               else f" — 계좌 기본 따름"
+                                    + (f" (스윙 {_w_eff:.0f}%)" if _w_eff is not None
+                                       else " (미설정)")),
+                            expanded=False,
+                        ):
+                            _ovc1, _ovc2, _ovc3 = st.columns([3, 1, 1])
+                            with _ovc1:
+                                _ov_val = st.slider(
+                                    "스윙 몫 (%)", min_value=0, max_value=100, step=5,
+                                    value=int(_sw_ov if _sw_ov is not None
+                                              else (_w_eff or 0)),
+                                    key=f"pf_swov_{acct}_{_tk}",
+                                    label_visibility="collapsed")
+                            with _ovc2:
+                                if st.button("💾", key=f"pf_swov_save_{acct}_{_tk}",
+                                             help="이 종목 비율 저장"):
+                                    _ok, _e = save_portfolio_swing_weight_setting(
+                                        puid, acct, _tk, float(_ov_val))
+                                    if _ok:
+                                        st.toast(f"{_tk} 비율 저장됨"); st.rerun()
+                                    else:
+                                        st.error(f"저장 실패: {_e}")
+                            with _ovc3:
+                                if st.button("↩️", key=f"pf_swov_clear_{acct}_{_tk}",
+                                             help="계좌 기본값으로 되돌리기"):
+                                    _ok, _e = save_portfolio_swing_weight_setting(
+                                        puid, acct, _tk, None)
+                                    if _ok:
+                                        st.toast(f"{_tk} 계좌 기본값 상속"); st.rerun()
+                                    else:
+                                        st.error(f"저장 실패: {_e}")
 
                         # ── 보유 플랜 (손절/목표 저장 · R:R) — #2 build_trade_plan 소비 (item2) ──
                         _ps = _pf_states.get(_key, {})
@@ -21634,6 +21759,44 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     _v_min = st.number_input("최소 거래금액 ($ · 0 = 미사용)", min_value=0.0, step=5.0,
                                              value=float(_p["Min_Trade_Dollars"]), key=f"_prof_min_{_pa}")
 
+                    # ── ✂️ 매도 규모 (트랜치 사이징) ────────────────────
+                    st.markdown("**✂️ 매도 규모 (트랜치)**")
+                    _sw_saved = _p.get("Swing_Weight_Pct")
+                    _v_swuse = st.checkbox(
+                        "매도 권장 수량 표시", value=(_sw_saved is not None),
+                        key=f"_prof_swuse_{_pa}",
+                        help="끄면 지금처럼 판정 라벨만 표시하고 수량은 제안하지 않습니다.")
+                    if _v_swuse:
+                        _v_sw = float(st.slider(
+                            "스윙 몫 (%) — 나머지는 포지션 몫", min_value=0, max_value=100, step=5,
+                            value=int(_sw_saved if _sw_saved is not None else 0),
+                            key=f"_prof_sw_{_pa}"))
+                        _v_trim = float(st.number_input(
+                            "줄이기 1회 축소폭 (해당 몫의 %)",
+                            min_value=float(rc.TRIM_RATIO_MIN_PCT),
+                            max_value=float(rc.TRIM_RATIO_MAX_PCT), step=1.0,
+                            value=float(_p.get("Trim_Ratio_Pct", rc.TRIM_RATIO_DEFAULT_PCT)),
+                            key=f"_prof_trim_{_pa}"))
+                        st.caption(
+                            f"스윙 {_v_sw:.0f}% / 포지션 {100 - _v_sw:.0f}% · "
+                            f"줄이기 = 해당 몫의 {_v_trim:.0f}% · "
+                            f"미설정 알림 이벤트는 "
+                            f"`{rc.default_events_for_weight(_v_sw)}` 로 해석됩니다."
+                        )
+                        if 0 < _v_sw < 100:
+                            st.caption(
+                                "⚠️ 중간 비율입니다. 한쪽 몫만 먼저 판 뒤에도 잔여가 이 비율대로 "
+                                "남아 있다고 가정해 계산합니다(트랜치 실행 추적 미구현)."
+                            )
+                        if float(_v_min) <= 0:
+                            st.caption(
+                                "💡 최소 거래금액이 0이라 아주 작은 축소도 그대로 제안됩니다. "
+                                "소액 계좌라면 값을 지정하는 편이 좋습니다."
+                            )
+                    else:
+                        _v_sw, _v_trim = None, float(
+                            _p.get("Trim_Ratio_Pct", rc.TRIM_RATIO_DEFAULT_PCT))
+
                     # ── 📅 실적 축소 한도 ──────────────────────────────
                     st.markdown("**📅 실적 축소 한도**")
                     _cap_cur = ac.resolve_earn_trim_cap(_p)
@@ -21753,6 +21916,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         "Max_Position_Pct": float(_v_cap), "Max_Positions": int(_v_slots),
                         "Cash_Reserve_Pct": float(_v_res), "Min_Trade_Dollars": float(_v_min),
                         "Earn_Preset": str(_v_preset), "Earn_Trim_Cap_Pct": float(_v_ecap),
+                        "Swing_Weight_Pct": _v_sw, "Trim_Ratio_Pct": float(_v_trim),
                     })
                     if _ok_p:
                         _invalidate_account_context_memo()
