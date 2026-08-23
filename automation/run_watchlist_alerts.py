@@ -1496,11 +1496,31 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
 
     state_ws = _open_pf_state(sh)
     st_vals = state_ws.get_all_values() or []
-    state_map = {}
-    for r in st_vals[1:]:
-        r = (list(r) + [""] * 4)[:4]
-        if str(r[0]).strip():
-            state_map[str(r[0]).strip()] = {"states": str(r[1]).strip(), "last": str(r[2]).strip()}
+    _NPF = len(_PFSTATE_COLS)
+
+    def _read_state_map(vals):
+        """시트값 → {key: {...}}. E열 이후(손절·목표)는 '키에 붙은 값'으로 보관한다.
+
+        ⚠️ 예전에는 r[:4] 로 잘라 읽고 A:D 만 되썼다. E/F 는 물리적 행에
+           붙박이였으므로 Portfolios 행 순서가 바뀌면(전량 매도로 행 삭제 등)
+           다른 종목의 손절/목표가로 조용히 어긋났다. 이제 키에 재부착한다.
+        """
+        out = {}
+        for _r in vals[1:]:
+            _r = (list(_r) + [""] * _NPF)[:_NPF]
+            _k = str(_r[0]).strip()
+            if _k:
+                out[_k] = {"states": str(_r[1]).strip(), "last": str(_r[2]).strip(),
+                           "extra": [str(x) for x in _r[4:_NPF]]}
+        return out
+
+    state_map = _read_state_map(st_vals)
+
+    def _pf_row(key, states_csv, last_state):
+        """A:F 한 행. E열 이후는 키로 조회해 붙인다(위치 의존 없음)."""
+        _ex = list(state_map.get(key, {}).get("extra") or [])
+        _ex = (_ex + [""] * (_NPF - 4))[:_NPF - 4]
+        return [key, states_csv, last_state, today] + _ex
 
     new_rows, n_eval = [], 0
     for r in holdings:
@@ -1521,7 +1541,7 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
                 # 🔴 보유 종목의 미수신은 **매도 신호가 영구히 오지 않는다**는
                 #    뜻이다. 워치리스트보다 심각도가 높으므로 반드시 기록한다.
                 record_nodata(uid, tk, "보유")
-                new_rows.append([key, states_csv, prev, today]); continue
+                new_rows.append(_pf_row(key, states_csv, prev)); continue
             _entry = float(avg) if pd.notna(avg) else None
             an = rc.analyze_ticker(hist, spy_close=spy_close,
                                    entry_price=_entry, entry_date=date_added)
@@ -1537,7 +1557,7 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
                 an, enabled, prev, today_str=today, price=float(hist["Close"].iloc[-1]),
                 pos_verdict=_posv, entry_baseline=_bl,
             )
-            new_rows.append([key, states_csv, new_state, today]); n_eval += 1
+            new_rows.append(_pf_row(key, states_csv, new_state)); n_eval += 1
             if fired:
                 _swc = rc.build_sell_card(an, None)
                 fired_by_user.setdefault(uid, []).append(
@@ -1547,14 +1567,30 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
                 print(f"  [FIRE-PF] {uid}/{account}/{tk}: {[e['event'] for e in fired]}")
         except Exception as e:
             print(f"  [WARN] {uid}/{account}/{tk} 평가 실패: {e}")
-            new_rows.append([key, states_csv, prev, today])
+            new_rows.append(_pf_row(key, states_csv, prev))
 
     # 전체 덮어쓰기(드리프트 없음). 이전이 더 길면 빈 행으로 잔재 정리.
     try:
+        # 쓰기 직전 재조회 — 평가 루프는 수 분이 걸린다. 그 사이 앱에서 손절/목표가를
+        # 고쳤다면 시작 시점 스냅샷으로 덮어쓰게 되므로, 최신값을 키로 다시 병합한다.
+        try:
+            _fresh = _read_state_map(state_ws.get_all_values() or [])
+        except Exception as _e:
+            _fresh = {}
+            print(f"  [WARN] 쓰기 직전 재조회 실패 — 시작 스냅샷 사용: {_e}")
+        if _fresh:
+            for _row in new_rows:
+                _ex = _fresh.get(_row[0], {}).get("extra")
+                if _ex is not None:
+                    _row[4:] = (list(_ex) + [""] * (_NPF - 4))[:_NPF - 4]
+
         prev_len = max(0, len(st_vals) - 1)
-        padded = new_rows + [["", "", "", ""]] * max(0, prev_len - len(new_rows))
-        body = [_PFSTATE_COLS[:4]] + padded   # A:D만 관리(상태머신). E/F(손절·목표)는 보존
-        state_ws.update(body, range_name=f"A1:D{len(body)}", value_input_option="RAW")
+        padded = new_rows + [[""] * _NPF for _ in range(max(0, prev_len - len(new_rows)))]
+        _lc = chr(ord("A") + _NPF - 1)
+        # A:F 전체를 관리한다. E/F 는 위치가 아니라 키로 재부착되므로 행 순서가
+        # 바뀌어도 다른 종목의 값으로 어긋나지 않는다.
+        body = [_PFSTATE_COLS] + padded
+        state_ws.update(body, range_name=f"A1:{_lc}{len(body)}", value_input_option="RAW")
         print(f"[OK] Portfolio_Alert_State 저장: {len(new_rows)}행 (평가 {n_eval})")
     except Exception as e:
         print(f"[ERROR] Portfolio_Alert_State 저장 실패: {e}")
