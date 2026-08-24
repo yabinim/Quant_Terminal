@@ -1,0 +1,74 @@
+name: 🔬 진단 — 시트 서식이 숫자를 파괴하는 칸 스캔 (읽기 전용)
+
+# 언제 쓰나:
+#   · 지금 한 번 (Account_Profile 에서 발견된 손상이 다른 시트에도 있는지 실측)
+#   · 새 숫자 열을 시트에 추가한 뒤
+#   · "저장했는데 값이 안 남는다" 는 증상이 보일 때
+#
+# 배경:
+#   Account_Profile.Earn_Trim_Cap_Pct 가 몇 달 동안 조용히 죽어 있었다.
+#   셀에 날짜 서식이 걸려 저장한 0 이 1899-12-30 으로 굳었고,
+#   get_all_values() 는 표시 문자열을 주므로 pd.to_numeric 이 NaN 을 냈다.
+#   오류도 경고도 없었다. Swing_Weight_Pct 를 얹다가 우연히 걸렸을 뿐이다.
+#
+#   같은 함정이 Portfolios.AvgPrice/Quantity 나
+#   Portfolio_Alert_State.Stop_Loss 에 걸리면 손절가가 조용히 틀린다.
+#
+# 무엇을 하나:
+#   모든 워크시트를 FORMATTED / UNFORMATTED 두 방식으로 읽어 비교한다.
+#     🔴 LOSS   원값은 숫자인데 표시로는 못 읽음 → 코드가 NaN 을 받는다
+#     🟠 WRONG  둘 다 읽히는데 값이 다름 → 코드가 틀린 숫자를 받는다 (더 위험)
+#     ⬜ TEXT   원값이 숫자가 아님 → 무해
+#
+#   실스캔 전에 분류기 자기검증(15케이스)이 먼저 돌고, 실패하면 스캔을
+#   시작하지 않는다. 분류기가 틀리면 "이상 없음" 이라는 거짓 안심을 주는데,
+#   그게 정확히 지금까지의 상태였다.
+#
+# 안전성:
+#   **읽기 전용.** update/clear/format/append/delete 를 한 번도 호출하지 않는다
+#   (`grep -cE 'ws\.(update|clear|format|append|delete|resize|batch_update)'` = 0).
+#   시트는 절대 바뀌지 않는다. 몇 번을 돌려도 같다.
+#
+# 종료 코드:
+#   0 = 이상 없음 또는 비핵심 열에서만 발견
+#   1 = 코드가 숫자로 파싱하는 열에서 손상 발견 (🚨 즉시 조치)
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: '특정 시트만 (쉼표 구분, 비우면 전체)'
+        required: false
+        default: ''
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install gspread google-auth pandas numpy
+
+      - name: 🧪 분류기 자기검증 (네트워크 없음)
+        run: python automation/diag_sheet_numfmt.py --selftest
+
+      - name: 🔬 시트 서식 스캔 (읽기 전용)
+        env:
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+        run: |
+          if [ -n "${{ github.event.inputs.only }}" ]; then
+            python automation/diag_sheet_numfmt.py --only "${{ github.event.inputs.only }}"
+          else
+            python automation/diag_sheet_numfmt.py
+          fi
