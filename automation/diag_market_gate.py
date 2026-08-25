@@ -419,9 +419,13 @@ try:
         if isinstance(_n, ast.Import):
             for _a in _n.names:
                 _alias[_a.asname or _a.name] = _a.name
+    # ⚠️ 새 공용 모듈을 만들면 여기에도 추가해야 한다. 빠뜨리면 이 스위트가
+    #    영구히 빨간불이 되고, 영구 빨간불은 아무도 안 읽는 스위트가 된다.
     _TARGETS = {"scanner_core", "narrative_core", "users_core", "fmp_extras",
                 "portfolio_core", "watchlist_metrics_core", "regime_core",
-                "earnings_core"}   # 2026-08-13: 실적 레이더 Tier 2(Source 열) 추가
+                "earnings_core",   # 2026-08-13: 실적 레이더 Tier 2(Source 열) 추가
+                "industry_core", "reminders_core",  # 2026-08-24: 누락분 보충
+                "calendar_core", "accounts_core", "gemini_core"}
     _al = {k: v for k, v in _alias.items() if v in _TARGETS}
 
     _used = {}
