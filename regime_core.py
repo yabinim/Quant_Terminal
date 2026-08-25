@@ -1016,8 +1016,20 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
                                entry_blocked: bool = False):
     """상태 전환 기반 알림 평가 (2일 확정 + 재무장). 순수 함수.
 
-    ※ 하루 1회 호출 전제(자동화). 호출 1회 = 평가 1회로 pending 카운터가 1 진행된다.
-       앱(rerun마다 호출)에서는 절대 호출하지 말 것 — 미리보기는 alert_conditions 사용.
+    ※ 자동화 전용. 앱(rerun마다 호출)에서는 절대 호출하지 말 것 —
+       미리보기는 alert_conditions 를 쓴다.
+
+    ※ 확정 카운터(pending)는 **호출 수가 아니라 날짜 수**를 센다. 이벤트별로
+       마지막으로 카운터를 올린 날짜(pday)를 기억하고, 같은 today_str 로 다시
+       불리면 올리지 않는다. 하루에 두 번 실행돼도(수동 재실행 · 재시도 ·
+       repository_dispatch 중복) 2일 확정이 하루 만에 통과하지 않는다.
+
+       카운터만 막고 평가 자체는 그대로 돈다 — 통째로 건너뛰면 1차 실행이
+       데이터 오류로 실패했을 때 재실행이 아무것도 복구하지 못한다.
+       악화 감지 · 재무장 · 발동은 정상 동작한다.
+
+       today_str 이 비면 종전대로 매번 진행한다(하위호환). pday 가 없는
+       구버전 state 는 '오늘 아직 안 올림' 으로 본다.
 
     entry_baseline: compute_entry_baseline() 반환값. 주어지면 '진입 시점에 이미 참이던'
       스윙 코드(exit/risk)만으로 구성된 조건은 발동시키지 않는다(2A). 보유 기간이
@@ -1074,12 +1086,13 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
             # (events_state 에 키가 없으면 없는 채로 두어야 차단 해제 시 정상 초기화된다)
             continue
         if e not in enabled:
-            events_state[e] = {"status": "armed", "pending": 0, "keys": []}
+            events_state[e] = {"status": "armed", "pending": 0, "keys": [], "pday": ""}
             continue
         cond, msg = conds.get(e, (False, ""))
         s = events_state.get(e) or {"status": "armed", "pending": 0}
         status = s.get("status", "armed")
         pending = int(s.get("pending", 0) or 0)
+        pday = str(s.get("pday") or "")     # 마지막으로 pending 을 올린 날짜
         seen = set(s.get("keys") or [])
         now_keys = set(sev.get(e) or [])
 
@@ -1095,10 +1108,14 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
 
         if cond:
             if status == "armed":
-                pending += 1
+                # 같은 날 두 번째 호출이면 카운터를 올리지 않는다.
+                # today_str 이 비면 종전 동작(매번 진행) — 하위호환.
+                if (not today_str) or (pday != today_str):
+                    pending += 1
+                    pday = today_str
                 if pending >= confirm_days:
                     fired.append({"event": e, "label": ALERT_EVENT_LABELS.get(e, e), "message": msg})
-                    status, pending = "fired", 0
+                    status, pending, pday = "fired", 0, ""
                     seen = set(now_keys)
             else:
                 # 이미 발동 상태 — 조건이 '지속'만 하면 침묵, '악화'하면 1회 재발동.
@@ -1118,31 +1135,36 @@ def evaluate_alert_transitions(analysis: dict, enabled_events, last_state_json: 
                     "message": (f"직전 매수 신호 조건 해제 — 현재 판정: {msg}"
                                 if msg else "직전 매수 신호 조건 해제 — 재평가 필요"),
                 })
-            status, pending = "armed", 0  # 재무장
+            status, pending, pday = "armed", 0, ""  # 재무장
             seen = set()
-        events_state[e] = {"status": status, "pending": pending, "keys": sorted(seen)}
+        events_state[e] = {"status": status, "pending": pending,
+                           "keys": sorted(seen), "pday": pday}
 
     # 레짐 전환: baseline 대비 변경 + 확정 → 발동 후 baseline 갱신(자동 재무장)
     if cur_regime is not None:
         if baseline_regime is None:
             baseline_regime = cur_regime  # 최초 기준점, 발동 안 함
-            events_state["regime"] = {"cand": None, "pending": 0}
+            events_state["regime"] = {"cand": None, "pending": 0, "pday": ""}
         elif "regime" in enabled and cur_regime != baseline_regime:
             rs = events_state.get("regime") or {"cand": None, "pending": 0}
             if rs.get("cand") == cur_regime:
-                rs["pending"] = int(rs.get("pending", 0) or 0) + 1
+                # 같은 후보 + 같은 날 재호출이면 진행하지 않는다.
+                if (not today_str) or (str(rs.get("pday") or "") != today_str):
+                    rs["pending"] = int(rs.get("pending", 0) or 0) + 1
+                    rs["pday"] = today_str
             else:
-                rs = {"cand": cur_regime, "pending": 1}
+                # 후보가 바뀐 것은 같은 날이라도 새 사건이다.
+                rs = {"cand": cur_regime, "pending": 1, "pday": today_str}
             if rs["pending"] >= confirm_days:
                 fired.append({
                     "event": "regime", "label": ALERT_EVENT_LABELS["regime"],
                     "message": f"{_REGIME_KR.get(baseline_regime, baseline_regime)} → {_REGIME_KR.get(cur_regime, cur_regime)}",
                 })
                 baseline_regime = cur_regime
-                rs = {"cand": None, "pending": 0}
+                rs = {"cand": None, "pending": 0, "pday": ""}
             events_state["regime"] = rs
         else:
-            events_state["regime"] = {"cand": None, "pending": 0}
+            events_state["regime"] = {"cand": None, "pending": 0, "pday": ""}
 
     new_state = {"regime": baseline_regime, "events": events_state, "ts": today_str}
     return fired, _json.dumps(new_state, ensure_ascii=False)
