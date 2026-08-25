@@ -1,0 +1,61 @@
+name: 🔬 진단 — 알림 확정 카운터 날짜 가드 (수동 전용)
+
+# 언제 쓰나:
+#   evaluate_alert_transitions 나 ALERT_CONFIRM_DAYS 를 건드린 직후, 배포 전.
+#   5PM 워크플로를 수동 재실행하기 전에도 한 번 돌려 두면 안심할 수 있다.
+#
+# 배경:
+#   pending 카운터가 '호출 1회 = 1 진행' 이었다. 독스트링에 "하루 1회 호출
+#   전제" 라고 적혀 있을 뿐 강제되지 않아, 5PM 잡을 하루 두 번 돌리면
+#   (수동 재실행 · 재시도 · repository_dispatch 중복) 2일 확정이 하루 만에
+#   통과해 알림이 조기 발동했다.
+#
+#   이 위험 때문에 A-2c 라이브니스 스캔을 강제 실행하지 못하고 금요일
+#   자연 실행을 기다려야 했다. 가드가 들어간 뒤로는 언제든 재실행할 수 있다.
+#
+# 무엇을 검사하나 (15항목):
+#   A 일반 이벤트 — 같은 날 N회 / 이틀 / 하루 3회씩 이틀 / 발동 후 재호출 /
+#                   today_str 빈 값 / pday 없는 구버전 state / 백테스트 패턴
+#   B 레짐 전환   — 같은 가드가 걸리는지
+#   C 양성 대조
+#
+#   ⚠️ 핵심은 '통째 스킵이 아니다' 는 것이다(A-6). 같은 날 재호출에서 평가를
+#      건너뛰면 1차 실행이 데이터 오류로 실패했을 때 재실행이 아무것도
+#      복구하지 못한다. 카운터만 막고 악화 감지·재무장은 그대로 돈다.
+#
+#   ⚠️ 로직을 복사하지 않는다. regime_core 의 실제 함수를 호출한다.
+#      가드 이전 코드에 물리면 15건 중 5건이 실패한다 — 검증된 사실.
+#
+# 안전성:
+#   · 네트워크·시트·FMP·메일 접근 없음 · 시크릿 불필요 · 부작용 없음
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install numpy pandas
+
+      - name: 🔬 날짜 가드 회귀 + 양성대조
+        run: python automation/diag_alert_dateguard.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          regime_core.py
+          automation/diag_alert_dateguard.py
