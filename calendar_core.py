@@ -77,6 +77,12 @@ except Exception:                                    # pragma: no cover
 CALENDAR_CORE_VERSION = "1.1.0"   # 1.1.0: 반일장(조기 마감) 규칙 추가
 
 CAL_SHEET = "Market_Calendar"
+# ⚠️ Adj_Open / Adj_Close 는 **가격이 아니라 시각**이다("09:30" · "13:00").
+#    FMP 응답 필드 adjOpenTime / adjCloseTime 에서 Time 이 탈락한 이름이다.
+#    열 이름만 보고 가격으로 읽으면 안 된다. 값은 전부 "HH:MM" 문자열이고,
+#    비어 있으면 그 날은 정규 마감(REGULAR_CLOSE_TIME)이라는 뜻이다.
+#    (이름을 고치지 않은 이유: 시트 헤더가 갱신되기 전 한 주 동안 구 헤더를
+#     받아줘야 해서 parse_calendar_values 에 영구 호환 분기가 생긴다.)
 CAL_COLS = ["Date", "Exchange", "Name", "Is_Closed",
             "Adj_Open", "Adj_Close", "Source", "Updated_At"]
 
