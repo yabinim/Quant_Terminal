@@ -1,0 +1,74 @@
+name: 🔬 진단 — 백테스트 유니버스 퍼널 검증 (수동 전용)
+
+# 언제 쓰나:
+#   월간 백테스트를 돌리기 **직전에** 한 번.
+#   run_signal_backtest.py 의 페치·유니버스·결과행 관련 코드를 건드린 뒤에도.
+#
+# 왜 필요한가 — 이 고장은 조용하다:
+#   FMP 분당 한도(300)를 넘긴 요청이 429 로 되돌아온다
+#     → status_code != 200 → 빈 DataFrame → 그 종목이 소리 없이 사라진다
+#     → 백테스트는 정상 완료되고 시트에 정상처럼 보이는 행이 쌓인다
+#     → 크기만 다를 뿐이라 사후에 골라낼 수 없다
+#     → run 간 비교가 오염된 줄 모르고 결론을 낸다
+#
+#   2026-08-26 진단에서 실제로 발생했다. 로그에 `299/474` 로만 남았고
+#   (299 = 300/분 − SPY 1콜) 몇 주간 발견되지 않았다. 8-01 의 `227→159` 도
+#   TEST_LOOKBACK 탓으로 **잘못 기록**돼 있었으나 같은 원인이었다.
+#
+# 무엇을 검사하나 (66항목):
+#   1 스로틀    _fmp_price_history 가 fmp_http SSOT 를 거치는지 (AST)
+#   2 분류      429·402·4xx·빈응답·예외를 사유별로 구분해 반환하는지 (스텁 주입)
+#   3 집계      _batch_fetch_history 가 사유·탈락 목록을 보존하는지
+#   4 게이트    부분 유니버스가 **시트 쓰기 전에** 차단되는지 (AST 순서)
+#   5 지문      세그먼트별 Universe_Size/Hash 가 실제 평가 집합을 반영하는지
+#   6 기록      결과 행에 지문이 실리는지
+#   7 뮤테이션  위 검사가 결함을 실제로 잡는지 역검증 + 양성대조
+#
+#   4절의 **순서** 검사가 핵심이다. 게이트가 있는지만 보면, 게이트를 시트 쓰기
+#   뒤로 옮긴 변경을 못 잡는다 — 오염 행은 그대로 들어가고 종료 코드만 1이 된다.
+#
+#   5절도 존재 검사로는 부족하다. 해시를 sorted() 없이 계산하면 구성이 같은데도
+#   run 마다 값이 달라지는데, 겉보기에는 '해시가 잘 찍히는' 정상 동작으로 보인다.
+#
+# 안전성:
+#   · 네트워크 접근 없음 · 시트 접근 없음 · FMP 호출 없음 · 이메일 없음
+#   · 부작용 전혀 없다. 몇 번을 돌려도 같은 결과.
+#
+# 락스텝: run_signal_backtest.py 와 같이 배포한다.
+#   미패치 버전에 이 스위트를 돌리면 "v2.8 이전 버전이다" 로 명시 중단한다.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # run_signal_backtest 를 실제로 import 하므로 모듈 의존성이 필요하다
+      # (환경변수는 .get 으로 읽어서 시크릿 없이도 import 가 된다).
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install numpy pandas pytz requests gspread google-auth
+
+      - name: 🔬 유니버스 퍼널 검증
+        run: python automation/diag_universe_funnel.py
+
+      - name: 🔬 확정 일수 배선 검증 (락스텝 짝 — 열 추가로 안 깨졌는지)
+        run: python automation/diag_confirm_sweep.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/run_signal_backtest.py
+          automation/diag_universe_funnel.py
