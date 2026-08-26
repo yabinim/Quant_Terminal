@@ -25,7 +25,10 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import requests
+# ⚠️ requests 를 일부러 임포트하지 않는다. 이 파일의 모든 FMP 호출은 fmp_http 를
+#    거친다(레이트리밋/429 백오프 SSOT). 임포트가 없으면 원시 호출을 되살릴 때
+#    반드시 임포트를 다시 추가해야 하므로 리뷰에서 눈에 띈다 — 규칙이 아니라
+#    구조로 막는다. 저장소 전역 감시는 diag_fmp_ssot.py A1 이 한다.
 import numpy as np
 import pandas as pd
 import pytz
@@ -41,6 +44,7 @@ import accounts_core as ac  # noqa: E402  — 계좌 프로필/자본금 순수 
 import earnings_core as ec  # noqa: E402  — 실적 이벤트 리스크 SSOT (app.py와 동일 모듈)
 import watchlist_metrics_core as wm  # noqa: E402  — 워치리스트 표시 지표 SSOT (app.py와 동일 모듈)
 import calendar_core as cc  # noqa: E402  — 시장 캘린더(휴장일) SSOT
+import fmp_http as fh     # noqa: E402  — FMP 레이트리밋/429 백오프 SSOT
 
 # ── 환경변수 ───────────────────────────────────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -54,7 +58,10 @@ _gcp_info = json.loads(GSPREAD_KEY_JSON)
 _KST = pytz.timezone("Asia/Seoul")
 _ET  = pytz.timezone("America/New_York")
 _FMP_BASE = "https://financialmodelingprep.com/stable"   # app.py 와 동일 (/stable/ 전용)
-_FMP_TIMEOUT = 15
+# 2026-08-26: 15 → 20. FMP 가 historical-price-eod 의 `limit` 을 **무시**하는 것이
+# diag_fmp_depth 로 확인됐다(limit=500 요청 → 1254봉 수신). 즉 이 파이프라인의
+# 모든 이력 호출은 limit 값과 무관하게 항상 5년치 페이로드를 받는다. 15초는 빠듯하다.
+_FMP_TIMEOUT = 20
 _SPREADSHEET_TITLE   = "Quant_DB"
 _WATCHLIST_WORKSHEET = "Watchlist"
 
@@ -227,12 +234,26 @@ def get_gspread_client():
 
 # ── FMP 가격 히스토리 (app.py cached_timing_price_history 와 동일 컬럼: OHLCV) ──
 def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
+    """FMP 일봉 → OHLCV DataFrame. 실패하면 빈 DataFrame(호출부 계약 불변).
+
+    2026-08-26: 원시 requests.get → fh.fmp_get_ex(레이트리밋/429 백오프 SSOT).
+
+    분당 한도 때문이 아니다 — 이 파이프라인은 5PM 약 90콜·2PM 약 180콜로 한도
+    (200/분) 아래이고 순차 호출이다. 진짜 이유는 **재시도가 없다는 것**이었다:
+    429 한 번이나 타임아웃 한 번이면 그 종목이 곧바로 _nodata 로 떨어지고,
+    그러면 A-2b 가 원인을 모르니 profile 을 **한 콜 더 써서** 조회한 뒤
+    🟡 "일시적 데이터 공백" 으로 이메일에 쓴다. 콜도 낭비하고 알림도 부정확했다.
+
+    ⚠️ 반환 계약은 일부러 바꾸지 않았다. (df, kind) 로 넓히면 nodata 회계·
+       이메일 렌더·diag_nodata_radar 92항목까지 파급된다 — 실운용 발송 경로다.
+       kind 를 nodata 원인 분류에 태우는 건 Phase 2 로 미룬다.
+    """
     try:
-        r = requests.get(
+        r, _status, _kind = fh.fmp_get_ex(
             f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
             timeout=_FMP_TIMEOUT,
         )
-        if r.status_code != 200:
+        if r is None or _kind != "ok":
             return pd.DataFrame()
         data = r.json()
         rows = data.get("historical", data) if isinstance(data, dict) else data
@@ -255,11 +276,17 @@ def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
 
 # ── 장중 실시간 가격 (잠정 봉 주입용) ───────────────────────────────────────────
 def _fmp_quote_price(ticker: str):
-    """/stable/quote → 현재가(price). 장중 잠정 판정용."""
+    """/stable/quote → 현재가(price). 장중 잠정 판정용. 실패는 None.
+
+    None 이어도 호출부(eval_watchlist_intraday)가 전일 종가로 폴백하므로
+    이 경로의 실패는 치명적이지 않다. 그래도 재시도를 붙이는 이유는, 폴백이
+    일어나면 '장중 헤드업'이 조용히 '전일 종가 판정'으로 바뀌기 때문이다.
+    """
     try:
-        r = requests.get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={FMP_API_KEY}",
-                         timeout=_FMP_TIMEOUT)
-        if r.status_code != 200:
+        r, _status, _kind = fh.fmp_get_ex(
+            f"{_FMP_BASE}/quote?symbol={ticker}&apikey={FMP_API_KEY}",
+            timeout=_FMP_TIMEOUT)
+        if r is None or _kind != "ok":
             return None
         data = r.json()
         row = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
@@ -590,21 +617,30 @@ def _fmp_profile_status(ticker: str):
 
     이 함수만 네트워크를 만진다. 판정 로직(classify_nodata_causes)과 분리해야
     회귀 스위트가 네트워크 없이 검사할 수 있다.
+
+    2026-08-26: fh.fmp_get_ex 로 전환. 상태 코드는 응답 객체가 아니라 **두 번째
+    반환값**에서 읽는다 — fmp_get_ex 는 402/에러일 때 r=None 을 주므로
+    r.status_code 를 그대로 쓰면 AttributeError 가 난다.
+
+    ⚠️ 402 는 재시도하지 않는다(fmp_get_ex 가 즉시 반환). 해외 상장은 몇 번을
+       다시 물어도 플랜에 없다 — 기존 동작과 동일하다.
     """
     try:
-        r = requests.get(
+        r, _status, _kind = fh.fmp_get_ex(
             f"{_FMP_BASE}/profile?symbol={ticker}&apikey={FMP_API_KEY}",
             timeout=_FMP_TIMEOUT,
         )
     except Exception as e:
         return "unknown", "", f"요청 실패({type(e).__name__})"
 
-    if r.status_code == 402:
+    if _kind == "plan_limited" or _status == 402:
         # 해외 거래소(.F/.KS/.T 등)에서 실제로 발생한다. 플랜 제한이지
         # 상장폐지가 아니다 — 단정하면 안 된다.
         return "unknown", "", "플랜 미포함(해외 상장 가능성)"
-    if r.status_code != 200:
-        return "unknown", "", f"HTTP {r.status_code}"
+    if r is None or _kind != "ok":
+        # 재시도까지 하고도 실패했다는 뜻. 여기서 "gone" 으로 넘어가면
+        # 우리 쪽 네트워크 문제를 티커 소멸로 오진한다.
+        return "unknown", "", (f"HTTP {_status}" if _status else f"조회 실패({_kind})")
 
     try:
         data = r.json()
@@ -834,17 +870,21 @@ def _fmp_actively_trading_symbols():
 
     None 과 빈 집합을 반드시 구분한다. 빈 집합을 돌려주면 호출부가
     '전 종목 부재'로 읽어 **모든 보유에 사망 경고**를 보낸다.
+
+    2026-08-26: fh.fmp_get_ex 로 전환. 응답이 26,000여 행·1.5MB 라 한 번의
+    일시적 실패가 그 주 점검 전체를 날린다 — 재시도의 가치가 가장 큰 호출이다.
+    실패 시 None 을 돌려주는 계약은 그대로다.
     """
     try:
-        r = requests.get(
+        r, _status, _kind = fh.fmp_get_ex(
             f"{_FMP_BASE}/actively-trading-list?apikey={FMP_API_KEY}",
             timeout=max(_FMP_TIMEOUT, 30),
         )
     except Exception as e:
         print(f"[LIVE] 목록 조회 실패({type(e).__name__}) — 점검 생략")
         return None
-    if r.status_code != 200:
-        print(f"[LIVE] 목록 HTTP {r.status_code} — 점검 생략")
+    if r is None or _kind != "ok":
+        print(f"[LIVE] 목록 조회 실패(HTTP {_status} · {_kind}) — 점검 생략")
         return None
     try:
         data = r.json()

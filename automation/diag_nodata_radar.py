@@ -26,8 +26,10 @@
     python automation/diag_nodata_radar.py
 """
 import ast
+import inspect
 import os
 import sys
+import textwrap
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
@@ -857,7 +859,11 @@ def test_liveness():
 #    지금은 하한선이 그걸 막지만, 하한선을 '중복이니 지우자'고 없애는 순간
 #    이 결함이 되살아난다. 둘 다 못으로 박아둔다.
 #
-#    이 함수만 requests 를 만지므로 가짜 requests 를 물려 따로 실행한다.
+#    이 함수만 네트워크를 만지므로 가짜 fetcher 를 물려 따로 실행한다.
+#
+#    2026-08-26 락스텝: run_watchlist_alerts 가 requests.get → fh.fmp_get_ex 로
+#    전환됐다. 하네스도 같이 바꾸지 않으면 exec 네임스페이스에 fh 가 없어
+#    **NameError 로 F2 전체가 깨진다.** 두 파일은 반드시 함께 배포한다.
 def _extract_fetcher():
     path = None
     for cand in (os.path.join(_HERE, "run_watchlist_alerts.py"),
@@ -889,14 +895,20 @@ class _FakeResp:
         return self._p
 
 
-class _FakeRequests:
-    def __init__(self, resp=None, exc=None):
-        self._resp, self._exc = resp, exc
+class _FakeFh:
+    """fmp_http 대역. fmp_get_ex 는 (응답|None, status, kind) 3-튜플을 돌려준다.
 
-    def get(self, *a, **k):
+    ⚠️ 실물과 계약이 어긋나면 이 스위트는 통과하는데 실운용은 깨진다. 아래
+    _assert_fh_contract() 가 실제 fmp_http 를 import 해 반환 길이를 대조한다.
+    """
+
+    def __init__(self, resp=None, status=200, kind="ok", exc=None):
+        self._resp, self._status, self._kind, self._exc = resp, status, kind, exc
+
+    def fmp_get_ex(self, *a, **k):
         if self._exc:
             raise self._exc
-        return self._resp
+        return self._resp, self._status, self._kind
 
 
 def test_fetcher_contract():
@@ -904,24 +916,54 @@ def test_fetcher_contract():
     node, _path = _extract_fetcher()
 
     def run(fake):
-        ns = {"print": lambda *a, **k: None, "requests": fake,
+        ns = {"print": lambda *a, **k: None, "fh": fake,
               "_FMP_BASE": "https://x", "FMP_API_KEY": "k", "_FMP_TIMEOUT": 5}
         mod = ast.Module(body=[node], type_ignores=[])
         exec(compile(ast.fix_missing_locations(mod), "<f>", "exec"), ns)
         return ns["_fmp_actively_trading_symbols"]()
 
-    check("F2-1 네트워크 예외 → None (빈 집합 아님)",
-          run(_FakeRequests(exc=RuntimeError("boom"))) is None)
+    # SSOT 전환 자체를 못으로 박는다. 원시 requests 로 되돌리면 여기서 걸린다.
+    _names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    check("F2-0 원시 requests 를 쓰지 않는다 (fmp_http 경유)",
+          "requests" not in _names and "fh" in _names,
+          repr(sorted(_names & {"requests", "fh"})))
+
+    check("F2-1 fetcher 자체가 예외를 던져도 → None (빈 집합 아님)",
+          run(_FakeFh(exc=RuntimeError("boom"))) is None)
+    check("F2-1b 네트워크 예외를 kind 로 받아도 → None",
+          run(_FakeFh(resp=None, status=0, kind="exception")) is None)
     check("F2-2 HTTP 402 → None",
-          run(_FakeRequests(resp=_FakeResp(402))) is None)
+          run(_FakeFh(resp=None, status=402, kind="plan_limited")) is None)
+    # 재시도까지 소진한 429. 전환 전에는 존재하지 않던 실패 모드다.
+    check("F2-2b 레이트리밋 소진 → None",
+          run(_FakeFh(resp=None, status=429, kind="rate_limited")) is None)
     check("F2-3 JSON 파싱 실패 → None",
-          run(_FakeRequests(resp=_FakeResp(200, raise_json=True))) is None)
+          run(_FakeFh(resp=_FakeResp(200, raise_json=True))) is None)
     check("F2-4 응답 타입 이상(dict) → None",
-          run(_FakeRequests(resp=_FakeResp(200, {"a": 1}))) is None)
-    got = run(_FakeRequests(resp=_FakeResp(200, [{"symbol": "aapl"}, {"symbol": "MSFT"}])))
+          run(_FakeFh(resp=_FakeResp(200, {"a": 1}))) is None)
+    got = run(_FakeFh(resp=_FakeResp(200, [{"symbol": "aapl"}, {"symbol": "MSFT"}])))
     check("F2-5 정상 → 대문자 심볼 집합", got == {"AAPL", "MSFT"}, repr(got))
-    got2 = run(_FakeRequests(resp=_FakeResp(200, ["aapl", "msft"])))
+    got2 = run(_FakeFh(resp=_FakeResp(200, ["aapl", "msft"])))
     check("F2-6 원소가 문자열이어도 견딤", got2 == {"AAPL", "MSFT"}, repr(got2))
+    _assert_fh_contract()
+
+
+def _assert_fh_contract():
+    """가짜 fh 가 실물 fmp_http 와 같은 계약인지 대조.
+
+    대역(mock)은 반드시 실물에서 멀어진다. 실물 fmp_get_ex 의 반환 원소 수가
+    바뀌면 이 스위트는 계속 초록불인데 실운용만 깨진다 — 그 침묵을 막는다.
+    """
+    try:
+        import fmp_http as _real
+    except Exception as e:
+        check("F2-7 실물 fmp_http 계약 대조", False, f"import 실패: {e}")
+        return
+    src = inspect.getsource(_real.fmp_get_ex)
+    arities = {len(n.value.elts) for n in ast.walk(ast.parse(textwrap.dedent(src)))
+               if isinstance(n, ast.Return) and isinstance(n.value, ast.Tuple)}
+    check("F2-7 실물 fmp_get_ex 가 3-튜플만 반환 (가짜 fh 와 동일 계약)",
+          arities == {3}, repr(sorted(arities)))
 
 
 # ══════════════════════════════════════════════════════════════════════════

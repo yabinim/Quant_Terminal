@@ -133,10 +133,9 @@ _RAW_GET_BASELINE = {
     "app.py": 58,
     # 8AM/9AM DRG 예측. 종목 수가 적어(매크로 지표 중심) 한도에 닿지 않는다.
     "run_drg_predict.py": 11,
-    # ⚠️ 실운용 경로. 순차 호출이라 병렬 폭주는 없고, 결측을 _nodata 회계 +
-    #    A-2b 원인분류가 잡아낸다(무성 탈락이 아니다). 다만 스로틀·429 재시도는
-    #    없으므로 유니버스가 커지면 위험해진다. 다음 우선순위 후보.
-    "run_watchlist_alerts.py": 4,
+    # run_watchlist_alerts.py 는 2026-08-26 에 4곳 전부 fmp_http 로 전환됐다.
+    # requests 임포트 자체를 지워 되살리려면 임포트를 다시 추가해야 한다.
+    # 기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
     "narrative_core.py": 2,
     "run_narrative.py": 2,
     "run_drg_verify.py": 1,
