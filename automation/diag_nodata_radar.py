@@ -26,10 +26,8 @@
     python automation/diag_nodata_radar.py
 """
 import ast
-import inspect
 import os
 import sys
-import textwrap
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
@@ -953,15 +951,35 @@ def _assert_fh_contract():
 
     대역(mock)은 반드시 실물에서 멀어진다. 실물 fmp_get_ex 의 반환 원소 수가
     바뀌면 이 스위트는 계속 초록불인데 실운용만 깨진다 — 그 침묵을 막는다.
+
+    ⚠️ import 하지 않고 **소스를 읽는다.** 이 파일의 원칙이기도 하지만
+    (상단 '대상 함수를 실제 소스에서 추출' 참조), 실무적 이유가 더 크다:
+    fmp_http.py 는 저장소 루트, 이 파일은 automation/ 에 있어 워크플로가
+    `python automation/diag_nodata_radar.py` 로 돌리면 sys.path[0] 가
+    automation/ 이라 import 가 실패한다. 2026-08-26 초안이 정확히 그렇게
+    깨졌다 — 평면 구조인 개발 환경에서는 통과하고 배포에서만 터졌다.
     """
-    try:
-        import fmp_http as _real
-    except Exception as e:
-        check("F2-7 실물 fmp_http 계약 대조", False, f"import 실패: {e}")
+    path = None
+    for cand in (os.path.join(_ROOT, "fmp_http.py"),
+                 os.path.join(_HERE, "fmp_http.py"),
+                 os.path.join(_ROOT, "automation", "fmp_http.py")):
+        if os.path.exists(cand):
+            path = cand
+            break
+    if path is None:
+        check("F2-7 실물 fmp_get_ex 계약 대조", False, "fmp_http.py 를 찾을 수 없음")
         return
-    src = inspect.getsource(_real.fmp_get_ex)
-    arities = {len(n.value.elts) for n in ast.walk(ast.parse(textwrap.dedent(src)))
-               if isinstance(n, ast.Return) and isinstance(n.value, ast.Tuple)}
+
+    node = None
+    for n in ast.parse(open(path, encoding="utf-8").read()).body:
+        if isinstance(n, ast.FunctionDef) and n.name == "fmp_get_ex":
+            node = n
+    if node is None:
+        check("F2-7 실물 fmp_get_ex 계약 대조", False, "fmp_get_ex 정의 없음")
+        return
+
+    arities = {len(r.value.elts) for r in ast.walk(node)
+               if isinstance(r, ast.Return) and isinstance(r.value, ast.Tuple)}
     check("F2-7 실물 fmp_get_ex 가 3-튜플만 반환 (가짜 fh 와 동일 계약)",
           arities == {3}, repr(sorted(arities)))
 
