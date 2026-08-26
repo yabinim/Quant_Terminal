@@ -92,6 +92,7 @@ import json
 import time
 import random
 import concurrent.futures
+import hashlib
 from datetime import datetime
 
 import numpy as np
@@ -102,6 +103,11 @@ import pytz
 #    (automation/ 하위에 두는 전제: dirname(dirname(file)) = 레포 루트)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import regime_core as rc  # noqa: E402
+import fmp_http as fh     # noqa: E402
+#   ⚠️ v2.8: FMP 호출은 반드시 fmp_http 를 거친다. 원시 requests.get 은
+#      레이트리밋을 우회해 분당 300 을 넘기고, 초과분이 429 → 빈 DataFrame 으로
+#      조용히 사라진다. 2026-08-26 진단: 474종목 중 174종목이 몇 주간 무성 탈락
+#      (로그에 '299/474' 로만 남았다. 299 = 300/분 − SPY 1콜).
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -130,6 +136,7 @@ _RT_COLS = [
     "Trades", "Closed", "OpenAtEnd_Pct", "WinRate", "Avg_R", "Median_R",
     "Avg_Ret_Pct", "Median_Ret_Pct", "Avg_Hold_Days", "EarlyExit_Pct",
     "Excess_vs_SPY_Pct", "Top_Exit_Reason",
+    "Universe_Hash",                       # v2.8: 세그먼트 티커 집합 지문
 ]
 _RESULT_COLS = [
     "Run_Date", "History_Start", "History_End", "Universe_Size", "Verdict",
@@ -140,10 +147,12 @@ _RESULT_COLS = [
     "Mode",                                # v1.4: verdict(화면 판정) | alert(실제 이메일)
     "Segment",                             # v1.5: all | etf | stock
     "Confirm_Days",                        # v2.7: 확정 일수 — 스윕 행 구분(Entry_Rule 과 같은 목적)
+    "Universe_Hash",                       # v2.8: 이 행 세그먼트의 티커 집합 지문
 ]
 
 _FMP_BASE    = "https://financialmodelingprep.com/stable"
-_FMP_TIMEOUT = 8
+_FMP_TIMEOUT = 20            # v2.8: 7(fmp_http 기본)·8 은 1,255봉 페이로드에 짧다.
+#   레이트리밋만 고치고 타임아웃을 그대로 두면 탈락 사유만 바뀔 뿐 결과가 같다.
 _FETCH_WORKERS = 8           # FMP Starter 300 req/min 여유
 
 # 백테스트 파라미터 (튜닝 한 곳)
@@ -155,8 +164,13 @@ TEST_LOOKBACK  = 934           # v2.5: 평가 구간(거래일 ≈ 3.7년) — F
 #   롤링)만 반환한다. 500 을 요청하든 5000 을 요청하든 시작일이 동일했다.
 #   → 2018 Q4·2020 코로나 폭락은 데이터 자체가 없어 아웃오브샘플 검증이 불가능하다.
 #   가능한 최대 = 1255 − MIN_PRIOR_BARS(220) − 꼬리(101) = 934.
-#   v2.4 의 2140 은 이 한도를 넘어서 종목 대부분이 조건 미달 탈락 → 유니버스가
-#   227→159 로 줄었다(진단상 0/60 충족). 한도에 맞춰 되돌린다.
+#   ⚠️ v2.8 정정: 예전 주석은 '2140 이 한도를 넘어 종목이 조건 미달 탈락해
+#   유니버스가 227→159 로 줄었다' 고 적었으나 **틀렸다.** 탈락 게이트는
+#   `n < min_prior+2` 와 `start_i = max(min_prior, n - test_lookback)` 둘뿐이고
+#   test_lookback 을 늘리면 평가일은 오히려 **늘어난다**. 실제 원인은 FMP
+#   분당 300 한도였다 — 8-01 로그가 `299/415`, 여기에 d0 생존율 53% 를 곱하면
+#   정확히 159 다(227 은 페치가 전부 성공한 run). v2.8 에서 fmp_http 스로틀로
+#   해결. 934 라는 값 자체는 1,255봉 한도 때문에 여전히 타당하다.
 
 # ── v2.7(2026-08-25): 확정 일수 스윕 ──────────────────────────────────────
 # "2일 확정이 값어치를 하는가" 를 재려고 외부에서 조절할 수 있게 뺐다.
@@ -187,6 +201,56 @@ def _env_confirm_days(raw=None, default: int = 2) -> int:
 
 
 CONFIRM_DAYS   = _env_confirm_days()   # v1.1: raw code 가 N일 연속 유지돼야 확정
+
+
+# ── v2.8(2026-08-26): 부분 유니버스 차단 ────────────────────────────────────
+# 페치가 일부만 성공해도 백테스트는 정상 완료되고 결과가 시트에 기록된다.
+# 크기만 다른 '정상처럼 보이는 오염 행' 이라 사후에 골라낼 수 없다.
+#
+# ⚠️ 우회 스위치(SKIP_FETCH_GATE=1 류)는 두지 않는다. '이번만 넘기자' 용 플래그는
+#    반드시 기본값이 된다. 낮추려면 이 값을 명시적으로 내려야 하고 로그에 남는다.
+def _env_fetch_rate(raw=None, default: float = 0.98) -> float:
+    """MIN_FETCH_RATE 파싱. 0.0~1.0 만 허용, 그 외는 경고 후 default."""
+    if raw is None:
+        raw = os.environ.get("MIN_FETCH_RATE", "")
+    t = str(raw).strip()
+    if not t:
+        return default
+    try:
+        v = float(t)
+    except (TypeError, ValueError):
+        print("[WARN] MIN_FETCH_RATE=" + repr(t) + " 는 실수가 아니다 → "
+              + str(default) + " 로 폴백")
+        return default
+    if not (0.0 <= v <= 1.0):
+        print("[WARN] MIN_FETCH_RATE=" + str(v) + " 는 범위(0.0~1.0) 밖 → "
+              + str(default) + " 로 폴백")
+        return default
+    if v < default:
+        print("[WARN] MIN_FETCH_RATE=" + str(v) + " — 기본 " + str(default)
+              + " 보다 낮다. 부분 유니버스 결과가 시트에 들어갈 수 있다.")
+    return v
+
+
+MIN_FETCH_RATE = _env_fetch_rate()
+
+
+def universe_hash(tickers) -> str:
+    """정렬된 티커 목록의 SHA1 앞 8자 — run 간 '같은 유니버스였나' 를 시트만 보고 판정.
+
+    ⚠️ 반드시 sorted() 를 거쳐야 한다. 집합(set) 순회 순서로 계산하면 구성이
+    같은데도 run 마다 값이 달라져 열 자체가 무의미해진다 — 그런데 겉보기에는
+    '해시가 잘 찍히는' 정상 동작으로 보인다.
+    """
+    seq = sorted(str(t).strip().upper() for t in (tickers or [])
+                 if str(t).strip())
+    if not seq:
+        return ""
+    # ⚠️ 접두어 'u' 는 장식이 아니다. 시트 쓰기가 USER_ENTERED 라, 16진수 8자가
+    #    우연히 전부 숫자면(확률 (10/16)^8 ≈ 2.3%) 구글 시트가 수로 해석해 앞자리
+    #    0 을 날린다("00123456" → 123456). 그러면 같은 유니버스인데 해시가 달라
+    #    보이고, 그게 바로 이 열이 막으려던 사고다.
+    return "u" + hashlib.sha1("\n".join(seq).encode("utf-8")).hexdigest()[:8]
 COOLDOWN_DAYS  = 5             # v1.1: 같은 code 재기록 최소 간격(경계 진동 압축)
 ENTRY_LAG_DAYS = 1             # v1.2: 신호일(t) 대비 실제 진입 거래일 지연.
                                #   1 = 메일(16:00 ET) 받고 '다음 거래일' 매수 = 라이브 구조.
@@ -786,25 +850,38 @@ def _jsonable(v):
 
 
 def build_rt_rows(rt_aggs: dict, run_date: str, hist_start: str, hist_end: str,
-                  universe_size: int) -> list:
+                  universe_size: int, seg_size: dict = None,
+                  seg_hash: dict = None) -> list:
+    """v2.8: Universe_Size 를 그 행 세그먼트의 실 종목수로 기록하고 지문을 붙인다.
+
+    seg_size/seg_hash 미제공 시 전역값으로 폴백(구 호출부 호환).
+    """
     rows = []
     for _k, a in rt_aggs.items():
         m, seg, yr = (_k + ("all",))[:3] if len(_k) == 2 else _k
+        _sz = (seg_size or {}).get(seg, universe_size)
+        _hs = (seg_hash or {}).get(seg, "")
         rows.append([_jsonable(x) for x in
-                     [run_date, hist_start, hist_end, universe_size, m, seg, yr,
+                     [run_date, hist_start, hist_end, _sz, m, seg, yr,
                       a.get("trades", 0), a.get("closed", 0), a.get("open_pct"),
                       a.get("winrate"), a.get("avg_r"), a.get("median_r"),
                       a.get("avg_ret"), a.get("median_ret"), a.get("avg_hold"),
-                      a.get("early_pct"), a.get("excess"), a.get("top_reason", "")]])
+                      a.get("early_pct"), a.get("excess"), a.get("top_reason", ""),
+                      _hs]])
     return rows
 
 
 def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
                       universe_size: int, buckets=BUCKETS,
-                      mode: str = "verdict", segment: str = "all") -> list[list]:
+                      mode: str = "verdict", segment: str = "all",
+                      uni_hash: str = "") -> list[list]:
     """집계 dict → Signal_Backtest 시트 행들(_RESULT_COLS 순서).
 
     mode: "verdict"(화면 판정) | "alert"(실제 이메일 발송 기준) — 시트 Mode 열로 구분.
+
+    v2.8 ⚠️ universe_size 의 의미가 바뀌었다: 전역 합계 → **그 행 세그먼트의 실
+    종목수**. 이전 행의 stock 값에는 ETF 가 섞여 있어, 개별주 유니버스가 바뀐
+    것인지 시트만 보고는 판별할 수 없었다. uni_hash 가 그 판정을 대신한다.
     """
     def _cell(v):
         return "" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else v
@@ -818,7 +895,7 @@ def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
             _cell(a.get("ret_20d_median")), _cell(a.get("ret_60d_mean")),
             _cell(a.get("mfe_20d_mean")), _cell(a.get("mae_20d_mean")),
             _cell(a.get("excess_20d_mean")), _cell(a.get("excess_win_20d")),
-            _ENTRY_RULE_LABEL, mode, segment, CONFIRM_DAYS,
+            _ENTRY_RULE_LABEL, mode, segment, CONFIRM_DAYS, uni_hash,
         ])
     return rows
 
@@ -894,26 +971,34 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
-def _fmp_price_history(ticker: str, limit: int = HISTORY_LIMIT) -> pd.DataFrame:
+def _fmp_price_history(ticker: str, limit: int = HISTORY_LIMIT):
     """app.py·run_watchlist_alerts 와 동일한 /stable historical-price-eod/full.
-    OHLCV(날짜 오름차순 인덱스) DataFrame 반환. 실패 시 빈 DataFrame."""
-    import requests
+
+    반환: (DataFrame, kind). kind ∈ {"ok","empty","no_key","rate_limited",
+    "plan_limited","http_error","exception"}
+
+    v2.8: 두 가지를 고쳤다.
+      1) requests.get → fh.fmp_get_ex — 레이트리밋(슬라이딩 윈도우) + 429 지수
+         백오프 + 지터가 딸려온다. 이전에는 이 경로만 SSOT 를 우회해, 분당 한도를
+         넘긴 요청이 429 로 되돌아와 빈 DataFrame 이 됐다.
+      2) 실패를 빈 DataFrame 하나로 뭉개지 않는다. 402(플랜 제한)·429(레이트리밋)·
+         빈 200 응답은 원인도 대응도 전혀 다른데 구분할 방법이 없었다.
+    """
     if not FMP_API_KEY:
-        return pd.DataFrame()
+        return pd.DataFrame(), "no_key"
+    url = (f"{_FMP_BASE}/historical-price-eod/full"
+           f"?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}")
+    r, _status, kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT)
+    if r is None or kind != "ok":
+        return pd.DataFrame(), kind
     try:
-        r = requests.get(
-            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code != 200:
-            return pd.DataFrame()
         data = r.json()
         rows = data.get("historical", data) if isinstance(data, dict) else data
         if not isinstance(rows, list) or not rows:
-            return pd.DataFrame()
+            return pd.DataFrame(), "empty"
         df = pd.DataFrame(rows)
         if "date" not in df.columns:
-            return pd.DataFrame()
+            return pd.DataFrame(), "empty"
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
         df = df.rename(columns={"close": "Close", "open": "Open", "high": "High",
@@ -921,27 +1006,41 @@ def _fmp_price_history(ticker: str, limit: int = HISTORY_LIMIT) -> pd.DataFrame:
         for col in ["Close", "Open", "High", "Low", "Volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
+        return df, "ok"
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(), "exception"
 
 
-def _batch_fetch_history(tickers: list, limit: int = HISTORY_LIMIT) -> dict:
-    """ThreadPoolExecutor 병렬 fetch → {ticker: DataFrame}. (app._fmp_batch_price_history 동일 철학)"""
-    out = {}
+def _batch_fetch_history(tickers: list, limit: int = HISTORY_LIMIT):
+    """ThreadPoolExecutor 병렬 fetch → (cache, reasons, failed).
+
+    cache   : {ticker: DataFrame}
+    reasons : {kind: count} — 성공/실패 사유 분포
+    failed  : [(ticker, kind), ...] — 탈락 종목과 그 이유
+
+    v2.8: 이전에는 `except: pass` 로 예외까지 삼켜 탈락 사유가 하나도 남지
+    않았다. 스로틀은 fh.fmp_get_ex 안에 있으므로 워커 수는 그대로 둔다
+    (워커는 한도에 걸리면 대기할 뿐 요청을 잃지 않는다).
+    """
+    out: dict = {}
+    reasons: dict = {}
+    failed: list = []
     if not tickers:
-        return out
+        return out, reasons, failed
     with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
         futs = {ex.submit(_fmp_price_history, tk, limit): tk for tk in tickers}
         for fut in concurrent.futures.as_completed(futs):
             tk = futs[fut]
             try:
-                df = fut.result()
-                if not df.empty:
-                    out[tk] = df
+                df, kind = fut.result()
             except Exception:
-                pass
-    return out
+                df, kind = pd.DataFrame(), "exception"
+            reasons[kind] = reasons.get(kind, 0) + 1
+            if df is not None and not df.empty:
+                out[tk] = df
+            else:
+                failed.append((tk, kind))
+    return out, reasons, failed
 
 
 def _read_col(ws, col_idx: int) -> list:
@@ -1067,6 +1166,7 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
     all_trades: list[dict] = []
     eval_starts, eval_ends = [], []
     n_with_data = 0
+    ok_by_seg: dict[str, list] = {}   # v2.8: d0 통과 티커를 세그먼트별로 보관
 
     for tk in universe:
         hist = hist_cache.get(tk)
@@ -1074,11 +1174,12 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
             continue
         events, alerts, tds, d0, d1 = walk_forward_events(
             hist, spy_close=spy_close, confirm_days=CONFIRM_DAYS)
+        _seg = (segment_map or {}).get(tk, "stock")
         if d0 is not None:
             n_with_data += 1
             eval_starts.append(pd.Timestamp(d0))
             eval_ends.append(pd.Timestamp(d1))
-        _seg = (segment_map or {}).get(tk, "stock")
+            ok_by_seg.setdefault(_seg, []).append(tk)
         for _e in events:
             _e["segment"] = _seg
         for _a in alerts:
@@ -1140,6 +1241,13 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         for m, a in aggregate_trades(_cohort).items():
             rt_aggs[(m, "stock", "cohort")] = a
 
+    # v2.8: 세그먼트별 '실제로 평가된' 티커 집합 — 시트의 Universe_Size/Hash 근거.
+    #   전역 해시로 하면 ETF 만 바뀌어도 개별주 비교까지 못 하게 된다.
+    _seg_tickers = {
+        "all": sorted(t for v in ok_by_seg.values() for t in v),
+        "etf": sorted(ok_by_seg.get("etf", [])),
+        "stock": sorted(ok_by_seg.get("stock", [])),
+    }
     _n_etf = sum(1 for t in universe if (segment_map or {}).get(t) == "etf")
     meta = {
         "universe_size": n_with_data,
@@ -1151,6 +1259,8 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         "n_etf": _n_etf,
         "n_stock": len(universe) - _n_etf,
     }
+    meta["seg_size"] = {k: len(v) for k, v in _seg_tickers.items()}
+    meta["seg_hash"] = {k: universe_hash(v) for k, v in _seg_tickers.items()}
     meta["rt_years"] = rt_years
     meta["rt_cohort_cutoff"] = _cutoff
     meta["rt_split_date"] = _split
@@ -1162,6 +1272,11 @@ def _print_summary(aggs: dict, meta: dict) -> None:
           f"구간 {meta['hist_start']}~{meta['hist_end']} · "
           f"판정 이벤트 {meta['total_events']} · 알림 이벤트 {meta.get('total_alerts', 0)} · "
           f"ETF {meta.get('n_etf', 0)} / 개별주 {meta.get('n_stock', 0)}")
+    _ss, _sh = meta.get("seg_size") or {}, meta.get("seg_hash") or {}
+    if _ss:
+        print("[유니버스 지문] " + " · ".join(
+            f"{k}={_ss.get(k, 0)}종목/{_sh.get(k, '') or '-'}"
+            for k in ("all", "stock", "etf")))
 
     def _s(v):
         return "-" if (v is None or (isinstance(v, float) and not np.isfinite(v))) else f"{v}"
@@ -1309,12 +1424,33 @@ def main():
         print("[INFO] 유니버스 비어 있음 — 중단")
         return 0
 
-    spy_hist = _fmp_price_history("SPY")
+    spy_hist, _spy_kind = _fmp_price_history("SPY")
     if spy_hist.empty:
-        print("[WARN] SPY 이력 fetch 실패 — 초과수익 NaN 으로 진행")
-    hist_cache = _batch_fetch_history(universe)
-    print(f"[STEP2] 이력 확보 {len(hist_cache)}/{len(universe)}종목 "
-          f"(SPY {'OK' if not spy_hist.empty else '실패'})")
+        print(f"[WARN] SPY 이력 fetch 실패({_spy_kind}) — 초과수익 NaN 으로 진행")
+    hist_cache, _reasons, _failed = _batch_fetch_history(universe)
+
+    _n_uni = len(universe)
+    _rate = (len(hist_cache) / _n_uni) if _n_uni else 1.0
+    print(f"[STEP2] 이력 확보 {len(hist_cache)}/{_n_uni}종목 ({_rate * 100:.1f}%) "
+          f"(SPY {'OK' if not spy_hist.empty else '실패:' + _spy_kind})")
+    if _reasons:
+        print("[STEP2] 사유별 — " + " · ".join(
+            f"{k}={v}" for k, v in sorted(_reasons.items(), key=lambda kv: -kv[1])))
+    print("[STEP2] " + fh.fmp_stats_line())
+    if _failed:
+        _head = ", ".join(f"{t}({k})" for t, k in sorted(_failed)[:20])
+        print(f"[STEP2] 탈락 {len(_failed)}종목 — {_head}"
+              + (" …" if len(_failed) > 20 else ""))
+
+    # v2.8: 부분 유니버스는 시트에 넣지 않는다. 크기만 다른 정상처럼 보이는 행이
+    #   섞이면 run 간 비교가 조용히 오염되고, 사후에 골라낼 방법이 없다.
+    if _rate < MIN_FETCH_RATE:
+        print(f"[ABORT] 페치 성공률 {_rate * 100:.1f}% < 임계 "
+              f"{MIN_FETCH_RATE * 100:.1f}% — 시트에 기록하지 않고 중단한다.")
+        print("[ABORT] 위 '사유별' 을 볼 것. rate_limited 가 많으면 "
+              "FMP_RATE_LIMIT_PER_MIN 을 낮추고, exception 이 많으면 "
+              "_FMP_TIMEOUT 을 늘린다.")
+        return 1
 
     aggs, rt_aggs, meta = run_backtest(universe, spy_hist, hist_cache,
                                        segment_map=segment_map)
@@ -1323,13 +1459,15 @@ def main():
 
     rows = []
     for seg in SEGMENTS:
+        _sz = (meta.get("seg_size") or {}).get(seg, meta["universe_size"])
+        _hs = (meta.get("seg_hash") or {}).get(seg, "")
         rows += build_result_rows(aggs.get(("alert", seg), {}), run_date,
                                   meta["hist_start"], meta["hist_end"],
-                                  meta["universe_size"], buckets=ALERT_BUCKETS,
-                                  mode="alert", segment=seg)
+                                  _sz, buckets=ALERT_BUCKETS,
+                                  mode="alert", segment=seg, uni_hash=_hs)
         rows += build_result_rows(aggs.get(("verdict", seg), {}), run_date,
                                   meta["hist_start"], meta["hist_end"],
-                                  meta["universe_size"], mode="verdict", segment=seg)
+                                  _sz, mode="verdict", segment=seg, uni_hash=_hs)
     try:
         ws = open_result_worksheet(gc)
         _safe_append_rows(ws, rows, ncols=len(_RESULT_COLS))
@@ -1340,7 +1478,9 @@ def main():
 
     try:
         _rt_rows = build_rt_rows(rt_aggs, run_date, meta["hist_start"], meta["hist_end"],
-                                 meta["universe_size"])
+                                 meta["universe_size"],
+                                 seg_size=meta.get("seg_size"),
+                                 seg_hash=meta.get("seg_hash"))
         _rtws = open_result_worksheet(gc, title=_RT_WORKSHEET, cols=_RT_COLS)
         _safe_append_rows(_rtws, _rt_rows, ncols=len(_RT_COLS))
         print(f"[OK] '{_RT_WORKSHEET}' 에 {len(_rt_rows)}행 저장")
