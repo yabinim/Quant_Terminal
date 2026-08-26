@@ -86,11 +86,31 @@ def write_calendar(ws, rows):
 
     ⚠️ 행 수가 줄어드는 경우(예: 3년치 → 2년치)를 대비해 먼저 clear 한다.
        clear 없이 update 만 하면 예전 꼬리가 남아 파싱 결과가 오염된다.
+
+    ⚠️ RAW 로 쓴다 — USER_ENTERED 는 이 시트를 조용히 망가뜨린다
+    ────────────────────────────────────────────────────────────
+    이 표는 8열이 **전부 리터럴 문자열**이다("2026-11-27" · "Y"/"N" ·
+    "13:00" · Updated_At). USER_ENTERED 는 그중 셋을 숫자로 바꾼다.
+
+      Adj_Close  "13:00"      → 0.5416666… (시간 값 + 시간 서식)
+      Date       "2026-11-27" → 날짜 값. 시트 로케일 서식이 M/D/YYYY 면
+                                get_all_values() 가 "11/27/2026" 을 준다.
+                                parse_calendar_values 는 len==10 을 통과시킨 뒤
+                                int(ds[:4]) = int("11/2") 에서 예외 → **그 행을
+                                조용히 버린다.** 지금 ISO 로 보이는 건 우연이다.
+
+    읽는 쪽(parse_calendar_values)은 get_all_values() 의 **표시 문자열**을 쓴다.
+    그래서 여기서는 UNFORMATTED 읽기가 아니라 **RAW 쓰기**가 맞는 짝이다
+    (숫자 열이었다면 반대였다 — 2026-08-25 Account_Profile 사례 참조).
+
+    셀에 남아 있는 옛 시간/날짜 서식은 문제가 되지 않는다. clear() 는 값만
+    지우고 서식은 남기지만, **텍스트 값은 숫자 서식의 영향을 받지 않는다.**
+    전체 교체 방식이라 이 잡이 한 번 돌면 과거 오염분도 같이 정상화된다.
     """
     ws.clear()
     body = [cc.CAL_COLS] + rows
     gsr.call(ws.update, body, range_name="A1",
-                   value_input_option="USER_ENTERED")
+                   value_input_option="RAW")
     return len(rows)
 
 

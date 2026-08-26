@@ -180,6 +180,41 @@ def is_market_open_today() -> bool:
     return cc.is_market_open_today()
 
 
+def _intraday_close_passed(now_et, close_t) -> bool:
+    """반일장 마감 시각이 이미 지났는가 — 2PM 장중 잡의 스킵 판정(순수 함수).
+
+        True  → 장이 이미 끝났다. 장중 헤드업을 보내면 안 된다.
+        False → 아직 장중이거나 애초에 반일장이 아니다 → 정상 진행.
+
+    ⚠️ 왜 함수로 뺐나
+    ─────────────────
+    main() 안에 인라인으로 있던 시절에는 회귀 스위트를 붙일 수가 없었다.
+    판별력 있는 변이가 실제로 존재한다 —
+
+      · `datetime.now(_ET)` 를 `_KST` 로 바꾸면 14:00 ET = 03:00 KST(익일) 이라
+        180 < 780 으로 가드가 통째로 통과한다 → 반일장에 장중 메일이 나간다
+      · `args.mode == "intraday"` 조건이 사라지면 17:00 EOD 실행까지 스킵돼
+        **확정 알림이 유실**된다 (이쪽이 훨씬 위험하다)
+
+    둘 다 로그에 에러가 남지 않는다. `diag_halfday_gate.py` 가 이 함수의 동작과
+    main() 의 배선을 **함께** 검사한다 — 순수 함수 테스트만으로는 위 두 변이를
+    잡을 수 없기 때문이다. 이 파일과 그 스위트는 락스텝이다.
+
+    ⚠️ fail-open — 판정 불가는 전부 False(정상 진행)로 떨어뜨린다.
+       헤드업을 통째로 놓치는 쪽이 라벨이 틀린 메일 한 통보다 나쁘다.
+       calendar_core 가 판정 불가 시 개장/16:00 으로 폴백하는 것과 같은 방향이다.
+    """
+    try:
+        t = str(close_t or "").strip()
+        if not t or t == cc.REGULAR_CLOSE_TIME:
+            return False                 # 반일장이 아니다 → 이 가드의 대상이 아님
+        _now_m = now_et.hour * 60 + now_et.minute
+        _close_m = cc.close_minutes(t)
+        return _now_m >= _close_m
+    except Exception:
+        return False
+
+
 # ── Google Sheets ──────────────────────────────────────────────────────────────
 def get_gspread_client():
     scopes = [
@@ -1845,12 +1880,14 @@ def main():
     #
     # eod 모드는 영향 없다(17:00 실행이라 반일장이든 아니든 마감 후다).
     # fail-open: 판정 실패 시 기존 동작 유지 — 헤드업을 통째로 놓치는 쪽이 더 나쁘다.
+    # ⚠️ args.mode 조건을 지우면 EOD(17:00) 실행까지 스킵돼 **확정 알림이
+    #    유실**된다. 판정 본체는 _intraday_close_passed 로 분리했다 —
+    #    이 배선까지 diag_halfday_gate.py 가 AST 로 검사한다.
     if args.mode == "intraday" and args.scope != "metrics":
         try:
             _ct = cc.session_close_time(None)
             if _ct and _ct != cc.REGULAR_CLOSE_TIME:
-                _n = datetime.now(_ET)
-                if (_n.hour * 60 + _n.minute) >= cc.close_minutes(_ct):
+                if _intraday_close_passed(datetime.now(_ET), _ct):
                     print("[SKIP] 반일장(" + _ct + " 마감) — 이미 장 마감. "
                           "장중 헤드업 생략(카운터 미진행).")
                     print("       확정 결과는 5PM EOD 실행이 보낸다.")
