@@ -1,0 +1,64 @@
+name: 🔬 진단 — 반일장 2PM 가드 회귀 검증 (수동 전용)
+
+# 언제 쓰나:
+#   run_watchlist_alerts.py 의 main() 게이트나 _intraday_close_passed 를
+#   건드린 직후, 배포 전에 돌린다. calendar_core.py 를 고쳤을 때도 같이 돌린다.
+#
+# 왜 필요한가:
+#   반일장(13:00 마감)에 2PM 잡이 그대로 돌면 13:00 **종가**를 "잠정 봉"으로
+#   주입하고 "장중 헤드업" 메일을 보낸다. 숫자는 맞고 라벨이 틀린다.
+#   반대로 가드가 과하게 걸리면 5PM EOD 까지 스킵돼 **확정 알림이 유실**된다.
+#   둘 다 로그에 에러가 남지 않는다 — 기계로 확인하는 수밖에 없다.
+#
+# 무엇을 검사하나 (36항목):
+#   1 정적 배선  — main() 이 _ET 로 호출하는가 · mode 조건이 살아 있는가 ·
+#                  판정 후 실제로 return 하는가 · 휴장일 게이트보다 뒤인가
+#   2 동작       — 경계(12:59 / 13:00 / 14:00) · 정규장 · 휴장 · fail-open
+#   3 캘린더 연동— 2026-11-27 · 12-24 반일장, 11-25 정규장, 11-26 전휴장
+#   4 뮤테이션(함수) — 본문에 결함 5종을 심어 2·3절이 빨간불이 되는지
+#   5 뮤테이션(배선) — 함수는 멀쩡한 채 호출부만 5종으로 망가뜨려
+#                      1절이 빨간불이 되는지
+#
+#   5 가 이 스위트의 핵심이다. 가장 위험한 두 변이가 함수 안이 아니라
+#   호출부에 있기 때문이다 —
+#     · datetime.now(_ET) → _KST : 14:00 ET = 03:00 KST 라 가드가 통째로 통과
+#     · args.mode 조건 삭제       : EOD 까지 스킵 → 확정 알림 유실
+#   순수 함수 테스트로는 둘 다 절대 안 잡힌다.
+#
+# 안전성:
+#   · 네트워크 접근 없음 · 시트 접근 없음 · FMP 호출 없음 · 이메일 없음
+#   · 환경변수 불필요(AST 추출이라 run_watchlist_alerts 를 import 하지 않는다)
+#   · 부작용 전혀 없다. 몇 번을 돌려도 같은 결과.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # calendar_core 만 import 한다(pytz 도 try/except 로 선택적).
+      # run_watchlist_alerts 는 AST 로 읽기만 하므로 gspread/pandas 가 필요 없다.
+      - name: 📦 의존성
+        run: pip install pytz
+
+      - name: 🔬 반일장 2PM 가드 회귀 검증
+        run: python automation/diag_halfday_gate.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          calendar_core.py
+          automation/diag_halfday_gate.py
+          automation/refresh_market_calendar.py
+          automation/run_watchlist_alerts.py
