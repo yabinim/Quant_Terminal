@@ -139,6 +139,7 @@ _RESULT_COLS = [
     "Entry_Rule",                          # v1.2: 진입가 규칙(close[t+N]) — 구/신 행 구분
     "Mode",                                # v1.4: verdict(화면 판정) | alert(실제 이메일)
     "Segment",                             # v1.5: all | etf | stock
+    "Confirm_Days",                        # v2.7: 확정 일수 — 스윕 행 구분(Entry_Rule 과 같은 목적)
 ]
 
 _FMP_BASE    = "https://financialmodelingprep.com/stable"
@@ -157,7 +158,35 @@ TEST_LOOKBACK  = 934           # v2.5: 평가 구간(거래일 ≈ 3.7년) — F
 #   v2.4 의 2140 은 이 한도를 넘어서 종목 대부분이 조건 미달 탈락 → 유니버스가
 #   227→159 로 줄었다(진단상 0/60 충족). 한도에 맞춰 되돌린다.
 
-CONFIRM_DAYS   = 2             # v1.1: raw code 가 N일 연속 유지돼야 이벤트 확정(라이브 알림과 동일 철학)
+# ── v2.7(2026-08-25): 확정 일수 스윕 ──────────────────────────────────────
+# "2일 확정이 값어치를 하는가" 를 재려고 외부에서 조절할 수 있게 뺐다.
+# confirm=1 은 '조건이 처음 참이 된 다음날 매수'(장중 헤드업이 잡아주는 시점),
+# confirm=2 는 현행. 같은 유니버스·같은 날 1/2/3 을 돌려 비교한다.
+#
+# ⚠️ 폴백은 반드시 시끄러워야 한다. 입력을 3으로 주고 돌렸는데 조용히 2로
+#    떨어지면, 세 번 돌려 같은 숫자를 얻고 "확정 일수는 영향이 없다" 는
+#    정반대 결론이 나온다. 그래서 폴백 시 [WARN] 을 찍는다.
+def _env_confirm_days(raw=None, default: int = 2) -> int:
+    """CONFIRM_DAYS 파싱. 정수 1~10 만 허용, 그 외는 경고 후 default."""
+    if raw is None:
+        raw = os.environ.get("CONFIRM_DAYS", "")
+    s = str(raw).strip()
+    if not s:
+        return default
+    try:
+        v = int(s)
+    except (TypeError, ValueError):
+        print("[WARN] CONFIRM_DAYS=" + repr(s) + " 는 정수가 아니다 → "
+              + str(default) + "일로 폴백")
+        return default
+    if not (1 <= v <= 10):
+        print("[WARN] CONFIRM_DAYS=" + str(v) + " 는 범위(1~10) 밖 → "
+              + str(default) + "일로 폴백")
+        return default
+    return v
+
+
+CONFIRM_DAYS   = _env_confirm_days()   # v1.1: raw code 가 N일 연속 유지돼야 확정
 COOLDOWN_DAYS  = 5             # v1.1: 같은 code 재기록 최소 간격(경계 진동 압축)
 ENTRY_LAG_DAYS = 1             # v1.2: 신호일(t) 대비 실제 진입 거래일 지연.
                                #   1 = 메일(16:00 ET) 받고 '다음 거래일' 매수 = 라이브 구조.
@@ -789,7 +818,7 @@ def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
             _cell(a.get("ret_20d_median")), _cell(a.get("ret_60d_mean")),
             _cell(a.get("mfe_20d_mean")), _cell(a.get("mae_20d_mean")),
             _cell(a.get("excess_20d_mean")), _cell(a.get("excess_win_20d")),
-            _ENTRY_RULE_LABEL, mode, segment,
+            _ENTRY_RULE_LABEL, mode, segment, CONFIRM_DAYS,
         ])
     return rows
 
@@ -1043,7 +1072,8 @@ def run_backtest(universe: list, spy_hist: pd.DataFrame, hist_cache: dict,
         hist = hist_cache.get(tk)
         if hist is None or hist.empty:
             continue
-        events, alerts, tds, d0, d1 = walk_forward_events(hist, spy_close=spy_close)
+        events, alerts, tds, d0, d1 = walk_forward_events(
+            hist, spy_close=spy_close, confirm_days=CONFIRM_DAYS)
         if d0 is not None:
             n_with_data += 1
             eval_starts.append(pd.Timestamp(d0))
