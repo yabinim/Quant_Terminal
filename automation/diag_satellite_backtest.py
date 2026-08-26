@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import random
@@ -65,6 +66,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
         sys.path.insert(0, _p)
 
 import fmp_extras as fx  # noqa: E402  — 후보 풀 SSOT
+import fmp_http as fh    # noqa: E402  — FMP 레이트리밋/429 SSOT
 
 # ── 환경 ──────────────────────────────────────────────────────────────────────
 FMP_API_KEY      = os.environ.get("FMP_API_KEY", "")
@@ -74,11 +76,72 @@ _KST = pytz.timezone("Asia/Seoul")
 _ET  = pytz.timezone("America/New_York")
 
 _FMP_BASE      = "https://financialmodelingprep.com/stable"
-_FMP_TIMEOUT   = 12
-_FETCH_WORKERS = 8            # FMP Starter 300 req/min 여유
+_FMP_TIMEOUT   = 20           # v2.8: 12 는 1,300봉 페이로드에 짧다. 레이트리밋만
+                              #   고치면 탈락 사유가 timeout 으로 옮겨갈 뿐이다.
+_FETCH_WORKERS = 8            # 스로틀은 fh.fmp_get_ex 안에 있다. 워커는 한도에
+                              #   걸리면 대기할 뿐 요청을 잃지 않으므로 그대로 둔다.
 
 _SPREADSHEET_TITLE = "Quant_DB"
 _RESULT_WORKSHEET  = "Satellite_Backtest"
+
+
+# ── v2.8(2026-08-26): 부분 유니버스 차단 ────────────────────────────────────
+# 후보 풀 56개 중 일부만 받아와도 백테스트는 정상 완료되고 결과가 시트에 들어간다.
+# Top5 를 고르는 모집단이 달라졌을 뿐 행 모양은 똑같아서 사후에 골라낼 수 없다.
+#
+# ⚠️ 우회 스위치(SKIP_FETCH_GATE=1 류)는 두지 않는다. '이번만 넘기자' 용 플래그는
+#    반드시 기본값이 된다. 낮추려면 이 값을 명시적으로 내려야 하고 로그에 남는다.
+#
+# ⚠️ 이 두 함수는 run_signal_backtest.py 와 **의도적으로 같은 구현**이다.
+#    공유 모듈로 빼지 않은 이유: 그러려면 run_signal_backtest 와 그 락스텝 짝인
+#    diag_universe_funnel(68/68 통과 중)까지 함께 손대야 한다. 대신 복제가
+#    어긋나지 않는지를 diag_fmp_ssot.py 가 두 모듈을 직접 호출해 대조한다.
+def _env_fetch_rate(raw=None, default: float = 0.98) -> float:
+    """MIN_FETCH_RATE 파싱. 0.0~1.0 만 허용, 그 외는 경고 후 default."""
+    if raw is None:
+        raw = os.environ.get("MIN_FETCH_RATE", "")
+    t = str(raw).strip()
+    if not t:
+        return default
+    try:
+        v = float(t)
+    except (TypeError, ValueError):
+        print("[WARN] MIN_FETCH_RATE=" + repr(t) + " 는 실수가 아니다 → "
+              + str(default) + " 로 폴백")
+        return default
+    if not (0.0 <= v <= 1.0):
+        print("[WARN] MIN_FETCH_RATE=" + str(v) + " 는 범위(0.0~1.0) 밖 → "
+              + str(default) + " 로 폴백")
+        return default
+    if v < default:
+        print("[WARN] MIN_FETCH_RATE=" + str(v) + " — 기본 " + str(default)
+              + " 보다 낮다. 부분 유니버스 결과가 시트에 들어갈 수 있다.")
+    return v
+
+
+MIN_FETCH_RATE = _env_fetch_rate()
+
+# 인프라성 실패 — 데이터가 원래 없는 것("empty")과 구분한다. 전자는 다시 돌리면
+# 달라지고 후자는 안 달라진다. 섞어서 세면 게이트가 영구 빨간불이 된다.
+_INFRA_KINDS = ("no_key", "rate_limited", "plan_limited", "http_error", "exception")
+
+
+def universe_hash(tickers) -> str:
+    """정렬된 티커 목록의 SHA1 앞 8자 — run 간 '같은 후보 풀이었나' 를 시트만 보고 판정.
+
+    ⚠️ 반드시 sorted() 를 거쳐야 한다. 집합(set) 순회 순서로 계산하면 구성이
+    같은데도 run 마다 값이 달라져 열 자체가 무의미해진다 — 그런데 겉보기에는
+    '해시가 잘 찍히는' 정상 동작으로 보인다.
+    """
+    seq = sorted(str(t).strip().upper() for t in (tickers or [])
+                 if str(t).strip())
+    if not seq:
+        return ""
+    # ⚠️ 접두어 'u' 는 장식이 아니다. 시트 쓰기가 USER_ENTERED 라, 16진수 8자가
+    #    우연히 전부 숫자면(확률 (10/16)^8 ≈ 2.3%) 구글 시트가 수로 해석해 앞자리
+    #    0 을 날린다("00123456" → 123456). 그러면 같은 풀인데 해시가 달라 보이고,
+    #    그게 바로 이 열이 막으려던 사고다.
+    return "u" + hashlib.sha1("\n".join(seq).encode("utf-8")).hexdigest()[:8]
 
 # ── 백테스트 파라미터 (튜닝 한 곳) ───────────────────────────────────────────
 CAPITAL        = 5_000.0      # 시작 자본
@@ -118,6 +181,7 @@ _RESULT_COLS = [
     "Start", "End", "Capital", "Final_Equity", "Total_Ret_Pct", "CAGR_Pct",
     "MDD_Pct", "Sharpe", "Trades", "WinRate_Pct", "Turnover_x",
     "Slippage_Cost", "vs_SPY_pp", "Div_Basis",
+    "Universe_Hash",              # v2.8: 이 run 의 실제 랭킹 후보 집합 지문
 ]
 
 
@@ -129,58 +193,78 @@ def _fmp_eod(ticker: str, endpoint: str, limit: int = HISTORY_LIMIT) -> pd.DataF
 
     endpoint='full'              : 원 종가 (랭킹용 — 라이브 compute_satellite_top10 과 동일)
     endpoint='dividend-adjusted' : 배당 재투자 반영 종가 (성과 측정용)
+
+    반환: (DataFrame, kind). kind ∈ {"ok","empty","no_key","rate_limited",
+    "plan_limited","http_error","exception"}
+
+    v2.8: 두 가지를 고쳤다.
+      1) requests.get → fh.fmp_get_ex. 이 경로만 SSOT 를 우회하고 있었다.
+         슬라이딩 윈도우 스로틀 + 429 지수 백오프 + 지터가 딸려온다. 이전의
+         자체 재시도(1.5초·3초)는 분당 한도 앞에서 무력했다 — 같은 1분 안에
+         다시 쏘기 때문이다.
+      2) 실패를 빈 DataFrame 하나로 뭉개지 않는다. 402(플랜 제한)·429(레이트
+         리밋)·빈 200 응답은 원인도 대응도 전혀 다르다. 특히 이 파일에서는
+         dividend-adjusted 실패가 **원 종가로 조용히 대체**되므로, 사유를
+         남기지 않으면 성과 기준이 언제 오염됐는지 영원히 알 수 없다.
     """
-    import requests
     if not FMP_API_KEY:
-        return pd.DataFrame()
-    for attempt in range(3):
-        try:
-            r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/{endpoint}"
-                f"?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code != 200:
-                if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                return pd.DataFrame()
-            data = r.json()
-            rows = data.get("historical", data) if isinstance(data, dict) else data
-            if not isinstance(rows, list) or not rows:
-                return pd.DataFrame()
-            df = pd.DataFrame(rows)
-            if "date" not in df.columns:
-                return pd.DataFrame()
-            # dividend-adjusted 는 adjClose 로 오기도 하고 close 가 이미 조정치이기도 하다
-            col = "adjClose" if "adjClose" in df.columns else "close"
-            if col not in df.columns:
-                return pd.DataFrame()
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date"]).set_index("date").sort_index()
-            df = df[~df.index.duplicated(keep="last")]
-            out = pd.DataFrame(index=df.index)
-            out["px"] = pd.to_numeric(df[col], errors="coerce")
-            return out.dropna(subset=["px"])
-        except Exception:
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-    return pd.DataFrame()
+        return pd.DataFrame(), "no_key"
+    url = (f"{_FMP_BASE}/historical-price-eod/{endpoint}"
+           f"?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}")
+    r, _status, kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT)
+    if r is None or kind != "ok":
+        return pd.DataFrame(), kind
+    try:
+        data = r.json()
+        rows = data.get("historical", data) if isinstance(data, dict) else data
+        if not isinstance(rows, list) or not rows:
+            return pd.DataFrame(), "empty"
+        df = pd.DataFrame(rows)
+        if "date" not in df.columns:
+            return pd.DataFrame(), "empty"
+        # dividend-adjusted 는 adjClose 로 오기도 하고 close 가 이미 조정치이기도 하다
+        col = "adjClose" if "adjClose" in df.columns else "close"
+        if col not in df.columns:
+            return pd.DataFrame(), "empty"
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).set_index("date").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        out = pd.DataFrame(index=df.index)
+        out["px"] = pd.to_numeric(df[col], errors="coerce")
+        out = out.dropna(subset=["px"])
+        return (out, "ok") if not out.empty else (out, "empty")
+    except Exception:
+        return pd.DataFrame(), "exception"
 
 
 def _batch_fetch(tickers: list) -> tuple:
-    """(raw_close{}, div_adj{}, fallback_list) — 두 엔드포인트를 병렬로 수집."""
+    """(raw_close{}, div_adj{}, fallback_list, reasons{}, failed[]) — 병렬 수집.
+
+    reasons : {(endpoint, kind): count} — 엔드포인트별 성공/실패 사유 분포
+    failed  : [(ticker, endpoint, kind), ...] — 탈락 항목과 그 이유
+
+    v2.8: 이전에는 `except Exception: df = pd.DataFrame()` 로 예외까지 삼켜
+    탈락 사유가 하나도 남지 않았다. 특히 dividend-adjusted 실패는 바로 아래에서
+    원 종가로 대체되므로, 사유가 없으면 **성과 기준이 종목마다 뒤섞인 채로
+    정상처럼 보이는 결과**가 나온다.
+    """
     raw, adj = {}, {}
+    reasons: dict = {}
+    failed: list = []
+    if not tickers:
+        return raw, adj, [], reasons, failed
     jobs = [(tk, "full") for tk in tickers] + [(tk, "dividend-adjusted") for tk in tickers]
     with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
         futs = {ex.submit(_fmp_eod, tk, ep): (tk, ep) for tk, ep in jobs}
         for fut in concurrent.futures.as_completed(futs):
             tk, ep = futs[fut]
             try:
-                df = fut.result()
+                df, kind = fut.result()
             except Exception:
-                df = pd.DataFrame()
-            if df.empty:
+                df, kind = pd.DataFrame(), "exception"
+            reasons[(ep, kind)] = reasons.get((ep, kind), 0) + 1
+            if df is None or df.empty:
+                failed.append((tk, ep, kind))
                 continue
             (raw if ep == "full" else adj)[tk] = df["px"]
     fallback = []
@@ -188,7 +272,7 @@ def _batch_fetch(tickers: list) -> tuple:
         if tk not in adj:
             adj[tk] = raw[tk]          # 배당조정 실패 → 원 종가로 폴백
             fallback.append(tk)
-    return raw, adj, fallback
+    return raw, adj, fallback, reasons, failed
 
 
 def build_panels(raw: dict, adj: dict, calendar_ticker: str = "SPY"):
@@ -1005,7 +1089,7 @@ def _selftest() -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 # 메인
 # ══════════════════════════════════════════════════════════════════════════════
-def main() -> None:
+def main() -> int:
     t0 = time.time()
     print("=" * 108)
     print(f"🛰️  위성 섹터 로테이션 백테스트 — {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
@@ -1016,16 +1100,50 @@ def main() -> None:
     fetch_list = sorted(set(universe) | set(BENCH_TICKERS))
     print(f"[STEP 1] 후보 풀 {len(universe)}개 + 벤치 {len(BENCH_TICKERS)}개 = "
           f"{len(fetch_list)}종목 × 2엔드포인트(원종가·배당조정) 수집 중...")
-    raw, adjmap, fallback = _batch_fetch(fetch_list)
-    print(f"[INFO] 확보 {len(raw)}/{len(fetch_list)}종목")
+    raw, adjmap, fallback, _reasons, _failed = _batch_fetch(fetch_list)
+
+    _n = len(fetch_list)
+    _rate = (len(raw) / _n) if _n else 1.0
+    print(f"[STEP 1] 원종가 확보 {len(raw)}/{_n}종목 ({_rate * 100:.1f}%) · "
+          f"배당조정 확보 {len(raw) - len(fallback)}/{_n}종목")
+    if _reasons:
+        print("[STEP 1] 사유별 — " + " · ".join(
+            f"{ep}:{k}={v}" for (ep, k), v in
+            sorted(_reasons.items(), key=lambda kv: -kv[1])))
+    print("[STEP 1] " + fh.fmp_stats_line())
     missing = sorted(set(fetch_list) - set(raw))
     if missing:
         print(f"[WARN] 이력 미확보: {missing}")
+    if _failed:
+        _head = ", ".join(f"{t}/{e}({k})" for t, e, k in sorted(_failed)[:20])
+        print(f"[STEP 1] 탈락 {len(_failed)}건 — {_head}"
+              + (" …" if len(_failed) > 20 else ""))
     if fallback:
         print(f"[WARN] 배당조정 실패 → 원 종가 폴백 {len(fallback)}종목: {fallback[:15]}")
     if "SPY" not in raw:
         print("[ERROR] SPY 이력 확보 실패 — 중단")
-        sys.exit(1)
+        return 1
+
+    # ── v2.8 게이트: 부분 유니버스는 시트에 넣지 않는다 ─────────────────────
+    # 후보 풀이 줄면 Top5 를 고르는 모집단 자체가 달라진다. 그런데 결과 행의
+    # 모양은 온전한 run 과 구별되지 않는다 — 그래서 **쓰기 전에** 막는다.
+    if _rate < MIN_FETCH_RATE:
+        print(f"[ABORT] 원종가 페치 성공률 {_rate * 100:.1f}% < 임계 "
+              f"{MIN_FETCH_RATE * 100:.1f}% — 시트에 기록하지 않고 중단한다.")
+        print("[ABORT] 위 '사유별' 을 볼 것. rate_limited 가 많으면 "
+              "FMP_RATE_LIMIT_PER_MIN 을 낮추고, exception 이 많으면 "
+              "_FMP_TIMEOUT 을 늘린다.")
+        return 1
+
+    # 배당조정은 별도로 판정한다. "empty"(원래 그 시리즈가 없음)는 다시 돌려도
+    # 같지만, 인프라성 실패는 다시 돌리면 달라진다. 둘을 섞어 세면 게이트가
+    # 영구 빨간불이 되거나 반대로 진짜 오염을 놓친다.
+    _adj_infra = sum(v for (ep, k), v in _reasons.items()
+                     if ep == "dividend-adjusted" and k in _INFRA_KINDS)
+    if _n and (_adj_infra / _n) > (1.0 - MIN_FETCH_RATE):
+        print(f"[ABORT] 배당조정 인프라성 실패 {_adj_infra}/{_n}건 — 성과 기준이 "
+              f"종목마다 뒤섞인다. 시트에 기록하지 않고 중단한다.")
+        return 1
 
     close_df, adj_df = build_panels(raw, adjmap)
     idx = close_df.index
@@ -1044,6 +1162,10 @@ def main() -> None:
             gaps.append((ar / cr) ** (252.0 / n) - 1.0)
     med_gap = float(np.median(gaps)) * 100.0 if gaps else 0.0
     div_basis = "dividend-adjusted(배당재투자)" if med_gap > 0.15 else "close(배당미반영)"
+    # 폴백이 있었다면 그 사실을 **행 자체에** 남긴다. 로그는 사라지지만 시트는
+    # 남는다 — 나중에 이 행을 다시 볼 때 성과 기준이 균일했는지 알아야 한다.
+    if fallback:
+        div_basis += f" · 혼합({len(fallback)}종목 close 대체)"
     print(f"[INFO] 성과 기준: {div_basis} · 배당 기여 중앙값 ≈ 연 {med_gap:.2f}%p")
     if med_gap <= 0.15:
         print("[WARN] 배당조정 시리즈가 원 종가와 사실상 동일 — 배당이 반영되지 않았다.")
@@ -1172,6 +1294,12 @@ def main() -> None:
                     round(m["turnover"], 2), round(m["slip"], 2), "", div_basis,
                 ])
 
+    # 랭킹 모집단 = 후보 풀 ∩ 실제 확보분. RankEngine 이 close_df.columns 로
+    # 거르므로 이것이 Top5 선정에 실제로 쓰인 집합이다(벤치 SPY/QQQ 는 제외).
+    _uhash = universe_hash(set(raw) & set(universe))
+    print(f"[INFO] 랭킹 후보 {len(set(raw) & set(universe))}종목 · 지문 {_uhash}")
+    all_rows = [list(r) + [_uhash] for r in all_rows]
+
     write_results(all_rows)
 
     print("\n" + "=" * 108)
@@ -1183,13 +1311,16 @@ def main() -> None:
     print("   → 절대 수익률이 아니라 '조건 간 상대 비교'만 신뢰할 것.")
     print(f"[DONE] {time.time() - t0:.0f}초 소요")
     print("=" * 108)
+    return 0
 
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     try:
-        main()
+        sys.exit(main() or 0)
+    except SystemExit:
+        raise
     except Exception:
         traceback.print_exc()
         sys.exit(1)

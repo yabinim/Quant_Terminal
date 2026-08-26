@@ -13,6 +13,19 @@ run_signal_backtest v2.4 에서 TEST_LOOKBACK 을 1260→2140 으로 늘렸는�
   2) 유니버스 표본에 대해 실제 확보 봉수 분포를 집계
   3) 위 결과로 '실현 가능한 TEST_LOOKBACK' 을 역산해 출력
 
+⚠️ v2.8 계약 (2026-08-26)
+────────────────────────
+`run_signal_backtest._fmp_price_history` 는 v2.8 부터 `(DataFrame, kind)` 를
+돌려준다. 이 파일은 그 함수를 빌려 쓰는데 v2.8 배포 때 **호출부가 갱신되지
+않았다.** 결과는 두 가지였다:
+
+  probe_limits  : tuple.empty → AttributeError → 즉시 크래시
+  probe_universe: len(tuple) == 2 → **예외 없이 전 종목이 "2봉"으로 집계**
+                  → recommend() 가 그 2봉으로 분위수를 내고 음수 LOOKBACK 권고
+
+두 번째가 더 위험하다. 이력 깊이를 재는 것이 이 스크립트의 존재 이유인데,
+그 숫자가 조용히 틀렸다. 이제 kind 를 받아 사유별로 집계한다.
+
 실행:  python automation/diag_fmp_depth.py
 """
 from __future__ import annotations
@@ -37,9 +50,9 @@ def probe_limits(ticker: str, limits) -> None:
     print(f"{'요청 limit':>10}{'실제 봉수':>10}{'시작일':>14}{'종료일':>14}{'연수':>7}")
     prev = None
     for lim in limits:
-        df = bt._fmp_price_history(ticker, limit=lim)
+        df, kind = bt._fmp_price_history(ticker, limit=lim)
         if df.empty:
-            print(f"{lim:>10}{'실패':>10}")
+            print(f"{lim:>10}{('실패:' + kind):>12}")
             continue
         n = len(df)
         print(f"{lim:>10}{n:>10}{str(df.index[0].date()):>14}"
@@ -52,18 +65,27 @@ def probe_limits(ticker: str, limits) -> None:
 def probe_universe(tickers: list, limit: int) -> pd.Series:
     print(f"\n[2] 유니버스 표본 {len(tickers)}종목 실제 봉수 (limit={limit})")
     counts = {}
+    reasons: dict = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=bt._FETCH_WORKERS) as ex:
         futs = {ex.submit(bt._fmp_price_history, tk, limit): tk for tk in tickers}
         for fut in concurrent.futures.as_completed(futs):
             tk = futs[fut]
             try:
-                df = fut.result()
+                # ⚠️ 반드시 2개로 언팩한다. 단일 이름으로 받으면 tuple 이 들어와
+                #    len() 이 항상 2 가 되고, 예외가 안 나서 발견되지 않는다.
+                df, kind = fut.result()
                 counts[tk] = len(df) if df is not None else 0
             except Exception:
+                kind = "exception"
                 counts[tk] = 0
+            reasons[kind] = reasons.get(kind, 0) + 1
     s = pd.Series(counts).sort_values()
     ok = s[s > 0]
     print(f"   응답 성공 {len(ok)}/{len(tickers)}  ·  빈 응답 {int((s == 0).sum())}")
+    if reasons:
+        print("   사유별 — " + " · ".join(
+            f"{k}={v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
+    print("   " + bt.fh.fmp_stats_line())
     if ok.empty:
         return s
     for q in (0.05, 0.25, 0.50, 0.75, 0.95):
@@ -96,6 +118,12 @@ def recommend(bars: pd.Series, keep_frac: float = 0.80) -> None:
 def main() -> int:
     if not bt.FMP_API_KEY:
         print("[ERR] FMP_API_KEY 없음")
+        return 1
+
+    # 부분 롤백 상태에서 스택 트레이스 대신 원인을 말하게 한다.
+    if not hasattr(bt, "fh"):
+        print("[ERR] run_signal_backtest 가 v2.8 이전 버전이다 "
+              "(fmp_http 미도입) — 두 파일을 함께 배포할 것")
         return 1
 
     probe_limits("SPY", [500, 1301, 2000, 2461, 3000, 5000])

@@ -147,8 +147,12 @@ def fifo_match(df: pd.DataFrame) -> pd.DataFrame:
 
 def attach_spy(t: pd.DataFrame) -> pd.DataFrame:
     """진입일~청산일 같은 창의 SPY 수익률을 붙여 초과수익(알파) 산출."""
-    spy = bt._fmp_price_history(SPY_TICKER, limit=bt.HISTORY_LIMIT)
+    # ⚠️ v2.8 부터 (DataFrame, kind) 튜플이다. 단일 이름으로 받으면 바로 아래
+    #    `.empty` 에서 AttributeError 가 나고, main() 이 감싸지 않아 STEP3 직전에
+    #    통째로 죽는다 — STEP1·STEP2 를 다 출력한 뒤라 더 헷갈린다.
+    spy, _spy_kind = bt._fmp_price_history(SPY_TICKER, limit=bt.HISTORY_LIMIT)
     if spy is None or spy.empty:
+        print(f"[WARN] SPY 이력 fetch 실패({_spy_kind}) — 초과수익(excess_pct) 생략")
         t["excess_pct"] = np.nan
         return t
     c = pd.to_numeric(spy["Close"], errors="coerce").dropna()
@@ -202,6 +206,10 @@ def _table(title: str, groups: list, note: str = "") -> None:
 
 
 def main() -> int:
+    if not hasattr(bt, "fh"):
+        print("[ERR] run_signal_backtest 가 v2.8 이전 버전이다 "
+              "(fmp_http 미도입) — 두 파일을 함께 배포할 것")
+        return 1
     if not bt.FMP_API_KEY:
         print("[WARN] FMP_API_KEY 없음 — SPY 초과수익은 생략됩니다")
     gc = bt.get_gspread_client()
