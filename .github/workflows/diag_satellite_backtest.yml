@@ -1,7 +1,25 @@
 name: 🛰️ 진단 — 위성 섹터 로테이션 백테스트 (수동 전용)
 
+# v2.8 (2026-08-26) 변경 요지
+# ────────────────────────────
+# 이 백테스트는 후보 풀 58종목 × 2엔드포인트 = 116콜을 워커 8개로 발사한다.
+# 116 < 300 이라 단독 실행이면 분당 한도에 안 걸리지만, 그건 **우연히 안 걸린
+# 것**이지 안전한 게 아니었다:
+#   · 다른 워크플로와 같은 분에 겹치면 계정 단위 한도를 함께 쓴다
+#   · 후보 풀이 늘면 그대로 넘긴다
+#   · 무엇보다 dividend-adjusted 페치가 실패하면 **원 종가로 조용히 대체**되어
+#     성과 기준이 종목마다 뒤섞인 채 정상처럼 보이는 결과가 나왔다
+#
+# 그래서 fmp_http(레이트리밋/429 SSOT)로 전환하고, 부분 유니버스는 시트에
+# 쓰기 **전에** 막는다.
+
 on:
   workflow_dispatch:        # 수동 실행만. 스케줄러/디스패치 트리거 없음.
+    inputs:
+      min_fetch_rate:
+        description: '페치 성공률 하한 (기본 0.98). 이 밑이면 시트에 안 쓰고 중단.'
+        required: false
+        default: '0.98'
 
 jobs:
   backtest:
@@ -22,6 +40,11 @@ jobs:
           pip install --upgrade pip
           pip install google-auth gspread requests numpy pandas pytz
 
+      # 락스텝 짝. 여기서 실패하면 아래 백테스트를 돌릴 이유가 없다 —
+      # 배선이 깨진 상태로 나온 숫자는 어차피 못 믿는다.
+      - name: 🛡️ FMP SSOT · 튜플 계약 가드 (락스텝)
+        run: python automation/diag_fmp_ssot.py
+
       - name: ✅ 엔진 자체검증 (합성 데이터 · 네트워크 불필요)
         run: |
           python automation/diag_satellite_backtest.py --selftest
@@ -30,5 +53,9 @@ jobs:
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          # FMP Starter 한도는 분당 300. 67% 로 둔다.
+          # ⚠️ 300 으로 올리지 말 것 — 한도에 붙이면 다시 429 가 난다.
+          FMP_RATE_LIMIT_PER_MIN: '200'
+          MIN_FETCH_RATE: ${{ inputs.min_fetch_rate }}
         run: |
           python automation/diag_satellite_backtest.py

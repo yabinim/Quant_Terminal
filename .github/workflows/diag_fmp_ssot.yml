@@ -1,0 +1,79 @@
+name: 🛡️ 진단 — FMP SSOT · 튜플 계약 가드 (수동 전용)
+
+# 언제 쓰나:
+#   1) FMP 를 호출하는 코드를 건드린 뒤 (파일 불문)
+#   2) 공유 함수의 **반환 모양**을 바꾼 뒤 — 이게 진짜 이유다
+#   3) diag_satellite_backtest.py 를 배포하기 직전 (락스텝 짝)
+#
+# 왜 필요한가 — 2026-08-26 에 같은 뿌리에서 두 번 터졌다:
+#
+#   (1) run_signal_backtest 가 fmp_http 를 우회하고 원시 requests.get 으로
+#       474종목을 발사 → 분당 한도(300)를 넘긴 174종목이 429 → 빈 DataFrame
+#       으로 무성 탈락 → 시트에 정상처럼 보이는 오염 행이 쌓였다.
+#
+#   (2) 그걸 고치며 _fmp_price_history 반환을 (df, kind) 로 바꿨는데, 그 함수를
+#       빌려 쓰는 diag_fmp_depth·diag_trade_history 의 호출부를 안 고쳤다.
+#       전자는 len(tuple)==2 라 **예외도 없이 전 종목이 "2봉"으로 집계**됐다.
+#
+#   (1) 은 fmp_extras.py 70행 주석에 이미 기록돼 있던 사고다. 그때 "같은 패턴을
+#   전 저장소에서 grep 한다"고 적었지만 grep 을 사람이 하기로 했고, 하지 않았다.
+#   → 그래서 grep 을 도구로 옮겼다. 이 워크플로가 그 도구다.
+#
+# 무엇을 검사하나 (38항목):
+#   A1 원시 FMP 호출 래칫  requests.get 직접 호출 지점이 기준선보다 늘었는가
+#   A2 튜플 계약           튜플 반환 함수를 단일 이름으로 받고 첫 원소인 척 쓰는가
+#   A3 submit 언팩         ex.submit(mod.튜플함수,…) 후 .result() 를 언팩하는가
+#   B1~B28 위성 백테스트   스로틀·실패분류·게이트 순서·지문·복제 대조
+#   M1~M7 뮤테이션         위 검사가 결함을 실제로 잡는지 역검증
+#
+#   A1 은 **래칫**이다. 저장소에 이미 80여 곳의 원시 호출이 있어 전부 실패로
+#   잡으면 첫날부터 빨간불이고, 빨간불인 스위트는 아무도 안 본다. 기준선보다
+#   늘면 실패, 줄면 통과하되 "기준선을 낮추라"고 경고한다.
+#   ⚠️ 기준선은 '괜찮다'가 아니라 '알고 있고 아직 안 고쳤다'는 뜻이다.
+#
+#   A2 는 허용목록이 없다. 0 이어야 한다.
+#
+#   B15(게이트 순서)가 핵심이다. 게이트가 있는지만 보면 게이트를 시트 쓰기
+#   뒤로 옮긴 변경을 못 잡는다 — 오염 행은 그대로 들어가고 종료 코드만 1이 된다.
+#
+# 안전성:
+#   · 네트워크 접근 없음 · 시트 접근 없음 · FMP 호출 없음 · 이메일 없음
+#   · 부작용 전혀 없다. 몇 번을 돌려도 같은 결과.
+#
+# 락스텝: diag_satellite_backtest.py 와 같이 배포한다.
+#   미패치 버전에 이 스위트를 돌리면 "v2.8 이전 버전이다" 로 명시 중단한다.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # diag_satellite_backtest 와 run_signal_backtest 를 실제로 import 하므로
+      # 모듈 의존성이 필요하다(환경변수는 .get 으로 읽어 시크릿 없이도 import 된다).
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install numpy pandas pytz requests gspread google-auth
+
+      - name: 🛡️ FMP SSOT · 튜플 계약 가드
+        run: python automation/diag_fmp_ssot.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_fmp_ssot.py
+          automation/diag_satellite_backtest.py
+          automation/diag_fmp_depth.py
+          automation/diag_trade_history.py
