@@ -8,7 +8,11 @@ on:
 jobs:
   run-2pm-intraday:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 2026-08-26: 15 → 20. run_watchlist_alerts 가 fmp_http 를 거치게 되면서
+    # 실패한 호출마다 재시도 백오프(2+4+8초 + 지터)가 붙는다. 장중 경로는
+    # 히스토리 + quote 로 약 180콜이라, 10종목이 실패하면 3분이 추가된다.
+    # 재시도를 줄이는 대신 예산을 늘렸다 — 조용히 종목을 잃는 쪽이 더 나쁘다.
+    timeout-minutes: 20
 
     steps:
       - name: 📥 코드 체크아웃
@@ -37,6 +41,10 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GMAIL_TO:          ${{ secrets.GMAIL_TO }}
           GSPREAD_KEY:       ${{ secrets.GSPREAD_KEY }}
+          # FMP Starter 는 분당 300. 67% 로 둔다. 이 잡의 실측 호출량(약 180)은
+          # 한도 아래지만, 다른 워크플로와 같은 분에 겹치면 계정 단위로 합산된다.
+          # ⚠️ 300 으로 올리지 말 것 — 한도에 붙이면 429 가 난다.
+          FMP_RATE_LIMIT_PER_MIN: '200'
         run: |
           python automation/run_watchlist_alerts.py --mode intraday
 

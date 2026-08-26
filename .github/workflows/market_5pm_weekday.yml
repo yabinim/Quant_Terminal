@@ -100,6 +100,12 @@ jobs:
           # 표현식으로 값을 만들지 않고 **입력값을 그대로 넘긴다** — 선택지가 늘
           # 때마다 고쳐야 하는 매핑은 언젠가 안 고쳐진다(2026-08-22 실제 사고).
           LIVENESS_FORCE:    ${{ inputs.force_liveness && '1' || '' }}
+          # 2026-08-26: run_watchlist_alerts 가 fmp_http 를 거친다. 카운터는
+          # 프로세스 단위라 같은 잡의 앞선 스텝(내러티브·DRG·실적)과는 합산되지
+          # 않지만, 값은 명시해 둔다 — 기본값에 의존하면 fmp_http 기본이 바뀔 때
+          # 이 파이프라인이 조용히 따라간다.
+          # ⚠️ 300(Starter 한도)으로 올리지 말 것.
+          FMP_RATE_LIMIT_PER_MIN: '200'
         run: |
           python automation/run_watchlist_alerts.py
 
