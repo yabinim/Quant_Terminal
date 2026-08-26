@@ -4,6 +4,18 @@ on:
   repository_dispatch:
     types: [trigger-backtest-monthly]   # Cloud Scheduler → GitHub API로 트리거 (월 1회)
   workflow_dispatch:                     # 수동 실행 (첫 실행/검증용)
+    inputs:
+      # v2.7: 확정 일수 스윕. "2일 확정이 값어치를 하는가" 를 재기 위한 입력.
+      #   1 = 조건이 처음 참이 된 다음날 매수 (장중 헤드업이 잡아주는 시점)
+      #   2 = 현행 (기본값)
+      #   3 = 더 기다림 — 방향 일관성 확인용
+      #
+      # ⚠️ 세 번을 **같은 날** 돌려야 비교가 성립한다. 다른 날 돌리면
+      #    History_End 가 달라져 평가 창이 어긋난다.
+      confirm_days:
+        description: '확정 일수 (1~10, 기본 2). 비우면 2'
+        type: string
+        default: '2'
   # schedule 미사용: 다른 워크플로와 동일하게 Cloud Scheduler(repository_dispatch)로만 트리거
   #   → GitHub Actions cron 의 지연(최대 수 시간) 회피
 
@@ -39,6 +51,10 @@ jobs:
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          # repository_dispatch(정기 실행)에는 inputs 가 없다 → 빈 값 → 파이썬이 2로 폴백.
+          # 표현식으로 값을 만들지 않고 **입력값을 그대로 넘긴다** — 선택지가 늘 때마다
+          # 고쳐야 하는 매핑은 언젠가 안 고쳐진다(2026-08-22 실제 사고).
+          CONFIRM_DAYS: ${{ inputs.confirm_days }}
         run: |
           python automation/run_signal_backtest.py
 

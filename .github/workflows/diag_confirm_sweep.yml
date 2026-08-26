@@ -1,0 +1,60 @@
+name: 🔬 진단 — 확정 일수 스윕 배선 검증 (수동 전용)
+
+# 언제 쓰나:
+#   월간 백테스트를 CONFIRM_DAYS=1/2/3 으로 돌리기 **직전에** 한 번.
+#   run_signal_backtest.py 의 확정 일수 관련 코드를 건드린 뒤에도.
+#
+# 왜 필요한가 — 이 스윕의 고장은 조용하다:
+#   입력을 3으로 주고 돌렸는데 내부가 2로 떨어지면
+#     → 세 번 돌려 똑같은 숫자가 나오고
+#     → "확정 일수는 성적에 영향이 없다" 는 **정반대 결론**을 낸다
+#     → 로그에도 시트에도 아무 이상이 없다
+#   90분을 쓰고 틀린 결론을 얻는 것이 이 검증 5분보다 훨씬 비싸다.
+#
+# 무엇을 검사하나 (33항목):
+#   1 파싱      _env_confirm_days — 정상값·빈값·쓰레기·범위밖 폴백
+#   2 전달      가짜 판정 함수를 주입해 **이벤트가 며칠째 확정되는지 직접 셈**
+#               (confirm=1 → 첫날 · 2 → 이틀째 · 3 → 사흘째)
+#   3 배선      run_backtest() 가 모듈 상수를 명시적으로 넘기는지 (AST)
+#   4 기록      결과 행에 Confirm_Days 가 실려 스윕 행을 구분할 수 있는지
+#   5 뮤테이션  위 검사가 결함을 실제로 잡는지 역검증 + 양성대조
+#
+#   2절이 핵심이다. 1절·3절만 있으면 "환경변수는 읽혔고 인자로도 넘어갔는데
+#   정작 루프가 무시하는" 경우를 못 잡는다.
+#
+# 안전성:
+#   · 네트워크 접근 없음 · 시트 접근 없음 · FMP 호출 없음 · 이메일 없음
+#   · 부작용 전혀 없다. 몇 번을 돌려도 같은 결과.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # run_signal_backtest 를 실제로 import 하므로 모듈 의존성이 필요하다
+      # (환경변수는 .get 으로 읽어서 시크릿 없이도 import 가 된다).
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install numpy pandas pytz requests gspread google-auth
+
+      - name: 🔬 확정 일수 배선 검증
+        run: python automation/diag_confirm_sweep.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/run_signal_backtest.py
+          automation/diag_confirm_sweep.py
