@@ -33,6 +33,7 @@
   [S] SSOT 격자 대조     — 합성 입력 전수로 복제본 == regime_core 검증 (콜 0회)
   [T] block0 자기검증    — 스텁 주입으로 [0] 의 분기 전수 실행 (콜 0회)
   [0] MA200 격차 원인 규명 — 중복날짜 · 창 길이 · min_periods · 배당조정 (3콜)
+       └ 0-F 과거 MA200 스냅샷 추적 — 외부값이 '언제의 값'인지 (추가 콜 0회)
   [1] 보유 종목 스냅샷   — MA200 이격 / MACD / 샹들리에 등 판정 입력 전체
   [2] 진입 시점 재구성   — Date_Added 당시 코드 vs 오늘 코드 (2A 억제 효과 판정)
   [3] 점수 시나리오 비교 — 현재 / 문턱5
@@ -90,6 +91,27 @@ ONLY_UID = os.environ.get("DIAG_ONLY_UID", "").strip()   # 빈 값 = 전체 사�
 #    임계값이 필요하면 rc.POSITION_MONTH_DROP_PCT 처럼 **rc 에서 읽어 쓸 것**.
 SELL_TH_DEFAULT, TRIM_TH_DEFAULT = 4, 2
 SELL_TH_ALT = 5                   # 미채택: 청산 문턱을 4 → 5 로
+
+# ── [0-F] 스냅샷 가설 사전 확정 기준 (2026-08-28 확정 · 결과를 보기 전에 못 박음) ─
+# 배당조정 · 중복날짜 · 창 길이 · 봉수 가설이 전부 기각된 뒤 남은 마지막 후보:
+#   "외부값(89.77 / 91.64)은 **다른 날짜의 우리 MA200 스냅샷**이다."
+#
+# ⚠️ 원안("최근 252봉 안에 두 값이 등장하면 채택")을 글자 그대로 쓰면 이 검정은
+#    거의 자동 통과한다. 우리 값 87.87 기준으로 두 목표는 **둘 다 위쪽**이고,
+#    MA200 이 하락 추세로 87 → 92 를 훑고 지나갔다면 그 사이의 **모든 값**이
+#    '등장'한다. 그때 통과는 스냅샷의 증거가 아니라 'MA200 이 그 구간을
+#    지나갔다'는 사실만 증명한다. 그래서 실행 전에 셋을 확정했다:
+#      (a) 허용오차 ±0.05        — 외부 표시가 소수 2자리이므로 그 언저리
+#      (b) 두 날짜 모두 최근 60봉(~3개월) 이내 — 데이터 사이트가 1년 낡을 리 없다
+#      (c) 판정 시리즈는 raw close 단독 — 배당조정본은 참고 출력이며 판정에
+#          관여하지 않는다(둘 다 허용하면 기회가 두 배가 되어 기준이 느슨해진다)
+#
+# ⚠️ 결과를 본 뒤 이 상수들을 손대지 말 것. 손대는 순간 이 검정은 증거가 아니라
+#    사후 맞춤이 된다. 값을 바꾸고 싶으면 **새 질문**으로 새 기준을 먼저 세운다.
+MA200_SNAP_TOL = 0.05          # (a)
+MA200_SNAP_RECENT = 60         # (b) 봉 단위
+MA200_SNAP_SCAN = 252          # 되짚을 과거 구간(봉)
+MA200_EXT_TARGETS = [("TickerReport", 89.77), ("Investing.com", 91.64)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -456,8 +478,16 @@ _T_CASES = [
       "사용 시리즈                    : limit 경로 600행",
       "사용 필드                      : adjClose",
       "close (중복제거)", "dividend-adjusted (adjClose)",
-      "✅ 배당조정 가설 기각"],
-     ["❗ 배당조정 MA200 이 미조정보다 높다", "응답 없음"]),
+      "✅ 배당조정 가설 기각",
+      # 0-F. 픽스처는 0.05/봉 로 단조 하락하므로 스윕 범위가 두 목표를 통째로
+      # 삼킨다 → '등장'은 하되 날짜 게이트에서 걸려야 한다. 이 조합이 곧
+      # "통과가 보장되는 검정"의 실물이며, 경고와 기각이 함께 나와야 옳다.
+      "── 0-F. 과거 MA200 스냅샷 추적 (FMP 콜 0회) ──",
+      "⚠️ 검정력 경고: 두 목표값이 모두 스윕 범위 안에 있다",
+      "❌ 스냅샷 가설 기각", "60봉 게이트 밖", "MA200 격차 건 종료",
+      "[참고] dividend-adjusted"],
+     ["❗ 배당조정 MA200 이 미조정보다 높다", "응답 없음",
+      "✅ 스냅샷 가설 채택", "⛔ 판정 보류"]),
     # T8 — 이번 실측에서 드러난 결함 그 자체. `kind=ok` 로 행이 왔는데 가격
     # 필드명이 달라 0-D 가 "응답 없음"을 찍고 0-E 가 판정을 포기했다.
     # 이 케이스가 없으면 같은 결함이 또 조용히 통과한다.
@@ -480,8 +510,13 @@ _T_CASES = [
      ["고유 봉이 170개뿐 — 200봉 창을 만들 수 없다",
       "200봉 평균이 아니다 (170봉 · min_periods=150)",
       "그대로 gap_ma200_pct 가 되어 3E 램프에 들어간다",
-      "봉 부족", "(170봉 / 200봉 필요)"],
-     ["프로덕션에서도 ma200 이 NaN"]),
+      "봉 부족", "(170봉 / 200봉 필요)",
+      # 0-F: 200봉이 안 되면 MA200 시계열 자체가 없다. 이때 '기각'을 찍으면
+      # 데이터 부족을 가설 기각으로 둔갑시키는 것이라 '판정 불가'여야 한다.
+      "⚠️ MA200 시계열을 만들 수 없다 (170봉 < 200봉)",
+      "⛔ 판정 불가"],
+     ["프로덕션에서도 ma200 이 NaN", "❌ 스냅샷 가설 기각",
+      "✅ 스냅샷 가설 채택"]),
     ("T3b 130봉", dict(full_n=130),
      ["봉이 130개뿐 — 프로덕션에서도 ma200 이 NaN"],
      ["그대로 gap_ma200_pct 가 되어"]),
@@ -490,8 +525,13 @@ _T_CASES = [
     #    52주 창만 짧다. 이 케이스가 없으면 그 오보를 아무도 못 잡는다.
     ("T3c 220봉", dict(full_n=220),
      ["은 정상(200봉 충족)이나 봉이 220개로 52주(252봉)에 미달한다",
-      "고점대비·낙폭 입력이 짧은 창에서 나온다"],
-     ["200봉 평균이 아니다", "프로덕션에서도 ma200 이 NaN"]),
+      "고점대비·낙폭 입력이 짧은 창에서 나온다",
+      # 0-F: MA200 점이 21개뿐이라 252봉 창을 못 덮는다. 접촉이 없는 목표가
+      # 있으면 '기각'이 아니라 '판정 보류'다 — 못 본 구간이 있기 때문이다.
+      "⚠️ 창 부족: MA200 점이 21개로 252봉에 미달한다",
+      "⛔ 판정 보류"],
+     ["200봉 평균이 아니다", "프로덕션에서도 ma200 이 NaN",
+      "❌ 스냅샷 가설 기각"]),
     ("T4 조정치가 더 높음", dict(full_n=600, adj_mult=1.05),
      ["❗ 배당조정 MA200 이 미조정보다 높다"], ["✅ 배당조정 가설 기각"]),
     ("T5 첫 호출 실패", dict(full_n=600, full_kind="rate_limited"),
@@ -500,6 +540,90 @@ _T_CASES = [
      ["adjClose 필드                  : 없음 ❌",
       "비교 대상 소스가 하나도 안 나왔다"], []),
 ]
+
+
+def _t_snap_frame(n=700, step=0.25) -> pd.DataFrame:
+    """단조 상승 합성 종가 n봉. 기울기를 크게 둬 봉마다 MA200 이 확실히 갈린다.
+
+    step 을 크게 잡은 이유: MA200 이 봉당 step 만큼 움직이므로 서로 다른 age 의
+    값이 허용오차(±0.05) 안에서 겹치지 않는다. 겹치면 '어느 날짜냐'를 묻는
+    검정 자체가 성립하지 않는다.
+    """
+    idx = pd.date_range("2022-01-03", periods=n, freq="B")
+    return pd.DataFrame({"Close": [50.0 + i * step for i in range(n)]},
+                        index=idx)
+
+
+def _t_snapshot_controls() -> list:
+    """0-F 의 대조군 T10~T14. 실패 메시지 리스트를 반환(빈 리스트 = 통과)."""
+    import io
+    from contextlib import redirect_stdout
+
+    out, g = [], globals()
+    df = _t_snap_frame()
+    trk = _ma200_track(df)                      # 스캔 창(252) 적용
+    full = _ma200_track(df, scan=0)             # 전체 — 창 게이트 검증용
+    # full 은 age 300 을 뽑을 수 있어야 한다(창 게이트 검증용) → 최소 301점.
+    if len(trk) != MA200_SNAP_SCAN or len(full) < 301:
+        return [f"T10~T14: 픽스처 이상 (trk={len(trk)}, full={len(full)})"]
+
+    def at(ser, age):
+        return float(ser.iloc[len(ser) - 1 - age])
+
+    v10, v20, v100 = at(trk, 10), at(trk, 20), at(trk, 100)
+    v300 = at(full, 300)                        # 252봉 창 **밖**
+
+    cases = [
+        # (이름, 목표쌍, 반드시 나올 것, 나오면 안 될 것)
+        ("T10 양성대조 (오차 0.04 · 최근 10/20봉)",
+         [("A", v10 + 0.04), ("B", v20 - 0.04)],
+         ["✅ 스냅샷 가설 채택"], ["❌ 스냅샷 가설 기각", "⛔ 판정 보류"]),
+        ("T11 음성대조 (스윕 범위 밖)",
+         [("A", v10), ("B", float(trk.max()) + 50.0)],
+         ["❌ 스냅샷 가설 기각", "한 번도 닿지 않았다"], ["✅ 스냅샷 가설 채택"]),
+        ("T12 날짜 게이트 (100봉 전 접촉)",
+         [("A", v10), ("B", v100)],
+         ["❌ 스냅샷 가설 기각", "100봉 전 — 60봉 게이트 밖"],
+         ["✅ 스냅샷 가설 채택"]),
+        ("T13 창 게이트 (252봉 밖 300봉 전 값)",
+         [("A", v10), ("B", v300)],
+         ["❌ 스냅샷 가설 기각", "한 번도 닿지 않았다"], ["✅ 스냅샷 가설 채택"]),
+        ("T14 허용오차 상한 (오차 0.10)",
+         [("A", v10 + 0.10), ("B", v20)],
+         ["❌ 스냅샷 가설 기각", "한 번도 닿지 않았다"], ["✅ 스냅샷 가설 채택"]),
+    ]
+
+    # T16 — 게이트 경계 + '가장 최근 접촉' 선택을 한 케이스로 못 박는다.
+    # step 을 0.02 로 낮춰 한 목표에 접촉이 5개(60~64봉 전) 생기게 만든다.
+    #   · 가장 최근 접촉(60봉)을 고르고 `<= 60` 이어야 채택이다
+    #   · 가장 오래된 접촉(64봉)을 고르면 기각으로 뒤집힌다  ← hits[-1] 뮤테이션
+    #   · 게이트를 `< 60` 으로 바꿔도 기각으로 뒤집힌다      ← 경계 뮤테이션
+    df2 = _t_snap_frame(700, step=0.02)
+    t2 = _ma200_track(df2)
+    cases.append(("T16 게이트 경계 (접촉 60~64봉 전)",
+                  [("A", at(t2, 62)), ("B", at(t2, 10))],
+                  ["✅ 스냅샷 가설 채택", "(60봉 전)"],
+                  ["❌ 스냅샷 가설 기각", "(64봉 전)"]))
+
+    orig = g["MA200_EXT_TARGETS"]
+    try:
+        for name, targets, want, unwant in cases:
+            frame = df2 if name.startswith("T16") else df
+            g["MA200_EXT_TARGETS"] = targets
+            buf = io.StringIO()
+            try:
+                with redirect_stdout(buf):
+                    block0f_snapshot(frame, None)
+            except Exception as e:
+                out.append(f"{name}: 예외 {type(e).__name__}: {e}")
+                continue
+            o = buf.getvalue()
+            out += [f"{name}: 기대 문자열 없음 → {w!r}" for w in want if w not in o]
+            out += [f"{name}: 나오면 안 되는 문자열 → {u!r}" for u in unwant
+                    if u in o]
+    finally:
+        g["MA200_EXT_TARGETS"] = orig
+    return out
 
 
 def block_t_selftest() -> bool:
@@ -556,13 +680,44 @@ def block_t_selftest() -> bool:
             if span != 460:
                 fails.append(f"T7: 창 폭 {span}일 (460이어야 함)")
 
+    # ── T10~T15. 0-F 사전 기준 대조군 ────────────────────────────────────────
+    # ⚠️ 심어놓은 값을 못 찾는 양성대조가 없으면, 0-F 가 그냥 아무것도 못 찾는
+    #    깡통이어도 "기각"이 나가고 그것이 결론처럼 읽힌다. 그래서 **먼저**
+    #    "있으면 반드시 찾는다"를 증명한 뒤에야 "없다"는 말에 무게가 생긴다.
+    #    허용오차는 안쪽(0.04)과 바깥쪽(0.10) 양쪽에서 못 박는다 — 목표를 정확히
+    #    맞춰 심으면(Δ=0) 오차 상수를 어떻게 바꿔도 통과해 뮤테이션을 놓친다.
+    fails += _t_snapshot_controls()
+
+    # T15. 0-F 는 "추가 FMP 콜 0회"가 계약이다. 나중에 누가 안에서 데이터를 더
+    # 받아오면 그 순간 조용히 깨진다 — AST 로 호출 자체를 막는다.
+    import ast as _ast
+    import inspect as _inspect
+    _banned = {"_fmp_rows", "_fmp_rows_ex", "_price_history", "fmp_get_ex",
+               "fmp_get"}
+    for fn in (block0f_snapshot, _snap_table, _snap_hits, _ma200_track):
+        try:
+            tree = _ast.parse(_inspect.getsource(fn))
+        except Exception as e:                      # pragma: no cover
+            fails.append(f"T15: {fn.__name__} 소스 파싱 실패 {e}")
+            continue
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            f = node.func
+            nm = (f.attr if isinstance(f, _ast.Attribute)
+                  else getattr(f, "id", ""))
+            if nm in _banned:
+                fails.append(f"T15: {fn.__name__} 안에서 {nm}() 호출 — "
+                             "0-F 는 콜 0회여야 한다")
+
     if fails:
         print(f"  ❌ block0 자기검증 실패 {len(fails)}건 — [0] 판정을 믿지 말 것")
         for f in fails:
             print("     - " + f)
         return False
-    print(f"  ✅ {len(_T_CASES) + 1} 케이스 전부 통과 "
-          "(T1·T2·T3·T3b·T3c·T4·T5·T6·T7·T8·T9)")
+    print(f"  ✅ {len(_T_CASES) + 8} 케이스 전부 통과 "
+          "(T1·T2·T3·T3b·T3c·T4·T5·T6·T7·T8·T9 / "
+          "0-F: T10·T11·T12·T13·T14·T15·T16)")
     return True
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -619,6 +774,174 @@ def _ma200_row(name: str, h: pd.DataFrame, base: float | None) -> float:
         delta = f"{m200 - base:+.2f}"
     print(f"  {name:<24}{px:>10.2f}{m50:>10.2f}{m200:>10.2f}{gap:>11.2f}%{delta:>10}")
     return m200
+
+
+def _ma200_track(h: pd.DataFrame, scan: int = MA200_SNAP_SCAN) -> pd.Series:
+    """과거 시점별 MA200 시계열(최근 `scan` 봉). 계산 불가면 빈 시리즈.
+
+    ⚠️ `min_periods=200` 을 **엄격하게** 쓴다. 프로덕션(`rc._ma_last(...,
+       min_p=150)`)과 일부러 다르다. 여기서 하는 일은 외부 사이트가 표시한
+       'MA200' 과 같은 자를 대는 것이고, 150봉 평균을 MA200 이라 부르며 대조하면
+       비교 자체가 성립하지 않는다.
+
+    반환 시리즈의 인덱스는 **그 MA200 이 성립한 날짜**(창의 마지막 봉)다.
+    """
+    if h is None or h.empty or "Close" not in h.columns or len(h) < 200:
+        return pd.Series(dtype=float)
+    ser = h["Close"].rolling(200, min_periods=200).mean().dropna()
+    if scan and len(ser) > scan:
+        ser = ser.iloc[-scan:]
+    return ser
+
+
+def _snap_hits(ser: pd.Series, target: float,
+               tol: float = MA200_SNAP_TOL) -> dict:
+    """`target` 에 tol 안으로 닿은 지점을 찾는다.
+
+    age = 시리즈 마지막 봉으로부터 몇 봉 전인가(0 = 최신). 날짜가 아니라 봉으로
+    세는 이유: 사전 기준(b)이 봉 단위이고, 휴장일이 섞이면 캘린더 일수와 봉 수가
+    어긋나 같은 기준이 종목마다 다른 뜻이 된다.
+    """
+    out = {"n": 0, "hit_age": None, "hit_date": None, "hit_val": None,
+           "near_age": None, "near_date": None, "near_val": None,
+           "near_delta": None, "lo": np.nan, "hi": np.nan}
+    if ser is None or ser.empty:
+        return out
+    last = len(ser) - 1
+    d = (ser - float(target)).abs().values
+    out["lo"], out["hi"] = float(ser.min()), float(ser.max())
+    hits = [i for i, v in enumerate(d) if v <= tol]
+    out["n"] = len(hits)
+    if hits:
+        i = hits[-1]                      # 가장 최근 접촉 = age 가 가장 작은 것
+        out["hit_age"] = last - i
+        out["hit_date"] = ser.index[i]
+        out["hit_val"] = float(ser.iloc[i])
+    j = int(np.argmin(d))
+    out["near_age"] = last - j
+    out["near_date"] = ser.index[j]
+    out["near_val"] = float(ser.iloc[j])
+    out["near_delta"] = float(ser.iloc[j] - float(target))
+    return out
+
+
+def _snap_table(label: str, ser: pd.Series, n_bars: int, *,
+                decides: bool) -> list:
+    """한 시리즈에 대한 목표별 접촉 표를 출력하고 결과 dict 리스트를 반환."""
+    tag = "판정" if decides else "참고"
+    print(f"\n  [{tag}] {label} — 원본 {n_bars}봉 → MA200 점 {len(ser)}개"
+          f" (스캔 최근 {MA200_SNAP_SCAN}봉)")
+    if ser.empty:
+        print(f"    ⚠️ MA200 시계열을 만들 수 없다 ({n_bars}봉 < 200봉)")
+        return []
+    print(f"    스윕 범위                    : {float(ser.min()):.2f}"
+          f" ~ {float(ser.max()):.2f}"
+          f"   ({ser.index[0].date()} ~ {ser.index[-1].date()})")
+
+    res = []
+    for name, tgt in MA200_EXT_TARGETS:
+        r = _snap_hits(ser, tgt)
+        r["name"], r["target"] = name, tgt
+        res.append(r)
+        head = f"    {name} {tgt:.2f}"
+        if r["hit_age"] is None:
+            print(f"{head:<34}: 접촉 없음 (±{MA200_SNAP_TOL})"
+                  f"   최근접 {r['near_val']:.2f}"
+                  f" ({r['near_delta']:+.2f}, {r['near_date'].date()},"
+                  f" {r['near_age']}봉 전)")
+        else:
+            gate = "✅ 60봉 이내" if r["hit_age"] <= MA200_SNAP_RECENT \
+                   else f"❌ {MA200_SNAP_RECENT}봉 초과"
+            print(f"{head:<34}: 접촉 {r['n']}개"
+                  f"   최근 접촉 {r['hit_val']:.2f}"
+                  f" ({r['hit_date'].date()}, {r['hit_age']}봉 전)  {gate}")
+    return res
+
+
+def block0f_snapshot(ded: pd.DataFrame, alt_h: pd.DataFrame | None) -> None:
+    """0-F. 과거 시점별 MA200 을 되짚어 외부값이 '언제의 값'인지 찾는다.
+
+    FMP 콜 0회 — 0-A/0-C 에서 이미 받은 행을 그대로 재사용한다.
+    사전 확정 기준은 `MA200_SNAP_*` 상수에 있으며 결과를 본 뒤 바꾸지 않는다.
+    """
+    print("\n  ── 0-F. 과거 MA200 스냅샷 추적 (FMP 콜 0회) ──")
+    print(f"  사전 기준: raw close 단독 판정 · |Δ| ≤ {MA200_SNAP_TOL}"
+          f" · 두 날짜 모두 최근 {MA200_SNAP_RECENT}봉 이내")
+
+    ser = _ma200_track(ded)
+    res = _snap_table("close (중복제거)", ser, len(ded), decides=True)
+
+    # 참고용. (c) 에 따라 판정에 관여하지 않는다 — 여기 결과로 판정을 뒤집으면
+    # 기회가 두 배가 되어 사전 기준이 느슨해진다.
+    if alt_h is not None and not alt_h.empty:
+        _snap_table("dividend-adjusted", _ma200_track(alt_h), len(alt_h),
+                    decides=False)
+        print("    ↑ 참고 전용 — (c)에 따라 판정에 관여하지 않는다")
+
+    # ── 검정력 자기고발 ─────────────────────────────────────────────────────
+    # 판정보다 **먼저** 찍는다. 두 목표가 스윕 범위 안에 통째로 들어가면 '등장'은
+    # 사실상 보장되고, 그때 판정을 가르는 것은 오직 날짜 게이트다. 이 줄이 없으면
+    # 다음 사람이 통과를 곧바로 '스냅샷 확인'으로 오독한다.
+    print("\n    ── 검정력 ──")
+    if ser.empty:
+        print("    ⚠️ 판정 시리즈가 비어 검정력을 말할 수 없다")
+    else:
+        lo, hi = float(ser.min()), float(ser.max())
+        inside = [f"{t:.2f}" for _, t in MA200_EXT_TARGETS if lo <= t <= hi]
+        if len(inside) == len(MA200_EXT_TARGETS):
+            print("    ⚠️ 검정력 경고: 두 목표값이 모두 스윕 범위 안에 있다 —"
+                  " '등장' 자체는 거의 보장된다.")
+            print("       통과해도 그것만으로는 스냅샷의 증거가 아니다."
+                  " 판정을 가르는 것은 날짜 게이트다.")
+        elif inside:
+            print(f"    스윕 범위 안: {', '.join(inside)} / 밖: "
+                  + ", ".join(f"{t:.2f}" for _, t in MA200_EXT_TARGETS
+                              if not (lo <= t <= hi)))
+        else:
+            print("    ✅ 두 목표값 모두 스윕 범위 밖 — 이 검정은 변별력이 있다")
+
+    # ── 사전 기준 대입 ──────────────────────────────────────────────────────
+    print("\n    ── 사전 기준 대입 ──")
+    if not res:
+        print("    ⛔ 판정 불가 — 판정 시리즈에서 MA200 을 만들 수 없다")
+        print("       (데이터 부족이지 가설의 기각이 아니다)")
+        return
+
+    short = len(ser) < MA200_SNAP_SCAN
+    if short:
+        print(f"    ⚠️ 창 부족: MA200 점이 {len(ser)}개로 "
+              f"{MA200_SNAP_SCAN}봉에 미달한다")
+
+    passed = [r for r in res
+              if r["hit_age"] is not None and r["hit_age"] <= MA200_SNAP_RECENT]
+    missing = [r for r in res if r["hit_age"] is None]
+
+    if len(passed) == len(res):
+        print("    ✅ 스냅샷 가설 채택 — 두 값 모두 ±"
+              f"{MA200_SNAP_TOL} 안에서, 최근 {MA200_SNAP_RECENT}봉 이내에 나왔다")
+        for r in passed:
+            print(f"       {r['name']} {r['target']:.2f}"
+                  f" → {r['hit_date'].date()} ({r['hit_age']}봉 전)")
+        print("       → 외부값은 다른 날짜의 우리 MA200 이다. 우리 계산은 틀리지 않았다.")
+    elif missing and short:
+        # 창이 짧아 못 본 구간이 있는데 '없다'고 단정하면 데이터 부족을 가설
+        # 기각으로 둔갑시키는 것이다. 여기서만 판정을 보류한다.
+        print("    ⛔ 판정 보류 — 창이 짧고 접촉이 없는 목표가 있다: "
+              + ", ".join(r["name"] for r in missing))
+        print(f"       {MA200_SNAP_SCAN}봉을 덮는 시리즈를 확보한 뒤 다시 돌릴 것")
+    else:
+        print("    ❌ 스냅샷 가설 기각 — 사전 기준을 충족하지 못했다")
+        for r in res:
+            if r["hit_age"] is None:
+                print(f"       {r['name']} {r['target']:.2f}: "
+                      f"±{MA200_SNAP_TOL} 안에 한 번도 닿지 않았다"
+                      f" (최근접 {r['near_delta']:+.2f})")
+            elif r["hit_age"] > MA200_SNAP_RECENT:
+                print(f"       {r['name']} {r['target']:.2f}: 닿은 것은 "
+                      f"{r['hit_age']}봉 전 — {MA200_SNAP_RECENT}봉 게이트 밖")
+        print("    → MA200 격차 건 종료. 남은 후보 가설이 없다.")
+        print("       (외부 두 값이 서로 2.1% 다르다는 사실 자체가"
+              " '외부 = 단일 정답' 전제를 이미 무너뜨린다)")
 
 
 def block0_datasource() -> None:
@@ -742,9 +1065,11 @@ def block0_datasource() -> None:
     variants = [("close (중복제거)", ded)]
     if has_adj:
         variants.append(("adjClose", _dedupe(_hist_from_rows(rows, "adjClose"))))
+    # 0-F 가 재사용한다 — 다시 부르면 콜이 늘어난다. 여기서 만든 것을 넘긴다.
+    alt_h = None
     if alt and alt_field:
-        variants.append((f"dividend-adjusted ({alt_field})",
-                         _dedupe(_hist_from_rows(alt, alt_field))))
+        alt_h = _dedupe(_hist_from_rows(alt, alt_field))
+        variants.append((f"dividend-adjusted ({alt_field})", alt_h))
     elif alt:
         # 행은 왔는데 쓸 가격 필드가 없다. '응답 없음'과 반드시 구분한다.
         print(f"  {'dividend-adjusted':<24}{'가격 필드 없음':>10}"
@@ -768,6 +1093,9 @@ def block0_datasource() -> None:
             print("  ❗ 배당조정 MA200 이 미조정보다 높다 — 예상 밖. 조정 방향을 재확인할 것.")
     elif not fin:
         print("  ⚠️ 비교 대상 소스가 하나도 안 나왔다 — 위 0-C 의 kind 를 볼 것.")
+
+    # ── 0-F. 마지막 후보: 외부값이 다른 날짜의 스냅샷인가 ───────────────────
+    block0f_snapshot(ded, alt_h)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
