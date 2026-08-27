@@ -4,7 +4,7 @@ on:
   workflow_dispatch:        # 수동 실행만. 스케줄러/repository_dispatch 트리거 없음.
     inputs:
       probe_ticker:
-        description: '[0] 데이터 소스 검증에 쓸 종목'
+        description: '[0] MA200 격차 원인 규명에 쓸 종목'
         required: false
         default: 'NEE'
       only_uid:
@@ -31,6 +31,8 @@ jobs:
           pip install --upgrade pip
           pip install google-auth gspread requests numpy pandas pytz
 
+      # [S] 격자 대조와 [T] block0 자기검증은 콜 0회이며 시크릿 없이도 돈다.
+      # 둘 중 하나라도 실패하면 종료 코드 1 — 시트 키가 없는 경로에서도 그렇다.
       - name: 🔍 매도 판정 진단 (읽기 전용 · 시트 기록 없음 · 이메일 없음)
         env:
           FMP_API_KEY:       ${{ secrets.FMP_API_KEY }}
