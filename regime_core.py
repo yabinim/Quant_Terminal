@@ -54,6 +54,14 @@ SCORE_WEAK = 35.0
 RS_FULL_PT = 10.0            # RS(%p) 가 이 값 이상이면 만점
 
 # 52주 위치 스케일
+W52_BARS = 252               # 52주 = 약 252 거래일.
+#   ⚠️ 입력 길이에 무관하게 **명시 고정**한다. 예전에는 close 전체를 집계했는데,
+#      FMP 가 limit 을 무시해 1254봉(약 5년)이 들어오면서 "52주 고점 대비"가
+#      실제로는 "5년 고점 대비"였다. 게다가 classify_regime 은 이미 가변 길이로
+#      호출된다(진입 시점 재구성은 sliced, 현재는 전체) — 같은 종목의 then/now
+#      비교가 서로 다른 창을 쓰고 있었다.
+#      _DD_FALLBACK_WINDOW 가 같은 이유로 이미 고정돼 있다(동일 실패 모드).
+#      회귀 가드: diag_regime_window.py (구조 + 길이 불변식)
 NEAR_HIGH_FULL = 0.0         # 고점 대비 0% → 만점
 NEAR_HIGH_ZERO = -25.0       # 고점 대비 -25% → 0점
 ABOVE_LOW_FULL = 25.0        # 저점 대비 +25% 이상 → 만점
@@ -213,8 +221,11 @@ def classify_regime(hist: pd.DataFrame, spy_close=None) -> dict:
     rsi = compute_rsi(close)
     rsi_last = float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else np.nan
 
-    high_52w = float(close.max())
-    low_52w = float(close.min())
+    # 52주 창은 입력 길이에 무관하게 고정한다(W52_BARS 주석 참조).
+    # close 에 직접 .max()/.min() 을 쓰지 말 것 — diag_regime_window 가 잡는다.
+    _w52 = close.tail(W52_BARS)
+    high_52w = float(_w52.max())
+    low_52w = float(_w52.min())
     pct_from_high = (price / high_52w - 1.0) * 100.0 if high_52w > 0 else np.nan
     pct_from_low = (price / low_52w - 1.0) * 100.0 if low_52w > 0 else np.nan
 
