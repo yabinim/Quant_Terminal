@@ -391,14 +391,22 @@ def satellite_tickers() -> list:
 # 반전 · min_periods 문턱 · 창 크기 · 봉수 게이트 · 중복 카운트)을 걸어 전부
 # 잡히는 것을 확인했고, **그 과정에서 죽은 조건절 하나를 발견해 제거**했다
 # (두 값 비교는 봉수 검사에 이미 가려져 판정에 관여하지 못했다).
-def _t_rows(n, start_px=80.0, dup=0, adj=True, step=0.05, adj_mult=0.985):
-    """합성 일봉 n개(거래일만). dup>0 이면 앞쪽 dup개 날짜를 중복시킨다."""
+def _t_rows(n, start_px=80.0, dup=0, adj=True, step=0.05, adj_mult=0.985,
+            with_close=True):
+    """합성 일봉 n개(거래일만). dup>0 이면 앞쪽 dup개 날짜를 중복시킨다.
+
+    with_close=False 는 **`close` 없이 `adjClose` 만 오는 스키마**를 재현한다.
+    `dividend-adjusted` 가 실제로 그 모양이며(2026-08-27 실측), 이 옵션이 없던
+    동안 T1 은 `close` 가 있는 가상의 응답만 먹여서 결함을 통과시켰다.
+    """
     out, d, got = [], datetime(2026, 8, 27).date(), 0
     while got < n:
         if d.weekday() < 5:
             px = start_px + got * step
             r = {"date": str(d), "open": px, "high": px, "low": px,
-                 "close": round(px, 4), "volume": 1000}
+                 "volume": 1000}
+            if with_close:
+                r["close"] = round(px, 4)
             if adj:
                 r["adjClose"] = round(px * adj_mult, 4)
             out.append(r)
@@ -410,12 +418,26 @@ def _t_rows(n, start_px=80.0, dup=0, adj=True, step=0.05, adj_mult=0.985):
 
 
 def _t_stub(full_n, dup=0, adj=True, adj_mult=0.985, div_lim=None,
-            div_win=None, div_kind="empty", full_kind="ok"):
-    """block0 이 부르는 `_fmp_rows_ex` 를 대신할 스텁을 만든다."""
+            div_win=None, div_kind="empty", full_kind="ok",
+            div_schema="adjClose"):
+    """block0 이 부르는 `_fmp_rows_ex` 를 대신할 스텁을 만든다.
+
+    div_schema ∈ {"adjClose", "close", "none"} — dividend-adjusted 응답의
+    가격 필드. 기본을 "adjClose" 로 둔 것은 그것이 **실측된 모양**이기 때문이다.
+    """
     def stub(t, limit=None, path="historical-price-eod/full", day_span=None):
         if "dividend-adjusted" in path:
             n = div_lim if day_span is None else div_win
-            return (_t_rows(n, 78.8, adj=False), "ok") if n else (None, div_kind)
+            if not n:
+                return None, div_kind
+            if div_schema == "adjClose":
+                r = _t_rows(n, 78.8, adj=True, adj_mult=1.0, with_close=False)
+            elif div_schema == "close":
+                r = _t_rows(n, 78.8, adj=False)
+            else:                       # 가격 필드가 아예 없는 응답
+                r = [{"date": x["date"], "volume": 1000} for x in
+                     _t_rows(n, 78.8, adj=False)]
+            return r, "ok"
         if full_kind != "ok":
             return None, full_kind
         return _t_rows(full_n, dup=dup, adj=adj, adj_mult=adj_mult), "ok"
@@ -424,11 +446,32 @@ def _t_stub(full_n, dup=0, adj=True, adj_mult=0.985, div_lim=None,
 
 # (이름, block0 입력, 반드시 나와야 할 문자열, 절대 나오면 안 될 문자열)
 _T_CASES = [
-    ("T1 정상 600봉", dict(full_n=600, div_lim=100, div_win=330),
+    # ⚠️ 픽스처는 **실측 비율**이다(2026-08-27 NEE): limit 요청은 무시되어
+    #    전체(1254행)가 오고, from/to 460일은 316행이 온다. 이전 픽스처는
+    #    div_lim=100 < div_win=330 으로 **정반대 세계**를 고정하고 있었고,
+    #    그래서 "짧은 쪽을 고른다"는 실제 결함을 통과시켰다.
+    ("T1 정상 600봉", dict(full_n=600, div_lim=600, div_win=316),
      ["중복 날짜                      : 0 건", "✅ 정상",
-      "원인 확정: `limit` 이 무시되고", "close (중복제거)",
-      "adjClose", "dividend-adjusted", "✅ 배당조정 가설 기각"],
-     ["❗ 배당조정 MA200 이 미조정보다 높다"]),
+      "`limit` 이 무시되고 전체 이력이 왔다 (600행)",
+      "사용 시리즈                    : limit 경로 600행",
+      "사용 필드                      : adjClose",
+      "close (중복제거)", "dividend-adjusted (adjClose)",
+      "✅ 배당조정 가설 기각"],
+     ["❗ 배당조정 MA200 이 미조정보다 높다", "응답 없음"]),
+    # T8 — 이번 실측에서 드러난 결함 그 자체. `kind=ok` 로 행이 왔는데 가격
+    # 필드명이 달라 0-D 가 "응답 없음"을 찍고 0-E 가 판정을 포기했다.
+    # 이 케이스가 없으면 같은 결함이 또 조용히 통과한다.
+    ("T8 dividend-adjusted 가 adjClose 로만 옴",
+     dict(full_n=600, div_lim=600, div_win=316, div_schema="adjClose"),
+     ["dividend-adjusted (adjClose)"],
+     ["응답 없음", "비교 대상 소스가 하나도 안 나왔다",
+      "dividend-adjusted            가격 필드 없음"]),
+    # T9 — 반대편. 행은 왔는데 쓸 가격 필드가 정말 없는 경우는 '응답 없음'이
+    # 아니라 **받은 필드 목록**을 보여줘야 다음 사람이 원인을 안다.
+    ("T9 가격 필드가 아예 없는 응답",
+     dict(full_n=600, div_lim=600, div_win=316, div_schema="none"),
+     ["가격 필드 없음", "받은 필드: date, volume"],
+     ["dividend-adjusted (adjClose)", "dividend-adjusted (close)"]),
     ("T2 중복 7건", dict(full_n=600, dup=7, div_kind="plan_limited"),
      ["중복 날짜                      : 7 건",
       "⚠️ 200봉 창이 200거래일보다 길어진다",
@@ -519,7 +562,7 @@ def block_t_selftest() -> bool:
             print("     - " + f)
         return False
     print(f"  ✅ {len(_T_CASES) + 1} 케이스 전부 통과 "
-          "(T1·T2·T3·T3b·T3c·T4·T5·T6·T7)")
+          "(T1·T2·T3·T3b·T3c·T4·T5·T6·T7·T8·T9)")
     return True
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -535,6 +578,27 @@ def _dedupe(h: pd.DataFrame) -> pd.DataFrame:
     if h.empty:
         return h
     return h[~h.index.duplicated(keep="last")]
+
+
+def _price_field(rows, prefer=("adjClose", "close")) -> str | None:
+    """행에 실제로 있는 가격 필드를 고른다. 없으면 None.
+
+    ⚠️ 2026-08-27 실측에서 나왔다. `dividend-adjusted` 는 `kind=ok` 로 1,254행을
+    돌려주는데도 0-D 가 "응답 없음"을 찍었다. 원인은 필드명이었다 — 이 경로는
+    `adjClose` 로 오는데 `close` 를 하드코딩해 `_hist_from_rows` 가 빈
+    DataFrame 을 냈고, 그것이 '응답 없음'과 구분되지 않았다.
+
+    `diag_satellite_backtest:226` 이 이미 같은 처리를 한다
+    (`col = "adjClose" if "adjClose" in df.columns else "close"`). 그 사실이
+    레포에 있었는데도 여기서 다시 틀렸다 — 그래서 헬퍼로 뽑아 한 곳에 둔다.
+    """
+    if not rows or not isinstance(rows[0], dict):
+        return None
+    keys = rows[0].keys()
+    for f in prefer:
+        if f in keys:
+            return f
+    return None
 
 
 def _ma200_row(name: str, h: pd.DataFrame, base: float | None) -> float:
@@ -647,12 +711,26 @@ def block0_datasource() -> None:
     alt_win, k_win = _fmp_rows_ex(PROBE_TICKER, path=_DIV, day_span=460)
     print(f"  from/to 460일 호출             : kind={k_win}, "
           f"{len(alt_win) if alt_win else 0}행")
-    if alt_lim and alt_win and len(alt_win) > len(alt_lim):
-        print("  → 원인 확정: `limit` 이 무시되고 기본 창이 짧았다 (§7 과 일치)")
-    elif not alt_lim and not alt_win:
+    n_lim = len(alt_lim) if alt_lim else 0
+    n_win = len(alt_win) if alt_win else 0
+    if not alt_lim and not alt_win:
         print(f"  → 엔드포인트 자체를 못 쓴다 (kind={k_lim}/{k_win})")
+    elif n_lim > n_win:
+        # 2026-08-27 실측: limit=600 을 요청했는데 1,254행이 왔다. `limit` 이
+        # 무시되면 창이 짧아지는 게 아니라 **전체가 온다.** 이전 서술은 반대로
+        # 적혀 있었고, [T] 픽스처도 그 반대 세계를 고정하고 있었다.
+        print(f"  → `limit` 이 무시되고 전체 이력이 왔다 ({n_lim}행) — §7 과 일치")
+    elif n_win > n_lim:
+        print(f"  → from/to 가 더 긴 시리즈를 준다 ({n_win} > {n_lim}행)")
 
-    alt = alt_win or alt_lim
+    # 더 긴 쪽을 쓴다. 짧은 쪽을 고르면 MA200 표본이 이유 없이 줄어든다.
+    alt = alt_lim if n_lim >= n_win else alt_win
+    alt_field = _price_field(alt)
+    if alt:
+        which = "limit" if alt is alt_lim else "from/to"
+        print(f"  사용 시리즈                    : {which} 경로 {len(alt)}행")
+        print(f"  사용 필드                      : {alt_field or '없음 ❌'}"
+              f"  ({', '.join(sorted(alt[0].keys()))})")
 
     # ── 0-D. 소스별 MA200 ───────────────────────────────────────────────────
     print("\n  ── 0-D. 소스별 MA200 ──")
@@ -664,8 +742,13 @@ def block0_datasource() -> None:
     variants = [("close (중복제거)", ded)]
     if has_adj:
         variants.append(("adjClose", _dedupe(_hist_from_rows(rows, "adjClose"))))
-    if alt:
-        variants.append(("dividend-adjusted", _dedupe(_hist_from_rows(alt, "close"))))
+    if alt and alt_field:
+        variants.append((f"dividend-adjusted ({alt_field})",
+                         _dedupe(_hist_from_rows(alt, alt_field))))
+    elif alt:
+        # 행은 왔는데 쓸 가격 필드가 없다. '응답 없음'과 반드시 구분한다.
+        print(f"  {'dividend-adjusted':<24}{'가격 필드 없음':>10}"
+              f"   (받은 필드: {', '.join(sorted(alt[0].keys()))})")
     adj_vals = []
     for name, h in variants:
         v = _ma200_row(name, h, base if np.isfinite(base) else None)
