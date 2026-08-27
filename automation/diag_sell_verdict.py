@@ -12,15 +12,30 @@
   - 시트 기록 없음 (읽기 전용)
   - 이메일 발송 없음
   - regime_core / app.py 로직 변경 없음
-  - 문턱 변경안(3D/3E)은 '시뮬레이션'일 뿐 SSOT 가 아니다.
+
+⚠️ 3D·3E 는 채택되어 사라졌다 (2026-08-26) — 다시 추가하지 말 것
+─────────────────────────────────────────────────────────────
+  · 3D(1개월 <= -5% 일 때만 +1) → `rc.POSITION_MONTH_DROP_PCT = -5.0` 으로 채택됨
+  · 3E(200일선 이격 비례 배점)  → `rc.MA200_GAP_BASE_SCORE/MA200_GAP_FULL_PCT` 로
+      채택됨. 단 SSOT 는 **선형 램프**이지 이 파일이 쓰던 계단식이 아니다.
+      app.py:10834 와 regime_core:2407 이 `gap_ma200_pct` 를 넘겨 이미 라이브다.
+
+  둘 다 프로덕션이 된 뒤에도 이 파일의 '현재' 열이 갱신되지 않아, 시나리오 열이
+  **프로덕션 대 프로덕션**을 비교하고 있었다. 그 상태로 PNC·CSCO 에서 SSOT 대조가
+  깨졌다(진단 🟡 줄이기 vs SSOT ✅ 보유). 원인은 '현재' 열이 `om < 0` 로 채점한
+  것 — SSOT 는 `om <= -5.0` 이다.
+
+  ⚠️ 재정의하지 말 것. 새 임계값을 넣는 것은 **새 질문을 발명하는 것**이고,
+     그럴 사전 기준도 근거도 없다.
 
 출력 블록
 ─────────
+  [S] SSOT 격자 대조     — 합성 입력 전수로 복제본 == regime_core 검증 (콜 0회)
   [0] 데이터 소스 검증   — adjClose 존재 여부 · 배당조정이 MA200 에 주는 영향
   [1] 보유 종목 스냅샷   — MA200 이격 / MACD / 샹들리에 등 판정 입력 전체
   [2] 진입 시점 재구성   — Date_Added 당시 코드 vs 오늘 코드 (2A 억제 효과 판정)
-  [3] 점수 시나리오 비교 — 현재 / 3D / 3E / 3D+3E / 3D+3E+문턱5
-  [4] MA200 이격 분포    — 3E 계단 경계를 데이터로 결정하기 위한 표본
+  [3] 점수 시나리오 비교 — 현재 / 문턱5
+  [4] MA200 이격 분포    — 보유·유니버스가 SSOT 램프의 어디에 있는지
 
 실행:  python automation/diag_sell_verdict.py   (repo root 에서)
 """
@@ -68,11 +83,12 @@ _FETCH_WORKERS = 6
 PROBE_TICKER = os.environ.get("DIAG_PROBE_TICKER", "NEE")
 ONLY_UID = os.environ.get("DIAG_ONLY_UID", "").strip()   # 빈 값 = 전체 사용자
 
-# ── 제안안 파라미터 (시뮬레이션 전용) ─────────────────────────────────────────
-D_MONTH_THRESHOLD = -5.0          # 3D: 1개월 수익률이 이보다 낮을 때만 +1
-E_LADDER = ((-3.0, 2), (-8.0, 3)) # 3E: gap > -3% → 2점, -8% < gap <= -3% → 3점, 그 외 4점
+# ── 문턱 (미채택 시나리오만 남긴다) ──────────────────────────────────────────
+# ⚠️ D_MONTH_THRESHOLD / E_LADDER 는 삭제됐다. 채택되어 SSOT 로 옮겨졌기 때문이다.
+#    상수를 여기 복제하면 SSOT 가 바뀔 때 조용히 갈라진다 — 실제로 그렇게 갈라졌다.
+#    임계값이 필요하면 rc.POSITION_MONTH_DROP_PCT 처럼 **rc 에서 읽어 쓸 것**.
 SELL_TH_DEFAULT, TRIM_TH_DEFAULT = 4, 2
-SELL_TH_ALT = 5
+SELL_TH_ALT = 5                   # 미채택: 청산 문턱을 4 → 5 로
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -163,50 +179,48 @@ def verdict_inputs(hist: pd.DataFrame, entry_price=None, entry_date: str = "") -
     }
 
 
-def score_components(inp: dict, *, use_3d: bool = False, use_3e: bool = False,
+def score_components(inp: dict, *,
                      trailing_stop_pct: float = rc._DEFAULT_TRAILING_STOP_PCT) -> tuple:
-    """점수 분해. ⚠️ SSOT 아님 — 진단/시뮬레이션 전용.
+    """점수 분해. ⚠️ SSOT 아님 — 항목별 기여도를 보여주기 위한 복제본이다.
 
-    use_3d/use_3e 가 모두 False 면 현재 regime_core.integrated_sell_verdict 와
-    동일한 배점이어야 한다([3] 블록에서 실제로 대조 검증한다).
+    `integrated_sell_verdict` 는 합계만 돌려주므로 분해를 얻으려면 복제가 필요하다.
+    **반드시 rc 와 같은 결과를 내야 한다** — [S] 블록이 합성 격자 전수로 대조한다.
+
+    ⚠️ 임계값을 이 파일에 복제하지 말 것. 전부 rc 에서 읽는다.
+       예전에 `om < 0` 을 하드코딩해 두었는데 SSOT 가 `om <= -5.0` 으로 바뀌면서
+       조용히 갈라졌고, 보유 종목의 1개월 수익률이 우연히 -5%~0% 에 들어온
+       날에야 발각됐다.
     """
-    c = {"ma200": 0, "trailing": 0, "macd": 0, "month": 0, "overheat": 0}
+    c = {"ma200": 0.0, "trailing": 0.0, "macd": 0.0, "month": 0.0, "overheat": 0.0}
 
     if inp.get("above_ma200") is False:
-        if use_3e:
-            gap = inp.get("gap200")
-            if pd.isna(gap):
-                c["ma200"] = 4
-            elif gap > E_LADDER[0][0]:
-                c["ma200"] = E_LADDER[0][1]
-            elif gap > E_LADDER[1][0]:
-                c["ma200"] = E_LADDER[1][1]
-            else:
-                c["ma200"] = 4
+        # SSOT 는 이격 비례 **선형 램프**다(계단식이 아니다).
+        # app.py·regime_core 가 gap_ma200_pct 를 넘기므로 이 경로가 라이브다.
+        gap = inp.get("gap200")
+        if pd.notna(gap):
+            _g = abs(float(gap))
+            c["ma200"] = rc.MA200_GAP_BASE_SCORE + (4.0 - rc.MA200_GAP_BASE_SCORE) * min(
+                1.0, _g / rc.MA200_GAP_FULL_PCT)
         else:
-            c["ma200"] = 4
+            c["ma200"] = 4.0
 
     dd = inp.get("drawdown")
     if pd.notna(dd) and dd <= -abs(trailing_stop_pct):
-        c["trailing"] = 3
+        c["trailing"] = 3.0
 
     macd = inp.get("macd")
     if macd == "DEAD_CROSS":
-        c["macd"] = 2
+        c["macd"] = 2.0
     elif macd == "BELOW_SIGNAL":
-        c["macd"] = 1
+        c["macd"] = 1.0
 
     om = inp.get("one_month")
-    if pd.notna(om):
-        if use_3d:
-            if om <= D_MONTH_THRESHOLD:
-                c["month"] = 1
-        elif om < 0:
-            c["month"] = 1
+    if pd.notna(om) and om <= rc.POSITION_MONTH_DROP_PCT:
+        c["month"] = 1.0
 
     rsi, p52 = inp.get("rsi"), inp.get("pct52")
     if pd.notna(rsi) and rsi > 70 and pd.notna(p52) and p52 > -3:
-        c["overheat"] = 1
+        c["overheat"] = 1.0
 
     return sum(c.values()), c
 
@@ -218,6 +232,66 @@ def label_for(score: int, sell_th: int = SELL_TH_DEFAULT,
     if score >= trim_th:
         return "🟡 줄이기"
     return "✅ 보유"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [S] SSOT 격자 대조 — 합성 입력 전수. FMP·시트 접근 없음.
+# ══════════════════════════════════════════════════════════════════════════════
+# 실보유 종목만으로 대조하면 **그날 우연히 판별 구간에 들어야만** 드리프트가
+# 잡힌다. 실제로 `om < 0` vs `om <= -5.0` 드리프트는 보유 종목의 1개월 수익률이
+# -5%~0% 에 들어온 날에야 발각됐다. 그 사이 [3] 은 계속 초록불이었다.
+#   → 경계값을 직접 만들어 전수로 돌린다. 매 실행마다 확정적으로 잡힌다.
+_G_MONTH = [float("nan"), -10.0, -5.1, -5.0, -4.9, -2.8, 0.0, 3.0]
+_G_GAP = [float("nan"), 0.0, -0.5, -3.0, -4.0, -7.9, -8.0, -8.1, -20.0]
+_G_MACD = ["DEAD_CROSS", "BELOW_SIGNAL", "ABOVE_SIGNAL", "N/A"]
+_G_RSI = [float("nan"), 50.0, 70.0, 70.1]
+_G_P52 = [float("nan"), -10.0, -3.0, -2.9, 0.0]
+_G_DD = [float("nan"), 0.0, -14.9, -15.0, -15.1]
+_G_ABOVE = [True, False]
+
+
+def block_s_ssot_grid() -> bool:
+    """복제본 score_components 가 regime_core 와 **모든 경계 조합**에서 일치하는가."""
+    print("\n" + "=" * 78)
+    print("[S] SSOT 격자 대조 — 합성 입력 전수 (FMP 콜 0 · 시트 접근 없음)")
+    print("=" * 78)
+
+    total, bad = 0, []
+    for above in _G_ABOVE:
+        for gap in _G_GAP:
+            for om in _G_MONTH:
+                for macd in _G_MACD:
+                    for rsi in _G_RSI:
+                        for p52 in _G_P52:
+                            for dd in _G_DD:
+                                inp = {"above_ma200": above, "gap200": gap,
+                                       "one_month": om, "macd": macd, "rsi": rsi,
+                                       "pct52": p52, "drawdown": dd}
+                                total += 1
+                                sc, _c = score_components(inp)
+                                mine = label_for(sc)
+                                ssot, _r = rc.integrated_sell_verdict(
+                                    above_ma200=above, one_month_return=om, rsi=rsi,
+                                    macd_signal=macd, pct_from_52w_high=p52,
+                                    drawdown_from_high_pct=dd, gap_ma200_pct=gap)
+                                if mine[0] != ssot[0]:
+                                    bad.append((inp, mine, ssot, sc))
+
+    print(f"  조합 {total:,}건 대조")
+    if bad:
+        print(f"\n  ❌ 불일치 {len(bad):,}건 — 진단 복제본이 SSOT 와 갈라졌다.")
+        for inp, mine, ssot, sc in bad[:8]:
+            print(f"     above_ma200={inp['above_ma200']} gap={inp['gap200']} "
+                  f"1개월={inp['one_month']} MACD={inp['macd']} RSI={inp['rsi']} "
+                  f"고점대비={inp['pct52']} 낙폭={inp['drawdown']}")
+            print(f"       진단 {sc:g} {mine}  vs  regime_core {ssot}")
+        if len(bad) > 8:
+            print(f"     … 외 {len(bad) - 8:,}건")
+        print("\n     → [1][2][3] 전부 신뢰하지 말 것. score_components 를 먼저 고쳐야 한다.")
+        print("     → 임계값을 이 파일에 복제하지 말고 rc 에서 읽을 것.")
+        return False
+    print("  ✅ 전 조합 일치 — 복제본이 regime_core.integrated_sell_verdict 와 동일")
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -425,52 +499,45 @@ def block2_entry_baseline(inputs: dict, hist: dict, spy_hist: pd.DataFrame) -> N
 # ══════════════════════════════════════════════════════════════════════════════
 # [3] 점수 시나리오 비교
 # ══════════════════════════════════════════════════════════════════════════════
-def block3_scenarios(inputs: dict) -> None:
+def block3_scenarios(inputs: dict) -> bool:
     print("\n" + "=" * 78)
     print("[3] 포지션 점수 시나리오 비교")
     print("=" * 78)
-    print(f"  3D: 1개월 수익률 <= {D_MONTH_THRESHOLD:.0f}% 일 때만 +1")
-    print(f"  3E: 200일선 이격 > {E_LADDER[0][0]:.0f}% → {E_LADDER[0][1]}점 · "
-          f"> {E_LADDER[1][0]:.0f}% → {E_LADDER[1][1]}점 · 그 외 4점")
+    print(f"  현재  : SSOT 그대로 (청산 문턱 {SELL_TH_DEFAULT} · 줄이기 {TRIM_TH_DEFAULT})")
+    print(f"  문턱5 : 미채택 시나리오 — 청산 문턱만 {SELL_TH_ALT} 로")
     print()
-    print(f"  {'종목':<7}{'현재':>14}{'3D':>14}{'3E':>14}{'3D+3E':>14}{'3D+3E+문턱5':>16}")
-    print("  " + "-" * 81)
+    print(f"  {'종목':<7}{'현재':>16}{'문턱5':>16}")
+    print("  " + "-" * 45)
 
     mismatch = []
     for (uid, acct, tk), (inp, avg, dadd) in inputs.items():
         s_cur, comp = score_components(inp)
-        s_d, _ = score_components(inp, use_3d=True)
-        s_e, _ = score_components(inp, use_3e=True)
-        s_de, _ = score_components(inp, use_3d=True, use_3e=True)
+        print(f"  {tk:<7}{f'{s_cur:g} ' + label_for(s_cur):>16}"
+              f"{f'{s_cur:g} ' + label_for(s_cur, sell_th=SELL_TH_ALT):>16}")
+        print(f"  {'':<7}└ 분해: 200일선 {comp['ma200']:g} · 트레일링 {comp['trailing']:g}"
+              f" · MACD {comp['macd']:g} · 1개월 {comp['month']:g} · 과열 {comp['overheat']:g}")
 
-        cells = [
-            f"{s_cur} {label_for(s_cur)}",
-            f"{s_d} {label_for(s_d)}",
-            f"{s_e} {label_for(s_e)}",
-            f"{s_de} {label_for(s_de)}",
-            f"{s_de} {label_for(s_de, sell_th=SELL_TH_ALT)}",
-        ]
-        print(f"  {tk:<7}{cells[0]:>14}{cells[1]:>14}{cells[2]:>14}{cells[3]:>14}{cells[4]:>16}")
-        print(f"  {'':<7}└ 현재 분해: 200일선 {comp['ma200']} · 트레일링 {comp['trailing']}"
-              f" · MACD {comp['macd']} · 1개월 {comp['month']} · 과열 {comp['overheat']}")
-
-        # SSOT 대조 — 현재 배점이 regime_core 와 일치하는지 검증
+        # SSOT 대조 — 실보유 데이터로도 확인한다.
+        # ⚠️ gap_ma200_pct 를 반드시 넘긴다. 안 넘기면 SSOT 가 일괄 4점 폴백으로
+        #    가는데, 프로덕션(app.py:10834 · regime_core:2407)은 넘긴다.
+        #    즉 안 넘기면 **프로덕션이 아닌 설정과 대조**하게 된다.
         ssot_label, _ = rc.integrated_sell_verdict(
             above_ma200=inp["above_ma200"], one_month_return=inp["one_month"],
             rsi=inp["rsi"], macd_signal=inp["macd"], pct_from_52w_high=inp["pct52"],
-            drawdown_from_high_pct=inp["drawdown"],
+            drawdown_from_high_pct=inp["drawdown"], gap_ma200_pct=inp.get("gap200"),
         )
         mine = label_for(s_cur)
         if mine[0] != ssot_label[0]:
             mismatch.append((tk, mine, ssot_label))
 
     if mismatch:
-        print("\n  ❌ SSOT 대조 실패 — 진단 배점이 regime_core 와 다르다:")
+        print("\n  ❌ SSOT 대조 실패(실보유) — 진단 배점이 regime_core 와 다르다:")
         for tk, mine, ssot in mismatch:
             print(f"     {tk}: 진단 {mine} vs regime_core {ssot}")
         print("     → [3] 결과를 신뢰하지 말 것. 진단 스크립트를 먼저 고쳐야 한다.")
-    else:
-        print("\n  ✅ SSOT 대조 통과 — '현재' 열이 regime_core.integrated_sell_verdict 와 일치")
+        return False
+    print("\n  ✅ SSOT 대조 통과(실보유) — regime_core.integrated_sell_verdict 와 일치")
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -478,7 +545,9 @@ def block3_scenarios(inputs: dict) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def block4_distribution(tickers: list) -> None:
     print("\n" + "=" * 78)
-    print(f"[4] MA200 이격 분포 — 표본 {len(tickers)}종목 (3E 계단 경계 결정용)")
+    print(f"[4] MA200 이격 분포 — 표본 {len(tickers)}종목 "
+          f"(SSOT 램프: 이격 0% → {rc.MA200_GAP_BASE_SCORE:g}점, "
+          f"{rc.MA200_GAP_FULL_PCT:g}% 이상 → 4점)")
     print("=" * 78)
     if not tickers:
         print("  표본 없음")
@@ -533,6 +602,11 @@ def main() -> int:
     print(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 78)
 
+    # ⚠️ 네트워크·시트보다 **먼저** 돌린다. 복제본이 SSOT 와 갈라져 있으면
+    #    아래 블록의 숫자가 전부 무의미하므로, 키가 없어 중단되는 경우에도
+    #    이 대조 결과만은 남아야 한다.
+    ok_grid = block_s_ssot_grid()
+
     if not FMP_API_KEY:
         print("❌ FMP_API_KEY 없음 — 중단")
         return 1
@@ -567,15 +641,18 @@ def main() -> int:
 
     inputs = block1_snapshot(holds, hist)
     block2_entry_baseline(inputs, hist, spy_hist)
-    block3_scenarios(inputs)
+    ok3 = block3_scenarios(inputs)
 
     universe = sorted(set(hold_tickers) | set(read_watchlist_tickers(sh)) | set(satellite_tickers()))
     block4_distribution(universe)
 
     print("\n" + "=" * 78)
     print("진단 종료 — 아무것도 수정하지 않았습니다.")
+    if not (ok_grid and ok3):
+        print("⚠️ SSOT 대조 실패 — 위 결과를 신뢰하지 마십시오.")
     print("=" * 78)
-    return 0
+    # SSOT 가 갈라진 채로 초록불을 내면 다음에도 못 잡는다. 빨간불로 남긴다.
+    return 0 if (ok_grid and ok3) else 1
 
 
 if __name__ == "__main__":
