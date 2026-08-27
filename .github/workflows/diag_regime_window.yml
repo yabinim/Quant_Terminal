@@ -1,0 +1,52 @@
+name: 🔍 진단 — regime 52주 창 영향 측정 (수동 전용)
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/디스패치 트리거 없음.
+    inputs:
+      mode:
+        description: '실행 모드'
+        required: true
+        default: 'measure'
+        type: choice
+        options:
+          - measure     # 실측 (종목당 1콜 + SPY 1콜)
+          - selftest    # 네트워크 없음 — 패치·집계 역검증만
+      max_tickers:
+        description: '대상 종목 수 상한 (= FMP 콜 수). 기본 80'
+        required: false
+        default: '80'
+        type: string
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20     # 읽기 전용 · 종목당 1콜(약 287KB) — 80종목 기준 2~4분
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install requests numpy pandas gspread google-auth
+
+      # 패치 판정기가 고장난 상태의 측정은 "잘못된 이유로 초록불"이 된다(§6-1).
+      # 키 없이 돌고 네트워크를 안 쓴다.
+      - name: 🧪 패치·집계 역검증 (네트워크 없음)
+        run: |
+          python automation/diag_regime_window.py --selftest
+
+      - name: 🔍 52주 창 영향 측정 (읽기 전용 · 시트 쓰기 없음)
+        if: ${{ inputs.mode == 'measure' }}
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          FMP_RATE_LIMIT_PER_MIN: '200'
+        run: |
+          python automation/diag_regime_window.py --max "${{ inputs.max_tickers }}"
