@@ -68,6 +68,7 @@ import pandas as pd  # noqa: E402
 # 사전 확정값
 # ══════════════════════════════════════════════════════════════════════════
 EXPECT_W52_BARS = 252        # 명시 핀. regime_core 가 이 값을 바꾸면 실패한다.
+EXPECT_MIN_BARS_FULL = 252   # 명시 핀. 52주 창 요구치(220 슬로프 수렴보다 크다).
 TARGET_FN = "classify_regime"
 AGG_ATTRS = {"max", "min"}   # 창 없이 쓰면 길이 의존이 생기는 집계
 WINDOWING = {"tail", "head", "iloc", "loc", "rolling", "last", "first"}
@@ -177,18 +178,27 @@ def unscoped_aggs(src, fn_name=TARGET_FN):
     return hits
 
 
-def module_const(src, name):
-    """모듈 최상위 정수 상수 값. 없으면 None."""
+def module_const(src, name, allow_name: bool = False):
+    """모듈 최상위 상수 값. 없으면 None.
+
+    allow_name=True 면 `A = B` 처럼 **다른 상수를 가리키는** 대입도 받아
+    그 이름(str)을 돌려준다. MIN_BARS_FULL 이 W52_BARS 를 그대로 가리키는지
+    확인하려면 값이 아니라 **연결 자체**를 봐야 하기 때문 — 둘 다 252 라고
+    따로 적어두면 한쪽만 바뀌어도 통과한다(§5-5 자기참조 핀 문제).
+    """
     try:
         tree = ast.parse(src)
     except SyntaxError:
         return None
     for n in tree.body:
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) \
-                and isinstance(n.value.value, int):
-            for t in n.targets:
-                if isinstance(t, ast.Name) and t.id == name:
-                    return n.value.value
+        if not isinstance(n, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
+            continue
+        if isinstance(n.value, ast.Constant) and isinstance(n.value.value, int):
+            return n.value.value
+        if allow_name and isinstance(n.value, ast.Name):
+            return n.value.id
     return None
 
 
@@ -196,6 +206,62 @@ def load_module(src, tag):
     m = types.ModuleType(tag)
     exec(compile(src, tag, "exec"), m.__dict__)
     return m
+
+
+def price_window_ok(src: str, tree) -> bool:
+    """_fmp_price_history 본문이 from/to 창을 쓰고 limit 을 안 쓰는가.
+
+    ⚠️ 파일 전역 문자열 검색으로 하면 안 된다. 같은 파일의 재무제표 호출
+       (income-statement · analyst-estimates · balance-sheet)은 limit 이
+       정상이므로 전역 검색은 영구 빨간불이 된다 — 실제로 그렇게 짰다가
+       C6 이 수정본에서도 실패했다. 함수 본문으로 범위를 좁힌다.
+    """
+    fn = _fn_node(tree, "_fmp_price_history")
+    if fn is None:
+        return False
+    # ⚠️ 원문(get_source_segment)을 보면 **독스트링과 주석까지 센다.** 전환 이력을
+    #    설명하는 문장에 "limit=" 이 들어 있어 실제로 거짓 실패가 났다.
+    #    ast.unparse 는 주석을 버리므로, 독스트링만 떼면 코드만 남는다.
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) and \
+            isinstance(body[0].value, ast.Constant) and \
+            isinstance(body[0].value.value, str):
+        body = body[1:]
+    code = "\n".join(ast.unparse(st) for st in body)
+    if "historical-price-eod" not in code:
+        return False
+    return ("from=" in code) and ("to=" in code) and ("limit=" not in code)
+
+
+def classify_call_sites(tree) -> int:
+    """classify_regime 호출 지점 수 (Attribute · Name 양쪽)."""
+    c = 0
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            f = n.func
+            if (isinstance(f, ast.Attribute) and f.attr == TARGET_FN) or \
+               (isinstance(f, ast.Name) and f.id == TARGET_FN):
+                c += 1
+    return c
+
+
+def excludes_on_full_metrics(tree, fn_name: str) -> bool:
+    """그 함수 안에 `full_metrics` 를 검사하고 continue 하는 분기가 있는가.
+
+    표시만 하고 넘어가면 weak 오답이 그대로 나간다. **제외까지** 확인한다.
+    단순 문자열 검색으로는 '어느 함수에서'를 구분할 수 없어 AST 로 한다.
+    """
+    fn = _fn_node(tree, fn_name)
+    if fn is None:
+        return False
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        if "full_metrics" not in ast.unparse(node.test):
+            continue
+        if any(isinstance(s, ast.Continue) for s in ast.walk(node)):
+            return True
+    return False
 
 
 def _hist(closes):
@@ -268,6 +334,63 @@ def main() -> int:
 
     mod = load_module(src, "regime_core_live")
 
+    # ── B: 봉수 보고 (2026-08-27 신설) ───────────────────────────────────
+    print("\n[B] 봉수 보고 — 창 고정은 봉이 252개 '있을 때'만 성립한다")
+    check(f"B1 MIN_BARS_FULL == {EXPECT_MIN_BARS_FULL}",
+          module_const(src, "MIN_BARS_FULL", allow_name=True), "W52_BARS")
+    check("B2 MIN_BARS_FULL 이 W52_BARS 를 가리킨다",
+          int(getattr(mod, "MIN_BARS_FULL", -1)), EXPECT_MIN_BARS_FULL)
+    _b251 = mod.classify_regime(_hist([50.0 + 0.05 * i for i in range(251)]))
+    _b252 = mod.classify_regime(_hist([50.0 + 0.05 * i for i in range(252)]))
+    check("B3 251봉 → full_metrics False", _b251.get("full_metrics"), False)
+    check("B4 252봉 → full_metrics True", _b252.get("full_metrics"), True)
+    check("B5 bars 가 실제 봉수와 일치", (_b251.get("bars"), _b252.get("bars")),
+          (251, 252))
+    _empty = mod.classify_regime(pd.DataFrame())
+    check("B6 빈 입력에도 필드가 존재한다 (None 과 0봉을 구분)",
+          (_empty.get("bars"), _empty.get("full_metrics")), (0, False))
+    # ⚠️ 핵심: 이 필드는 **보고용**이다. regime/score/enough_data 를 바꾸면
+    #    regime_core:629(진입 시점 재구성 → 알림 억제)가 조용히 달라진다.
+    check("B7 full_metrics=False 여도 enough_data 는 예전대로 True",
+          _b251.get("enough_data"), True)
+    check("B8 full_metrics=False 여도 regime 이 계산된다",
+          _b251.get("regime") in ("strong", "sideways", "weak"), True)
+
+    # ── C: 모듈 경계 — scanner_core 가 실제로 소비하는가 ──────────────────
+    # §3-2 의 실패가 정확히 여기였다: diag_fmp_window [E] 는 파일 단위라
+    # scanner_core → regime_core 소비를 구조적으로 못 봤고, 그래서 위험을
+    # 엉뚱한 곳에 지목했다. "한계를 적는 것과 대비하는 것은 다르다."
+    print("\n[C] 모듈 경계 — scanner_core 가 full_metrics 를 실제로 읽는가")
+    sc_path = os.path.join(root, "scanner_core.py")
+    if not os.path.exists(sc_path):
+        sc_path = os.path.join(here, "scanner_core.py")
+    if not os.path.exists(sc_path):
+        check("C0 scanner_core.py 발견", False, True)
+    else:
+        sc_src = open(sc_path, "r", encoding="utf-8").read()
+        sc_tree = ast.parse(sc_src)
+        n_calls = classify_call_sites(sc_tree)
+        check("C1 classify_regime 호출부를 찾았다", n_calls > 0, True)
+        check("C2 full_metrics 를 읽는 곳이 있다",
+              sc_src.count('"full_metrics"') > 0, True)
+        # 라우터는 제외까지 해야 한다 — 표시만으로는 weak 오답이 그대로 나간다
+        check("C3 route_candidates_by_regime 이 full_metrics 로 제외한다",
+              excludes_on_full_metrics(sc_tree, "route_candidates_by_regime"), True)
+        # 룩백 창이 요구치를 만족하는가 (거래일 ≈ 달력일 × 0.690)
+        _lb = module_const(sc_src, "_REGIME_LOOKBACK_DAYS")
+        check("C4 _REGIME_LOOKBACK_DAYS 상수 존재", isinstance(_lb, int), True)
+        if isinstance(_lb, int):
+            _bars = int(_lb * 252 / 365)
+            print(f"     {_lb}일 → 약 {_bars}거래일 "
+                  f"(요구 {EXPECT_MIN_BARS_FULL}봉 · 여유 {_bars - EXPECT_MIN_BARS_FULL}봉)")
+            check("C5 룩백이 MIN_BARS_FULL + 30봉 이상을 확보한다",
+                  _bars >= EXPECT_MIN_BARS_FULL + 30, True)
+        # ⚠️ 파일 전역 "&limit=" 검색은 오탐이다. income-statement ·
+        #    analyst-estimates · balance-sheet 는 재무제표라 limit 이 정상이다.
+        #    **가격 이력 함수 본문으로 범위를 좁힌다.**
+        check("C6 가격 이력이 from/to 로 전환됐다 (limit 잔재 없음)",
+              price_window_ok(sc_src, sc_tree), True)
+
     # ── L: 길이 불변식 ───────────────────────────────────────────────────
     print("\n[L] 길이 불변식 — 창 밖에 초고점·초저점을 심고 앞에 600봉을 덧댄다")
     a, b = length_invariance(mod)
@@ -326,6 +449,37 @@ def main() -> int:
     check("S12 컬럼 선택은 창이 아니다 — 위반을 여전히 잡는다",
           len(unscoped_aggs('def f(hist):\n    close = hist["Close"].dropna()\n'
                             "    x = close.max()\n", "f")), 1)
+    _S_OLD = ('def _fmp_price_history(t, limit=252):\n'
+              '    u = f"x/historical-price-eod/full?symbol={t}&limit={limit}"\n'
+              '    return u\n')
+    _S_NEW = ('def _fmp_price_history(t, lookback_days=460):\n'
+              '    u = f"x/historical-price-eod/full?symbol={t}&from={a}&to={b}"\n'
+              '    return u\n')
+    check("S14 C6 탐지기가 limit 판을 잡는다",
+          price_window_ok(_S_OLD, ast.parse(_S_OLD)), False)
+    check("S15 C6 탐지기가 from/to 판을 오탐하지 않는다",
+          price_window_ok(_S_NEW, ast.parse(_S_NEW)), True)
+    # ⚠️ 판별 케이스: 독스트링에 limit= 이 있어도 코드가 from/to 면 통과여야 한다.
+    #    실제로 이 오탐이 났다 — 전환 이력을 독스트링에 적었기 때문.
+    _S_DOC = ('def _fmp_price_history(t, lookback_days=460):\n'
+              '    """limit=500 을 보내도 1254봉이 왔다. 그래서 from/to 로 바꿨다."""\n'
+              '    u = f"x/historical-price-eod/full?symbol={t}&from={a}&to={b}"\n'
+              '    return u\n')
+    check("S18 독스트링의 limit 언급은 잔재가 아니다",
+          price_window_ok(_S_DOC, ast.parse(_S_DOC)), True)
+    check("S16 C3 탐지기 — 표시만 하고 제외 안 하면 False",
+          excludes_on_full_metrics(ast.parse(
+              'def route_candidates_by_regime(x):\n'
+              '    for t in x:\n'
+              '        if not r.get("full_metrics"):\n'
+              '            log(t)\n'), "route_candidates_by_regime"), False)
+    check("S17 C3 탐지기 — 제외하면 True",
+          excludes_on_full_metrics(ast.parse(
+              'def route_candidates_by_regime(x):\n'
+              '    for t in x:\n'
+              '        if not r.get("full_metrics"):\n'
+              '            out.append(t)\n'
+              '            continue\n'), "route_candidates_by_regime"), True)
     check("S13 행 슬라이스는 창이다",
           len(unscoped_aggs("def f(close):\n    p = close[-252:]\n"
                             "    x = p.max()\n", "f")), 0)
