@@ -584,14 +584,22 @@ def block4_distribution(tickers: list) -> None:
     if len(below):
         print(f"  이탈분 분위: " + "  ".join(
             f"{int(q * 100)}%={below.quantile(q):+.1f}" for q in (0.05, 0.25, 0.50, 0.75, 0.95)))
-        buckets = [("0 ~ -3%", ((below > -3.0).sum())),
-                   ("-3 ~ -8%", (((below <= -3.0) & (below > -8.0)).sum())),
-                   ("-8% 초과", ((below <= -8.0).sum()))]
-        print("\n  제안 계단별 분포(200일선 아래 종목만):")
+        # ⚠️ 구간 경계를 하드코딩하지 않는다. 삭제된 3E 계단(-3/-8)이 여기
+        #    남아 "제안 계단별 분포"로 계속 출력되고 있었다. SSOT 램프 상수에서
+        #    유도해 상수가 바뀌면 표도 따라오게 한다.
+        _full = float(rc.MA200_GAP_FULL_PCT)
+        _half = _full / 2.0
+        buckets = [
+            (f"0 ~ -{_half:g}%  (2.0~3.0점)", ((below > -_half).sum())),
+            (f"-{_half:g} ~ -{_full:g}% (3.0~4.0점)",
+             (((below <= -_half) & (below > -_full)).sum())),
+            (f"-{_full:g}% 초과 (4.0점 포화)", ((below <= -_full).sum()))]
+        print("\n  SSOT 램프 구간별 분포(200일선 아래 종목만):")
         for name, n in buckets:
             pct = n / len(below) * 100
-            print(f"    {name:<12}{n:>4}종목 ({pct:>5.1f}%)  {'█' * int(pct / 2)}")
-        print("\n  → 특정 구간에 표본이 몰려 있으면 그 경계가 판정을 좌우한다.")
+            print(f"    {name:<24}{n:>4}종목 ({pct:>5.1f}%)  {'█' * int(pct / 2)}")
+        print(f"\n  → -{_full:g}% 초과분은 이격이 더 벌어져도 점수가 안 변한다(포화).")
+        print("    거기 표본이 몰려 있으면 램프가 사실상 일괄 4점처럼 작동한다는 뜻.")
         print("    현재 단면은 시장 국면에 따라 통째로 이동하므로 과적합에 주의.")
 
 
