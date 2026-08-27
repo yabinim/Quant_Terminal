@@ -12,6 +12,34 @@ verdict(entry/wait/overheat/trend_break/avoid)가 켜진 시점 이후 실제로
 
   → "🎯 entry 가 정말 돈이 됐나? 시장(SPY) 대비 알파가 있나? entry>wait>overheat>avoid 로 갈리나?"
 
+v2.9 변경 (2026-08-27 · integrated_sell_verdict SSOT 정합)
+---------------------------------------------------------
+`_pos_label_at` 이 `gap_ma200_pct` 를 넘기지 않아, 200일선 이탈에 **일괄 4.0점**
+(🔴 청산 문턱)을 주는 보수적 폴백을 타고 있었다. 프로덕션(app.py:10834 ·
+regime_core.position_sell_verdict:2407)은 넘기므로 이격 비례 2.0~4.0 램프(3E)를 탄다.
+
+  → 백테스트가 프로덕션보다 **체계적으로 매도에 적극적**이었다.
+
+실측(2026-08-27 diag_sell_verdict [4] · 200일선 아래 21종목):
+
+    이격 0~-4%    13종목(61.9%)   프로덕션 2.0~3.0  vs  백테스트 4.0
+    이격 -4~-8%    1종목( 4.8%)   프로덕션 3.0~4.0  vs  백테스트 4.0
+    이격 -8% 초과   7종목(33.3%)   양쪽 4.0 (포화) ✅
+
+즉 200일선 아래 종목의 약 3분의 2에서 판정이 갈렸다. 영향 범위는
+`Signal_Backtest_RT`(왕복) 시트뿐 — entry/wait/overheat 표는 안 움직인다.
+청산이 **늦어지는** 방향이다.
+
+왜 몇 달간 안 보였나: `_pos_label_at` 독스트링이 "(SSOT 그대로)"라고 **주장만**
+하고 있었고 그 주장을 검사하는 것이 없었다. 주석은 계약을 강제하지 않는다.
+→ `diag_fmp_ssot.py` **A4** 가 이제 `integrated_sell_verdict` 호출부를 저장소
+   전역으로 정적 강제한다(누락 시 하드 실패).
+
+설계 메모: gap 은 `_position_features` 에서 미리 계산하지 않고 `_pos_label_at`
+  안에서 만든다. 미리 계산하면 분자(가격)가 인자 `price` 에서, 분모(ma200)가
+  feats 배열에서 — 서로 다른 경로로 오게 되어, 호출부가 다른 price 를 넘기는
+  순간 `dd` 와 `gap` 이 조용히 갈라진다. feats 는 `ma200` 원값만 내보낸다.
+
 v1.5 변경 (ETF / 개별주 분리 집계)
 ----------------------------------
 유니버스 413종목 중 ETF_Universe 가 343개(83%)라 기존 집계는 사실상 'ETF 성적표'였다.
@@ -475,6 +503,12 @@ def _position_features(h: pd.DataFrame) -> dict:
     atr = tr.rolling(getattr(rc, "ATR_WINDOW", 14)).mean()
     return {
         "above_ma200": (c > ma200).to_numpy(bool),
+        # v2.9(2026-08-27): ma200 을 **원값 그대로** 내보낸다. gap 을 여기서 미리
+        #   계산해두면 분자(가격)가 _pos_label_at 에 넘어온 price 와, 분모(ma200)가
+        #   이 배열과 — 서로 다른 경로에서 오게 된다. 오늘은 둘 다 h["Close"] 라
+        #   값이 같지만, 나중에 호출부가 다른 price 를 넘기는 순간 dd 와 gap 이
+        #   조용히 갈라진다. gap 산출은 price 를 아는 _pos_label_at 이 한다.
+        "ma200": ma200.to_numpy(float),
         "ret_1m": (c / c.shift(22) - 1.0).mul(100.0).to_numpy(float),
         "rsi": rsi.to_numpy(float),
         "macd": st,
@@ -495,8 +529,30 @@ def _market_warnings(spy_arr) -> np.ndarray:
 
 
 def _pos_label_at(feats: dict, price: float, ref_high: float, i: int):
-    """사전계산 입력 + 진입 이후 고점 → integrated_sell_verdict (SSOT 그대로)."""
+    """사전계산 입력 + 진입 이후 고점 → integrated_sell_verdict.
+
+    v2.9(2026-08-27): `gap_ma200_pct` 를 넘기지 않고 있었다. 이 인자를 빼면
+      `integrated_sell_verdict` 는 200일선 이탈에 **일괄 4.0점**(🔴 청산 문턱)을
+      주는 보수적 폴백으로 간다. 프로덕션(app.py · regime_core.position_sell_verdict)
+      은 넘기므로 이격에 비례한 2.0~4.0 램프를 탄다.
+
+      즉 백테스트가 프로덕션보다 체계적으로 매도에 적극적이었다. 실측(2026-08-27
+      diag_sell_verdict [4], 200일선 아래 21종목): 이격 0~-4% 구간이 13종목(61.9%)
+      으로, 프로덕션 2.0~3.0점 대 백테스트 4.0점. 이격 -8% 초과(포화) 7종목에서만
+      두 경로가 일치했다. 200일선 바로 아래 종목의 3분의 2에서 판정이 갈렸다.
+
+      이전 독스트링은 "(SSOT 그대로)" 라고 적혀 있었는데 **거짓**이었다. 주석이
+      계약을 주장만 하고 아무도 검사하지 않으면 그 주석이 드리프트를 감춘다.
+      → diag_fmp_ssot.py A4 가 이제 이 호출부를 정적으로 강제한다.
+
+    gap 을 여기서 계산하는 이유: 분모 ma200 은 feats 에서, 분자는 인자로 받은
+      `price` 에서 온다. dd 와 gap 이 **같은 price** 를 쓰도록 묶어둔다.
+      가드 조건은 regime_core.position_sell_verdict 의 산출식과 문자 그대로 같다.
+    """
     dd = (price / ref_high - 1.0) * 100.0 if (ref_high and np.isfinite(ref_high) and ref_high > 0) else np.nan
+    _ma200 = float(feats["ma200"][i])
+    gap = ((price / _ma200 - 1.0) * 100.0
+           if (np.isfinite(_ma200) and _ma200 > 0) else np.nan)
     return rc.integrated_sell_verdict(
         above_ma200=bool(feats["above_ma200"][i]),
         one_month_return=float(feats["ret_1m"][i]),
@@ -504,6 +560,7 @@ def _pos_label_at(feats: dict, price: float, ref_high: float, i: int):
         macd_signal=feats["macd"][i],
         pct_from_52w_high=float(feats["pct52"][i]),
         drawdown_from_high_pct=dd,
+        gap_ma200_pct=gap,
     )
 
 

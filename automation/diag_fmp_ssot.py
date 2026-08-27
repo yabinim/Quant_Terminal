@@ -370,6 +370,135 @@ print(f"      (튜플 반환 함수 {_n_tuple_fns}개를 추적 중)")
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# A4 — 필수 키워드 인자 계약 (2026-08-27 신설)
+# ══════════════════════════════════════════════════════════════════════════
+# 왜 A2 로 안 되나
+# ────────────────
+# A2 는 '반환 모양'이 바뀐 계약을 본다. A4 는 그 반대 방향 — **인자를 빼먹어도
+# 예외가 안 나고 조용히 다른 답이 나오는** 계약이다. 이쪽이 더 조용하다.
+#
+#   rc.integrated_sell_verdict(..., gap_ma200_pct=gap)   ← 이격 비례 2.0~4.0
+#   rc.integrated_sell_verdict(...)                      ← 일괄 4.0 (폴백)
+#
+# 둘 다 정상 실행되고 둘 다 라벨을 반환한다. 다른 것은 **점수**뿐이고, 4.0 은
+# 🔴 청산 문턱이라 판정이 갈린다. 타입 오류도, 예외도, 로그도 없다.
+#
+# 2026-08-27 에 실제로 터졌다: run_signal_backtest._pos_label_at 이 이 인자를
+# 빼고 있었고, 그 함수의 독스트링에는 "(SSOT 그대로)" 라고 **적혀만** 있었다.
+# 주석은 계약을 강제하지 않는다. 그래서 강제를 도구로 옮긴다.
+#
+# 래칫이 아니라 하드 실패인 이유: 위반이 1곳뿐이었고 그 1곳을 같은 커밋에서
+# 고쳤다. 기준선 0 에서 출발할 수 있으면 래칫을 둘 이유가 없다.
+_A4_CONTRACTS = [
+    # (소유 모듈, 함수명, 필수 키워드, 빼먹었을 때 무슨 일이 나는가)
+    ("regime_core", "integrated_sell_verdict", "gap_ma200_pct",
+     "200일선 이탈 점수가 이격 비례(2.0~4.0)가 아닌 일괄 4.0 폴백이 된다"),
+]
+
+
+def _def_node(tree, func_name):
+    """모듈 최상위 FunctionDef 를 찾는다. 없으면 None."""
+    if tree is None:
+        return None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef) and n.name == func_name:
+            return n
+    return None
+
+
+def declares_kwarg(tree, func_name, kwarg) -> bool:
+    """정의부가 그 키워드를 **실제로** 받는가 (명시 핀).
+
+    ⚠️ 이 검사가 없으면 SSOT 쪽에서 인자 이름만 바꿔도 A4 는 초록불이다 —
+       호출부는 옛 이름을 그대로 넘기고 있고, 탐지기도 옛 이름을 찾으니까.
+       그러면 옛 이름은 **kwargs 도 없이 TypeError 가 나거나(그나마 나음),
+       시그니처가 유연하면 조용히 무시된다. 정의부를 직접 못 박는다.
+    """
+    fn = _def_node(tree, func_name)
+    if fn is None:
+        return False
+    names = [a.arg for a in fn.args.args] + [a.arg for a in fn.args.kwonlyargs]
+    return kwarg in names
+
+
+def required_kw_violations(tree, func_name, kwarg) -> list:
+    """[(lineno, 설명)] — 그 함수를 호출하면서 필수 키워드를 안 넘긴 지점.
+
+    호출 지점 인정 범위:
+      · rc.integrated_sell_verdict(...)      → Attribute
+      · integrated_sell_verdict(...)         → Name (from … import 경로)
+    `**kwargs` 전달이 있으면 정적으로는 증명할 수 없으므로 통과시킨다
+    (누락을 만들지 않기 위해서가 아니라, 거짓 빨간불을 만들지 않기 위해서다 —
+     이 저장소에 그런 호출부는 현재 없고, 생기면 아래 목록 개수로 드러난다).
+    """
+    if tree is None:
+        return []
+    bad = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        f = n.func
+        if isinstance(f, ast.Attribute):
+            hit = (f.attr == func_name)
+        elif isinstance(f, ast.Name):
+            hit = (f.id == func_name)
+        else:
+            hit = False
+        if not hit:
+            continue
+        kws = [k.arg for k in n.keywords]
+        if None in kws:          # **kwargs 전달 — 정적 판정 불가
+            continue
+        if kwarg not in kws:
+            bad.append((getattr(n, "lineno", 0),
+                        _unparse(f) + "(…) 에 " + kwarg + " 없음"))
+    return bad
+
+
+def _count_call_sites(tree, func_name) -> int:
+    if tree is None:
+        return 0
+    c = 0
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        f = n.func
+        if (isinstance(f, ast.Attribute) and f.attr == func_name) or \
+           (isinstance(f, ast.Name) and f.id == func_name):
+            c += 1
+    return c
+
+
+print()
+print("=" * 76)
+print("A) 저장소 전역 — 필수 키워드 인자 계약 (허용목록 없음 · 0 이어야 한다)")
+print("=" * 76)
+
+for _own, _fn, _kw, _why in _A4_CONTRACTS:
+    # A4a 정의부 명시 핀 — 인자 이름이 바뀌면 여기서 먼저 빨간불
+    check(f"A4a {_own}.{_fn} 정의부가 {_kw} 를 받는다",
+          declares_kwarg(TREES.get(_own), _fn, _kw), True)
+
+    # A4b 호출부 전수
+    # 소유 모듈(regime_core) 안의 내부 호출도 검사 대상에 넣는다 —
+    # position_sell_verdict 가 실제 호출부다. 정의(FunctionDef)는 Call 이
+    # 아니므로 자기 자신을 위반으로 잡는 오탐은 나지 않는다(M8c 가 확인).
+    _v4, _sites = [], 0
+    for m in sorted(TREES):
+        _t = TREES[m]
+        _sites += _count_call_sites(_t, _fn)
+        for ln, why in required_kw_violations(_t, _fn, _kw):
+            _v4.append(f"{m}.py:{ln}  {why}")
+
+    check(f"A4b {_fn} 호출부 전부가 {_kw} 를 넘긴다", _v4, [])
+    for x in _v4:
+        print("        · " + x)
+    if _v4:
+        print("        ↳ 빼먹으면: " + _why)
+    print(f"      (호출부 {_sites}곳을 추적 중 · 소유 {_own}.py)")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # B) 위성 백테스트 게이트 — diag_satellite_backtest.py 락스텝 짝
 # ══════════════════════════════════════════════════════════════════════════
 # ⚠️ 로직을 복사하지 않는다. 실제 모듈을 import 해서 실제 함수를 호출하고,
@@ -754,6 +883,67 @@ if _hits:
 else:
     print("  ❌ M7 인공 계약 위반을 **잡아내지 못함** — A2 는 판별력이 없다")
     _fails.append("M7 A2 판별력")
+
+# ── M8 A4 스캐너 자체의 판별력 ────────────────────────────────────────────
+# 초록불인 가드는 두 가지 이유로 초록불일 수 있다: 위반이 없거나, 못 잡거나.
+# 셋을 인공으로 만들어 구분한다 — 누락 검출 · 오탐 없음 · 정의부 핀.
+#   ⚠️ A4 는 지금 위반 0곳에서 출발한다. 판별력 증명이 없으면 이 가드는
+#      영원히 초록불인 채 아무것도 안 지킨다(2026-08-27 diag_regime_window
+#      X4 에서 실제로 겪은 실패 모드).
+_A4_BAD = '''
+import regime_core as rc
+def f(feats, price, i):
+    return rc.integrated_sell_verdict(
+        above_ma200=True, one_month_return=0.0, rsi=50.0,
+        macd_signal="ABOVE_SIGNAL", pct_from_52w_high=-1.0,
+        drawdown_from_high_pct=-2.0,
+    )
+'''
+_A4_GOOD = '''
+import regime_core as rc
+def f(feats, price, i):
+    return rc.integrated_sell_verdict(
+        above_ma200=True, one_month_return=0.0, rsi=50.0,
+        macd_signal="ABOVE_SIGNAL", pct_from_52w_high=-1.0,
+        drawdown_from_high_pct=-2.0, gap_ma200_pct=-3.0,
+    )
+'''
+_A4_NODECL = '''
+def integrated_sell_verdict(*, above_ma200, one_month_return, rsi,
+                            macd_signal, pct_from_52w_high,
+                            drawdown_from_high_pct):
+    return ("보유", "")
+'''
+
+_m8_bad = required_kw_violations(ast.parse(_A4_BAD),
+                                 "integrated_sell_verdict", "gap_ma200_pct")
+if _m8_bad:
+    print("  ✅ M8a 인공 인자 누락을 A4 가 잡아냄 — " + _m8_bad[0][1][:52])
+    _passes += 1
+else:
+    print("  ❌ M8a 인공 인자 누락을 **잡아내지 못함** — A4 는 판별력이 없다")
+    _fails.append("M8a A4 판별력")
+
+_m8_good = required_kw_violations(ast.parse(_A4_GOOD),
+                                  "integrated_sell_verdict", "gap_ma200_pct")
+if not _m8_good:
+    print("  ✅ M8b 정상 호출을 A4 가 오탐하지 않음")
+    _passes += 1
+else:
+    print("  ❌ M8b 정상 호출을 위반으로 **오탐** — " + _m8_good[0][1][:52])
+    _fails.append("M8b A4 오탐")
+
+_m8_tree = ast.parse(_A4_NODECL)
+_m8_decl_bad = declares_kwarg(_m8_tree, "integrated_sell_verdict", "gap_ma200_pct")
+_m8_self = required_kw_violations(_m8_tree, "integrated_sell_verdict", "gap_ma200_pct")
+if (not _m8_decl_bad) and (not _m8_self):
+    print("  ✅ M8c 정의부 핀이 인자 소실을 잡고, 정의 자체를 호출로 오탐하지 않음")
+    _passes += 1
+else:
+    print("  ❌ M8c 정의부 핀 실패 — "
+          + ("인자 없는 정의를 통과시킴" if _m8_decl_bad else "")
+          + ("정의를 호출 위반으로 오탐" if _m8_self else ""))
+    _fails.append("M8c A4 정의부 핀")
 
 
 # ══════════════════════════════════════════════════════════════════════════
