@@ -1,0 +1,46 @@
+name: 🔍 진단 — FMP 날짜창 프로브 (수동 전용)
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/디스패치 트리거 없음.
+    inputs:
+      mode:
+        description: '실행 모드'
+        required: true
+        default: 'probe'
+        type: choice
+        options:
+          - probe       # 실제 FMP 프로브 (약 7콜)
+          - selftest    # 네트워크 없음 — 판정기 역검증만
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10     # 읽기 전용 · 7콜 — 보통 30초 이내
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install requests
+
+      # selftest 는 키 없이 돈다. 프로브 전에 판정기가 멀쩡한지 먼저 본다.
+      - name: 🧪 판정기 역검증 (네트워크 없음)
+        run: |
+          python automation/diag_fmp_window.py --selftest
+
+      - name: 🔍 FMP 날짜창 프로브 (읽기 전용 · 시트 기록 없음 · 약 7콜)
+        if: ${{ inputs.mode == 'probe' }}
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          # 프로브는 7콜뿐이지만 SSOT 기본값을 그대로 따른다.
+          FMP_RATE_LIMIT_PER_MIN: '200'
+        run: |
+          python automation/diag_fmp_window.py
