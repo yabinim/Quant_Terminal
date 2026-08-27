@@ -25,7 +25,7 @@ import time
 import threading
 import traceback
 import concurrent.futures
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import numpy as np
@@ -38,6 +38,20 @@ import fmp_extras as fx
 
 # ── 공용 상수 ─────────────────────────────────────────────────────────────────
 _FMP_BASE = "https://financialmodelingprep.com/stable"
+
+# ── 가격 이력 룩백 창 (2026-08-27: limit → from/to 전환) ────────────────────
+# 값을 옮겨 적지 않고 **하류 요구치에서 유도**한다. §3-3 의 교훈: limit 숫자들은
+# 한 번도 강제된 적이 없어 검증된 적도 없다. from 으로 바꾸는 순간 처음으로
+# 실제 상한이 되므로, 그 숫자는 소비자가 무엇을 필요로 하는지에서 나와야 한다.
+#
+# 거래일 ≈ 달력일 × 0.690 (252/365).
+_REGIME_LOOKBACK_DAYS = 460   # ≈317거래일. 소비자: rc.classify_regime
+#   요구치 = rc.MIN_BARS_FULL(252) ← 52주 창. ma200_slope 수렴(220)보다 크다.
+#   여유 65봉. 380일(≈262봉, 여유 10)은 데이터 공백 한 번에 252 밑으로 떨어지고
+#   그러면 52주 창이 조용히 짧아진다.
+_SHORT_LOOKBACK_DAYS = 190    # ≈131거래일. 소비자: emerging / expansion 스코어러
+#   요구치 = 50봉(ma50). 실측 최대 룩백: emerging 50봉 · expansion 30봉.
+#   이 두 경로는 classify_regime 을 타지 않는다(close_df/volume_df 만 쓴다).
 _FMP_TIMEOUT = 7
 _MARKET_ET_TZ = pytz.timezone("America/New_York")
 
@@ -473,14 +487,36 @@ def _fmp_income(ticker: str) -> dict:
         return {}
 
 @ttl_cache(ttl=1800)
-def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
-    """FMP historical-price-eod → Close/Open/High/Low/Volume DataFrame 반환."""
+def _fmp_price_history(ticker: str, lookback_days: int = 460) -> pd.DataFrame:
+    """FMP historical-price-eod → Close/Open/High/Low/Volume DataFrame 반환.
+
+    2026-08-27: `limit` → `from`/`to` 날짜창으로 전환.
+
+      `limit` 은 **한 번도 강제된 적이 없다.** 무엇을 적든 FMP 는 5년 롤링 전폭
+      (약 1,254봉)을 돌려줬다(diag_fmp_window 실측: limit=500 → 1254봉 수신).
+      즉 호출부의 숫자들은 "필요한 최소 봉수"가 아니라 "누가 언젠가 적어둔 값"
+      이었고 검증된 적이 없다.
+
+      `from`/`to` 는 먹힌다 — 좁은 창(20봉)부터 전폭(1254봉)까지 6개 케이스 전부
+      `honored_complete`. 봉당 229바이트이므로 1254봉 ≈ 287KB/종목이다.
+
+    ⚠️ 전환하는 순간 이 값이 **처음으로 실제 상한**이 된다. 그러므로
+       lookback_days 는 limit 값을 옮겨 적는 게 아니라 **하류 요구치에서 유도**해야
+       한다. 기본 460일 ≈ 317거래일 = rc.MIN_BARS_FULL(252) + 여유 65봉.
+       (380일이면 ≈262봉으로 여유가 10봉뿐이라 데이터 공백 한 번에 252 밑으로
+        떨어지고, 그러면 52주 창이 조용히 짧아진다 — 에러도 로그도 안 난다.)
+    """
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
     try:
+        # UTC 기준 날짜. ET 대비 최대 하루 어긋날 수 있으나 여유 65봉에 비해 무의미하다.
+        _today = datetime.now(timezone.utc).date()
+        _from = (_today - timedelta(days=int(lookback_days))).isoformat()
+        _to = _today.isoformat()
         r = fx.fmp_get(
-            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={k}",
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}"
+            f"&from={_from}&to={_to}&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         if r is None:
@@ -507,7 +543,7 @@ def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
         return pd.DataFrame()
 
 @ttl_cache(ttl=1800)
-def _fmp_batch_price_history(tickers: list, limit: int = 130) -> dict:
+def _fmp_batch_price_history(tickers: list, *, lookback_days: int) -> dict:
     """여러 티커를 ThreadPoolExecutor로 병렬 FMP 호출 → {ticker: DataFrame} 반환.
     순차 루프 대비 섹터 스캔(30~50종목) 기준 약 5~8배 속도 향상.
     max_workers=8: FMP Starter 레이트 리밋(300 req/min) 여유 있게 유지.
@@ -520,7 +556,7 @@ def _fmp_batch_price_history(tickers: list, limit: int = 130) -> dict:
     _MAX_WORKERS = 8  # FMP 레이트 리밋 감안한 동시 요청 수
 
     def _fetch_one(tk):
-        df = _fmp_price_history(tk, limit=limit)
+        df = _fmp_price_history(tk, lookback_days=lookback_days)
         return tk, df
 
     result = {}
@@ -1291,12 +1327,12 @@ def batch_narrative_setup_scores(tickers, narrative_text):
                 out[t] = (0.0, SCANNER_NARRATIVE_API_FAIL_MESSAGE)
     return out
 
-def route_candidates_by_regime(candidate_tickers, limit: int = 252):
+def route_candidates_by_regime(candidate_tickers, lookback_days: int = _REGIME_LOOKBACK_DAYS):
     """후보 풀 각 종목을 regime_core.classify_regime 으로 분기.
     반환: {
       "leaders":  [티커...],          # regime strong (Stage 2), 천장 아님
       "setups":   [티커...],          # regime sideways (Stage 1), 천장 아님
-      "excluded": [(티커, 사유)...],   # weak(Stage4)/topping(Stage3)/데이터부족 → 매도 레이더
+      "excluded": [(티커, 사유)...],   # weak(Stage4)/topping(Stage3)/데이터부족/이력부족 → 매도 레이더
       "detail":   {티커: classify_regime dict},
     }
     """
@@ -1307,7 +1343,7 @@ def route_candidates_by_regime(candidate_tickers, limit: int = 252):
     if not clean:
         return result
     try:
-        batch = _fmp_batch_price_history(clean + ["SPY"], limit=limit)
+        batch = _fmp_batch_price_history(clean + ["SPY"], lookback_days=lookback_days)
     except Exception:
         batch = {}
     spy_df = batch.get("SPY", pd.DataFrame())
@@ -1329,6 +1365,15 @@ def route_candidates_by_regime(candidate_tickers, limit: int = 252):
         result["detail"][tk] = reg
         if not reg.get("enough_data", False):
             result["excluded"].append((tk, "데이터 부족"))
+            continue
+        # 2026-08-27: 봉수가 모자라면 52주 창이 짧아지고 ma200_slope 가 미수렴이다.
+        #   그대로 두면 이런 종목이 **weak(약추세 Stage4)** 로 나가 매도 레이더에
+        #   실린다 — 사유가 거짓말이 된다. 이건 from 전환 위험 대비가 아니라
+        #   지금 있는 버그다: 상장 1년 미만 종목은 1254봉을 요청해도 252봉이 없다.
+        if not reg.get("full_metrics", False):
+            _b = int(reg.get("bars") or 0)
+            result["excluded"].append(
+                (tk, f"이력 부족 ({_b}봉 / {rc.MIN_BARS_FULL}봉 필요 — 신규 상장 가능)"))
             continue
         regime = str(reg.get("regime", "unknown"))
         topping = bool(reg.get("topping", False))
@@ -1362,7 +1407,7 @@ def score_opportunity_universe(universe_tickers, latest_analysis, regime_detail=
 
     with _spinner("가격/거래량 데이터 다운로드 중..."):
         try:
-            batch = _fmp_batch_price_history(tickers + ["SPY"], limit=252)
+            batch = _fmp_batch_price_history(tickers + ["SPY"], lookback_days=_REGIME_LOOKBACK_DAYS)
             close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch.items() if "Close" in df.columns}).sort_index()
             volume_df = pd.DataFrame({tk: df["Volume"] for tk, df in batch.items() if "Volume" in df.columns}).sort_index()
             spy_hist = batch.get("SPY", pd.DataFrame())
@@ -1407,7 +1452,15 @@ def score_opportunity_universe(universe_tickers, latest_analysis, regime_detail=
             except Exception:
                 _reg = {}
         regime_score_raw = to_float(_reg.get("score")) if isinstance(_reg, dict) else np.nan
-        regime_available = bool(isinstance(_reg, dict) and _reg.get("enough_data", False))
+        # 2026-08-27: full_metrics 를 함께 요구한다. 252봉 미만이면 52주 창이
+        #   짧아지고 ma200_slope 가 미수렴이라 score 를 믿을 수 없다.
+        #   (여기서는 제외하지 않고 Regime Available=False 로 표시만 한다 —
+        #    이 함수의 순위는 레짐 외 요소로도 구성되고, 열이 이미 존재한다.)
+        regime_available = bool(
+            isinstance(_reg, dict)
+            and _reg.get("enough_data", False)
+            and _reg.get("full_metrics", False)
+        )
 
         # 병렬 웜업 딕셔너리에서 조회 (캐시 히트) — 없으면 fallback으로 직접 호출
         info = _info_cache.get(ticker) or _fmp_fill({}, ticker)
@@ -1543,7 +1596,7 @@ def score_emerging_opportunity_universe(universe_tickers, latest_analysis):
 
     with _spinner("Emerging: 가격·거래량 데이터 다운로드 중..."):
         try:
-            batch_em = _fmp_batch_price_history(tickers, limit=130)
+            batch_em = _fmp_batch_price_history(tickers, lookback_days=_SHORT_LOOKBACK_DAYS)
             close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch_em.items() if "Close" in df.columns}).sort_index()
             volume_df = pd.DataFrame({tk: df["Volume"] for tk, df in batch_em.items() if "Volume" in df.columns}).sort_index()
         except Exception:
@@ -1770,7 +1823,7 @@ def score_expansion_opportunity_universe(universe_tickers, latest_analysis):
 
     with _spinner("확산주: 가격·거래량 데이터 다운로드 중..."):
         try:
-            batch_x = _fmp_batch_price_history(tickers, limit=130)
+            batch_x = _fmp_batch_price_history(tickers, lookback_days=_SHORT_LOOKBACK_DAYS)
             close_df = pd.DataFrame({tk: df["Close"] for tk, df in batch_x.items() if "Close" in df.columns}).sort_index()
             volume_df = pd.DataFrame({tk: df["Volume"] for tk, df in batch_x.items() if "Volume" in df.columns}).sort_index()
         except Exception:

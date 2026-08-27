@@ -62,6 +62,37 @@ W52_BARS = 252               # 52주 = 약 252 거래일.
 #      비교가 서로 다른 창을 쓰고 있었다.
 #      _DD_FALLBACK_WINDOW 가 같은 이유로 이미 고정돼 있다(동일 실패 모드).
 #      회귀 가드: diag_regime_window.py (구조 + 길이 불변식)
+
+# 모든 지표가 정확해지는 최소 봉 수 (2026-08-27 신설)
+# ────────────────────────────────────────────────────────────────────────
+# W52_BARS 고정으로 52주 창이 **길이 무관**해졌지만, 그건 봉이 252개 **있을 때**의
+# 이야기다. `close.tail(252)` 는 252봉이 없으면 있는 만큼만 반환하므로, 입력이
+# 짧으면 "52주 고점"이 조용히 더 짧은 창의 고점이 된다. 고친 결함이 입력 부족으로
+# 재발하는 경로다.
+#
+# 실측(2026-08-27, 합성 시리즈로 봉수를 계단식으로 줄여 classify_regime 실행):
+#
+#     봉수    ma200    ma200_slope    regime
+#     130      NaN         NaN        weak      ← ma200 소실 → 점수 붕괴
+#     150     59.09        NaN        sideways
+#     170     58.32       0.26        sideways  ← 값은 나오지만 **틀린 값**
+#     200     57.07       0.47        sideways  ← 여전히 틀림
+#     220     57.07       1.71        strong    ← 첫 정답
+#     252+    57.07       1.71        strong
+#
+# 두 개의 요구치가 있고 큰 쪽이 구속한다:
+#   · ma200_slope 수렴 = 220봉
+#       (ma200_series 는 min_periods=150 이라 170봉부터 값이 나오지만, t-20 시점의
+#        MA 까지 진짜 200봉 평균이어야 기울기가 맞는다 → 200 + SLOPE_LOOKBACK)
+#   · 52주 창 = 252봉  ← 이쪽이 크다
+#
+# ⚠️ 이 상수는 **보고용**이다. classify_regime 은 이 값 미만이어도 예전과 똑같이
+#    동작한다(regime · score · enough_data 전부 무변경). 짧은 시리즈를 의도적으로
+#    넘기는 라이브 호출부가 있기 때문 — regime_core:629 는 진입 시점 재구성용
+#    sliced 를 `len >= 50` 만으로 통과시키고, 그 결과가 알림 억제 판정에 쓰인다.
+#    거기에 하드 게이트를 걸면 페이로드 절감 작업이 알림 동작을 바꾸게 된다.
+#    판단은 호출부가 한다: scanner_core 는 full_metrics=False 를 제외 사유로 쓴다.
+MIN_BARS_FULL = W52_BARS
 NEAR_HIGH_FULL = 0.0         # 고점 대비 0% → 만점
 NEAR_HIGH_ZERO = -25.0       # 고점 대비 -25% → 0점
 ABOVE_LOW_FULL = 25.0        # 저점 대비 +25% 이상 → 만점
@@ -194,6 +225,10 @@ def classify_regime(hist: pd.DataFrame, spy_close=None) -> dict:
       rsi_band: (lo, hi)
       topping: bool (Stage 3 서브플래그)
       enough_data: bool
+      bars: int            — 실제로 받은 봉 수 (2026-08-27)
+      full_metrics: bool   — bars >= MIN_BARS_FULL(252). False 면 52주 창이
+                             짧아지고 ma200_slope 가 미수렴이다. **regime·score 는
+                             그래도 계산된다** — 판단은 호출부가 한다.
       components: {price, ma20, ma50, ma150, ma200, ma200_slope, rsi,
                    rs, pct_from_high, pct_from_low}
       color: "🟢"|"🟡"|"🔴"|"⚪"
@@ -202,11 +237,16 @@ def classify_regime(hist: pd.DataFrame, spy_close=None) -> dict:
         "regime": "unknown", "stage": 0, "score": np.nan,
         "rsi_band": RSI_BAND["sideways"], "topping": False,
         "enough_data": False, "components": {}, "color": "⚪",
+        # 2026-08-27: 조기 반환 경로에도 반드시 넣는다. 소비자가 `.get("bars")`
+        #   로 읽을 때 None 이 나오면 0 봉인지 필드가 없는 버전인지 구분이 안 된다.
+        "bars": 0, "full_metrics": False,
     }
     if hist is None or hist.empty or "Close" not in hist.columns:
         return out
 
     close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+    out["bars"] = int(len(close))
+    out["full_metrics"] = bool(len(close) >= MIN_BARS_FULL)
     if len(close) < 50:           # 최소 데이터 가드
         out["components"] = {"price": float(close.iloc[-1]) if not close.empty else np.nan}
         return out
