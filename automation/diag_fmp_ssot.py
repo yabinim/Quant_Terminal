@@ -130,7 +130,9 @@ def _unparse(n) -> str:
 _RAW_GET_BASELINE = {
     # 대화형 경로 + @st.cache_data. 자동화와 위험도가 다르고 68곳을 한 번에
     # 손대면 회귀 위험이 크다 → 별도 검토 사안(인수인계 §6-B5).
-    "app.py": 58,
+    # 2026-08-27: 58 → 63. 코드가 늘어난 게 아니라 **탐지기가 눈을 떴다**
+    # (`_fmp_url_names` 가 변수에 담긴 URL 까지 추적). 실제 부채는 처음부터 63 이었다.
+    "app.py": 63,
     # 8AM/9AM DRG 예측. 종목 수가 적어(매크로 지표 중심) 한도에 닿지 않는다.
     "run_drg_predict.py": 11,
     # run_watchlist_alerts.py 는 2026-08-26 에 4곳 전부 fmp_http 로 전환됐다.
@@ -143,8 +145,23 @@ _RAW_GET_BASELINE = {
     "industry_core.py": 1,
     "diag_earnings_preview_backtest.py": 1,
     "diag_industry_mapping.py": 1,
-    # P2 로 미룬 항목 — 읽기 전용 진단이고 시트에 쓰지 않는다.
-    "diag_sell_verdict.py": 1,
+    # ── 2026-08-27 신규 노출 (강화된 탐지기가 처음 본 것들 · 코드 변경 아님) ──
+    # 전부 `url = FMP_BASE + … + "apikey=" + KEY` → `requests.get(url)` 모양이라
+    # 이전 탐지기가 통째로 놓쳤다. 이제 보이므로 기준선에 명시해 부채로 남긴다.
+    #
+    # ⚠️ calendar_core 는 **코어 모듈**이다(진단이 아니다). holidays-by-exchange
+    #    호출로, refresh_market_calendar 가 주말마다 타는 경로다. 429 재시도가
+    #    없어 실패하면 캘린더가 조용히 낡는다 — 우선 정리 대상.
+    "calendar_core.py": 1,
+    "diag_fmp_endpoints.py": 1,
+    "diag_fmp_newcaps.py": 1,
+    "diag_industry_momentum.py": 1,
+    "diag_nodata_cause.py": 1,
+    # diag_sell_verdict.py 는 2026-08-27 에 fmp_http 로 전환됐다(1 → 0).
+    # 기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
+    # 전환 이유는 스타일이 아니었다: 이 진단은 6워커 병렬로 유니버스를 훑는데
+    # 429 를 조용히 삼키면 '봉 부족'과 구분되지 않아 [0] 블록의 원인 규명 자체가
+    # 오염된다.
 }
 
 # fmp_http 자체는 SSOT 구현체이므로 원시 호출이 있어야 정상이다.
@@ -152,15 +169,44 @@ _RAW_GET_EXEMPT = {"fmp_http"}
 
 
 def _fmp_url_names(tree) -> set:
-    """모듈 안에서 FMP 주소 문자열이 바인딩된 이름들 (_FMP_BASE 등)."""
+    """모듈 안에서 FMP 주소가 바인딩된 이름들 (_FMP_BASE · url · 그 파생).
+
+    ⚠️ 2026-08-27: 이전 구현은 **문자열 상수 직접 대입만** 봤다. 그래서
+
+        url = f"{_FMP_BASE}/…?apikey={KEY}"
+        requests.get(url, timeout=…)
+
+    이 패턴을 통째로 놓쳤다 — 호출식의 인자가 `url` 뿐이라 그 안에
+    "financialmodelingprep" 도 "apikey" 도 `_FMP_BASE` 도 없기 때문이다.
+    뮤테이션으로 실증했다(M9). 저장소에 이 모양이 10곳 있었고 그중 하나는
+    **코어 모듈**(`calendar_core`)이었다.
+
+    그래서 **고정점까지 전파**한다: 값의 소스에 FMP 표식이나 이미 알려진
+    FMP 이름이 등장하면 그 대입 대상도 FMP 이름이다. 증강 대입(`url += …`)도
+    같이 본다 — 조각을 나눠 붙이면 표식이 첫 줄에만 있다.
+    """
     out = set()
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) \
-                and isinstance(n.value.value, str) \
-                and "financialmodelingprep" in n.value.value:
-            for t in n.targets:
+    for _ in range(6):          # 고정점. 실측 2회면 수렴하나 여유를 둔다.
+        before = len(out)
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign):
+                targets, val = n.targets, n.value
+            elif isinstance(n, ast.AugAssign):
+                targets, val = [n.target], n.value
+            else:
+                continue
+            src = _unparse(val)
+            if not src:
+                continue
+            hit = ("financialmodelingprep" in src or "apikey" in src
+                   or any(nm in src for nm in out))
+            if not hit:
+                continue
+            for t in targets:
                 if isinstance(t, ast.Name):
                     out.add(t.id)
+        if len(out) == before:
+            break
     return out
 
 
@@ -178,8 +224,14 @@ def raw_fmp_gets(mod: str) -> list:
                 and c.func.value.id == "requests"):
             continue
         arg = _unparse(c.args[0]) if c.args else ""
+        # ⚠️ 이름 매칭은 **AST 이름 노드**로 한다. 부분 문자열로 하면
+        #    `url` 이라는 이름이 `cfg['url']`(RSS 피드 주소)에 걸리고,
+        #    `a` 같은 한 글자 이름은 거의 모든 인자에 걸린다. 실제로 그렇게
+        #    narrative_core 가 2 → 3 으로 부풀었다.
+        argn = {x.id for x in ast.walk(c.args[0])
+                if isinstance(x, ast.Name)} if c.args else set()
         if ("financialmodelingprep" in arg or "apikey" in arg
-                or any(nm in arg for nm in names)):
+                or (argn & names)):
             hits.append((c.lineno, arg[:60]))
     return hits
 
@@ -944,6 +996,86 @@ else:
           + ("인자 없는 정의를 통과시킴" if _m8_decl_bad else "")
           + ("정의를 호출 위반으로 오탐" if _m8_self else ""))
     _fails.append("M8c A4 정의부 핀")
+
+# ── M9 — 변수에 담긴 FMP URL 을 A1 이 보는가 ───────────────────────────────
+# 2026-08-27 실패에서 나왔다. `_fmp_url_names` 가 문자열 상수 직접 대입만 보던
+# 시절, 아래 M9a 모양은 A1 이 초록불을 냈다. 저장소에 이 모양이 10곳 있었고
+# 그중 하나는 코어 모듈(calendar_core)이었다.
+#
+# M9b 는 반대편을 지킨다: 이름 매칭을 부분 문자열로 하면 `url` 이라는 이름이
+# `cfg['url']`(RSS 피드 주소)에 걸려 narrative_core 가 2 → 3 으로 부풀었다.
+# 두 방향을 같이 걸어야 '엄격해지기'와 '정확해지기'가 구분된다.
+_M9A = """
+import requests
+FMP_BASE = "https://financialmodelingprep.com/stable"
+def go(sym):
+    url = FMP_BASE + "/quote?symbol=" + sym + "&apikey=" + KEY
+    return requests.get(url, timeout=10)
+"""
+_M9B = """
+import requests
+FMP_BASE = "https://financialmodelingprep.com/stable"
+def go(cfg):
+    url = FMP_BASE + "/quote?apikey=" + KEY
+    return requests.get(cfg['url'], timeout=10)
+"""
+
+
+# M9c — 고정점 반복이 실제로 필요한 모양. `b = a + …` 가 `a = …` 보다 **먼저**
+# 순회되므로 1회 통과로는 b 를 못 잡는다(모듈 말미에 상수를 두는 흔한 배치다).
+# 이 케이스가 없으면 `for _ in range(6)` 루프가 1회로 잘려도 아무도 모른다.
+# ⚠️ `ast.walk` 은 BFS 다(소스 순서가 아니다). 그래서 사용처를 정의보다 앞에,
+#    **같은 깊이**에 둬야 1회 통과로 못 잡는다. 이름은 `_q1` 처럼 길게 쓴다 —
+#    `a` 같은 한 글자로 두면 `_fmp_url_names` 의 부분 문자열 매칭에 우연히
+#    걸려 통과해 버려서, 정작 고정점을 시험하지 못한다.
+_M9C = """
+import requests
+_q2 = _q1 + "&limit=5"
+def go():
+    return requests.get(_q2, timeout=10)
+_q1 = "https://financialmodelingprep.com/stable/quote?apikey=" + KEY
+"""
+
+# M9d — 증강 대입(`url += …`)으로 조각을 이어 붙이는 모양. 시작이 빈 문자열이면
+# 표식이 첫 줄에 없어 `ast.Assign` 만 보는 구현은 통째로 놓친다.
+_M9D = """
+import requests
+def go(sym):
+    url = ""
+    url += "https://financialmodelingprep.com/stable/quote?symbol=" + sym
+    url += "&apikey=" + KEY
+    return requests.get(url, timeout=10)
+"""
+
+
+def _a1_hits_on(src_text: str) -> int:
+    """합성 소스에 **진짜 A1 탐지기**(`raw_fmp_gets`)를 적용한다.
+
+    ⚠️ 판정 규칙을 여기 복제하지 않는다. 복제하면 `raw_fmp_gets` 를 무력화하는
+       변경(`argn & names` 제거 등)에도 이 검사가 초록불을 내준다 — 실제로
+       2026-08-27 에 복제본으로 짰다가 뮤테이션 MX-b 에서 그 구멍이 드러났다.
+       TREES 에 임시로 밀어 넣고 원본을 호출한 뒤 반드시 되돌린다.
+    """
+    key = "__m9_probe__.py"
+    TREES[key] = ast.parse(src_text)
+    SRCS[key] = src_text
+    try:
+        return len(raw_fmp_gets(key))
+    finally:
+        TREES.pop(key, None)
+        SRCS.pop(key, None)
+
+
+_m9a, _m9b = _a1_hits_on(_M9A), _a1_hits_on(_M9B)
+_m9c, _m9d = _a1_hits_on(_M9C), _a1_hits_on(_M9D)
+if _m9a == 1 and _m9b == 0 and _m9c == 1 and _m9d == 1:
+    _passes += 1
+    print("  ✅ M9 변수 URL(a) · 겹친 이름 오탐 없음(b) · 다단 전파(c) · "
+          "증강 대입(d) 전부 정상")
+else:
+    print("  ❌ M9 실패 — 변수URL=" + str(_m9a) + "(1) · 오탐=" + str(_m9b)
+          + "(0) · 다단전파=" + str(_m9c) + "(1) · 증강대입=" + str(_m9d) + "(1)")
+    _fails.append("M9 A1 변수 URL 탐지")
 
 
 # ══════════════════════════════════════════════════════════════════════════

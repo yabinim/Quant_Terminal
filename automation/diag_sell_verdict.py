@@ -31,7 +31,8 @@
 출력 블록
 ─────────
   [S] SSOT 격자 대조     — 합성 입력 전수로 복제본 == regime_core 검증 (콜 0회)
-  [0] 데이터 소스 검증   — adjClose 존재 여부 · 배당조정이 MA200 에 주는 영향
+  [T] block0 자기검증    — 스텁 주입으로 [0] 의 분기 전수 실행 (콜 0회)
+  [0] MA200 격차 원인 규명 — 중복날짜 · 창 길이 · min_periods · 배당조정 (3콜)
   [1] 보유 종목 스냅샷   — MA200 이격 / MACD / 샹들리에 등 판정 입력 전체
   [2] 진입 시점 재구성   — Date_Added 당시 코드 vs 오늘 코드 (2A 억제 효과 판정)
   [3] 점수 시나리오 비교 — 현재 / 문턱5
@@ -45,15 +46,15 @@ import concurrent.futures
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import fmp_http as fh  # noqa: E402
 import regime_core as rc  # noqa: E402
 
 try:
@@ -94,20 +95,54 @@ SELL_TH_ALT = 5                   # 미채택: 청산 문턱을 4 → 5 로
 # ══════════════════════════════════════════════════════════════════════════════
 # FMP
 # ══════════════════════════════════════════════════════════════════════════════
-def _fmp_rows(ticker: str, limit: int, path: str = "historical-price-eod/full"):
-    """원본 행 리스트 반환. 실패 시 None (키 점검용으로 가공 전 상태를 준다)."""
+def _fmp_rows_ex(ticker: str, limit: int | None = None,
+                 path: str = "historical-price-eod/full",
+                 day_span: int | None = None):
+    """(행 리스트 | None, kind) — 실패 사유를 보존한다.
+
+    day_span 을 주면 `limit` 대신 `from`/`to` 창으로 호출한다.
+    §7 에서 `historical-price-eod` 의 `limit` 은 **무효 확정**이고 `from`/`to` 는
+    **먹힘 확정**이므로, 두 방식을 나란히 비교할 수 있어야 원인을 가른다.
+
+    kind ∈ {"ok","empty","no_key","rate_limited","plan_limited","http_error",
+            "exception","bad_json"}
+
+    왜 사유를 남기는가: 이전 구현은 non-200 을 전부 None 으로 뭉갰다. 그러면
+    402(플랜 미제공)와 429(레이트리밋)와 '200 인데 행이 짧음'이 화면상 똑같이
+    보인다. **이번 조사(배당조정 봉 부족)의 원인 후보가 정확히 그 셋**이라
+    뭉개면 조사 자체가 성립하지 않는다.
+    """
+    if not FMP_API_KEY:
+        return None, "no_key"
+    url = f"{_FMP_BASE}/{path}?symbol={ticker}"
+    if day_span is not None:
+        today = datetime.utcnow().date()
+        url += (f"&from={today - timedelta(days=int(day_span))}"
+                f"&to={today}")
+    elif limit is not None:
+        url += f"&limit={int(limit)}"
+    url += f"&apikey={FMP_API_KEY}"
+
+    r, _status, kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT)
+    if r is None or kind != "ok":
+        return None, kind
     try:
-        r = requests.get(
-            f"{_FMP_BASE}/{path}?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code != 200:
-            return None
         data = r.json()
-        rows = data.get("historical", data) if isinstance(data, dict) else data
-        return rows if isinstance(rows, list) and rows else None
     except Exception:
-        return None
+        return None, "bad_json"
+    rows = data.get("historical", data) if isinstance(data, dict) else data
+    if not (isinstance(rows, list) and rows):
+        return None, "empty"
+    return rows, "ok"
+
+
+def _fmp_rows(ticker: str, limit: int, path: str = "historical-price-eod/full"):
+    """원본 행 리스트 반환. 실패 시 None (키 점검용으로 가공 전 상태를 준다).
+
+    ⚠️ 반환 계약을 일부러 바꾸지 않았다 — `_price_history` 를 거쳐 [1]~[4] 전
+       블록이 이 모양에 의존한다. 사유가 필요하면 `_fmp_rows_ex` 를 쓴다.
+    """
+    return _fmp_rows_ex(ticker, limit=limit, path=path)[0]
 
 
 def _hist_from_rows(rows, price_field: str = "close") -> pd.DataFrame:
@@ -349,52 +384,307 @@ def satellite_tickers() -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [0] 데이터 소스 검증
+# [T] block0 자기검증 — 스텁 주입 · FMP 콜 0회 · 네트워크 없음
 # ══════════════════════════════════════════════════════════════════════════════
-def block0_datasource() -> None:
+# [S] 격자 대조와 같은 취지다: 이 블록의 판정을 믿기 전에 블록 자신을 검증한다.
+# 개발 중 뮤테이션 7건(중복제거 무력화 · from/to 분기 제거 · 배당조정 부등호
+# 반전 · min_periods 문턱 · 창 크기 · 봉수 게이트 · 중복 카운트)을 걸어 전부
+# 잡히는 것을 확인했고, **그 과정에서 죽은 조건절 하나를 발견해 제거**했다
+# (두 값 비교는 봉수 검사에 이미 가려져 판정에 관여하지 못했다).
+def _t_rows(n, start_px=80.0, dup=0, adj=True, step=0.05, adj_mult=0.985):
+    """합성 일봉 n개(거래일만). dup>0 이면 앞쪽 dup개 날짜를 중복시킨다."""
+    out, d, got = [], datetime(2026, 8, 27).date(), 0
+    while got < n:
+        if d.weekday() < 5:
+            px = start_px + got * step
+            r = {"date": str(d), "open": px, "high": px, "low": px,
+                 "close": round(px, 4), "volume": 1000}
+            if adj:
+                r["adjClose"] = round(px * adj_mult, 4)
+            out.append(r)
+            got += 1
+        d -= timedelta(days=1)
+    for i in range(dup):
+        out.insert(0, dict(out[i]))
+    return out
+
+
+def _t_stub(full_n, dup=0, adj=True, adj_mult=0.985, div_lim=None,
+            div_win=None, div_kind="empty", full_kind="ok"):
+    """block0 이 부르는 `_fmp_rows_ex` 를 대신할 스텁을 만든다."""
+    def stub(t, limit=None, path="historical-price-eod/full", day_span=None):
+        if "dividend-adjusted" in path:
+            n = div_lim if day_span is None else div_win
+            return (_t_rows(n, 78.8, adj=False), "ok") if n else (None, div_kind)
+        if full_kind != "ok":
+            return None, full_kind
+        return _t_rows(full_n, dup=dup, adj=adj, adj_mult=adj_mult), "ok"
+    return stub
+
+
+# (이름, block0 입력, 반드시 나와야 할 문자열, 절대 나오면 안 될 문자열)
+_T_CASES = [
+    ("T1 정상 600봉", dict(full_n=600, div_lim=100, div_win=330),
+     ["중복 날짜                      : 0 건", "✅ 정상",
+      "원인 확정: `limit` 이 무시되고", "close (중복제거)",
+      "adjClose", "dividend-adjusted", "✅ 배당조정 가설 기각"],
+     ["❗ 배당조정 MA200 이 미조정보다 높다"]),
+    ("T2 중복 7건", dict(full_n=600, dup=7, div_kind="plan_limited"),
+     ["중복 날짜                      : 7 건",
+      "⚠️ 200봉 창이 200거래일보다 길어진다",
+      "엔드포인트 자체를 못 쓴다 (kind=plan_limited/plan_limited)"], []),
+    ("T3 170봉", dict(full_n=170),
+     ["고유 봉이 170개뿐 — 200봉 창을 만들 수 없다",
+      "200봉 평균이 아니다 (170봉 · min_periods=150)",
+      "그대로 gap_ma200_pct 가 되어 3E 램프에 들어간다",
+      "봉 부족", "(170봉 / 200봉 필요)"],
+     ["프로덕션에서도 ma200 이 NaN"]),
+    ("T3b 130봉", dict(full_n=130),
+     ["봉이 130개뿐 — 프로덕션에서도 ma200 이 NaN"],
+     ["그대로 gap_ma200_pct 가 되어"]),
+    # ⚠️ T3c 는 2026-08-27 추가. 200~251봉 구간에서 "200봉 평균이 아니다"라는
+    #    **거짓 문장**이 나가던 것을 잡는다. 이 구간은 ma200 자체는 정상이고
+    #    52주 창만 짧다. 이 케이스가 없으면 그 오보를 아무도 못 잡는다.
+    ("T3c 220봉", dict(full_n=220),
+     ["은 정상(200봉 충족)이나 봉이 220개로 52주(252봉)에 미달한다",
+      "고점대비·낙폭 입력이 짧은 창에서 나온다"],
+     ["200봉 평균이 아니다", "프로덕션에서도 ma200 이 NaN"]),
+    ("T4 조정치가 더 높음", dict(full_n=600, adj_mult=1.05),
+     ["❗ 배당조정 MA200 이 미조정보다 높다"], ["✅ 배당조정 가설 기각"]),
+    ("T5 첫 호출 실패", dict(full_n=600, full_kind="rate_limited"),
+     ["응답 없음 (kind=rate_limited)"], ["0-D. 소스별 MA200"]),
+    ("T6 adjClose 없음", dict(full_n=600, adj=False),
+     ["adjClose 필드                  : 없음 ❌",
+      "비교 대상 소스가 하나도 안 나왔다"], []),
+]
+
+
+def block_t_selftest() -> bool:
+    """block0 의 분기를 스텁으로 전수 실행한다. True = 전부 통과."""
+    import io
+    from contextlib import redirect_stdout
+
     print("\n" + "=" * 78)
-    print("[0] 데이터 소스 검증 — 배당조정이 MA200 에 주는 영향")
+    print("[T] block0 자기검증 (스텁 · FMP 콜 0회)")
     print("=" * 78)
 
-    rows = _fmp_rows(PROBE_TICKER, 300)
+    g = globals()
+    orig, fails = g["_fmp_rows_ex"], []
+    try:
+        for name, kw, want, unwant in _T_CASES:
+            g["_fmp_rows_ex"] = _t_stub(**kw)
+            buf = io.StringIO()
+            try:
+                with redirect_stdout(buf):
+                    block0_datasource()
+            except Exception as e:
+                fails.append(f"{name}: 예외 {type(e).__name__}: {e}")
+                continue
+            o = buf.getvalue()
+            fails += [f"{name}: 기대 문자열 없음 → {w!r}" for w in want if w not in o]
+            fails += [f"{name}: 나오면 안 되는 문자열 → {u!r}" for u in unwant if u in o]
+    finally:
+        g["_fmp_rows_ex"] = orig
+
+    # T7 — URL 조립. from/to 가 실제로 붙고 limit 과 섞이지 않는지.
+    # ⚠️ 스텁이 아니라 진짜 `_fmp_rows_ex` 를 부른다(위 finally 로 복원된 뒤).
+    #    fh.fmp_get_ex 만 가로채므로 네트워크는 나가지 않는다.
+    seen, real = [], fh.fmp_get_ex
+    fh.fmp_get_ex = lambda url, timeout=None: (seen.append(url),
+                                               (None, None, "empty"))[1]
+    try:
+        _fmp_rows_ex("TEST", limit=600)
+        _fmp_rows_ex("TEST", path="historical-price-eod/dividend-adjusted",
+                     day_span=460)
+    finally:
+        fh.fmp_get_ex = real
+    if len(seen) != 2:
+        fails.append(f"T7: 호출 {len(seen)}회 (2여야 함)")
+    else:
+        if "&limit=600" not in seen[0] or "from=" in seen[0]:
+            fails.append(f"T7: limit 경로 URL 이상 → {seen[0][:80]}")
+        elif ("from=" not in seen[1] or "&to=" not in seen[1]
+                or "limit=" in seen[1]):
+            fails.append(f"T7: from/to 경로 URL 이상 → {seen[1][:80]}")
+        else:
+            _d = datetime.fromisoformat
+            span = (_d(seen[1].split("&to=")[1].split("&")[0])
+                    - _d(seen[1].split("from=")[1].split("&")[0])).days
+            if span != 460:
+                fails.append(f"T7: 창 폭 {span}일 (460이어야 함)")
+
+    if fails:
+        print(f"  ❌ block0 자기검증 실패 {len(fails)}건 — [0] 판정을 믿지 말 것")
+        for f in fails:
+            print("     - " + f)
+        return False
+    print(f"  ✅ {len(_T_CASES) + 1} 케이스 전부 통과 "
+          "(T1·T2·T3·T3b·T3c·T4·T5·T6·T7)")
+    return True
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [0] MA200 격차 원인 규명
+# ══════════════════════════════════════════════════════════════════════════════
+def _dedupe(h: pd.DataFrame) -> pd.DataFrame:
+    """같은 날짜가 두 번 오면 마지막 것만 남긴다.
+
+    `app.py:6997` · `fmp_extras:669` · `run_hidden_alpha:193` ·
+    `diag_satellite_backtest:231` 이 전부 하는 처리다. 하지 않으면 '최근 200봉'이
+    200 거래일보다 **긴 구간**을 덮어 MA200 이 과거로 끌려간다(= 낮아진다).
+    """
+    if h.empty:
+        return h
+    return h[~h.index.duplicated(keep="last")]
+
+
+def _ma200_row(name: str, h: pd.DataFrame, base: float | None) -> float:
+    """소스 하나의 MA200 을 한 줄로 출력하고 MA200 값을 반환(실패 시 nan)."""
+    if h.empty:
+        print(f"  {name:<24}{'응답 없음':>10}")
+        return np.nan
+    if len(h) < 200:
+        # ⚠️ '봉 부족'을 여기서 끝내지 않는다 — 몇 봉인지가 원인 판별의 핵심이다.
+        print(f"  {name:<24}{'봉 부족':>10}{'':>10}{'':>10}{'':>12}"
+              f"   ({len(h)}봉 / 200봉 필요)")
+        return np.nan
+    c = h["Close"]
+    px, m50, m200 = float(c.iloc[-1]), rc._ma_last(c, 50), rc._ma_last(c, 200)
+    gap = (px / m200 - 1.0) * 100.0 if np.isfinite(m200) and m200 > 0 else np.nan
+    delta = ""
+    if base is not None and np.isfinite(base) and np.isfinite(m200):
+        delta = f"{m200 - base:+.2f}"
+    print(f"  {name:<24}{px:>10.2f}{m50:>10.2f}{m200:>10.2f}{gap:>11.2f}%{delta:>10}")
+    return m200
+
+
+def block0_datasource() -> None:
+    """MA200 격차 원인 규명 — FMP 3콜, 읽기 전용.
+
+    배경: 우리 NEE MA200 = 87.87 인데 외부는 89.77(TickerReport) /
+    91.64(Investing.com) 이다. 인수인계는 이것을 '배당조정 미반영'으로 진단했으나
+    **부호가 반대다** — 배당조정(후방조정)은 과거 가격을 낮추므로 배당조정 MA200 은
+    미조정보다 **작아진다.** 외부가 우리보다 높은 것을 설명할 수 없다.
+
+    그래서 이 블록은 배당조정을 '도입'하는 게 아니라 **가설을 기각하거나 채택**하고,
+    동시에 다른 후보(중복 날짜 · 창 길이 · min_periods 완화)를 같은 화면에서 가른다.
+    """
+    print("\n" + "=" * 78)
+    print(f"[0] MA200 격차 원인 규명 ({PROBE_TICKER})")
+    print("=" * 78)
+
+    rows, kind = _fmp_rows_ex(PROBE_TICKER, limit=HOLD_LIMIT)
     if not rows:
-        print(f"  ❌ {PROBE_TICKER} 응답 없음 — 이후 블록 결과도 신뢰 불가")
+        print(f"  ❌ {PROBE_TICKER} 응답 없음 (kind={kind}) — 이후 블록도 신뢰 불가")
         return
 
     keys = sorted(rows[0].keys()) if isinstance(rows[0], dict) else []
-    print(f"  historical-price-eod/full 응답 필드({PROBE_TICKER}): {', '.join(keys)}")
-
     has_adj = "adjClose" in keys
-    print(f"  adjClose 필드: {'있음 ✅' if has_adj else '없음 ❌'}")
 
-    # 배당조정 전용 엔드포인트가 플랜에 있는지 확인
-    alt = _fmp_rows(PROBE_TICKER, 300, path="historical-price-eod/dividend-adjusted")
-    print(f"  dividend-adjusted 엔드포인트: {'사용 가능 ✅' if alt else '사용 불가 / 미제공'}")
+    # ── 0-A. 원본 시리즈 상태 ────────────────────────────────────────────────
+    print("\n  ── 0-A. 원본 시리즈 상태 ──")
+    print(f"  historical-price-eod/full 필드 : {', '.join(keys)}")
+    print(f"  adjClose 필드                  : {'있음 ✅' if has_adj else '없음 ❌'}")
 
-    variants = [("close (현재 사용)", _hist_from_rows(rows, "close"))]
+    raw = _hist_from_rows(rows, "close")
+    ded = _dedupe(raw)
+    n_dup = len(raw) - len(ded)
+    print(f"  총 행 수                       : {len(raw)}")
+    print(f"  고유 날짜 수                   : {len(ded)}")
+    print(f"  중복 날짜                      : {n_dup} 건"
+          + ("   ⚠️ 200봉 창이 200거래일보다 길어진다" if n_dup else "   ✅"))
+    if not raw.empty:
+        print(f"  최신 봉 날짜                   : {raw.index[-1].date()}")
+
+    # ── 0-B. MA200 창 검증 ──────────────────────────────────────────────────
+    # 외부 사이트와 '같은 200봉'을 보고 있는지 확인한다. 창의 시작일이 다르면
+    # 배당조정이 아니라 창 자체가 원인이다.
+    print("\n  ── 0-B. MA200 창 검증 ──")
+    if len(ded) >= 200:
+        win = ded.index[-200:]
+        span = (win[-1] - win[0]).days
+        # 거래일 → 캘린더일 근사 (§8: × 0.690). 200거래일 ≈ 290일.
+        expect = int(round(200 / 0.690))
+        print(f"  최근 200봉 구간                : {win[0].date()} ~ {win[-1].date()}")
+        print(f"  구간 캘린더 일수               : {span}일  (기대 ≈{expect}일)")
+        verdict = ("✅ 정상" if abs(span - expect) <= 20
+                   else "⚠️ 창이 어긋난다 — 결측/중복 의심")
+        print(f"  판정                           : {verdict}")
+    else:
+        print(f"  ⚠️ 고유 봉이 {len(ded)}개뿐 — 200봉 창을 만들 수 없다")
+
+    # 프로덕션(`classify_regime`)은 `_ma_last(close, 200, min_p=150)` 을 쓴다.
+    # 봉이 150~199개면 200봉이 아닌 평균이 'ma200' 이라는 이름으로 나가고,
+    # 그 값이 `gap_ma200_pct` 가 되어 3E 램프에 그대로 들어간다.
+    #
+    # ⚠️ 여기서 두 값을 비교하지 않는다. 봉이 200 이상이면 둘은 **항상** 같고
+    #    미만이면 엄격 쪽이 NaN 이라, 비교식은 실행돼도 판정에 관여하지 못하는
+    #    죽은 코드가 된다(뮤테이션 M-d 로 실증). 판정하는 것은 봉 수뿐이다.
+    n_uniq = len(ded)
+    if 0 < n_uniq < rc.W52_BARS:
+        loose = rc._ma_last(ded["Close"], 200, min_p=150)
+        if not np.isfinite(loose):
+            print(f"  ⚠️ 봉이 {n_uniq}개뿐 — 프로덕션에서도 ma200 이 NaN 이다 "
+                  "(§3-1: regime 이 weak 로 떨어진다)")
+        elif n_uniq < 200:
+            print(f"  ⚠️ 프로덕션 ma200 = {loose:.2f} 이지만 200봉 평균이 아니다 "
+                  f"({n_uniq}봉 · min_periods=150)")
+            print("     → 이 값이 그대로 gap_ma200_pct 가 되어 3E 램프에 들어간다")
+        else:
+            # 200~251봉. ma200 자체는 진짜 200봉 평균이라 정확하다. 그러나 52주
+            # 창(rc.W52_BARS=252)이 짧아 고점대비·낙폭 입력이 함께 degraded 다.
+            # ⚠️ 여기서 "200봉 평균이 아니다"라고 쓰면 **거짓말**이 된다.
+            print(f"  ⚠️ ma200 = {loose:.2f} 은 정상(200봉 충족)이나 봉이 "
+                  f"{n_uniq}개로 52주({rc.W52_BARS}봉)에 미달한다")
+            print("     → 고점대비·낙폭 입력이 짧은 창에서 나온다")
+
+    # ── 0-C. dividend-adjusted 엔드포인트 진단 ──────────────────────────────
+    # '봉 부족'의 원인이 플랜 제한인지, 레이트리밋인지, 파라미터인지 가른다.
+    print("\n  ── 0-C. dividend-adjusted 엔드포인트 ──")
+    _DIV = "historical-price-eod/dividend-adjusted"
+    alt_lim, k_lim = _fmp_rows_ex(PROBE_TICKER, limit=HOLD_LIMIT, path=_DIV)
+    print(f"  limit={HOLD_LIMIT} 호출            : kind={k_lim}, "
+          f"{len(alt_lim) if alt_lim else 0}행")
+    alt_win, k_win = _fmp_rows_ex(PROBE_TICKER, path=_DIV, day_span=460)
+    print(f"  from/to 460일 호출             : kind={k_win}, "
+          f"{len(alt_win) if alt_win else 0}행")
+    if alt_lim and alt_win and len(alt_win) > len(alt_lim):
+        print("  → 원인 확정: `limit` 이 무시되고 기본 창이 짧았다 (§7 과 일치)")
+    elif not alt_lim and not alt_win:
+        print(f"  → 엔드포인트 자체를 못 쓴다 (kind={k_lim}/{k_win})")
+
+    alt = alt_win or alt_lim
+
+    # ── 0-D. 소스별 MA200 ───────────────────────────────────────────────────
+    print("\n  ── 0-D. 소스별 MA200 ──")
+    print(f"  {'소스':<24}{'종가':>10}{'MA50':>10}{'MA200':>10}"
+          f"{'MA200이격':>12}{'기준대비':>10}")
+    print("  " + "-" * 76)
+
+    base = _ma200_row("close (현재 사용)", raw, None)
+    variants = [("close (중복제거)", ded)]
     if has_adj:
-        variants.append(("adjClose", _hist_from_rows(rows, "adjClose")))
+        variants.append(("adjClose", _dedupe(_hist_from_rows(rows, "adjClose"))))
     if alt:
-        variants.append(("dividend-adjusted", _hist_from_rows(alt, "close")))
-
-    print(f"\n  {'소스':<22}{'종가':>10}{'MA50':>10}{'MA200':>10}{'MA200이격':>12}")
-    print("  " + "-" * 64)
-    base_gap = None
+        variants.append(("dividend-adjusted", _dedupe(_hist_from_rows(alt, "close"))))
+    adj_vals = []
     for name, h in variants:
-        if h.empty or len(h) < 200:
-            print(f"  {name:<22}{'봉 부족':>10}")
-            continue
-        c = h["Close"]
-        px, m50, m200 = float(c.iloc[-1]), rc._ma_last(c, 50), rc._ma_last(c, 200)
-        gap = (px / m200 - 1.0) * 100.0 if np.isfinite(m200) and m200 > 0 else np.nan
-        if base_gap is None:
-            base_gap = gap
-        print(f"  {name:<22}{px:>10.2f}{m50:>10.2f}{m200:>10.2f}{gap:>11.2f}%")
+        v = _ma200_row(name, h, base if np.isfinite(base) else None)
+        if name != "close (중복제거)":
+            adj_vals.append(v)
 
-    if has_adj or alt:
-        print("\n  → 소스별 MA200 차이가 크면 배당주(NEE·SCHD·JEPQ·PNC 등)의")
-        print("    '200일선 이탈' 판정이 데이터 선택만으로 뒤집힐 수 있다.")
-    print("  ※ 참고: 외부 사이트 NEE MA200 = 89.77(TickerReport) / 91.64(Investing.com)")
+    # ── 0-E. 판정 ───────────────────────────────────────────────────────────
+    print("\n  ── 0-E. 외부 대조 및 가설 판정 ──")
+    print("  외부 보고치: 89.77(TickerReport) / 91.64(Investing.com)")
+    print("  ⚠️ 외부 두 값이 1.87(2.1%) 다르다 — 단일 정답이 아니며 자로 쓸 수 없다.")
+    fin = [v for v in adj_vals if np.isfinite(v)]
+    if np.isfinite(base) and fin:
+        if all(v <= base + 1e-9 for v in fin):
+            print("  ✅ 배당조정 가설 기각 — 배당조정 MA200 이 미조정보다 낮거나 같다.")
+            print("     외부가 우리보다 높은 것을 배당조정으로는 설명할 수 없다.")
+        else:
+            print("  ❗ 배당조정 MA200 이 미조정보다 높다 — 예상 밖. 조정 방향을 재확인할 것.")
+    elif not fin:
+        print("  ⚠️ 비교 대상 소스가 하나도 안 나왔다 — 위 0-C 의 kind 를 볼 것.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -615,6 +905,10 @@ def main() -> int:
     #    이 대조 결과만은 남아야 한다.
     ok_grid = block_s_ssot_grid()
 
+    # [T] 도 콜 0회다. [0] 의 판정을 읽기 전에 [0] 자신을 먼저 검증한다 —
+    # 순서가 반대면 이미 화면에 뿌려진 숫자를 나중에 부정하게 된다.
+    ok_t = block_t_selftest()
+
     if not FMP_API_KEY:
         print("❌ FMP_API_KEY 없음 — 중단")
         return 1
@@ -623,7 +917,16 @@ def main() -> int:
 
     if not GSPREAD_KEY_JSON:
         print("\n⚠️ GSPREAD_KEY 없음 — [1]~[3] 건너뜀 (보유 종목을 읽을 수 없음)")
-        return 0
+        # ⚠️ 무조건 0 을 내던 자리다. 시트 키가 없는 실행에서는 [S]/[T] 가
+        #    깨져도 초록불이 나갔다 — 자기검증을 켜 둔 의미가 없어진다.
+        if not (ok_grid and ok_t):
+            # 종료 코드만 1 로 내보내면 로그에서 'GSPREAD_KEY 없음' 이 원인처럼
+            # 읽힌다. 진짜 원인을 한 줄로 못 박는다.
+            bad = [n for n, v in (("[S] SSOT 격자", ok_grid),
+                                  ("[T] block0 자기검증", ok_t)) if not v]
+            print("⚠️ 자기검증 실패: " + " · ".join(bad)
+                  + " — 시트 키 부재가 아니라 이것이 실패 원인이다.")
+        return 0 if (ok_grid and ok_t) else 1
 
     try:
         sh = _sheet()
@@ -656,11 +959,15 @@ def main() -> int:
 
     print("\n" + "=" * 78)
     print("진단 종료 — 아무것도 수정하지 않았습니다.")
-    if not (ok_grid and ok3):
-        print("⚠️ SSOT 대조 실패 — 위 결과를 신뢰하지 마십시오.")
+    if not (ok_grid and ok_t and ok3):
+        bad = [n for n, v in (("[S] SSOT 격자", ok_grid),
+                              ("[T] block0 자기검증", ok_t),
+                              ("[3] 시나리오 SSOT", ok3)) if not v]
+        print("⚠️ 자기검증 실패: " + " · ".join(bad))
+        print("   위 결과를 신뢰하지 마십시오.")
     print("=" * 78)
     # SSOT 가 갈라진 채로 초록불을 내면 다음에도 못 잡는다. 빨간불로 남긴다.
-    return 0 if (ok_grid and ok3) else 1
+    return 0 if (ok_grid and ok_t and ok3) else 1
 
 
 if __name__ == "__main__":
