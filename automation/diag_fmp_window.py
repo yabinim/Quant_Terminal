@@ -1,68 +1,103 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""FMP historical-price-eod — 날짜창 파라미터 검증 + GNOM 113.98 소재 추적.
+"""FMP historical-price-eod — 날짜창 파라미터 검증 + 전환 안전성 감사.
 
-목적
+v2 (2026-08-26): [A] 종결 후 [D] 완전성 · [E] 하류 소요 봉수 감사 추가.
+
+배경
 ────
-두 가지를 한 번에 묻는다. 같은 엔드포인트라 콜을 합칠 수 있다.
+`limit` 은 무시된다(limit=500 → 1254봉). v1 프로브로 **`from`/`to` 는 먹힌다**가
+확정됐다 — 지금까지 확인된 FMP 파라미터 중 유일하게 작동하는 것이다.
+[A] GNOM 113.98 은 시리즈에 없었다(not_found) → 수동 입력 오류로 종결.
 
-  [A] Trade_History 의 GNOM 2026-06-29 매수가 113.98 이 FMP 시리즈 안에
-      존재하는 값인가? (실제 체결가는 Ryan 확인 결과 56.72)
-  [B] `limit` 이 무시되는 것은 확정됐다(limit=500 → 1254봉). 그렇다면
-      `from`/`to` 는 먹히는가? 먹히면 호출부 30여 곳의 페이로드를 줄일 수 있고,
-      안 먹히면 "줄일 방법 없음"으로 확정하고 타임아웃을 그 전제로 맞춘다.
+그런데 "먹힌다"만으로는 전환할 수 없다. v1 이 확인한 것은 **경계**뿐이다:
+from 이전 봉이 안 온다는 것. **창 안의 봉이 전부 오는지(완전성)는 확인하지
+않았다.** B4·B5 가 20봉짜리 좁은 창이라 중간 절삭이 있어도 드러나지 않는다.
 
-이 스크립트는 아무것도 수정하지 않는다. 읽기 전용이다.
-  · 시트 접근 없음 · 파일 쓰기 없음 · FMP 읽기 7콜
+⚠️ 전환의 진짜 위험 — limit 은 한 번도 강제된 적이 없다
+─────────────────────────────────────────────────────
+현재 호출부의 `limit` 값들은 **전부 무의미했다.** 뭘 적든 1254봉이 왔다.
+즉 그 숫자는 "필요한 최소 봉수"가 아니라 **"누가 언젠가 적어둔 값"** 이고
+한 번도 검증된 적이 없다.
+
+`from` 으로 전환하는 순간 그 숫자가 **처음으로 실제 상한이 된다.**
+`limit=130` 인데 하류에서 200일선을 계산하는 곳이 하나라도 있으면, 오늘까지
+멀쩡하던 것이 전환 당일 조용히 NaN 이 된다. [E] 가 그걸 미리 찾는다.
+
+단위도 다르다. `limit` 은 **거래일**, `from` 은 **달력일**이다. 비율은 추정하지
+않고 기준선 응답에서 **실측**한다.
+
+이 스크립트는 아무것도 수정하지 않는다.
+  · 시트 접근 없음 · 파일 쓰기 없음 · FMP 읽기 7콜(기본) / 8콜(--with-a)
 
 ════════════════════════════════════════════════════════════════════════
 ⚠️ 사전 확정 판정 기준 — 결과를 보기 전에 못 박는다
 ════════════════════════════════════════════════════════════════════════
 
-[A] GNOM 113.98
-  · 시리즈 전체(close/open/high/low)에서 113.98 의 ±0.5% 안을 찾는다.
-  · 미발견            → FMP 데이터 기원설 **기각**. 수동 입력 오류로 확정.
-                        코드 수정 불필요, 시트 수정만.
-  · 발견 & 위치 상위 5 → "가장 오래된 봉" 가설 살아남음. 경로 추적 계속.
-  · 발견 & 그 외       → 위치·날짜를 기록하고 별도 조사.
+[B]·[D] 공통 — **기준선 시리즈를 정답지로 쓴다**
 
-  ⚠️ app.py 매수 폼 두 곳(22030 `value=0.0`, 25077 `value=현재가`)을 확인한
-     결과 과거 봉이 매수가 입력란에 들어갈 경로는 **없다**. 즉 이 검사의
-     사전 기대값은 "미발견"이다. 발견되면 그게 새 정보다.
+  v1 은 경계(최소·최대 날짜)만 봤다. v2 는 B1(무파라미터) 응답을 먼저 받아
+  **그 시리즈에서 창 안의 봉 수를 직접 세어 기대값**으로 삼는다. 추가 콜 0회로
+  판정력이 올라간다 — 기대값이 외부 가정이 아니라 같은 엔드포인트의 실측이다.
 
-[B] from/to — **날짜로만 판정한다. 봉수·바이트로 판정하지 않는다.**
-  근거: 봉수는 파라미터가 무시돼도 다른 이유로 달라질 수 있다. 반면
-  "from 이전의 봉이 하나라도 왔다"는 파라미터가 무시됐을 때만 성립한다.
-  (지난 세션 교훈: limit=500 요청에 1254봉 수신 → 한 방향으로 결정적)
+  · 경계 위반(from 이전 / to 이후 봉 존재)        → **ignored**
+  · 경계 OK · 실제 == 기대 (±1봉)                 → **honored_complete**
+  · 경계 OK · 실제 <  기대                        → **honored_truncated**
+      경계는 지키지만 봉이 빠진다. 넓은 창에 쓸 수 없다
+  · 경계 OK · 실제 >  기대                        → **anomaly** (조사 필요)
+  · 빈 응답                                       → **inconclusive**
+      범위 축소 결과인지 엔드포인트 장애인지 구분할 수 없다
 
-  · from 먹힘 = 응답의 **최소 날짜 ≥ from**
-  · to   먹힘 = 응답의 **최대 날짜 ≤ to**
-  · 둘 다 지정한 두 창(B4·B5) **모두** 통과해야 "먹힘" 확정.
-    하나만 통과하면 **불확정** — 한 창의 우연을 배제할 수 없다.
-  · 빈 응답은 "먹힘"이 아니라 **불확정**이다. 범위를 좁혔더니 0건 온 것과
-    엔드포인트가 죽은 것을 구분할 수 없기 때문.
+  ±1봉 허용 이유: 기준선과 창 요청 사이 수 초 간격에 당일 봉이 생길 수 있다.
+  2봉 이상 차이는 허용하지 않는다.
 
-[C] 페이로드 영향 — 콜 0회. 저장소 소스를 직접 읽어 호출부와 limit 값을
-    열거한다. 기억이 아니라 소스가 근거다.
+  **최종 "전환 가능" 판정 = B2~B5 · D1 · D2 가 전부 honored_complete.**
+  하나라도 truncated 면 전환 불가. 하나라도 inconclusive 면 재실행.
+
+[D] 완전성 — 좁은 창만으로는 못 본다
+
+  D1 중간폭 창: from = 기준선의 중앙 날짜 (약 절반 ≈ 600봉대)
+  D2 전폭 창  : from = 기준선의 최초 날짜 (전량 ≈ 1254봉)
+
+  D2 가 complete 면 "날짜창으로 전량 확보 가능" 이 확정된다 — 이게 되어야
+  `run_signal_backtest` 처럼 최대 깊이가 필요한 곳도 전환할 수 있다.
+
+[E] 하류 소요 봉수 감사 — 콜 0회, AST
+
+  각 호출부 **파일**을 훑어 긴 윈도우 연산의 최대 N 을 찾는다:
+  `rolling(N)` · `ewm(span=N)` · `.tail(N)` · `.iloc[-N:]` ·
+  `*_BARS/LOOKBACK/WINDOW/PERIOD/MIN_PRIOR* = N` 상수.
+
+  판정: limit < 관측최대N → **위험**(전환 시 데이터 부족)
+
+  ⚠️ **이 감사는 파일 단위 과대근사다.** 같은 파일의 다른 함수가 쓰는 윈도우도
+     함께 잡힌다. 즉 **오탐은 나지만 누락은 나지 않는다** — 전환 전 감사로는
+     안전한 방향이다. 여기서 '안전'으로 나온 것만 자동으로 믿어도 되고,
+     '위험'은 사람이 한 번 봐야 한다.
+  ⚠️ df 가 다른 모듈로 넘어가 거기서 200일선을 계산하면 이 감사는 못 본다.
+     파일 경계를 넘는 소비는 범위 밖이다.
 
 ════════════════════════════════════════════════════════════════════════
 
 설계 제약
 ─────────
 · **원시 requests.get 을 쓰지 않는다.** 전부 fmp_http(SSOT) 경유.
-  diag_fmp_ssot.py 의 A1 래칫은 기준선에 없는 파일에서 원시 호출이
-  발견되면 실패한다. 새 파일은 0곳이어야 한다.
-· **다른 모듈을 import 하지 않는다.** run_signal_backtest 를 빌려 쓰면
-  gspread·pandas 의존이 딸려오고, 평면 디렉터리에서만 되는 경로 결함이
-  숨는다(§6-2). URL 은 여기서 만들고, 호출부 조사는 **소스 텍스트**로 한다.
+  diag_fmp_ssot A1 래칫은 기준선에 없는 파일의 원시 호출을 실패 처리한다.
+· **다른 저장소 모듈을 import 하지 않는다.** 의존성 딸림·경로 결함 은폐 방지
+  (§6-2). URL 은 여기서 만들고 호출부 조사는 소스 AST 로 한다.
+· 의존성은 `requests` 하나(그마저 fmp_http 경유).
 
 실행
 ────
-    python automation/diag_fmp_window.py              # 실제 프로브 (7콜)
-    python automation/diag_fmp_window.py --selftest   # 네트워크 없음, 판정기 역검증
+    python automation/diag_fmp_window.py              # 기본 7콜 (B·D·C·E)
+    python automation/diag_fmp_window.py --with-a     # + GNOM 재확인 (8콜)
+    python automation/diag_fmp_window.py --selftest   # 네트워크 없음
 """
 from __future__ import annotations
 
+import ast
+import datetime as dt
+import math
 import os
 import re
 import sys
@@ -76,22 +111,32 @@ import fmp_http as fh  # noqa: E402
 # 상수 — 사전 확정값
 # ══════════════════════════════════════════════════════════════════════════
 GNOM_SYMBOL = "GNOM"
-GNOM_RECORDED = 113.98     # Trade_History 에 기록된 값
+GNOM_RECORDED = 113.98     # Trade_History 에 기록됐던 값 (2026-08-26 56.72 로 정정)
 GNOM_ACTUAL = 56.72        # Ryan 확인 실제 체결가
 GNOM_TRADE_DATE = "2026-06-29"
 MATCH_TOL = 0.005          # ±0.5%
-HEAD_N = 5                 # "가장 오래된 봉" 판정 폭
+HEAD_N = 5
 
 PROBE_SYMBOL = "SPY"
 ENDPOINT = "historical-price-eod/full"
 
-# B4·B5 두 창. 서로 다른 시기를 고른다 — 한 창의 우연을 배제한다.
 WIN_A = ("2026-06-01", "2026-06-30")
 WIN_B = ("2026-08-01", "2026-08-25")
 FROM_ONLY = "2026-06-01"
 TO_ONLY = "2022-12-31"
 
-TIMEOUT = 20.0             # limit 무시 확정 이후 항상 1254봉이 온다
+COUNT_TOL = 1              # 기준선 대비 허용 봉수 차 (당일 봉 타이밍)
+SAFETY_MARGIN = 1.10       # 전환 권고 오프셋 안전계수
+SAFETY_PAD_DAYS = 10       # 연휴 구간 대비 고정 여유
+
+TIMEOUT = 20.0
+
+# [E] 가 훑는 긴 윈도우 신호
+_WINDOW_CALLS = {"rolling", "ewm"}
+_TAIL_CALLS = {"tail", "head"}
+_CONST_RE = re.compile(r"(BARS|LOOKBACK|WINDOW|PERIOD|MIN_PRIOR|_MA\b|HISTORY)",
+                       re.IGNORECASE)
+_CONST_MAX = 5000          # 이보다 큰 상수는 봉수가 아니라 다른 것(포트·바이트 등)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -107,7 +152,7 @@ def extract_rows(data):
 
 
 def row_dates(rows):
-    """레코드 리스트 → (유효날짜 리스트, 불량건수). 날짜는 'YYYY-MM-DD' 문자열."""
+    """레코드 리스트 → (정렬된 유효날짜 리스트, 불량건수)."""
     out, bad = [], 0
     for r in rows:
         d = str(r.get("date") or "").strip()[:10]
@@ -118,34 +163,36 @@ def row_dates(rows):
     return sorted(out), bad
 
 
-def verdict_range(rows, d_from, d_to):
-    """날짜창 파라미터가 먹혔는지 판정.
+def expected_in_window(baseline_dates, d_from, d_to):
+    """기준선 시리즈에서 [d_from, d_to] 안의 봉 수 — 창 요청의 기대값.
 
-    Returns: (verdict, detail)
-      verdict ∈ {"honored", "ignored", "inconclusive"}
-
-    ⚠️ 판정은 **날짜 경계**로만 한다. 봉수·바이트는 참고 지표일 뿐이다.
-       빈 응답은 honored 가 아니라 inconclusive — 범위 축소의 결과인지
-       엔드포인트 장애인지 구분할 수 없다.
+    기대값을 외부 가정이 아니라 **같은 엔드포인트의 실측**에서 뽑는다.
+    빈 경계는 무제한으로 본다.
     """
+    lo = d_from or "0000-00-00"
+    hi = d_to or "9999-99-99"
+    return sum(1 for d in baseline_dates if lo <= d <= hi)
+
+
+def verdict_range(rows, d_from, d_to):
+    """경계 판정만. Returns: (verdict, detail). v1 호환 유지."""
     dates, bad = row_dates(rows)
     if not dates:
         return "inconclusive", "유효 날짜 0건 (빈 응답 — 범위 축소인지 장애인지 구분 불가)"
     lo, hi = dates[0], dates[-1]
-    bits = []
-    violated = False
+    bits, violated = [], False
     if d_from:
         if lo < d_from:
             violated = True
-            bits.append(f"최소날짜 {lo} < from {d_from} → from 무시됨")
+            bits.append(f"최소 {lo} < from {d_from} → from 무시")
         else:
-            bits.append(f"최소날짜 {lo} ≥ from {d_from} ✓")
+            bits.append(f"최소 {lo} ≥ from ✓")
     if d_to:
         if hi > d_to:
             violated = True
-            bits.append(f"최대날짜 {hi} > to {d_to} → to 무시됨")
+            bits.append(f"최대 {hi} > to {d_to} → to 무시")
         else:
-            bits.append(f"최대날짜 {hi} ≤ to {d_to} ✓")
+            bits.append(f"최대 {hi} ≤ to ✓")
     if bad:
         bits.append(f"날짜 파싱 실패 {bad}건")
     if not d_from and not d_to:
@@ -153,27 +200,59 @@ def verdict_range(rows, d_from, d_to):
     return ("ignored" if violated else "honored"), " · ".join(bits)
 
 
-def find_value(rows, target, tol=MATCH_TOL):
-    """시리즈 안에서 target 의 ±tol 안에 드는 값을 모두 찾는다.
+def verdict_window(rows, d_from, d_to, expected):
+    """경계 + **완전성** 판정.
 
-    close 만 보지 않는다 — open/high/low/adjClose 를 잘못 집는 것도
-    가능한 메커니즘이므로 전부 훑는다.
-
-    Returns: [(index, date, field, value), ...]  (index 는 과거→현재 정렬 기준)
+    경계만 보면 "from 이후만 왔다"는 알 수 있어도 "창 안 봉이 다 왔는가"는
+    모른다. 좁은 창에서는 중간 절삭이 드러나지 않기 때문에 반드시 기대값과
+    개수를 맞춰야 한다.
     """
-    dated = []
-    for r in rows:
-        d = str(r.get("date") or "").strip()[:10]
-        dated.append((d, r))
-    dated.sort(key=lambda t: t[0])
+    base_v, base_d = verdict_range(rows, d_from, d_to)
+    if base_v != "honored":
+        return base_v, base_d
+    dates, _bad = row_dates(rows)
+    n = len(dates)
+    if expected is None:
+        return "honored", base_d + " · 기대값 없음(완전성 미판정)"
+    diff = n - expected
+    tail = f"실제 {n}봉 / 기대 {expected}봉 ({diff:+d})"
+    if abs(diff) <= COUNT_TOL:
+        return "honored_complete", base_d + " · " + tail
+    if diff < 0:
+        return "honored_truncated", base_d + " · " + tail + " ← 봉 누락"
+    return "anomaly", base_d + " · " + tail + " ← 기대 초과"
 
+
+def bars_per_calendar_day(dates):
+    """기준선에서 실측한 거래일/달력일 비율. 추정하지 않는다."""
+    if len(dates) < 2:
+        return 0.0
+    try:
+        a = dt.date.fromisoformat(dates[0])
+        b = dt.date.fromisoformat(dates[-1])
+    except ValueError:
+        return 0.0
+    span = (b - a).days
+    return (len(dates) / span) if span > 0 else 0.0
+
+
+def calendar_days_for(bars, ratio):
+    """N 거래일을 확보하는 데 필요한 달력일 (안전계수 + 고정 여유 포함)."""
+    if not ratio or bars <= 0:
+        return 0
+    return int(math.ceil(bars / ratio * SAFETY_MARGIN)) + SAFETY_PAD_DAYS
+
+
+def find_value(rows, target, tol=MATCH_TOL):
+    """시리즈에서 target 의 ±tol 안에 드는 값 전부. close 외 필드도 훑는다."""
+    dated = sorted(((str(r.get("date") or "")[:10], r) for r in rows),
+                   key=lambda t: t[0])
     hits = []
     lo, hi = target * (1.0 - tol), target * (1.0 + tol)
     for i, (d, r) in enumerate(dated):
         for field in ("close", "adjClose", "open", "high", "low"):
-            v = r.get(field)
             try:
-                fv = float(v)
+                fv = float(r.get(field))
             except (TypeError, ValueError):
                 continue
             if lo <= fv <= hi:
@@ -182,7 +261,6 @@ def find_value(rows, target, tol=MATCH_TOL):
 
 
 def bar_on(rows, date_s):
-    """특정 날짜의 레코드. 없으면 None."""
     for r in rows:
         if str(r.get("date") or "").strip()[:10] == date_s:
             return r
@@ -190,12 +268,97 @@ def bar_on(rows, date_s):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# [E] 하류 윈도우 스캐너 — AST
+# ══════════════════════════════════════════════════════════════════════════
+def _int_of(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) \
+            and not isinstance(node.value, bool):
+        return node.value
+    return None
+
+
+def scan_windows(src):
+    """소스에서 '긴 윈도우를 요구하는' 신호를 모두 찾는다.
+
+    Returns: [(lineno, kind, N), ...]
+
+    구조적 신호만 본다. "200 이라는 숫자가 근처에 있다" 같은 텍스트 휴리스틱은
+    쓰지 않는다 — 오탐이 나오는 가드는 곧 무시당한다(§6-3).
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return []
+    out = []
+    for n in ast.walk(tree):
+        # rolling(N) / rolling(window=N) / ewm(span=N)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr in _WINDOW_CALLS:
+                v = None
+                for a in n.args:
+                    v = v or _int_of(a)
+                for kw in n.keywords:
+                    if kw.arg in ("window", "span", "periods", "min_periods"):
+                        v = v or _int_of(kw.value)
+                if v and 0 < v <= _CONST_MAX:
+                    out.append((n.lineno, n.func.attr, v))
+            elif n.func.attr in _TAIL_CALLS and n.args:
+                v = _int_of(n.args[0])
+                if v and 0 < v <= _CONST_MAX:
+                    out.append((n.lineno, n.func.attr, v))
+        # .iloc[-N:]  /  [-N:]
+        elif isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Slice):
+            lo = n.slice.lower
+            if isinstance(lo, ast.UnaryOp) and isinstance(lo.op, ast.USub):
+                v = _int_of(lo.operand)
+                if v and 0 < v <= _CONST_MAX:
+                    out.append((n.lineno, "slice", v))
+        # 이름이 봉수를 뜻하는 정수 상수
+        elif isinstance(n, ast.Assign):
+            v = _int_of(n.value)
+            if v and 0 < v <= _CONST_MAX:
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and _CONST_RE.search(t.id):
+                        out.append((n.lineno, f"const {t.id}", v))
+    return out
+
+
+_CALLSITE_RE = re.compile(
+    r"historical-price-eod/(?:full|light)[^\"'\n]*?limit=(\{?[A-Za-z_0-9]+\}?)")
+
+
+def scan_callsites(root):
+    """저장소에서 historical-price-eod 호출부와 limit 값을 열거한다.
+
+    기억이 아니라 소스가 근거다. 새 호출부가 생기면 자동으로 표에 뜬다.
+    Returns: [(파일명, 절대경로, 행, limit문자열), ...]
+    """
+    found = []
+    for d in (root, os.path.join(root, "automation")):
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    src = f.read()
+            except Exception:
+                continue
+            for i, line in enumerate(src.splitlines(), 1):
+                m = _CALLSITE_RE.search(line)
+                if m:
+                    found.append((fn, p, i, m.group(1)))
+    return found
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 네트워크
 # ══════════════════════════════════════════════════════════════════════════
 def fetch(path):
     """(rows, status, kind, nbytes). fmp_http 경유 — 원시 requests 를 쓰지 않는다."""
-    url = fh.fmp_url(path)
-    r, status, kind = fh.fmp_get_ex(url, timeout=TIMEOUT)
+    r, status, kind = fh.fmp_get_ex(fh.fmp_url(path), timeout=TIMEOUT)
     if r is None or kind != "ok":
         return [], status, kind, 0
     nbytes = len(r.content or b"")
@@ -217,11 +380,11 @@ def _q(symbol, d_from="", d_to="", limit=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# [A] GNOM 113.98 소재
+# [A] GNOM 113.98 소재 — v1 에서 not_found 로 종결. --with-a 로만 재확인.
 # ══════════════════════════════════════════════════════════════════════════
 def part_a():
     print("\n" + "=" * 74)
-    print("[A] GNOM 113.98 소재 추적  (기록값 113.98 · 실제 체결가 56.72)")
+    print("[A] GNOM 113.98 소재 재확인  (v1 결과: not_found — 종결됨)")
     print("=" * 74)
 
     rows, status, kind, nbytes = fetch(_q(GNOM_SYMBOL))
@@ -230,166 +393,119 @@ def part_a():
         return "inconclusive"
 
     dates, bad = row_dates(rows)
-    print(f"  응답: {len(rows)}봉 · {dates[0]} ~ {dates[-1]} · "
-          f"{nbytes:,}바이트" + (f" · 날짜불량 {bad}건" if bad else ""))
+    print(f"  응답: {len(rows)}봉 · {dates[0]} ~ {dates[-1]} · {nbytes:,}바이트")
 
-    # 거래일 실제 봉 — FMP 데이터 자체가 맞는지 독립 확인
     b = bar_on(rows, GNOM_TRADE_DATE)
-    if b is None:
-        print(f"  · {GNOM_TRADE_DATE} 봉 없음 (휴장일이거나 범위 밖)")
-    else:
+    if b is not None:
         try:
             c = float(b.get("close"))
             gap = (c - GNOM_ACTUAL) / GNOM_ACTUAL * 100.0
-            mark = "✓ 일치" if abs(gap) <= 2.0 else "⚠️ 불일치"
-            print(f"  · {GNOM_TRADE_DATE} 종가 ${c:.2f}  vs 실제 체결가 "
-                  f"${GNOM_ACTUAL:.2f} ({gap:+.1f}%) {mark}")
+            print(f"  · {GNOM_TRADE_DATE} 종가 ${c:.2f} vs 실제 체결가 "
+                  f"${GNOM_ACTUAL:.2f} ({gap:+.1f}%) "
+                  f"{'✓' if abs(gap) <= 2.0 else '⚠️'}")
         except (TypeError, ValueError):
-            print(f"  · {GNOM_TRADE_DATE} 봉의 close 를 읽을 수 없음")
-
-    print(f"\n  가장 오래된 {HEAD_N}봉:")
-    dated = sorted(((str(r.get('date') or '')[:10], r) for r in rows),
-                   key=lambda t: t[0])
-    for i, (d, r) in enumerate(dated[:HEAD_N]):
-        try:
-            print(f"    [{i}] {d}  close ${float(r.get('close')):>8.2f}")
-        except (TypeError, ValueError):
-            print(f"    [{i}] {d}  close 파싱 실패")
+            print(f"  · {GNOM_TRADE_DATE} close 파싱 실패")
 
     hits = find_value(rows, GNOM_RECORDED)
-    print(f"\n  113.98 ±{MATCH_TOL * 100:.1f}% 탐색 (close/adjClose/open/high/low): "
-          f"{len(hits)}건")
-
+    print(f"  113.98 ±{MATCH_TOL * 100:.1f}% 탐색: {len(hits)}건")
     if not hits:
-        print("\n  ✅ 판정: **미발견** → FMP 데이터 기원설 기각.")
-        print("     113.98 은 GNOM 시리즈 어디에도 없다. 수동 입력 오류로 확정.")
-        print("     조치: 시트 F열 수정만. 코드 변경 불필요.")
+        print("  ✅ 미발견 — FMP 데이터 기원설 기각 유지. 수동 입력 오류 확정.")
         return "not_found"
-
-    for i, d, field, v in hits[:12]:
+    for i, d, field, v in hits[:8]:
         print(f"    idx {i:>5}  {d}  {field:>8} ${v:.2f}")
-    if len(hits) > 12:
-        print(f"    … 외 {len(hits) - 12}건")
-
     min_idx = min(h[0] for h in hits)
-    if min_idx < HEAD_N:
-        print(f"\n  ⚠️ 판정: **최고참 봉 근처에서 발견** (idx {min_idx}).")
-        print("     '가장 오래된 봉을 집었다' 가설이 살아남았다.")
-        print("     → app.py 원시 호출 58곳에서 iloc[0]/head()/[0] 패턴을 찾을 것.")
-        return "head_hit"
-
-    print(f"\n  판정: **발견되었으나 최고참 봉이 아님** (최소 idx {min_idx}).")
-    print("     단순 우연일 수 있다 — 5년 시계열에 특정 값이 한 번 나오는 것은 흔하다.")
-    print("     날짜가 매수일과 무관하면 우연으로 본다.")
-    return "mid_hit"
+    return "head_hit" if min_idx < HEAD_N else "mid_hit"
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# [B] from / to 파라미터
+# [B] from / to — 경계 + 완전성 (기준선을 정답지로)
 # ══════════════════════════════════════════════════════════════════════════
 def part_b():
     print("\n" + "=" * 74)
-    print(f"[B] from/to 파라미터 검증  (심볼 {PROBE_SYMBOL})")
+    print(f"[B] from/to 경계·완전성  (심볼 {PROBE_SYMBOL})")
     print("=" * 74)
 
+    # B1 기준선을 **먼저** 받는다 — 이후 모든 창의 기대값이 여기서 나온다.
+    base_rows, status, kind, base_bytes = fetch(_q(PROBE_SYMBOL))
+    base_dates, _bad = row_dates(base_rows)
+    if not base_dates:
+        print(f"  ❌ 기준선 응답 없음 (status={status} kind={kind}) — 전체 판정 불가")
+        return "inconclusive", {}, [], 0.0
+
+    ratio = bars_per_calendar_day(base_dates)
+    print(f"\n  B1 기준선(무파라미터): {len(base_dates)}봉 · "
+          f"{base_dates[0]} ~ {base_dates[-1]} · {base_bytes:,}바이트")
+    if ratio:
+        print(f"     봉당 {base_bytes / len(base_dates):.0f}바이트 · "
+              f"거래일/달력일 실측 비율 {ratio:.4f} "
+              f"(1봉당 달력 {1 / ratio:.2f}일)")
+
     cases = [
-        ("B1 기준선 (파라미터 없음)", "", "", None),
-        ("B2 from 단독", FROM_ONLY, "", None),
-        ("B3 to 단독", "", TO_ONLY, None),
-        (f"B4 창A {WIN_A[0]}~{WIN_A[1]}", WIN_A[0], WIN_A[1], None),
-        (f"B5 창B {WIN_B[0]}~{WIN_B[1]}", WIN_B[0], WIN_B[1], None),
+        ("B2 from 단독", FROM_ONLY, ""),
+        ("B3 to 단독", "", TO_ONLY),
+        (f"B4 창A {WIN_A[0]}~{WIN_A[1]}", WIN_A[0], WIN_A[1]),
+        (f"B5 창B {WIN_B[0]}~{WIN_B[1]}", WIN_B[0], WIN_B[1]),
     ]
 
     results = {}
-    base_bytes, base_bars = 0, 0
-
-    print(f"\n  {'케이스':<32}{'봉수':>7}{'바이트':>11}  {'최소~최대':<24}판정")
-    print("  " + "-" * 88)
-    for label, d_from, d_to, lim in cases:
-        rows, status, kind, nbytes = fetch(_q(PROBE_SYMBOL, d_from, d_to, lim))
-        if not rows:
-            print(f"  {label:<32}{'—':>7}{'—':>11}  응답 없음 "
-                  f"(status={status} kind={kind})")
-            results[label[:2]] = ("inconclusive", f"응답 없음 ({kind})")
-            continue
-        dates, _bad = row_dates(rows)
-        v, detail = verdict_range(rows, d_from, d_to)
-        if label.startswith("B1"):
-            base_bytes, base_bars = nbytes, len(rows)
-            v, detail = "baseline", f"{dates[0]} ~ {dates[-1]}"
-        span = f"{dates[0]}~{dates[-1]}"
-        print(f"  {label:<32}{len(rows):>7}{nbytes:>11,}  {span:<24}{v}")
+    print(f"\n  {'케이스':<30}{'실제':>7}{'기대':>7}{'바이트':>10}  판정")
+    print("  " + "-" * 74)
+    for label, d_from, d_to in cases:
+        rows, st, kd, nb = fetch(_q(PROBE_SYMBOL, d_from, d_to))
+        exp = expected_in_window(base_dates, d_from, d_to)
+        v, detail = verdict_window(rows, d_from, d_to, exp)
+        n = len(row_dates(rows)[0])
+        print(f"  {label:<30}{n:>7}{exp:>7}{nb:>10,}  {v}")
         results[label[:2]] = (v, detail)
 
     print("\n  상세:")
     for k in sorted(results):
-        v, detail = results[k]
-        print(f"    {k}: {v} — {detail}")
+        print(f"    {k}: {results[k][1]}")
 
-    # ── 사전 확정 기준 적용 ────────────────────────────────────────────
-    b4 = results.get("B4", ("inconclusive", ""))[0]
-    b5 = results.get("B5", ("inconclusive", ""))[0]
-    b2 = results.get("B2", ("inconclusive", ""))[0]
-    b3 = results.get("B3", ("inconclusive", ""))[0]
-
-    print("\n  " + "─" * 70)
-    if b4 == "honored" and b5 == "honored":
-        final = "honored"
-        print("  ✅ 판정: from/to **먹힘** — 두 창 모두 경계를 지켰다.")
-        if base_bytes and base_bars:
-            print(f"     기준선 {base_bars}봉 {base_bytes:,}바이트 "
-                  f"(봉당 약 {base_bytes / base_bars:.0f}바이트)")
-            print("     → [C] 의 호출부들에 날짜창을 적용하면 페이로드가 줄어든다.")
-    elif "ignored" in (b4, b5):
-        final = "ignored"
-        print("  ❌ 판정: from/to **무시됨** — 범위 밖 날짜가 왔다.")
-        print("     limit·delisted-companies 심볼필터·symbol-change 심볼필터에 이은")
-        print("     **네 번째 '조용히 무시되는 FMP 파라미터'**.")
-        print("     → 페이로드 축소 방법 없음으로 확정. 타임아웃을 1254봉 전제로 유지.")
-    else:
-        final = "inconclusive"
-        print("  ⚠️ 판정: **불확정** — 두 창이 엇갈리거나 응답이 비었다.")
-        print("     한 창의 결과만으로 결론내지 않는다. 재실행하거나 창을 바꿔 볼 것.")
-
-    print(f"     (단독 파라미터: from={b2} · to={b3})")
-    return final, base_bytes, base_bars
+    return "ok", results, base_dates, (base_bytes / len(base_dates))
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# [C] 호출부 조사 — 콜 0회, 소스 텍스트 기반
+# [D] 완전성 — 넓은 창에서도 전량 오는가 (2콜)
 # ══════════════════════════════════════════════════════════════════════════
-_CALLSITE_RE = re.compile(
-    r"historical-price-eod/(?:full|light)[^\"'\n]*?limit=(\{?[A-Za-z_0-9]+\}?)")
-
-
-def scan_callsites(root):
-    """저장소에서 historical-price-eod 호출부와 limit 값을 열거한다.
-
-    기억이 아니라 소스가 근거다. 새 호출부가 생기면 자동으로 표에 뜬다.
-    """
-    found = []
-    for d in (root, os.path.join(root, "automation")):
-        if not os.path.isdir(d):
-            continue
-        for fn in sorted(os.listdir(d)):
-            if not fn.endswith(".py"):
-                continue
-            p = os.path.join(d, fn)
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    src = f.read()
-            except Exception:
-                continue
-            for i, line in enumerate(src.splitlines(), 1):
-                m = _CALLSITE_RE.search(line)
-                if m:
-                    found.append((fn, i, m.group(1)))
-    return found
-
-
-def part_c(root, bytes_per_bar):
+def part_d(base_dates):
     print("\n" + "=" * 74)
-    print("[C] 호출부 · 페이로드 영향  (FMP 콜 0회 — 소스 스캔)")
+    print("[D] 완전성 — 넓은 창 (좁은 창만으로는 중간 절삭이 안 보인다)")
+    print("=" * 74)
+
+    if not base_dates:
+        print("  기준선이 없어 판정 불가")
+        return {}
+
+    mid = base_dates[len(base_dates) // 2]
+    cases = [
+        (f"D1 중간폭 from={mid}", mid, ""),
+        (f"D2 전폭   from={base_dates[0]}", base_dates[0], ""),
+    ]
+
+    results = {}
+    print(f"\n  {'케이스':<34}{'실제':>7}{'기대':>7}  판정")
+    print("  " + "-" * 70)
+    for label, d_from, d_to in cases:
+        rows, st, kd, nb = fetch(_q(PROBE_SYMBOL, d_from, d_to))
+        exp = expected_in_window(base_dates, d_from, d_to)
+        v, detail = verdict_window(rows, d_from, d_to, exp)
+        n = len(row_dates(rows)[0])
+        print(f"  {label:<34}{n:>7}{exp:>7}  {v}")
+        results[label[:2]] = (v, detail)
+
+    print("\n  상세:")
+    for k in sorted(results):
+        print(f"    {k}: {results[k][1]}")
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# [C]+[E] 호출부 · 하류 소요 봉수 감사 (콜 0회)
+# ══════════════════════════════════════════════════════════════════════════
+def part_ce(root, bytes_per_bar, ratio):
+    print("\n" + "=" * 74)
+    print("[C/E] 호출부 · 하류 소요 봉수 감사  (FMP 콜 0회 — 소스 AST)")
     print("=" * 74)
 
     sites = scan_callsites(root)
@@ -397,30 +513,70 @@ def part_c(root, bytes_per_bar):
         print("  호출부를 찾지 못했습니다 (경로 확인 필요).")
         return
 
-    print(f"\n  {'파일':<34}{'행':>6}{'요청 limit':>12}{'실제 수신':>10}{'배율':>8}")
-    print("  " + "-" * 72)
-    ACTUAL = 1254  # limit 무시 확정값
+    ACTUAL = 1254
+    win_cache = {}
+    risky, unknown, safe = [], [], []
+
+    print(f"\n  {'파일':<32}{'행':>6}{'limit':>9}{'하류최대':>9}{'판정':>8}"
+          f"{'권고 from':>11}")
+    print("  " + "-" * 78)
     waste = 0
-    for fn, ln, lim in sites:
+    for fn, path, ln, lim in sites:
+        if path not in win_cache:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    win_cache[path] = scan_windows(f.read())
+            except Exception:
+                win_cache[path] = []
+        wins = win_cache[path]
+        wmax = max((w[2] for w in wins), default=0)
+
         try:
             n = int(lim)
-            ratio = f"{ACTUAL / n:.0f}x"
             waste += max(0, ACTUAL - n)
         except ValueError:
-            n, ratio = lim, "—"      # 변수명(HISTORY_LIMIT 등)
-        print(f"  {fn:<34}{ln:>6}{str(lim):>12}{ACTUAL:>10}{ratio:>8}")
+            n = None
 
-    print(f"\n  호출부 {len(sites)}곳 · 상수 limit 기준 낭비 봉수 합계 약 {waste:,}봉")
-    if bytes_per_bar:
-        print(f"  봉당 {bytes_per_bar:.0f}바이트 → 회당 절감 가능 약 "
-              f"{waste * bytes_per_bar / 1024 / 1024:.1f}MB")
-        print("  ⚠️ [B] 가 'honored' 일 때만 실현 가능한 수치다.")
-    else:
-        print("  (봉당 바이트를 재지 못해 용량 환산 생략)")
+        if n is None:
+            verdict, rec = "불명", "—"
+            unknown.append((fn, ln, lim, wmax))
+        elif wmax == 0:
+            verdict, rec = "신호없음", f"{calendar_days_for(n, ratio)}일"
+            unknown.append((fn, ln, lim, wmax))
+        elif n < wmax:
+            verdict = "⚠️위험"
+            rec = f"{calendar_days_for(wmax, ratio)}일"
+            risky.append((fn, ln, n, wmax))
+        else:
+            verdict = "안전"
+            rec = f"{calendar_days_for(n, ratio)}일"
+            safe.append((fn, ln, n, wmax))
+
+        print(f"  {fn:<32}{ln:>6}{str(lim):>9}{(wmax or '—'):>9}{verdict:>8}{rec:>11}")
+
+    print(f"\n  호출부 {len(sites)}곳 — 안전 {len(safe)} · 위험 {len(risky)} · "
+          f"판정보류 {len(unknown)}")
+    if bytes_per_bar and waste:
+        print(f"  상수 limit 기준 낭비 {waste:,}봉 · 봉당 {bytes_per_bar:.0f}바이트 "
+              f"→ 회당 약 {waste * bytes_per_bar / 1024 / 1024:.1f}MB")
+
+    if risky:
+        print("\n  ⚠️ 위험 — 지금 limit 으로 전환하면 데이터가 부족해진다:")
+        for fn, ln, n, wmax in risky:
+            print(f"     {fn}:{ln}  limit={n} < 하류 최대 윈도우 {wmax}")
+        print("     → 전환 전에 limit 이 아니라 **하류 요구치**로 from 을 잡을 것.")
+
+    if unknown:
+        print(f"\n  판정보류 {len(unknown)}곳 — 변수 limit 이거나 윈도우 신호 없음.")
+        print("     사람이 직접 확인해야 한다. 자동 전환 대상에서 제외할 것.")
+
+    print("\n  ⚠️ 이 감사는 **파일 단위 과대근사**다. 같은 파일의 다른 함수가 쓰는")
+    print("     윈도우도 잡힌다 — 오탐은 나지만 누락은 나지 않는다.")
+    print("     df 가 다른 모듈로 넘어가 거기서 계산되면 이 감사는 못 본다.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# selftest — 네트워크 없음. 판정기가 **틀린 입력에서 실패하는지** 확인한다.
+# selftest
 # ══════════════════════════════════════════════════════════════════════════
 def _rows(dates, close=100.0):
     return [{"date": d, "close": close, "open": close,
@@ -428,13 +584,10 @@ def _rows(dates, close=100.0):
 
 
 def _raw_get_calls(path=None, src=None):
-    """원시 requests.get(FMP) 호출 지점 목록 — diag_fmp_ssot.raw_fmp_gets 와 동일 규칙.
+    """원시 requests.get(FMP) 호출 지점 — diag_fmp_ssot.raw_fmp_gets 와 동일 규칙.
 
-    Attribute(attr='get', value=Name(id='requests')) 인 Call 중, 첫 인자에
-    financialmodelingprep 또는 apikey 가 있는 것만 센다. 규칙을 A1 과 맞춰
-    두어야 "여기선 통과, A1 에선 실패"가 생기지 않는다.
+    규칙을 A1 과 맞춰 두어야 "여기선 통과, A1 에선 실패"가 생기지 않는다.
     """
-    import ast
     if src is None:
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
@@ -459,8 +612,6 @@ def _raw_get_calls(path=None, src=None):
 
 
 def _uses(path, attr):
-    """소스에 `<something>.attr(...)` 호출이 실제로 있는가 (AST — 주석/산문 제외)."""
-    import ast
     with open(path, "r", encoding="utf-8") as f:
         tree = ast.parse(f.read())
     return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
@@ -468,8 +619,7 @@ def _uses(path, attr):
 
 
 def selftest():
-    fails = []
-    ran = []
+    fails, ran = [], []
 
     def check(name, got, want):
         ran.append(name)
@@ -483,73 +633,127 @@ def selftest():
     print("selftest — 판정기 역검증 (네트워크·시트 접근 없음)")
     print("=" * 74)
 
-    print("\n verdict_range — 정상 경로")
-    check("S1 범위 안",
-          verdict_range(_rows(["2026-06-02", "2026-06-15", "2026-06-30"]),
-                        "2026-06-01", "2026-06-30")[0], "honored")
-    check("S2 경계 정확히",
-          verdict_range(_rows(["2026-06-01", "2026-06-30"]),
-                        "2026-06-01", "2026-06-30")[0], "honored")
+    print("\n verdict_range — 경계 정상")
+    check("S1 범위 안", verdict_range(_rows(["2026-06-02", "2026-06-30"]),
+                                      "2026-06-01", "2026-06-30")[0], "honored")
+    check("S2 경계 정확히", verdict_range(_rows(["2026-06-01", "2026-06-30"]),
+                                          "2026-06-01", "2026-06-30")[0], "honored")
 
-    print("\n verdict_range — 역검증 (여기가 판별력이다)")
-    # 실물 실패 모양: 창을 좁혔는데 5년치가 그대로 온다
-    check("S3 from 이전 봉 존재 → ignored",
+    print("\n verdict_range — 역검증")
+    check("S3 from 이전 봉 → ignored",
           verdict_range(_rows(["2021-08-27", "2026-06-15"]),
                         "2026-06-01", "2026-06-30")[0], "ignored")
-    check("S4 to 이후 봉 존재 → ignored",
+    check("S4 to 이후 봉 → ignored",
           verdict_range(_rows(["2026-06-15", "2026-08-25"]),
                         "2026-06-01", "2026-06-30")[0], "ignored")
-    check("S5 from 단독 위반 → ignored",
-          verdict_range(_rows(["2020-01-02"]), "2026-06-01", "")[0], "ignored")
-    check("S6 to 단독 위반 → ignored",
-          verdict_range(_rows(["2026-08-25"]), "", "2022-12-31")[0], "ignored")
+    check("S5 from 단독 위반", verdict_range(_rows(["2020-01-02"]),
+                                             "2026-06-01", "")[0], "ignored")
+    check("S6 to 단독 위반", verdict_range(_rows(["2026-08-25"]),
+                                           "", "2022-12-31")[0], "ignored")
 
-    print("\n verdict_range — 침묵 금지 (빈 응답을 통과로 읽지 않는다)")
+    print("\n verdict_range — 침묵 금지")
     check("S7 빈 응답 → inconclusive",
           verdict_range([], "2026-06-01", "2026-06-30")[0], "inconclusive")
     check("S8 날짜 전부 불량 → inconclusive",
           verdict_range([{"date": "bad", "close": 1}], "2026-06-01", "")[0],
           "inconclusive")
-    check("S9 기준 날짜 미지정 → inconclusive",
+    check("S9 기준 미지정 → inconclusive",
           verdict_range(_rows(["2026-06-15"]), "", "")[0], "inconclusive")
 
-    print("\n find_value")
-    hits = find_value(_rows(["2021-06-30"], close=113.98)
-                      + _rows(["2026-06-29"], close=56.72), 113.98)
-    check("S10 정확값 발견", len(hits) > 0, True)
-    check("S11 발견 위치가 최고참", min(h[0] for h in hits) if hits else -1, 0)
-    check("S12 허용오차 밖은 미발견",
-          len(find_value(_rows(["2021-06-30"], close=120.0), 113.98)), 0)
-    check("S13 허용오차 안은 발견",
-          len(find_value(_rows(["2021-06-30"], close=114.3), 113.98)) > 0, True)
+    print("\n expected_in_window — 기대값 산출")
+    BASE = ["2026-06-01", "2026-06-15", "2026-06-30", "2026-07-15"]
+    check("S10 창 안 개수", expected_in_window(BASE, "2026-06-01", "2026-06-30"), 3)
+    check("S11 from 단독", expected_in_window(BASE, "2026-06-15", ""), 3)
+    check("S12 to 단독", expected_in_window(BASE, "", "2026-06-15"), 2)
+    check("S13 경계 없음 = 전량", expected_in_window(BASE, "", ""), 4)
+    check("S14 빈 교집합", expected_in_window(BASE, "2027-01-01", ""), 0)
+
+    print("\n verdict_window — 완전성 (v2 의 핵심 · 여기가 판별력이다)")
+    check("S15 완전",
+          verdict_window(_rows(["2026-06-01", "2026-06-15", "2026-06-30"]),
+                         "2026-06-01", "2026-06-30", 3)[0], "honored_complete")
+    # 실물 실패 모양: 경계는 지키는데 중간 봉이 빠진다 — 좁은 창에선 안 보인다
+    check("S16 절삭 → truncated (2봉 이상 부족)",
+          verdict_window(_rows(["2026-06-01", "2026-06-30"]),
+                         "2026-06-01", "2026-06-30", 4)[0], "honored_truncated")
+    check("S17 초과 → anomaly",
+          verdict_window(_rows(["2026-06-01", "2026-06-15", "2026-06-30"]),
+                         "2026-06-01", "2026-06-30", 1)[0], "anomaly")
+    # 경계 케이스: 기준선과 창 요청 사이 수 초에 당일 봉이 생길 수 있다.
+    # 1봉 차이는 통과, 2봉부터는 실패 — 이 경계가 흐려지면 절삭을 놓친다.
+    check("S18 -1봉은 완전으로 본다 (당일 봉 타이밍)",
+          verdict_window(_rows(["2026-06-01", "2026-06-30"]),
+                         "2026-06-01", "2026-06-30", 3)[0], "honored_complete")
+    check("S18b +1봉도 완전으로 본다",
+          verdict_window(_rows(["2026-06-01", "2026-06-15", "2026-06-30"]),
+                         "2026-06-01", "2026-06-30", 2)[0], "honored_complete")
+    check("S19 경계 위반이 완전성보다 우선",
+          verdict_window(_rows(["2021-01-01", "2026-06-15", "2026-06-30"]),
+                         "2026-06-01", "2026-06-30", 3)[0], "ignored")
+    check("S20 빈 응답은 complete 가 아니다",
+          verdict_window([], "2026-06-01", "2026-06-30", 0)[0], "inconclusive")
+
+    print("\n bars_per_calendar_day / calendar_days_for")
+    r = bars_per_calendar_day(["2021-08-27", "2026-08-26"])
+    check("S21 비율 계산됨", 0.0 < r < 1.0, True)
+    check("S22 1봉 시리즈는 0", bars_per_calendar_day(["2026-01-01"]), 0.0)
+    check("S23 달력일 환산 (252봉·비율0.69)",
+          calendar_days_for(252, 0.69) > 252, True)
+    check("S24 비율 0 이면 0", calendar_days_for(252, 0.0), 0)
+
+    print("\n scan_windows — 하류 윈도우 탐지")
+    # ⚠️ 판별 케이스: 이름 필터를 지웠을 때 **결과가 달라져야** 한다.
+    #    PORT=8080 만으로는 안 된다 — 8080 은 크기 필터(_CONST_MAX)에 먼저
+    #    걸려서, 이름 필터를 통째로 제거해도 여전히 미검출이다.
+    #    5000 미만이면서 이름이 봉수와 무관한 상수가 있어야 판별력이 생긴다.
+    SRC = ("df['x'].rolling(200).mean()\n"
+           "df['y'].ewm(span=26).mean()\n"
+           "z = df.tail(60)\n"
+           "w = arr[-252:]\n"
+           "MIN_PRIOR_BARS = 220\n"
+           "MAX_WORKERS = 8\n"
+           "TIMEOUT_SEC = 20\n"
+           "PORT = 8080\n")
+    got = scan_windows(SRC)
+    check("S25 rolling 잡힘", any(k == "rolling" and v == 200 for _l, k, v in got), True)
+    check("S26 ewm span 잡힘", any(k == "ewm" and v == 26 for _l, k, v in got), True)
+    check("S27 tail 잡힘", any(k == "tail" and v == 60 for _l, k, v in got), True)
+    check("S28 음수 슬라이스 잡힘", any(k == "slice" and v == 252 for _l, k, v in got), True)
+    check("S29 봉수 상수 잡힘", any(v == 220 for _l, _k, v in got), True)
+    # 역검증: 이름이 봉수와 무관한 상수는 잡으면 안 된다 (오탐 = 무시당함)
+    check("S30 큰 무관 상수 미검출", any(v == 8080 for _l, _k, v in got), False)
+    check("S30b 작은 무관 상수 미검출 (MAX_WORKERS=8)",
+          any(v == 8 for _l, _k, v in got), False)
+    check("S30c 작은 무관 상수 미검출 (TIMEOUT_SEC=20)",
+          any(k.startswith("const") and v == 20 for _l, k, v in got), False)
+    check("S31 최대 윈도우", max(v for _l, _k, v in got), 252)
+    check("S32 구문오류는 빈 결과", scan_windows("def ("), [])
 
     print("\n extract_rows / row_dates")
-    check("S14 dict 래핑 해제",
+    check("S33 dict 래핑 해제",
           len(extract_rows({"historical": _rows(["2026-01-02"])})), 1)
-    check("S15 리스트 그대로", len(extract_rows(_rows(["2026-01-02"]))), 1)
-    check("S16 비리스트 → 빈 결과", extract_rows("nope"), [])
-    check("S17 날짜 정렬",
+    check("S34 비리스트 → 빈 결과", extract_rows("nope"), [])
+    check("S35 날짜 정렬",
           row_dates(_rows(["2026-06-30", "2021-08-27"]))[0][0], "2021-08-27")
 
-    print("\n 구조 — 원시 FMP 호출이 이 파일에 없는가 (diag_fmp_ssot A1 래칫)")
-    # ⚠️ 텍스트 매칭을 쓰면 안 된다. 이 파일의 독스트링에 "원시 requests.get 을
-    #    쓰지 않는다"라는 **산문**이 있어서 초안이 자기 자신을 오탐했다.
-    #    판정은 diag_fmp_ssot.raw_fmp_gets 와 **동일한 AST 규칙**으로 한다 —
-    #    규칙이 다르면 여기선 통과하고 A1 에서 터진다.
-    raw_calls = _raw_get_calls(os.path.abspath(__file__))
-    check("S18 원시 requests.get 호출 0곳 (AST)", len(raw_calls), 0)
-    check("S19 fmp_http 경유", _uses(os.path.abspath(__file__), "fmp_get_ex"), True)
-    # 역검증: 같은 탐지기가 **진짜 원시 호출을 잡는지** 확인한다.
-    # 이게 없으면 탐지기가 항상 0 을 돌려줘도 S18 은 초록불이다.
-    check("S20 탐지기 역검증 — 원시 호출 샘플을 잡는다",
-          len(_raw_get_calls(src=(
-              "import requests\n"
-              "r = requests.get(f'{BASE}/quote?symbol=X&apikey={k}')\n"))), 1)
-    check("S21 탐지기 오탐 없음 — 무관한 .get 은 안 잡는다",
-          len(_raw_get_calls(src=(
-              "d = {}\n"
-              "v = d.get('apikey')\n"
-              "s.get('https://financialmodelingprep.com/x')\n"))), 0)
+    print("\n find_value")
+    hits = find_value(_rows(["2021-06-30"], 113.98) + _rows(["2026-06-29"], 56.72),
+                      113.98)
+    check("S36 정확값 발견", len(hits) > 0, True)
+    check("S37 위치가 최고참", min(h[0] for h in hits) if hits else -1, 0)
+    check("S38 허용오차 밖 미발견",
+          len(find_value(_rows(["2021-06-30"], 120.0), 113.98)), 0)
+
+    print("\n 구조 — 원시 FMP 호출 (diag_fmp_ssot A1 래칫과 동일 규칙)")
+    me = os.path.abspath(__file__)
+    check("S39 원시 requests.get 0곳", len(_raw_get_calls(me)), 0)
+    check("S40 fmp_http 경유", _uses(me, "fmp_get_ex"), True)
+    check("S41 탐지기 역검증 — 진짜 원시 호출을 잡는다",
+          len(_raw_get_calls(src="import requests\n"
+                                 "r = requests.get(f'{B}/quote?apikey={k}')\n")), 1)
+    check("S42 탐지기 오탐 없음 — 무관한 .get 은 안 잡는다",
+          len(_raw_get_calls(src="d={}\nv=d.get('apikey')\n"
+                                 "s.get('https://financialmodelingprep.com/x')\n")), 0)
 
     print("\n" + "=" * 74)
     if fails:
@@ -570,27 +774,46 @@ def main() -> int:
         print("[ERR] FMP_API_KEY 없음")
         return 1
 
+    with_a = "--with-a" in sys.argv
     print("=" * 74)
-    print("FMP 날짜창 프로브 — 읽기 전용 · 시트 기록 없음 · 예상 7콜")
+    print(f"FMP 날짜창 프로브 v2 — 읽기 전용 · 시트 기록 없음 · "
+          f"예상 {8 if with_a else 7}콜")
     print("=" * 74)
 
-    a_verdict = part_a()
-    b_verdict, base_bytes, base_bars = part_b()
-    part_c(root, (base_bytes / base_bars) if base_bars else 0.0)
+    a_verdict = part_a() if with_a else "skipped(v1 에서 not_found 로 종결)"
+    b_ok, b_res, base_dates, bytes_per_bar = part_b()
+    d_res = part_d(base_dates) if b_ok == "ok" else {}
+    ratio = bars_per_calendar_day(base_dates)
+    part_ce(root, bytes_per_bar, ratio)
 
     print("\n" + "=" * 74)
     print("요약")
     print("=" * 74)
     print(f"  [A] GNOM 113.98 : {a_verdict}")
-    print(f"  [B] from/to     : {b_verdict}")
-    print(f"  {fh.fmp_stats_line()}")
+    all_v = {**{k: v[0] for k, v in b_res.items()},
+             **{k: v[0] for k, v in d_res.items()}}
+    for k in sorted(all_v):
+        print(f"  [{k}] {all_v[k]}")
 
-    # 종료코드는 '프로브가 제대로 돌았는가'만 나타낸다.
-    # 파라미터가 무시된다는 결과 자체는 실패가 아니라 **답**이다.
-    if b_verdict == "inconclusive" or a_verdict == "inconclusive":
-        print("\n  ⚠️ 불확정 항목이 있습니다 — 위 상세를 보고 재실행 여부를 판단하세요.")
-        return 2
-    return 0
+    # ── 사전 확정 최종 판정 ────────────────────────────────────────────
+    need = ["B2", "B3", "B4", "B5", "D1", "D2"]
+    have = [all_v.get(k) for k in need]
+    print("\n  " + "─" * 70)
+    if not all_v or any(v is None for v in have):
+        final, code = "불완전 — 일부 케이스가 실행되지 않음", 2
+    elif all(v == "honored_complete" for v in have):
+        final, code = ("✅ 전환 가능 — 6개 케이스 전부 경계·완전성 통과. "
+                       "단 [E] 의 '위험'·'판정보류' 호출부는 개별 확인 필요", 0)
+    elif any(v == "ignored" for v in have):
+        final, code = "❌ 전환 불가 — 파라미터가 무시되는 케이스가 있다", 0
+    elif any(v == "honored_truncated" for v in have):
+        final, code = ("❌ 전환 불가 — 경계는 지키나 봉이 누락된다. "
+                       "어느 창에서 절삭되는지 위 상세를 볼 것", 0)
+    else:
+        final, code = "⚠️ 불확정 — 재실행하거나 창을 바꿔 볼 것", 2
+    print(f"  {final}")
+    print(f"\n  {fh.fmp_stats_line()}")
+    return code
 
 
 if __name__ == "__main__":
