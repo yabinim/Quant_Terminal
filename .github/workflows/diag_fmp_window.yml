@@ -9,13 +9,14 @@ on:
         default: 'probe'
         type: choice
         options:
-          - probe       # 실제 FMP 프로브 (약 7콜)
+          - probe       # B(5) + D(2) + C/E(0) = 7콜
           - selftest    # 네트워크 없음 — 판정기 역검증만
+          - with_a      # probe + GNOM 재확인 = 8콜 (v1 에서 not_found 로 종결됨)
 
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 10     # 읽기 전용 · 7콜 — 보통 30초 이내
+    timeout-minutes: 10     # 읽기 전용 · 7~8콜 — 보통 30초 이내
 
     steps:
       - name: 📥 코드 체크아웃
@@ -31,16 +32,24 @@ jobs:
           pip install --upgrade pip
           pip install requests
 
-      # selftest 는 키 없이 돈다. 프로브 전에 판정기가 멀쩡한지 먼저 본다.
+      # selftest 를 먼저 돌린다. 판정기가 고장난 상태의 프로브 결과는
+      # "잘못된 이유로 초록불"이 된다(§6-1). 키 없이 돌고 네트워크를 안 쓴다.
       - name: 🧪 판정기 역검증 (네트워크 없음)
         run: |
           python automation/diag_fmp_window.py --selftest
 
-      - name: 🔍 FMP 날짜창 프로브 (읽기 전용 · 시트 기록 없음 · 약 7콜)
+      - name: 🔍 날짜창 프로브 (읽기 전용 · 시트 기록 없음 · 7콜)
         if: ${{ inputs.mode == 'probe' }}
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-          # 프로브는 7콜뿐이지만 SSOT 기본값을 그대로 따른다.
           FMP_RATE_LIMIT_PER_MIN: '200'
         run: |
           python automation/diag_fmp_window.py
+
+      - name: 🔍 날짜창 프로브 + GNOM 재확인 (8콜)
+        if: ${{ inputs.mode == 'with_a' }}
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          FMP_RATE_LIMIT_PER_MIN: '200'
+        run: |
+          python automation/diag_fmp_window.py --with-a
