@@ -38,6 +38,14 @@
   [H] 보유창 — _hist_days_for_holding 경계 표
   [G] 런타임 — 실제 URL 문자열과 파싱 계약 (fmp_get_ex 스텁)
   [C] 캐시   — 조회 깊이 기록과 FMP 콜 수 보존
+  [A] app.py — historical-price-eod 창 + **시그니처 결합** (정적 AST, 임포트 없음)
+  [W] 충분성 — app.py 각 창이 하류 요구 봉수를 덮는지 (크로스 모듈 역산)
+  [X] SSOT   — 0.6871·환산기·보유창이 fmp_extras 한 곳에만 존재하는지
+
+⚠️ [A][W] 가 app.py 를 **임포트하지 않고 소스 AST 만 읽는 이유**: app.py 는
+   streamlit 위에서만 임포트되고 최상단부터 UI 를 그린다. 임포트하는 순간 이
+   스위트는 시트·FMP·Gemini 를 건드리게 된다. 정적 분석이 유일하게 안전한 방법이고,
+   [A4] 시그니처 결합은 정적으로도 충분히 잡힌다(2026-08-28 실증: 18/18 검출).
 
 안전성: 네트워크 0 · FMP 콜 0 · 시트 접근 0 · 메일 0 · 파일 쓰기 0.
 
@@ -60,8 +68,81 @@ import pandas as pd
 import run_watchlist_alerts as m
 import regime_core as rc
 import watchlist_metrics_core as wm
+import fmp_extras as fx
 
 PASS, FAIL = [], []
+
+_REPO = os.path.dirname(os.path.abspath(__file__))
+
+
+def src_file(name: str) -> str:
+    """저장소 루트의 파일 소스. 임포트하지 않는다(app.py 는 임포트 불가)."""
+    with open(os.path.join(_REPO, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def tree_file(name: str) -> ast.Module:
+    return ast.parse(src_file(name))
+
+
+def sig_from_ast(tree: ast.Module, name: str):
+    """소스에서 함수 시그니처를 복원한다 — 임포트 없이 결합 검사를 하기 위해.
+
+    기본값의 '값'은 필요 없다(결합만 본다). 있으면 None, 없으면 empty 로 둔다.
+    """
+    import inspect as _insp
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef) and n.name == name:
+            a, P = n.args, __import__("inspect").Parameter
+            ps, nd = [], len(a.defaults)
+            for i, x in enumerate(a.args):
+                ps.append(P(x.arg, P.POSITIONAL_OR_KEYWORD,
+                            default=(P.empty if i < len(a.args) - nd else None)))
+            if a.vararg:
+                ps.append(P(a.vararg.arg, P.VAR_POSITIONAL))
+            for x, dv in zip(a.kwonlyargs, a.kw_defaults):
+                ps.append(P(x.arg, P.KEYWORD_ONLY,
+                            default=(P.empty if dv is None else None)))
+            if a.kwarg:
+                ps.append(P(a.kwarg.arg, P.VAR_KEYWORD))
+            return _insp.Signature(ps)
+    return None
+
+
+def hist_urls(tree: ast.Module):
+    """historical-price-eod 를 담은 f-string 노드들.
+
+    인접한 문자열 리터럴은 파서가 하나의 JoinedStr 로 합치므로, 여러 줄로 쪼갠
+    f-string 도 한 노드로 잡힌다(그래서 줄 단위 grep 보다 정확하다).
+    반환: [(lineno, 상수부 합친 문자열, [FormattedValue 노드]), ...]
+    """
+    out = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.JoinedStr):
+            continue
+        lit = "".join(v.value for v in n.values
+                      if isinstance(v, ast.Constant) and isinstance(v.value, str))
+        if "historical-price-eod" in lit:
+            fvs = [v for v in n.values if isinstance(v, ast.FormattedValue)]
+            out.append((n.lineno, lit, fvs))
+    return out
+
+
+def calls_named(tree, dotted: str):
+    """`fx.hist_range_params` 같은 점 표기 호출 노드들."""
+    mod, _, attr = dotted.partition(".")
+    hits = []
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == attr
+                and isinstance(n.func.value, ast.Name) and n.func.value.id == mod):
+            hits.append(n)
+    return hits
+
+
+def float_literals(tree) -> set:
+    return {n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, float)}
 
 
 def ok(tag, msg):
@@ -593,11 +674,260 @@ def group_C():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# [A] app.py — 조회 창 구조 + 시그니처 결합 (정적 AST · 임포트 없음)
+# ══════════════════════════════════════════════════════════════════════════════
+#   app.py 유예 호출부 기준선. **'괜찮다'가 아니라 '알고 있고 아직 안 고쳤다'**는 뜻.
+#     · cached_earnings_price_history(limit=900) — run_earnings_watch.py:242 와
+#       락스텝 쌍이다. 한쪽만 from/to 로 바꾸면 실적 갭 표본 수가 갈려서 앱 화면과
+#       이메일의 예상 변동폭이 달라진다. 같은 커밋에서 함께 전환할 것(백로그).
+_APP_LIMIT_BASELINE = 1
+
+
+def group_A():
+    print("\n[A] app.py — historical-price-eod 창 · 시그니처 결합")
+    at = tree_file("app.py")
+    asrc = src_file("app.py")
+    urls = hist_urls(at)
+
+    chk(len(urls) >= 6, "A0", f"historical-price-eod URL {len(urls)}곳 발견")
+
+    with_limit = [(ln, lit) for ln, lit, _ in urls if "limit=" in lit]
+    chk(len(with_limit) <= _APP_LIMIT_BASELINE, "A1",
+        f"limit= 잔존 {len(with_limit)}곳 (기준선 {_APP_LIMIT_BASELINE}) "
+        f"{[ln for ln, _ in with_limit]}")
+    if len(with_limit) < _APP_LIMIT_BASELINE:
+        print("      ⚠️ 기준선보다 줄었다 — _APP_LIMIT_BASELINE 을 낮출 것")
+    chk(all("limit=900" in lit for _, lit in with_limit), "A1b",
+        "유예된 곳은 실적 심층 캐시(limit=900) 뿐이다 "
+        f"{[lit[-40:] for _, lit in with_limit] or ''}")
+
+    # 전환된 곳은 전부 fx.hist_range_params 를 통과해야 한다.
+    conv = [(ln, lit, fvs) for ln, lit, fvs in urls if "limit=" not in lit]
+    missing = []
+    for ln, lit, fvs in conv:
+        has = any(calls_named(ast.Module(body=[ast.Expr(v.value)], type_ignores=[]),
+                              "fx.hist_range_params") for v in fvs)
+        if not has:
+            missing.append(ln)
+    chk(not missing, "A2",
+        f"전환된 {len(conv)}곳 전부 fx.hist_range_params 경유 {missing or ''}")
+
+    chk(all(("from=" not in lit and "to=" not in lit) for _, lit, _ in conv), "A2b",
+        "from/to 를 호출부에서 직접 조립하지 않는다 — 조립은 fmp_extras 한 곳")
+
+    # ── A4: 시그니처 결합. 이 스위트가 존재하는 가장 큰 이유다. ──────────────
+    #   scanner_core 가 limit → lookback_days 로 바뀌었는데 app.py 호출부가
+    #   하나도 안 따라와 18곳 전부 TypeError 였다(2026-08-27~28). 전부 try/except
+    #   안이라 **조용히** 빈 DataFrame 이 됐고, check_freshness 정합성 검사는
+    #   '심볼 존재'만 보므로 초록불이었다. 그 사각지대를 여기서 덮는다.
+    sct = tree_file("scanner_core.py")
+    sigs = {}
+    for nm in ("_fmp_price_history", "_fmp_batch_price_history"):
+        sg = sig_from_ast(sct, nm)
+        if sg:
+            sigs[nm] = sg
+    for nm in ("_fmp_batch_to_close_df", "_wl_prefetch_histories",
+               "_pf_prefetch_histories", "_fmp_price_history_robust",
+               "_fmp_robust_batch_close", "_fmp_robust_batch_history_report"):
+        sg = sig_from_ast(at, nm)
+        if sg:
+            sigs[nm] = sg
+    chk(len(sigs) >= 8, "A3", f"검사 대상 함수 {len(sigs)}개 시그니처 복원")
+
+    ok, bad = 0, []
+    for n in ast.walk(at):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in sigs:
+            try:
+                sigs[n.func.id].bind(*[object()] * len(n.args),
+                                     **{k.arg: object() for k in n.keywords if k.arg})
+                ok += 1
+            except TypeError as e:
+                bad.append(f"{n.lineno}:{n.func.id} — {e}")
+    chk(not bad, "A4", f"app.py 호출부 {ok}곳 전부 실제 시그니처에 결합")
+    for b in bad:
+        print("        ❌ " + b)
+
+    # ── A5: 옛 단위가 위치 인자로 스며드는 경로 차단 ────────────────────────
+    kwonly_required = ("_fmp_batch_to_close_df", "_wl_prefetch_histories",
+                       "_pf_prefetch_histories", "_fmp_price_history_robust",
+                       "_fmp_robust_batch_close", "_fmp_robust_batch_history_report")
+    leaks = []
+    for nm in kwonly_required:
+        sg = sigs.get(nm)
+        if sg is None:
+            leaks.append(f"{nm}(없음)")
+            continue
+        if "limit" in sg.parameters:
+            leaks.append(f"{nm}: limit 파라미터 잔존")
+        cd = sg.parameters.get("calendar_days") or sg.parameters.get("date_added_map")
+        if cd is None or cd.kind is not cd.KEYWORD_ONLY:
+            leaks.append(f"{nm}: 창 인자가 키워드 전용이 아니다")
+    chk(not leaks, "A5", f"래퍼 6개 모두 limit 제거 + 키워드 전용 {leaks or ''}")
+
+    # 주석에는 남아 있어도 된다(왜 폐기했는지가 기록이다). **코드 심볼**로만 없으면 된다.
+    live = []
+    for nm in kwonly_required:
+        fn = find_func(at, nm)
+        if fn is None:
+            continue
+        live += [f"{nm}:{n.lineno}" for n in ast.walk(fn)
+                 if isinstance(n, ast.Name) and n.id == "limit"]
+    chk(not live, "A5b",
+        f"래퍼 6개 본문에 limit 코드 심볼 부재(주석 언급은 허용) {live or ''}")
+    chk("limit" in asrc, "A5c",
+        "폐기 사유가 주석으로 남아 있다 — 같은 파라미터가 되살아나는 것을 막는다")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [W] app.py 창 충분성 — 하류 요구 봉수를 실제로 덮는가
+# ══════════════════════════════════════════════════════════════════════════════
+def group_W():
+    print("\n[W] app.py 창 충분성 — 하류 요구 역산")
+    at = tree_file("app.py")
+    aconst = module_ints(at)
+    rt = tree_of(rc)
+    rconst = module_ints(rt)
+
+    # W1/W2 — 기술적 분석 캐시(SPY 포함)가 market_warnings 를 먹인다
+    mw = find_func(rt, "market_warnings")
+    chain = required_bars_in(mw, rconst)
+    gate = hard_gate_in(mw)
+    have = fx.bars_for_calendar_days(fx.HIST_WINDOW_DAYS)
+    print(f"      · 기본 창 {fx.HIST_WINDOW_DAYS}달력일 → 약 {have}봉 "
+          f"(체인 요구 {chain} · 하드게이트 {gate})")
+    chk(have >= chain, "W1", f"{have}봉 ≥ vol 체인 요구 {chain}봉")
+    chk(have >= gate, "W2", f"{have}봉 ≥ 하드게이트 {gate}봉")
+
+    # W3 — 진짜 범인은 limit 이 아니라 이 후처리였다. 부활 금지.
+    ctph = find_func(at, "cached_timing_price_history")
+    chk(ctph is not None, "W3a", "cached_timing_price_history 존재")
+    if ctph is not None:
+        offs = [n for n in ast.walk(ctph)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "DateOffset"]
+        chk(not offs, "W3",
+            f"1년 cutoff 후처리 부재 — 창은 from/to 만이 정한다 "
+            f"{[n.lineno for n in offs] or ''}")
+        lit = "".join(v for _, v, _ in hist_urls(ast.Module(body=[ctph], type_ignores=[])))
+        chk("limit=" not in lit, "W3b", "요청 URL 에 limit= 부재")
+
+    # W4 — MA200 경로(_fmp_robust_batch_close 기본 창)
+    ve = find_func(at, "verify_emerging_with_quant")
+    need_ma = required_bars_in(ve, aconst) if ve else 0
+    bc = sig_from_ast(at, "_fmp_robust_batch_close")
+    bc_days = 0
+    if bc and bc.parameters.get("calendar_days") is not None:
+        for n in ast.walk(at):
+            if isinstance(n, ast.FunctionDef) and n.name == "_fmp_robust_batch_close":
+                for x, dv in zip(n.args.kwonlyargs, n.args.kw_defaults):
+                    if x.arg == "calendar_days" and isinstance(dv, ast.Constant):
+                        bc_days = int(dv.value)
+    bc_bars = fx.bars_for_calendar_days(bc_days)
+    chk(bc_bars >= need_ma > 0, "W4",
+        f"batch_close 기본 {bc_days}일(≈{bc_bars}봉) ≥ MA200 요구 {need_ma}봉")
+
+    # W5 — RS 경로(_fmp_robust_batch_history_report 기본 창)
+    ds = find_func(at, "detect_sector_momentum_reversal")
+    need_rs = hard_gate_in(ds) if ds else 0
+    hr_days = 0
+    for n in ast.walk(at):
+        if isinstance(n, ast.FunctionDef) and n.name == "_fmp_robust_batch_history_report":
+            for x, dv in zip(n.args.kwonlyargs, n.args.kw_defaults):
+                if x.arg == "calendar_days" and isinstance(dv, ast.Constant):
+                    hr_days = int(dv.value)
+    hr_bars = fx.bars_for_calendar_days(hr_days)
+    chk(hr_bars >= need_rs > 0, "W5",
+        f"batch_history_report 기본 {hr_days}일(≈{hr_bars}봉) ≥ RS 게이트 {need_rs}봉")
+
+    # W6/W7 — 분모가 시리즈 길이인 곳은 tail() 로 못 박혀 있어야 한다.
+    #   창을 넓히는 순간 '값'이 바뀌는 부류다. VIX 백분위와 거래량 비율이 그렇다.
+    #   ⚠️ any() 로 쓰면 안 된다. 이 함수에는 **FRED 경로에도** s.tail(252) 가 있어서
+    #      FMP 쪽 tail 을 지워도 any() 는 계속 참이다(2026-08-28 뮤테이션에서 실제로
+    #      놓쳤다). 판별력이 있는 통계는 '개수'다 — 두 경로 각각 하나씩, 총 2개.
+    vix = find_func(at, "fetch_vix_latest_and_history")
+    n252 = len([a for n in (ast.walk(vix) if vix else [])
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "tail"
+                for a in n.args
+                if isinstance(a, ast.Constant) and a.value == 252])
+    chk(n252 >= 2, "W6",
+        f"tail(252) 가 FRED·FMP 두 경로에 각각 존재 (발견 {n252}개, 기대 2) — "
+        f"백분위 분모가 소스에 따라 갈리지 않는다")
+
+    css = find_func(at, "calculate_style_scores")
+    tails2 = [n for n in ast.walk(css)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "tail"] if css else []
+    chk(any(isinstance(a, ast.Constant) and a.value == 65
+            for n in tails2 for a in n.args), "W7",
+        "calculate_style_scores 에 tail(65) 고정 — vols.mean() 분모 안정")
+
+    # W8 — 요구가 가변인 3곳은 상수 리터럴이면 안 된다.
+    for fname, tag in (("_dividend_reinvest_price", "W8a"),
+                       ("_pf_prefetch_histories", "W8b")):
+        fn = find_func(at, fname)
+        dyn = False
+        if fn is not None:
+            dyn = bool(calls_named(ast.Module(body=[fn], type_ignores=[]),
+                                   "fx.hist_days_for_holding")
+                       or calls_named(ast.Module(body=[fn], type_ignores=[]),
+                                      "fx.hist_days_for_target_date"))
+        chk(dyn, tag, f"{fname} 이 동적 창 헬퍼를 쓴다(상수 아님)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [X] SSOT — 환산 상수·보유창이 한 곳에만 존재하는가
+# ══════════════════════════════════════════════════════════════════════════════
+def group_X():
+    print("\n[X] SSOT — 0.6871 · 환산기 · 보유창의 단일 출처")
+    ratio = fx.HIST_TD_PER_CD
+
+    # X1 — 코드 리터럴 기준(주석은 허용). 복제가 드리프트의 시작이다.
+    dupes = []
+    for name in ("app.py", "run_watchlist_alerts.py", "scanner_core.py"):
+        try:
+            if ratio in float_literals(tree_file(name)):
+                dupes.append(name)
+        except FileNotFoundError:
+            pass
+    chk(not dupes, "X1",
+        f"{ratio} 코드 리터럴이 fmp_extras 밖에 없다 {dupes or ''}")
+    chk(ratio in float_literals(tree_file("fmp_extras.py")), "X1b",
+        "fmp_extras 에는 실제로 존재한다(검사기가 헛도는 것 방지)")
+
+    # X2 — 재수출이 값·객체 동일성까지 유지하는가
+    chk(m._HIST_TD_PER_CD == ratio, "X2a", "run_watchlist_alerts 재수출 값 동일")
+    chk(m._HIST_WINDOW_DAYS == fx.HIST_WINDOW_DAYS, "X2b", "기본 창 동일")
+    chk(m._HIST_MAX_DAYS == fx.HIST_MAX_DAYS, "X2c", "상한 동일")
+    chk(m._bars_for_calendar_days is fx.bars_for_calendar_days, "X2d",
+        "변환기가 같은 객체(사본이 아니라 재수출)")
+    chk(m._hist_days_for_holding is fx.hist_days_for_holding, "X2e",
+        "보유창 함수가 같은 객체 — 메일과 화면이 같은 규칙을 쓴다")
+
+    # X3 — app.py 가 실제로 SSOT 를 임포트하는가
+    at = tree_file("app.py")
+    aliases = {a.asname or a.name for n in ast.walk(at)
+               if isinstance(n, ast.Import) for a in n.names}
+    chk("fx" in aliases, "X3a", "app.py 가 fmp_extras 를 fx 로 임포트")
+    chk("fh" in aliases, "X3b", "app.py 가 fmp_http 를 fh 로 임포트")
+
+    # X4 — 승격된 함수가 옛 동작을 그대로 재현하는가(경계 4종)
+    T = "2026-08-27"
+    cases = [("", fx.HIST_WINDOW_DAYS), ("2026-09-01", fx.HIST_WINDOW_DAYS),
+             ("2026-07-28", fx.HIST_WINDOW_DAYS + 30), ("1990-01-01", fx.HIST_MAX_DAYS)]
+    bad = [(d, fx.hist_days_for_holding(d, today=T), w)
+           for d, w in cases if fx.hist_days_for_holding(d, today=T) != w]
+    chk(not bad, "X4", f"보유창 경계 4종 재현 {bad or ''}")
+
+
 def main():
     print("=" * 78)
     print("diag_hist_window — 가격 히스토리 조회 창(from/to) 회귀 스위트")
     print(f"  run_watchlist_alerts: {m.__file__}")
     print(f"  regime_core        : {rc.__file__}")
+    print(f"  fmp_extras         : {fx.__file__}")
+    print(f"  app.py             : {os.path.join(_REPO, 'app.py')} (정적 분석)")
     print("=" * 78)
 
     group_S()
@@ -607,6 +937,9 @@ def main():
     group_H()
     group_G()
     group_C()
+    group_A()
+    group_W()
+    group_X()
 
     print("\n" + "=" * 78)
     print(f"결과: {len(PASS)}/{len(PASS) + len(FAIL)} 통과")

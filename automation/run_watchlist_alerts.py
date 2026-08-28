@@ -45,6 +45,7 @@ import earnings_core as ec  # noqa: E402  — 실적 이벤트 리스크 SSOT (a
 import watchlist_metrics_core as wm  # noqa: E402  — 워치리스트 표시 지표 SSOT (app.py와 동일 모듈)
 import calendar_core as cc  # noqa: E402  — 시장 캘린더(휴장일) SSOT
 import fmp_http as fh     # noqa: E402  — FMP 레이트리밋/429 백오프 SSOT
+import fmp_extras as fx   # noqa: E402  — 조회 창 환산·보유창 SSOT (app.py와 동일 모듈)
 
 # ── 환경변수 ───────────────────────────────────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -130,59 +131,28 @@ _PF_COL_DATE_ADDED = 5
 #   272봉 ÷ 0.6871 = 395.9 달력일. 460일 요청 시 실측 316봉(2026-08-28 probe).
 #   여유 44봉(16%). 언더슈트 비용(게이트 침묵 무력화)이 오버슈트 비용(페이로드)보다
 #   압도적으로 크므로 마진은 이 비대칭에 맞춘다.
-_HIST_TD_PER_CD = 0.6871     # 실측 비율. 추정치 아님 — diag_fmp_window.py 기준선 응답
-_HIST_WINDOW_DAYS = 460      # 달력일. 구속 요구 272봉 → 약 316봉 확보
-_HIST_MAX_DAYS = 1826        # 달력일 상한(약 5년 ≈ 1,254봉 = limit 무효 시절의 사실상 동작)
+# [2026-08-28] 아래는 전부 **fmp_extras 재수출**이다. 정의가 아니다.
+#   app.py 가 같은 환산을 쓰기 시작하면서 0.6871 이 두 벌이 될 뻔했다.
+#   상수가 갈리면 한쪽 창만 짧아지고, 짧아진 창은 260봉 하드게이트를 조용히
+#   못 넘긴다 — 에러도 로그도 남지 않는다. 사본을 만들지 말 것.
+#
+#   모듈 레벨 **이름을 유지하는 이유**: diag_hist_window [R][T][G] 가
+#   `m._HIST_WINDOW_DAYS` 처럼 이 모듈의 속성으로 접근한다. 이름을 지우면
+#   검증군이 통과가 아니라 **에러로 죽는다**(더 나쁘게는, 조건부로 건너뛰면
+#   조용히 초록불이 된다). 재수출이 가장 싼 방어다.
+#   diag_hist_window [X] 가 이 파일에 0.6871 리터럴이 되살아나는 것을 막는다.
+_HIST_TD_PER_CD = fx.HIST_TD_PER_CD
+_HIST_WINDOW_DAYS = fx.HIST_WINDOW_DAYS
+_HIST_MAX_DAYS = fx.HIST_MAX_DAYS
+_bars_for_calendar_days = fx.bars_for_calendar_days
+_calendar_days_for_bars = fx.calendar_days_for_bars
 
 
-def _bars_for_calendar_days(days: int) -> int:
-    """달력일 → 기대 거래일(봉) 수. 단위 혼동을 막기 위한 명시 변환기."""
-    return int(float(days) * _HIST_TD_PER_CD)
-
-
-def _calendar_days_for_bars(bars: int) -> int:
-    """요구 봉수 → 필요한 최소 달력일(올림). 마진은 호출부가 따로 얹는다."""
-    return int(-(-float(bars) // _HIST_TD_PER_CD))
-
-
-def _hist_days_for_holding(date_added, today=None, ticker: str = "") -> int:
-    """보유 종목 1건에 필요한 조회 창(달력일).
-
-    `compute_position_drawdown` 의 보유 고점은 `close[index >= Date_Added]` 의
-    최대값이다 — **상수가 아니라 보유 기간에 비례**한다. 창이 매수일에 못 미치면
-    트레일링 스톱 기준 고점이 조용히 낮아져 **매도 신호가 덜 뜬다**(놓치는 방향).
-
-    반환 규칙
-      · Date_Added 없음      → 기본 창. 하류가 _DD_FALLBACK_WINDOW(252봉) 폴백을
-                               쓰므로 깊은 조회가 필요 없다.
-      · Date_Added 파싱 실패 → **최대 창**. 값은 있는데 못 읽었다면 보유 기간이
-                               미상이다. 짧은 창으로 조용히 틀리는 것보다
-                               페이로드를 더 쓰는 편이 낫다(관측 가능한 비용).
-      · 정상                 → min(기본 + 보유 달력일, 상한)
-    """
-    base = _HIST_WINDOW_DAYS
-    try:
-        s = str(date_added or "").strip()[:10]
-        if not s:
-            return base
-        d = pd.to_datetime(s, errors="coerce")
-        if pd.isna(d):
-            print(f"[WARN] {ticker or '?'} Date_Added 파싱 실패({s!r}) — 최대 창 적용")
-            return _HIST_MAX_DAYS
-        t = pd.to_datetime(str(today or "")[:10], errors="coerce")
-        if pd.isna(t):
-            t = pd.Timestamp(datetime.now(_ET).date())
-        held = int((t - d).days)
-        if held <= 0:
-            return base           # 미래 날짜/당일 매수 → 깊은 조회 불필요
-        want = base + held
-        if want > _HIST_MAX_DAYS:
-            print(f"[WARN] {ticker or '?'} 보유 {held}일 — 조회 창 상한 "
-                  f"{_HIST_MAX_DAYS}일 적용(보유 고점 절삭 가능)")
-            return _HIST_MAX_DAYS
-        return want
-    except Exception:
-        return _HIST_MAX_DAYS
+# [2026-08-28] 본체를 fmp_extras.hist_days_for_holding 으로 옮겼다(재수출).
+#   app.py 의 포트폴리오 경로가 고정 600봉을 쓰고 있어서 **같은 보유 종목을 두고
+#   메일과 화면의 트레일링 고점이 갈렸다.** 자동화만 고쳐두면 화면이 조용히 틀린다.
+#   동작·반환값·[WARN] 문자열 전부 동일하다(diag_hist_window [H] 경계표가 지킨다).
+_hist_days_for_holding = fx.hist_days_for_holding
 
 # ── 실적 진입 차단 게이트 ─────────────────────────────────────────────────────
 # Earnings_Events 시트를 **공유 상태**로 읽는다(스크립트 실행 순서에 의존하지 않음).

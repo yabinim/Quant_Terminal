@@ -132,7 +132,10 @@ _RAW_GET_BASELINE = {
     # 손대면 회귀 위험이 크다 → 별도 검토 사안(인수인계 §6-B5).
     # 2026-08-27: 58 → 63. 코드가 늘어난 게 아니라 **탐지기가 눈을 떴다**
     # (`_fmp_url_names` 가 변수에 담긴 URL 까지 추적). 실제 부채는 처음부터 63 이었다.
-    "app.py": 63,
+    # 2026-08-28: 63 → 62. _fmp_price_history_robust 를 fh.fmp_get_ex 로 위임했다.
+    #   나머지 62곳은 @st.cache_data 대화형 경로다 — 한 번에 손대면 회귀 위험이
+    #   크므로 계속 래칫으로 조인다(인수인계 §6-B5).
+    "app.py": 62,
     # 8AM/9AM DRG 예측. 종목 수가 적어(매크로 지표 중심) 한도에 닿지 않는다.
     "run_drg_predict.py": 11,
     # run_watchlist_alerts.py 는 2026-08-26 에 4곳 전부 fmp_http 로 전환됐다.
