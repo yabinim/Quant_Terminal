@@ -86,6 +86,19 @@ HIST_WINDOW_DAYS = 460
 HIST_MAX_DAYS = 1826
 #   상한(약 5년 ≈ 1,254봉). limit 이 무시되던 시절의 사실상 동작과 같은 크기.
 
+HIST_MIN_DAYS = 21
+#   하한(달력일). 요구 봉수가 작을 때 순수 환산만 쓰면 창이 위험하게 짧아진다:
+#   2봉 → ceil(2 ÷ 0.6871) = **3달력일**이다. 금요일 휴장(굿프라이데이·독립기념일
+#   등)이면 목 종가에서 다음 월요일까지 간격만 4달력일이라 **0봉**이 온다.
+#   비상 휴장은 더 길다 — 2001-09-11 은 7달력일 연속이었다.
+#   21일이면 그 7일짜리 휴장이 창에 통째로 들어와도 14달력일 ≈ 9봉이 남는다.
+#
+#   비용은 여기서도 비대칭이다:
+#     · 언더슈트 → `len(rows) >= 6` 같은 가드에 걸려 **신호가 조용히 사라진다**.
+#       rolling(20, min_periods=10) 이면 더 나쁘다 — 에러 없이 더 짧은 창의
+#       평균이 나와 값이 조용히 틀린다.
+#     · 오버슈트 → 수 KB 페이로드. 관측 가능하고 되돌리기 쉽다.
+
 
 def bars_for_calendar_days(days) -> int:
     """달력일 → 기대 거래일(봉) 수. 단위 혼동을 막기 위한 명시 변환기."""
@@ -95,6 +108,33 @@ def bars_for_calendar_days(days) -> int:
 def calendar_days_for_bars(bars) -> int:
     """요구 봉수 → 필요한 최소 달력일(올림). 마진은 호출부가 따로 얹는다."""
     return int(-(-float(bars) // HIST_TD_PER_CD))
+
+
+def hist_days_for_bars(bars, pad_bars: int = 5) -> int:
+    """요구 **봉수** → 실제로 요청할 조회 창(달력일). 마진·하한·상한 포함.
+
+    `calendar_days_for_bars()` 와 역할이 다르다. 둘을 헷갈리면 안 된다:
+      · calendar_days_for_bars — **순수 환산**. 마진도 하한도 없다.
+        무마진 최소치를 계산해 마진의 존재를 검증하는 용도(diag T6).
+      · hist_days_for_bars     — **호출부용**. 여유 봉수를 얹고 HIST_MIN_DAYS
+        바닥과 HIST_MAX_DAYS 상한을 적용한 최종 값.
+
+    호출부가 마진 정책을 몰라도 되게 하는 것이 요점이다. 호출부마다 직접
+    `calendar_days_for_bars(n + 5)` 를 쓰면 0.6871 은 한 벌이어도 **정책이
+    여러 벌**이 되고, 나중에 한쪽만 갱신된다. 그 실패는 로그를 남기지 않는다.
+
+    [2026-08-28] run_drg_predict.py 의 limit=2 / limit=10 호출을 from/to 로
+      옮기며 신설. 봉수를 달력일에 그대로 넣으면 연휴 한 번에 0봉이 온다.
+
+    bars     : 하류가 실제로 소비하는 꼬리 깊이(iloc[-n] · rolling(n) 의 n).
+    pad_bars : 그 위에 얹는 여유 봉수. 기본 5.
+    """
+    try:
+        need = max(1, int(bars)) + max(0, int(pad_bars))
+    except Exception:
+        return HIST_MAX_DAYS      # 요구치를 못 읽었다 → 짧게 틀리느니 넓게 받는다
+    return int(min(max(calendar_days_for_bars(need), HIST_MIN_DAYS),
+                   HIST_MAX_DAYS))
 
 
 def hist_range_params(calendar_days, today=None) -> str:
