@@ -1,0 +1,154 @@
+name: 🔬 진단 — historical-price-eod 소비처 조회 창 검증 (수동 전용)
+
+# 언제 쓰나:
+#   · fmp_extras._closes / run_hidden_alpha._fmp_price_history_close /
+#     run_narrative._fmp_close_series / run_drg_verify.verify_prediction 의
+#     FMP 호출부나 `bars=` 선언을 건드린 직후, 배포 전
+#   · 위 함수들의 **소비 구문**(rolling·tail·iloc·_trailing_return·
+#     calculate_period_return)의 창 길이를 바꾼 직후. 요구 봉수를 소스에서
+#     역산하므로 하류가 더 깊은 꼬리를 요구하기 시작하면 여기서 먼저 빨간불이 켜진다.
+#   · `fmp_extras.hist_days_for_bars` / `HIST_MIN_DAYS` / `HIST_TD_PER_CD` 를
+#     건드린 직후 — 이 4곳의 창이 전부 그 정책에서 나온다.
+#
+# 왜 필요한가 — 이 결함군은 전부 조용하다:
+#   1) FMP `historical-price-eod` 의 `limit` 은 **무시된다**. 무엇을 적어도 약
+#      1,254봉이 왔다. 즉 옛 상수(130 / 170 / 260 / 900 / 20)는 한 번도 강제된
+#      적이 없고, **아무도 검증한 적이 없는 숫자**다. `from` 으로 바꾸는 순간
+#      그 숫자가 처음으로 진짜 상한이 된다.
+#      → run_narrative 가 실증이다: limit 은 130 인데 실요구는 **200봉**이었다.
+#        130 을 그대로 창으로 옮겼다면 `if len(s) >= 150` 가드가 실패해
+#        `above_ma200=None` 이 되고, verdict 분기 "❌ 하락 추세 (대기)" 가
+#        **통째로 도달 불가**가 된다. 예외도 로그도 남지 않는다.
+#        150~199봉이면 더 나쁘다 — 에러 없이 더 짧은 창의 평균이 나온다.
+#   2) run_drg_verify 의 창만 기준점이 **오늘이 아니라 pred_date** 다.
+#      미검증 예측이 며칠 밀려 있으면(주말·휴장·워크플로 실패) 오늘 기준 창은
+#      pred_date 봉을 안 담고 `hist_on_pred.empty` 로 빠져 그 예측은
+#      **영구 미검증**으로 남는다. 이메일에는 "검증할 예측 없음" 한 줄만 뜬다.
+#   3) 429 를 조용히 삼키는 경로였다. 전환 전 이 4곳 중 3곳은 원시
+#      `requests.get` 이라 재시도가 없었다. 레이트리밋에 걸리면
+#      run_narrative 는 종목을 `continue` 로 건너뛰고(Emerging 검증에서 종목이
+#      통째로 사라진다), run_drg_verify 는 `.json()` 이 예외로 튀어 그날 검증이
+#      사라진다. 둘 다 로그에 아무것도 안 남는다.
+#
+# 무엇을 검사하나 (95항목):
+#   [C] 정적 배선 — URL 의 limit 부재 · from/to 결합 · import requests 부재(래칫)
+#                   · 창 함수 정의부의 **기본값 금지** · 호출부의 bars= 명시
+#                   · 순수 환산기 직접 호출 금지 · 0.6871 복제 금지
+#                   · run_drg_verify 의 today= 앵커 · 죽은 변수 부재
+#   [R] 요구 역산 — 소비 구문(rolling·tail·iloc·함수 경계 넘김)에서 요구 봉수를
+#                   AST 로 역산하고, **호출부 소스의 `bars=` 선언치**와 대조.
+#                   R0 은 역산기 자체의 양성대조다(역산기가 0 을 내면 R1 이
+#                   통째로 공허하게 통과한다).
+#   [E] 런타임   — 4개 모듈을 **실제로 임포트해 스텁 FMP 위에서 실행**한다.
+#                   관측 창이 정책 산출값과 일치하는지, 공급 봉수가 요구를
+#                   덮는지, 그리고 **결과값을 직접 관측**한다:
+#                     · above_ma200 이 None 이 아닌가 (창 길이 비교로는 못 잡는다)
+#                     · verify_prediction 이 방향을 실제로 산출하는가
+#                     · to 가 pred_date+1 인가 (오늘 앵커가 아닌가)
+#   [B] 비상휴장 — 7달력일 연속 휴장(2001-09-11 급)을 주입하고 [E] 전부 재실행
+#
+#   ⚠️ 원시 requests.get 이 한 곳이라도 남아 있으면 **런타임 군을 중단한다**
+#      (C-STOP). 스텁이 그 경로를 가로채지 못해 진짜 FMP 로 나가기 때문이다.
+#
+#   ⚠️ 요구 봉수도 선언치도 이 진단 안에 상수로 적지 않는다. 양쪽 다 소스에서
+#      뽑는다 — 요구는 소비 구문에서 역산, 선언은 호출부 `bars=` 에서 판독.
+#      한쪽이라도 진단이 들고 있으면 소스를 바꿔도 통과하는 가짜 초록불이 된다.
+#      (diag_hist_window [D] D3 이 남긴 한계를 여기서는 반복하지 않는다.)
+#
+#   ⚠️ 이 스위트는 하네스를 복제하지 않고 `diag_hist_window` 에서 **import** 한다
+#      (스텁 FMP `_drg_stub` · AST 헬퍼 `offset_of`/`required_bars_in`/`FakeResp`).
+#      두 파일은 그래서 락스텝이다. diag_hist_window 의 헬퍼 시그니처가 바뀌면
+#      여기서 먼저 죽는다.
+#
+# 검증된 판별력 (2026-08-28 4차, 변이 16건 전건 탐지 · SHA 원복 확인):
+#   P1  run_narrative 종목 bars 200→130 (옛 limit 이식)  → R1b **E2b**
+#   P2  run_narrative SPY bars 64→200 (과다 선언)        → R1b
+#   P3  _closes 기본값 부활                              → C4b
+#   P4  fmp_extras SPY bars 200→127 (두 요구 혼동)       → R1b
+#   P5  run_hidden_alpha bars 22→6                       → R1b **E5c**
+#   P6  run_drg_verify today= 앵커 제거                  → C8a **E3b**
+#   P7  순수 환산기 직접 호출 (마진 우회)                → C6 E3c
+#   P8  limit 부활                                       → C1b (+C-STOP)
+#   P9  import requests 만 부활 (호출 없음)              → C3
+#   P10 원시 GET 실제 부활                               → diag_fmp_ssot A1
+#   P11 손으로 &from= 작성 (정책 복제)                   → C2a E5a
+#   P12 rolling(200)→rolling(150), 선언은 그대로         → R1b R2a
+#   P13 _fmp_batch_close_df 기본값 부활 (중간 계층)      → C4b
+#   P14 HIST_MIN_DAYS 21→3                               → diag_hist_window T7a T9
+#   P15 기준선 0 파일에 **별칭** 원시 GET 신설           → diag_fmp_ssot A1
+#   P16 A1 기준선만 낮추고 코드는 그대로                 → diag_fmp_ssot A1
+#
+#   ⚠️ P10 은 처음에 **놓쳤다.** A1 탐지기가 `c.func.value.id == "requests"` 를
+#      하드코딩하고 있어 `import requests as _rq` 한 줄이면 래칫이 통째로
+#      우회됐다. "기준선에서 제거 = 이제 한 곳이라도 생기면 실패한다"는 문장이
+#      별칭 앞에서는 사실이 아니었다. diag_fmp_ssot 를 별칭 인지로 고치고
+#      M10(별칭 3형태 + dict.get 오탐 대조)을 심었다.
+#   ⚠️ P15 도 한 번 갈렸다. 기준선이 **1** 인 파일에서 호출을 별칭으로 바꾸면
+#      개수가 그대로 1 이라 A1 은 정상적으로 통과한다 — 그건 우회가 아니다.
+#      래칫을 시험하려면 **기준선에서 제거된 파일**(0)에 새로 만들어야 한다.
+#
+# 안전성:
+#   · 네트워크 접근 없음 · FMP 호출 없음 · 시트 접근 없음 · 메일 발송 없음
+#   · fmp_http.fmp_get_json 과 fmp_extras.fmp_get 은 스텁으로 대체되고 원복된다
+#     (fmp_extras 는 임포트 시점에 `fmp_get = _fh.fmp_get` 로 **값을 바인딩**하므로
+#      fh 쪽만 갈면 run_hidden_alpha 는 여전히 원본을 부른다 — 양쪽을 다 건다)
+#   · 시크릿 불필요 (diag_hist_window 가 더미 환경변수를 setdefault 로 채운다)
+#   · 부작용 없음. 몇 번을 돌려도 같은 결과.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # run_narrative / run_drg_verify / run_hidden_alpha 를 import 하므로
+      # 모듈 레벨 의존성이 전부 필요하다. 실제 호출은 하지 않는다(스텁 대체).
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install \
+            google-genai \
+            google-auth \
+            gspread \
+            feedparser \
+            requests \
+            numpy \
+            pandas \
+            pytz \
+            fredapi
+
+      - name: 🔬 소비처 조회 창 회귀 + 요구 봉수 역산 + 런타임 관측
+        run: python automation/diag_hist_window_consumers.py
+
+      # 하네스(_drg_stub · offset_of · required_bars_in · FakeResp)를 import 로
+      # 재사용한다 — 복제하지 않은 대가로 두 파일이 락스텝이다. 헬퍼 시그니처가
+      # 바뀌면 위 스위트가 먼저 죽으므로, 원본도 같이 돌려 어느 쪽이 깨졌는지 가른다.
+      - name: 🔁 락스텝 스위트 — 조회 창 원본 (하네스 제공자)
+        run: python automation/diag_hist_window.py
+
+      # 이 커밋은 A1 기준선에서 run_narrative(2) · run_drg_verify(1) 을 제거했고,
+      # 탐지기를 별칭 인지로 고쳤다. 기준선만 낮추고 코드를 안 고치면(또는 그
+      # 반대면) 여기서 갈린다.
+      - name: 🔁 락스텝 스위트 — FMP SSOT / A1 원시 호출 래칫
+        run: python automation/diag_fmp_ssot.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          fmp_extras.py
+          automation/run_narrative.py
+          automation/run_drg_verify.py
+          automation/run_hidden_alpha.py
+          automation/diag_fmp_ssot.py
+          automation/diag_hist_window_consumers.py
