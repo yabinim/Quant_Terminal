@@ -72,11 +72,32 @@ import fmp_extras as fx
 
 PASS, FAIL = [], []
 
-_REPO = os.path.dirname(os.path.abspath(__file__))
+def _find_repo_root(start: str) -> str:
+    """app.py 가 있는 디렉터리를 위로 올라가며 찾는다.
+
+    ⚠️ `os.path.dirname(__file__)` 을 저장소 루트로 가정하면 안 된다. 이 스위트는
+       `automation/` 에 있고 app.py·regime_core·fmp_extras 는 레포 루트에 있다.
+       (2026-08-28 실측: 그 가정 때문에 [A] 가 FileNotFoundError 로 죽었고,
+        예외가 main() 을 통째로 끊어 요약조차 안 나왔다.)
+       배치가 바뀌어도 따라가도록 앵커 파일로 탐색한다.
+    """
+    d = os.path.abspath(start)
+    for _ in range(5):
+        if os.path.exists(os.path.join(d, "app.py")):
+            return d
+        up = os.path.dirname(d)
+        if up == d:
+            break
+        d = up
+    return os.path.abspath(start)
+
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = _find_repo_root(_HERE)
 
 
 def src_file(name: str) -> str:
-    """저장소 루트의 파일 소스. 임포트하지 않는다(app.py 는 임포트 불가)."""
+    """레포 루트의 파일 소스. 임포트하지 않는다(app.py 는 임포트 불가)."""
     with open(os.path.join(_REPO, name), encoding="utf-8") as fh:
         return fh.read()
 
@@ -686,6 +707,20 @@ _APP_LIMIT_BASELINE = 1
 
 def group_A():
     print("\n[A] app.py — historical-price-eod 창 · 시그니처 결합")
+
+    # A-0: 경로 해석을 **검사 항목으로** 만든다. 예외로 죽으면 main() 이 끊겨
+    #      나머지 검사군의 결과조차 못 본다(2026-08-28 실측). 못 찾으면 실패로
+    #      기록하고 진행한다 — 조용히 건너뛰면 가짜 초록불이 된다.
+    missing_src = [n for n in ("app.py", "scanner_core.py")
+                   if not os.path.exists(os.path.join(_REPO, n))]
+    chk(not missing_src, "A-0",
+        f"레포 루트 해석 성공: {_REPO} "
+        f"{'— 없는 파일 ' + str(missing_src) if missing_src else ''}")
+    if missing_src:
+        print(f"        · 스위트 위치: {_HERE}")
+        print("        · app.py 를 앵커로 위로 5단계까지 탐색했으나 못 찾았다.")
+        return
+
     at = tree_file("app.py")
     asrc = src_file("app.py")
     urls = hist_urls(at)
@@ -784,6 +819,9 @@ def group_A():
 # ══════════════════════════════════════════════════════════════════════════════
 def group_W():
     print("\n[W] app.py 창 충분성 — 하류 요구 역산")
+    if not os.path.exists(os.path.join(_REPO, "app.py")):
+        chk(False, "W-0", f"app.py 를 찾지 못했다 ({_REPO}) — [A-0] 참조")
+        return
     at = tree_file("app.py")
     aconst = module_ints(at)
     rt = tree_of(rc)
@@ -906,6 +944,9 @@ def group_X():
         "보유창 함수가 같은 객체 — 메일과 화면이 같은 규칙을 쓴다")
 
     # X3 — app.py 가 실제로 SSOT 를 임포트하는가
+    if not os.path.exists(os.path.join(_REPO, "app.py")):
+        chk(False, "X3-0", f"app.py 를 찾지 못했다 ({_REPO}) — [A-0] 참조")
+        return
     at = tree_file("app.py")
     aliases = {a.asname or a.name for n in ast.walk(at)
                if isinstance(n, ast.Import) for a in n.names}
@@ -927,6 +968,7 @@ def main():
     print(f"  run_watchlist_alerts: {m.__file__}")
     print(f"  regime_core        : {rc.__file__}")
     print(f"  fmp_extras         : {fx.__file__}")
+    print(f"  레포 루트           : {_REPO}  (스위트 위치: {_HERE})")
     print(f"  app.py             : {os.path.join(_REPO, 'app.py')} (정적 분석)")
     print("=" * 78)
 
