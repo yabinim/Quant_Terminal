@@ -18,7 +18,6 @@ from email.mime.text import MIMEText
 import numpy as np
 import pandas as pd
 import pytz
-import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from google import genai
@@ -27,6 +26,8 @@ from google.genai import types as genai_types
 # ── repo root 를 sys.path 에 추가 → 공유 SSOT 모듈(gemini_core) import ──
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gemini_core
+import fmp_http as fh   # FMP HTTP SSOT — 레이트리밋·429 재시도·URL 조립
+import fmp_extras as fx  # 조회 창 SSOT — 요구 봉수 ↔ 달력일 환산
 import users_core as uc  # Users 시트/수신자 SSOT
 import calendar_core as cc  # 시장 캘린더(휴장일) SSOT
 
@@ -182,15 +183,32 @@ def verify_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         if pd.isna(pred_date):
             return "", np.nan, ""
 
-        start_date = pred_date - pd.Timedelta(days=14)
-        end_date   = pred_date + pd.Timedelta(days=2)
-
-        FMP_KEY_V = os.environ.get("FMP_API_KEY", "")
-        fmp_r = requests.get(
-            f"https://financialmodelingprep.com/stable/historical-price-eod/full?symbol={bench_etf}&limit=20&apikey={FMP_KEY_V}",
-            timeout=8
+        # ⚠️ 이 창의 기준점은 **오늘이 아니라 pred_date** 다. 다른 호출부와 다르다.
+        #   미검증 예측이 며칠 밀려 있으면(주말·휴장·워크플로 실패) 오늘 기준 창은
+        #   pred_date 봉을 아예 안 담고, `hist_on_pred.empty` 로 빠져 그 예측은
+        #   **영구 미검증**으로 남는다. 실패가 조용해서 알아채기 어렵다.
+        #   `hist_range_params(..., today=)` 가 앵커를 받는다.
+        #
+        # 소요 2봉 — 아래 hist_on_pred(예측일 종가) + hist_before(직전 종가).
+        #   HIST_MIN_DAYS 바닥(21일)이 걸려 실제 창은 21달력일이다.
+        #
+        # [2026-08-28] 세 가지를 함께 고쳤다.
+        #   1. 맨 requests.get → fh.fmp_get_json. 이 경로만 **429 재시도가 없었다.**
+        #      레이트리밋을 삼키면 `fmp_r.json()` 이 예외로 튀어 verify_prediction 이
+        #      통째로 빈 결과를 돌려준다 = 그날 검증이 사라진다.
+        #   2. `limit=20` → from/to 창. limit 은 무시되므로 1,254봉이 오고 있었다.
+        #   3. URL 하드코딩 → fh 의 base/키 조립. `FMP_KEY_V` 지역 변수도 없앤다.
+        #
+        # 죽은 변수 정리: 옛 `start_date`/`end_date` 는 계산만 하고 **한 번도 쓰이지
+        #   않았다.** 원래 의도가 바로 이 창이었으므로 여기서 되살린 셈이다.
+        fmp_data = fh.fmp_get_json(
+            "historical-price-eod/full?symbol=" + str(bench_etf)
+            + fx.hist_range_params(fx.hist_days_for_bars(2),
+                                   today=pred_date.date()),
+            timeout=8,
         )
-        fmp_data = fmp_r.json()
+        if fmp_data is None:
+            return "", np.nan, ""
         fmp_rows = fmp_data.get("historical", fmp_data) if isinstance(fmp_data, dict) else fmp_data
         if not isinstance(fmp_rows, list) or not fmp_rows:
             return "", np.nan, ""

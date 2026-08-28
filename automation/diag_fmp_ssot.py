@@ -146,8 +146,16 @@ _RAW_GET_BASELINE = {
     # requests 임포트 자체를 지워 되살리려면 임포트를 다시 추가해야 한다.
     # 기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
     "narrative_core.py": 2,
-    "run_narrative.py": 2,
-    "run_drg_verify.py": 1,
+    # run_narrative.py 는 2026-08-28 에 2곳 전부 fmp_http 로 전환됐다(2 → 0).
+    #   requests 임포트 자체를 지웠다 — 되살리려면 임포트를 다시 추가해야 한다.
+    #   기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
+    #   전환 이유는 스타일이 아니다: _fmp_close_series 가 429 를 조용히 삼키면
+    #   빈 Series 가 돌아가고 호출부는 그걸 '데이터 부족'으로 읽어 종목을
+    #   continue 로 건너뛴다. **Emerging 검증 결과에서 종목이 통째로 사라지는데
+    #   로그에는 아무것도 안 남는다.**
+    # run_drg_verify.py 도 같은 날 1곳 전환됐다(1 → 0). 이쪽은 더 나빴다 —
+    #   429 면 fmp_r.json() 이 예외로 튀어 verify_prediction 이 빈 결과를
+    #   돌려주고, 그날 DRG 검증이 통째로 사라진다.
     "run_earnings_watch.py": 1,
     "industry_core.py": 1,
     "diag_earnings_preview_backtest.py": 1,
@@ -217,18 +225,54 @@ def _fmp_url_names(tree) -> set:
     return out
 
 
+def _requests_names(tree):
+    """(requests 모듈을 가리키는 이름들, requests.get 자체를 가리키는 이름들).
+
+    ⚠️ 2026-08-28: 이전 구현은 `c.func.value.id == "requests"` 하드코딩이었다.
+       즉 **별칭 한 줄이면 래칫이 통째로 우회된다**:
+
+           import requests as _rq
+           _rq.get(url, timeout=8)          # ← A1 이 못 봤다
+
+       변이 P10 으로 실증했다. 기준선에서 파일을 제거하며 "이제 한 곳이라도
+       생기면 실패한다"고 적어 온 문장이, 별칭 앞에서는 사실이 아니었다.
+       `from requests import get` 과 `_g = requests.get` 도 같은 구멍이다.
+    """
+    mods, gets = {"requests"}, set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                if a.name.split(".")[0] == "requests":
+                    mods.add(a.asname or a.name.split(".")[0])
+        elif isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "requests":
+            for a in n.names:
+                (gets if a.name == "get" else mods).add(a.asname or a.name)
+        elif (isinstance(n, ast.Assign) and len(n.targets) == 1
+              and isinstance(n.targets[0], ast.Name)):
+            v, t = n.value, n.targets[0].id
+            if (isinstance(v, ast.Attribute) and v.attr == "get"
+                    and isinstance(v.value, ast.Name) and v.value.id in mods):
+                gets.add(t)
+            elif isinstance(v, ast.Name) and v.id in mods:
+                mods.add(t)
+    return mods, gets
+
+
 def raw_fmp_gets(mod: str) -> list:
     """[(lineno, 호출식 요약)] — requests.get 으로 FMP 를 직접 때리는 지점."""
     tree = TREES.get(mod)
     if tree is None or mod in _RAW_GET_EXEMPT:
         return []
     names = _fmp_url_names(tree)
+    rq_mods, rq_gets = _requests_names(tree)
     hits = []
     for c in ast.walk(tree):
-        if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-                and c.func.attr == "get"
-                and isinstance(c.func.value, ast.Name)
-                and c.func.value.id == "requests"):
+        _is_get = (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                   and c.func.attr == "get" and isinstance(c.func.value, ast.Name)
+                   and c.func.value.id in rq_mods)
+        _is_bare = (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                    and c.func.id in rq_gets)
+        if not (_is_get or _is_bare):
             continue
         arg = _unparse(c.args[0]) if c.args else ""
         # ⚠️ 이름 매칭은 **AST 이름 노드**로 한다. 부분 문자열로 하면
@@ -1072,6 +1116,44 @@ def _a1_hits_on(src_text: str) -> int:
         TREES.pop(key, None)
         SRCS.pop(key, None)
 
+
+# M10 — 별칭으로 래칫을 우회할 수 있는가. 변이 P10 이 이 구멍을 드러냈다.
+#   a: `import requests as _rq` → `_rq.get(...)`
+#   b: `from requests import get` → `get(...)`
+#   c: `_g = requests.get` → `_g(...)`
+#   d: **오탐 대조** — requests 와 무관한 객체의 `.get()`(dict 조회 등)은 잡히면 안 된다.
+#      이게 없으면 "attr == 'get' 이면 전부 히트" 로 바꿔도 a~c 는 통과한다.
+_M10A = """
+import requests as _rq
+def go(sym):
+    return _rq.get("https://financialmodelingprep.com/stable/quote?symbol=" + sym, timeout=8)
+"""
+_M10B = """
+from requests import get
+def go(sym):
+    return get("https://financialmodelingprep.com/stable/quote?symbol=" + sym, timeout=8)
+"""
+_M10C = """
+import requests
+_g = requests.get
+def go(sym):
+    return _g("https://financialmodelingprep.com/stable/quote?symbol=" + sym, timeout=8)
+"""
+_M10D = """
+import fmp_http as fh
+def go(cfg, sym):
+    url = "https://financialmodelingprep.com/stable/quote?symbol=" + sym
+    _ = cfg.get(url)
+    return fh.fmp_get(url, timeout=8)
+"""
+_m10 = [_a1_hits_on(s) for s in (_M10A, _M10B, _M10C, _M10D)]
+if _m10 == [1, 1, 1, 0]:
+    _passes += 1
+    print("  ✅ M10 별칭 우회 탐지 — import as(a) · from import(b) · "
+          "변수 바인딩(c) · dict.get 오탐 없음(d)")
+else:
+    _fails.append(f"M10 별칭 우회 탐지 — 기대 [1,1,1,0], 실제 {_m10}")
+    print(f"  ❌ M10 별칭 우회 탐지 — 기대 [1,1,1,0], 실제 {_m10}")
 
 _m9a, _m9b = _a1_hits_on(_M9A), _a1_hits_on(_M9B)
 _m9c, _m9d = _a1_hits_on(_M9C), _a1_hits_on(_M9D)

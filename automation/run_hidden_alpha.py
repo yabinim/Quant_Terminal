@@ -32,7 +32,6 @@ from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import requests
 import numpy as np
 import pandas as pd
 import pytz
@@ -170,11 +169,23 @@ def load_universe_tickers(ws) -> list[str]:
 
 
 # ── FMP 헬퍼 (app.py 로직에서 st.cache_data·st.secrets만 제거) ────────────────
-def _fmp_price_history_close(ticker: str, limit: int = 130) -> pd.Series:
-    """historical-price-eod → Close 시리즈."""
+def _fmp_price_history_close(ticker: str, bars: int) -> pd.Series:
+    """historical-price-eod → Close 시리즈.
+
+    bars: 하류가 실제로 소비하는 꼬리 깊이. **기본값을 두지 않는다** —
+      호출부가 자기 요구를 밝히지 않으면 TypeError 로 즉시 죽는 편이,
+      어느 요구인지 모르는 창이 조용히 생기는 것보다 낫다.
+
+    [2026-08-28] `limit=130` → `from`/`to` 창. FMP 는 이 엔드포인트의 `limit` 을
+      **무시**하므로 실제로는 1,254봉을 받고 있었다. 옛 130 은 검증된 적 없는
+      숫자라 요구의 근거로 쓰지 않았다 — `calculate_period_return(s, 21)` 이
+      `iloc[-(21+1)]` 를 읽으므로 요구는 22봉이다.
+    """
     try:
         r = fx.fmp_get(
-            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}"
+            + fx.hist_range_params(fx.hist_days_for_bars(bars))
+            + f"&apikey={FMP_API_KEY}",
             timeout=_FMP_TIMEOUT,
         )
         if r is None:
@@ -196,14 +207,18 @@ def _fmp_price_history_close(ticker: str, limit: int = 130) -> pd.Series:
         return pd.Series(dtype=float)
 
 
-def _fmp_batch_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
-    """여러 티커 병렬 Close 조회 → DataFrame. (app._fmp_batch_to_close_df 동일 패턴)"""
+def _fmp_batch_close_df(tickers: list, bars: int) -> pd.DataFrame:
+    """여러 티커 병렬 Close 조회 → DataFrame. (app._fmp_batch_to_close_df 동일 패턴)
+
+    bars 는 그대로 하류에 전달된다. 여기에도 기본값을 두지 않는다 — 중간 계층이
+    기본값을 가지면 최종 호출부의 요구가 가려진다.
+    """
     if not tickers:
         return pd.DataFrame()
     import concurrent.futures
 
     def _one(tk):
-        return tk, _fmp_price_history_close(tk, limit=limit)
+        return tk, _fmp_price_history_close(tk, bars=bars)
 
     out = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
@@ -355,7 +370,8 @@ def discover_and_add_new_etfs(ws) -> int:
 def build_ranked_table(tickers: list) -> pd.DataFrame:
     """티커별 1주·1개월 수익률 → 백분위 정규화 → 가중 점수 → 순위.
     반환 컬럼: rank, Ticker, week_pct, month_pct, score"""
-    close_df = _fmp_batch_close_df(tickers, limit=130)
+    # 소요 22봉 — 아래 calculate_period_return(s, 21) 이 iloc[-(21+1)] 를 읽는다.
+    close_df = _fmp_batch_close_df(tickers, bars=22)
     if close_df.empty:
         return pd.DataFrame()
 

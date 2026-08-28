@@ -16,7 +16,6 @@ from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import requests
 import numpy as np
 import pandas as pd
 import pytz
@@ -30,6 +29,8 @@ from fredapi import Fred
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import narrative_core
 import gemini_core
+import fmp_http as fh   # FMP HTTP SSOT — 레이트리밋·429 재시도·URL 조립
+import fmp_extras as fx  # 조회 창 SSOT — 요구 봉수 ↔ 달력일 환산
 import users_core as uc  # Users 시트/수신자 SSOT
 import calendar_core as cc  # 시장 캘린더(휴장일) SSOT
 
@@ -278,18 +279,37 @@ def save_narrative_to_sheet(analysis: dict, news_count: int, fred_releases: list
 
 
 # ── Emerging 정량 검증 + 추적기 적재 (app.py 로직 포팅) ───────────────────────
-def _fmp_close_series(ticker: str, limit: int = 130):
-    """FMP stable historical-price-eod → 종가 Series (오래된→최신 정렬)."""
+def _fmp_close_series(ticker: str, bars: int):
+    """FMP stable historical-price-eod → 종가 Series (오래된→최신 정렬).
+
+    bars: 하류가 실제로 소비하는 꼬리 깊이. **기본값을 두지 않는다** — 두
+      호출부의 요구가 다르다(SPY 기준선 64봉 vs 종목 200봉).
+
+    [2026-08-28] 두 가지를 함께 고쳤다.
+      1. 맨 `requests.get` → `fh.fmp_get_json`. 이 경로만 **429 재시도가
+         없었다.** 레이트리밋을 조용히 삼키면 빈 Series 가 돌아가고, 호출부는
+         그걸 '데이터 부족'으로 읽어 종목이 `continue` 로 빠진다 — Emerging
+         검증 결과에서 종목이 통째로 사라지는데 로그에는 아무것도 안 남는다.
+      2. `limit=130` → `from`/`to` 창. FMP 는 `limit` 을 **무시**하므로 실제로는
+         1,254봉이 오고 있었다.
+
+    ⚠️ 옛 `limit=130` 을 그대로 창으로 옮기면 **판정이 조용히 바뀐다.**
+      아래 소비부가 `s.rolling(200, min_periods=150)` 을 `if len(s) >= 150`
+      가드로 감싸고 있다. 130봉 창이면 가드가 실패해 `above_ma200=None` 이 되고
+      verdict 분기 중 "❌ 하락 추세 (대기)" 가 통째로 도달 불가가 된다.
+      150~199봉이면 더 나쁘다 — **에러 없이** 더 짧은 창의 평균이 나온다.
+      그래서 요구는 130 이 아니라 **200봉**이다.
+    """
     if not FMP_API_KEY:
         return pd.Series(dtype=float), pd.Series(dtype=float)
     try:
-        r = requests.get(
-            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
+        data = fh.fmp_get_json(
+            f"historical-price-eod/full?symbol={ticker}"
+            + fx.hist_range_params(fx.hist_days_for_bars(bars)),
             timeout=_FMP_TIMEOUT,
         )
-        if r.status_code != 200:
+        if data is None:
             return pd.Series(dtype=float), pd.Series(dtype=float)
-        data = r.json()
         rows = data.get("historical", data) if isinstance(data, dict) else data
         if not isinstance(rows, list) or not rows:
             return pd.Series(dtype=float), pd.Series(dtype=float)
@@ -310,12 +330,12 @@ def _fmp_profile(ticker: str) -> dict:
     if not FMP_API_KEY or not str(ticker).strip():
         return {}
     try:
-        r = requests.get(f"{_FMP_BASE}/profile",
-                         params={"symbol": str(ticker).strip().upper(), "apikey": FMP_API_KEY},
-                         timeout=8)
-        if r.status_code != 200:
+        # [2026-08-28] 맨 requests.get → fh.fmp_get_json. 이 경로에도 429 재시도가
+        #   없었다. ETF 판별에 실패하면 Phase 1 개별주 픽에서 ETF 가 안 걸러진다.
+        data = fh.fmp_get_json(
+            "profile?symbol=" + str(ticker).strip().upper(), timeout=8)
+        if data is None:
             return {}
-        data = r.json()
         return data[0] if isinstance(data, list) and data else {}
     except Exception:
         return {}
@@ -358,12 +378,15 @@ def verify_emerging_with_quant(emerging_tickers: list) -> list[dict]:
     unique = list(dict.fromkeys(str(t).strip().upper() for t in emerging_tickers if str(t).strip()))
 
     # SPY 3개월 수익률 (RS 기준선)
-    spy_close, _ = _fmp_close_series("SPY", limit=130)
+    # 소요 64봉 — 아래 spy_close.iloc[-64] (3개월 수익률 기준선).
+    spy_close, _ = _fmp_close_series("SPY", bars=64)
     spy_3m = float((spy_close.iloc[-1] / spy_close.iloc[-64] - 1) * 100) if len(spy_close) >= 64 else 0.0
 
     results = []
     for tk in unique:
-        s, vol = _fmp_close_series(tk, limit=130)
+        # 소요 200봉 — 아래 s.rolling(200, min_periods=150). 64봉(3개월 모멘텀)이나
+        #   21봉(거래량)이 아니라 **가장 깊은 소비**가 창을 결정한다.
+        s, vol = _fmp_close_series(tk, bars=200)
         if len(s) < 22:
             continue
         mom_1m = float((s.iloc[-1] / s.iloc[-22] - 1) * 100) if len(s) >= 22 else np.nan
