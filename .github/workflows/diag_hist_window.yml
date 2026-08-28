@@ -3,6 +3,10 @@ name: 🔬 진단 — 가격 히스토리 조회 창(from/to) 검증 (수동 전
 # 언제 쓰나:
 #   · run_watchlist_alerts.py 의 _fmp_price_history / _pf_hist /
 #     _hist_days_for_holding / _HIST_* 상수를 건드린 직후, 배포 전
+#   · **app.py 의 historical-price-eod 호출부나 조회 창을 건드린 직후** (2026-08-28~)
+#   · **scanner_core / fmp_extras 의 함수 시그니처를 바꾼 직후** — app.py 호출부가
+#     따라오지 않으면 [A4] 가 잡는다. check_freshness 정합성 검사는 '심볼 존재'만
+#     보므로 시그니처 드리프트를 못 본다(2026-08-27 실제 사고: 18곳 전건 TypeError).
 #   · regime_core.market_warnings · classify_regime · position_sell_verdict 나
 #     watchlist_metrics_core.compute_metrics 의 **윈도우 길이**를 바꾼 직후.
 #     이 스위트는 그쪽 요구치를 소스에서 역산하므로, 하류가 더 긴 창을
@@ -24,7 +28,7 @@ name: 🔬 진단 — 가격 히스토리 조회 창(from/to) 검증 (수동 전
 #      최대값이다 — 상수가 아니라 **보유 기간에 비례**한다. 창이 매수일에
 #      못 미치면 기준 고점이 낮아져 **매도 신호가 덜 뜬다**(놓치는 방향).
 #
-# 무엇을 검사하나 (66항목):
+# 무엇을 검사하나 (97항목):
 #   [S] 구조   — limit 파라미터 제거 · URL 의 from/to · calendar_days 키워드 전용
 #                · _pf_hist 호출부 2곳이 date_added·today 를 넘기는지 (AST)
 #   [R] 요구치 — regime_core / watchlist_metrics_core 소스를 AST 로 읽어
@@ -37,11 +41,36 @@ name: 🔬 진단 — 가격 히스토리 조회 창(from/to) 검증 (수동 전
 #                (빈 값 / 최근 / 2년 / 상한 초과 / 파싱 실패 / 미래 날짜)
 #   [G] 런타임 — fmp_get_ex 를 스텁해 **실제 URL 문자열**과 파싱 계약 검사
 #   [C] 캐시   — 조회 깊이 기록과 FMP 콜 수 보존
+#   [A] app.py — historical-price-eod 창(limit 잔존 래칫) + **시그니처 결합**.
+#                app.py 는 임포트하지 않는다(임포트하면 UI·시트·FMP 가 깨어난다)
+#                — 소스 AST 만 읽는다. 정적으로도 18/18 검출됨이 실증됐다.
+#   [W] 충분성 — app.py 각 창이 하류 요구 봉수를 덮는지. 분모가 시리즈 길이인
+#                호출부(VIX 백분위·거래량 비율)에 tail() 고정이 있는지도 본다
+#   [X] SSOT   — 0.6871 / 환산기 / 보유창이 fmp_extras 한 곳에만 존재하는지.
+#                run_watchlist_alerts 는 재수출이며 `is` 동일성까지 검사한다
 #
 #   ⚠️ 요구 봉수를 이 저장소 어디에도 상수로 적어두지 않는다. 복사하면 원본이
 #      바뀌어도 통과하는 가짜 초록불이 된다. 소스에서 매번 역산한다.
 #
-# 검증된 판별력 (2026-08-28, 14건 변이 전건 탐지 · 원복 확인):
+# 검증된 판별력 (2026-08-28 2차, 총 25건 변이 전건 탐지 · 원복 확인)
+#   2차 추가분 11건:
+#   N1  timing 창이 limit 으로 회귀            → A1 W3b
+#   N2  1년 cutoff 후처리 부활                 → W3
+#   N3  VIX tail(252) 제거                     → W6
+#   N4  batch_close 창 460→200(MA200 미달)     → W4
+#   N5  호출부가 옛 limit= 로 회귀             → A4
+#   N6  보유창이 상수 600 으로 회귀            → W8b
+#   N7  거래량 분모 tail(65) 제거              → W7
+#   N8  기본 창 460→380 (272봉 미만)           → W1 W2 R3 R4 T6
+#   N9  비율 0.6871→0.95                       → T1
+#   N10 rwa 가 0.6871 사본을 되살림            → X1 X2d
+#   N11 보유창을 상수 람다로 대체              → H* X2e
+#
+#   ⚠️ N3 은 처음에 **놓쳤다.** any(tail(252)) 로 검사했는데 같은 함수의 FRED
+#      경로에도 tail(252) 가 있어 FMP 쪽을 지워도 참이었다. 판별력 있는 통계는
+#      '존재'가 아니라 '개수'(2개)다. 뮤테이션이 없었으면 초록불로 남았을 검사다.
+#
+# 1차 14건:
 #   M1  창 마진 제거 460→396              → R3 R4 T6
 #   M2  달력일 자리에 봉수 대입 460→272    → R3 R4 T6
 #   M3  보유 기간 무시(want = base)        → H3~H7 H11 H12 C3 C4 C6
