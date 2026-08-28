@@ -4,6 +4,9 @@ name: 🔬 진단 — 가격 히스토리 조회 창(from/to) 검증 (수동 전
 #   · run_watchlist_alerts.py 의 _fmp_price_history / _pf_hist /
 #     _hist_days_for_holding / _HIST_* 상수를 건드린 직후, 배포 전
 #   · **app.py 의 historical-price-eod 호출부나 조회 창을 건드린 직후** (2026-08-28~)
+#   · **run_drg_predict.py 의 FMP 호출부를 건드린 직후** (2026-08-28 2차~).
+#     [D] 가 이 파일을 **실제로 임포트해 실행**한다 — 조용한 값 오류(창 부족·
+#     정렬 가정)는 AST 로 안 보인다.
 #   · **scanner_core / fmp_extras 의 함수 시그니처를 바꾼 직후** — app.py 호출부가
 #     따라오지 않으면 [A4] 가 잡는다. check_freshness 정합성 검사는 '심볼 존재'만
 #     보므로 시그니처 드리프트를 못 본다(2026-08-27 실제 사고: 18곳 전건 TypeError).
@@ -28,7 +31,7 @@ name: 🔬 진단 — 가격 히스토리 조회 창(from/to) 검증 (수동 전
 #      최대값이다 — 상수가 아니라 **보유 기간에 비례**한다. 창이 매수일에
 #      못 미치면 기준 고점이 낮아져 **매도 신호가 덜 뜬다**(놓치는 방향).
 #
-# 무엇을 검사하나 (98항목):
+# 무엇을 검사하나 (127항목):
 #   [S] 구조   — limit 파라미터 제거 · URL 의 from/to · calendar_days 키워드 전용
 #                · _pf_hist 호출부 2곳이 date_added·today 를 넘기는지 (AST)
 #   [R] 요구치 — regime_core / watchlist_metrics_core 소스를 AST 로 읽어
@@ -48,6 +51,20 @@ name: 🔬 진단 — 가격 히스토리 조회 창(from/to) 검증 (수동 전
 #                호출부(VIX 백분위·거래량 비율)에 tail() 고정이 있는지도 본다
 #   [X] SSOT   — 0.6871 / 환산기 / 보유창이 fmp_extras 한 곳에만 존재하는지.
 #                run_watchlist_alerts 는 재수출이며 `is` 동일성까지 검사한다
+#   [D] DRG    — run_drg_predict 를 임포트해 **스텁 FMP 위에서 실행**한다.
+#                이 파일의 실패 모드는 전부 조용하다:
+#                  · 창이 짧으면 `len(rows) >= 6` 가드에 걸려 신호 한 줄이
+#                    통째로 사라지고, DRG 프롬프트만 짧아진다.
+#                  · rolling(20, min_periods=10) 은 20봉 미만이어도 **에러 없이**
+#                    더 짧은 창의 평균을 낸다 — below_ma20 이 조용히 틀린다.
+#                  · 응답 정렬을 가정하면 '직전 종가' 자리에 창에서 가장
+#                    오래된 종가가 들어간다.
+#                7달력일 연속 휴장(2001-09-11 급)을 주입해 하한(HIST_MIN_DAYS)이
+#                실제로 그 상황을 견디는지도 본다.
+#
+#   ⚠️ [D] 는 원시 requests.get 이 한 곳이라도 남아 있으면 **런타임 검사를
+#      중단한다**(D0-STOP). fh 스텁이 그 경로를 가로채지 못해 진짜 FMP 로
+#      나가기 때문이다 — 이 스위트의 '네트워크 0' 약속을 지키기 위한 장치다.
 #
 #   ⚠️ 이 스위트는 `automation/` 에 있고 app.py·regime_core·fmp_extras·scanner_core 는
 #      **레포 루트**에 있다. [A-0] 이 app.py 를 앵커로 위로 탐색해 루트를 찾고,
@@ -56,6 +73,31 @@ name: 🔬 진단 — 가격 히스토리 조회 창(from/to) 검증 (수동 전
 #
 #   ⚠️ 요구 봉수를 이 저장소 어디에도 상수로 적어두지 않는다. 복사하면 원본이
 #      바뀌어도 통과하는 가짜 초록불이 된다. 소스에서 매번 역산한다.
+#
+# 검증된 판별력 (2026-08-28 3차, 누적 39건 변이 전건 탐지 · 원복 확인)
+#   3차 추가분 14건 — 역검증(패치 전 파일로 [D] 12건 실패) 선행:
+#   P1  HIST_MIN_DAYS 21→3 (바닥 무력화)        → T7a T9
+#   P2  pad_bars 5→0 (마진 제거)                → T7a T8
+#   P3  바닥 자체 삭제(max 제거)                → T7a
+#   P4  잘못된 요구치에 기본창 반환             → T7c
+#   P5  대장주 호출부 30→6봉 (MA20 언더슈트)    → D2b D3b
+#   P5b _fmp_hist 기본값 부활                   → D0e
+#   P6  안전자산 창을 손으로 3일 지정           → D2a D3c D4a
+#   P7  직전 종가 sorted() 제거 (정렬 가정)     → D5
+#   P8  SPY 현재가 max→rows[0] (정렬 가정)      → D6b D6c
+#   P9  limit 부활                              → D6a D6b
+#   P10 순수 환산기 직접 호출 (마진 우회)       → X5b D2a
+#   P11a requests 임포트만 부활                 → D0c D0-STOP
+#   P11b 원시 GET 실제 부활                     → diag_fmp_ssot A1
+#   P12 0.6871 을 run_drg_predict 에 복제       → X1
+#
+#   ⚠️ P5 는 처음에 **놓쳤다.** `_fmp_hist(bars=30)` 의 **기본값**을 6 으로
+#      바꾸는 변이였는데, 대장주 호출부가 30 을 명시로 넘기고 있어 창이 안
+#      바뀌었다. 실제 위험은 호출부에 있었다. 이 발견으로 기본값을 아예
+#      제거했다 — 두 소비처의 요구가 다른데(6봉 vs 20봉) 기본값이 있으면
+#      호출부가 자기 요구를 안 밝혀도 통과한다.
+#   ⚠️ P11 도 한 번 갈렸다. 임포트만 되살리는 변이는 A1(호출 개수 기준)이
+#      못 본다 — 잡는 쪽은 [D] D0c 다. 두 검사가 서로 다른 층을 본다.
 #
 # 검증된 판별력 (2026-08-28 2차, 총 25건 변이 전건 탐지 · 원복 확인)
 #   2차 추가분 11건:
@@ -142,6 +184,12 @@ jobs:
       - name: 🔁 락스텝 스위트 — 워치리스트 지표
         run: python automation/diag_watchlist_metrics.py
 
+      # run_drg_predict 의 원시 FMP 호출 11곳이 0 이 되면서 A1 기준선에서
+      # 항목 자체가 빠졌다. 두 파일은 락스텝이다 — 기준선만 낮추고 코드를
+      # 안 고치면(또는 그 반대면) 여기서 갈린다.
+      - name: 🔁 락스텝 스위트 — FMP SSOT / A1 원시 호출 래칫
+        run: python automation/diag_fmp_ssot.py
+
       - name: ✅ Python 3.11 문법 호환성
         run: >
           python check_py311.py
@@ -149,3 +197,5 @@ jobs:
           automation/diag_hist_window.py
           automation/diag_pfstate_align.py
           automation/diag_watchlist_metrics.py
+          automation/diag_fmp_ssot.py
+          automation/run_drg_predict.py
