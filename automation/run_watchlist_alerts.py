@@ -21,7 +21,7 @@ import sys
 import json
 import smtplib
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -93,8 +93,96 @@ _PF_COL_AVG = 3
 _PF_COL_QTY = 4
 _PF_COL_DATE_ADDED = 5
 
-# 진입 시점 baseline(2A) 재구성용 — Date_Added 이전 200봉이 있어야 MA200 이 나온다.
-_PF_HIST_LIMIT = 600
+# ══════════════════════════════════════════════════════════════════════════════
+# 가격 히스토리 조회 창 — 단위: **달력일**(거래일 아님)
+# ══════════════════════════════════════════════════════════════════════════════
+# FMP `limit` 은 무시된다(무엇을 적어도 약 1,254봉이 온다). 즉 예전 상수
+# (252 / _PF_HIST_LIMIT=600)는 "필요 최소 봉수"가 아니라 **한 번도 강제된 적 없는
+# 장식**이었다. from/to 로 바꾸는 순간 그 숫자가 처음으로 진짜 상한이 되므로,
+# 값은 옛 상수가 아니라 **하류 소비처의 실제 요구치에서 역산**한다.
+#
+# 모듈 경계를 넘는 요구치 감사 (2026-08-28) — 근거 위치를 함께 적는다
+# ────────────────────────────────────────────────────────────────────────
+#   경로                      소비 함수                                 요구 봉수
+#   워치리스트 지표 L~1427    wm.compute_metrics → MA200(min_periods=200)   253
+#                             + rc.analyze_ticker (W52_BARS=252)
+#                             (+1: wm.completed_bars_only 가 당일 봉 1개 절삭)
+#   워치리스트 알림 L~1545    rc.analyze_ticker                             252
+#   워치리스트 장중 L~1786    rc.analyze_ticker                             252
+#   SPY 시장게이트  L~1948    rc.market_gate_status → rc.market_warnings    272  ← 구속
+#   보유 baseline   _pf_hist  rc.compute_entry_baseline                     272
+#   보유 트레일링   _pf_hist  rc.compute_position_drawdown.high_since_buy   가변
+#
+# ⚠️ SPY 272봉이 구속치인 이유 — 파일 단위 AST 스캔으로는 안 보인다
+#    regime_core.market_warnings 는 rolling 을 **체인**한다:
+#        vol20   = c.pct_change().rolling(20).std()        # 유효 시작 = idx 20
+#        vol_med = vol20.rolling(252, min_periods=60).median()
+#    마지막 행이 진짜 252창 중앙값이 되려면 20 + 252 = 272봉이 필요하다.
+#    개별 rolling 인자의 최대값(252)만 보면 20봉이 부족해진다.
+#
+# ⚠️ 그리고 260봉 **하드게이트**가 있다 (regime_core: `notna().sum() < 260`).
+#    미달이면 market_warnings 가 None → market_gate_status.available=False →
+#    fail-open 으로 **시장 게이트가 통째로 꺼진다. 에러 로그는 남지 않는다.**
+#    260~271봉 구간은 값이 나오긴 하지만 vol 중앙값 창이 짧은 '침묵의 오답' 구간이다.
+#    창을 줄일 때 여기가 첫 번째로 깨진다 — diag_hist_window.py [R] 가 지킨다.
+#
+# 달력일 환산 — 실측 비율 (거래일 ÷ 달력일)
+#   272봉 ÷ 0.6871 = 395.9 달력일. 460일 요청 시 실측 316봉(2026-08-28 probe).
+#   여유 44봉(16%). 언더슈트 비용(게이트 침묵 무력화)이 오버슈트 비용(페이로드)보다
+#   압도적으로 크므로 마진은 이 비대칭에 맞춘다.
+_HIST_TD_PER_CD = 0.6871     # 실측 비율. 추정치 아님 — diag_fmp_window.py 기준선 응답
+_HIST_WINDOW_DAYS = 460      # 달력일. 구속 요구 272봉 → 약 316봉 확보
+_HIST_MAX_DAYS = 1826        # 달력일 상한(약 5년 ≈ 1,254봉 = limit 무효 시절의 사실상 동작)
+
+
+def _bars_for_calendar_days(days: int) -> int:
+    """달력일 → 기대 거래일(봉) 수. 단위 혼동을 막기 위한 명시 변환기."""
+    return int(float(days) * _HIST_TD_PER_CD)
+
+
+def _calendar_days_for_bars(bars: int) -> int:
+    """요구 봉수 → 필요한 최소 달력일(올림). 마진은 호출부가 따로 얹는다."""
+    return int(-(-float(bars) // _HIST_TD_PER_CD))
+
+
+def _hist_days_for_holding(date_added, today=None, ticker: str = "") -> int:
+    """보유 종목 1건에 필요한 조회 창(달력일).
+
+    `compute_position_drawdown` 의 보유 고점은 `close[index >= Date_Added]` 의
+    최대값이다 — **상수가 아니라 보유 기간에 비례**한다. 창이 매수일에 못 미치면
+    트레일링 스톱 기준 고점이 조용히 낮아져 **매도 신호가 덜 뜬다**(놓치는 방향).
+
+    반환 규칙
+      · Date_Added 없음      → 기본 창. 하류가 _DD_FALLBACK_WINDOW(252봉) 폴백을
+                               쓰므로 깊은 조회가 필요 없다.
+      · Date_Added 파싱 실패 → **최대 창**. 값은 있는데 못 읽었다면 보유 기간이
+                               미상이다. 짧은 창으로 조용히 틀리는 것보다
+                               페이로드를 더 쓰는 편이 낫다(관측 가능한 비용).
+      · 정상                 → min(기본 + 보유 달력일, 상한)
+    """
+    base = _HIST_WINDOW_DAYS
+    try:
+        s = str(date_added or "").strip()[:10]
+        if not s:
+            return base
+        d = pd.to_datetime(s, errors="coerce")
+        if pd.isna(d):
+            print(f"[WARN] {ticker or '?'} Date_Added 파싱 실패({s!r}) — 최대 창 적용")
+            return _HIST_MAX_DAYS
+        t = pd.to_datetime(str(today or "")[:10], errors="coerce")
+        if pd.isna(t):
+            t = pd.Timestamp(datetime.now(_ET).date())
+        held = int((t - d).days)
+        if held <= 0:
+            return base           # 미래 날짜/당일 매수 → 깊은 조회 불필요
+        want = base + held
+        if want > _HIST_MAX_DAYS:
+            print(f"[WARN] {ticker or '?'} 보유 {held}일 — 조회 창 상한 "
+                  f"{_HIST_MAX_DAYS}일 적용(보유 고점 절삭 가능)")
+            return _HIST_MAX_DAYS
+        return want
+    except Exception:
+        return _HIST_MAX_DAYS
 
 # ── 실적 진입 차단 게이트 ─────────────────────────────────────────────────────
 # Earnings_Events 시트를 **공유 상태**로 읽는다(스크립트 실행 순서에 의존하지 않음).
@@ -160,16 +248,27 @@ def load_earnings_gate_users() -> set:
 _DEEP_KEY = "__deep__"      # 티커와 충돌 불가한 센티넬 키
 
 
-def _pf_hist(tk: str, hist_cache: dict):
-    """보유 종목용 깊은 히스토리. 얕게 캐시된 프레임이 있으면 1회만 덮어쓴다.
+def _pf_hist(tk: str, hist_cache: dict, date_added=None, today=None):
+    """보유 종목용 깊은 히스토리. 필요한 창은 Date_Added 에서 정해진다.
 
-    ⚠️ 깊은 조회 여부는 hist_cache 안에 기록한다. 모듈 전역에 두면 캐시가 새로
-       만들어진 뒤 재조회를 건너뛰어 None 이 반환된다(평가 전체가 조용히 스킵됨).
+    ⚠️ 조회 **깊이**를 hist_cache 안에 기록한다(예전엔 '깊게 봤다' 여부만 담는
+       set 이었다). 같은 티커를 여러 계좌가 보유하면 Date_Added 가 서로 다를 수
+       있고, 그때 먼저 온 얕은 창이 뒤의 오래된 보유를 조용히 절삭했었다.
+       이제 더 깊은 요구가 오면 한 번 더 조회한다.
+
+    ⚠️ 모듈 전역이 아니라 캐시 안에 기록하는 이유는 그대로다. 전역에 두면 캐시가
+       새로 만들어진 뒤 재조회를 건너뛰어 None 이 반환된다(평가 전체가 조용히 스킵).
+
+    ⚠️ 깊이 기록은 **조회 전에** 올린다. 실패한 조회를 같은 실행 안에서 재시도하지
+       않기 위해서다(옛 동작과 동일 — FMP 콜 수가 보유 행 수만큼 늘어나는 것을 막는다).
     """
-    deep = hist_cache.setdefault(_DEEP_KEY, set())
-    if tk not in deep:
-        deep.add(tk)
-        h = _fmp_price_history(tk, limit=_PF_HIST_LIMIT)
+    need = _hist_days_for_holding(date_added, today, ticker=tk)
+    depth = hist_cache.setdefault(_DEEP_KEY, {})
+    # 캐시에 있는데 깊이 기록이 없다면 워치리스트 루프가 기본 창으로 받아둔 것이다.
+    have = depth.get(tk, _HIST_WINDOW_DAYS if tk in hist_cache else 0)
+    if have < need:
+        depth[tk] = need
+        h = _fmp_price_history(tk, calendar_days=need)
         if h is not None and not h.empty:
             hist_cache[tk] = h
     return hist_cache.get(tk)
@@ -233,8 +332,21 @@ def get_gspread_client():
 
 
 # ── FMP 가격 히스토리 (app.py cached_timing_price_history 와 동일 컬럼: OHLCV) ──
-def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
+def _fmp_price_history(ticker: str, *, calendar_days: int = _HIST_WINDOW_DAYS) -> pd.DataFrame:
     """FMP 일봉 → OHLCV DataFrame. 실패하면 빈 DataFrame(호출부 계약 불변).
+
+    ⚠️ 인자 단위는 **달력일**이다. 봉 수가 아니다.
+       `limit` 파라미터는 일부러 제거했다 — FMP 가 무시하는 값이라 아무 효과가
+       없었고, 남겨두면 '봉 수'와 '달력일'이 계속 섞인다. 봉 수로 생각하고 싶다면
+       `_calendar_days_for_bars()` 로 명시 변환할 것. 키워드 전용(`*`)으로 둔 것도
+       같은 이유다 — `_fmp_price_history(tk, 600)` 같은 위치 인자가 옛 단위로
+       조용히 통과하는 경로를 구조적으로 막는다.
+
+    ⚠️ `to` 는 오늘이 아니라 **오늘+1일**이다. 상한 경계가 포함인지 배제인지,
+       서버 타임존이 무엇인지에 우리 최신 봉을 걸지 않기 위한 방어다. 하루를
+       더 줘도 미래 봉은 존재하지 않으므로 결과는 달라지지 않고, 만약 `to` 가
+       배타적이었다면 전 종목이 하루 낡은 봉으로 평가됐을 것이다.
+       룩백 기준점은 어디까지나 오늘이다(`from` = 오늘 − calendar_days).
 
     2026-08-26: 원시 requests.get → fh.fmp_get_ex(레이트리밋/429 백오프 SSOT).
 
@@ -249,8 +361,12 @@ def _fmp_price_history(ticker: str, limit: int = 252) -> pd.DataFrame:
        kind 를 nodata 원인 분류에 태우는 건 Phase 2 로 미룬다.
     """
     try:
+        _today = datetime.now(_ET).date()
+        _from = (_today - timedelta(days=int(calendar_days))).strftime("%Y-%m-%d")
+        _to = (_today + timedelta(days=1)).strftime("%Y-%m-%d")
         r, _status, _kind = fh.fmp_get_ex(
-            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}",
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}"
+            f"&from={_from}&to={_to}&apikey={FMP_API_KEY}",
             timeout=_FMP_TIMEOUT,
         )
         if r is None or _kind != "ok":
@@ -1666,7 +1782,7 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
             states_csv, rc.default_events_for_weight(_swing_w, _PF_ALERT_DEFAULT))
         prev = state_map.get(key, {}).get("last", "")
         try:
-            hist = _pf_hist(tk, hist_cache)
+            hist = _pf_hist(tk, hist_cache, date_added, today)
             record_attempt()
             if hist is None or hist.empty:
                 # 🔴 보유 종목의 미수신은 **매도 신호가 영구히 오지 않는다**는
@@ -1853,7 +1969,7 @@ def eval_portfolio_intraday(spy_close, hist_cache, quote_cache, today):
         if not (any(e in enabled for e in _PF_INTRADAY_EVENTS) or _has_plan):
             continue
         try:
-            _base_hist = _pf_hist(tk, hist_cache)
+            _base_hist = _pf_hist(tk, hist_cache, date_added, today)
             if tk not in quote_cache:
                 quote_cache[tk] = _fmp_quote_price(tk)
             hist = _with_intraday_price(_base_hist, quote_cache[tk])
@@ -1945,8 +2061,14 @@ def main():
 
     reset_nodata()          # 실행마다 미수신 집계 초기화
     reset_liveness()        # A-2c 선제 점검 집계도 실행 간 오염을 막는다
+    print(f"[HIST] 조회 창 {_HIST_WINDOW_DAYS}달력일 "
+          f"(기대 약 {_bars_for_calendar_days(_HIST_WINDOW_DAYS)}봉) · "
+          f"보유 상한 {_HIST_MAX_DAYS}달력일")
     spy_hist = _fmp_price_history("SPY")
     spy_close = spy_hist["Close"] if (spy_hist is not None and not spy_hist.empty) else None
+    if spy_close is not None:
+        print(f"[HIST] SPY {len(spy_close)}봉 수신 "
+              f"(market_warnings 하드게이트 260봉 · 정확도 요구 272봉)")
     hist_cache, quote_cache = {}, {}
 
     try:

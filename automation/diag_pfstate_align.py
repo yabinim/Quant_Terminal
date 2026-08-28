@@ -86,7 +86,12 @@ def run_case(name, pf_rows, state_rows, expect_pairs, nodata_tickers=()):
                                         "record_attempt", "record_nodata")}
     m._open_ws = lambda t: (sh, pf_ws)
     m._open_pf_state = lambda _sh: st_ws
-    m._pf_hist = lambda tk, cache: (None if tk in nodata_tickers else _hist())
+    # ⚠️ 시그니처는 run_watchlist_alerts._pf_hist 와 락스텝이다.
+    #    2026-08-28 에 date_added·today 가 붙었다(조회 창이 Date_Added 에서 결정됨).
+    #    스텁이 낡으면 TypeError 가 try 블록에 먹혀 '평가 실패' WARN 만 남고
+    #    스위트는 7/7 초록을 유지한다 — 아무것도 검증하지 않는 가짜 초록불이다.
+    m._pf_hist = (lambda tk, cache, date_added=None, today=None:
+                  (None if tk in nodata_tickers else _hist()))
     m.record_attempt = lambda: None
     m.record_nodata = lambda *a, **k: None
     try:

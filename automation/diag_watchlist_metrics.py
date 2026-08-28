@@ -162,7 +162,8 @@ def _fake_env(tickers, metrics_rows=None, hist_map=None, dead=()):
     sh = FakeSH(wss)
     R._open_ws = lambda title: (sh, sh.worksheet(title))
     hm = hist_map or {t: mk_hist(300, seed=i + 1, end=_TODAY) for i, t in enumerate(tickers)}
-    R._fmp_price_history = lambda tk, limit=252: (
+    # 단위: 달력일(봉 수 아님) — run_watchlist_alerts 와 락스텝.
+    R._fmp_price_history = lambda tk, *, calendar_days=None: (
         pd.DataFrame() if tk in dead else hm.get(tk, mk_hist(300, 9, end=_TODAY)))
     return sh, wss
 
@@ -230,7 +231,8 @@ def run_writepath_tests(ck) -> None:
     sh, _ = _fake_env(["AAA", "BBB"])
     _calls = []
     _orig_fetch = R._fmp_price_history
-    R._fmp_price_history = lambda tk, limit=252: (_calls.append(tk), _orig_fetch(tk))[1]
+    R._fmp_price_history = (lambda tk, *, calendar_days=None:
+                            (_calls.append(tk), _orig_fetch(tk))[1])
     R.persist_watchlist_metrics(
         None, {"AAA": mk_hist(300, 1, end=_TODAY), "BBB": mk_hist(300, 2, end=_TODAY)}, _TODAY)
     ck(_calls == [], "W6 캐시된 종목은 FMP 재호출 안 함", f"calls={_calls}")
