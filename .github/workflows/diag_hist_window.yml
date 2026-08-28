@@ -1,0 +1,117 @@
+name: 🔬 진단 — 가격 히스토리 조회 창(from/to) 검증 (수동 전용)
+
+# 언제 쓰나:
+#   · run_watchlist_alerts.py 의 _fmp_price_history / _pf_hist /
+#     _hist_days_for_holding / _HIST_* 상수를 건드린 직후, 배포 전
+#   · regime_core.market_warnings · classify_regime · position_sell_verdict 나
+#     watchlist_metrics_core.compute_metrics 의 **윈도우 길이**를 바꾼 직후.
+#     이 스위트는 그쪽 요구치를 소스에서 역산하므로, 하류가 더 긴 창을
+#     요구하기 시작하면 여기서 먼저 빨간불이 켜진다.
+#
+# 왜 필요한가 — 이 결함군은 전부 조용하다:
+#   1) FMP `limit` 은 무시된다. 무엇을 적어도 약 1,254봉이 왔다. 즉 예전
+#      상수(252 / _PF_HIST_LIMIT=600)는 한 번도 강제된 적이 없다.
+#      `from` 으로 바꾸는 순간 그 숫자가 **처음으로 진짜 상한**이 된다.
+#   2) regime_core.market_warnings 에는 `notna().sum() < 260` 하드게이트가 있다.
+#      미달이면 None → market_gate_status.available=False → fail-open 으로
+#      **시장 진입 게이트가 통째로 꺼진다. 에러 로그는 남지 않는다.**
+#   3) 같은 함수의 rolling 은 체인이다:
+#         vol20   = c.pct_change().rolling(20).std()
+#         vol_med = vol20.rolling(252, min_periods=60).median()
+#      진짜 252창 중앙값이 되려면 272봉이 필요하다. 개별 rolling 인자의
+#      최대값(252)만 보면 20봉이 모자란다.
+#   4) 보유 종목의 트레일링 스톱 기준 고점은 `close[index >= Date_Added]` 의
+#      최대값이다 — 상수가 아니라 **보유 기간에 비례**한다. 창이 매수일에
+#      못 미치면 기준 고점이 낮아져 **매도 신호가 덜 뜬다**(놓치는 방향).
+#
+# 무엇을 검사하나 (66항목):
+#   [S] 구조   — limit 파라미터 제거 · URL 의 from/to · calendar_days 키워드 전용
+#                · _pf_hist 호출부 2곳이 date_added·today 를 넘기는지 (AST)
+#   [R] 요구치 — regime_core / watchlist_metrics_core 소스를 AST 로 읽어
+#                rolling·shift·pct_change **체인**을 따라 요구 봉수를 역산하고,
+#                하드게이트 리터럴도 소스에서 뽑아 창이 덮는지 검증
+#   [P] 양성대조 — 추출기가 알려진 체인에서 정답(272봉·260게이트)을 내는지.
+#                  추출기가 부패하면 [R] 이 통째로 무의미해진다
+#   [T] 단위   — 달력일 ↔ 봉 변환기 (혼동이 이 작업의 핵심 위험이다)
+#   [H] 보유창 — _hist_days_for_holding 경계표 10건
+#                (빈 값 / 최근 / 2년 / 상한 초과 / 파싱 실패 / 미래 날짜)
+#   [G] 런타임 — fmp_get_ex 를 스텁해 **실제 URL 문자열**과 파싱 계약 검사
+#   [C] 캐시   — 조회 깊이 기록과 FMP 콜 수 보존
+#
+#   ⚠️ 요구 봉수를 이 저장소 어디에도 상수로 적어두지 않는다. 복사하면 원본이
+#      바뀌어도 통과하는 가짜 초록불이 된다. 소스에서 매번 역산한다.
+#
+# 검증된 판별력 (2026-08-28, 14건 변이 전건 탐지 · 원복 확인):
+#   M1  창 마진 제거 460→396              → R3 R4 T6
+#   M2  달력일 자리에 봉수 대입 460→272    → R3 R4 T6
+#   M3  보유 기간 무시(want = base)        → H3~H7 H11 H12 C3 C4 C6
+#   M4  Date_Added 파싱 실패 시 기본 창    → H8
+#   M5  URL 에 limit 재도입                → S3c G1
+#   M6  from/to 뒤바꿈                     → G2 G3 G6
+#   M7  to 의 +1일 방어 제거               → G3
+#   M8  _pf_hist 가 date_added 무시        → C3 C4 C6
+#   M9  깊이 기록 dict → set (옛 방식)     → C4 C7 C9
+#   M10 calendar_days 키워드 전용 해제     → S2 G11
+#   M11 EOD 호출부 배선 누락               → S6b
+#   M13 장중 호출부 배선 누락              → S6b
+#   M14 조회 창 상한 제거                  → H6
+#   M12 거래일/달력일 비율 1.0             → T1 T2 T3
+#
+# 안전성:
+#   · 네트워크 접근 없음 · FMP 호출 없음 · 시트 접근 없음 · 메일 발송 없음
+#   · fmp_http.fmp_get_ex 는 스텁으로 대체되고 실행 후 원복된다
+#   · 시크릿 불필요 (스크립트가 더미 환경변수를 setdefault 로 채운다)
+#   · 부작용 없음. 몇 번을 돌려도 같은 결과.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # run_watchlist_alerts 를 import 하므로 모듈 레벨 의존성이 전부 필요하다.
+      # 다만 실제 호출은 하지 않는다(스텁으로 대체).
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install \
+            google-genai \
+            google-auth \
+            gspread \
+            feedparser \
+            requests \
+            numpy \
+            pandas \
+            pytz \
+            fredapi
+
+      - name: 🔬 조회 창 회귀 + 크로스모듈 요구치 역산 + 양성대조
+        run: python automation/diag_hist_window.py
+
+      # 이 변경은 _pf_hist 시그니처를 바꿨다. 두 스위트가 그 함수를 스텁하므로
+      # 락스텝이다 — 스텁이 낡으면 TypeError 가 try 에 먹혀 '평가 실패' WARN 만
+      # 남고 스위트는 초록을 유지한다(아무것도 검증하지 않는 가짜 초록불).
+      - name: 🔁 락스텝 스위트 — Portfolio_Alert_State 정렬
+        run: python automation/diag_pfstate_align.py
+
+      - name: 🔁 락스텝 스위트 — 워치리스트 지표
+        run: python automation/diag_watchlist_metrics.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/run_watchlist_alerts.py
+          automation/diag_hist_window.py
+          automation/diag_pfstate_align.py
+          automation/diag_watchlist_metrics.py
