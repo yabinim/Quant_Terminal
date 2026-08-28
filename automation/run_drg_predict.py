@@ -16,7 +16,6 @@ from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import requests
 import numpy as np
 import pandas as pd
 import pytz
@@ -30,6 +29,8 @@ from fredapi import Fred
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import narrative_core
 import gemini_core
+import fmp_http as fh   # FMP HTTP SSOT — 레이트리밋·429 재시도·URL 조립
+import fmp_extras as fx  # 조회 창 SSOT — 요구 봉수 ↔ 달력일 환산
 import users_core as uc  # Users 시트/수신자 SSOT
 import calendar_core as cc  # 시장 캘린더(휴장일) SSOT
 
@@ -107,37 +108,31 @@ def get_todays_major_releases(fred: Fred = None) -> tuple:
     """
     today_str = datetime.now(_ET).strftime("%Y-%m-%d")
     to_str    = (datetime.now(_ET) + timedelta(days=3)).strftime("%Y-%m-%d")
-    FMP_KEY_C = os.environ.get("FMP_API_KEY", "")
-    FMP_BASE_C = "https://financialmodelingprep.com/stable"
     releases, full_events = [], []
 
-    if FMP_KEY_C:
+    if fh.fmp_key():
         try:
-            r = requests.get(
-                f"{FMP_BASE_C}/economic-calendar?from={today_str}&to={to_str}&apikey={FMP_KEY_C}",
-                timeout=10,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list):
-                    for ev in data:
-                        country = str(ev.get("country","") or "").upper()
-                        if country not in ("US","USD","UNITED STATES",""):
-                            continue
-                        impact  = str(ev.get("impact","") or ev.get("importance","") or "").capitalize()
-                        ev_name = str(ev.get("event","") or ev.get("name",""))
-                        ev_date = str(ev.get("date",""))[:10]
-                        if not ev_name:
-                            continue
-                        full_events.append({"date":ev_date,"event":ev_name,"impact":impact,
-                                            "actual":ev.get("actual"),
-                                            "estimate":ev.get("estimate"),
-                                            "prior":ev.get("previous") or ev.get("prior")})
-                        if impact.lower() in ("high","3") and ev_date == today_str:
-                            releases.append(ev_name)
-                    print(f"[INFO] FMP 캘린더: {len(full_events)}개, 오늘 고임팩트 {len(releases)}개")
-                    if full_events:
-                        return releases, full_events
+            data = fh.fmp_get_json(
+                f"economic-calendar?from={today_str}&to={to_str}", timeout=10)
+            if isinstance(data, list):
+                for ev in data:
+                    country = str(ev.get("country","") or "").upper()
+                    if country not in ("US","USD","UNITED STATES",""):
+                        continue
+                    impact  = str(ev.get("impact","") or ev.get("importance","") or "").capitalize()
+                    ev_name = str(ev.get("event","") or ev.get("name",""))
+                    ev_date = str(ev.get("date",""))[:10]
+                    if not ev_name:
+                        continue
+                    full_events.append({"date":ev_date,"event":ev_name,"impact":impact,
+                                        "actual":ev.get("actual"),
+                                        "estimate":ev.get("estimate"),
+                                        "prior":ev.get("previous") or ev.get("prior")})
+                    if impact.lower() in ("high","3") and ev_date == today_str:
+                        releases.append(ev_name)
+                print(f"[INFO] FMP 캘린더: {len(full_events)}개, 오늘 고임팩트 {len(releases)}개")
+                if full_events:
+                    return releases, full_events
         except Exception as e:
             print(f"[WARN] FMP 캘린더 실패: {e}")
 
@@ -178,19 +173,32 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
 
     # ── 신호 2: 신용 스프레드 (HYG/LQD) ────────────────────────────────────
     try:
-        FMP_KEY = os.environ.get("FMP_API_KEY", "")
-        FMP_BASE = "https://financialmodelingprep.com/stable"
-        def _fmp_hist(sym, limit=30):
-            r = requests.get(f"{FMP_BASE}/historical-price-eod/full?symbol={sym}&limit={limit}&apikey={FMP_KEY}", timeout=8)
-            data = r.json()
+        FMP_KEY = fh.fmp_key()
+        def _fmp_hist(sym, bars):
+            """일봉 종가 시리즈. `bars` 는 **요구 봉수**(공급량이 아니다).
+
+            창 지정 수단은 from/to 뿐이다 — limit 은 FMP 가 무시한다. 봉수를
+            달력일로 바꾸는 마진·하한 정책은 fmp_extras 가 소유한다.
+
+            ⚠️ `bars` 에 기본값을 두지 않는다. 두 소비처의 요구가 다르다
+               (신용 스프레드 6봉 · 대장주 20봉). 기본값이 있으면 호출부가
+               자기 요구를 말하지 않아도 통과하고, **어느 쪽 요구인지 모르는
+               창**이 생긴다. 실제로 기본 30 이던 시절 신용 스프레드는 자기
+               요구(6봉)의 5배를 받고 있었고 아무도 몰랐다. 요구를 못 밝히면
+               TypeError 로 즉시 죽는 편이 낫다.
+            """
+            data = fh.fmp_get_json(
+                "historical-price-eod/full?symbol=" + str(sym)
+                + fx.hist_range_params(fx.hist_days_for_bars(bars)))
             rows = data.get("historical", data) if isinstance(data, dict) else data
             if not isinstance(rows, list) or not rows: return pd.Series(dtype=float)
             df = pd.DataFrame(rows)
             df["date"] = pd.to_datetime(df["date"])
             df = df.set_index("date").sort_index()
             return pd.to_numeric(df["close"], errors="coerce").dropna()
-        hyg = _fmp_hist("HYG")
-        lqd = _fmp_hist("LQD")
+        # 소요 6봉 — 아래 iloc[-6] (5일 변화율).
+        hyg = _fmp_hist("HYG", bars=6)
+        lqd = _fmp_hist("LQD", bars=6)
         if len(hyg) >= 6 and len(lqd) >= 6:
             spread_now = float(hyg.iloc[-1] / lqd.iloc[-1])
             spread_5d  = float(hyg.iloc[-6] / lqd.iloc[-6])
@@ -207,7 +215,8 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
         leaders = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT"]
         close_dict = {}
         for sym in leaders:
-            s = _fmp_hist(sym, limit=30)
+            # 소요 20봉 — 아래 rolling(20, min_periods=10). 여유 10봉.
+            s = _fmp_hist(sym, bars=30)
             if not s.empty:
                 close_dict[sym] = s
         close_df = pd.DataFrame(close_dict).sort_index() if close_dict else pd.DataFrame()
@@ -245,33 +254,36 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
     #    stock-price-change(1D)로 폴백하되 라벨을 '전일 종가 기준'으로 정직하게 표기.
     def _prev_close(sym: str):
         # 전일(직전 정규장) 종가. quote.previousClose 가 가장 명확하다.
-        # [중요] historical-price-eod(limit=1)는 장중에 '오늘'의 진행중 봉을 돌려줘서
+        # [중요] 과거 구현은 historical-price-eod 최근 1봉을 썼는데, 장중에는
         # 프리마켓 % 가 (오늘÷오늘)=~0% 로 뭉개지는 버그가 있었다. previousClose 사용.
         try:
-            r = requests.get(f"{FMP_BASE}/quote?symbol={sym}&apikey={FMP_KEY}", timeout=8)
-            if r.status_code == 200:
-                d = r.json()
-                it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
-                pc = it.get("previousClose")
-                if pc not in (None, "", 0):
-                    return float(pc)
+            d = fh.fmp_get_json(f"quote?symbol={sym}")
+            it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+            pc = it.get("previousClose")
+            if pc not in (None, "", 0):
+                return float(pc)
         except Exception:
             pass
-        # 폴백: historical-price-eod 2개 받아 '오늘'이 아닌 직전 종가 사용
+        # 폴백: 최근 봉을 받아 '오늘'이 아닌 직전 종가 사용. 소요 2봉.
         try:
-            r = requests.get(
-                f"{FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=2&apikey={FMP_KEY}",
-                timeout=8,
-            )
-            if r.status_code == 200:
-                d = r.json()
-                rows = d.get("historical", d) if isinstance(d, dict) else d
-                if isinstance(rows, list) and rows:
-                    today = datetime.now(_ET).strftime("%Y-%m-%d")
-                    for row in rows:
-                        if str(row.get("date", ""))[:10] != today:
-                            return float(row["close"])
-                    return float(rows[-1]["close"])
+            d = fh.fmp_get_json(
+                "historical-price-eod/full?symbol=" + str(sym)
+                + fx.hist_range_params(fx.hist_days_for_bars(2)))
+            rows = d.get("historical", d) if isinstance(d, dict) else d
+            if isinstance(rows, list) and rows:
+                today = datetime.now(_ET).strftime("%Y-%m-%d")
+                # [중요] 응답 정렬에 걸지 않는다. 예전 코드는 newest-first 를
+                # 가정하고 첫 행부터 훑었는데, 그 가정이 깨지면 **21일 전 종가가
+                # '직전 종가'로 들어가고 에러는 나지 않는다.** limit 시절에는
+                # 1,254봉이 와서 오차가 5년치였다.
+                rows = sorted(rows, key=lambda _r: str(_r.get("date", "")),
+                              reverse=True)
+                for row in rows:
+                    if str(row.get("date", ""))[:10] != today:
+                        return float(row["close"])
+                # 여기 도달 = 모든 행이 오늘. 사실상 불가하지만, rows[-1] 은
+                # 창 안에서 **가장 오래된 봉**이라 값 자체가 틀렸다(§6 이월).
+                return float(rows[-1]["close"])
         except Exception:
             pass
         return None
@@ -280,39 +292,35 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
         """실시간 확장시간 체결가. (price) | None"""
         # 1차: aftermarket-trade (최근 확장시간 체결가)
         try:
-            r = requests.get(f"{FMP_BASE}/aftermarket-trade?symbol={sym}&apikey={FMP_KEY}", timeout=8)
-            if r.status_code == 200:
-                d = r.json()
-                it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
-                for f in ("price", "lastSalePrice", "tradePrice", "last"):
-                    v = it.get(f)
-                    if v not in (None, "", 0):
-                        try:
-                            return float(v)
-                        except (TypeError, ValueError):
-                            pass
-        except Exception:
-            pass
-        # 2차: aftermarket-quote (bid/ask 중간값)
-        try:
-            r = requests.get(f"{FMP_BASE}/aftermarket-quote?symbol={sym}&apikey={FMP_KEY}", timeout=8)
-            if r.status_code == 200:
-                d = r.json()
-                it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
-                bid = it.get("bidPrice", it.get("bid"))
-                ask = it.get("askPrice", it.get("ask"))
-                try:
-                    bid = float(bid); ask = float(ask)
-                    if bid > 0 and ask > 0:
-                        return (bid + ask) / 2.0
-                except (TypeError, ValueError):
-                    pass
-                v = it.get("price", it.get("lastPrice"))
+            d = fh.fmp_get_json(f"aftermarket-trade?symbol={sym}")
+            it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+            for f in ("price", "lastSalePrice", "tradePrice", "last"):
+                v = it.get(f)
                 if v not in (None, "", 0):
                     try:
                         return float(v)
                     except (TypeError, ValueError):
                         pass
+        except Exception:
+            pass
+        # 2차: aftermarket-quote (bid/ask 중간값)
+        try:
+            d = fh.fmp_get_json(f"aftermarket-quote?symbol={sym}")
+            it = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+            bid = it.get("bidPrice", it.get("bid"))
+            ask = it.get("askPrice", it.get("ask"))
+            try:
+                bid = float(bid); ask = float(ask)
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2.0
+            except (TypeError, ValueError):
+                pass
+            v = it.get("price", it.get("lastPrice"))
+            if v not in (None, "", 0):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
         except Exception:
             pass
         return None
@@ -336,12 +344,8 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
             if not _is_live:
                 _pm = {}
                 try:
-                    r_chg = requests.get(
-                        f"{FMP_BASE}/stock-price-change?symbol=SPY,QQQ&apikey={FMP_KEY}",
-                        timeout=8,
-                    )
-                    if r_chg.status_code == 200:
-                        data_chg = r_chg.json()
+                    data_chg = fh.fmp_get_json("stock-price-change?symbol=SPY,QQQ")
+                    if data_chg is not None:
                         items = data_chg if isinstance(data_chg, list) else [data_chg]
                         for item in items:
                             sym = str(item.get("symbol", "")).upper()
@@ -377,12 +381,11 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
         _safety_lines = []
         for sym5, name5 in _safety.items():
             try:
-                r5 = requests.get(
-                    f"{FMP_BASE}/historical-price-eod/full?symbol={sym5}&limit=10&apikey={FMP_KEY}",
-                    timeout=8
-                )
-                if r5.status_code == 200:
-                    d5 = r5.json()
+                # 소요 6봉(iloc[-6]). 아래 set_index+sort_index 가 있어 정렬 무관.
+                d5 = fh.fmp_get_json(
+                    "historical-price-eod/full?symbol=" + str(sym5)
+                    + fx.hist_range_params(fx.hist_days_for_bars(6)))
+                if d5 is not None:
                     rows5 = d5.get("historical", d5) if isinstance(d5, dict) else d5
                     if isinstance(rows5, list) and len(rows5) >= 6:
                         df5 = pd.DataFrame(rows5)
@@ -399,12 +402,11 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
             _rising = [s for s, c in _safety_chgs if c > 0.3]
             spy_5d_chg = 0.0
             try:
-                r_spy2 = requests.get(
-                    f"{FMP_BASE}/historical-price-eod/full?symbol=SPY&limit=10&apikey={FMP_KEY}",
-                    timeout=8
-                )
-                if r_spy2.status_code == 200:
-                    d_spy2 = r_spy2.json()
+                # 소요 6봉(iloc[-6]). 아래 set_index+sort_index 가 있어 정렬 무관.
+                d_spy2 = fh.fmp_get_json(
+                    "historical-price-eod/full?symbol=SPY"
+                    + fx.hist_range_params(fx.hist_days_for_bars(6)))
+                if d_spy2 is not None:
                     rows_spy2 = d_spy2.get("historical", d_spy2) if isinstance(d_spy2, dict) else d_spy2
                     if isinstance(rows_spy2, list) and len(rows_spy2) >= 6:
                         df_spy2 = pd.DataFrame(rows_spy2)
@@ -454,8 +456,7 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
     # sector-performance-snapshot 1콜로 두 신호를 함께 산출(앱과 동일 로직).
     # app.py의 compute_daily_risk_gauge 신호 7·8 / fmp_extras.compute_sector_signals 와 동일.
     try:
-        _FMP_KEY7 = os.environ.get("FMP_API_KEY", "")
-        _FMP_BASE7 = "https://financialmodelingprep.com/stable"
+        _FMP_KEY7 = fh.fmp_key()
         _DEF = {"Utilities", "Consumer Staples", "Consumer Defensive",
                 "Healthcare", "Health Care", "Real Estate"}
         _CYC = {"Technology", "Consumer Cyclical", "Consumer Discretionary",
@@ -468,15 +469,11 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
                 _d = _today_et - timedelta(days=_back)
                 if _d.weekday() >= 5:
                     continue
-                _r7 = requests.get(
-                    f"{_FMP_BASE7}/sector-performance-snapshot?date={_d.isoformat()}&apikey={_FMP_KEY7}",
-                    timeout=8,
-                )
-                if _r7.status_code == 200:
-                    _j7 = _r7.json()
-                    if isinstance(_j7, list) and _j7:
-                        _snap = _j7
-                        break
+                _j7 = fh.fmp_get_json(
+                    f"sector-performance-snapshot?date={_d.isoformat()}")
+                if isinstance(_j7, list) and _j7:
+                    _snap = _j7
+                    break
         _vals = {}
         for _row7 in _snap:
             if not isinstance(_row7, dict):
@@ -1209,11 +1206,20 @@ def main():
 
     # SPY 현재가 — FMP
     try:
-        FMP_KEY_MAIN = os.environ.get("FMP_API_KEY", "")
-        spy_r = requests.get(f"https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=SPY&limit=2&apikey={FMP_KEY_MAIN}", timeout=8)
-        spy_data = spy_r.json()
+        spy_data = fh.fmp_get_json(
+            "historical-price-eod/full?symbol=SPY"
+            + fx.hist_range_params(fx.hist_days_for_bars(1)))
         spy_rows = spy_data.get("historical", spy_data) if isinstance(spy_data, dict) else spy_data
-        spy_close = float(spy_rows[0]["close"]) if isinstance(spy_rows, list) and spy_rows else np.nan
+        # [중요] 예전엔 newest-first 를 믿고 rows[0] 을 썼다. 이 블록에는 정렬이
+        # 없으므로 순서 가정이 깨지면 **창에서 가장 오래된 종가가 'SPY 현재가'로
+        # 들어가고 에러는 나지 않는다.** 순서에 걸지 말고 최신 날짜를 고른다.
+        spy_close = np.nan
+        if isinstance(spy_rows, list) and spy_rows:
+            try:
+                _latest = max(spy_rows, key=lambda _r: str(_r.get("date", "")))
+                spy_close = float(_latest["close"])
+            except Exception:
+                spy_close = np.nan
     except Exception:
         spy_close = np.nan
 

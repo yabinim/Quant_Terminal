@@ -41,6 +41,7 @@
   [A] app.py — historical-price-eod 창 + **시그니처 결합** (정적 AST, 임포트 없음)
   [W] 충분성 — app.py 각 창이 하류 요구 봉수를 덮는지 (크로스 모듈 역산)
   [X] SSOT   — 0.6871·환산기·보유창이 fmp_extras 한 곳에만 존재하는지
+  [D] DRG    — run_drg_predict 의 창·정렬·봉수 충족 (런타임, 스텁 FMP)
 
 ⚠️ [A][W] 가 app.py 를 **임포트하지 않고 소스 AST 만 읽는 이유**: app.py 는
    streamlit 위에서만 임포트되고 최상단부터 UI 를 그린다. 임포트하는 순간 이
@@ -57,8 +58,11 @@ import os
 import sys
 import ast
 
+# GOOGLE_API_KEY·FRED_API_KEY 는 run_drg_predict 가 **모듈 최상단에서**
+# os.environ[...] 로 읽는다(get 이 아니다) — 없으면 임포트가 KeyError 로 죽는다.
 for _k, _v in (("FMP_API_KEY", "x"), ("GSPREAD_KEY", "{}"), ("GMAIL_USER", "a"),
-               ("GMAIL_APP_PASSWORD", "b"), ("GMAIL_TO", "c")):
+               ("GMAIL_APP_PASSWORD", "b"), ("GMAIL_TO", "c"),
+               ("GOOGLE_API_KEY", "x"), ("FRED_API_KEY", "x")):
     os.environ.setdefault(_k, _v)
 
 from datetime import datetime, timedelta
@@ -66,6 +70,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 import run_watchlist_alerts as m
+import run_drg_predict as drg
+import fmp_http as fh
 import regime_core as rc
 import watchlist_metrics_core as wm
 import fmp_extras as fx
@@ -519,6 +525,36 @@ def group_T():
         f"기본 창({m._HIST_WINDOW_DAYS})이 무마진 최소치({d272})보다 크다 — 마진 존재")
 
 
+    # ── T7~T9 — hist_days_for_bars (요구 봉수 → 창, 마진·하한 포함) ────────
+    # calendar_days_for_bars 는 **순수 환산**이라 작은 요구에서 위험하다:
+    # 2봉 → 3달력일. 금요일 휴장이면 목→월 간격만 4달력일이라 0봉이 온다.
+    # hist_days_for_bars 가 그 함정을 막는 정책 계층이다.
+    tbl = [(1, 21), (2, 21), (6, 21), (20, 37), (30, 51), (272, 404)]
+    bad7 = [(b, fx.hist_days_for_bars(b), w)
+            for b, w in tbl if fx.hist_days_for_bars(b) != w]
+    chk(not bad7, "T7a", f"요구 봉수 → 창 경계표 6종 {bad7 or ''}")
+    chk(fx.hist_days_for_bars(10 ** 6) == fx.HIST_MAX_DAYS, "T7b",
+        "거대 요구는 상한으로 클램프")
+    chk(fx.hist_days_for_bars("깨진값") == fx.HIST_MAX_DAYS, "T7c",
+        "요구치를 못 읽으면 최대 창 — 짧게 조용히 틀리는 것보다 낫다")
+
+    # T8 — 마진이 실제로 존재하는가(무마진 환산보다 항상 넓다).
+    #   이 검사가 없으면 pad_bars 를 0 으로 바꿔도 초록불이 난다.
+    nomargin = [b for b in (1, 2, 6, 20, 30, 100, 272)
+                if fx.hist_days_for_bars(b) <= fx.calendar_days_for_bars(b)]
+    chk(not nomargin, "T8", f"모든 요구치에서 무마진 환산보다 넓다 {nomargin or ''}")
+
+    # T9 — 하한이 '최장 비상 휴장 + 최대 소요'를 견디는가.
+    #   2001-09-11 은 7달력일 연속 휴장이었다. 그 7일이 창에 통째로 들어와도
+    #   6봉(이 저장소의 소형 요구 중 최대)이 남아야 한다.
+    _EMERGENCY_CLOSURE_CD = 7
+    survive = fx.bars_for_calendar_days(fx.HIST_MIN_DAYS - _EMERGENCY_CLOSURE_CD)
+    print(f"      · 하한 {fx.HIST_MIN_DAYS}일 − 비상휴장 {_EMERGENCY_CLOSURE_CD}일 "
+          f"→ 잔여 약 {survive}봉")
+    chk(survive >= 6, "T9",
+        f"하한이 7일 연속 휴장을 견딘다(잔여 {survive}봉 ≥ 6)")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # [H] 보유 창
 # ══════════════════════════════════════════════════════════════════════════════
@@ -923,7 +959,8 @@ def group_X():
 
     # X1 — 코드 리터럴 기준(주석은 허용). 복제가 드리프트의 시작이다.
     dupes = []
-    for name in ("app.py", "run_watchlist_alerts.py", "scanner_core.py"):
+    for name in ("app.py", "run_watchlist_alerts.py", "scanner_core.py",
+                 "automation/run_drg_predict.py"):
         try:
             if ratio in float_literals(tree_file(name)):
                 dupes.append(name)
@@ -961,6 +998,260 @@ def group_X():
            for d, w in cases if fx.hist_days_for_holding(d, today=T) != w]
     chk(not bad, "X4", f"보유창 경계 4종 재현 {bad or ''}")
 
+    # X5 — run_drg_predict 가 창을 **직접 조립하지 않는가**.
+    #   `&from=` 을 손으로 쓰기 시작하면 to=오늘+1 규약과 마진 정책이 조용히
+    #   두 벌이 된다. 창 조립은 fx.hist_range_params 하나만 통과해야 한다.
+    dsrc = src_file("automation/run_drg_predict.py")
+    chk("&from=" not in dsrc, "X5a", "run_drg_predict 에 직접 조립한 &from= 없음")
+    chk("calendar_days_for_bars" not in dsrc, "X5b",
+        "순수 환산기를 직접 부르지 않는다(마진 정책 우회 차단)")
+    chk("hist_days_for_bars" in dsrc, "X5c",
+        "정책 변환기를 실제로 쓴다(검사기가 헛도는 것 방지)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [D] run_drg_predict — 창·정렬·봉수 충족 (런타임)
+# ══════════════════════════════════════════════════════════════════════════════
+# 정적 분석만으로는 부족하다. 이 파일의 실패 모드는 전부 **조용한 값 오류**다:
+#   · 창이 짧으면 `len(rows) >= 6` 가드에 걸려 신호 한 줄이 통째로 사라진다.
+#   · rolling(20, min_periods=10) 은 20봉 미만이어도 **에러 없이** 더 짧은 창의
+#     평균을 낸다 — below_ma20 이 조용히 틀린다.
+#   · 응답 정렬을 가정하면 '직전 종가' 자리에 창에서 가장 오래된 종가가 들어간다.
+# 셋 다 AST 로는 안 보인다. 스텁 FMP 를 물리고 **실제로 실행**한다.
+_DRG_FAIL_MARK = "조회 실패"
+
+
+def _drg_stub(order="oldest", blackout=None, log=None, supply=None):
+    """요청된 from/to 창 안의 평일을 봉으로 만들어 주는 가짜 FMP.
+
+    order    : "oldest" | "newest" — 응답 정렬. 코드가 정렬에 걸리면 둘이 갈린다.
+    blackout : (시작, 끝) 달력일 구간을 휴장으로 지운다(연휴/비상휴장 모사).
+    supply   : 호출 **1건당 1개** dict 를 append 할 리스트.
+
+    ⚠️ supply 를 심볼 키 dict 로 두면 안 된다. 같은 심볼이 서로 다른 창으로
+       여러 번 불린다(SPY 는 51일 창과 21일 창 양쪽에서). 심볼 키로 기록하면
+       뒤 호출이 앞 호출을 덮어써서 **대장주 51일 창의 공급량을 21일 창 값으로
+       착각**한다. 2026-08-28 1차 작성에서 실제로 그렇게 틀렸다.
+    """
+    def _f(path, timeout=None, retries=None, key=""):
+        p = str(path)
+        if log is not None:
+            log.append(p)
+        head, _, qs = p.partition("?")
+        q = dict(kv.split("=", 1) for kv in qs.split("&") if "=" in kv)
+        if head.startswith("historical-price-eod"):
+            today = datetime.now().date()
+            d0 = datetime.strptime(q["from"], "%Y-%m-%d").date()
+            d1 = min(datetime.strptime(q["to"], "%Y-%m-%d").date(), today)
+            rows, d, px = [], d0, 100.0
+            while d <= d1:
+                closed = d.weekday() >= 5 or (
+                    blackout and blackout[0] <= d <= blackout[1])
+                if not closed:
+                    rows.append({"date": d.isoformat(), "close": round(px, 2),
+                                 "open": round(px, 2), "high": round(px, 2),
+                                 "low": round(px, 2), "volume": 1000})
+                    px += 1.0
+                d += timedelta(days=1)
+            if supply is not None:
+                supply.append({
+                    "symbol": q.get("symbol", "?"),
+                    "days": (today - d0).days,
+                    "bars": len(rows),
+                    "last_close": rows[-1]["close"] if rows else None,
+                })
+            return rows if order == "oldest" else list(reversed(rows))
+        if head.startswith("quote"):
+            return [{"previousClose": 0}]      # → 반드시 일봉 폴백을 태운다
+        if head.startswith("aftermarket-trade"):
+            return [{"price": 200.0}]          # → 실시간 경로를 살려 prev 를 쓰게 한다
+        if head.startswith("aftermarket-quote"):
+            return []
+        if head.startswith("stock-price-change"):
+            return [{"symbol": "SPY", "1D": 0.5}, {"symbol": "QQQ", "1D": -0.3}]
+        if head.startswith("sector-performance-snapshot"):
+            return [{"sector": "Technology", "averageChange": 1.0},
+                    {"sector": "Utilities", "averageChange": -0.5}]
+        if head.startswith("economic-calendar"):
+            return [{"country": "US", "impact": "High", "event": "CPI",
+                     "date": datetime.now().strftime("%Y-%m-%d")}]
+        return []
+    return _f
+
+
+class _FredStub:
+    def get_series(self, name):
+        idx = pd.date_range("2026-01-01", periods=60, freq="D")
+        return pd.Series([18.0 + i * 0.05 for i in range(60)], index=idx)
+
+
+def _run_macro(order="oldest", blackout=None):
+    """fetch_macro_context 를 스텁 위에서 실행. (산출텍스트, 호출로그, 공급봉수)"""
+    log, supply = [], []
+    saved = fh.fmp_get_json
+    fh.fmp_get_json = _drg_stub(order=order, blackout=blackout,
+                                log=log, supply=supply)
+    try:
+        out = drg.fetch_macro_context(_FredStub(), [])
+    finally:
+        fh.fmp_get_json = saved
+    return out, log, supply
+
+
+def group_D():
+    print("\n[D] run_drg_predict — 조회 창·정렬·봉수 (런타임 · FMP 콜 0)")
+
+    # ── D0 — 배선과 A1 래칫 ────────────────────────────────────────────────
+    dsrc = src_file("automation/run_drg_predict.py")
+    dtree = ast.parse(dsrc)
+    aliases = {a.asname or a.name for n in ast.walk(dtree)
+               if isinstance(n, ast.Import) for a in n.names}
+    chk("fh" in aliases, "D0a", "fmp_http 를 fh 로 임포트")
+    chk("fx" in aliases, "D0b", "fmp_extras 를 fx 로 임포트")
+    # requests 임포트가 없어야 원시 GET 이 '되살리려면 임포트부터'가 된다.
+    _no_req_import = "requests" not in aliases
+    _no_raw_get = "requests.get" not in dsrc
+    chk(_no_req_import, "D0c",
+        "requests 를 임포트하지 않는다 — 원시 FMP 호출 래칫이 잠긴다")
+    chk(_no_raw_get, "D0d", "소스에 requests.get 이 0곳")
+
+    # D0e/D0f — `_fmp_hist(sym, bars)` 는 기본값을 가지면 안 된다.
+    #   소비처 요구가 서로 다르다(신용 스프레드 6봉 · 대장주 20봉). 기본값이
+    #   있으면 호출부가 자기 요구를 말하지 않아도 통과하고, **어느 요구인지 모르는
+    #   창**이 생긴다. 기본값 부활은 그 자체로는 동작을 안 바꾸므로 런타임 검사에
+    #   안 잡힌다 — 정적으로 못 박는다.
+    _fd = find_func(dtree, "_fmp_hist")
+    if _fd is None:
+        chk(False, "D0e-0", "_fmp_hist 정의를 찾지 못했다")
+    else:
+        chk(not _fd.args.defaults and not _fd.args.kw_defaults, "D0e",
+            "_fmp_hist 인자에 기본값이 없다 — 호출부가 요구 봉수를 반드시 밝힌다")
+        _calls = [n for n in ast.walk(dtree)
+                  if isinstance(n, ast.Call)
+                  and isinstance(n.func, ast.Name) and n.func.id == "_fmp_hist"]
+        _naked = [n.lineno for n in _calls
+                  if len(n.args) < 2 and not any(k.arg == "bars" for k in n.keywords)]
+        chk(_calls and not _naked, "D0f",
+            f"_fmp_hist 호출 {len(_calls)}곳 전부가 bars 를 명시 {_naked or ''}")
+
+    # ⚠️ 여기서 반드시 멈춘다. 원시 requests.get 이 남아 있으면 fh 스텁이 그
+    #    경로를 **가로채지 못하고**, 아래 런타임 검사가 진짜 FMP 로 나간다.
+    #    이 스위트는 '네트워크 0'을 약속한다 — 약속을 지키려면 조기 종료해야 한다.
+    #    (역검증에서 실제로 확인: 패치 전 파일로 돌리면 여기서 걸린다.)
+    if not (_no_req_import and _no_raw_get):
+        chk(False, "D0-STOP",
+            "원시 requests 경로 잔존 — 런타임 검사를 건너뛴다(네트워크 보호)")
+        return
+
+    # ── D1 — URL 계약 ──────────────────────────────────────────────────────
+    out, log, supply = _run_macro()
+    hist = [p for p in log if p.startswith("historical-price-eod")]
+    chk(len(hist) >= 5, "D1a", f"일봉 호출 관측 {len(hist)}건")
+    chk(all("&from=" in p and "&to=" in p for p in hist), "D1b",
+        "일봉 호출 전건에 from/to 존재")
+    chk(not any("limit=" in p for p in log), "D1c",
+        f"전 호출 URL 에 limit= 부재 ({len(log)}건)")
+    tom = (datetime.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+    chk(all(f"&to={tom}" in p for p in hist), "D1d",
+        f"to 가 오늘+1 ({tom}) — hist_range_params 규약")
+
+    # ── D2 — 창 폭이 정책 변환기 산출과 정확히 일치 ────────────────────────
+    #   호출부가 fx 를 우회해 제 손으로 달력일을 정하면 여기서 갈린다.
+    allowed = {fx.hist_days_for_bars(1), fx.hist_days_for_bars(2),
+               fx.hist_days_for_bars(6), fx.hist_days_for_bars(30)}
+    widths = set()
+    for p in hist:
+        q = dict(kv.split("=", 1) for kv in p.partition("?")[2].split("&") if "=" in kv)
+        f = datetime.strptime(q["from"], "%Y-%m-%d").date()
+        widths.add((datetime.now().date() - f).days)
+    chk(widths <= allowed, "D2a",
+        f"관측 창 {sorted(widths)} ⊆ 정책 산출 {sorted(allowed)}")
+    chk(max(widths) == fx.hist_days_for_bars(30), "D2b",
+        f"최대 창이 대장주 요구(30봉={fx.hist_days_for_bars(30)}일)와 일치")
+
+    # ── D3 — 봉수 충족: 각 창이 **그 창이 존재하는 이유**를 덮는가 ─────────
+    #   자기참조를 피하려고 요구치를 창에서 되읽지 않는다. 아래 표는 소스의
+    #   소비 깊이(rolling(20) · iloc[-6] · 직전봉 · 최신봉)에서 직접 온 값이다.
+    #   창이 여러 요구를 공유하면(21일 창은 1·2·6봉 공용) 최댓값으로 조인다.
+    need = {}
+    for _req_bars, _consume, _why in ((30, 20, "_fmp_hist rolling(20)"),
+                                      (6, 6, "안전자산·SPY비교 iloc[-6]"),
+                                      (2, 2, "직전 종가 폴백"),
+                                      (1, 1, "SPY 현재가")):
+        _w = fx.hist_days_for_bars(_req_bars)
+        need[_w] = max(need.get(_w, 0), _consume)
+    print(f"      · 창별 최소 요구 봉수: {dict(sorted(need.items()))}")
+
+    def _shortfall(sup):
+        return [(e["symbol"], e["days"], e["bars"], need.get(e["days"]))
+                for e in sup if e["bars"] < need.get(e["days"], 0)]
+
+    print(f"      · 공급 봉수: "
+          f"{sorted({(e['days'], e['bars']) for e in supply})} (달력일, 봉)")
+    chk(not _shortfall(supply), "D3a",
+        f"전 호출이 자기 창의 요구 봉수를 덮는다 {_shortfall(supply) or ''}")
+    chk(any(e["days"] == fx.hist_days_for_bars(30) for e in supply), "D3b",
+        "대장주 51일 창 호출이 실제로 관측된다(검사기가 헛도는 것 방지)")
+    chk(_DRG_FAIL_MARK not in out, "D3c",
+        "정상 창에서 '조회 실패' 문구가 하나도 없다")
+
+    # ── D4 — 최악 휴장: 7달력일 연속 휴장을 견디는가 ───────────────────────
+    #   HIST_MIN_DAYS 의 존재 이유를 직접 검증한다. 하한을 지우면 여기서 깨진다.
+    _t = datetime.now().date()
+    out_bo, _, sup_bo = _run_macro(blackout=(_t - timedelta(days=8),
+                                             _t - timedelta(days=2)))
+    print(f"      · 7일 휴장 시 공급: "
+          f"{sorted({(e['days'], e['bars']) for e in sup_bo})}")
+    chk(_DRG_FAIL_MARK not in out_bo, "D4a",
+        "7달력일 연속 휴장에도 신호가 사라지지 않는다")
+    chk(not _shortfall(sup_bo), "D4b",
+        f"7일 휴장에도 전 창이 요구를 덮는다 {_shortfall(sup_bo) or ''}")
+
+    # ── D5 — 정렬 무의존성 ────────────────────────────────────────────────
+    #   FMP 는 지금 newest-first 로 준다. 그 순서를 코드가 **가정하면**
+    #   순서가 바뀌는 날 '직전 종가' 자리에 창의 가장 오래된 종가가 들어가고
+    #   에러는 나지 않는다. 두 정렬에서 산출이 동일해야 한다.
+    out_new, _, _ = _run_macro(order="newest")
+    chk(out == out_new, "D5",
+        "oldest-first / newest-first 응답에서 산출 텍스트 동일")
+    if out != out_new:
+        for a, b in zip(out.splitlines(), out_new.splitlines()):
+            if a != b:
+                print(f"      · oldest: {a}")
+                print(f"      · newest: {b}")
+
+    # ── D6 — main() 의 SPY 현재가 블록 (AST 추출 후 실제 실행) ─────────────
+    #   main() 은 시트·메일을 건드리므로 통째로 부를 수 없다. 해당 try 블록만
+    #   소스에서 떼어내 실행한다 — **사본이 아니라 배포될 코드 자체**다.
+    mfn = find_func(dtree, "main")
+    blk = None
+    for n in ast.walk(mfn) if mfn else []:
+        if isinstance(n, ast.Try) and "spy_data = fh.fmp_get_json" in ast.unparse(n):
+            blk = n
+            break
+    if blk is None:
+        chk(False, "D6-0", "main() 에서 SPY 현재가 블록을 찾지 못했다")
+    else:
+        ns = {"fh": fh, "fx": fx, "np": __import__("numpy")}
+        log6, sup6 = [], []
+        saved = fh.fmp_get_json
+        # 일부러 oldest-first 로 준다 — rows[0] 을 쓰면 여기서 갈린다.
+        fh.fmp_get_json = _drg_stub(order="oldest", log=log6, supply=sup6)
+        try:
+            exec(compile(ast.Module(body=[blk], type_ignores=[]),
+                         "<spy_block>", "exec"), ns)
+        finally:
+            fh.fmp_get_json = saved
+        got = ns.get("spy_close")
+        want = sup6[-1]["last_close"] if sup6 else None    # 스텁이 만든 최신 봉
+        oldest = 100.0                                      # 스텁의 첫 봉 종가
+        chk(not any("limit=" in p for p in log6), "D6a",
+            "SPY 현재가 호출에 limit= 부재")
+        chk(got == want, "D6b",
+            f"oldest-first 응답에서도 **최신** 종가를 고른다 (got={got}, want={want})")
+        chk(got != oldest, "D6c",
+            f"창의 **가장 오래된** 종가({oldest})가 아니다 — 정렬 가정 부활 검출")
+
 
 def main():
     print("=" * 78)
@@ -982,6 +1273,7 @@ def main():
     group_A()
     group_W()
     group_X()
+    group_D()
 
     print("\n" + "=" * 78)
     print(f"결과: {len(PASS)}/{len(PASS) + len(FAIL)} 통과")
