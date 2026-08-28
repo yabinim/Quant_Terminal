@@ -35,6 +35,10 @@ from google.oauth2.service_account import Credentials
 from fredapi import Fred
 
 import fmp_extras as fx
+import fmp_http as fh  # FMP 레이트리밋/429·402 분류 SSOT — 자동화와 동일 모듈
+#   ⚠️ 조회 창 환산(봉 ↔ 달력일)도 fmp_extras 가 SSOT 다:
+#      fx.hist_range_params() / fx.bars_for_calendar_days() / fx.HIST_WINDOW_DAYS.
+#      `limit` 은 FMP 가 무시하므로 historical-price-eod 창은 from/to 로만 지정한다.
 import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_narrative)와 동일 모듈
 import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화와 동일 모듈
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
@@ -2060,11 +2064,18 @@ def load_earnings_preview() -> list[dict]:
 def cached_earnings_price_history(ticker_upper: str):
     """실적 갭 산출 전용 심층 일봉(약 3.5년, 6시간 캐시).
 
-    ⚠️ cached_timing_price_history 는 limit=260(1년)이라 실적이 4분기밖에 안 들어간다.
-       가장 오래된 건은 직전 봉이 없어 측정 불가 → 실질 3건 → MIN_SAMPLE 미달로 '미상'.
-       또 automation(run_earnings_watch._HIST_LIMIT=900)과 표본 수가 달라져
-       앱 화면과 이메일의 예상 변동폭이 갈린다. 그래서 전용 심층 캐시를 둔다.
-       (기술적 분석용 1년 캐시는 다른 8개 호출부가 쓰므로 건드리지 않는다.)
+    ⚠️ cached_timing_price_history 는 460달력일(≈316봉, 약 15개월)이라 실적이
+       5분기밖에 안 들어간다. 가장 오래된 건은 직전 봉이 없어 측정 불가 →
+       MIN_SAMPLE 미달로 '미상'. 또 automation(run_earnings_watch._HIST_LIMIT=900)과
+       표본 수가 달라져 앱 화면과 이메일의 예상 변동폭이 갈린다.
+       그래서 전용 심층 캐시를 둔다.
+
+    ⚠️ [부채, 2026-08-28] 이 호출만 아직 `limit=900` 이다. limit 은 FMP 가 무시하므로
+       실제로는 5년 전체 피드가 오고, **그 점에서 run_earnings_watch.py:242 와
+       우연히 일치한다**(둘 다 전체 피드). 여기만 from/to 로 바꾸면 앱은 창을 받고
+       자동화는 전체 피드를 받아 표본 수가 갈린다 — 위 경고가 실제로 발생한다.
+       둘은 락스텝 쌍이므로 같은 커밋에서 함께 전환해야 한다(백로그).
+       diag_hist_window [A3] 가 이 예외를 1곳으로 못 박아 확산을 막는다.
     """
     k = _fmp_key()
     if not k:
@@ -3586,8 +3597,14 @@ def fetch_vix_latest_and_history():
     try:
         k = _fmp_key()
         if k:
+            # limit 은 FMP 가 무시한다 → from/to. 창 400달력일(≈275봉)을 받아
+            # 아래에서 tail(252) 로 자른다 — **FRED 경로의 s.tail(252) 와 표본을 맞추기
+            # 위해서다.** 맞추지 않으면 Fear&Greed 백분위의 분모가 소스에 따라
+            # 1년/5년으로 갈린다(아래 계산이 len(_vix_s) 로 나눈다). 같은 VIX 값에
+            # 다른 점수가 나오고, 어느 쪽이 맞는지 화면에는 아무 표시도 없다.
             r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX&limit=252&apikey={k}",
+                f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX"
+                f"{fx.hist_range_params(400)}&apikey={k}",
                 timeout=_FMP_TIMEOUT,
             )
             if r.status_code == 200:
@@ -3601,7 +3618,7 @@ def fetch_vix_latest_and_history():
                         df["date"] = pd.to_datetime(df["date"])
                         df = df.set_index("date").sort_index()
                         df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-                        df = df.dropna()
+                        df = df.dropna().tail(252)   # FRED 경로(s.tail(252))와 동일 표본
                         if not df.empty:
                             return float(df["Close"].iloc[-1]), df, "FMP폴백"
     except Exception:
@@ -3639,8 +3656,12 @@ def fetch_wti_latest():
         if k:
             for sym in ("USO", "OIL"):
                 try:
+                    # 최신 1봉만 쓴다(rows[0], FMP 는 최신순 반환). 20달력일이면
+                    # 연휴가 겹쳐도 최소 1봉은 확보된다. limit=5 는 무시되던 값이라
+                    # 실제로는 5년 전체 피드(≈1,254행)를 받아 첫 행만 쓰고 버렸다.
                     r = requests.get(
-                        f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=5&apikey={k}",
+                        f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}"
+                        f"{fx.hist_range_params(20)}&apikey={k}",
                         timeout=_FMP_TIMEOUT,
                     )
                     if r.status_code == 200:
@@ -3824,8 +3845,11 @@ def fetch_dxy_latest_and_mean_deviation():
     try:
         k = _fmp_key()
         if k:
+            # _calc 는 rolling(252, min_periods=63).iloc[-1] 만 본다 → 구속 252봉.
+            # 600달력일 ≈ 412봉으로 FRED 경로의 s.tail(400) 과 같은 깊이를 맞춘다.
             r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=400&apikey={k}",
+                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP"
+                f"{fx.hist_range_params(600)}&apikey={k}",
                 timeout=_FMP_TIMEOUT,
             )
             if r.status_code == 200:
@@ -4065,8 +4089,11 @@ def _hist_fetch_dxy() -> pd.Series:
     try:
         k = _fmp_key()
         if k:
+            # 아래 tail(500) 이 구속 조건 → 500봉 필요. 800달력일 ≈ 549봉.
+            # FRED 경로도 tail(500) 이라 두 소스의 차트 길이가 같아진다.
             r = requests.get(
-                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP&limit=500&apikey={k}",
+                f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP"
+                f"{fx.hist_range_params(800)}&apikey={k}",
                 timeout=_FMP_TIMEOUT,
             )
             if r.status_code == 200:
@@ -4690,7 +4717,7 @@ def build_etf_universe_returns_table(pool_tickers):
         return pd.DataFrame(columns=cols)
 
     try:
-        close_df = _fmp_batch_to_close_df(unique_tickers, limit=130)
+        close_df = _fmp_batch_to_close_df(unique_tickers, calendar_days=190)
     except Exception:
         close_df = pd.DataFrame()
 
@@ -5250,7 +5277,9 @@ def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series
         report["total"] = len(unique)
 
         # ── [1] SPY 기준 시리즈 최우선 확보 (실패 시 구체적 사유 반환) ──
-        spy_df, spy_status = _fmp_price_history_robust("SPY", limit=130, return_status=True)
+        #    190달력일 ≈ 130봉. 아래 하드게이트 70봉 + 최대 룩백 69봉 대비 충분.
+        spy_df, spy_status = _fmp_price_history_robust(
+            "SPY", calendar_days=190, return_status=True)
         spy = (
             pd.to_numeric(spy_df["Close"], errors="coerce").dropna()
             if (spy_df is not None and not spy_df.empty and "Close" in spy_df.columns)
@@ -5266,7 +5295,8 @@ def compute_rs_score_weekly_change(pool_tickers: list, spy_series_now: pd.Series
 
         # ── [2] 유니버스 전수 fetch (재시도 포함 · 캐시 없음 · 상태 보고) ──
         fetch_targets = [t for t in unique if t != "SPY"]
-        hist, status_map = _fmp_robust_batch_history_report(fetch_targets, limit=130)
+        hist, status_map = _fmp_robust_batch_history_report(
+            fetch_targets, calendar_days=190)
 
         def _mark_missing(tk, key, bars=None):
             entry = {
@@ -5343,8 +5373,9 @@ def verify_emerging_with_quant(emerging_tickers: list, narrative_date: str = "")
     try:
         unique = list(dict.fromkeys(str(t).strip().upper() for t in emerging_tickers if str(t).strip()))
         all_tickers = list(dict.fromkeys(unique + ["SPY"]))
-        # 느려도 확실하게: 재시도·버스트억제·빈결과 캐시안함. limit 220 → MA200 실제 계산.
-        close_df = _fmp_robust_batch_close(all_tickers, limit=220)
+        # 느려도 확실하게: 재시도·버스트억제·빈결과 캐시안함.
+        # 460달력일 ≈ 316봉 → 아래 rolling(200) 이 min_periods 폴백 없이 실제 계산된다.
+        close_df = _fmp_robust_batch_close(all_tickers, calendar_days=460)
         if close_df.empty:
             return []
 
@@ -5521,7 +5552,9 @@ def detect_sector_momentum_reversal(universe_tickers: list):
         report["total"] = len(unique)
 
         # ── SPY 기준 시리즈 최우선 확보 ──
-        spy_df, spy_status = _fmp_price_history_robust("SPY", limit=130, return_status=True)
+        #    190달력일 ≈ 130봉. 아래 하드게이트 75봉 + calc_rs 최대 룩백 74봉 대비 충분.
+        spy_df, spy_status = _fmp_price_history_robust(
+            "SPY", calendar_days=190, return_status=True)
         spy = (
             pd.to_numeric(spy_df["Close"], errors="coerce").dropna()
             if (spy_df is not None and not spy_df.empty and "Close" in spy_df.columns)
@@ -5540,7 +5573,8 @@ def detect_sector_momentum_reversal(universe_tickers: list):
         # FMP 가 간헐적으로 중복 날짜 행을 반환하면 결합 시 duplicate-axis 예외로 전체가 죽는다.
         # compute_rs_score_weekly_change 와 동일하게 티커별 개별 처리(+중복 인덱스 방어).
         fetch_targets = [t for t in unique if t != "SPY"]
-        hist, status_map = _fmp_robust_batch_history_report(fetch_targets, limit=130)
+        hist, status_map = _fmp_robust_batch_history_report(
+            fetch_targets, calendar_days=190)
         spy = spy[~spy.index.duplicated(keep="last")]
 
         def _mark_missing(tk, key, reason=None, bars=None):
@@ -5666,7 +5700,7 @@ def get_macro_dashboard_with_validation():
 def cached_sector_etf_closes(tickers_tuple: tuple[str, ...]):
     if not tickers_tuple:
         return pd.DataFrame()
-    return _fmp_batch_to_close_df(list(tickers_tuple), limit=500)
+    return _fmp_batch_to_close_df(list(tickers_tuple), calendar_days=730)
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -5725,13 +5759,36 @@ def cached_quote_type(ticker_upper: str):
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
 def cached_timing_price_history(ticker_upper: str):
-    """1년 일봉 히스토리 — 기술적 분석 전용 (1Y 기간만)."""
+    """기술적 분석용 일봉 히스토리 — 창 fx.HIST_WINDOW_DAYS 달력일(≈316봉).
+
+    [2026-08-28] **1년 창에서 460달력일로 넓혔다. 리팩터가 아니라 결함 수정이다.**
+
+    이전 구현은 `limit=260` 을 보내고(FMP 가 무시) 받아온 5년 피드를
+    `cutoff = now - DateOffset(years=1)` 로 잘랐다. 즉 실제 공급은 **250~252봉**이었고,
+    limit 값과는 아무 상관이 없었다. 그런데 하류 요구는 그보다 위에 있다:
+
+      · regime_core.market_warnings **260봉 하드게이트**
+        `if c.notna().sum() < 260: return None`
+        → market_gate_status.available=False → fail-open → **시장 진입 게이트가
+          통째로 꺼진다.** 게다가 워치리스트 배너는 `if _wl_mkt.get("available")`
+          안에 있어서 배너조차 안 뜬다 — 에러도 경고도 없이 조용히.
+      · 같은 함수의 rolling 체인(vol 20창 → 252 중앙값) 요구 **272봉**
+      · regime_core.classify_regime / compute_position_drawdown 요구 **252봉**
+
+    252 < 260 이므로 게이트는 처음부터 한 번도 켜진 적이 없다. 그래서 창을 넓히는
+    동시에 **cutoff 후처리를 제거**했다. 창을 정의하는 곳이 두 군데(from/to 와
+    cutoff)면 둘 중 짧은 쪽이 조용히 이긴다 — from/to 하나만 남긴다.
+
+    ⚠️ 이 변경은 화면 신호를 바꾼다(의도된 것이다). 252창 지표가 이제 마지막
+       행에서 실제로 계산되므로 레짐 분류·시장 게이트 배너가 달라져 보일 수 있다.
+    """
     k = _fmp_key()
     if not k:
         return pd.DataFrame()
     try:
         r = requests.get(
-            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker_upper.strip().upper()}&limit=260&apikey={k}",
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker_upper.strip().upper()}"
+            f"{fx.hist_range_params(fx.HIST_WINDOW_DAYS)}&apikey={k}",
             timeout=_FMP_TIMEOUT
         )
         if r.status_code != 200:
@@ -5749,9 +5806,10 @@ def cached_timing_price_history(ticker_upper: str):
         for col in ["Close", "Open", "High", "Low", "Volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        # 정확히 1년치만 반환
-        cutoff = pd.Timestamp.now() - pd.DateOffset(years=1)
-        df = df[df.index >= cutoff]
+        # ⚠️ 여기 있던 `cutoff = now - DateOffset(years=1)` 후처리는 제거했다.
+        #    창은 from/to 가 정한다 — 두 군데서 자르면 짧은 쪽이 조용히 이긴다.
+        #    (그 짧은 쪽이 251봉이었고 260봉 하드게이트를 못 넘겼다.)
+        #    diag_hist_window [W3] 가 이 줄의 부활을 막는다.
         return df
     except Exception:
         return pd.DataFrame()
@@ -5972,7 +6030,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     def _fetch_credit_data():
         try:
             tickers = ["HYG", "LQD"]
-            df = _fmp_batch_to_close_df(tickers, limit=30)
+            df = _fmp_batch_to_close_df(tickers, calendar_days=45)
             return ("credit", df)
         except Exception:
             return ("credit", pd.DataFrame())
@@ -5980,7 +6038,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
     def _fetch_leaders_data():
         try:
             tickers_dl = list(dict.fromkeys(leaders + ["SPY"]))
-            df = _fmp_batch_to_close_df(tickers_dl, limit=30)
+            df = _fmp_batch_to_close_df(tickers_dl, calendar_days=45)
             return ("leaders", df)
         except Exception:
             return ("leaders", pd.DataFrame())
@@ -6012,8 +6070,11 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
                 pass
             # 폴백: historical-price-eod 2개 중 '오늘'이 아닌 직전 종가
             try:
+                # '오늘이 아닌 첫 행'만 쓴다 → 구속 2봉. 20달력일이면 연휴에도 충분.
+                # (limit=2 는 무시되던 값이라 실제로는 5년 피드를 받아 2행만 썼다.)
                 r = requests.get(
-                    f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}&limit=2&apikey={k_drg}",
+                    f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}"
+                    f"{fx.hist_range_params(20)}&apikey={k_drg}",
                     timeout=_FMP_TIMEOUT,
                 )
                 if r.status_code == 200:
@@ -6095,7 +6156,7 @@ def compute_daily_risk_gauge(sector_filter: str = "전체") -> dict:
             return ("riskoff", results)
         # UUP, GLD, IEF를 배치로 한 번에
         try:
-            df = _fmp_batch_to_close_df(["UUP", "GLD", "IEF"], limit=10)
+            df = _fmp_batch_to_close_df(["UUP", "GLD", "IEF"], calendar_days=20)
             name_map = {"UUP": "달러", "GLD": "금", "IEF": "국채(7-10Y)"}
             for sym, name in name_map.items():
                 if sym in df.columns:
@@ -6983,9 +7044,16 @@ def _fmp_cashflow(ticker: str) -> dict:
 
 
 
-def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
-    """FMP 배치 조회 → Close 컬럼만 모은 DataFrame 반환."""
-    batch = _fmp_batch_price_history(tickers, limit=limit)
+def _fmp_batch_to_close_df(tickers: list, *, calendar_days: int = 190) -> pd.DataFrame:
+    """FMP 배치 조회 → Close 컬럼만 모은 DataFrame 반환.
+
+    ⚠️ 단위는 **달력일**(구 limit=130 봉). scanner_core._fmp_batch_price_history 가
+       2026-08-27 에 from/to 로 전환되며 `lookback_days`(달력일) 를 받게 됐다.
+       봉 수로 생각하고 싶으면 fx.calendar_days_for_bars() 로 명시 변환할 것.
+       키워드 전용(`*`)인 것도 같은 이유다 — 옛 단위가 위치 인자로 조용히
+       통과하는 경로를 구조적으로 막는다.
+    """
+    batch = _fmp_batch_price_history(tickers, lookback_days=calendar_days)
     if not batch:
         return pd.DataFrame()
     close_dict = {}
@@ -7000,7 +7068,8 @@ def _fmp_batch_to_close_df(tickers: list, limit: int = 130) -> pd.DataFrame:
     return pd.DataFrame(close_dict).sort_index()
 
 
-def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float = 0.0,
+def _fmp_price_history_robust(ticker: str, *, calendar_days: int = None,
+                             deadline_ts: float = 0.0,
                              max_retries: int = 5, base_delay: float = 2.0,
                              return_status: bool = False):
     """historical-price-eod/full 1종목 — 일시 실패(429·5xx·타임아웃)에만 지수 백오프 재시도.
@@ -7011,18 +7080,40 @@ def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float 
       status ∈ {"ok", "no_data", "exhausted", "no_key"}
       - "no_data":  HTTP 200 + 빈 응답 = 데이터가 존재하지 않음(상장폐지/티커 변경/신규)
       - "exhausted": 재시도 소진 = 일시 장애(429/5xx/타임아웃)가 끝내 해소되지 않음
-    기본(return_status=False)은 기존과 동일하게 DataFrame 만 반환(기존 호출부 호환)."""
+    기본(return_status=False)은 기존과 동일하게 DataFrame 만 반환(기존 호출부 호환).
+
+    ⚠️ [2026-08-28] `limit`(봉 수) → `calendar_days`(**달력일**)로 바뀌었다.
+       FMP 가 limit 을 무시하므로 창을 지정하는 유일한 수단이 from/to 이고, 그
+       단위는 달력일이다. 봉 수로 생각하고 싶으면 `fx.calendar_days_for_bars()`
+       로 명시 변환할 것. **키워드 전용(`*`)** 인 것도 같은 이유다 —
+       `_fmp_price_history_robust(tk, 220)` 같은 위치 인자가 옛 단위(봉)로 조용히
+       통과하는 경로를 구조적으로 막는다. run_watchlist_alerts._fmp_price_history
+       와 동일한 계약이다(2026-08-28 선례).
+
+    ⚠️ HTTP 는 fh.fmp_get_ex(**retries=0**)에 위임한다. 재시도 루프는 여기 그대로
+       두는데, 바깥 루프만이 `deadline_ts`(배치 시간 예산 420초)를 안다. 위임을
+       완전히 하면 예산이 사라지고 스캐너가 예산을 넘겨 돈다. 위임으로 얻는 것은
+       레이트리밋 토큰·통계의 SSOT 화와 **402/4xx 즉시 중단**이다 —
+       이전에는 404(잘못된 티커)를 5회 백오프로 재시도했다."""
     def _ret(df, status):
         return (df, status) if return_status else df
 
     k = _fmp_key()
     if not k:
         return _ret(pd.DataFrame(), "no_key")
-    url = f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}&apikey={k}"
+    _cd = fx.HIST_WINDOW_DAYS if calendar_days is None else int(calendar_days)
+    url = (f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}"
+           f"{fx.hist_range_params(_cd)}&apikey={k}")
     for attempt in range(max_retries + 1):
         try:
-            r = requests.get(url, timeout=_FMP_TIMEOUT)
-            if r.status_code == 200:
+            # retries=0 — 백오프는 아래 바깥 루프가 담당한다(이중 재시도 방지).
+            r, _http_status, _kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT, retries=0)
+            if _kind in ("plan_limited", "http_error"):
+                # 402(플랜)·4xx(잘못된 심볼)는 재시도해도 절대 안 바뀐다.
+                # 어휘는 넓히지 않는다 — "exhausted" 를 쓰면 _RS_SCAN_MISS_REASONS
+                # 와 미수집 사유 표시가 그대로 동작한다(호출부 계약 불변).
+                return _ret(pd.DataFrame(), "exhausted")
+            if r is not None and _kind == "ok":
                 data = r.json()
                 rows = data.get("historical", data) if isinstance(data, dict) else data
                 if not isinstance(rows, list) or not rows:
@@ -7038,7 +7129,7 @@ def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float 
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
                 return _ret(df, "ok")
-            # 비-200(429/5xx) → 일시 실패로 보고 재시도
+            # kind == "rate_limited"(429) / "exception" → 일시 실패로 보고 재시도
         except Exception:
             pass  # 타임아웃/커넥션 → 재시도
         if attempt >= max_retries or (deadline_ts and time.time() >= deadline_ts):
@@ -7048,7 +7139,7 @@ def _fmp_price_history_robust(ticker: str, limit: int = 220, deadline_ts: float 
     return _ret(pd.DataFrame(), "exhausted")  # 재시도 소진(일시 실패) — 호출자가 '검증 실패'로 처리
 
 
-def _fmp_robust_batch_history_report(tickers: list, limit: int = 130,
+def _fmp_robust_batch_history_report(tickers: list, *, calendar_days: int = 190,
                                      time_budget_sec: int = 420, max_workers: int = 3,
                                      max_retries: int = 5):
     """다수 티커의 OHLCV DataFrame 을 '느려도 확실하게 + 전수 결과 보고'로 수집.
@@ -7057,7 +7148,12 @@ def _fmp_robust_batch_history_report(tickers: list, limit: int = 130,
     티커별 상태 맵을 추가 — '조용한 탈락'을 없애고 미수집 사유를 호출자가 표시할 수 있게 한다.
 
     반환: (hist: {ticker: DataFrame}, status_map: {ticker: "ok"|"no_data"|"exhausted"|"no_key"})
-    캐시 없음(실패가 30분 박제되는 문제 원천 차단) — 매 호출 신선."""
+    캐시 없음(실패가 30분 박제되는 문제 원천 차단) — 매 호출 신선.
+
+    ⚠️ 단위는 **달력일**(구 limit=130 봉). 190달력일 ≈ 130봉으로 종전 요청량을
+       그대로 옮겼다. 구속 요구는 RS 경로의 75봉이다
+       (detect_sector_momentum_reversal 의 `len(spy) < 75` 하드게이트 +
+        calc_rs 최대 룩백 10+63+1=74). 마진 73% — diag_hist_window [W5]."""
     import concurrent.futures as _cf
     syms = list(dict.fromkeys(str(t).upper().strip() for t in tickers if str(t).strip()))
     hist, status_map = {}, {}
@@ -7067,7 +7163,7 @@ def _fmp_robust_batch_history_report(tickers: list, limit: int = 130,
 
     def _one(tk):
         df, status = _fmp_price_history_robust(
-            tk, limit=limit, deadline_ts=deadline,
+            tk, calendar_days=calendar_days, deadline_ts=deadline,
             max_retries=max_retries, return_status=True,
         )
         return tk, df, status
@@ -7091,13 +7187,19 @@ def _fmp_robust_batch_history_report(tickers: list, limit: int = 130,
     return hist, status_map
 
 
-def _fmp_robust_batch_close(tickers: list, limit: int = 220,
+def _fmp_robust_batch_close(tickers: list, *, calendar_days: int = 460,
                             time_budget_sec: int = 300, max_workers: int = 3,
                             max_retries: int = 5) -> pd.DataFrame:
     """다수 티커의 Close DataFrame을 '느려도 확실하게' 수집.
     - 동시 요청 3개로 버스트 억제(레이트리밋 회피), 종목당 최대 5회 재시도.
     - 전체 시간 예산(기본 5분) 내에서 동작; 빈/부분 결과를 캐시하지 않음(매 호출 신선).
-    - HTTP 200·빈 응답(신규 상장)은 컬럼 없이 통과 → 호출자가 '신규'로 분류."""
+    - HTTP 200·빈 응답(신규 상장)은 컬럼 없이 통과 → 호출자가 '신규'로 분류.
+
+    ⚠️ 단위는 **달력일**(구 limit=220 봉). 구속 요구는 verify_emerging_with_quant 의
+       `rolling(200, min_periods=150)` = **200봉**이다. 220봉(321달력일)은 마진이
+       10%뿐이라 연휴가 몰린 구간에서 MA200 이 min_periods 폴백으로 조용히
+       내려앉는다. 460달력일 ≈ 316봉으로 올려 마진 58% 를 준다 —
+       기본 창(fx.HIST_WINDOW_DAYS)과 같은 값이다. diag_hist_window [W4]."""
     import concurrent.futures as _cf
     syms = list(dict.fromkeys(str(t).upper().strip() for t in tickers if str(t).strip()))
     if not syms:
@@ -7106,7 +7208,8 @@ def _fmp_robust_batch_close(tickers: list, limit: int = 220,
     close_dict = {}
 
     def _one(tk):
-        return tk, _fmp_price_history_robust(tk, limit=limit, deadline_ts=deadline,
+        return tk, _fmp_price_history_robust(tk, calendar_days=calendar_days,
+                                             deadline_ts=deadline,
                                              max_retries=max_retries)
 
     try:
@@ -7580,18 +7683,20 @@ def fetch_company_overview(ticker_upper: str) -> dict:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_price_history_by_period(ticker_upper: str, period: str) -> pd.DataFrame:
     """기간별 주가 히스토리 — FMP historical-price-eod 사용. period별 독립 캐시."""
-    # period별 필요 limit (넉넉하게 요청 후 슬라이싱)
-    period_limit_map = {
-        "1D":  3,
-        "1M":  25,
-        "3M":  70,
-        "YTD": 365,
-        "1Y":  260,
-        "5Y":  1300,
-        "MAX": 6000,
+    # period별 조회 창 — 단위는 **달력일**(구: 봉 수). 아래 슬라이싱이 이미
+    # DateOffset(달력 기준)이므로 달력일로 통일하면 요청과 슬라이싱의 단위가
+    # 처음으로 일치한다. 값은 전부 슬라이싱 컷오프를 덮도록 여유를 얹었다.
+    period_days_map = {
+        "1D":  5,
+        "1M":  40,
+        "3M":  110,
+        "YTD": 400,
+        "1Y":  400,
+        "5Y":  1900,
+        "MAX": 9000,
     }
-    limit = period_limit_map.get(period, 260)
-    df = _fmp_price_history(ticker_upper, limit=limit)
+    _cd = period_days_map.get(period, 400)
+    df = _fmp_price_history(ticker_upper, lookback_days=_cd)
     if df.empty:
         return df
 
@@ -7694,7 +7799,7 @@ def cached_portfolio_yf_close_1y(tuple_tickers: tuple[str, ...]):
     tickers_list = list(dict.fromkeys([t for t in tuple_tickers if str(t).strip()]))
     if not tickers_list:
         return pd.DataFrame()
-    close_df = _fmp_batch_to_close_df(tickers_list, limit=252)
+    close_df = _fmp_batch_to_close_df(tickers_list, calendar_days=400)
     if close_df.empty:
         return close_df
     if len(tickers_list) == 1 and "SINGLE" in close_df.columns:
@@ -7730,8 +7835,9 @@ def evaluate_kpis(ticker_symbol):
         tk_upper = str(ticker_symbol).strip().upper()
         # FMP primary
         info = _fmp_fill({}, tk_upper)
-        # 주가 히스토리 (MA200 등 계산용)
-        history = _fmp_price_history(tk_upper, limit=252)
+        # 주가 히스토리 (MA200 등 계산용) — 구속 200봉(MA200)·252봉(52주).
+        # 460달력일 ≈ 316봉으로 min_periods 폴백 없이 실제 계산된다.
+        history = _fmp_price_history(tk_upper, lookback_days=fx.HIST_WINDOW_DAYS)
         # FMP 재무제표 활용
         inc = _fmp_income(tk_upper)
         cf = _fmp_cashflow(tk_upper)
@@ -8033,7 +8139,10 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
         info = _fmp_fill({}, ticker_upper)
         earn_df = cached_earnings_history(ticker_upper)
         inst_df = cached_institutional_holders(ticker_upper)
-        hist = _fmp_price_history(ticker_upper, limit=65)
+        # ⚠️ 아래 거래량 비율의 **분모가 시리즈 전체 길이**(vols.mean())라
+        #    창 크기가 값 자체를 바꾼다. 95달력일(≈65봉)을 받아 tail(65) 로
+        #    못 박아 종전(limit=65 의도)과 같은 표본을 유지한다.
+        hist = _fmp_price_history(ticker_upper, lookback_days=95)
     except Exception:
         info = _fmp_fill({}, ticker_upper)
         earn_df = inst_df = hist = pd.DataFrame()
@@ -8185,7 +8294,7 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     vol_ratio = np.nan
     if not hist.empty and "Volume" in hist.columns:
         try:
-            vols = pd.to_numeric(hist["Volume"], errors="coerce").dropna()
+            vols = pd.to_numeric(hist["Volume"], errors="coerce").dropna().tail(65)
             if len(vols) >= 10:
                 vol_ratio = float(vols.tail(5).mean() / vols.mean())
         except Exception:
@@ -8572,7 +8681,7 @@ def build_etf_holdings_performance(holdings_df):
         return pd.DataFrame(columns=["Ticker", "현재가", "1개월(%)", "3개월(%)", "6개월(%)", "12개월(%)", "비중(%)"])
 
     try:
-        close_df = _fmp_batch_to_close_df(tickers, limit=500)
+        close_df = _fmp_batch_to_close_df(tickers, calendar_days=730)
     except Exception:
         close_df = pd.DataFrame()
     if close_df.empty:
@@ -9018,8 +9127,9 @@ def verify_drg_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
 
         pred_date_naive = pred_date.date()
 
-        # FMP로 예측일 전후 20일치 데이터 조회
-        hist = _fmp_price_history(bench_etf, limit=20)
+        # 예측일과 그 **직전 1봉**이 창 안에 있어야 한다. 검증은 예측 당일이
+        # 아니라 수 주 뒤에 돌 수도 있으므로(미검증 행이 쌓인다) 60달력일(≈41봉).
+        hist = _fmp_price_history(bench_etf, lookback_days=60)
         if hist is None or hist.empty:
             return "", np.nan, ""
 
@@ -9533,8 +9643,12 @@ def _dividend_reinvest_price(ticker: str, pay_date: str, ex_date: str):
         note = "지급일 미제공 → 배당락일 종가 사용"
     if not tk or not target:
         return None, "", "날짜 정보 없음"
+    # ⚠️ 구속 요구는 '봉 수'가 아니라 **target(지급일)이 창 안에 있을 것**이다.
+    #    고정 창을 쓰면 오래된 미기록 배당이 조용히 '가격 이력 조회 실패'로 떨어지고,
+    #    실패는 기록되지 않으므로 다음 접속에도 똑같이 실패한다 — 영구 미기록.
     try:
-        hist = _fmp_price_history(tk, limit=260)
+        hist = _fmp_price_history(
+            tk, lookback_days=fx.hist_days_for_target_date(target))
     except Exception:
         hist = None
     if hist is None or getattr(hist, "empty", True) or "Close" not in getattr(hist, "columns", []):
@@ -10193,8 +10307,10 @@ def compute_trade_exit_quality(closed_df: pd.DataFrame, fwd_days: int = 30) -> p
     days_needed = 300
     if pd.notna(oldest):
         days_needed = int((pd.Timestamp.today().normalize() - oldest).days) + fwd_days + 10
-    limit = max(60, min(days_needed, 1500))
-    hist = _fmp_batch_price_history(tickers, limit=limit)
+    # 이 값은 처음부터 **달력일**이었다(위 days_needed 가 .days 기반).
+    # 변수 이름만 limit 이라 단위가 어긋나 보였을 뿐이다 — 이름을 바로잡는다.
+    _cd = max(60, min(days_needed, 1500))
+    hist = _fmp_batch_price_history(tickers, lookback_days=_cd)
     for idx, row in out.iterrows():
         tk = str(row["ticker"]).strip().upper()
         sd = pd.to_datetime(row["sell_date"], errors="coerce")
@@ -10492,7 +10608,8 @@ def compute_position_intelligence(sell_radar_df: pd.DataFrame, drg: dict) -> tup
     bench_map = _position_benchmark_map(tuple(sorted(set(tickers))))
     bench_etfs = sorted(set(bench_map.values()) | {"SPY"})
     try:
-        etf_hist = _fmp_batch_price_history(bench_etfs, limit=45)
+        # 구속은 아래 _ret21 의 22봉(`len(c) < 22`). 60달력일 ≈ 41봉.
+        etf_hist = _fmp_batch_price_history(bench_etfs, lookback_days=60)
     except Exception:
         etf_hist = {}
 
@@ -12350,7 +12467,8 @@ def load_watchlist_metrics() -> dict:
         return {}
 
 
-def _wl_prefetch_histories(tickers: tuple, limit: int = 252) -> dict:
+def _wl_prefetch_histories(tickers: tuple, *,
+                           calendar_days: int = None) -> dict:
     """알림 평가용 일봉을 병렬로 미리 채운다. 반환 {TICKER: DataFrame|None}.
 
     `_fmp_price_history` 는 scanner_core 의 프로세스 수명 TTL 캐시(30분)를 쓰므로,
@@ -12366,9 +12484,12 @@ def _wl_prefetch_histories(tickers: tuple, limit: int = 252) -> dict:
     if not tks:
         return out
 
+    # 단위는 **달력일**. 구속은 rc.analyze_ticker → classify_regime 의 252봉.
+    _cd = fx.HIST_WINDOW_DAYS if calendar_days is None else int(calendar_days)
+
     def _one(tk):
         try:
-            return tk, _fmp_price_history(tk, limit=limit)
+            return tk, _fmp_price_history(tk, lookback_days=_cd)
         except Exception:
             return tk, None
 
@@ -12391,11 +12512,23 @@ def _wl_prefetch_histories(tickers: tuple, limit: int = 252) -> dict:
     return out
 
 
-def _pf_prefetch_histories(tickers: tuple, limit: int = 600) -> dict:
+def _pf_prefetch_histories(tickers: tuple, *, date_added_map: dict = None) -> dict:
     """포트폴리오 보유 종목 일봉을 병렬로 미리 받는다. {TICKER: DataFrame|None}
 
-    워치리스트용 _wl_prefetch_histories 와 같은 패턴이지만 봉 수가 600 이다
-    (매도 레이더는 200일선·장기 추세를 봐야 해서 252봉으로는 부족하다).
+    워치리스트용 _wl_prefetch_histories 와 같은 패턴이지만 창이 **고정이 아니다.**
+
+    ⚠️ [2026-08-28] 옛 구현은 전 종목 600봉 고정이었다. 그런데 매도 판정의
+       트레일링 고점은 `rc.compute_position_drawdown` 이 `close[index >= Date_Added]`
+       의 최대값으로 잡는다 — **보유 기간에 비례하는 요구**다. 3년 보유 종목에
+       600봉(≈2.4년) 창을 주면 기준 고점이 조용히 낮아져 **매도 신호가 덜 뜬다**
+       (놓치는 방향이라 더 위험하다).
+       자동화(run_watchlist_alerts)는 이미 보유 기간 비례 창을 쓰고 있었으므로
+       **같은 종목을 두고 메일과 화면의 판정이 갈리고 있었다.**
+       이제 둘 다 fx.hist_days_for_holding 하나를 부른다.
+
+    date_added_map: {TICKER: Date_Added}. 같은 티커를 여러 계좌가 보유하면
+       **가장 오래된** Date_Added 를 넣을 것 — 요구가 가장 깊은 쪽에 맞춰야
+       얕은 창이 깊은 보유를 절삭하지 않는다. 없으면 기본 창.
 
     ⚠️ max_workers 를 종목 수에 맞춰 조절한다. 보유가 50종목까지 늘어도
        FMP Starter 300/분 안에서 안전하도록 상한을 8로 둔다. 레이트리밋 자체는
@@ -12407,9 +12540,12 @@ def _pf_prefetch_histories(tickers: tuple, limit: int = 600) -> dict:
     if not tks:
         return out
 
+    _dam = date_added_map or {}
+
     def _one(tk):
         try:
-            return tk, _fmp_price_history(tk, limit=limit)
+            _need = fx.hist_days_for_holding(_dam.get(tk), ticker=tk)
+            return tk, _fmp_price_history(tk, lookback_days=_need)
         except Exception:
             return tk, None
 
@@ -13388,7 +13524,7 @@ def fetch_latest_prices_for_tickers(tickers: tuple) -> dict:
     missing = [tk for tk in clean_tickers if tk not in price_map or pd.isna(price_map.get(tk))]
     for tk in missing:
         try:
-            hist = _fmp_price_history(tk, limit=5)
+            hist = _fmp_price_history(tk, lookback_days=20)  # 마지막 1봉만 필요
             if not hist.empty and "Close" in hist.columns:
                 last_close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
                 if not last_close.empty:
@@ -13609,11 +13745,13 @@ def _factcheck_download_closes(tickers, period: str = "60d") -> pd.DataFrame:
     clean = list(dict.fromkeys(clean))
     if not clean:
         return pd.DataFrame()
-    # period 문자열 → limit 변환
-    period_limit = {"30d": 30, "60d": 65, "90d": 95, "6mo": 130, "1y": 252}
-    limit = period_limit.get(period, 65)
+    # period 문자열 → **달력일** 변환. 이름이 그대로 '30d/60d' 이므로 달력일
+    # 해석이 오히려 원래 의도에 가깝다(옛 값은 봉 수였는데 라벨은 달력일이었다).
+    # 여유를 얹은 이유: 60달력일이면 41봉뿐이라 "60d" 라벨과 실제 표본이 갈린다.
+    period_days = {"30d": 45, "60d": 95, "90d": 140, "6mo": 190, "1y": 400}
+    _cd = period_days.get(period, 95)
     try:
-        close_df = _fmp_batch_to_close_df(clean, limit=limit)
+        close_df = _fmp_batch_to_close_df(clean, calendar_days=_cd)
         if close_df is None or close_df.empty:
             return pd.DataFrame({t: pd.Series(dtype=float) for t in clean})
         for t in clean:
@@ -15120,7 +15258,10 @@ def compute_quantitative_sector_leaders(top_n: int = 30) -> dict:
         all_tickers = list(dict.fromkeys(universe + [spy_ticker] + sector_etfs))
 
         try:
-            batch_ql = _fmp_batch_price_history(all_tickers, limit=252)
+            # 구속은 아래 rolling(200, min_periods=150) 의 200봉.
+            # 460달력일 ≈ 316봉 → min_periods 폴백 없이 실제 MA200 이 나온다.
+            batch_ql = _fmp_batch_price_history(
+                all_tickers, lookback_days=fx.HIST_WINDOW_DAYS)
             closes = pd.DataFrame({tk: df["Close"] for tk, df in batch_ql.items() if "Close" in df.columns}).sort_index()
             volumes = pd.DataFrame({tk: df["Volume"] for tk, df in batch_ql.items() if "Volume" in df.columns}).sort_index()
         except Exception:
@@ -15905,9 +16046,10 @@ if st.session_state.get("logged_in"):
                 # 일봉은 병렬로 미리 채운다 — 아래 루프는 전부 캐시 히트가 된다
                 with _timed("WL 일봉 프리페치"):
                     _hist_map = _wl_prefetch_histories(_wl_tickers)
-                _perf_note("WL 일봉 프리페치", f"{len(_wl_tickers)}종목 · 252봉")
+                _perf_note("WL 일봉 프리페치",
+                           f"{len(_wl_tickers)}종목 · {fx.HIST_WINDOW_DAYS}달력일")
                 try:
-                    _spy_h = _fmp_price_history("SPY", limit=252)
+                    _spy_h = _fmp_price_history("SPY", lookback_days=fx.HIST_WINDOW_DAYS)
                     _spy_c = (_spy_h["Close"]
                               if (_spy_h is not None and not _spy_h.empty and "Close" in _spy_h.columns)
                               else None)
@@ -16674,7 +16816,7 @@ if st.session_state.get("logged_in"):
 
                 # 현재 벤치마크 ETF 종가 가져오기
                 try:
-                    _spy_df = _fmp_price_history(_bench_etf, limit=3)
+                    _spy_df = _fmp_price_history(_bench_etf, lookback_days=20)  # 마지막 1봉
                     _spy_close = float(_spy_df["Close"].iloc[-1]) if _spy_df is not None and not _spy_df.empty else np.nan
                 except Exception:
                     _spy_close = np.nan
@@ -21010,8 +21152,13 @@ if st.session_state.get("logged_in"):
                 # 거기엔 `거래일` 컬럼이 있어 사람이 지연을 직접 보고 할인할 수 있다.
                 # VERDICT 108행의 "표시 전용으로 유지"가 가리키는 게 그쪽이다.
                 #
-                # 부수 효과: 같은 데이터를 두 번 가져오던 중복이 사라져 정밀검사
-                # 1회당 FMP 2콜(senate-trades + house-trades)이 절감된다.
+                # ⚠️ [2026-08-28 정정] 이전 주석은 "정밀검사 1회당 FMP 2콜 절감"이라고
+                #    적었으나 **실제 절감은 0콜**이다. fetch_senate_house_trading 은
+                #    @st.cache_data(ttl=3600) 이고, 같은 탭의 화면 표(위 '🏛️ 상원/하원
+                #    의원 거래' 섹션)가 어차피 같은 인자로 먼저 호출한다 — 프롬프트에서
+                #    빼도 캐시 히트가 하나 줄 뿐 네트워크 콜은 그대로다.
+                #    이 변경의 실제 이득은 콜 절감이 아니라 **낡은 데이터가 LLM 판단
+                #    입력으로 들어가지 않는 것**이다. 그 이유만으로 충분하다.
 
                 def _nv(v, fmt=".2f", pre="", suf=""):
                     return f"{pre}{v:{fmt}}{suf}" if pd.notna(v) else "N/A"
@@ -21387,7 +21534,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
             _pf_states = load_portfolio_alert_states()
             try:
-                _spy_pf = _fmp_price_history("SPY", limit=252)
+                _spy_pf = _fmp_price_history("SPY", lookback_days=fx.HIST_WINDOW_DAYS)
                 _spy_pf_close = (_spy_pf["Close"]
                                  if (_spy_pf is not None and not _spy_pf.empty and "Close" in _spy_pf.columns)
                                  else None)
@@ -21402,11 +21549,25 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             #      regime_core 를 스레드에 태우면 검증 부담이 커진다.
             #   ⚠️ 600봉은 워치리스트(252봉)의 2.4배다. FMP 레이트리밋은
             #      fmp_extras 의 락 기반 슬라이딩 윈도우가 처리하므로 초과하지 않는다.
+            # 같은 티커를 여러 계좌가 보유하면 **가장 오래된** Date_Added 를 쓴다 —
+            # 요구가 가장 깊은 쪽에 맞춰야 얕은 창이 깊은 보유를 절삭하지 않는다.
+            _pf_dadd_map = {}
+            try:
+                for _, _r in portfolio_df.iterrows():
+                    _k = str(_r.get("Ticker") or "").strip().upper()
+                    _v = str(_r.get("Date_Added", "") or "").strip()[:10]
+                    if not _k or not _v:
+                        continue
+                    if _k not in _pf_dadd_map or _v < _pf_dadd_map[_k]:
+                        _pf_dadd_map[_k] = _v
+            except Exception:
+                _pf_dadd_map = {}
             with _timed("PF 일봉 프리페치"):
                 _pf_hist_cache = _pf_prefetch_histories(
-                    tuple(portfolio_df["Ticker"].astype(str).str.strip().str.upper().unique())
+                    tuple(portfolio_df["Ticker"].astype(str).str.strip().str.upper().unique()),
+                    date_added_map=_pf_dadd_map,
                 )
-            _perf_note("PF 일봉 프리페치", f"{len(_pf_hist_cache)}종목 · 600봉")
+            _perf_note("PF 일봉 프리페치", f"{len(_pf_hist_cache)}종목 · 보유기간 비례 창")
             # 카드·표 매도 판정 통일: integrated_sell_verdict(표와 동일 소스) 상태를 미리 계산해 공유
             _card_status, _card_status_tk = {}, {}
             try:
@@ -21448,7 +21609,10 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     _dadd = str(_h.get("Date_Added", "") or "")
                     try:
                         if _tk not in _pf_hist_cache:
-                            _pf_hist_cache[_tk] = _fmp_price_history(_tk, limit=600)
+                            # 프리페치에서 빠진 종목 — 여기서도 보유 기간 비례 창을 쓴다.
+                            # 고정 창을 쓰면 이 경로만 조용히 얕아진다.
+                            _pf_hist_cache[_tk] = _fmp_price_history(
+                                _tk, lookback_days=fx.hist_days_for_holding(_dadd, ticker=_tk))
                         _an = rc.analyze_ticker(
                             _pf_hist_cache[_tk], spy_close=_spy_pf_close,
                             entry_price=float(_avg) if pd.notna(_avg) else None,
@@ -24545,7 +24709,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 # RS(상대강도) 계산용 SPY 종가 — 1회만 조회
                 try:
                     with _timed("WL SPY 일봉"):
-                        _spy_hist_wl = _fmp_price_history("SPY", limit=252)
+                        _spy_hist_wl = _fmp_price_history("SPY", lookback_days=fx.HIST_WINDOW_DAYS)
                     _spy_close_wl = (
                         _spy_hist_wl["Close"]
                         if (_spy_hist_wl is not None and not _spy_hist_wl.empty and "Close" in _spy_hist_wl.columns)
@@ -24896,7 +25060,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             _hist_card = hist_map_wl.get(tk)
                             if _hist_card is None:
                                 try:
-                                    _hist_card = _fmp_price_history(tk, limit=252)
+                                    _hist_card = _fmp_price_history(
+                                        tk, lookback_days=fx.HIST_WINDOW_DAYS)
                                     hist_map_wl[tk] = _hist_card
                                 except Exception:
                                     _hist_card = None

@@ -59,6 +59,140 @@ def _key() -> str:
     return str(_os.environ.get("FMP_API_KEY", "") or "").strip()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 일봉 조회 창 — 봉(거래일) ↔ 달력일 환산 SSOT
+# ══════════════════════════════════════════════════════════════════════════
+# FMP `historical-price-eod` 의 `limit` 은 **무시된다**(실측 확정). 창을 지정하는
+# 유일한 수단은 `from`/`to` 이고 그 단위는 **달력일**이다. 반면 하류 지표 요구치는
+# 전부 **봉 수**로 표현된다 — 두 단위가 코드 안에서 계속 섞인다. 환산을 여기
+# 한 곳에만 둔다.
+#
+# ⚠️ 이 상수를 복제하지 말 것. 2026-08-28(2차)에 app.py 와 run_watchlist_alerts.py
+#    가 각각 사본을 가질 뻔했다. 0.6871 이 두 벌이 되면 한쪽만 갱신되고, 창이
+#    조용히 짧아지는 실패는 **에러 로그를 남기지 않는다**. diag_hist_window [X] 가
+#    저장소 전역에서 이 리터럴의 중복을 금지한다.
+HIST_TD_PER_CD = 0.6871
+#   실측 비율(거래일 ÷ 달력일). 추정치 아님 — diag_fmp_window.py 기준선 응답.
+
+HIST_WINDOW_DAYS = 460
+#   기본 창(달력일). 최대 구속 요구는 regime_core.market_warnings 의 272봉이다
+#   (vol 20창 → 252 중앙값 체인: 20 + 252 = 272). 272 ÷ 0.6871 = 395.9 달력일이
+#   무마진 최소치이고, 460일 요청 시 실측 316봉(2026-08-28 probe) — 여유 44봉(16%).
+#   마진을 이 방향으로 기울이는 이유는 비용이 비대칭이기 때문이다:
+#     · 언더슈트 → 260봉 하드게이트 미달 → market_warnings=None →
+#       market_gate_status.available=False → 게이트가 **조용히** 꺼진다(fail-open).
+#     · 오버슈트 → 페이로드만 늘어난다. 관측 가능하고 되돌리기 쉽다.
+
+HIST_MAX_DAYS = 1826
+#   상한(약 5년 ≈ 1,254봉). limit 이 무시되던 시절의 사실상 동작과 같은 크기.
+
+
+def bars_for_calendar_days(days) -> int:
+    """달력일 → 기대 거래일(봉) 수. 단위 혼동을 막기 위한 명시 변환기."""
+    return int(float(days) * HIST_TD_PER_CD)
+
+
+def calendar_days_for_bars(bars) -> int:
+    """요구 봉수 → 필요한 최소 달력일(올림). 마진은 호출부가 따로 얹는다."""
+    return int(-(-float(bars) // HIST_TD_PER_CD))
+
+
+def hist_range_params(calendar_days, today=None) -> str:
+    """`&from=...&to=...` 쿼리 조각 — historical-price-eod 창 지정의 유일한 수단.
+
+    인자 단위는 **달력일**이다. 봉 수로 생각하고 싶으면 `calendar_days_for_bars()`
+    로 명시 변환할 것. `limit` 을 되살리는 대신 이 함수를 쓰라는 것이 요점이다.
+
+    ⚠️ `to` 는 오늘이 아니라 **오늘+1일**이다. 상한 경계가 포함인지 배제인지,
+       서버 타임존이 무엇인지에 최신 봉을 걸지 않기 위한 방어다. 하루를 더 줘도
+       미래 봉은 존재하지 않으므로 결과는 달라지지 않지만, 만약 `to` 가
+       배타적이었다면 전 종목이 하루 낡은 봉으로 평가됐을 것이다.
+       룩백 기준점은 어디까지나 오늘이다(`from` = 오늘 − calendar_days).
+    """
+    d = today or _dt.datetime.now(_ET_TZ).date()
+    _from = (d - _dt.timedelta(days=int(calendar_days))).strftime("%Y-%m-%d")
+    _to = (d + _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    return f"&from={_from}&to={_to}"
+
+
+def hist_days_for_holding(date_added, today=None, ticker: str = "",
+                          base: int = None, warn=print) -> int:
+    """보유 종목 1건에 필요한 조회 창(달력일).
+
+    `regime_core.compute_position_drawdown` 의 보유 고점은 `close[index >= Date_Added]`
+    의 최대값이다 — **상수가 아니라 보유 기간에 비례한다.** 창이 매수일에 못 미치면
+    트레일링 스톱 기준 고점이 조용히 낮아져 **매도 신호가 덜 뜬다**(놓치는 방향이라
+    더 위험하다). 고정 창으로는 절대 못 푸는 요구다.
+
+    반환 규칙
+      · Date_Added 없음      → 기본 창. 하류가 252봉 폴백을 쓰므로 깊은 조회 불필요.
+      · Date_Added 파싱 실패 → **최대 창**. 값은 있는데 못 읽었다면 보유 기간이
+                               미상이다. 짧은 창으로 조용히 틀리는 것보다 페이로드를
+                               더 쓰는 편이 낫다(관측 가능한 비용).
+      · 정상                 → min(기본 + 보유 달력일, 상한)
+
+    [2026-08-28] run_watchlist_alerts._hist_days_for_holding 에서 승격했다.
+      app.py 의 포트폴리오 경로는 고정 600봉(≈limit)을 쓰고 있어서, **같은 보유
+      종목을 두고 메일과 화면의 트레일링 고점이 갈렸다.** 자동화만 고쳐두면
+      화면이 조용히 틀린다 — 두 소비자가 같은 함수를 부르게 한다.
+
+    warn: 경고 출력 훅. 자동화는 print(기본), 앱은 로그로 흘려도 무해하다.
+    """
+    _base = HIST_WINDOW_DAYS if base is None else int(base)
+    try:
+        s = str(date_added or "").strip()[:10]
+        if not s:
+            return _base
+        d = pd.to_datetime(s, errors="coerce")
+        if pd.isna(d):
+            if warn:
+                warn(f"[WARN] {ticker or '?'} Date_Added 파싱 실패({s!r}) — 최대 창 적용")
+            return HIST_MAX_DAYS
+        t = pd.to_datetime(str(today or "")[:10], errors="coerce")
+        if pd.isna(t):
+            t = pd.Timestamp(_dt.datetime.now(_ET_TZ).date())
+        held = int((t - d).days)
+        if held <= 0:
+            return _base          # 미래 날짜/당일 매수 → 깊은 조회 불필요
+        want = _base + held
+        if want > HIST_MAX_DAYS:
+            if warn:
+                warn(f"[WARN] {ticker or '?'} 보유 {held}일 — 조회 창 상한 "
+                     f"{HIST_MAX_DAYS}일 적용(보유 고점 절삭 가능)")
+            return HIST_MAX_DAYS
+        return want
+    except Exception:
+        return HIST_MAX_DAYS
+
+
+def hist_days_for_target_date(target, today=None, base: int = None,
+                              pad: int = 10) -> int:
+    """특정 과거 날짜(target)를 반드시 포함하는 조회 창(달력일).
+
+    배당 재투자 체결가처럼 **요구가 '봉 수'가 아니라 '이 날짜가 창 안에 있을 것'**
+    인 경우에 쓴다. 고정 창을 쓰면 오래된 미기록 배당이 조용히 "가격 이력 조회
+    실패"로 떨어지고, 실패는 기록되지 않으므로 **다음 접속에도 똑같이 실패한다**
+    — 영구 미기록이 된다.
+
+    pad: target 이후 첫 거래일을 찾아야 하므로 하한이 아니라 상한 쪽 여유가 아니라,
+         연휴로 target 직후 거래일이 밀리는 경우를 위한 며칠의 여유다.
+    """
+    _base = HIST_WINDOW_DAYS if base is None else int(base)
+    try:
+        ts = pd.to_datetime(str(target or "")[:10], errors="coerce")
+        if pd.isna(ts):
+            return _base
+        t = pd.to_datetime(str(today or "")[:10], errors="coerce")
+        if pd.isna(t):
+            t = pd.Timestamp(_dt.datetime.now(_ET_TZ).date())
+        back = int((t - ts).days)
+        if back <= 0:
+            return _base          # 미래 지급일 → 어차피 데이터 없음
+        return int(min(max(_base, back + int(pad)), HIST_MAX_DAYS))
+    except Exception:
+        return HIST_MAX_DAYS
+
+
 # st.secrets 우선 키 제공자를 fmp_http 에 설치한다(자동화에서는 _key 가 환경변수로 폴백).
 _fh.set_key_provider(_key)
 
