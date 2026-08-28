@@ -829,10 +829,25 @@ def satellite_candidate_pool() -> dict:
     return pool
 
 
-def _closes(ticker: str, limit: int = 170) -> pd.Series:
-    """일별 종가 시리즈(오름차순·중복 날짜 제거). 일시 실패 2회 재시도."""
+def _closes(ticker: str, bars: int) -> pd.Series:
+    """일별 종가 시리즈(오름차순·중복 날짜 제거). 일시 실패 2회 재시도.
+
+    bars: 하류가 실제로 소비하는 꼬리 깊이. **기본값을 두지 않는다.**
+      두 호출부의 요구가 다르다 — 시장 필터는 200봉(`tail(200)`), 챔피언 선발은
+      127봉(`_trailing_return(s, 126)`). 기본값이 있으면 호출부가 자기 요구를
+      안 밝혀도 통과하고 **어느 요구인지 모르는 창**이 생긴다.
+      `run_drg_predict._fmp_hist` 에서 실제로 겪었다(기본 30 이 요구 6봉짜리
+      호출부에 5배 창을 주고 있었고 아무도 몰랐다). 요구를 못 밝히면
+      TypeError 로 즉시 죽는 편이 낫다.
+
+    [2026-08-28] `limit`(170·260) → `from`/`to` 창. FMP 는 historical-price-eod 의
+      `limit` 을 **무시**하므로 두 호출부 모두 1,254봉을 받고 있었다.
+      ⚠️ 옛 limit 숫자를 요구 봉수의 근거로 쓰지 않았다 — 무시돼 온 값이라
+      **아무도 검증한 적이 없다.** 소비 구문에서 역산했다.
+    """
     for attempt in range(3):
-        data = _get_json(f"historical-price-eod/full?symbol={ticker}&limit={limit}")
+        data = _get_json(f"historical-price-eod/full?symbol={ticker}"
+                         + hist_range_params(hist_days_for_bars(bars)))
         rows = data.get("historical", data) if isinstance(data, dict) else data
         if isinstance(rows, list) and rows:
             df = pd.DataFrame(rows)
@@ -893,7 +908,8 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
            "market_filter": None, "rows": [], "matrix": {}, "skipped": []}
 
     # ── 🚦 시장 필터 (SPY vs 200일선) ──
-    spy = _closes("SPY", limit=260)
+    # 소요 200봉 — 아래 len(spy) >= 200 가드와 spy.tail(200).mean().
+    spy = _closes("SPY", bars=200)
     if len(spy) >= 200:
         ma200 = float(spy.tail(200).mean())
         last = float(spy.iloc[-1])
@@ -906,7 +922,8 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
     for sec, cands in satellite_candidate_pool().items():
         best = None
         for tk in cands:
-            s = _closes(tk, limit=170)
+            # 소요 127봉 — 아래 len(s) < 127 가드와 _trailing_return(s, 126).
+            s = _closes(tk, bars=127)
             _time.sleep(pause_sec)
             if len(s) < 127:  # 6M(126봉) 계산 불가
                 out["skipped"].append((tk, f"히스토리 부족({len(s)}봉)"))
