@@ -29,7 +29,7 @@ import os
 import smtplib
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -37,15 +37,16 @@ import gspread
 import numpy as np
 import pandas as pd
 import pytz
-import requests
 from google.oauth2.service_account import Credentials
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import accounts_core as ac    # noqa: E402
 import earnings_core as ec    # noqa: E402
+# ⚠️ fmp_extras 는 선택이 아니다 — 모든 FMP 호출이 fx.fmp_get(레이트 리미터)을
+#    거쳐야 429 가 조용히 빈 응답으로 사라지지 않는다(diag_fmp_ssot A1).
+import fmp_extras as fx      # noqa: E402
 import gs_retry as gsr  # noqa: E402  — Sheets 재시도 SSOT(503 등 일시 장애 방어)
 import users_core as uc       # noqa: E402
-import calendar_core as cc    # noqa: E402  — 시장 캘린더(휴장일) SSOT
 
 # ── 환경변수 ──────────────────────────────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -79,19 +80,50 @@ _PF_WORKSHEET = "Portfolios"
 _PROFILE_WORKSHEET = "Account_Profile"
 _USERS_WORKSHEET = "Users"
 
-_HIST_LIMIT = 900          # 8분기(≈2년) 갭 이력 + ATR 산출에 여유
+# ── 가격 이력 조회 창 ─────────────────────────────────────────────────────
+# [2026-08-28] `limit=900` → `from`/`to` 창. FMP 는 historical-price-eod 의
+#   `limit` 을 **무시**하므로 실제로는 매 호출 약 1,254봉(281KB)을 받고 있었다.
+#
+# 옛 주석은 "8분기(≈2년)" 라고 적었지만 **소비 구문이 요구하는 것은 12분기**다:
+#     ec.past_earnings_dates(limit=GAP_QUARTERS + 4)  → 최신 12개 이벤트
+#     ec.gap_history(hist, past)                      → 성공 8건 모일 때까지 12개 순회
+#   gap_history 는 측정 실패한 이벤트를 건너뛰고 계속 돈다. 8분기로 창을 자르면
+#   9~12번째 이벤트가 창 밖으로 나가고, 앞 8개 중 하나라도 실패하면 표본이 8
+#   아래로 떨어진다. 6 미만이면 expected_move 의 confidence 가 강등된다
+#   (earnings_core: `len(vals) < GAP_QUARTERS - 2`).
+#
+#   → **옛 limit 숫자를 요구의 근거로 쓰지 않았다.** limit 은 무시돼 온 값이라
+#     검증된 적이 없다. 요구는 소비 구문에서 역산했다(run_narrative 가 실증:
+#     limit 130 / 실요구 200봉).
+#
+# ⚠️ 호출부별 `bars` 인자를 두지 않는 이유 — 6개 호출부가 **hist_cache 를 공유**한다.
+#    먼저 부른 쪽의 창이 캐시에 박히므로 요구가 다른 창을 섞으면 나중 호출부가
+#    자기 요구보다 얕은 이력을 받고도 그 사실을 모른다. 창은 최심 소비처 하나로
+#    통일하는 것이 맞다. (§7 의 "창 함수에 기본값 금지" 는 호출부가 캐시를
+#    공유하지 않는 경우의 규칙이다 — 여기서는 반대로 단일 창이 정답이다.)
+_HIST_QUARTERS = ec.GAP_QUARTERS + 4       # = 12. past_earnings_dates 상한과 동일
+_QUARTER_DAYS = 91.31                      # 365.25 / 4
+_HIST_BARS = (fx.bars_for_calendar_days(_HIST_QUARTERS * _QUARTER_DAYS)
+              + ec.VOLUME_BASELINE_BARS    # measure_reaction 의 거래량 기준 구간
+              + 1)                         # 직전 종가(pre_close) 1봉
+_HIST_DAYS = fx.hist_days_for_bars(_HIST_BARS)   # 1,133달력일 ≈ 778봉 (실측)
+_HIST_EDGE_TOL_DAYS = 7
+#   이력의 첫 봉이 창 하단에서 이 일수 안쪽이면 "창에 맞닿았다"고 본다.
+#   긴 연휴(추수감사절 주간 등)를 흡수할 만큼만 잡는다.
 _THESIS_WORKSHEET = "Thesis"     # app.py _THESIS_SHEET_COLS 와 lockstep
 _CORE_CATEGORY = "core_dca"      # 코어/정기적립 마커 (app.py save_thesis_row 와 동일)
 
-# ── 휴장일 판정 — calendar_core SSOT 로 단일화 ────────────────────────────────
-# 기존 하드코딩 집합은 2026-12-25 에서 끝나 2027-01-01 부터 모든 휴장일을
-# 거래일로 오판했다(같은 상수가 5개 자동화 파일에 중복돼 있었다).
-#
-# calendar_core 는 **규칙 계산**이라 FMP·시트 접근이 없다. 이 가드는 시트를
-# 열기 전 최상단에 있으므로, 네트워크나 시트 왕복을 붙이면 "휴장일이라 즉시
-# 종료"하는 실행에까지 비용이 생긴다. 호출 비용은 기존과 같은 0 이다.
+_NYSE_HOLIDAYS = {
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+}
+
+
 def is_market_open_today() -> bool:
-    return cc.is_market_open_today()
+    now = datetime.now(_ET)
+    return now.weekday() < 5 and now.strftime("%Y-%m-%d") not in _NYSE_HOLIDAYS
 
 
 # ── Sheets ────────────────────────────────────────────────────────────────
@@ -238,12 +270,22 @@ def _batch_update(ws, updates, ncol: int, label: str = "batch") -> int:
 
 
 # ── FMP ───────────────────────────────────────────────────────────────────
-def fmp_price_history(ticker: str, limit: int = _HIST_LIMIT) -> pd.DataFrame:
+def fmp_price_history(ticker: str) -> pd.DataFrame:
+    """historical-price-eod → OHLCV DataFrame(오름차순, Close 결측 제거).
+
+    창은 모듈 상수 `_HIST_DAYS` 하나다. 인자로 받지 않는 이유는 위 상수 블록
+    참조 — 호출부 6곳이 `hist_cache` 를 공유하기 때문이다.
+
+    `fx.fmp_get` 을 쓰는 이유는 스타일이 아니다: 원시 `requests.get` 은 분당
+    한도를 우회해 초과분이 429 → 빈 DataFrame 으로 조용히 사라진다. 그러면
+    실적 갭 표본이 줄어든 것이 "종목 이력이 짧다"와 구분되지 않는다.
+    """
     try:
-        r = requests.get(
-            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}&limit={limit}"
-            f"&apikey={FMP_API_KEY}", timeout=_FMP_TIMEOUT)
-        if r.status_code != 200:
+        r = fx.fmp_get(
+            f"{_FMP_BASE}/historical-price-eod/full?symbol={ticker}"
+            + fx.hist_range_params(_HIST_DAYS)
+            + f"&apikey={FMP_API_KEY}", timeout=_FMP_TIMEOUT)
+        if r is None or r.status_code != 200:
             return pd.DataFrame()
         data = r.json()
         rows = data.get("historical", data) if isinstance(data, dict) else data
@@ -262,6 +304,28 @@ def fmp_price_history(ticker: str, limit: int = _HIST_LIMIT) -> pd.DataFrame:
         return out.dropna(subset=["Close"])
     except Exception:
         return pd.DataFrame()
+
+
+
+def _hist_window_bound(hist) -> bool:
+    """이력의 시작이 조회 창 하단 경계에 맞닿아 있는가.
+
+    갭 표본이 모자랄 때 원인이 **창**인지 **종목의 짧은 이력**인지 가르는
+    판별자다. 개수만 보면 두 원인이 구분되지 않는다 — 상장 1년 된 종목의
+    n=4 는 정상이고, 상장 10년 된 종목의 n=4 는 창이 짧다는 뜻이다.
+
+    창을 줄일 때 유일하게 위험한 실패 모드가 이것이다: measure_reaction 은
+    이벤트가 창 밖이면 값을 틀리게 주는 게 아니라 **측정을 조용히 건너뛴다**
+    (resolve_reaction_index 가 cand<=0 에서 None). 로그가 없으면 아무도 모른다.
+    """
+    try:
+        if hist is None or hist.empty:
+            return False
+        first = pd.Timestamp(hist.index[0]).date()
+        edge = datetime.now(_ET).date() - timedelta(days=_HIST_DAYS)
+        return (first - edge).days <= _HIST_EDGE_TOL_DAYS
+    except Exception:
+        return False
 
 
 # ── 대상 수집 ─────────────────────────────────────────────────────────────
@@ -493,8 +557,13 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
                                   f"({_inf['votes']['bmo']}b/{_inf['votes']['amc']}a "
                                   f"n={_inf['n']} {_inf['ratio']:.0%})")
                     if move is not None:
+                        _sn = int(move.get("sample_n") or 0)
                         print(f"  [MOVE] {tk} D-{dd} ±{move.get('median_pct')}% "
-                              f"n={move.get('sample_n')} ({move.get('confidence')})")
+                              f"n={_sn} ({move.get('confidence')})")
+                        if _sn < ec.GAP_QUARTERS and _hist_window_bound(hist):
+                            print(f"  [WARN] {tk} 갭 표본 {_sn}/{ec.GAP_QUARTERS} "
+                                  f"— 이력 시작이 조회 창 하단({_HIST_DAYS}일)과 "
+                                  f"맞닿음. 창 제약 의심 → _HIST_QUARTERS 상향 검토")
 
             _src = (ec.SOURCE_USER if (user_set is None or tk in user_set)
                     else ec.SOURCE_UNIVERSE)
@@ -692,12 +761,11 @@ def pass_delayed(rows, hist_cache, today):
 def pass_preview(cal, prev_rows, hist_cache, today, now_et, spy_hist=None):
     """D-7 / D-3 / 최종 스냅샷. Tier 1(보유+워치리스트)만.
 
-    스냅샷당 FMP 5콜:
-        earnings?symbol=          A블록(EPS·매출 컨센서스) + B블록(beat·서프라이즈)
-        price-target-consensus    목표주가
-        grades-historical         의견 수준·90일 변화
-        news/stock?symbols=       뉴스 증분
-        insider-trading/search    C블록 — 최근 90일 재량 내부자 거래(달러)
+    스냅샷당 FMP 4콜:
+        earnings?symbol=        A블록(EPS·매출 컨센서스) + B블록(beat·서프라이즈)
+        price-target-consensus  목표주가
+        grades-historical       의견 수준·90일 변화
+        news/stock?symbols=     뉴스 증분
     가격 이력은 hist_cache 재사용(0콜), SPY 는 실행당 1회.
 
     append-only. 이미 있는 (Event_ID, Phase) 는 절대 다시 쓰지 않는다 —
@@ -804,31 +872,12 @@ def pass_preview(cal, prev_rows, hist_cache, today, now_et, spy_hist=None):
             cnt, njson = ec.news_digest(news, since=since)
             m["news_count"], m["news_json"] = cnt, njson
 
-            # ── 콜 5: 내부자 거래 (C블록) ──
-            #   방향 신호로 쓰지 않는다. 검증되지 않은 가설이라 원자료만 적재하고
-            #   판정은 Pre_Ret_D1/D3/D7 이 쌓인 뒤 백테스트에 맡긴다.
-            ins = ec.fetch_insider_90d(tk, key=FMP_API_KEY, today=today)
-            if not ins.get("ok"):
-                flags.append("no_insider")
-            else:
-                m["ins_sale_val"] = ins.get("sale_val")
-                m["ins_sale_n"] = ins.get("sale_n")
-                m["ins_buy_val"] = ins.get("buy_val")
-                m["ins_cov_d"] = ins.get("cov_d")
-                _cov = ec._num(ins.get("cov_d"))
-                if _cov is not None and _cov < ec.PREVIEW_INSIDER_WINDOW:
-                    # 잘린 창이다. 이 행의 달러값은 다른 행과 비교하면 안 된다.
-                    flags.append("insider_short_window")
-                if ins.get("price_missing"):
-                    flags.append("insider_price_missing")
-
             m["flags"] = flags
             ev = {"ticker": tk, "earnings_date": ed, "days_until": dd, "timing": timing}
             new_rows.append(ec.preview_row(ev, phase, m, now_et=now_et))
             print(f"  [PREVIEW] {tk} {phase} D-{dd} {ed} "
                   f"EPS={m.get('est_eps')} 목표대비={_fmt1(m.get('target_upside_pct'))}% "
-                  f"RS={_fmt1(m.get('rs_20d_pct'))}%p 뉴스{cnt}건 "
-                  f"내부자매도={_fmt_usd(m.get('ins_sale_val'))}"
+                  f"RS={_fmt1(m.get('rs_20d_pct'))}%p 뉴스{cnt}건"
                   + (f" ⚠️{','.join(flags)}" if flags else ""))
         except Exception as e:
             print(f"  [WARN] {tk} 프리뷰 실패: {e}")
@@ -840,18 +889,6 @@ def pass_preview(cal, prev_rows, hist_cache, today, now_et, spy_hist=None):
 def _fmt1(v):
     n = ec._num(v)
     return "—" if n is None else f"{n:+.1f}"
-
-
-def _fmt_usd(v):
-    """달러 → 로그용 축약. 결측은 '—' (0 과 구분돼야 한다)."""
-    n = ec._num(v)
-    if n is None:
-        return "—"
-    if abs(n) >= 1e9:
-        return f"${n / 1e9:,.2f}B"
-    if abs(n) >= 1e6:
-        return f"${n / 1e6:,.1f}M"
-    return f"${n:,.0f}"
 
 
 # ── 수신자별 판정 (계좌 프로필 반영) ──────────────────────────────────────

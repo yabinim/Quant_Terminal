@@ -64,6 +64,8 @@ import fmp_extras as fx
 import run_narrative as nrt
 import run_drg_verify as drv
 import run_hidden_alpha as hid
+import run_earnings_watch as rew
+import earnings_core as ec
 
 PASS, FAIL = [], []
 
@@ -260,6 +262,37 @@ def _docstring_ids(t: ast.Module) -> set:
     return out
 
 
+def _manual_from_stmts(t: ast.Module) -> set:
+    """historical-price-eod URL 을 품은 **문 전체**에 손으로 쓴 from= 이 있는가.
+
+    `hist_url_nodes` 는 문자열 노드 단위라 연결 체인의 옆 항을 못 본다.
+    여기서는 URL 조각을 포함하는 최상위 문을 통째로 unparse 해서 검사한다.
+    `hist_range_params` 가 만든 from 은 소스에 리터럴로 나타나지 않으므로
+    오탐하지 않는다 — 리터럴 `from=` 이 보이면 그건 손으로 쓴 것이다.
+    """
+    docs = _docstring_ids(t)
+    hits = set()
+    for n in ast.walk(t):
+        if not isinstance(n, (ast.Assign, ast.Expr, ast.Return, ast.AugAssign)):
+            continue
+        try:
+            src = ast.unparse(n)
+        except Exception:
+            continue
+        # 독스트링 배제. `docs` 는 **Constant 노드**의 id 라 Expr 노드와는 안 맞는다
+        # (1차 작성에서 fmp_extras.hist_range_params 의 독스트링이 오탐했다 —
+        #  그 독스트링에 "historical-price-eod" 와 "&from=" 이 둘 다 들어 있다).
+        # 문자열만 있는 Expr 은 URL 조립일 수 없으므로 통째로 뺀다.
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) \
+                and isinstance(n.value.value, str):
+            continue
+        if id(n) in docs or "historical-price-eod" not in src:
+            continue
+        if "&from=" in src or "?from=" in src:
+            hits.add(n.lineno)
+    return hits
+
+
 def hist_url_nodes(t: ast.Module):
     """historical-price-eod **URL** 을 담은 문자열 노드들 — f-string 과 상수 양쪽.
 
@@ -328,7 +361,12 @@ def kw_int(call, name):
 # 검사 대상 — (모듈, 정의 함수, 호출부 함수, [(선언 bars, 결과 변수들)])
 # ══════════════════════════════════════════════════════════════════════════════
 _MODULES = {"fmp_extras": fx, "run_hidden_alpha": hid,
-            "run_narrative": nrt, "run_drg_verify": drv}
+            "run_narrative": nrt, "run_drg_verify": drv,
+            "run_earnings_watch": rew}
+# run_earnings_watch 는 `bars=` 인자가 아니라 **모듈 상수 하나**로 창을 정한다
+# (호출부 6곳이 hist_cache 를 공유하므로 창이 여러 벌이면 캐시 선점 순서에 따라
+#  이력 깊이가 달라진다). 그래서 _DEFS/_SITES 에는 넣지 않고, 정적 배선(C)과
+# 전용 군 [Q] 로 본다.
 
 # 창을 만드는 정의부 — 여기에 기본값이 있으면 호출부가 요구를 안 밝혀도 통과한다.
 _DEFS = [
@@ -412,12 +450,19 @@ def group_C():
         n_url = len(hist_url_nodes(t))
         chk(n_rp >= n_url, "C2a",
             f"{name}: hist_range_params {n_rp}회 ≥ URL {n_url}건")
-        manual = [ln for ln, lit in hist_url_nodes(t) if "&from=" in lit or "?from=" in lit]
+        # ⚠️ URL 노드 하나만 보면 안 된다. `f"...?symbol={t}" + "&from=..."` 처럼
+        #    **연결 체인의 다른 항**에 붙이면 URL 노드의 리터럴에는 from= 이 없다.
+        #    변이 M4 가 이 사각지대를 실증했다(C2a 가 대신 잡아 가려져 있었다).
+        #    URL 노드를 품은 대입/호출문 전체를 unparse 해서 본다.
+        manual = sorted({ln for ln, lit in hist_url_nodes(t)
+                         if "&from=" in lit or "?from=" in lit}
+                        | _manual_from_stmts(t))
         chk(not manual, "C2b",
             f"{name}: 손으로 쓴 &from= 없음" + (f" — {manual}" if manual else ""))
 
     # 원시 requests 가 남아 있으면 아래 런타임 군의 스텁이 그 경로를 못 가로챈다.
-    for name in ("run_narrative", "run_drg_verify", "run_hidden_alpha"):
+    for name in ("run_narrative", "run_drg_verify", "run_hidden_alpha",
+                 "run_earnings_watch"):
         t = tree(_MODULES[name])
         chk(not has_import(t, "requests"), "C3",
             f"{name}: import requests 없음 (래칫 — 되살리려면 임포트부터 다시)")
@@ -480,6 +525,85 @@ def group_C():
             and n.targets[0].id in ("start_date", "end_date")] if f else []
     chk(not dead, "C8b",
         "run_drg_verify: 죽은 start_date/end_date 제거됨" + (f" — {dead}" if dead else ""))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [Q] run_earnings_watch 의 분기 요구 — earnings_core 와의 락스텝
+# ══════════════════════════════════════════════════════════════════════════════
+def group_Q():
+    """창이 `past_earnings_dates` 가 실제로 돌려주는 이벤트 수를 덮는가.
+
+    ⚠️ 여기서 `12` 를 리터럴로 쓰지 않는다. 쓰면 진단이 정답을 들고 있는 셈이라
+       run_earnings_watch 의 `GAP_QUARTERS + 4` 를 `GAP_QUARTERS` 로 바꿔도
+       진단은 여전히 12 와 대조해 **통과한다**. 요구치는 earnings_core 의
+       시그니처 기본값에서, 선언치는 run_earnings_watch 의 상수에서 —
+       서로 다른 파일에서 독립으로 뽑아 대조한다.
+    """
+    print("\n[Q] 실적 레이더 분기 요구")
+
+    # 요구치: past_earnings_dates(limit=...) 의 기본값을 AST 로 판독
+    t_ec = tree(ec)
+    f = find_func(t_ec, "past_earnings_dates")
+    want = None
+    if f is not None:
+        names = [a.arg for a in f.args.args]
+        if "limit" in names:
+            pos = names.index("limit")
+            n_def = len(f.args.defaults)
+            if pos >= len(names) - n_def:
+                want = _const_int(f.args.defaults[pos - (len(names) - n_def)],
+                                  {"GAP_QUARTERS": ec.GAP_QUARTERS})
+    chk(want is not None, "Q1a",
+        f"earnings_core.past_earnings_dates: limit 기본값 판독 ({want})")
+
+    # 선언치: run_earnings_watch 의 모듈 상수
+    got = getattr(rew, "_HIST_QUARTERS", None)
+    chk(isinstance(got, int), "Q1b", f"run_earnings_watch._HIST_QUARTERS 존재 ({got})")
+
+    if want is not None and isinstance(got, int):
+        chk(got >= want, "Q2",
+            f"창 분기수 {got} ≥ past_earnings_dates 이벤트 수 {want}")
+
+    # 호출부가 limit 을 직접 넘기지 않는가 — 넘기면 위 대조가 공허해진다.
+    t_rew = tree(rew)
+    overridden = [c.lineno for c in calls_to(t_rew, "past_earnings_dates")
+                  if any(kw.arg == "limit" for kw in c.keywords)]
+    chk(not overridden, "Q3",
+        "run_earnings_watch: past_earnings_dates(limit=) 미지정(기본값 사용)"
+        + (f" — 지정됨 {overridden}" if overridden else ""))
+
+    # 공급 봉수가 요구를 덮는가. 요구 = 12분기 도달 + 거래량 기준 + 직전 종가.
+    days = getattr(rew, "_HIST_DAYS", None)
+    chk(isinstance(days, int) and days > 0,
+        "Q4a", f"run_earnings_watch._HIST_DAYS 존재 ({days})")
+    if isinstance(days, int) and want:
+        supply = fx.bars_for_calendar_days(days)
+        need_hard = fx.bars_for_calendar_days(want * 91.31) + 1
+        need_soft = need_hard + ec.VOLUME_BASELINE_BARS
+        chk(supply >= need_hard, "Q4b",
+            f"공급 {supply}봉 ≥ 하드 요구 {need_hard}봉"
+            f"({want}분기 도달 + 직전 종가)")
+        chk(supply >= need_soft, "Q4c",
+            f"공급 {supply}봉 ≥ 소프트 요구 {need_soft}봉"
+            f"(+거래량 기준 {ec.VOLUME_BASELINE_BARS}봉)")
+        chk(days <= fx.HIST_MAX_DAYS, "Q4d",
+            f"창 {days}일 ≤ 상한 {fx.HIST_MAX_DAYS}일")
+
+    # 창 제약 판별자가 살아 있는가. 개수만 보면 '창이 짧다'와 '종목 이력이
+    # 짧다'가 구분되지 않는다 — 이 함수가 유일한 판별자다.
+    wb = getattr(rew, "_hist_window_bound", None)
+    chk(callable(wb), "Q5a", "run_earnings_watch._hist_window_bound 존재")
+    if callable(wb):
+        now = datetime.now(rew._ET).date()
+        edge = pd.Timestamp(now - timedelta(days=rew._HIST_DAYS))
+        near = pd.DataFrame({"Close": [1.0, 2.0]},
+                            index=[edge, edge + timedelta(days=1)])
+        far = pd.DataFrame({"Close": [1.0, 2.0]},
+                           index=[edge + timedelta(days=400),
+                                  edge + timedelta(days=401)])
+        chk(wb(near) is True, "Q5b", "창 하단에 맞닿은 이력 → True")
+        chk(wb(far) is False, "Q5c", "훨씬 뒤에서 시작하는 이력 → False (종목 이력이 짧은 것)")
+        chk(wb(pd.DataFrame()) is False, "Q5d", "빈 이력 → False (단정하지 않는다)")
 
 
 def c_stop() -> bool:
@@ -773,11 +897,13 @@ def main():
     print("diag_hist_window_consumers — historical-price-eod 소비처 창 회귀")
     for name, mod in _MODULES.items():
         print(f"  {name:18s}: {mod.__file__}")
+    print(f"  earnings_core     : {ec.__file__}")
     print(f"  하네스             : {dhw.__file__} (스텁·AST 헬퍼 재사용)")
     print("=" * 78)
 
     group_C()
     group_R()
+    group_Q()
     if c_stop():
         group_E()
         group_B()
@@ -790,7 +916,7 @@ def main():
             print(f"  ❌ {f}")
         print("=" * 78)
         return 1
-    print("✅ 전 항목 통과 — 소비처 4곳의 창이 하류 요구치를 덮는다.")
+    print("✅ 전 항목 통과 — 소비처 5곳의 창이 하류 요구치를 덮는다.")
     print("=" * 78)
     return 0
 

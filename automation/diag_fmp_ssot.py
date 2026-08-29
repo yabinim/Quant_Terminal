@@ -156,7 +156,12 @@ _RAW_GET_BASELINE = {
     # run_drg_verify.py 도 같은 날 1곳 전환됐다(1 → 0). 이쪽은 더 나빴다 —
     #   429 면 fmp_r.json() 이 예외로 튀어 verify_prediction 이 빈 결과를
     #   돌려주고, 그날 DRG 검증이 통째로 사라진다.
-    "run_earnings_watch.py": 1,
+    # run_earnings_watch.py 는 2026-08-28 에 1곳 전환됐다(1 → 0). requests 임포트
+    #   자체를 지웠다 — 되살리려면 임포트를 다시 추가해야 한다.
+    #   기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
+    #   전환 이유는 스타일이 아니다: fmp_price_history 가 429 를 조용히 삼키면
+    #   빈 DataFrame 이 돌아가고, 그러면 실적 갭 표본이 줄어든 것이 "종목 이력이
+    #   짧다"와 **구분되지 않는다.** 예상 변동폭 confidence 가 조용히 강등된다.
     "industry_core.py": 1,
     "diag_earnings_preview_backtest.py": 1,
     "diag_industry_mapping.py": 1,

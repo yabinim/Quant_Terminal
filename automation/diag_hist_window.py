@@ -78,6 +78,19 @@ import fmp_extras as fx
 
 PASS, FAIL = [], []
 
+
+def _et_today():
+    """[D] 군의 '오늘' — `fx.hist_range_params` 와 **같은 시계**여야 한다.
+
+    ⚠️ naive `datetime.now()` 를 쓰면 안 된다. 창을 만드는 쪽은
+       `datetime.now(_ET_TZ)` 로 ET 날짜를 잡는데, 검사 쪽이 시스템 로컬(=UTC,
+       GitHub Actions 도 UTC)을 쓰면 **매일 20:00~24:00 ET 사이에 하루가
+       어긋나** D1d·D2a·D2b·D3b 가 통째로 실패한다. 코드는 멀쩡한데 스위트만
+       빨간불이 되고, 그런 스위트는 곧 아무도 안 읽는다.
+       (2026-08-28 실측: 00:27 UTC 실행 시 123/127. 같은 코드가 낮에는 127/127.)
+    """
+    return datetime.now(m._ET).date()
+
 def _find_repo_root(start: str) -> str:
     """app.py 가 있는 디렉터리를 위로 올라가며 찾는다.
 
@@ -1040,7 +1053,7 @@ def _drg_stub(order="oldest", blackout=None, log=None, supply=None):
         head, _, qs = p.partition("?")
         q = dict(kv.split("=", 1) for kv in qs.split("&") if "=" in kv)
         if head.startswith("historical-price-eod"):
-            today = datetime.now().date()
+            today = _et_today()
             d0 = datetime.strptime(q["from"], "%Y-%m-%d").date()
             d1 = min(datetime.strptime(q["to"], "%Y-%m-%d").date(), today)
             rows, d, px = [], d0, 100.0
@@ -1074,7 +1087,7 @@ def _drg_stub(order="oldest", blackout=None, log=None, supply=None):
                     {"sector": "Utilities", "averageChange": -0.5}]
         if head.startswith("economic-calendar"):
             return [{"country": "US", "impact": "High", "event": "CPI",
-                     "date": datetime.now().strftime("%Y-%m-%d")}]
+                     "date": _et_today().strftime("%Y-%m-%d")}]
         return []
     return _f
 
@@ -1151,7 +1164,7 @@ def group_D():
         "일봉 호출 전건에 from/to 존재")
     chk(not any("limit=" in p for p in log), "D1c",
         f"전 호출 URL 에 limit= 부재 ({len(log)}건)")
-    tom = (datetime.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+    tom = (_et_today() + timedelta(days=1)).strftime("%Y-%m-%d")
     chk(all(f"&to={tom}" in p for p in hist), "D1d",
         f"to 가 오늘+1 ({tom}) — hist_range_params 규약")
 
@@ -1163,7 +1176,7 @@ def group_D():
     for p in hist:
         q = dict(kv.split("=", 1) for kv in p.partition("?")[2].split("&") if "=" in kv)
         f = datetime.strptime(q["from"], "%Y-%m-%d").date()
-        widths.add((datetime.now().date() - f).days)
+        widths.add((_et_today() - f).days)
     chk(widths <= allowed, "D2a",
         f"관측 창 {sorted(widths)} ⊆ 정책 산출 {sorted(allowed)}")
     chk(max(widths) == fx.hist_days_for_bars(30), "D2b",
@@ -1197,7 +1210,7 @@ def group_D():
 
     # ── D4 — 최악 휴장: 7달력일 연속 휴장을 견디는가 ───────────────────────
     #   HIST_MIN_DAYS 의 존재 이유를 직접 검증한다. 하한을 지우면 여기서 깨진다.
-    _t = datetime.now().date()
+    _t = _et_today()
     out_bo, _, sup_bo = _run_macro(blackout=(_t - timedelta(days=8),
                                              _t - timedelta(days=2)))
     print(f"      · 7일 휴장 시 공급: "
