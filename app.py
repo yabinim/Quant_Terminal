@@ -377,6 +377,13 @@ _DIVIDEND_TRADE_ACTION = "DIV"
 _DIVIDEND_MEMO_TAG_DRIP = "[배당재투자]"
 _DIVIDEND_MEMO_TAG_CASH = "[배당현금]"
 
+# 매매 복기 분석 시작일(기본값). 이 날짜 **이전에 진입**한 포지션은 복기 통계에서
+# 제외한다 — 앱 도입 전 임의 매매가 승률·손익비를 오염시키기 때문.
+# ⚠️ 컷오프는 반드시 compute_closed_trades_detail **결과에** 적용한다.
+#    입력 trade_df 를 먼저 자르면 컷오프 이전 BUY 가 사라져 이후 SELL 이
+#    '매수 없는 매도'로 잡히고 FIFO 원가가 깨진다.
+_TRADE_REVIEW_DEFAULT_START = "2026-07-01"
+
 
 @st.cache_resource
 def get_gspread_client():
@@ -23587,24 +23594,109 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     st.info("아직 매매 기록이 없습니다. '종목 추가' 또는 '매도 기록'을 통해 거래를 기록하면 여기에 표시됩니다.")
                     st.caption("💡 동기화 버튼을 눌러도 안 나타나면 Google Sheets Quant_DB에 'Trade_History' 탭이 생성됐는지 확인해주세요.")
         else:
-            show_df = trade_hist_df.copy()
-            show_df["거래금액"] = show_df["shares"] * show_df["price"]
-            disp = show_df.rename(columns={
-                "account": "계좌", "ticker": "티커", "action": "매수/매도",
-                "shares": "수량", "price": "가격", "date": "날짜", "memo": "메모"
-            })[["날짜", "계좌", "티커", "매수/매도", "수량", "가격", "거래금액", "메모"]]
+            # ── 원장 뷰어 ────────────────────────────────────────────────────
+            #   과거에는 전 기간을 무필터로 통째 덤프해 3월 거래까지 함께 보였다.
+            #   기간·계좌·액션·티커 필터 + 최신순 정렬 + 요약을 붙인다.
+            #   이 블록은 **읽기 전용**(시트 쓰기 없음)이라 st.fragment 로 감싸
+            #   필터 변경이 포트폴리오 탭 전체를 재실행하지 않게 한다.
+            #   (구버전 Streamlit 대비 getattr 폴백 — 없으면 그냥 전체 리런)
+            _ledger_frag = (getattr(st, "fragment", None)
+                            or getattr(st, "experimental_fragment", None))
 
-            def _c_act2(v):
-                if str(v).upper() == "BUY": return "color:#2563eb;font-weight:700;"
-                if str(v).upper() == "SELL": return "color:#dc2626;font-weight:700;"
-                return ""
+            def _render_trade_ledger(_src=trade_hist_df):
+                _led = _src.copy()
+                _led["_dt"] = pd.to_datetime(_led["date"], errors="coerce")
 
-            st.dataframe(
-                disp.style
-                .format({"수량": "{:,.4f}", "가격": "${:,.4f}", "거래금액": "${:,.2f}"}, na_rep="N/A")
-                .map(_c_act2, subset=["매수/매도"]),
-                use_container_width=True, hide_index=True,
-            )
+                _f1, _f2, _f3 = st.columns([1.1, 1.2, 1.0])
+                with _f1:
+                    _led_period = st.selectbox(
+                        "기간", ["최근 3개월", "최근 6개월", "최근 12개월", "전체"],
+                        index=0, key="_tl_period",
+                        help="기본은 최근 3개월입니다. 오래된 원장까지 보려면 '전체'를 고르세요.",
+                    )
+                with _f2:
+                    _acct_all = sorted({str(a).strip() for a in _led["account"].astype(str)
+                                        if str(a).strip()})
+                    _led_accts = st.multiselect(
+                        "계좌", _acct_all, default=[], key="_tl_accts",
+                        help="비워두면 전체 계좌입니다.",
+                    )
+                with _f3:
+                    _led_act = st.selectbox(
+                        "구분", ["전체", "BUY", "SELL", "DIV"], index=0, key="_tl_action",
+                        help="DIV 는 현금 배당 기록입니다(실현손익 계산에는 미포함).",
+                    )
+                _led_tk = st.text_input(
+                    "티커 검색", value="", placeholder="예: NVDA  (비우면 전체)",
+                    key="_tl_ticker",
+                ).strip().upper()
+
+                _n_total = len(_led)
+                _days = {"최근 3개월": 92, "최근 6개월": 183, "최근 12개월": 366}.get(_led_period)
+                if _days:
+                    _cut = pd.Timestamp(datetime.now(_MARKET_ET_TZ).date()) - pd.Timedelta(days=_days)
+                    # 날짜 파싱 실패 행은 버리지 않는다 — 원장 누락이 더 위험하다.
+                    _led = _led[_led["_dt"].isna() | (_led["_dt"] >= _cut)]
+                if _led_accts:
+                    _led = _led[_led["account"].astype(str).str.strip().isin(_led_accts)]
+                if _led_act != "전체":
+                    _led = _led[_led["action"].astype(str).str.strip().str.upper() == _led_act]
+                if _led_tk:
+                    _led = _led[_led["ticker"].astype(str).str.upper().str.contains(_led_tk, na=False)]
+
+                if _led.empty:
+                    st.info(f"조건에 맞는 거래가 없습니다. (전체 {_n_total}건 중 0건)")
+                    return
+
+                _led = _led.sort_values("_dt", ascending=False, na_position="last")
+                _led["거래금액"] = pd.to_numeric(_led["shares"], errors="coerce") * \
+                                 pd.to_numeric(_led["price"], errors="coerce")
+
+                _act_u = _led["action"].astype(str).str.strip().str.upper()
+                _buy_sum = float(_led.loc[_act_u == "BUY", "거래금액"].sum(skipna=True))
+                _sell_sum = float(_led.loc[_act_u == "SELL", "거래금액"].sum(skipna=True))
+                _m1, _m2, _m3, _m4 = st.columns(4)
+                with _m1:
+                    st.metric("표시 건수", f"{len(_led):,}건", help=f"전체 원장 {_n_total:,}건 중")
+                with _m2:
+                    st.metric("매수 합계", f"${_buy_sum:,.2f}")
+                with _m3:
+                    st.metric("매도 합계", f"${_sell_sum:,.2f}")
+                with _m4:
+                    st.metric("순현금흐름", f"${(_sell_sum - _buy_sum):+,.2f}",
+                              help="매도 합계 − 매수 합계. 실현손익이 아니라 현금 이동액입니다.")
+
+                disp = _led.rename(columns={
+                    "account": "계좌", "ticker": "티커", "action": "매수/매도",
+                    "shares": "수량", "price": "가격", "date": "날짜", "memo": "메모"
+                })[["날짜", "계좌", "티커", "매수/매도", "수량", "가격", "거래금액", "메모"]]
+
+                def _c_act2(v):
+                    if str(v).upper() == "BUY": return "color:#2563eb;font-weight:700;"
+                    if str(v).upper() == "SELL": return "color:#dc2626;font-weight:700;"
+                    if str(v).upper() == "DIV": return "color:#059669;font-weight:700;"
+                    return ""
+
+                st.dataframe(
+                    disp.style
+                    .format({"수량": "{:,.4f}", "가격": "${:,.4f}", "거래금액": "${:,.2f}"}, na_rep="N/A")
+                    .map(_c_act2, subset=["매수/매도"]),
+                    use_container_width=True, hide_index=True,
+                    height=(420 if len(disp) > 12 else None),
+                )
+                try:
+                    st.download_button(
+                        "⬇️ 현재 조건 CSV 저장",
+                        data=disp.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"trade_history_{datetime.now(_MARKET_ET_TZ).strftime('%Y%m%d')}.csv",
+                        mime="text/csv", key="_tl_csv", use_container_width=True,
+                    )
+                except Exception:
+                    pass
+
+            if callable(_ledger_frag):
+                _render_trade_ledger = _ledger_frag(_render_trade_ledger)
+            _render_trade_ledger()
 
     elif main_nav == _MAIN_NAV_OPTIONS[8]:
         # ─────────────────────────────────────────────────────────────────────
@@ -25219,44 +25311,44 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         _bp_acct_opts = list(_wl_acct_opts) + ["직접 입력"]
                         _bp_acct_idx = (_bp_acct_opts.index(_bp_acct_cur)
                                         if _bp_acct_cur in _bp_acct_opts else len(_bp_acct_opts) - 1)
-                        _bp_acct_sel = st.selectbox(
-                            "🏦 매수한 계좌", _bp_acct_opts, index=_bp_acct_idx,
-                            key=f"wl_buy_acct_{idx}_{tk}",
-                            help="워치리스트 귀속 계좌가 기본값입니다.",
-                        )
-                        _bp_mode = st.radio(
-                            "입력 방식", ["수량으로", "금액($)으로"], horizontal=True,
-                            key=f"wl_buy_mode_{idx}_{tk}",
-                            help="금액 방식: 매수가 + 투입 금액($)을 넣으면 수량을 자동 계산합니다.",
-                        )
 
+                        # ⚠️ 계좌 selectbox·입력방식 radio 는 반드시 st.form **안**에 둔다.
+                        #    폼 밖 위젯은 값이 바뀔 때마다 스크립트를 통째로 재실행하므로
+                        #    워치리스트 전 종목이 재계산되고 expander 가 접힌다.
+                        #    폼 안에서는 조건부 렌더가 제출 전까지 갱신되지 않으니,
+                        #    '직접 입력' 칸과 수량/금액 칸을 **항상 노출**하고 제출 시점에 판정한다.
+                        #    (제출 로직은 _bp_acct_sel / _bp_mode 로 사용할 칸을 고르므로 불변)
                         with st.form(f"wl_buy_form_{idx}_{tk}", clear_on_submit=False):
-                            if _bp_acct_sel == "직접 입력":
-                                _bp_acct_custom = st.text_input(
-                                    "계좌명 직접 입력", value="",
-                                    placeholder="예: robinhood, Fidelity Roth",
-                                    key=f"wl_buy_acct_custom_{idx}_{tk}",
-                                )
-                            else:
-                                _bp_acct_custom = ""
+                            _bp_acct_sel = st.selectbox(
+                                "🏦 매수한 계좌", _bp_acct_opts, index=_bp_acct_idx,
+                                key=f"wl_buy_acct_{idx}_{tk}",
+                                help="워치리스트 귀속 계좌가 기본값입니다.",
+                            )
+                            _bp_acct_custom = st.text_input(
+                                "계좌명 직접 입력 (위에서 '직접 입력'을 고른 경우에만 사용)", value="",
+                                placeholder="예: robinhood, Fidelity Roth",
+                                key=f"wl_buy_acct_custom_{idx}_{tk}",
+                            )
                             _bp_price = st.number_input(
                                 "💵 실제 매수가", min_value=0.0,
                                 value=(float(current_price) if pd.notna(current_price) else 0.0),
                                 step=0.01, format="%.2f", key=f"wl_buy_px_{idx}_{tk}",
                                 help="현재가가 기본값입니다. 실제 체결가로 수정하세요.",
                             )
-                            if _bp_mode == "금액($)으로":
-                                _bp_amt = st.number_input(
-                                    "투입 금액 ($)", min_value=0.0, value=_bp_dollars_def,
-                                    step=10.0, format="%.2f", key=f"wl_buy_amt_{idx}_{tk}",
-                                )
-                                _bp_qty = 0.0
-                            else:
-                                _bp_amt = 0.0
-                                _bp_qty = st.number_input(
-                                    "수량", min_value=0.0, value=_bp_shares_def,
-                                    step=1.0, format="%.4f", key=f"wl_buy_qty_{idx}_{tk}",
-                                )
+                            _bp_mode = st.radio(
+                                "입력 방식", ["수량으로", "금액($)으로"], horizontal=True,
+                                key=f"wl_buy_mode_{idx}_{tk}",
+                                help="선택한 쪽 칸만 사용합니다. 금액 방식은 금액 ÷ 매수가로 수량을 자동 계산합니다.",
+                            )
+                            _bp_qty = st.number_input(
+                                "수량 — '수량으로' 선택 시 사용", min_value=0.0, value=_bp_shares_def,
+                                step=1.0, format="%.4f", key=f"wl_buy_qty_{idx}_{tk}",
+                            )
+                            _bp_amt = st.number_input(
+                                "투입 금액 ($) — '금액($)으로' 선택 시 사용", min_value=0.0,
+                                value=_bp_dollars_def,
+                                step=10.0, format="%.2f", key=f"wl_buy_amt_{idx}_{tk}",
+                            )
                             _bp_thesis = st.selectbox(
                                 "📌 투자 Thesis", options=_wl_thesis_labels, index=0,
                                 key=f"wl_buy_thesis_{idx}_{tk}",
@@ -25704,12 +25796,52 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             except Exception as exc:
                 st.error(f"거래 내역을 불러오지 못했습니다: {exc}")
 
-            if closed is None or closed.empty:
-                st.info(
-                    "아직 분석할 **청산 거래**가 없습니다. `🛡️ [4단계] 포트폴리오 매도 레이더` 탭의 "
-                    "**💸 매도 기록**으로 매도를 남기면 여기서 자동으로 복기됩니다."
+            # ── 분석 시작일 컷오프 ────────────────────────────────────────
+            #   앱 도입(2026-07) 이전의 임의 매매가 승률·손익비를 왜곡하므로
+            #   **진입일(first_buy_date) 기준**으로 잘라낸다. 매도일 기준으로 자르면
+            #   3월에 산 포지션이 8월 매도로 다시 섞여 들어온다.
+            try:
+                _rv_default = datetime.strptime(_TRADE_REVIEW_DEFAULT_START, "%Y-%m-%d").date()
+            except Exception:
+                _rv_default = datetime.now(_MARKET_ET_TZ).date()
+            _rc1, _rc2 = st.columns([1, 1.4])
+            with _rc1:
+                _rv_all = st.checkbox(
+                    "전체 기간 보기", value=False, key="_rv_all_period",
+                    help="체크하면 컷오프 없이 모든 청산 거래를 분석합니다.",
                 )
+            with _rc2:
+                _rv_start = st.date_input(
+                    "분석 시작일 (이 날짜 이후 **진입**한 거래만)",
+                    value=_rv_default, key="_rv_start_date", disabled=_rv_all,
+                    help="앱 도입 전 임의 매매를 통계에서 제외합니다. 포지션을 연 첫 매수일 기준.",
+                )
+            _rv_cut = None if _rv_all else pd.Timestamp(_rv_start)
+
+            _rv_before = 0 if (closed is None or closed.empty) else len(closed)
+            if _rv_cut is not None and closed is not None and not closed.empty:
+                _fb = pd.to_datetime(closed["first_buy_date"], errors="coerce")
+                # 진입일을 알 수 없는 행(NaT)은 판정 불가 → 보수적으로 제외한다.
+                closed = closed[_fb.notna() & (_fb >= _rv_cut)].copy()
+            _rv_excluded = _rv_before - (0 if (closed is None or closed.empty) else len(closed))
+
+            if closed is None or closed.empty:
+                if _rv_cut is not None and _rv_before > 0:
+                    st.info(
+                        f"**{_rv_start:%Y-%m-%d} 이후 진입**한 청산 거래가 없습니다. "
+                        f"(컷오프로 {_rv_excluded}건 제외 — 이전 기록을 보려면 '전체 기간 보기'를 켜세요.)"
+                    )
+                else:
+                    st.info(
+                        "아직 분석할 **청산 거래**가 없습니다. `🛡️ [4단계] 포트폴리오 매도 레이더` 탭의 "
+                        "**💸 매도 기록**으로 매도를 남기면 여기서 자동으로 복기됩니다."
+                    )
             else:
+                if _rv_cut is not None and _rv_excluded > 0:
+                    st.caption(
+                        f"🗓️ **{_rv_start:%Y-%m-%d} 이후 진입** 기준 — 이전 진입 {_rv_excluded}건은 "
+                        "통계에서 제외했습니다. (원가·보유기간은 전체 원장으로 FIFO 계산한 뒤 필터하므로 정확합니다.)"
+                    )
                 # 카테고리·보유기간·진입신호 부착
                 tmap = build_trade_thesis_map(puid)
                 closed = closed.copy()
@@ -25717,11 +25849,33 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 closed["보유기간"] = closed["holding_days"].apply(_trade_review_hold_bucket)
                 closed["진입신호"] = closed.get("entry_reason", "🧩 기타 / 미기록")
 
+                # 컷오프 일관성 헬퍼 — compute_realized_pnl 결과에는 진입일이 없으므로
+                # 이미 걸러진 closed 의 (티커|계좌|매도일) 키와 교집합을 취한다.
+                # 여기서 키를 만들어 둔다: 아래에서 closed 가 재할당되기 전 시점.
+                def _rv_key_series(_df):
+                    return (_df["ticker"].astype(str).str.upper().str.strip() + "|"
+                            + _df["account"].astype(str).str.strip() + "|"
+                            + _df["sell_date"].astype(str).str.strip())
+
+                _rv_keys = None if _rv_cut is None else set(_rv_key_series(closed))
+
+                def _rv_apply_cutoff(_df):
+                    if _rv_keys is None or _df is None or _df.empty:
+                        return _df
+                    try:
+                        return _df[_rv_key_series(_df).isin(_rv_keys)]
+                    except Exception:
+                        return _df
+
                 # ── 매수 기록 없어 제외된 매도 경고 ──────────────────────────
+                #   미매칭 매도는 진입일이 없으므로 **매도일** 기준으로 같은 컷오프를 적용한다.
                 try:
                     _unmatched = find_unmatched_sells(_tr_df)
                 except Exception:
                     _unmatched = pd.DataFrame()
+                if _rv_cut is not None and _unmatched is not None and not _unmatched.empty:
+                    _usd = pd.to_datetime(_unmatched["sell_date"], errors="coerce")
+                    _unmatched = _unmatched[_usd.notna() & (_usd >= _rv_cut)]
                 if _unmatched is not None and not _unmatched.empty:
                     _u_tk = ", ".join(sorted(_unmatched["ticker"].astype(str).unique())[:12])
                     st.warning(
@@ -25914,7 +26068,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     )
 
                 # ── 💰 실현 손익 상세 + 📈 누적 차트 (매도 레이더에서 이동) ────
-                _pnl_df = compute_realized_pnl(_tr_df)
+                _pnl_df = _rv_apply_cutoff(compute_realized_pnl(_tr_df))
                 with st.expander("💰 실현 손익 상세 (FIFO · 평균단가)", expanded=False):
                     if _pnl_df is None or _pnl_df.empty:
                         st.info("실현된 손익이 없습니다. 매도 기록이 있어야 계산됩니다.")
@@ -25947,7 +26101,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         )
 
                 with st.expander("📈 누적 손익 차트", expanded=False):
-                    _pnl_c = compute_realized_pnl(_tr_df)
+                    _pnl_c = _rv_apply_cutoff(compute_realized_pnl(_tr_df))
                     if _pnl_c is None or _pnl_c.empty:
                         st.info("실현 손익 데이터가 없습니다.")
                     else:
