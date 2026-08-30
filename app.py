@@ -21413,7 +21413,8 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     "유니버스 **Top 5 밖**이면 셀 앞에 🔴가 붙습니다. (랭킹은 1시간 캐시)"
                 )
                 with st.spinner("기관급 포트폴리오 레이더를 계산하는 중..."):
-                    sell_radar_df = build_portfolio_sell_radar_df(filtered_portfolio_df)
+                    with _timed("PF 매도레이더 계산"):
+                        sell_radar_df = build_portfolio_sell_radar_df(filtered_portfolio_df)
                     # 포트폴리오 스냅샷 자동 저장 (일 1회)
                     _ph_uid = str(st.session_state.get("user_id") or "").strip()
                     _ph_last = st.session_state.get("_portfolio_snapshot_saved_date")
