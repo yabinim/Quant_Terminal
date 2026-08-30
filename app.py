@@ -3241,6 +3241,16 @@ _MAIN_NAV_OPTIONS = (
     NAV_SETTINGS,
 )
 
+# 사이드바 표시용 묶음. 평탄화하면 _MAIN_NAV_OPTIONS 와 순서까지 같아야 한다
+# (diag_startup [1] 이 강제한다). 관리자 항목은 런타임에 마지막 그룹에 붙는다.
+_NAV_GROUPS = (
+    ("시작하기", (NAV_HOME, NAV_DRG)),
+    ("분석 도구", (NAV_MACRO, NAV_NARRATIVE, NAV_SECTOR, NAV_SCANNER, NAV_STOCK)),
+    ("포트폴리오", (NAV_RADAR, NAV_EARNINGS, NAV_REVIEW, NAV_WATCHLIST)),
+    ("AI 인사이트", (NAV_HITRATE, NAV_IDEA, NAV_WEEKLY, NAV_EMERGING)),
+    ("도움말 · 계정", (NAV_GUIDE, NAV_SETTINGS)),
+)
+
 
 _NARRATIVE_RECORD_SOURCE_WEEKLY_7D = "weekly_trend_7d"
 
@@ -16147,9 +16157,12 @@ if st.session_state.get("logged_in"):
     _boot_mark("워치리스트 알림 점검")
 
     _nav_key = "main_sidebar_nav"
-    _nav_opts = list(_MAIN_NAV_OPTIONS)
+    # 그룹 묶음 — 관리자 항목은 마지막 그룹(도움말 · 계정)에 붙인다.
+    _nav_groups = [(g, list(items)) for g, items in _NAV_GROUPS]
     if st.session_state.get("user_role") == "admin":
-        _nav_opts.append(_NAV_ADMIN_APPROVAL)
+        _nav_groups[-1][1].append(_NAV_ADMIN_APPROVAL)
+    _nav_opts = [t for _g, _items in _nav_groups for t in _items]
+
     # 탭 간 이동(시작 화면 바로가기·알림 배너)은 라벨로 목적지를 지정한다.
     # 예전에는 숫자 인덱스였고, 목록에 항목을 하나 끼우면 전부 어긋났다.
     _goto = st.session_state.pop("main_nav_goto", None)
@@ -16157,14 +16170,30 @@ if st.session_state.get("logged_in"):
         st.session_state[_nav_key] = _goto
     _cur_nav = st.session_state.get(_nav_key)
     if _cur_nav not in _nav_opts:
-        st.session_state[_nav_key] = _nav_opts[0]
-    
-    main_nav = st.sidebar.radio(
-        "탑다운 단계",
-        _nav_opts,
-        key=_nav_key,
-        label_visibility="collapsed",
-    )
+        _cur_nav = _nav_opts[0]
+        st.session_state[_nav_key] = _cur_nav
+
+    # 라디오 17개를 한 줄로 늘어놓으면 그 아래 티커 입력·투자 메모가 스크롤
+    # 밖으로 밀린다. 활성 탭이 속한 그룹만 펼쳐 평소 보이는 줄을 줄인다.
+    #   expander 여닫기는 프런트엔드 동작이라 rerun 을 일으키지 않는다 →
+    #   다른 그룹을 열어보는 것은 자유롭고, 탭을 누른 뒤에만 다시 정렬된다.
+    def _nav_go(_dest):
+        st.session_state[_nav_key] = _dest
+
+    for _gname, _gitems in _nav_groups:
+        if not _gitems:
+            continue
+        with st.sidebar.expander(_gname, expanded=(_cur_nav in _gitems)):
+            for _t in _gitems:
+                st.button(
+                    _t,
+                    key=f"_nav_btn_{_t}",
+                    use_container_width=True,
+                    type=("primary" if _t == _cur_nav else "secondary"),
+                    on_click=_nav_go,
+                    args=(_t,),
+                )
+    main_nav = _cur_nav
 
     # ── 🏦 활성 계좌 — 전 탭 공유 사이징 컨텍스트 (스키마 변경 없음) ──
     _uid_side = str(st.session_state.get("user_id") or "").strip()
