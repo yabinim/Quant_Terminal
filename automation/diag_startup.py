@@ -5,10 +5,11 @@ app.py 를 **소스로 검사**한다(streamlit 없이 import 할 수 없으므�
 
 지키려는 위험
 ─────────────
-  1. 메뉴 인덱스 밀림
-       _MAIN_NAV_OPTIONS 중간에 항목을 끼우면 _MAIN_NAV_OPTIONS[n] 분기가
-       전부 한 칸씩 밀려 엉뚱한 페이지가 열린다. 새 항목은 **맨 뒤 append**,
-       표시 순서만 _nav_opts 에서 재배치해야 한다.
+  1. 메뉴 인덱스 결합 부활
+       예전에는 _MAIN_NAV_OPTIONS[n] 정수 인덱스가 분기 46곳 + 이동 통로
+       7곳을 묶고 있어, 목록 중간에 항목을 끼우면 전부 한 칸씩 밀렸다.
+       지금은 NAV_* 이름 상수를 쓴다. 인덱스나 main_nav_idx 가 다시
+       들어오면 그 취약성이 그대로 돌아온다 — 잔재 0 을 강제한다.
   2. 시작 페이지가 무거워짐
        착지 지점을 옮긴 이유가 사라진다. FMP 호출·가격 이력·DRG 계산이
        _render_home 안에 들어오면 안 된다.
@@ -52,6 +53,23 @@ if _APP is None:
     print("❌ app.py 를 찾지 못했다")
     sys.exit(1)
 
+
+def _strip_comments(text):
+    """주석을 지운 사본. '인덱스 잔재 0' 검사가 설명 주석에 걸리지 않게 한다."""
+    import io
+    import tokenize
+    lines = text.split("\n")
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                r, c0 = tok.start
+                c1 = tok.end[1]
+                ln = lines[r - 1]
+                lines[r - 1] = ln[:c0] + " " * (c1 - c0) + ln[c1:]
+    except Exception:
+        return text
+    return "\n".join(lines)
+
 SRC = open(_APP, encoding="utf-8").read()
 TREE = ast.parse(SRC)
 
@@ -66,28 +84,71 @@ def fn_src(name):
 
 TOPLEVEL = {n.name for n in TREE.body if isinstance(n, ast.FunctionDef)}
 
-print("\n[1] 메뉴 구성 — 인덱스가 밀리면 안 된다")
+CODE = _strip_comments(SRC)
+
+print("\n[1] 메뉴 구성 — 이름 상수로만 묶여야 한다")
 _nav = next((n for n in TREE.body if isinstance(n, ast.Assign)
              and getattr(n.targets[0], "id", "") == "_MAIN_NAV_OPTIONS"), None)
 check("_MAIN_NAV_OPTIONS 존재", _nav is not None)
-if _nav is not None:
-    opts = [e.value for e in _nav.value.elts]
-    check("항목 17개", len(opts) == 17, f"got {len(opts)}")
-    # 기존 인덱스 분기가 의존하는 자리들 — 하나라도 밀리면 오작동한다
-    for idx, want in ((0, "Daily Risk Gauge"), (6, "포트폴리오 매도 레이더"),
-                      (7, "Buy Watchlist"), (12, "사용 가이드"),
-                      (13, "매매 복기"), (14, "내 설정"), (15, "실적 레이더")):
-        check(f"index {idx} = {want}", want in opts[idx], f"got {opts[idx]!r}")
-    check("시작 페이지가 맨 뒤(index 16)", "시작" in opts[16], f"got {opts[16]!r}")
-    check("항목이 전부 유일", len(set(opts)) == len(opts))
 
-print("\n[2] 표시 순서 재배치 — 시작이 맨 앞")
-check("_nav_opts 에서 시작을 0번으로 삽입",
-      "_nav_opts.insert(0, _home_label)" in SRC)
-check("_MAIN_NAV_OPTIONS[16] 을 참조", "_MAIN_NAV_OPTIONS[16]" in SRC)
-check("라우팅 분기 존재",
-      re.search(r"if main_nav == _MAIN_NAV_OPTIONS\[16\]", SRC) is not None)
-check("_render_home 호출", "_render_home()" in SRC)
+# 모듈 레벨 NAV_* 상수 수집 (이름 → 라벨)
+NAVC, NAVPOS = {}, {}
+for n in TREE.body:
+    if isinstance(n, ast.Assign) and len(n.targets) == 1:
+        t = n.targets[0]
+        if (isinstance(t, ast.Name) and t.id.startswith("NAV_")
+                and isinstance(n.value, ast.Constant)
+                and isinstance(n.value.value, str)):
+            NAVC[t.id] = n.value.value
+            NAVPOS[t.id] = n.lineno
+
+if _nav is not None:
+    elts = _nav.value.elts
+    check("항목 17개", len(elts) == 17, f"got {len(elts)}")
+    # 문자열 리터럴이 섞이면 상수 결합이 깨진 것이다 — 그 항목만 이름이 없다
+    lits = [ast.get_source_segment(SRC, e) for e in elts
+            if not isinstance(e, ast.Name)]
+    check("전 항목이 이름 참조 (리터럴 혼입 없음)", not lits, f"리터럴 {lits}")
+
+    names = [e.id for e in elts if isinstance(e, ast.Name)]
+    check("참조 상수가 전부 정의됨",
+          all(x in NAVC for x in names),
+          f"미정의 {[x for x in names if x not in NAVC]}")
+    labels = [NAVC[x] for x in names if x in NAVC]
+    check("라벨이 전부 유일", len(set(labels)) == len(labels))
+    check("첫 항목이 NAV_HOME (로그인 후 착지 지점)",
+          names[:1] == ["NAV_HOME"], f"got {names[:1]}")
+
+    # 새로 생긴 제약: 상수 정의가 소비처보다 앞서야 한다
+    _last_const = max(NAVPOS.values()) if NAVPOS else 10**9
+    check("상수 정의 < _MAIN_NAV_OPTIONS 정의",
+          _last_const < _nav.lineno, f"상수 {_last_const} / 튜플 {_nav.lineno}")
+    _home_def = next((n.lineno for n in TREE.body
+                      if isinstance(n, ast.FunctionDef) and n.name == "_render_home"),
+                     10**9)
+    check("상수 정의 < _render_home (바로가기가 참조한다)",
+          _last_const < _home_def, f"상수 {_last_const} / _render_home {_home_def}")
+
+print("\n[2] 인덱스 결합 회귀 금지")
+check("_MAIN_NAV_OPTIONS[n] 잔재 0", "_MAIN_NAV_OPTIONS[" not in CODE,
+      f"{CODE.count('_MAIN_NAV_OPTIONS[')}곳")
+check("main_nav_idx 잔재 0", "main_nav_idx" not in CODE,
+      f"{CODE.count('main_nav_idx')}곳")
+check("표시 순서 재배치 로직 제거됨",
+      "_nav_opts.insert(" not in CODE)
+check("이동 통로는 라벨 기반", 'st.session_state.pop("main_nav_goto"' in CODE)
+
+_branch = re.findall(r"main_nav == (NAV_[A-Z_]+)", CODE)
+check("dispatch 분기 17개", len(_branch) == 17, f"got {len(_branch)}")
+check("분기가 상수당 정확히 1회",
+      len(set(_branch)) == len(_branch),
+      f"중복 {[x for x in set(_branch) if _branch.count(x) > 1]}")
+if _nav is not None:
+    _tup = {e.id for e in _nav.value.elts if isinstance(e, ast.Name)}
+    check("분기 집합 == 메뉴 집합", set(_branch) == _tup,
+          f"메뉴만 {_tup - set(_branch)} / 분기만 {set(_branch) - _tup}")
+check("관리자 분기 유지", "main_nav == _NAV_ADMIN_APPROVAL" in CODE)
+check("_render_home 호출", "_render_home()" in CODE)
 
 print("\n[3] 시작 페이지는 가벼워야 한다")
 home = fn_src("_render_home")
@@ -100,8 +161,10 @@ if home:
         check(f"{bad} 미호출", bad not in home,
               "시작 화면이 무거워진다")
     check("사용 가이드 안내 포함", "사용 가이드" in home)
-    check("가이드로 이동 index 12",
-          'st.session_state["main_nav_idx"] = 12' in home)
+    check("가이드로 이동 = NAV_GUIDE",
+          'st.session_state["main_nav_goto"] = NAV_GUIDE' in home)
+    check("바로가기가 라벨 상수를 쓴다",
+          "NAV_DRG" in home and "NAV_RADAR" in home and "NAV_WATCHLIST" in home)
     check("시트 읽기는 허용 — 실적 캘린더 사용",
           "load_earnings_calendar" in home)
 
@@ -132,7 +195,7 @@ if m:
 # 게이트가 무거운 계산보다 앞에 있어야 의미가 있다.
 # ⚠️ 전역 find 를 쓰면 안 된다 — fetch_latest_prices_for_tickers 는 다른 탭에도
 #    있어서 앞쪽 것을 잡고 오판한다. 실적 레이더 섹션 안으로 범위를 좁힌다.
-i_sec = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[15]:")
+i_sec = SRC.find("elif main_nav == NAV_EARNINGS:")
 check("실적 레이더 섹션 발견", i_sec != -1)
 SEC = SRC[i_sec:]
 i_gate = SEC.find("_e_ck = (")
@@ -182,8 +245,8 @@ check("놓치지 않는다는 안내", "5PM" in home7 or "이메일" in home7)
 
 print("\n[8] 사용 가이드 — 신규 기능이 문서화됐는가")
 # 시작 화면이 "가이드부터 보라"고 안내하므로 가이드가 낡으면 안내가 해가 된다.
-i_g = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[12]:")
-j_g = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[14]:", i_g)
+i_g = SRC.find("elif main_nav == NAV_GUIDE:")
+j_g = SRC.find("elif main_nav == NAV_SETTINGS:", i_g)
 GUIDE = SRC[i_g:j_g] if (i_g != -1 and j_g > i_g) else ""
 check("가이드 구간 발견", len(GUIDE) > 1000)
 for topic, needle in (("🏠 시작", "**시작** — 로그인 직후 착지"),
@@ -210,8 +273,8 @@ print("\n[9] 알림 점검 — 소비 탭에서만 자동 실행")
 # '첫 탭 이동' 시점으로 옮겨졌다. 계산이 전혀 없는 사용 가이드에서 20초를 맞았다.
 # 알림 결과를 쓰는 곳은 index 7(Buy Watchlist) 하나뿐이다.
 check("소비 탭 판정 존재", "_wl_needed" in SRC)
-check("index 7 을 본다",
-      re.search(r"_wl_needed = \(_nav_now == _MAIN_NAV_OPTIONS\[7\]\)", SRC)
+check("워치리스트 게이트가 NAV_WATCHLIST 를 본다",
+      re.search(r"_wl_needed = \(_nav_now == NAV_WATCHLIST\)", SRC)
       is not None)
 check("게이트가 _wl_needed 를 쓴다",
       re.search(r"_wl_defer = \(not _wl_needed\)", SRC) is not None)
@@ -223,8 +286,8 @@ home9 = fn_src("_render_home") or ""
 check("시작 화면 안내가 소비 탭을 지목", "Buy Watchlist & Alert` 탭" in home9)
 
 print("\n[10] 매도 레이더 — 계측 누락 구간 없음")
-i_pf = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[6]:")
-j_pf = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[7]:", i_pf)
+i_pf = SRC.find("elif main_nav == NAV_RADAR:")
+j_pf = SRC.find("elif main_nav == NAV_WATCHLIST:", i_pf)
 PF = SRC[i_pf:j_pf] if (i_pf != -1 and j_pf > i_pf) else ""
 check("매도 레이더 구간 발견", len(PF) > 1000)
 for span in ("PF 배당 스캔", "PF 일봉 프리페치", "PF 매도레이더 계산",
@@ -351,8 +414,8 @@ check("경로 길이 상한", "[:48]" in W)
 check("집계가 잠금 안에서", W.find("_FMP_STATS_LOCK") < W.find('setdefault("by_ep"'))
 
 print("\n[18] 섹터 탭 — 계측 누락 구간")
-i_s3 = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[3]:")
-j_s3 = SRC.find("elif main_nav == _MAIN_NAV_OPTIONS[5]:", i_s3)
+i_s3 = SRC.find("elif main_nav == NAV_SECTOR:")
+j_s3 = SRC.find("elif main_nav == NAV_STOCK:", i_s3)
 S3 = SRC[i_s3:j_s3] if (i_s3 != -1 and j_s3 > i_s3) else ""
 check("섹터 탭 구간 발견", len(S3) > 1000)
 for span in ("섹터 ETF 종가", "섹터 PER", "테마 ETF 수익률",
