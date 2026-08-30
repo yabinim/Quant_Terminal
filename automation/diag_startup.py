@@ -129,6 +129,23 @@ if _nav is not None:
     check("상수 정의 < _render_home (바로가기가 참조한다)",
           _last_const < _home_def, f"상수 {_last_const} / _render_home {_home_def}")
 
+# ── 그룹 묶음(A-2) — 평탄화가 메뉴와 어긋나면 탭이 사라지거나 중복된다 ──
+_grp = next((n for n in TREE.body if isinstance(n, ast.Assign)
+             and getattr(n.targets[0], "id", "") == "_NAV_GROUPS"), None)
+check("_NAV_GROUPS 존재", _grp is not None)
+if _grp is not None and _nav is not None:
+    _gnames, _flat = [], []
+    for pair in _grp.value.elts:
+        _gnames.append(pair.elts[0].value)
+        _flat += [e.id for e in pair.elts[1].elts if isinstance(e, ast.Name)]
+    _menu = [e.id for e in _nav.value.elts if isinstance(e, ast.Name)]
+    check("그룹 평탄화 == 메뉴 (순서까지)", _flat == _menu,
+          f"그룹만 {set(_flat) - set(_menu)} / 메뉴만 {set(_menu) - set(_flat)}")
+    check("그룹 이름이 유일", len(set(_gnames)) == len(_gnames))
+    check("탭이 정확히 한 그룹에만", len(set(_flat)) == len(_flat),
+          f"중복 {[x for x in set(_flat) if _flat.count(x) > 1]}")
+    check("그룹 5개", len(_gnames) == 5, f"got {len(_gnames)}")
+
 print("\n[2] 인덱스 결합 회귀 금지")
 check("_MAIN_NAV_OPTIONS[n] 잔재 0", "_MAIN_NAV_OPTIONS[" not in CODE,
       f"{CODE.count('_MAIN_NAV_OPTIONS[')}곳")
@@ -147,6 +164,10 @@ if _nav is not None:
     _tup = {e.id for e in _nav.value.elts if isinstance(e, ast.Name)}
     check("분기 집합 == 메뉴 집합", set(_branch) == _tup,
           f"메뉴만 {_tup - set(_branch)} / 분기만 {set(_branch) - _tup}")
+check("그룹 expander 로 그린다", "st.sidebar.expander(_gname" in CODE)
+check("탭 버튼이 콜백으로 이동", "on_click=_nav_go" in CODE)
+check("활성 탭 강조", 'type=("primary" if _t == _cur_nav else "secondary")' in CODE)
+check("관리자 항목이 그룹에 편입", "_nav_groups[-1][1].append(_NAV_ADMIN_APPROVAL)" in CODE)
 check("관리자 분기 유지", "main_nav == _NAV_ADMIN_APPROVAL" in CODE)
 check("_render_home 호출", "_render_home()" in CODE)
 
