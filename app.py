@@ -295,6 +295,27 @@ _DRG_PREDICTIONS_SHEET_COLS = [
     "is_correct", "review_comment",
     "revised_direction", "revised_full_text", "revision_reason", "revised_at", "is_revised"
 ]
+# ── 네비게이션 라벨 상수 ───────────────────────────────────────────────
+#   분기·이동 통로는 전부 이 이름을 쓴다. 인덱스(_MAIN_NAV_OPTIONS[n])와
+#   숫자 리터럴(main_nav_idx = 12)은 라벨을 하나 끼우면 전부 어긋났다.
+#   순서를 바꾸거나 탭을 추가해도 이름이 같으면 분기는 안전하다.
+NAV_HOME = "🏠 시작"
+NAV_DRG = "🚨 Daily Risk Gauge"
+NAV_MACRO = "🌐 [1단계] 거시경제 지표"
+NAV_NARRATIVE = "📰 [1단계] 시장 내러티브"
+NAV_SECTOR = "🎯 [2단계] 섹터 & 자금 흐름"
+NAV_SCANNER = "🚀 [2단계] AI 종목 스캐너"
+NAV_STOCK = "🔬 [3단계] 개별 종목 정밀 검사"
+NAV_RADAR = "🛡️ [4단계] 포트폴리오 매도 레이더"
+NAV_EARNINGS = "📅 실적 레이더"
+NAV_REVIEW = "📊 매매 복기"
+NAV_WATCHLIST = "🔔 Buy Watchlist & Alert"
+NAV_HITRATE = "📊 [AI] 내러티브 적중률 트래커"
+NAV_IDEA = "💡 [AI] Idea-to-Portfolio 추적"
+NAV_WEEKLY = "📋 [AI] 주간 포트폴리오 요약"
+NAV_EMERGING = "📡 [AI] Emerging 종목 추적기"
+NAV_GUIDE = "📖 사용 가이드"
+NAV_SETTINGS = "⚙️ 내 설정"
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
 _THESIS_WORKSHEET_TITLE = "Thesis"
 _WATCHLIST_SHEET_TITLE = "Watchlist"
@@ -987,7 +1008,7 @@ def _render_home() -> None:
         "**손실 방지 제약**이라는 전제를 먼저 이해하고 쓰는 편이 안전합니다."
     )
     if st.button("📖 사용 가이드 열기", use_container_width=True):
-        st.session_state["main_nav_idx"] = 12
+        st.session_state["main_nav_goto"] = NAV_GUIDE
         st.rerun()
 
     st.divider()
@@ -1027,7 +1048,7 @@ def _render_home() -> None:
             st.markdown(" · ".join(f"**{t}**(D-{d})" for d, t, _e in _soon[:12])
                         + (" 외" if len(_soon) > 12 else ""))
             if st.button("📅 실적 레이더에서 보기", use_container_width=True):
-                st.session_state["main_nav_idx"] = 15
+                st.session_state["main_nav_goto"] = NAV_EARNINGS
                 st.rerun()
     except Exception:
         pass
@@ -1043,7 +1064,7 @@ def _render_home() -> None:
                        + ", ".join(str(t) for t in _hits))
             if st.button("🔔 Buy Watchlist & Alert 에서 보기",
                          use_container_width=True):
-                st.session_state["main_nav_idx"] = 7
+                st.session_state["main_nav_goto"] = NAV_WATCHLIST
                 st.rerun()
     else:
         if st.button("🔔 워치리스트 알림 확인", use_container_width=True):
@@ -1062,12 +1083,12 @@ def _render_home() -> None:
     st.divider()
     st.markdown("## 바로 가기")
     _c1, _c2, _c3 = st.columns(3)
-    for _col, _label, _idx in (
-            (_c1, "🚨 Daily Risk Gauge", 0),
-            (_c2, "🛡️ 포트폴리오 매도 레이더", 6),
-            (_c3, "🔔 Buy Watchlist & Alert", 7)):
-        if _col.button(_label, use_container_width=True, key=f"_home_go_{_idx}"):
-            st.session_state["main_nav_idx"] = _idx
+    for _col, _label, _dest in (
+            (_c1, "🚨 Daily Risk Gauge", NAV_DRG),
+            (_c2, "🛡️ 포트폴리오 매도 레이더", NAV_RADAR),
+            (_c3, "🔔 Buy Watchlist & Alert", NAV_WATCHLIST)):
+        if _col.button(_label, use_container_width=True, key=f"_home_go_{_dest}"):
+            st.session_state["main_nav_goto"] = _dest
             st.rerun()
     st.caption(
         "**시장 위험도(DRG)는 이 화면에서 계산하지 않습니다.** 시작 화면은 시트만 읽어 "
@@ -3193,35 +3214,31 @@ def _render_guest_guide():
 
 
 # 사이드바 메인 내비게이션 (탑다운: 단일 radio, 옵션 문자열로 분기)
+# 화면에 그려지는 순서 그대로다. 재배치 로직이 따로 없다 —
+# 순서를 바꾸려면 이 목록에서 줄을 옮기면 된다(분기는 이름을 쓰므로 안전).
 _MAIN_NAV_OPTIONS = (
-    # ── 시작하기 ───────────────────────────────────────────────────────────
-    "🚨 Daily Risk Gauge",
-    # ── 분석 도구 ──────────────────────────────────────────────────────────
-    "🌐 [1단계] 거시경제 지표",
-    "📰 [1단계] 시장 내러티브",
-    "🎯 [2단계] 섹터 & 자금 흐름",
-    "🚀 [2단계] AI 종목 스캐너",
-    "🔬 [3단계] 개별 종목 정밀 검사",
-    # ── 포트폴리오 관리 ────────────────────────────────────────────────────
-    "🛡️ [4단계] 포트폴리오 매도 레이더",
-    "🔔 Buy Watchlist & Alert",
-    # ── AI 인사이트 ────────────────────────────────────────────────────────
-    "📊 [AI] 내러티브 적중률 트래커",
-    "💡 [AI] Idea-to-Portfolio 추적",
-    "📋 [AI] 주간 포트폴리오 요약",
-    "📡 [AI] Emerging 종목 추적기",
-    # ── 도움말 ─────────────────────────────────────────────────────────────
-    "📖 사용 가이드",
-    # ── 복기 (index 13: 인덱스 분기 호환 위해 맨 끝에 append) ────────────────
-    "📊 매매 복기",
-    # ── 계정 (index 14: 맨 끝 append — 기존 인덱스 분기 불변) ────────────────
-    "⚙️ 내 설정",
-    # ── 실적 (index 15: 맨 끝 append — 표시 순서는 아래 _nav_opts 에서 재배치) ──
-    "📅 실적 레이더",
-    # ── 시작 (index 16: 맨 끝 append — 표시 순서는 _nav_opts 에서 맨 앞으로) ──
-    #   ⚠️ 반드시 맨 뒤에 붙인다. 중간에 끼우면 _MAIN_NAV_OPTIONS[n] 인덱스 분기가
-    #      전부 한 칸씩 밀려 엉뚱한 페이지가 열린다.
-    "🏠 시작",
+    # ── 시작하기 ───────────────────────────────────────────────────────
+    NAV_HOME,
+    NAV_DRG,
+    # ── 분석 도구 ──────────────────────────────────────────────────────
+    NAV_MACRO,
+    NAV_NARRATIVE,
+    NAV_SECTOR,
+    NAV_SCANNER,
+    NAV_STOCK,
+    # ── 포트폴리오 관리 ────────────────────────────────────────────────
+    NAV_RADAR,
+    NAV_EARNINGS,
+    NAV_REVIEW,
+    NAV_WATCHLIST,
+    # ── AI 인사이트 ────────────────────────────────────────────────────
+    NAV_HITRATE,
+    NAV_IDEA,
+    NAV_WEEKLY,
+    NAV_EMERGING,
+    # ── 도움말 · 계정 ──────────────────────────────────────────────────
+    NAV_GUIDE,
+    NAV_SETTINGS,
 )
 
 
@@ -3516,7 +3533,7 @@ def macro_traffic_light(bad_total, total_indicators: int = 11):
     else:
         st.success(
             f"🟢 **[초록불] 매크로 환경 안정적** — {total_indicators}개 지표 중 경고 {bad_total}개. "
-            f"「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털과 매수 타점을 확인한 뒤 투자를 진행하세요."
+            f"「{NAV_SCANNER}」에서 펀더멘털과 매수 타점을 확인한 뒤 투자를 진행하세요."
         )
 
 
@@ -14141,7 +14158,7 @@ def resolve_opportunity_scanner_narrative_for_direct_mode():
     return {
         "summary": (
             "사용자 지정 섹터/티커 스캔입니다. "
-            f"「{_MAIN_NAV_OPTIONS[1]}」 메뉴에서 분석을 실행해 두면 같은 유니버스에 대해 Narrative Alignment 점수가 더 잘 맞습니다."
+            f"「{NAV_MACRO}」 메뉴에서 분석을 실행해 두면 같은 유니버스에 대해 Narrative Alignment 점수가 더 잘 맞습니다."
         ),
         "themes": [],
     }
@@ -14251,7 +14268,7 @@ def render_opportunity_scanner_snapshot(snap):
             # 아이디어A: 1클릭으로 3단계 정밀검사 탭으로 이동
             def _goto_micro(tk=tk_scan):
                 st.session_state["selected_ticker"] = tk
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                st.session_state["main_sidebar_nav"] = NAV_STOCK
             st.button(f"🔬 {tk_scan} 정밀검사",
                 key=f"scanner_goto_micro_{rank_idx}_{tk_scan}",
                 on_click=_goto_micro,
@@ -14295,7 +14312,7 @@ def render_opportunity_scanner_snapshot(snap):
                     st.button(f"🔔 {_rtk}", key=f"rem_wl_{_ri}_{_rtk}", on_click=_add_rem_wl, use_container_width=True)
                 def _goto_micro_rem(tk=_rtk):
                     st.session_state["selected_ticker"] = tk
-                    st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                    st.session_state["main_sidebar_nav"] = NAV_STOCK
                 st.button(f"🔬 {_rtk}", key=f"rem_micro_{_ri}_{_rtk}", on_click=_goto_micro_rem, use_container_width=True, help="3단계 정밀검사로 이동")
     else:
         st.caption("유니버스 종목 수가 3개 이하라 추가 표시는 없습니다.")
@@ -14475,7 +14492,7 @@ def render_opportunity_emerging_snapshot(snap):
         with _em_btn_c2:
             def _goto_micro_em(tk=tk_em):
                 st.session_state["selected_ticker"] = tk
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                st.session_state["main_sidebar_nav"] = NAV_STOCK
             st.button(
                 f"🔬 {tk_em} 정밀검사",
                 key=f"em_snap_micro_{rank_idx}_{tk_em}",
@@ -14651,7 +14668,7 @@ def render_opportunity_expansion_snapshot(snap):
         with _x_c2:
             def _goto_micro_x(tk=tk_x):
                 st.session_state["selected_ticker"] = tk
-                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                st.session_state["main_sidebar_nav"] = NAV_STOCK
             st.button(
                 f"🔬 {tk_x} 정밀검사",
                 key=f"x_snap_micro_{rank_idx}_{tk_x}",
@@ -16011,7 +16028,7 @@ if st.session_state.get("logged_in"):
     #      놓칠 걱정은 없다 — 평일 2PM·5PM 이메일이 같은 알림을 보내고,
     #      시작 화면에 즉시 실행 버튼이 있다.
     _nav_now = st.session_state.get("main_sidebar_nav")
-    _wl_needed = (_nav_now == _MAIN_NAV_OPTIONS[7])
+    _wl_needed = (_nav_now == NAV_WATCHLIST)
     _wl_defer = (not _wl_needed) and not bool(
         st.session_state.pop("_wl_check_now", False))
 
@@ -16131,37 +16148,13 @@ if st.session_state.get("logged_in"):
 
     _nav_key = "main_sidebar_nav"
     _nav_opts = list(_MAIN_NAV_OPTIONS)
-    # 표시 순서만 재배치: '📊 매매 복기'를 '🛡️ [4단계] 포트폴리오 매도 레이더'(index 6) 바로 뒤로.
-    # (분기는 문자열 비교이므로 _MAIN_NAV_OPTIONS 인덱스/cross-nav는 영향 없음)
-    try:
-        _review_label = _MAIN_NAV_OPTIONS[13]
-        _radar_label = _MAIN_NAV_OPTIONS[6]
-        if _review_label in _nav_opts and _radar_label in _nav_opts:
-            _nav_opts.remove(_review_label)
-            _nav_opts.insert(_nav_opts.index(_radar_label) + 1, _review_label)
-        # 📅 실적 레이더(index 15)도 포트폴리오 관리 묶음으로 끌어올린다.
-        _earn_label = _MAIN_NAV_OPTIONS[15]
-        if _earn_label in _nav_opts and _radar_label in _nav_opts:
-            _nav_opts.remove(_earn_label)
-            _nav_opts.insert(_nav_opts.index(_radar_label) + 1, _earn_label)
-        # 🏠 시작(index 16)을 맨 앞으로. 로그인 직후 기본 착지 지점이 된다.
-        #   DRG 는 스냅샷 즉시 반환 구조지만 콜드 스타트에서 백그라운드 재계산이
-        #   돌면서 첫 화면 체감이 느렸다. 시작 페이지는 시트만 읽어 즉시 뜬다.
-        _home_label = _MAIN_NAV_OPTIONS[16]
-        if _home_label in _nav_opts:
-            _nav_opts.remove(_home_label)
-            _nav_opts.insert(0, _home_label)
-    except Exception:
-        pass
     if st.session_state.get("user_role") == "admin":
         _nav_opts.append(_NAV_ADMIN_APPROVAL)
-    if "main_nav_idx" in st.session_state:
-        try:
-            _omi = int(st.session_state.pop("main_nav_idx"))
-            if 0 <= _omi < len(_MAIN_NAV_OPTIONS):
-                st.session_state[_nav_key] = _MAIN_NAV_OPTIONS[_omi]
-        except (TypeError, ValueError):
-            st.session_state.pop("main_nav_idx", None)
+    # 탭 간 이동(시작 화면 바로가기·알림 배너)은 라벨로 목적지를 지정한다.
+    # 예전에는 숫자 인덱스였고, 목록에 항목을 하나 끼우면 전부 어긋났다.
+    _goto = st.session_state.pop("main_nav_goto", None)
+    if _goto in _nav_opts:
+        st.session_state[_nav_key] = _goto
     _cur_nav = st.session_state.get(_nav_key)
     if _cur_nav not in _nav_opts:
         st.session_state[_nav_key] = _nav_opts[0]
@@ -16278,7 +16271,7 @@ if st.session_state.get("logged_in"):
             st.sidebar.error(f"저장 실패: {_err_wl_save}")
 
     def _goto_watchlist():
-        st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[7]
+        st.session_state["main_sidebar_nav"] = NAV_WATCHLIST
 
     st.sidebar.button(
         "🔔 Watchlist 전체 보기",
@@ -16430,10 +16423,10 @@ if st.session_state.get("logged_in"):
     _tab_hint(main_nav)
 
     # 🏠 시작 — 시트만 읽고 즉시 렌더. 어떤 계산도 트리거하지 않는다.
-    if main_nav == _MAIN_NAV_OPTIONS[16]:
+    if main_nav == NAV_HOME:
         _render_home()
 
-    elif main_nav == _MAIN_NAV_OPTIONS[0]:
+    elif main_nav == NAV_DRG:
         # ─────────────────────────────────────────────────────────────────────
         # 🚨 Daily Risk Gauge
         # ─────────────────────────────────────────────────────────────────────
@@ -17200,9 +17193,9 @@ if st.session_state.get("logged_in"):
                 "새로운 뉴스·이벤트 발생 시 '🗑️ 초기화' 후 재분석을 권장합니다."
             )
 
-    elif main_nav == _MAIN_NAV_OPTIONS[1]:
+    elif main_nav == NAV_MACRO:
         render_sync_button("sync_tab_macro", [cached_analyze_us_macro_dashboard.clear], "불러온 지표는 세션 동안 캐시됩니다.")
-        st.subheader(f"{_MAIN_NAV_OPTIONS[1]} · 미국 거시경제 대시보드")
+        st.subheader(f"{NAV_MACRO} · 미국 거시경제 대시보드")
         st.caption("FRED API + FMP Treasury/Economics API 기준. 금리차는 FMP 실시간, 월간 지표는 FRED. 판단은 참고용 휴리스틱입니다.")
 
         try:
@@ -17370,7 +17363,7 @@ if st.session_state.get("logged_in"):
             st.error("거시경제 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
             st.exception(e)
     
-    elif main_nav == _MAIN_NAV_OPTIONS[2]:
+    elif main_nav == NAV_NARRATIVE:
         hydrate_narrative_from_disk_once()
     
         nrow_1, nrow_2 = st.columns([1, 3])
@@ -17389,7 +17382,7 @@ if st.session_state.get("logged_in"):
     
         header_col_1, header_col_2 = st.columns([3, 1])
         with header_col_1:
-            st.subheader(f"{_MAIN_NAV_OPTIONS[2]} · AI 시장 내러티브 분석")
+            st.subheader(f"{NAV_NARRATIVE} · AI 시장 내러티브 분석")
         with header_col_2:
             language_option = st.radio(
                 "언어",
@@ -17955,7 +17948,7 @@ if st.session_state.get("logged_in"):
                         ]
                         st.info(
                             f"주간 트렌드 결과를 Google 시트 **`Narratives`**에 저장했습니다. "
-                            f"「{_MAIN_NAV_OPTIONS[3]}」의 「주간 메가 트렌드」 소스에서 사용할 수 있습니다."
+                            f"「{NAV_SECTOR}」의 「주간 메가 트렌드」 소스에서 사용할 수 있습니다."
                         )
     
         if btn_wow:
@@ -18101,7 +18094,7 @@ if st.session_state.get("logged_in"):
                                 st.markdown(f"**{ui_text['sentiment']}**\n\n{deep_result.get('market_sentiment', 'N/A')}")
                                 st.markdown(f"**{ui_text['outlook']}**\n\n{deep_result.get('forward_outlook', 'N/A')}")
     
-    elif main_nav == _MAIN_NAV_OPTIONS[4]:
+    elif main_nav == NAV_SCANNER:
         render_sync_button("sync_tab_scanner", [], "스캐너 결과 캐시를 초기화합니다.")
 
         # ── 세션 최초 진입 시 Sheets에서 마지막 스캔 결과 복원 ──────────────
@@ -18126,7 +18119,7 @@ if st.session_state.get("logged_in"):
                         st.session_state["scanner_results_expansion"] = _restored_x
             st.session_state["_scanner_last_result_restored"] = True
 
-        st.subheader(f"{_MAIN_NAV_OPTIONS[4]} · 3-버킷 (주도주·대기주·확산주)")
+        st.subheader(f"{NAV_SCANNER} · 3-버킷 (주도주·대기주·확산주)")
         st.caption(
             "winners∪emerging 후보 풀을 regime(추세 단계)으로 라우팅: **주도주**(강세 추세)·**대기주**(베이스/출발 직전)로 분기하고, "
             "**확산주**는 내러티브의 expanding_to(2·3차 후발)를 감시 티어로 스코어링합니다. 모든 점수는 절대 앵커링."
@@ -18428,7 +18421,7 @@ if st.session_state.get("logged_in"):
             else:
                 st.caption(
                     "`Quant_DB` / `Narratives`에서 **가장 최근 주간 트렌드(최근 7일)** 저장분의 티커 풀·브리핑을 사용합니다. "
-                    f"「{_MAIN_NAV_OPTIONS[1]}」 메뉴에서 「📊 주간 트렌드 추출」 실행 시 `Narratives` 시트에 자동 저장됩니다."
+                    f"「{NAV_MACRO}」 메뉴에서 「📊 주간 트렌드 추출」 실행 시 `Narratives` 시트에 자동 저장됩니다."
                 )
     
             run_scanner = st.button("Current Leaders 스캔", key="run_ai_opportunity_scanner", use_container_width=True, type="primary")
@@ -18463,7 +18456,7 @@ if st.session_state.get("logged_in"):
                     scanner_mode_saved = "내러티브 기반 스캔"
                     if not isinstance(latest_analysis, dict) or latest_analysis.get("source") != _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
                         st.warning(
-                            f"저장된 주간 트렌드(최근 7일) 분석이 없습니다. 「{_MAIN_NAV_OPTIONS[1]}」에서 "
+                            f"저장된 주간 트렌드(최근 7일) 분석이 없습니다. 「{NAV_MACRO}」에서 "
                             "「📊 주간 트렌드 추출 (최근 7일)」을 먼저 실행해 주세요."
                         )
                     elif not target_universe:
@@ -18646,7 +18639,7 @@ if st.session_state.get("logged_in"):
                     scanner_mode_saved_em = "내러티브 기반 스캔"
                     if not isinstance(latest_a_em, dict) or latest_a_em.get("source") != _NARRATIVE_RECORD_SOURCE_WEEKLY_7D:
                         st.warning(
-                            f"저장된 주간 트렌드(최근 7일) 분석이 없습니다. 「{_MAIN_NAV_OPTIONS[1]}」에서 "
+                            f"저장된 주간 트렌드(최근 7일) 분석이 없습니다. 「{NAV_MACRO}」에서 "
                             "「📊 주간 트렌드 추출 (최근 7일)」을 먼저 실행해 주세요."
                         )
                     elif not target_u_em:
@@ -18800,7 +18793,7 @@ if st.session_state.get("logged_in"):
             elif not run_expansion:
                 st.caption("확산주 스캔을 실행하면 2·3차 후발 수혜주가 감시 티어로 표시됩니다.")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[3]:
+    elif main_nav == NAV_SECTOR:
         syn_s1, syn_s2 = st.columns([1, 3])
         with syn_s1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_sector", use_container_width=True):
@@ -18883,7 +18876,7 @@ if st.session_state.get("logged_in"):
                 else:
                     st.info("정리 대상 ETF가 없어요. 리스트 품질이 좋은 상태예요.")
 
-        st.subheader(f"{_MAIN_NAV_OPTIONS[3]} · 섹터 ETF 상대 강도")
+        st.subheader(f"{NAV_SECTOR} · 섹터 ETF 상대 강도")
         st.caption(
             "미국 시장 GICS 11개 대형 섹터의 상대 강도 + 현재 PER을 한눈에 보고 (최근 1년 수익률 기준), "
             "섹터를 골라 테마 ETF → 주도주·저평가 후발주까지 내려갈 수 있어요."
@@ -19043,7 +19036,7 @@ if st.session_state.get("logged_in"):
 
                 st.info(
                     "🚀 주도주는 추세에 올라타고, 💎 저평가 후발주는 2·3차 수혜를 노리는 종목입니다. "
-                    f"티커를 사이드바에 입력한 뒤 「{_MAIN_NAV_OPTIONS[4]}」에서 펀더멘털·매수 타점을 확인하세요."
+                    f"티커를 사이드바에 입력한 뒤 「{NAV_SCANNER}」에서 펀더멘털·매수 타점을 확인하세요."
                 )
 
                 # ── 🛰️ 위성 섹터 Top10 (월간 리밸런싱 후보 · SSOT: fmp_extras) ──
@@ -19182,7 +19175,7 @@ if st.session_state.get("logged_in"):
             )
             st.markdown(
                 "💡 [Ryan's Alpha Strategy] 1주와 1개월 수익률이 모두 초록색인 상위 3~5개 ETF에 분할 투자하는 방식은 "
-                f"'추세 추종(Momentum)'의 정석입니다. 단, 매수 전 「{_MAIN_NAV_OPTIONS[4]}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
+                f"'추세 추종(Momentum)'의 정석입니다. 단, 매수 전 「{NAV_SCANNER}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
             )
 
         st.info(
@@ -19470,7 +19463,7 @@ if st.session_state.get("logged_in"):
                         else:
                             st.warning("⚠️ 모멘텀 약화 초기 신호 — 매도 준비 또는 손절 라인 설정 권장")
     
-    elif main_nav == _MAIN_NAV_OPTIONS[5]:
+    elif main_nav == NAV_STOCK:
         render_sync_button(
             "sync_tab_stock",
             [cached_evaluate_kpis_snapshot.clear, cached_etf_holdings_universe_str.clear,
@@ -19479,7 +19472,7 @@ if st.session_state.get("logged_in"):
              _fmp_profile.clear, _fmp_ratios.clear, _fmp_key_metrics.clear, _fmp_cashflow.clear],
             "종목별 재무·차트·회사정보 캐시를 비우고 최신 데이터를 받습니다.",
         )
-        st.subheader(_MAIN_NAV_OPTIONS[5])
+        st.subheader(NAV_STOCK)
         st.caption(
             "사이드바의 분석 티커 기준입니다. **상단**에서 펀더멘털·KPI(또는 ETF 건전성)를 확인한 뒤, **하단**에서 RSI·이동평균으로 매수 타점을 점검하세요."
         )
@@ -21283,7 +21276,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
         else:
             st.caption("등급 변경 히스토리 데이터를 찾을 수 없습니다.")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[6]:
+    elif main_nav == NAV_RADAR:
         syn_p1, syn_p2 = st.columns([1, 3])
         with syn_p1:
             if st.button("🔄 현재 페이지 데이터 동기화", key="sync_tab_portfolio", use_container_width=True):
@@ -21302,7 +21295,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 "시세·ETF 유니버스 모멘텀 랭킹(1시간 TTL)·종목 유형(quoteType) 캐시를 비우고 레이더를 다시 계산합니다."
             )
     
-        st.subheader(_MAIN_NAV_OPTIONS[6])
+        st.subheader(NAV_RADAR)
         st.caption(
             "Google 시트 `Quant_DB` / **Portfolios** 한 줄은 "
             "`[ID, Account, Ticker, AvgPrice, Quantity, Date_Added]` 입니다. "
@@ -23748,7 +23741,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     _render_trade_ledger = _ledger_frag(_render_trade_ledger)
                 _render_trade_ledger()
 
-    elif main_nav == _MAIN_NAV_OPTIONS[8]:
+    elif main_nav == NAV_HITRATE:
         # ─────────────────────────────────────────────────────────────────────
         # 🎯 AI 내러티브 적중률 트래커
         # Narratives 시트에 저장된 Winners/Emerging 티커의 실제 수익률을 역산해
@@ -24219,7 +24212,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         "이벤트는 **2일 확정 + 5일 쿨다운**으로 경계 진동(중복)을 걸러냈고, 이벤트수가 적은 버킷은 통계가 불안정할 수 있습니다."
                     )
 
-    elif main_nav == _MAIN_NAV_OPTIONS[9]:
+    elif main_nav == NAV_IDEA:
         render_sync_button("sync_tab_idea", [], "Idea-to-Portfolio 데이터를 다시 불러옵니다.")
         # ─────────────────────────────────────────────────────────────────────
         # 💡 Idea-to-Portfolio 추적
@@ -24366,7 +24359,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             )
             st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
 
-    elif main_nav == _MAIN_NAV_OPTIONS[10]:
+    elif main_nav == NAV_WEEKLY:
         render_sync_button("sync_tab_weekly", [], "주간 요약 데이터를 다시 불러옵니다.")
         # ─────────────────────────────────────────────────────────────────────
         # 📋 주간 포트폴리오 AI 요약
@@ -24523,12 +24516,12 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             st.markdown(latest_summary)
             st.caption("이 리포트는 `Narratives` 시트에 자동 저장됩니다. 과거 기록은 위의 '📚 이전 주간 요약 기록 보기'에서 볼 수 있어요. 투자 권유가 아닙니다.")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[7]:
+    elif main_nav == NAV_WATCHLIST:
         # ─────────────────────────────────────────────────────────────────────
         # 🔔 Buy Watchlist & Alert
         # 관심 종목 등록 + 매수 조건(목표가/RSI/200일선) 자동 체크
         # ─────────────────────────────────────────────────────────────────────
-        st.subheader(_MAIN_NAV_OPTIONS[7])
+        st.subheader(NAV_WATCHLIST)
         st.caption(
             "관심 종목을 등록하고 **매수 조건**을 설정하세요. "
             "앱 접속 시 조건이 자동으로 체크되며, 발동 시 상단에 알림이 표시됩니다."
@@ -25124,7 +25117,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
 
                             def _goto_micro_wl(_t=tk):
                                 st.session_state["selected_ticker"] = _t
-                                st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                                st.session_state["main_sidebar_nav"] = NAV_STOCK
                             st.button(f"🔬 {tk} 정밀 검사로 자세히 보기",
                                       key=f"wl_goto_micro_{idx}_{tk}",
                                       on_click=_goto_micro_wl,
@@ -25595,7 +25588,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     with btn_col1:
                         def _goto_analysis(ticker=tk):
                             st.session_state["selected_ticker"] = ticker
-                            st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                            st.session_state["main_sidebar_nav"] = NAV_STOCK
                         st.button(
                             f"📌 {tk} 분석하기",
                             key=f"wl_pick_{idx}",
@@ -25673,7 +25666,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     else:
                         st.error(f"저장 실패: {err_fix}")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[11]:
+    elif main_nav == NAV_EMERGING:
         render_sync_button("sync_tab_emerging", [], "Emerging 추적 데이터를 다시 불러옵니다.")
         # ─────────────────────────────────────────────────────────────────────
         # 📡 Emerging 종목 추적기
@@ -25743,7 +25736,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     with col_a:
                         def _goto_stock(tk=row["Ticker"]):
                             st.session_state["selected_ticker"] = tk
-                            st.session_state["main_sidebar_nav"] = _MAIN_NAV_OPTIONS[5]
+                            st.session_state["main_sidebar_nav"] = NAV_STOCK
                         st.button(f"🔬 {row['Ticker']} 분석", key=f"et_goto_{row['Ticker']}", on_click=_goto_stock)
 
             # ── 반복 등장 종목 ─────────────────────────────────────────────
@@ -25824,13 +25817,13 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                 else:
                     st.error(f"삭제 실패: {err_del}")
 
-    elif main_nav == _MAIN_NAV_OPTIONS[13]:
+    elif main_nav == NAV_REVIEW:
         # ─────────────────────────────────────────────────────────────────────
         # 📊 매매 복기 (Trade Review) — Chunk 1
         # 청산된 거래를 thesis 카테고리·보유기간별로 분석해 '어디서 돈을 버는지' 파악.
         # 기존 Trade_History 데이터만 사용 (FMP·매수폼 변경 없음).
         # ─────────────────────────────────────────────────────────────────────
-        st.subheader(f"{_MAIN_NAV_OPTIONS[13]} · 내 매매 패턴 분석")
+        st.subheader(f"{NAV_REVIEW} · 내 매매 패턴 분석")
         st.caption(
             "청산(매도)된 거래만 분석합니다. **어떤 thesis 카테고리·보유기간에서 실제로 수익이 나는지**를 "
             "확인하고 다음 매매 규칙에 반영하세요. (FIFO 기준 실현손익)"
@@ -26193,7 +26186,7 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                         )
                         st.altair_chart(_bar, use_container_width=True)
 
-    elif main_nav == _MAIN_NAV_OPTIONS[12]:
+    elif main_nav == NAV_GUIDE:
         # ─────────────────────────────────────────────────────────────────────
         # 📖 사용 가이드 (v4 — 2026-08 증분 개정)
         #   v3(2026-07) 이후 추가된 것을 반영: 🏠 시작 · 📅 실적 레이더 ·
@@ -26741,7 +26734,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
                 "**앱 버전:** v3.0 (2026-07) | "
                 "**Tech Stack:** Streamlit · Google Sheets · FMP stable · Gemini 2.5 Flash · GitHub Actions"
             )
-    elif main_nav == _MAIN_NAV_OPTIONS[14]:
+    elif main_nav == NAV_SETTINGS:
         # ─────────────────────────────────────────────────────────────────────
         # ⚙️ 내 설정 — 이메일/알림 수신/비밀번호를 본인이 직접 관리
         # 자동화 스크립트는 매 실행 시 Users 시트를 새로 읽으므로,
@@ -26897,7 +26890,7 @@ ETF: 정밀 검사에 직접 입력 — 보유 종목 Top·기술적 분석 지�
     #     차단(게이트) · 축소(사이징) · 관찰(PEAD)
     #   매수는 레짐·타이밍·R:R 게이트가, 매도는 스윙/포지션 신호가 결정한다.
     # ═══════════════════════════════════════════════════════════════════
-    elif main_nav == _MAIN_NAV_OPTIONS[15]:
+    elif main_nav == NAV_EARNINGS:
         st.title("📅 실적 레이더")
         st.caption("실적 발표 전후의 **이벤트 리스크**를 관리합니다. "
                    "여기서 나오는 판정은 매매 신호가 아니라 신호 위에 얹히는 제약입니다.")
