@@ -1018,12 +1018,32 @@ LEVERAGED_ETF_MAP = {
 }
 
 # 이름 문자열 보조 추정용 (매핑에 없을 때만): 배수 크기와 인버스 방향을 따로 판별.
-_LEV_MAG_3X = _re.compile(r"\b3X\b|ULTRAPRO|TRIPLE", _re.I)
-_LEV_MAG_2X = _re.compile(r"\b2X\b|\bULTRA\b|DOUBLE", _re.I)
-_LEV_MAG_15 = _re.compile(r"\b1\.5X\b", _re.I)
+# [2026-09-01] 배수 패턴을 열거에서 **일반형 캡처**로 바꿨다.
+#   옛 구현은 3X / 2X / 1.5X 세 개만 알았다. 발행사들이 4X·5X·1.75X·1.25X 를
+#   쏟아내는데 열거 방식은 새 배수가 나올 때마다 조용히 뚫린다 —
+#   "아는 것만 막는" 필터는 모르는 것에 대해 항상 통과를 반환한다.
+#   숫자를 캡처하면 배수 종류와 무관하게 걸린다.
+#   (?<![A-Z0-9.]) 는 'SPX500X' 같은 심볼 꼬리를 배수로 오독하는 것을 막는다.
+_LEV_MAG_NX = _re.compile(r"(?<![A-Z0-9.])(\d+(?:\.\d+)?)\s?X\b", _re.I)
+# 숫자 없이 배수를 뜻하는 상표/단어들
+_LEV_MAG_WORD_3X = _re.compile(r"ULTRAPRO|TRIPLE", _re.I)
+_LEV_MAG_WORD_2X = _re.compile(r"ULTRASHORT|\bULTRA\b|DOUBLE", _re.I)
 _LEV_INVERSE = _re.compile(r"INVERSE|SHORT|BEAR", _re.I)
 # 'SHORT'의 채권 만기 표현 오탐 방지 (Short-Term Treasury 등)
 _LEV_SHORT_FALSE_POS = _re.compile(r"SHORT[\s\-]?(TERM|DURATION|MATURITY)", _re.I)
+
+# 배수를 못 읽어도 레버리지 상품임이 명백한 작명들.
+#   'DAILY TARGET'  : T-REX / Defiance 계열 일간 레버리지 상표
+#   'LEVERAGED'     : 직설
+# 배수 판정이 아니라 **의심 플래그**로만 쓴다 — 배수를 모르면서 아는 척하지 않는다.
+# 그래서 get_leverage_multiplier 가 아니라 is_rotation_excluded 에서만 본다.
+_LEV_SUSPECT = _re.compile(r"DAILY\s+TARGET|LEVERAGED", _re.I)
+
+
+def is_leverage_suspect(name: str = "") -> bool:
+    """배수는 못 읽었지만 레버리지 상품으로 강하게 의심되는 이름인지."""
+    n = str(name or "")
+    return bool(n) and bool(_LEV_SUSPECT.search(n))
 
 
 def get_leverage_multiplier(ticker: str, name: str = "") -> float | None:
@@ -1034,14 +1054,22 @@ def get_leverage_multiplier(ticker: str, name: str = "") -> float | None:
         return LEVERAGED_ETF_MAP[t]
     if name:
         n = str(name)
-        if _LEV_MAG_3X.search(n):
-            mag = 3.0
-        elif _LEV_MAG_2X.search(n):
-            mag = 2.0
-        elif _LEV_MAG_15.search(n):
-            mag = 1.5
-        else:
-            mag = None
+        mag = None
+        _m = _LEV_MAG_NX.search(n)
+        if _m:
+            try:
+                _v = float(_m.group(1))
+                # 1배 이하는 레버리지가 아니다. 20배 초과는 상품이 아니라
+                # 이름에 섞인 다른 숫자일 확률이 높으므로 배수로 읽지 않는다.
+                if 1.0 < _v <= 20.0:
+                    mag = _v
+            except (TypeError, ValueError):
+                mag = None
+        if mag is None:
+            if _LEV_MAG_WORD_3X.search(n):
+                mag = 3.0
+            elif _LEV_MAG_WORD_2X.search(n):
+                mag = 2.0
         is_inverse = bool(_LEV_INVERSE.search(n)) and not _LEV_SHORT_FALSE_POS.search(n)
         if mag is not None:
             return -mag if is_inverse else mag
@@ -1054,6 +1082,11 @@ def is_rotation_excluded(ticker: str, name: str = "") -> bool:
     """Hidden Alpha 로테이션 유니버스에서 제외 대상인지 (플래그 정책 적용)."""
     m = get_leverage_multiplier(ticker, name)
     if m is None:
+        # 배수를 못 읽어도 작명이 레버리지 상품임을 말하면 제외한다.
+        # (2026-08-29 SPAX 사고: 'T-REX 2X Long SPCX Daily Target ETF' 가
+        #  이름 없이 넘어와 1위·매수로 나갔다. 이름이 오면 두 경로가 다 막는다.)
+        if is_leverage_suspect(name):
+            return EXCLUDE_LEVERAGED_LONG
         return False
     if m < 0:
         return EXCLUDE_INVERSE

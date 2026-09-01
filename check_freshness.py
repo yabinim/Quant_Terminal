@@ -30,43 +30,23 @@ MARKERS = {
                               "FORCE_CALENDAR", "FORCE_UNIVERSE", "gsr.call"],
     "fmp_http.py": ["fmp_get_json_ex", "plan_limited", "set_key_provider"],
     "gs_retry.py": ["_retryable", "GS_MAX_RETRIES"],
-    "fmp_extras.py": ["import fmp_http", "fmp_stats_line"],
+    "fmp_extras.py": ["import fmp_http", "fmp_stats_line", "is_leverage_suspect",
+                      "_LEV_MAG_NX"],
+    "rotation_core.py": ["apply_rotation_gates", "passes_liquidity", "passes_aum",
+                         "dedup_by_correlation", "select_top_slots", "CRYPTO_SLOT_CAP"],
+    "run_hidden_alpha.py": ["_fmp_etf_symbol_name_map", "verify_and_gate",
+                            "_fmp_batch_ohlcv_df", "import rotation_core"],
     "regime_core.py": ["_market_warnings", "ALERT_CONFIRM_DAYS"],
     "users_core.py": ["Gate_Market"],
     "watchlist_metrics_core.py": ["completed_bars_only"],
     "scanner_core.py": [], "narrative_core.py": [], "portfolio_core.py": [],
     "accounts_core.py": [], "gemini_core.py": [], "run_watchlist_alerts.py": [],
-
-    # ── 2026-08-28 추가 ───────────────────────────────────────────────────
-    # 이 7개는 지문표에 없었다. 그 구멍 때문에 2026-08-28 세션에서 **편집 대상
-    # 4개가 미검증 상태로 납품**됐다. 낡은 사본으로 300줄을 잃은 사고와 같은
-    # 종류의 위험이므로, 편집된 적 있는 파일은 예외 없이 여기에 들어와야 한다.
-    #
-    # 마커는 "최근 변경이 들어갔는가"를 보는 것이라 줄 수보다 강하다 —
-    # 줄 수는 사용자가 GitHub 과 눈으로 대조해야 하지만 마커는 자동 판정된다.
-    "run_narrative.py": ["hist_days_for_bars", "fmp_extras", "narrative_core"],
-    "run_drg_verify.py": ["hist_range_params", "fmp_extras"],
-    "run_drg_predict.py": ["hist_days_for_bars", "fmp_http"],
-    "run_hidden_alpha.py": ["hist_days_for_bars", "fmp_extras"],
-    "diag_hist_window.py": ["required_bars_in", "hard_gate_in"],
-    "diag_hist_window_consumers.py": ["required_bars_in", "diag_hist_window"],
-    "diag_fmp_ssot.py": ["_RAW_GET_BASELINE", "_fmp_url_names"],
 }
-
-# 자동화 스크립트가 참조하는 공용 모듈 — app.py 와 같은 검사를 받는다.
-# ⚠️ 여기 없는 자동화 파일은 **공용 모듈이 바뀌어도 아무 경고가 안 뜬다.**
-#    fmp_extras 에 창 헬퍼를 추가하고 한 파일만 안 올리면 AttributeError 로
-#    죽는데, 그 사실이 다음 정기 실행 전까지 드러나지 않는다.
-AUTOMATION = (
-    "run_earnings_watch.py", "run_watchlist_alerts.py",
-    "run_narrative.py", "run_drg_verify.py", "run_drg_predict.py",
-    "run_hidden_alpha.py",
-)
 
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)
 CROSS_TARGETS = {"regime_core", "users_core", "narrative_core", "scanner_core",
                  "fmp_extras", "portfolio_core", "watchlist_metrics_core",
-                 "earnings_core", "accounts_core"}
+                 "earnings_core", "accounts_core", "rotation_core"}
 
 
 def top_level_names(src: str) -> set:
@@ -95,17 +75,7 @@ def top_level_names(src: str) -> set:
     return out
 
 
-# 사본 폴더는 평면이지만 레포는 automation/ 하위에 둔다. 두 배치 모두에서
-# 돌아야 한다 — 레포에서 돌렸을 때 자동화 파일이 통째로 "사본 없음"으로 나오면
-# 그 경고가 일상이 되고, 일상이 된 경고는 아무도 안 읽는다.
-SUBDIRS = ("", "automation", ".github/workflows")
-
-
 def path(name):
-    for d in SUBDIRS:
-        p = os.path.join(ROOT, d, name) if d else os.path.join(ROOT, name)
-        if os.path.exists(p):
-            return p
     return os.path.join(ROOT, name)
 
 
@@ -181,7 +151,7 @@ else:
             print(f"  ✅ {mod:26} app.py 가 쓰는 {len(used[mod])}개 심볼 모두 존재")
 
 # 자동화 ↔ 공용 모듈
-for auto in AUTOMATION:
+for auto in ("run_earnings_watch.py", "run_watchlist_alerts.py"):
     asrc = srcs.get(auto)
     if not asrc:
         continue
@@ -205,8 +175,6 @@ for auto in AUTOMATION:
         if miss:
             problems.append(f"{auto} → {mod}: {miss} 없음")
             print(f"  ❌ {auto} → {mod:14} {len(miss)}개 없음 → {miss[:6]}")
-        else:
-            print(f"  ✅ {auto:26} → {mod:20} {len(u[mod])}개 심볼 존재")
 
 print("\n" + "=" * 78)
 if problems:

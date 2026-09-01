@@ -10803,7 +10803,11 @@ def compute_sell_signal_indicators(tickers: list) -> dict:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_hidden_alpha_ranks() -> tuple:
-    """HiddenAlpha_Snapshot(A1 셀 JSON) → ({TICKER: rank}, 기준일). 실패 시 ({}, "").
+    """HiddenAlpha_Snapshot(A1 셀 JSON) → ({TICKER: rank}, 기준일, 보유목록).
+
+    [2026-09-01] 세 번째 반환값(보유 목록)을 추가했다. 게이트(유동성·중복·크립토
+      캡)가 순위와 실제 보유를 분리했으므로, 앱이 '순위 ≤ 5 = 보유'로 역산하면
+      이메일과 화면이 어긋난다. 자동화가 저장한 선정 결과를 그대로 읽는다.
 
     자동화(run_hidden_alpha, 토요일 5PM)가 이미 계산해 저장한 랭킹이다.
     앱이 같은 걸 다시 계산하면 ETF 유니버스 전체(~350종목)를 받아야 해서
@@ -10816,16 +10820,20 @@ def load_hidden_alpha_ranks() -> tuple:
     try:
         ws = _ws_handle("HiddenAlpha_Snapshot")
         if ws is None:
-            return {}, ""
+            return {}, "", []
         raw = ws.acell("A1").value
         if not raw:
-            return {}, ""
+            return {}, "", []
         obj = json.loads(raw)
         ranks = {str(k).strip().upper(): int(v)
                  for k, v in (obj.get("ranks") or {}).items()}
-        return ranks, str(obj.get("date", ""))
+        sel = [str(t).strip().upper() for t in (obj.get("selected") or []) if str(t).strip()]
+        if not sel:
+            # 하위호환: 게이트 도입(2026-09-01) 이전 스냅샷에는 selected 가 없다.
+            sel = sorted([t for t, r in ranks.items() if r <= 5], key=lambda t: ranks[t])
+        return ranks, str(obj.get("date", "")), sel
     except Exception:
-        return {}, ""
+        return {}, "", []
 
 
 def build_portfolio_sell_radar_df(portfolio_df):
@@ -10885,12 +10893,14 @@ def build_portfolio_sell_radar_df(portfolio_df):
     # 유니버스 랭킹은 자동화가 계산해 둔 스냅샷을 읽는다.
     # 예전에는 여기서 cached_etf_universe_rankings_full 로 전 유니버스(~350종목)를
     # 다시 계산해 376콜·111초가 들었다. 표시용 1개 열을 위한 비용으로는 과했다.
-    ticker_to_rank, _ha_rank_date = load_hidden_alpha_ranks()
+    ticker_to_rank, _ha_rank_date, _ha_selected = load_hidden_alpha_ranks()
     # 주 1회(토요일) 갱신이므로 어느 시점 기준인지 화면에 남긴다. 숨기면
     # 며칠 지난 순위를 최신으로 오해할 수 있다.
     try:
         st.session_state["_pf_rank_meta"] = {
             "date": _ha_rank_date, "n": len(ticker_to_rank),
+            # 게이트 통과 후 실제 보유 슬롯. 순위와 다를 수 있다(유동성·중복·크립토 캡).
+            "selected": list(_ha_selected),
         }
     except Exception:
         pass
