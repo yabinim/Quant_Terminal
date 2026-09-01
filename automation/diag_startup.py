@@ -169,7 +169,8 @@ check("탭 버튼이 콜백으로 이동", "on_click=_nav_go" in CODE)
 check("활성 탭 강조", 'type=("primary" if _t == _cur_nav else "secondary")' in CODE)
 check("관리자 항목이 그룹에 편입", "_nav_groups[-1][1].append(_NAV_ADMIN_APPROVAL)" in CODE)
 # ── 탭 내부 구획(B·C단계) — 목적 밖 내용이 판단 화면에 되돌아오면 안 된다 ──
-for _k in ("pf_radar_view", "ai_perf_view", "ai_review_view", "wl_view"):
+for _k in ("pf_radar_view", "ai_perf_view", "ai_review_view", "wl_view",
+           "stock_inspect_view"):
     check(f"구획 라디오 {_k}", f'key="{_k}"' in CODE)
 for _old in ("NAV_HITRATE", "NAV_IDEA", "NAV_WEEKLY", "NAV_EMERGING"):
     check(f"통합 전 상수 {_old} 잔재 0", _old not in CODE)
@@ -177,6 +178,10 @@ _i_v1 = CODE.find("_wl_view == _WL_V1")
 _i_add = CODE.find("➕ 관심 종목 추가")
 check("워치리스트 등록 폼이 판단 구획 밖", _i_v1 != -1 and _i_add > _i_v1,
       f"판단 {_i_v1} / 등록폼 {_i_add}")
+_i_si2 = CODE.find("_si_view == _SI_V2")
+_i_tech = CODE.find("📊 기술적 분석 (Technical Analysis)")
+check("기술적 분석이 개요 구획 밖", _i_si2 != -1 and _i_tech > _i_si2,
+      f"기술적구획 {_i_si2} / 분석블록 {_i_tech}")
 check("관리자 분기 유지", "main_nav == _NAV_ADMIN_APPROVAL" in CODE)
 check("_render_home 호출", "_render_home()" in CODE)
 
