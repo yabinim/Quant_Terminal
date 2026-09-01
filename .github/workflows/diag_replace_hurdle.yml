@@ -1,0 +1,29 @@
+name: 🔍 진단 — 교체 허들 (수동 전용)
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/repository_dispatch 트리거 없음.
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10     # 순수 로직 진단 — 보통 10초 이내
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # FMP·Google 시트를 전혀 쓰지 않는다. 시크릿 없이 돌아가는 것이 정상이며,
+      # 그래서 배포 **직전** 게이트로 쓸 수 있다(네트워크 실패로 흔들리지 않음).
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install numpy pandas
+
+      - name: 🔍 교체 허들 진단 (읽기 전용 · FMP 콜 0회 · 시트 기록 없음)
+        run: |
+          python automation/diag_replace_hurdle.py
