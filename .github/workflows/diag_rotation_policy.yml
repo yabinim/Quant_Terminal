@@ -47,7 +47,11 @@ jobs:
       - name: 📦 의존성
         run: |
           pip install --upgrade pip
-          pip install numpy pandas
+          pip install numpy pandas pytz requests gspread google-auth
+          # pytz·requests 는 fmp_extras 가 요구한다 (fmp_http 경유).
+          # streamlit 은 fmp_extras 안에서 try/except 로 감싼 선택 의존이라 불필요.
+          # 이 줄은 diag_fmp_ssot.yml / diag_confirm_sweep.yml 과 동일하게 유지한다 —
+          # fmp_extras 를 import 하는 진단은 전부 같은 의존 집합을 갖는다.
 
       - name: 🔬 로테이션 게이트 회귀 + 양성대조
         run: python automation/diag_rotation_policy.py
