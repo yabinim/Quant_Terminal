@@ -310,10 +310,8 @@ NAV_RADAR = "🛡️ [4단계] 포트폴리오 매도 레이더"
 NAV_EARNINGS = "📅 실적 레이더"
 NAV_REVIEW = "📊 매매 복기"
 NAV_WATCHLIST = "🔔 Buy Watchlist & Alert"
-NAV_HITRATE = "📊 [AI] 내러티브 적중률 트래커"
-NAV_IDEA = "💡 [AI] Idea-to-Portfolio 추적"
-NAV_WEEKLY = "📋 [AI] 주간 포트폴리오 요약"
-NAV_EMERGING = "📡 [AI] Emerging 종목 추적기"
+NAV_AIPERF = "📊 [AI] 내러티브 성과"
+NAV_AIREVIEW = "💡 [AI] 내 포트폴리오 리뷰"
 NAV_GUIDE = "📖 사용 가이드"
 NAV_SETTINGS = "⚙️ 내 설정"
 _NAV_ADMIN_APPROVAL = "👑 [관리자] 유저 승인"
@@ -3137,8 +3135,7 @@ def _render_guest_guide():
 | 🛡️ 포트폴리오 매도 레이더 | 내 보유 종목의 스윙/포지션 매도 신호 추적 |
 | 🔔 Buy Watchlist & Alert | 매수 후보 저장 + 진입/이탈 알림 조건 관리 |
 | 📅 실적 레이더 | 내 보유·관심 종목의 실적 발표 일정과 진입 차단·축소 판정 |
-| 💡 Idea-to-Portfolio 추적 | 투자 아이디어(Thesis)를 기록하고 실제 성과와 대조 |
-| 📋 주간 포트폴리오 요약 | 내 포트폴리오의 AI 주간 리뷰 생성 |
+| 💡 [AI] 내 포트폴리오 리뷰 | Thesis 추적(Idea-to-Portfolio) + AI 주간 리뷰 생성 |
 | 📊 매매 복기 | 청산 거래 기록 · 수익률/알파 자동 계산 |
 
 포트폴리오·워치리스트·복기 기록은 전부 **본인 계정에만** 저장되며 다른 사용자에게 보이지 않습니다.
@@ -3148,7 +3145,7 @@ def _render_guest_guide():
 ## 🔵 열람 전용 탭 (자동으로 매일 갱신)
 
 🚨 Daily Risk Gauge · 🌐 거시경제 지표 · 📰 시장 내러티브 · 🎯 섹터 & 자금 흐름 ·
-📊 적중률 트래커 · 📡 Emerging 종목 추적기
+📊 [AI] 내러티브 성과 (적중률 트래커 · Emerging 추적기)
 
 **AI 분석 생성 버튼**(내러티브 엔진·예측·검증·리포트 등)은 관리자 전용으로 비활성화되어 있습니다 —
 **자동화가 주중 아침/저녁, 주말 1회** 생성해 두므로 직접 실행할 필요 없이 최신 결과와 히스토리를 열람하면 됩니다.
@@ -3232,10 +3229,8 @@ _MAIN_NAV_OPTIONS = (
     NAV_REVIEW,
     NAV_WATCHLIST,
     # ── AI 인사이트 ────────────────────────────────────────────────────
-    NAV_HITRATE,
-    NAV_IDEA,
-    NAV_WEEKLY,
-    NAV_EMERGING,
+    NAV_AIPERF,
+    NAV_AIREVIEW,
     # ── 도움말 · 계정 ──────────────────────────────────────────────────
     NAV_GUIDE,
     NAV_SETTINGS,
@@ -3247,7 +3242,7 @@ _NAV_GROUPS = (
     ("시작하기", (NAV_HOME, NAV_DRG)),
     ("분석 도구", (NAV_MACRO, NAV_NARRATIVE, NAV_SECTOR, NAV_SCANNER, NAV_STOCK)),
     ("포트폴리오", (NAV_RADAR, NAV_EARNINGS, NAV_REVIEW, NAV_WATCHLIST)),
-    ("AI 인사이트", (NAV_HITRATE, NAV_IDEA, NAV_WEEKLY, NAV_EMERGING)),
+    ("AI 인사이트", (NAV_AIPERF, NAV_AIREVIEW)),
     ("도움말 · 계정", (NAV_GUIDE, NAV_SETTINGS)),
 )
 
@@ -23771,780 +23766,957 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                     _render_trade_ledger = _ledger_frag(_render_trade_ledger)
                 _render_trade_ledger()
 
-    elif main_nav == NAV_HITRATE:
-        # ─────────────────────────────────────────────────────────────────────
-        # 🎯 AI 내러티브 적중률 트래커
-        # Narratives 시트에 저장된 Winners/Emerging 티커의 실제 수익률을 역산해
-        # AI의 예측 품질을 정량적으로 평가합니다.
-        # ─────────────────────────────────────────────────────────────────────
-        st.subheader("🎯 AI 내러티브 적중률 트래커")
-        st.caption(
-            "`Narratives` 시트의 **Winners / Emerging** 티커를 기준으로, "
-            "내러티브 생성 시점 이후 **실제 주가 수익률**을 역산해 AI의 예측 품질을 정량 평가합니다. "
-            "적중 기준: 내러티브 생성 후 해당 기간 내 **+5% 이상** 상승."
+    elif main_nav == NAV_AIPERF:
+        # ═══════════════════════════════════════════════════════════════════
+        # 📊 [AI] 내러티브 성과 — 전역 내러티브(관리자 소유)의 사후 추적.
+        #   적중률은 '얼마나 맞혔나', Emerging 은 '무엇을 반복 지목했나'.
+        #   둘 다 _shared_owner_uid() 를 읽으므로 게스트도 같은 결과를 본다.
+        # ═══════════════════════════════════════════════════════════════════
+        _AP_V1, _AP_V2 = "🎯 적중률 트래커", "📡 Emerging 추적기"
+        _ap_view = st.radio(
+            "구획", [_AP_V1, _AP_V2], horizontal=True,
+            key="ai_perf_view", label_visibility="collapsed",
         )
-
-        uid_tracker = _shared_owner_uid()  # 적중률 트래커는 전역 내러티브 기반 — 게스트는 관리자 결과 열람
-
-        # 세션 최초 진입 시 Quant_DB 에서 마지막 적중률 분석 결과 복원
-        if not st.session_state.get("_accuracy_tracker_restored"):
-            if uid_tracker:
-                _acc_restored = load_accuracy_tracker_last_result(uid_tracker)
-                if _acc_restored:
-                    st.session_state["_accuracy_tracker_last"] = _acc_restored
-            st.session_state["_accuracy_tracker_restored"] = True
-
-        # ── 설정 컨트롤 ────────────────────────────────────────────────────
-        ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
-        with ctrl_col1:
-            lookback_days = st.selectbox(
-                "분석 기간 (최근 N일 내러티브)",
-                options=[7, 14, 30, 60, 90],
-                index=1,
-                key="tracker_lookback_days",
-                help="몇 일 이내에 생성된 내러티브를 평가 대상으로 할지 설정합니다.",
-            )
-        with ctrl_col2:
-            eval_horizon = st.selectbox(
-                "수익률 측정 기간",
-                options=["1주(5거래일)", "2주(10거래일)", "1개월(21거래일)"],
-                index=0,
-                key="tracker_eval_horizon",
-                help="내러티브 생성 시점 이후 몇 거래일 후 수익률을 측정할지 설정합니다.",
-            )
-        with ctrl_col3:
-            hit_threshold = st.number_input(
-                "적중 기준 (%)",
-                min_value=1.0,
-                max_value=20.0,
-                value=5.0,
-                step=0.5,
-                format="%.1f",
-                key="tracker_hit_threshold",
-                help="이 수익률(%) 이상이면 '적중'으로 판정합니다.",
+        if _ap_view == _AP_V1:
+            # ─────────────────────────────────────────────────────────────────────
+            # 🎯 AI 내러티브 적중률 트래커
+            # Narratives 시트에 저장된 Winners/Emerging 티커의 실제 수익률을 역산해
+            # AI의 예측 품질을 정량적으로 평가합니다.
+            # ─────────────────────────────────────────────────────────────────────
+            st.subheader("🎯 AI 내러티브 적중률 트래커")
+            st.caption(
+                "`Narratives` 시트의 **Winners / Emerging** 티커를 기준으로, "
+                "내러티브 생성 시점 이후 **실제 주가 수익률**을 역산해 AI의 예측 품질을 정량 평가합니다. "
+                "적중 기준: 내러티브 생성 후 해당 기간 내 **+5% 이상** 상승."
             )
 
-        horizon_map = {
-            "1주(5거래일)": 5,
-            "2주(10거래일)": 10,
-            "1개월(21거래일)": 21,
-        }
-        horizon_td = horizon_map[eval_horizon]
+            uid_tracker = _shared_owner_uid()  # 적중률 트래커는 전역 내러티브 기반 — 게스트는 관리자 결과 열람
 
-        run_tracker = st.button(
-            "📊 적중률 분석 실행",
-            key="run_accuracy_tracker_btn",
-            type="primary",
-            use_container_width=True,
-            disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다",
-        )
+            # 세션 최초 진입 시 Quant_DB 에서 마지막 적중률 분석 결과 복원
+            if not st.session_state.get("_accuracy_tracker_restored"):
+                if uid_tracker:
+                    _acc_restored = load_accuracy_tracker_last_result(uid_tracker)
+                    if _acc_restored:
+                        st.session_state["_accuracy_tracker_last"] = _acc_restored
+                st.session_state["_accuracy_tracker_restored"] = True
 
-        if run_tracker:
-            with st.spinner("Narratives 시트에서 기록을 불러오는 중..."):
-                all_records, sheet_err = fetch_narrative_records_from_sheet()
+            # ── 설정 컨트롤 ────────────────────────────────────────────────────
+            ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
+            with ctrl_col1:
+                lookback_days = st.selectbox(
+                    "분석 기간 (최근 N일 내러티브)",
+                    options=[7, 14, 30, 60, 90],
+                    index=1,
+                    key="tracker_lookback_days",
+                    help="몇 일 이내에 생성된 내러티브를 평가 대상으로 할지 설정합니다.",
+                )
+            with ctrl_col2:
+                eval_horizon = st.selectbox(
+                    "수익률 측정 기간",
+                    options=["1주(5거래일)", "2주(10거래일)", "1개월(21거래일)"],
+                    index=0,
+                    key="tracker_eval_horizon",
+                    help="내러티브 생성 시점 이후 몇 거래일 후 수익률을 측정할지 설정합니다.",
+                )
+            with ctrl_col3:
+                hit_threshold = st.number_input(
+                    "적중 기준 (%)",
+                    min_value=1.0,
+                    max_value=20.0,
+                    value=5.0,
+                    step=0.5,
+                    format="%.1f",
+                    key="tracker_hit_threshold",
+                    help="이 수익률(%) 이상이면 '적중'으로 판정합니다.",
+                )
 
-            if sheet_err:
-                st.error(f"시트 로드 실패: {sheet_err}")
-            elif not all_records:
-                st.info("분석 가능한 내러티브 기록이 없습니다. 먼저 내러티브를 생성하고 저장해주세요.")
-            else:
-                # user_id 필터링
-                user_records = [
-                    r for r in all_records
-                    if str(r.get("_sheet_user_id") or "").strip().upper() == uid_tracker.upper()
-                ]
+            horizon_map = {
+                "1주(5거래일)": 5,
+                "2주(10거래일)": 10,
+                "1개월(21거래일)": 21,
+            }
+            horizon_td = horizon_map[eval_horizon]
 
-                if not user_records:
-                    st.info(f"현재 계정(`{uid_tracker}`)으로 저장된 내러티브가 없습니다.")
+            run_tracker = st.button(
+                "📊 적중률 분석 실행",
+                key="run_accuracy_tracker_btn",
+                type="primary",
+                use_container_width=True,
+                disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다",
+            )
+
+            if run_tracker:
+                with st.spinner("Narratives 시트에서 기록을 불러오는 중..."):
+                    all_records, sheet_err = fetch_narrative_records_from_sheet()
+
+                if sheet_err:
+                    st.error(f"시트 로드 실패: {sheet_err}")
+                elif not all_records:
+                    st.info("분석 가능한 내러티브 기록이 없습니다. 먼저 내러티브를 생성하고 저장해주세요.")
                 else:
-                    # lookback 필터링
-                    now_utc = datetime.now(timezone.utc)
-                    cutoff_utc = now_utc - timedelta(days=lookback_days)
-                    filtered_records = [
-                        r for r in user_records
-                        if (_narrative_parse_saved_at_utc(r.get("saved_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff_utc
+                    # user_id 필터링
+                    user_records = [
+                        r for r in all_records
+                        if str(r.get("_sheet_user_id") or "").strip().upper() == uid_tracker.upper()
                     ]
 
-                    if not filtered_records:
-                        st.warning(f"최근 {lookback_days}일 이내 저장된 내러티브가 없습니다. 분석 기간을 늘려보세요.")
+                    if not user_records:
+                        st.info(f"현재 계정(`{uid_tracker}`)으로 저장된 내러티브가 없습니다.")
                     else:
-                        # ── 티커 수집 ──────────────────────────────────────────
-                        rows_to_evaluate = []
-                        for rec in filtered_records:
-                            saved_at_utc = _narrative_parse_saved_at_utc(rec.get("saved_at"))
-                            if saved_at_utc is None:
-                                continue
-                            saved_at_kst = saved_at_utc.astimezone(_MARKET_ET_TZ)
-                            date_label = saved_at_kst.strftime("%m/%d %H:%M")
-                            session_label = rec.get("session_label") or ""
+                        # lookback 필터링
+                        now_utc = datetime.now(timezone.utc)
+                        cutoff_utc = now_utc - timedelta(days=lookback_days)
+                        filtered_records = [
+                            r for r in user_records
+                            if (_narrative_parse_saved_at_utc(r.get("saved_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff_utc
+                        ]
 
-                            # Winners
-                            winners_csv = str(rec.get("_sheet_winners_csv") or "").strip()
-                            for tk in filter_scanner_ticker_list(
-                                [t.strip().upper() for t in winners_csv.split(",") if t.strip()]
-                            ):
-                                rows_to_evaluate.append({
-                                    "saved_at_utc": saved_at_utc,
-                                    "date_label": date_label,
-                                    "session": session_label,
-                                    "type": "Winners",
-                                    "ticker": tk,
-                                })
-
-                            # Emerging
-                            emerging_csv = str(rec.get("_sheet_emerging_csv") or "").strip()
-                            for tk in filter_scanner_ticker_list(
-                                [t.strip().upper() for t in emerging_csv.split(",") if t.strip()]
-                            ):
-                                rows_to_evaluate.append({
-                                    "saved_at_utc": saved_at_utc,
-                                    "date_label": date_label,
-                                    "session": session_label,
-                                    "type": "Emerging",
-                                    "ticker": tk,
-                                })
-
-                        if not rows_to_evaluate:
-                            st.warning("해당 기간 내러티브에 Winners/Emerging 티커가 기록되어 있지 않습니다.")
+                        if not filtered_records:
+                            st.warning(f"최근 {lookback_days}일 이내 저장된 내러티브가 없습니다. 분석 기간을 늘려보세요.")
                         else:
-                            unique_tickers = list(dict.fromkeys(r["ticker"] for r in rows_to_evaluate))
-                            st.info(
-                                f"**{len(filtered_records)}**개 내러티브 · **{len(unique_tickers)}**개 고유 티커 분석 중... "
-                                f"(측정 기간: {eval_horizon})"
-                            )
+                            # ── 티커 수집 ──────────────────────────────────────────
+                            rows_to_evaluate = []
+                            for rec in filtered_records:
+                                saved_at_utc = _narrative_parse_saved_at_utc(rec.get("saved_at"))
+                                if saved_at_utc is None:
+                                    continue
+                                saved_at_kst = saved_at_utc.astimezone(_MARKET_ET_TZ)
+                                date_label = saved_at_kst.strftime("%m/%d %H:%M")
+                                session_label = rec.get("session_label") or ""
 
-                            # ── 가격 데이터 다운로드 ───────────────────────────
-                            with st.spinner(f"FMP에서 {len(unique_tickers)}개 티커 가격 데이터를 받는 중..."):
-                                dl_period = "3mo" if horizon_td <= 21 else "6mo"
-                                closes = _factcheck_download_closes(unique_tickers, period=dl_period)
+                                # Winners
+                                winners_csv = str(rec.get("_sheet_winners_csv") or "").strip()
+                                for tk in filter_scanner_ticker_list(
+                                    [t.strip().upper() for t in winners_csv.split(",") if t.strip()]
+                                ):
+                                    rows_to_evaluate.append({
+                                        "saved_at_utc": saved_at_utc,
+                                        "date_label": date_label,
+                                        "session": session_label,
+                                        "type": "Winners",
+                                        "ticker": tk,
+                                    })
 
-                            # ── 수익률 계산 ────────────────────────────────────
-                            result_rows = []
-                            for row in rows_to_evaluate:
-                                tk = row["ticker"]
-                                saved_at_utc = row["saved_at_utc"]
+                                # Emerging
+                                emerging_csv = str(rec.get("_sheet_emerging_csv") or "").strip()
+                                for tk in filter_scanner_ticker_list(
+                                    [t.strip().upper() for t in emerging_csv.split(",") if t.strip()]
+                                ):
+                                    rows_to_evaluate.append({
+                                        "saved_at_utc": saved_at_utc,
+                                        "date_label": date_label,
+                                        "session": session_label,
+                                        "type": "Emerging",
+                                        "ticker": tk,
+                                    })
 
-                                if closes.empty or tk not in closes.columns:
-                                    ret = np.nan
-                                else:
-                                    series = closes[tk].dropna()
-                                    # 내러티브 생성 날짜 이후 데이터만 슬라이싱
-                                    # FMP 종가 인덱스가 tz-aware일 수 있으므로(방어적 처리)
-                                    # tz_convert(None)로 naive로 변환 후 비교
-                                    try:
-                                        naive_cutoff = pd.Timestamp(saved_at_utc.replace(tzinfo=None))
-                                        idx = series.index
-                                        if hasattr(idx, 'tz') and idx.tz is not None:
-                                            idx_naive = idx.tz_convert(None)  # tz aware → naive
-                                        else:
-                                            idx_naive = idx  # 이미 naive
-                                        mask = idx_naive >= naive_cutoff
-                                        series_after = series.iloc[mask.values]
-                                        # 슬라이싱 결과가 비어있으면 전체 series 사용
-                                        if series_after.empty:
-                                            series_after = series
-                                    except Exception:
-                                        series_after = series
+                            if not rows_to_evaluate:
+                                st.warning("해당 기간 내러티브에 Winners/Emerging 티커가 기록되어 있지 않습니다.")
+                            else:
+                                unique_tickers = list(dict.fromkeys(r["ticker"] for r in rows_to_evaluate))
+                                st.info(
+                                    f"**{len(filtered_records)}**개 내러티브 · **{len(unique_tickers)}**개 고유 티커 분석 중... "
+                                    f"(측정 기간: {eval_horizon})"
+                                )
 
-                                    if len(series_after) >= horizon_td:
-                                        base = float(series_after.iloc[0])
-                                        end_ = float(series_after.iloc[min(horizon_td - 1, len(series_after) - 1)])
-                                        ret = (end_ / base - 1.0) * 100.0 if base != 0 else np.nan
-                                    elif len(series_after) >= 2:
-                                        # 데이터가 horizon보다 짧으면 현재까지 수익률로 표시
-                                        base = float(series_after.iloc[0])
-                                        end_ = float(series_after.iloc[-1])
-                                        ret = (end_ / base - 1.0) * 100.0 if base != 0 else np.nan
-                                    else:
+                                # ── 가격 데이터 다운로드 ───────────────────────────
+                                with st.spinner(f"FMP에서 {len(unique_tickers)}개 티커 가격 데이터를 받는 중..."):
+                                    dl_period = "3mo" if horizon_td <= 21 else "6mo"
+                                    closes = _factcheck_download_closes(unique_tickers, period=dl_period)
+
+                                # ── 수익률 계산 ────────────────────────────────────
+                                result_rows = []
+                                for row in rows_to_evaluate:
+                                    tk = row["ticker"]
+                                    saved_at_utc = row["saved_at_utc"]
+
+                                    if closes.empty or tk not in closes.columns:
                                         ret = np.nan
+                                    else:
+                                        series = closes[tk].dropna()
+                                        # 내러티브 생성 날짜 이후 데이터만 슬라이싱
+                                        # FMP 종가 인덱스가 tz-aware일 수 있으므로(방어적 처리)
+                                        # tz_convert(None)로 naive로 변환 후 비교
+                                        try:
+                                            naive_cutoff = pd.Timestamp(saved_at_utc.replace(tzinfo=None))
+                                            idx = series.index
+                                            if hasattr(idx, 'tz') and idx.tz is not None:
+                                                idx_naive = idx.tz_convert(None)  # tz aware → naive
+                                            else:
+                                                idx_naive = idx  # 이미 naive
+                                            mask = idx_naive >= naive_cutoff
+                                            series_after = series.iloc[mask.values]
+                                            # 슬라이싱 결과가 비어있으면 전체 series 사용
+                                            if series_after.empty:
+                                                series_after = series
+                                        except Exception:
+                                            series_after = series
 
-                                hit = (pd.notna(ret) and ret >= hit_threshold)
-                                result_rows.append({
-                                    "날짜": row["date_label"],
-                                    "세션": row["session"],
-                                    "타입": row["type"],
-                                    "티커": tk,
-                                    f"수익률(%, {eval_horizon})": ret,
-                                    "적중 여부": "✅ 적중" if hit else ("N/A" if pd.isna(ret) else "❌ 미적중"),
-                                })
+                                        if len(series_after) >= horizon_td:
+                                            base = float(series_after.iloc[0])
+                                            end_ = float(series_after.iloc[min(horizon_td - 1, len(series_after) - 1)])
+                                            ret = (end_ / base - 1.0) * 100.0 if base != 0 else np.nan
+                                        elif len(series_after) >= 2:
+                                            # 데이터가 horizon보다 짧으면 현재까지 수익률로 표시
+                                            base = float(series_after.iloc[0])
+                                            end_ = float(series_after.iloc[-1])
+                                            ret = (end_ / base - 1.0) * 100.0 if base != 0 else np.nan
+                                        else:
+                                            ret = np.nan
 
-                            result_df = pd.DataFrame(result_rows)
+                                    hit = (pd.notna(ret) and ret >= hit_threshold)
+                                    result_rows.append({
+                                        "날짜": row["date_label"],
+                                        "세션": row["session"],
+                                        "타입": row["type"],
+                                        "티커": tk,
+                                        f"수익률(%, {eval_horizon})": ret,
+                                        "적중 여부": "✅ 적중" if hit else ("N/A" if pd.isna(ret) else "❌ 미적중"),
+                                    })
 
-                            # 결과를 세션 + Quant_DB 에 저장 후 공용 렌더러로 표시 (rerun 후에도 유지)
-                            _acc_snap = {
-                                "result_df": result_df,
-                                "eval_horizon": eval_horizon,
-                                "hit_threshold": float(hit_threshold),
-                                "saved_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            st.session_state["_accuracy_tracker_last"] = _acc_snap
-                            _ok_acc, _err_acc = save_accuracy_tracker_last_result(uid_tracker, _acc_snap)
-                            if not _ok_acc and _err_acc:
-                                st.warning(f"적중률 결과 Quant_DB 저장 실패 (화면 표시는 정상): {_err_acc}")
-                            _render_accuracy_tracker_results(result_df, eval_horizon, float(hit_threshold))
+                                result_df = pd.DataFrame(result_rows)
 
-        else:
-            _acc_last = st.session_state.get("_accuracy_tracker_last")
-            if (
-                isinstance(_acc_last, dict)
-                and isinstance(_acc_last.get("result_df"), pd.DataFrame)
-                and not _acc_last["result_df"].empty
-            ):
-                _acc_saved_dt = _narrative_parse_saved_at_utc(_acc_last.get("saved_at"))
-                _acc_saved_str = (
-                    _acc_saved_dt.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M") + " ET"
-                    if _acc_saved_dt else "이전 분석"
-                )
-                _acc_src = "Quant_DB 복원" if _acc_last.get("_restored_from_sheet") else "이번 세션"
-                st.success(f"✅ 가장 최근 적중률 분석 결과 ({_acc_saved_str} · {_acc_src})")
-                st.caption("아래는 마지막으로 실행한 분석 결과입니다. 새로 계산하려면 위의 **📊 적중률 분석 실행** 버튼을 누르세요.")
-                _render_accuracy_tracker_results(
-                    _acc_last["result_df"],
-                    str(_acc_last.get("eval_horizon") or eval_horizon),
-                    float(_acc_last.get("hit_threshold") or hit_threshold),
-                )
+                                # 결과를 세션 + Quant_DB 에 저장 후 공용 렌더러로 표시 (rerun 후에도 유지)
+                                _acc_snap = {
+                                    "result_df": result_df,
+                                    "eval_horizon": eval_horizon,
+                                    "hit_threshold": float(hit_threshold),
+                                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                                }
+                                st.session_state["_accuracy_tracker_last"] = _acc_snap
+                                _ok_acc, _err_acc = save_accuracy_tracker_last_result(uid_tracker, _acc_snap)
+                                if not _ok_acc and _err_acc:
+                                    st.warning(f"적중률 결과 Quant_DB 저장 실패 (화면 표시는 정상): {_err_acc}")
+                                _render_accuracy_tracker_results(result_df, eval_horizon, float(hit_threshold))
+
             else:
-                # 버튼 미클릭 상태 안내
-                st.info(
-                    "설정을 완료한 후 **📊 적중률 분석 실행** 버튼을 클릭하면 분석이 시작됩니다.\n\n"
-                    "**분석 방식:**\n"
-                    "- `Narratives` 시트에서 현재 계정의 내러티브 기록을 불러옵니다.\n"
-                    "- 각 내러티브의 **Winners**와 **Emerging** 티커에 대해 생성 시점 이후 수익률을 계산합니다.\n"
-                    "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
-                )
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 🔬 신호 검증 (백테스트) — Signal_Backtest 시트(run_signal_backtest 자동화 적재) 읽기 전용
-        #   레짐 엔진 verdict(entry/wait/overheat/trend_break/avoid)가 과거에 실제로 낸
-        #   forward-return·MFE/MAE 를 버킷별로 표시. 엔진의 '판별력'을 정량 확인.
-        # ═══════════════════════════════════════════════════════════════════
-        st.divider()
-        st.subheader("🔬 신호 검증 (백테스트)")
-        st.caption(
-            "레짐 엔진의 **매수/대기/과열/이탈/회피** 판정이 과거에 실제로 어떤 수익을 냈는지 "
-            "**워크포워드**(미래 훔쳐보기 없음)로 역검증한 결과입니다. `run_signal_backtest` 자동화가 "
-            "계산해 `Signal_Backtest` 시트에 적재하며, 여기서는 **읽기 전용**으로 최신 실행을 표시합니다."
-        )
-
-        _sb_reload = st.button(
-            "🔄 백테스트 결과 새로고침", key="reload_signal_backtest_btn",
-            help="Signal_Backtest 시트에서 최신 실행 결과를 다시 불러옵니다.",
-        )
-        if _sb_reload or "_signal_backtest_cache" not in st.session_state:
-            _sb_rows, _sb_err = [], None
-            try:
-                _gc_sb = get_gspread_client()
-                if _gc_sb is None:
-                    _sb_err = "Google 서비스 계정이 설정되지 않았습니다."
-                else:
-                    _sh_sb = _gc_sb.open(_QUANT_DB_SPREADSHEET_TITLE)
-                    if "Signal_Backtest" in [w.title for w in _sh_sb.worksheets()]:
-                        _sb_rows = _sh_sb.worksheet("Signal_Backtest").get_all_values() or []
-                    else:
-                        _sb_err = "no_sheet"
-            except Exception as _e_sb:
-                _sb_err = str(_e_sb)
-            st.session_state["_signal_backtest_cache"] = {"rows": _sb_rows, "err": _sb_err}
-
-        _sb = st.session_state.get("_signal_backtest_cache") or {"rows": [], "err": None}
-        _sb_rows, _sb_err = (_sb.get("rows") or []), _sb.get("err")
-
-        if _sb_err == "no_sheet" or (not _sb_rows or len(_sb_rows) < 2):
-            st.info(
-                "아직 신호 백테스트 결과가 없습니다. `run_signal_backtest` 자동화(월 1회/수동)를 "
-                "한 번 실행하면 여기에 버킷별 검증 결과가 표시됩니다."
-            )
-        elif _sb_err:
-            st.warning(f"백테스트 결과 로드 실패: {_sb_err}")
-        else:
-            # 헤더/데이터 열 수 불일치 방어 — run_signal_backtest v1.2 에서 Entry_Rule 열이
-            # 추가되어, 그 이전에 적재된 구 행은 열이 하나 적을 수 있다(래그드 → DataFrame 예외).
-            _sb_hdr = [str(c).strip() for c in (_sb_rows[0] or [])]
-            _sb_ncol = len(_sb_hdr)
-            _sb_body = [(list(r) + [""] * _sb_ncol)[:_sb_ncol] for r in _sb_rows[1:]]
-            _sb_df = pd.DataFrame(_sb_body, columns=_sb_hdr)
-            if "Run_Date" in _sb_df.columns and not _sb_df.empty:
-                _sb_latest = _sb_df["Run_Date"].astype(str).max()
-                _sb_df = _sb_df[_sb_df["Run_Date"].astype(str) == _sb_latest]
-                # 같은 Run_Date 에 여러 번 실행된 경우(동일 날짜 재실행) 중복 방지:
-                # append 순서가 시간순이므로 버킷별 마지막 행(=최신 실행)만 유지
-                if "Verdict" in _sb_df.columns:
-                    _sb_dedup = ["Verdict"]
-                    for _k in ("Mode", "Segment"):
-                        if _k in _sb_df.columns:
-                            _sb_dedup.insert(0, _k)
-                    _sb_df = _sb_df.drop_duplicates(subset=_sb_dedup, keep="last")
-
-            if _sb_df.empty:
-                st.info("표시할 백테스트 결과가 없습니다.")
-            else:
-                _sb_meta = _sb_df.iloc[0]
-                # 진입가 규칙(v1.2~) — 구/신 실행이 시트에 섞여도 어떤 기준인지 즉시 구분
-                _sb_rule = str(_sb_meta.get("Entry_Rule", "") or "").strip()
-                st.success(
-                    f"📅 최신 실행: **{_sb_meta.get('Run_Date', '')}** · "
-                    f"검증 구간 {_sb_meta.get('History_Start', '')} ~ {_sb_meta.get('History_End', '')} · "
-                    f"유니버스 {_sb_meta.get('Universe_Size', '')}종목"
-                    + (f" · 진입가 **{_sb_rule}**" if _sb_rule else "")
-                )
-                if _sb_rule:
-                    st.caption(
-                        "진입가는 신호 확정일이 아니라 **그 다음 거래일 종가** 기준입니다 — "
-                        "알림 메일이 장 마감 후 발송되므로 실제로 체결 가능한 최초 가격이에요."
-                    )
-                else:
-                    st.warning(
-                        "⚠️ 이 결과는 **신호 확정일 종가**를 진입가로 계산한 구버전 실행입니다. "
-                        "알림은 종가 확정 *후* 발송되므로 그 가격은 체결할 수 없습니다 — "
-                        "실현 불가능한 성과이니 기준 조정의 근거로 쓰지 마세요. "
-                        "백테스트를 다시 실행하면 `close[t+1]` 기준으로 갱신됩니다."
-                    )
-
-                # v1.5: 세그먼트 선택 — ETF 가 유니버스의 대부분이라 섞으면 결론이 오염된다
-                if "Segment" in _sb_df.columns:
-                    _sb_seg_col = _sb_df["Segment"].astype(str).str.strip()
-                    _SB_SEG_KR = {"stock": "📈 개별주만", "etf": "🧺 ETF만", "all": "🌐 전체"}
-                    _sb_seg_avail = [k for k in ("stock", "etf", "all")
-                                     if (_sb_seg_col == k).any()]
-                    if _sb_seg_avail:
-                        _sb_seg_pick = st.radio(
-                            "집계 대상", _sb_seg_avail, horizontal=True,
-                            format_func=lambda k: _SB_SEG_KR.get(k, k),
-                            key="sb_segment_pick",
-                            help="워치리스트 알림은 주로 개별주에 쓰입니다. ETF 가 유니버스의 대부분이라 "
-                                 "'전체'는 사실상 ETF 성적표에 가깝습니다.",
-                        )
-                        _sb_df = _sb_df[_sb_seg_col == _sb_seg_pick]
-                        if _sb_seg_pick == "all":
-                            st.caption(
-                                "⚠️ '전체'는 ETF와 개별주를 섞은 값입니다. 유니버스의 다수가 ETF라 "
-                                "개별주 신호의 성적을 대표하지 않습니다."
-                            )
-                if _sb_df.empty:
-                    # st.stop() 은 페이지 전체를 중단시키므로 사용하지 않는다.
-                    # 아래 렌더 루프는 빈 그룹을 자동으로 건너뛴다.
-                    st.info("선택한 집계 대상에 해당하는 결과가 없습니다.")
-
-                # v1.4: Mode 별 분리 — alert(실제 이메일 기준) / verdict(화면 판정 기준)
-                _SB_ALERT_LABELS = {
-                    "alert_entry_pass":    "🟢 매수 메일 (게이트 통과)",
-                    "alert_entry_skip":    "🟡 매수 메일 (고점 근접)",
-                    "alert_entry_na":      "⚪ 매수 메일 (게이트 보류)",
-                    "alert_risk":          "⚠️ 위험 알림",
-                    "alert_entry_invalid": "🔄 매수 신호 무효화",
-                }
-                _SB_ALERT_ORDER = list(_SB_ALERT_LABELS.keys())
-                _SB_VERDICT_ORDER = ["entry", "wait", "overheat", "trend_break", "avoid"]
-
-                if "Mode" in _sb_df.columns:
-                    _sb_mode_col = _sb_df["Mode"].astype(str).str.strip()
-                    _sb_groups = [
-                        ("alert", _sb_df[_sb_mode_col == "alert"]),
-                        ("verdict", _sb_df[_sb_mode_col != "alert"]),
-                    ]
-                else:
-                    _sb_groups = [("verdict", _sb_df)]   # 구버전 시트 호환
-
-                for _sb_mode, _sb_g in _sb_groups:
-                    if _sb_g is None or _sb_g.empty:
-                        continue
-                    if _sb_mode == "alert":
-                        st.markdown("#### 📧 실제 이메일 알림 기준 — 실전 성적표")
-                        st.caption(
-                            "라이브와 **동일한 상태머신**(2일 확정 + 발동 후 재무장)을 통과해 "
-                            "**실제로 메일이 나갔을 날**만 집계합니다. 같은 매수 구간이 30일 이어져도 메일은 1통이므로 "
-                            "아래 '화면 판정' 표보다 이벤트 수가 훨씬 적은 게 정상입니다. "
-                            "**게이트 통과 vs 미통과**를 비교하면 R:R 게이트가 실제로 걸러주는지 알 수 있습니다."
-                        )
-                        _sb_order, _sb_labels = _SB_ALERT_ORDER, _SB_ALERT_LABELS
-                    else:
-                        st.markdown("#### 🖥️ 화면 판정 기준 — 엔진 판별력 진단")
-                        st.caption(
-                            "앱 화면에 판정이 표시된 **모든 날**을 집계합니다(2일 확정 + 5일 쿨다운). "
-                            "메일 발송 여부와 무관하며, 판정 자체에 예측력이 있는지 보는 용도입니다."
-                        )
-                        _sb_order, _sb_labels = _SB_VERDICT_ORDER, None
-
-                    _sb_g = _sb_g.copy()
-                    _sb_g["_o"] = _sb_g["Verdict"].map({c: i for i, c in enumerate(_sb_order)})
-                    _sb_g = _sb_g.sort_values("_o", na_position="last")
-
-                    _sb_disp = _sb_g.copy()
-                    _sb_disp["판정"] = _sb_disp["Verdict"].map(
-                        lambda c: (_sb_labels.get(str(c), str(c)) if _sb_labels
-                                   else rc.TIMING_BADGE.get(str(c), str(c)))
-                    )
-                    _sb_numcols = ["Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean",
-                                   "Ret_20d_Median", "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean",
-                                   "Excess_20d_Mean", "ExcessWin_20d"]  # v1.1: SPY 대비 알파
-                    for _c in _sb_numcols:
-                        if _c in _sb_disp.columns:
-                            _sb_disp[_c] = pd.to_numeric(_sb_disp[_c], errors="coerce")
-                    _sb_disp = _sb_disp.rename(columns={
-                        "Event_Count": "이벤트수", "WinRate_20d": "승률20d(%)",
-                        "Ret_5d_Mean": "평균5d(%)", "Ret_20d_Mean": "평균20d(%)",
-                        "Ret_20d_Median": "중앙20d(%)", "Ret_60d_Mean": "평균60d(%)",
-                        "MFE_20d_Mean": "MFE20d(%)", "MAE_20d_Mean": "MAE20d(%)",
-                        "Excess_20d_Mean": "초과20d(%)", "ExcessWin_20d": "초과승률20d(%)",
-                    })
-                    _sb_ret_cols = ["평균5d(%)", "평균20d(%)", "중앙20d(%)", "평균60d(%)",
-                                    "MFE20d(%)", "MAE20d(%)"]
-                    # 초과수익 컬럼은 v1.1 백테스트 이후에만 존재 → 있을 때만 표시(구버전 시트 호환)
-                    if "초과20d(%)" in _sb_disp.columns:
-                        _sb_ret_cols = _sb_ret_cols + ["초과20d(%)"]   # 초과수익도 색상 적용
-                    _sb_show = ["판정", "이벤트수", "승률20d(%)"] + _sb_ret_cols
-                    if "초과승률20d(%)" in _sb_disp.columns:
-                        _sb_show = _sb_show + ["초과승률20d(%)"]
-
-                    def _sb_color(v):
-                        try:
-                            x = float(v)
-                        except (TypeError, ValueError):
-                            return ""
-                        if x > 0:
-                            return "color:#16a34a;font-weight:600;"
-                        if x < 0:
-                            return "color:#dc2626;font-weight:600;"
-                        return ""
-
-                    _sb_fmt = {}
-                    for _c in _sb_show:
-                        if _c == "판정":
-                            continue
-                        elif _c == "이벤트수":
-                            _sb_fmt[_c] = "{:,.0f}"
-                        elif _c in ("승률20d(%)", "초과승률20d(%)"):
-                            _sb_fmt[_c] = "{:,.1f}"
-                        else:
-                            _sb_fmt[_c] = "{:,.2f}"
-
-                    st.dataframe(
-                        _sb_disp[_sb_show].style
-                        .format(_sb_fmt, na_rep="-")
-                        .map(_sb_color, subset=_sb_ret_cols),
-                        use_container_width=True, hide_index=True,
-                    )
-                    if _sb_mode == "alert":
-                        st.caption(
-                            "**읽는 법:** `🟢 게이트 통과` 행이 형님이 실제로 매수하는 신호입니다. "
-                            "이 행의 **초과20d(%)**(SPY 대비 알파)가 0보다 크고 `🟡 미통과`보다 높아야 "
-                            "R:R 게이트가 제 역할을 한다는 뜻입니다. 게이트는 메일을 막지 않고 라벨만 바꾸므로 "
-                            "두 행 모두 실제로 발송된 메일입니다. "
-                            "※ 워치리스트 행별 사용자 설정(목표 매수가·RSI·200일선)은 과거 재현이 불가능해 "
-                            "`watch` 알림은 집계에서 빠져 있습니다."
-                        )
-                    else:
-                        st.caption(
-                        "**읽는 법:** **초과20d(%)**·**초과승률**은 SPY를 같은 기간 보유한 것 대비 성과(=**알파**, 베타 제거)입니다. "
-                        "0보다 클수록 시장 표류가 아닌 **타이밍이 더한 진짜 수익**을 뜻합니다. `🎯 지금 매수 구간`의 +20일·초과수익이 "
-                        "`대기/과열/회피`보다 높을수록 엔진의 **판별력**이 유효하다는 신호입니다. **MFE/MAE**(최대 상승/하락 여력)는 "
-                        "다음 단계인 **사이징·손익비(R:R)** 설계에서 손절·목표 거리 산정의 입력으로 쓰입니다. "
-                        "이벤트는 **2일 확정 + 5일 쿨다운**으로 경계 진동(중복)을 걸러냈고, 이벤트수가 적은 버킷은 통계가 불안정할 수 있습니다."
-                    )
-
-    elif main_nav == NAV_IDEA:
-        render_sync_button("sync_tab_idea", [], "Idea-to-Portfolio 데이터를 다시 불러옵니다.")
-        # ─────────────────────────────────────────────────────────────────────
-        # 💡 Idea-to-Portfolio 추적
-        # 내러티브 테마 → 종목 발굴 → 포트폴리오 편입 흐름을 Thesis ID로 연결
-        # ─────────────────────────────────────────────────────────────────────
-        st.subheader("💡 Idea-to-Portfolio 추적")
-        st.caption(
-            "AI 내러티브 테마(Thesis)에서 시작해 포트폴리오에 편입한 종목들을 추적합니다. "
-            "**[4단계] 포트폴리오 매도 레이더**에서 종목 추가 시 Thesis를 선택하면 여기에 자동으로 기록돼요."
-        )
-
-        uid_thesis = str(st.session_state.get("user_id") or "").strip()
-
-        with st.spinner("Thesis 기록 불러오는 중..."):
-            thesis_df = load_thesis_records(uid_thesis)
-
-        if thesis_df.empty:
-            st.info(
-                "아직 Thesis 기록이 없어요. "
-                "[4단계] 포트폴리오 매도 레이더 → 종목 추가 시 "
-                "📌 투자 Thesis 드롭다운에서 내러티브 테마를 선택하면 여기에 자동으로 기록됩니다."
-            )
-        else:
-            # ── 요약 지표 ──────────────────────────────────────────────────
-            total_positions = len(thesis_df)
-            unique_thesis = thesis_df["Thesis_Title"].nunique()
-            unique_tickers = thesis_df["Ticker"].nunique()
-
-            m1, m2, m3 = st.columns(3)
-            with m1:
-                st.metric("총 Thesis 연결 포지션", f"{total_positions}건")
-            with m2:
-                st.metric("고유 Thesis 수", f"{unique_thesis}개")
-            with m3:
-                st.metric("추적 중인 티커", f"{unique_tickers}개")
-
-            st.divider()
-
-            # ── Thesis별 그룹 뷰 ───────────────────────────────────────────
-            st.markdown("### 📋 Thesis별 포지션 현황")
-
-            # 매수가/수량 조회용 포트폴리오 (루프 밖에서 1회 로드)
-            try:
-                portfolio_df_thesis = load_portfolio()
-            except Exception:
-                portfolio_df_thesis = pd.DataFrame()
-            if portfolio_df_thesis is None:
-                portfolio_df_thesis = pd.DataFrame()
-
-            thesis_groups = thesis_df.groupby("Thesis_Title")
-
-            for thesis_title, group in thesis_groups:
-                tickers_in_thesis = group["Ticker"].tolist()
-                narrative_date = group["Narrative_Date"].iloc[0]
-                narrative_cat = group["Narrative_Category"].iloc[0]
-
-                # 현재가 및 수익률 계산
-                ticker_tuple = tuple(sorted(set(tickers_in_thesis)))
-                try:
-                    close_df_thesis = cached_portfolio_yf_close_1y(ticker_tuple)
-                except Exception:
-                    close_df_thesis = pd.DataFrame()
-
-                perf_rows = []
-                for _, row in group.iterrows():
-                    tk = str(row["Ticker"]).strip().upper()
-                    acct = str(row["Account"]).strip()
-                    date_added = str(row["Date_Added"]).strip()
-
-                    # 포트폴리오에서 매수가/수량 조회
-                    # portfolio_df_thesis 는 루프 밖에서 이미 로드됨
-                    port_row = portfolio_df_thesis[
-                        (portfolio_df_thesis["Ticker"] == tk) &
-                        (portfolio_df_thesis["Account"] == acct)
-                    ] if not portfolio_df_thesis.empty else pd.DataFrame()
-
-                    purchase_price = np.nan
-                    current_price = np.nan
-                    ret_pct = np.nan
-                    if not port_row.empty:
-                        purchase_price = pd.to_numeric(port_row.iloc[0].get("Purchase_Price"), errors="coerce")
-                    if not close_df_thesis.empty and tk in close_df_thesis.columns:
-                        series = pd.to_numeric(close_df_thesis[tk], errors="coerce").dropna()
-                        current_price = float(series.iloc[-1]) if not series.empty else np.nan
-                    if pd.notna(purchase_price) and pd.notna(current_price) and purchase_price > 0:
-                        ret_pct = (current_price / purchase_price - 1.0) * 100.0
-
-                    perf_rows.append({
-                        "계좌": acct,
-                        "티커": tk,
-                        "매수가": purchase_price,
-                        "현재가": current_price,
-                        "수익률(%)": ret_pct,
-                        "Thesis 편입일": date_added,
-                    })
-
-                perf_df = pd.DataFrame(perf_rows)
-                avg_ret = pd.to_numeric(perf_df["수익률(%)"], errors="coerce").mean()
-                avg_ret_str = f"{avg_ret:+.2f}%" if pd.notna(avg_ret) else "N/A"
-
-                with st.expander(
-                    f"**{thesis_title}** [{narrative_date}] — {len(tickers_in_thesis)}개 종목 · 평균 수익률 {avg_ret_str}",
-                    expanded=True,
+                _acc_last = st.session_state.get("_accuracy_tracker_last")
+                if (
+                    isinstance(_acc_last, dict)
+                    and isinstance(_acc_last.get("result_df"), pd.DataFrame)
+                    and not _acc_last["result_df"].empty
                 ):
-                    st.caption(f"카테고리: `{narrative_cat}` · 내러티브 날짜: `{narrative_date}`")
+                    _acc_saved_dt = _narrative_parse_saved_at_utc(_acc_last.get("saved_at"))
+                    _acc_saved_str = (
+                        _acc_saved_dt.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M") + " ET"
+                        if _acc_saved_dt else "이전 분석"
+                    )
+                    _acc_src = "Quant_DB 복원" if _acc_last.get("_restored_from_sheet") else "이번 세션"
+                    st.success(f"✅ 가장 최근 적중률 분석 결과 ({_acc_saved_str} · {_acc_src})")
+                    st.caption("아래는 마지막으로 실행한 분석 결과입니다. 새로 계산하려면 위의 **📊 적중률 분석 실행** 버튼을 누르세요.")
+                    _render_accuracy_tracker_results(
+                        _acc_last["result_df"],
+                        str(_acc_last.get("eval_horizon") or eval_horizon),
+                        float(_acc_last.get("hit_threshold") or hit_threshold),
+                    )
+                else:
+                    # 버튼 미클릭 상태 안내
+                    st.info(
+                        "설정을 완료한 후 **📊 적중률 분석 실행** 버튼을 클릭하면 분석이 시작됩니다.\n\n"
+                        "**분석 방식:**\n"
+                        "- `Narratives` 시트에서 현재 계정의 내러티브 기록을 불러옵니다.\n"
+                        "- 각 내러티브의 **Winners**와 **Emerging** 티커에 대해 생성 시점 이후 수익률을 계산합니다.\n"
+                        "- 설정한 적중 기준(%) 이상 상승한 티커를 '적중'으로 판정하고 AI 예측 품질을 평가합니다."
+                    )
 
-                    def _style_ret(val):
-                        v = pd.to_numeric(val, errors="coerce")
-                        if pd.isna(v): return "color: #9ca3af;"
-                        if v > 0: return "color: #16a34a; font-weight: 600;"
-                        if v < 0: return "color: #dc2626; font-weight: 600;"
+            # ═══════════════════════════════════════════════════════════════════
+            # 🔬 신호 검증 (백테스트) — Signal_Backtest 시트(run_signal_backtest 자동화 적재) 읽기 전용
+            #   레짐 엔진 verdict(entry/wait/overheat/trend_break/avoid)가 과거에 실제로 낸
+            #   forward-return·MFE/MAE 를 버킷별로 표시. 엔진의 '판별력'을 정량 확인.
+            # ═══════════════════════════════════════════════════════════════════
+            st.divider()
+            st.subheader("🔬 신호 검증 (백테스트)")
+            st.caption(
+                "레짐 엔진의 **매수/대기/과열/이탈/회피** 판정이 과거에 실제로 어떤 수익을 냈는지 "
+                "**워크포워드**(미래 훔쳐보기 없음)로 역검증한 결과입니다. `run_signal_backtest` 자동화가 "
+                "계산해 `Signal_Backtest` 시트에 적재하며, 여기서는 **읽기 전용**으로 최신 실행을 표시합니다."
+            )
+
+            _sb_reload = st.button(
+                "🔄 백테스트 결과 새로고침", key="reload_signal_backtest_btn",
+                help="Signal_Backtest 시트에서 최신 실행 결과를 다시 불러옵니다.",
+            )
+            if _sb_reload or "_signal_backtest_cache" not in st.session_state:
+                _sb_rows, _sb_err = [], None
+                try:
+                    _gc_sb = get_gspread_client()
+                    if _gc_sb is None:
+                        _sb_err = "Google 서비스 계정이 설정되지 않았습니다."
+                    else:
+                        _sh_sb = _gc_sb.open(_QUANT_DB_SPREADSHEET_TITLE)
+                        if "Signal_Backtest" in [w.title for w in _sh_sb.worksheets()]:
+                            _sb_rows = _sh_sb.worksheet("Signal_Backtest").get_all_values() or []
+                        else:
+                            _sb_err = "no_sheet"
+                except Exception as _e_sb:
+                    _sb_err = str(_e_sb)
+                st.session_state["_signal_backtest_cache"] = {"rows": _sb_rows, "err": _sb_err}
+
+            _sb = st.session_state.get("_signal_backtest_cache") or {"rows": [], "err": None}
+            _sb_rows, _sb_err = (_sb.get("rows") or []), _sb.get("err")
+
+            if _sb_err == "no_sheet" or (not _sb_rows or len(_sb_rows) < 2):
+                st.info(
+                    "아직 신호 백테스트 결과가 없습니다. `run_signal_backtest` 자동화(월 1회/수동)를 "
+                    "한 번 실행하면 여기에 버킷별 검증 결과가 표시됩니다."
+                )
+            elif _sb_err:
+                st.warning(f"백테스트 결과 로드 실패: {_sb_err}")
+            else:
+                # 헤더/데이터 열 수 불일치 방어 — run_signal_backtest v1.2 에서 Entry_Rule 열이
+                # 추가되어, 그 이전에 적재된 구 행은 열이 하나 적을 수 있다(래그드 → DataFrame 예외).
+                _sb_hdr = [str(c).strip() for c in (_sb_rows[0] or [])]
+                _sb_ncol = len(_sb_hdr)
+                _sb_body = [(list(r) + [""] * _sb_ncol)[:_sb_ncol] for r in _sb_rows[1:]]
+                _sb_df = pd.DataFrame(_sb_body, columns=_sb_hdr)
+                if "Run_Date" in _sb_df.columns and not _sb_df.empty:
+                    _sb_latest = _sb_df["Run_Date"].astype(str).max()
+                    _sb_df = _sb_df[_sb_df["Run_Date"].astype(str) == _sb_latest]
+                    # 같은 Run_Date 에 여러 번 실행된 경우(동일 날짜 재실행) 중복 방지:
+                    # append 순서가 시간순이므로 버킷별 마지막 행(=최신 실행)만 유지
+                    if "Verdict" in _sb_df.columns:
+                        _sb_dedup = ["Verdict"]
+                        for _k in ("Mode", "Segment"):
+                            if _k in _sb_df.columns:
+                                _sb_dedup.insert(0, _k)
+                        _sb_df = _sb_df.drop_duplicates(subset=_sb_dedup, keep="last")
+
+                if _sb_df.empty:
+                    st.info("표시할 백테스트 결과가 없습니다.")
+                else:
+                    _sb_meta = _sb_df.iloc[0]
+                    # 진입가 규칙(v1.2~) — 구/신 실행이 시트에 섞여도 어떤 기준인지 즉시 구분
+                    _sb_rule = str(_sb_meta.get("Entry_Rule", "") or "").strip()
+                    st.success(
+                        f"📅 최신 실행: **{_sb_meta.get('Run_Date', '')}** · "
+                        f"검증 구간 {_sb_meta.get('History_Start', '')} ~ {_sb_meta.get('History_End', '')} · "
+                        f"유니버스 {_sb_meta.get('Universe_Size', '')}종목"
+                        + (f" · 진입가 **{_sb_rule}**" if _sb_rule else "")
+                    )
+                    if _sb_rule:
+                        st.caption(
+                            "진입가는 신호 확정일이 아니라 **그 다음 거래일 종가** 기준입니다 — "
+                            "알림 메일이 장 마감 후 발송되므로 실제로 체결 가능한 최초 가격이에요."
+                        )
+                    else:
+                        st.warning(
+                            "⚠️ 이 결과는 **신호 확정일 종가**를 진입가로 계산한 구버전 실행입니다. "
+                            "알림은 종가 확정 *후* 발송되므로 그 가격은 체결할 수 없습니다 — "
+                            "실현 불가능한 성과이니 기준 조정의 근거로 쓰지 마세요. "
+                            "백테스트를 다시 실행하면 `close[t+1]` 기준으로 갱신됩니다."
+                        )
+
+                    # v1.5: 세그먼트 선택 — ETF 가 유니버스의 대부분이라 섞으면 결론이 오염된다
+                    if "Segment" in _sb_df.columns:
+                        _sb_seg_col = _sb_df["Segment"].astype(str).str.strip()
+                        _SB_SEG_KR = {"stock": "📈 개별주만", "etf": "🧺 ETF만", "all": "🌐 전체"}
+                        _sb_seg_avail = [k for k in ("stock", "etf", "all")
+                                         if (_sb_seg_col == k).any()]
+                        if _sb_seg_avail:
+                            _sb_seg_pick = st.radio(
+                                "집계 대상", _sb_seg_avail, horizontal=True,
+                                format_func=lambda k: _SB_SEG_KR.get(k, k),
+                                key="sb_segment_pick",
+                                help="워치리스트 알림은 주로 개별주에 쓰입니다. ETF 가 유니버스의 대부분이라 "
+                                     "'전체'는 사실상 ETF 성적표에 가깝습니다.",
+                            )
+                            _sb_df = _sb_df[_sb_seg_col == _sb_seg_pick]
+                            if _sb_seg_pick == "all":
+                                st.caption(
+                                    "⚠️ '전체'는 ETF와 개별주를 섞은 값입니다. 유니버스의 다수가 ETF라 "
+                                    "개별주 신호의 성적을 대표하지 않습니다."
+                                )
+                    if _sb_df.empty:
+                        # st.stop() 은 페이지 전체를 중단시키므로 사용하지 않는다.
+                        # 아래 렌더 루프는 빈 그룹을 자동으로 건너뛴다.
+                        st.info("선택한 집계 대상에 해당하는 결과가 없습니다.")
+
+                    # v1.4: Mode 별 분리 — alert(실제 이메일 기준) / verdict(화면 판정 기준)
+                    _SB_ALERT_LABELS = {
+                        "alert_entry_pass":    "🟢 매수 메일 (게이트 통과)",
+                        "alert_entry_skip":    "🟡 매수 메일 (고점 근접)",
+                        "alert_entry_na":      "⚪ 매수 메일 (게이트 보류)",
+                        "alert_risk":          "⚠️ 위험 알림",
+                        "alert_entry_invalid": "🔄 매수 신호 무효화",
+                    }
+                    _SB_ALERT_ORDER = list(_SB_ALERT_LABELS.keys())
+                    _SB_VERDICT_ORDER = ["entry", "wait", "overheat", "trend_break", "avoid"]
+
+                    if "Mode" in _sb_df.columns:
+                        _sb_mode_col = _sb_df["Mode"].astype(str).str.strip()
+                        _sb_groups = [
+                            ("alert", _sb_df[_sb_mode_col == "alert"]),
+                            ("verdict", _sb_df[_sb_mode_col != "alert"]),
+                        ]
+                    else:
+                        _sb_groups = [("verdict", _sb_df)]   # 구버전 시트 호환
+
+                    for _sb_mode, _sb_g in _sb_groups:
+                        if _sb_g is None or _sb_g.empty:
+                            continue
+                        if _sb_mode == "alert":
+                            st.markdown("#### 📧 실제 이메일 알림 기준 — 실전 성적표")
+                            st.caption(
+                                "라이브와 **동일한 상태머신**(2일 확정 + 발동 후 재무장)을 통과해 "
+                                "**실제로 메일이 나갔을 날**만 집계합니다. 같은 매수 구간이 30일 이어져도 메일은 1통이므로 "
+                                "아래 '화면 판정' 표보다 이벤트 수가 훨씬 적은 게 정상입니다. "
+                                "**게이트 통과 vs 미통과**를 비교하면 R:R 게이트가 실제로 걸러주는지 알 수 있습니다."
+                            )
+                            _sb_order, _sb_labels = _SB_ALERT_ORDER, _SB_ALERT_LABELS
+                        else:
+                            st.markdown("#### 🖥️ 화면 판정 기준 — 엔진 판별력 진단")
+                            st.caption(
+                                "앱 화면에 판정이 표시된 **모든 날**을 집계합니다(2일 확정 + 5일 쿨다운). "
+                                "메일 발송 여부와 무관하며, 판정 자체에 예측력이 있는지 보는 용도입니다."
+                            )
+                            _sb_order, _sb_labels = _SB_VERDICT_ORDER, None
+
+                        _sb_g = _sb_g.copy()
+                        _sb_g["_o"] = _sb_g["Verdict"].map({c: i for i, c in enumerate(_sb_order)})
+                        _sb_g = _sb_g.sort_values("_o", na_position="last")
+
+                        _sb_disp = _sb_g.copy()
+                        _sb_disp["판정"] = _sb_disp["Verdict"].map(
+                            lambda c: (_sb_labels.get(str(c), str(c)) if _sb_labels
+                                       else rc.TIMING_BADGE.get(str(c), str(c)))
+                        )
+                        _sb_numcols = ["Event_Count", "WinRate_20d", "Ret_5d_Mean", "Ret_20d_Mean",
+                                       "Ret_20d_Median", "Ret_60d_Mean", "MFE_20d_Mean", "MAE_20d_Mean",
+                                       "Excess_20d_Mean", "ExcessWin_20d"]  # v1.1: SPY 대비 알파
+                        for _c in _sb_numcols:
+                            if _c in _sb_disp.columns:
+                                _sb_disp[_c] = pd.to_numeric(_sb_disp[_c], errors="coerce")
+                        _sb_disp = _sb_disp.rename(columns={
+                            "Event_Count": "이벤트수", "WinRate_20d": "승률20d(%)",
+                            "Ret_5d_Mean": "평균5d(%)", "Ret_20d_Mean": "평균20d(%)",
+                            "Ret_20d_Median": "중앙20d(%)", "Ret_60d_Mean": "평균60d(%)",
+                            "MFE_20d_Mean": "MFE20d(%)", "MAE_20d_Mean": "MAE20d(%)",
+                            "Excess_20d_Mean": "초과20d(%)", "ExcessWin_20d": "초과승률20d(%)",
+                        })
+                        _sb_ret_cols = ["평균5d(%)", "평균20d(%)", "중앙20d(%)", "평균60d(%)",
+                                        "MFE20d(%)", "MAE20d(%)"]
+                        # 초과수익 컬럼은 v1.1 백테스트 이후에만 존재 → 있을 때만 표시(구버전 시트 호환)
+                        if "초과20d(%)" in _sb_disp.columns:
+                            _sb_ret_cols = _sb_ret_cols + ["초과20d(%)"]   # 초과수익도 색상 적용
+                        _sb_show = ["판정", "이벤트수", "승률20d(%)"] + _sb_ret_cols
+                        if "초과승률20d(%)" in _sb_disp.columns:
+                            _sb_show = _sb_show + ["초과승률20d(%)"]
+
+                        def _sb_color(v):
+                            try:
+                                x = float(v)
+                            except (TypeError, ValueError):
+                                return ""
+                            if x > 0:
+                                return "color:#16a34a;font-weight:600;"
+                            if x < 0:
+                                return "color:#dc2626;font-weight:600;"
+                            return ""
+
+                        _sb_fmt = {}
+                        for _c in _sb_show:
+                            if _c == "판정":
+                                continue
+                            elif _c == "이벤트수":
+                                _sb_fmt[_c] = "{:,.0f}"
+                            elif _c in ("승률20d(%)", "초과승률20d(%)"):
+                                _sb_fmt[_c] = "{:,.1f}"
+                            else:
+                                _sb_fmt[_c] = "{:,.2f}"
+
+                        st.dataframe(
+                            _sb_disp[_sb_show].style
+                            .format(_sb_fmt, na_rep="-")
+                            .map(_sb_color, subset=_sb_ret_cols),
+                            use_container_width=True, hide_index=True,
+                        )
+                        if _sb_mode == "alert":
+                            st.caption(
+                                "**읽는 법:** `🟢 게이트 통과` 행이 형님이 실제로 매수하는 신호입니다. "
+                                "이 행의 **초과20d(%)**(SPY 대비 알파)가 0보다 크고 `🟡 미통과`보다 높아야 "
+                                "R:R 게이트가 제 역할을 한다는 뜻입니다. 게이트는 메일을 막지 않고 라벨만 바꾸므로 "
+                                "두 행 모두 실제로 발송된 메일입니다. "
+                                "※ 워치리스트 행별 사용자 설정(목표 매수가·RSI·200일선)은 과거 재현이 불가능해 "
+                                "`watch` 알림은 집계에서 빠져 있습니다."
+                            )
+                        else:
+                            st.caption(
+                            "**읽는 법:** **초과20d(%)**·**초과승률**은 SPY를 같은 기간 보유한 것 대비 성과(=**알파**, 베타 제거)입니다. "
+                            "0보다 클수록 시장 표류가 아닌 **타이밍이 더한 진짜 수익**을 뜻합니다. `🎯 지금 매수 구간`의 +20일·초과수익이 "
+                            "`대기/과열/회피`보다 높을수록 엔진의 **판별력**이 유효하다는 신호입니다. **MFE/MAE**(최대 상승/하락 여력)는 "
+                            "다음 단계인 **사이징·손익비(R:R)** 설계에서 손절·목표 거리 산정의 입력으로 쓰입니다. "
+                            "이벤트는 **2일 확정 + 5일 쿨다운**으로 경계 진동(중복)을 걸러냈고, 이벤트수가 적은 버킷은 통계가 불안정할 수 있습니다."
+                        )
+
+
+        else:
+            render_sync_button("sync_tab_emerging", [], "Emerging 추적 데이터를 다시 불러옵니다.")
+            # ─────────────────────────────────────────────────────────────────────
+            # 📡 Emerging 종목 추적기
+            # ─────────────────────────────────────────────────────────────────────
+            st.subheader("📡 Emerging 종목 추적기")
+            st.caption(
+                "AI 내러티브 분석 후 Emerging 종목 검증을 실행할 때마다 자동으로 기록이 쌓입니다. "
+                "같은 종목이 반복 등장할수록 신뢰도 높은 신호예요."
+            )
+
+            uid_et = _shared_owner_uid()  # Emerging 추적은 자동화(관리자 소유) 누적 데이터 열람
+
+            with st.spinner("Emerging 추적 기록 불러오는 중..."):
+                et_df = load_emerging_tracker(uid_et)
+                et_df = _augment_emerging_with_freshness(et_df)
+
+            if et_df.empty:
+                st.info(
+                    "아직 추적 기록이 없어요. "
+                    "[1단계] 시장 내러티브에서 AI 분석 후 **Emerging 종목 검증 실행** 버튼을 누르면 "
+                    "자동으로 기록이 쌓입니다."
+                )
+            else:
+                # ── 요약 지표 ──────────────────────────────────────────────────
+                total = len(et_df)
+                hot = (et_df["Count"].astype(int) >= 3).sum() if "Count" in et_df.columns else 0
+                new_ones = (et_df["Status"].str.contains("신규", na=False)).sum()
+                # 매수 신호: 검증 라벨이 최적/얼리버드 AND 최근 10일 내 등장(신선)만
+                _is_stale_col = et_df["_is_stale"] if "_is_stale" in et_df.columns else pd.Series(False, index=et_df.index)
+                best_ones = et_df[
+                    et_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)
+                    & (~_is_stale_col.fillna(False).astype(bool))
+                ]
+                stale_count = int(_is_stale_col.fillna(False).astype(bool).sum())
+
+                m1, m2, m3, m4 = st.columns(4)
+                with m1:
+                    st.metric("전체 추적 종목", f"{total}개")
+                with m2:
+                    st.metric("🔥 반복 등장 (3회+)", f"{hot}개")
+                with m3:
+                    st.metric("🆕 신규 등장", f"{new_ones}개")
+                with m4:
+                    st.metric("🎯 매수 신호 (신선)", f"{len(best_ones)}개")
+
+                if stale_count > 0:
+                    st.caption(
+                        f"⏳ {stale_count}개 종목은 마지막 등장이 {_EMERGING_STALE_DAYS}일을 넘어 '오래된 신호'로 분류됐어요. "
+                        "매수 신호 섹션에서는 제외되며, 전체 목록에는 배지와 함께 남습니다."
+                    )
+
+                # ── 최우선 관심 종목 ───────────────────────────────────────────
+                if not best_ones.empty:
+                    st.divider()
+                    st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드 · 최근 10일 내)")
+                    st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 **신선한** 종목들이에요. RS 값은 등장 당시 검증값입니다.")
+                    for _, row in best_ones.sort_values("Count", ascending=False).iterrows():
+                        count = int(row["Count"]) if str(row["Count"]).isdigit() else 1
+                        rs_str = f"RS {float(row['RS_Score']):.1f}%p(당시)" if row["RS_Score"] else ""
+                        _days_old = row.get("_days_old", np.nan)
+                        _fresh = f"{_days_old:.0f}일 전" if pd.notna(_days_old) else row["Last_Seen"]
+                        st.markdown(
+                            f"**{row['Ticker']}** — {row['Best_Verdict']} | "
+                            f"등장 **{count}회** | {rs_str} | 최근: {_fresh}"
+                        )
+                        col_a, col_b = st.columns([1, 4])
+                        with col_a:
+                            def _goto_stock(tk=row["Ticker"]):
+                                st.session_state["selected_ticker"] = tk
+                                st.session_state["main_sidebar_nav"] = NAV_STOCK
+                            st.button(f"🔬 {row['Ticker']} 분석", key=f"et_goto_{row['Ticker']}", on_click=_goto_stock)
+
+                # ── 반복 등장 종목 ─────────────────────────────────────────────
+                st.divider()
+                st.markdown("### 🔥 반복 등장 종목 (관심 집중)")
+
+                hot_df = et_df[et_df["Count"].astype(int) >= 2].sort_values("Count", ascending=False)
+                if hot_df.empty:
+                    st.info("아직 2회 이상 등장한 종목이 없어요. 내러티브 분석을 더 진행하면 쌓입니다.")
+                else:
+                    def _style_count(val):
+                        v = int(val) if str(val).isdigit() else 0
+                        if v >= 5: return "color:#dc2626;font-weight:700"
+                        if v >= 3: return "color:#f97316;font-weight:600"
+                        return "color:#16a34a"
+
+                    def _style_verdict(val):
+                        if "최적" in str(val): return "color:#16a34a;font-weight:700"
+                        if "얼리" in str(val): return "color:#0ea5e9;font-weight:600"
                         return ""
 
-                    styled_perf = (
-                        perf_df.style
-                        .format({
-                            "매수가": lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A",
-                            "현재가": lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A",
-                            "수익률(%)": lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A",
-                        }, na_rep="N/A")
-                        .map(_style_ret, subset=["수익률(%)"])
+                    def _freshness_badge(days_old):
+                        if pd.isna(days_old):
+                            return "—"
+                        d = float(days_old)
+                        if d > _EMERGING_STALE_DAYS:
+                            return f"⏳ 오래됨 ({d:.0f}일 전)"
+                        if d <= 2:
+                            return f"🟢 최신 ({d:.0f}일 전)"
+                        return f"🟡 {d:.0f}일 전"
+
+                    hot_disp = hot_df.copy()
+                    hot_disp["신선도"] = hot_disp["_days_old"].apply(_freshness_badge)
+
+                    def _style_freshness(val):
+                        if "오래됨" in str(val): return "color:#9ca3af;font-style:italic"
+                        if "최신" in str(val): return "color:#16a34a;font-weight:600"
+                        return "color:#f59e0b"
+
+                    styled_hot = (
+                        hot_disp[["Ticker", "Theme", "First_Seen", "Last_Seen", "신선도", "Count", "Best_Verdict", "RS_Score", "Status"]]
+                        .style
+                        .map(_style_count, subset=["Count"])
+                        .map(_style_verdict, subset=["Best_Verdict"])
+                        .map(_style_freshness, subset=["신선도"])
                     )
-                    st.dataframe(styled_perf, use_container_width=True, hide_index=True)
+                    st.dataframe(styled_hot, use_container_width=True, hide_index=True)
+                    st.caption("RS_Score는 종목이 마지막으로 검증된 **당시 값**입니다(실시간 아님). '오래됨' 종목은 매수 판단에서 제외하세요.")
 
-                    # Thesis 삭제 버튼
-                    if st.button(
-                        f"🗑️ '{thesis_title}' Thesis 기록 삭제",
-                        key=f"del_thesis_{thesis_title[:20]}",
-                        help="Thesis 연결 기록만 삭제합니다. 포트폴리오 종목은 삭제되지 않아요.",
-                    ):
-                        for tk in tickers_in_thesis:
-                            delete_thesis_row(uid_thesis, tk, thesis_title)
-                        st.success(f"'{thesis_title}' Thesis 기록을 삭제했습니다.")
-                        st.rerun()
-
-            st.divider()
-            st.markdown("### 📊 티커별 Thesis 연결 현황")
-            st.caption("한 종목이 여러 Thesis에 연결되어 있을 수 있어요.")
-            ticker_thesis_summary = (
-                thesis_df.groupby("Ticker")["Thesis_Title"]
-                .apply(lambda x: " / ".join(x.unique()))
-                .reset_index()
-                .rename(columns={"Thesis_Title": "연결된 Thesis"})
-            )
-            st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
-
-    elif main_nav == NAV_WEEKLY:
-        render_sync_button("sync_tab_weekly", [], "주간 요약 데이터를 다시 불러옵니다.")
-        # ─────────────────────────────────────────────────────────────────────
-        # 📋 주간 포트폴리오 AI 요약
-        # 포트폴리오 현황 + 최근 내러티브 + Macro를 묶어 Gemini로 주간 리포트 생성
-        # ─────────────────────────────────────────────────────────────────────
-        st.subheader("📋 주간 포트폴리오 AI 요약")
-        st.caption(
-            "현재 포트폴리오 상태 · 최근 AI 내러티브 · 거시경제 지표를 종합해 "
-            "Gemini가 **주간 투자 리뷰 리포트**를 자동 생성합니다. "
-            "생성된 리포트는 `Narratives` 시트에 자동 저장돼요."
-        )
-
-        uid_weekly = str(st.session_state.get("user_id") or "").strip()
-
-        # ── 이전 저장된 요약 불러오기 ──────────────────────────────────────
-        with st.expander("📚 이전 주간 요약 기록 보기", expanded=False):
-            prev_records, _ = fetch_narrative_records_from_sheet()
-            prev_summaries = [
-                r for r in (prev_records or [])
-                if str(r.get("_sheet_user_id", "")).strip().upper() == uid_weekly.upper()
-                and isinstance(r.get("analysis"), dict)
-                and r["analysis"].get("source") == "weekly_portfolio_summary"
-            ]
-            if not prev_summaries:
-                st.caption("저장된 주간 요약이 없습니다.")
-            else:
-                prev_summaries_sorted = sorted(
-                    prev_summaries,
-                    key=lambda r: _narrative_parse_saved_at_utc(r.get("saved_at"))
-                    or datetime.min.replace(tzinfo=timezone.utc),
-                    reverse=True,
-                )
-                for prev in prev_summaries_sorted[:5]:
-                    dt = _narrative_parse_saved_at_utc(prev.get("saved_at"))
-                    dt_str = dt.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M") if dt else "날짜 불명"
-                    summary_text = prev["analysis"].get("summary", "")
-                    with st.expander(f"📋 {dt_str} (ET)", expanded=False):
-                        st.markdown(summary_text)
-
-        st.divider()
-
-        # ── 데이터 미리보기 ────────────────────────────────────────────────
-        with st.expander("📊 분석에 사용될 데이터 미리보기", expanded=False):
-            col_p, col_m = st.columns(2)
-            with col_p:
-                st.markdown("**포트폴리오 종목**")
-                preview_portfolio = load_portfolio()
-                if preview_portfolio.empty:
-                    st.caption("포트폴리오가 없습니다.")
-                else:
+                # ── 전체 목록 ──────────────────────────────────────────────────
+                st.divider()
+                st.markdown("### 📋 전체 추적 목록")
+                with st.expander("전체 보기", expanded=False):
+                    _full = et_df.sort_values("Count", ascending=False).copy()
+                    if "_days_old" in _full.columns:
+                        _full["경과일"] = _full["_days_old"].apply(
+                            lambda d: f"{d:.0f}일 전" if pd.notna(d) else "—"
+                        )
+                    _drop = [c for c in ("_days_old", "_is_stale") if c in _full.columns]
                     st.dataframe(
-                        preview_portfolio[["Account", "Ticker"]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-            with col_m:
-                st.markdown("**거시경제 지표**")
-                macro_preview = _build_macro_context_for_summary()
-                if not macro_preview:
-                    st.caption("Macro 데이터 없음")
-                else:
-                    for k, v in list(macro_preview.items())[:5]:
-                        status_icon = "✅" if v["status"] == "pass" else ("🟡" if v["status"] == "warning" else "🔴")
-                        st.caption(f"{status_icon} {k}: {v['value']}")
-
-            st.markdown("**최근 내러티브 테마**")
-            narr_preview = _build_narrative_context_for_summary(_shared_owner_uid())
-            if not narr_preview:
-                st.caption("내러티브 기록 없음")
-            else:
-                for n in narr_preview[:3]:
-                    themes_str = " · ".join(n.get("themes", [])[:3])
-                    st.caption(f"- {n.get('session', '')} | {themes_str}")
-
-        st.divider()
-
-        # ── 생성 버튼 ──────────────────────────────────────────────────────
-        st.info(
-            "💡 리포트 생성 전 **[4단계] 포트폴리오 매도 레이더**를 한 번 열어두면 "
-            "포트폴리오 수익률 데이터가 더 정확하게 반영됩니다."
-        )
-
-        if st.button(
-            "🤖 주간 AI 리포트 생성",
-            key="generate_weekly_summary_btn",
-            type="primary",
-            use_container_width=True,
-        ):
-            with st.status("주간 리포트를 생성하는 중...", expanded=True) as weekly_status:
-                st.write("📊 포트폴리오 데이터 수집 중...")
-                portfolio_df_weekly = load_portfolio()
-                if portfolio_df_weekly.empty:
-                    weekly_status.update(label="❌ 포트폴리오 데이터 없음", state="error")
-                    st.error("포트폴리오에 종목을 먼저 추가해주세요.")
-                else:
-                    # sell_radar_df 계산
-                    sell_radar_weekly = build_portfolio_sell_radar_df(portfolio_df_weekly)
-                    portfolio_ctx = _build_portfolio_context_for_summary(sell_radar_weekly)
-
-                    st.write("🧠 내러티브 데이터 수집 중...")
-                    narrative_ctx = _build_narrative_context_for_summary(_shared_owner_uid())
-
-                    st.write("🌐 거시경제 지표 수집 중...")
-                    macro_ctx = _build_macro_context_for_summary()
-
-                    st.write("✨ Gemini가 리포트를 작성하는 중... (약 20~30초 소요)")
-                    summary_md = generate_weekly_portfolio_summary(
-                        portfolio_ctx, narrative_ctx, macro_ctx
+                        _full.drop(columns=_drop),
+                        use_container_width=True, hide_index=True
                     )
 
-                    if not summary_md or summary_md.startswith("Weekly Summary 생성 실패"):
-                        weekly_status.update(label="❌ 리포트 생성 실패", state="error")
-                        st.error(summary_md or "알 수 없는 오류가 발생했습니다.")
-                    else:
-                        st.write("💾 Narratives 시트에 저장 중...")
-                        ok_save, err_save = _save_weekly_summary_to_narratives(uid_weekly, summary_md)
-                        if not ok_save:
-                            st.warning(f"시트 저장 실패 (리포트는 아래에서 확인 가능): {err_save}")
-                        weekly_status.update(label="✅ 주간 리포트 생성 완료!", state="complete", expanded=False)
-                        st.session_state["_weekly_summary_latest"] = summary_md
+                # ── 개별 삭제 ──────────────────────────────────────────────────
+                st.divider()
+                st.markdown("### 🗑️ 종목 삭제")
+                del_ticker = st.selectbox(
+                    "삭제할 종목 선택",
+                    options=[""] + et_df["Ticker"].tolist(),
+                    key="et_del_select"
+                )
+                if del_ticker and st.button("🗑️ 선택 종목 삭제", key="et_del_btn", disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
+                    ok_del, err_del = delete_emerging_tracker_row(uid_et, del_ticker)
+                    if ok_del:
+                        st.success(f"✅ {del_ticker} 삭제 완료")
                         st.rerun()
+                    else:
+                        st.error(f"삭제 실패: {err_del}")
 
-        # ── 생성된 리포트 표시 ─────────────────────────────────────────────
-        # 1순위: 이번 세션에서 방금 생성한 것. 없으면 시트에서 가장 최근 저장본을 복원.
-        latest_summary = st.session_state.get("_weekly_summary_latest", "")
-        latest_saved_at = None
-        if not latest_summary:
-            try:
-                _all_recs, _ = fetch_narrative_records_from_sheet()
-                _mine = [
-                    r for r in (_all_recs or [])
+
+    elif main_nav == NAV_AIREVIEW:
+        # ═══════════════════════════════════════════════════════════════════
+        # 💡 [AI] 내 포트폴리오 리뷰 — 내 포지션에 AI 를 붙인 것.
+        #   Idea 는 '아이디어→편입 연결', 주간요약은 '현재 상태 종합 리뷰'.
+        #   둘 다 user_id 기준 개인 데이터다(위 성과 탭과 소유권이 다르다).
+        # ═══════════════════════════════════════════════════════════════════
+        _AR_V1, _AR_V2 = "💡 Idea-to-Portfolio", "📋 주간 요약"
+        _ar_view = st.radio(
+            "구획", [_AR_V1, _AR_V2], horizontal=True,
+            key="ai_review_view", label_visibility="collapsed",
+        )
+        if _ar_view == _AR_V1:
+            render_sync_button("sync_tab_idea", [], "Idea-to-Portfolio 데이터를 다시 불러옵니다.")
+            # ─────────────────────────────────────────────────────────────────────
+            # 💡 Idea-to-Portfolio 추적
+            # 내러티브 테마 → 종목 발굴 → 포트폴리오 편입 흐름을 Thesis ID로 연결
+            # ─────────────────────────────────────────────────────────────────────
+            st.subheader("💡 Idea-to-Portfolio 추적")
+            st.caption(
+                "AI 내러티브 테마(Thesis)에서 시작해 포트폴리오에 편입한 종목들을 추적합니다. "
+                "**[4단계] 포트폴리오 매도 레이더**에서 종목 추가 시 Thesis를 선택하면 여기에 자동으로 기록돼요."
+            )
+
+            uid_thesis = str(st.session_state.get("user_id") or "").strip()
+
+            with st.spinner("Thesis 기록 불러오는 중..."):
+                thesis_df = load_thesis_records(uid_thesis)
+
+            if thesis_df.empty:
+                st.info(
+                    "아직 Thesis 기록이 없어요. "
+                    "[4단계] 포트폴리오 매도 레이더 → 종목 추가 시 "
+                    "📌 투자 Thesis 드롭다운에서 내러티브 테마를 선택하면 여기에 자동으로 기록됩니다."
+                )
+            else:
+                # ── 요약 지표 ──────────────────────────────────────────────────
+                total_positions = len(thesis_df)
+                unique_thesis = thesis_df["Thesis_Title"].nunique()
+                unique_tickers = thesis_df["Ticker"].nunique()
+
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    st.metric("총 Thesis 연결 포지션", f"{total_positions}건")
+                with m2:
+                    st.metric("고유 Thesis 수", f"{unique_thesis}개")
+                with m3:
+                    st.metric("추적 중인 티커", f"{unique_tickers}개")
+
+                st.divider()
+
+                # ── Thesis별 그룹 뷰 ───────────────────────────────────────────
+                st.markdown("### 📋 Thesis별 포지션 현황")
+
+                # 매수가/수량 조회용 포트폴리오 (루프 밖에서 1회 로드)
+                try:
+                    portfolio_df_thesis = load_portfolio()
+                except Exception:
+                    portfolio_df_thesis = pd.DataFrame()
+                if portfolio_df_thesis is None:
+                    portfolio_df_thesis = pd.DataFrame()
+
+                thesis_groups = thesis_df.groupby("Thesis_Title")
+
+                for thesis_title, group in thesis_groups:
+                    tickers_in_thesis = group["Ticker"].tolist()
+                    narrative_date = group["Narrative_Date"].iloc[0]
+                    narrative_cat = group["Narrative_Category"].iloc[0]
+
+                    # 현재가 및 수익률 계산
+                    ticker_tuple = tuple(sorted(set(tickers_in_thesis)))
+                    try:
+                        close_df_thesis = cached_portfolio_yf_close_1y(ticker_tuple)
+                    except Exception:
+                        close_df_thesis = pd.DataFrame()
+
+                    perf_rows = []
+                    for _, row in group.iterrows():
+                        tk = str(row["Ticker"]).strip().upper()
+                        acct = str(row["Account"]).strip()
+                        date_added = str(row["Date_Added"]).strip()
+
+                        # 포트폴리오에서 매수가/수량 조회
+                        # portfolio_df_thesis 는 루프 밖에서 이미 로드됨
+                        port_row = portfolio_df_thesis[
+                            (portfolio_df_thesis["Ticker"] == tk) &
+                            (portfolio_df_thesis["Account"] == acct)
+                        ] if not portfolio_df_thesis.empty else pd.DataFrame()
+
+                        purchase_price = np.nan
+                        current_price = np.nan
+                        ret_pct = np.nan
+                        if not port_row.empty:
+                            purchase_price = pd.to_numeric(port_row.iloc[0].get("Purchase_Price"), errors="coerce")
+                        if not close_df_thesis.empty and tk in close_df_thesis.columns:
+                            series = pd.to_numeric(close_df_thesis[tk], errors="coerce").dropna()
+                            current_price = float(series.iloc[-1]) if not series.empty else np.nan
+                        if pd.notna(purchase_price) and pd.notna(current_price) and purchase_price > 0:
+                            ret_pct = (current_price / purchase_price - 1.0) * 100.0
+
+                        perf_rows.append({
+                            "계좌": acct,
+                            "티커": tk,
+                            "매수가": purchase_price,
+                            "현재가": current_price,
+                            "수익률(%)": ret_pct,
+                            "Thesis 편입일": date_added,
+                        })
+
+                    perf_df = pd.DataFrame(perf_rows)
+                    avg_ret = pd.to_numeric(perf_df["수익률(%)"], errors="coerce").mean()
+                    avg_ret_str = f"{avg_ret:+.2f}%" if pd.notna(avg_ret) else "N/A"
+
+                    with st.expander(
+                        f"**{thesis_title}** [{narrative_date}] — {len(tickers_in_thesis)}개 종목 · 평균 수익률 {avg_ret_str}",
+                        expanded=True,
+                    ):
+                        st.caption(f"카테고리: `{narrative_cat}` · 내러티브 날짜: `{narrative_date}`")
+
+                        def _style_ret(val):
+                            v = pd.to_numeric(val, errors="coerce")
+                            if pd.isna(v): return "color: #9ca3af;"
+                            if v > 0: return "color: #16a34a; font-weight: 600;"
+                            if v < 0: return "color: #dc2626; font-weight: 600;"
+                            return ""
+
+                        styled_perf = (
+                            perf_df.style
+                            .format({
+                                "매수가": lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A",
+                                "현재가": lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A",
+                                "수익률(%)": lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A",
+                            }, na_rep="N/A")
+                            .map(_style_ret, subset=["수익률(%)"])
+                        )
+                        st.dataframe(styled_perf, use_container_width=True, hide_index=True)
+
+                        # Thesis 삭제 버튼
+                        if st.button(
+                            f"🗑️ '{thesis_title}' Thesis 기록 삭제",
+                            key=f"del_thesis_{thesis_title[:20]}",
+                            help="Thesis 연결 기록만 삭제합니다. 포트폴리오 종목은 삭제되지 않아요.",
+                        ):
+                            for tk in tickers_in_thesis:
+                                delete_thesis_row(uid_thesis, tk, thesis_title)
+                            st.success(f"'{thesis_title}' Thesis 기록을 삭제했습니다.")
+                            st.rerun()
+
+                st.divider()
+                st.markdown("### 📊 티커별 Thesis 연결 현황")
+                st.caption("한 종목이 여러 Thesis에 연결되어 있을 수 있어요.")
+                ticker_thesis_summary = (
+                    thesis_df.groupby("Ticker")["Thesis_Title"]
+                    .apply(lambda x: " / ".join(x.unique()))
+                    .reset_index()
+                    .rename(columns={"Thesis_Title": "연결된 Thesis"})
+                )
+                st.dataframe(ticker_thesis_summary, use_container_width=True, hide_index=True)
+
+
+        else:
+            render_sync_button("sync_tab_weekly", [], "주간 요약 데이터를 다시 불러옵니다.")
+            # ─────────────────────────────────────────────────────────────────────
+            # 📋 주간 포트폴리오 AI 요약
+            # 포트폴리오 현황 + 최근 내러티브 + Macro를 묶어 Gemini로 주간 리포트 생성
+            # ─────────────────────────────────────────────────────────────────────
+            st.subheader("📋 주간 포트폴리오 AI 요약")
+            st.caption(
+                "현재 포트폴리오 상태 · 최근 AI 내러티브 · 거시경제 지표를 종합해 "
+                "Gemini가 **주간 투자 리뷰 리포트**를 자동 생성합니다. "
+                "생성된 리포트는 `Narratives` 시트에 자동 저장돼요."
+            )
+
+            uid_weekly = str(st.session_state.get("user_id") or "").strip()
+
+            # ── 이전 저장된 요약 불러오기 ──────────────────────────────────────
+            with st.expander("📚 이전 주간 요약 기록 보기", expanded=False):
+                prev_records, _ = fetch_narrative_records_from_sheet()
+                prev_summaries = [
+                    r for r in (prev_records or [])
                     if str(r.get("_sheet_user_id", "")).strip().upper() == uid_weekly.upper()
                     and isinstance(r.get("analysis"), dict)
                     and r["analysis"].get("source") == "weekly_portfolio_summary"
                 ]
-                if _mine:
-                    _latest_rec = max(
-                        _mine,
+                if not prev_summaries:
+                    st.caption("저장된 주간 요약이 없습니다.")
+                else:
+                    prev_summaries_sorted = sorted(
+                        prev_summaries,
                         key=lambda r: _narrative_parse_saved_at_utc(r.get("saved_at"))
                         or datetime.min.replace(tzinfo=timezone.utc),
+                        reverse=True,
                     )
-                    latest_summary = _latest_rec["analysis"].get("summary", "")
-                    latest_saved_at = _narrative_parse_saved_at_utc(_latest_rec.get("saved_at"))
-            except Exception:
-                latest_summary = ""
+                    for prev in prev_summaries_sorted[:5]:
+                        dt = _narrative_parse_saved_at_utc(prev.get("saved_at"))
+                        dt_str = dt.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M") if dt else "날짜 불명"
+                        summary_text = prev["analysis"].get("summary", "")
+                        with st.expander(f"📋 {dt_str} (ET)", expanded=False):
+                            st.markdown(summary_text)
 
-        if latest_summary:
             st.divider()
-            if latest_saved_at is not None:
-                _saved_str = latest_saved_at.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M")
-                st.success(f"✅ 가장 최근 저장된 AI 포트폴리오 리포트 ({_saved_str} ET)")
-            else:
-                st.success("✅ 이번 주 AI 포트폴리오 리포트")
-            st.markdown(latest_summary)
-            st.caption("이 리포트는 `Narratives` 시트에 자동 저장됩니다. 과거 기록은 위의 '📚 이전 주간 요약 기록 보기'에서 볼 수 있어요. 투자 권유가 아닙니다.")
+
+            # ── 데이터 미리보기 ────────────────────────────────────────────────
+            with st.expander("📊 분석에 사용될 데이터 미리보기", expanded=False):
+                col_p, col_m = st.columns(2)
+                with col_p:
+                    st.markdown("**포트폴리오 종목**")
+                    preview_portfolio = load_portfolio()
+                    if preview_portfolio.empty:
+                        st.caption("포트폴리오가 없습니다.")
+                    else:
+                        st.dataframe(
+                            preview_portfolio[["Account", "Ticker"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                with col_m:
+                    st.markdown("**거시경제 지표**")
+                    macro_preview = _build_macro_context_for_summary()
+                    if not macro_preview:
+                        st.caption("Macro 데이터 없음")
+                    else:
+                        for k, v in list(macro_preview.items())[:5]:
+                            status_icon = "✅" if v["status"] == "pass" else ("🟡" if v["status"] == "warning" else "🔴")
+                            st.caption(f"{status_icon} {k}: {v['value']}")
+
+                st.markdown("**최근 내러티브 테마**")
+                narr_preview = _build_narrative_context_for_summary(_shared_owner_uid())
+                if not narr_preview:
+                    st.caption("내러티브 기록 없음")
+                else:
+                    for n in narr_preview[:3]:
+                        themes_str = " · ".join(n.get("themes", [])[:3])
+                        st.caption(f"- {n.get('session', '')} | {themes_str}")
+
+            st.divider()
+
+            # ── 생성 버튼 ──────────────────────────────────────────────────────
+            st.info(
+                "💡 리포트 생성 전 **[4단계] 포트폴리오 매도 레이더**를 한 번 열어두면 "
+                "포트폴리오 수익률 데이터가 더 정확하게 반영됩니다."
+            )
+
+            if st.button(
+                "🤖 주간 AI 리포트 생성",
+                key="generate_weekly_summary_btn",
+                type="primary",
+                use_container_width=True,
+            ):
+                with st.status("주간 리포트를 생성하는 중...", expanded=True) as weekly_status:
+                    st.write("📊 포트폴리오 데이터 수집 중...")
+                    portfolio_df_weekly = load_portfolio()
+                    if portfolio_df_weekly.empty:
+                        weekly_status.update(label="❌ 포트폴리오 데이터 없음", state="error")
+                        st.error("포트폴리오에 종목을 먼저 추가해주세요.")
+                    else:
+                        # sell_radar_df 계산
+                        sell_radar_weekly = build_portfolio_sell_radar_df(portfolio_df_weekly)
+                        portfolio_ctx = _build_portfolio_context_for_summary(sell_radar_weekly)
+
+                        st.write("🧠 내러티브 데이터 수집 중...")
+                        narrative_ctx = _build_narrative_context_for_summary(_shared_owner_uid())
+
+                        st.write("🌐 거시경제 지표 수집 중...")
+                        macro_ctx = _build_macro_context_for_summary()
+
+                        st.write("✨ Gemini가 리포트를 작성하는 중... (약 20~30초 소요)")
+                        summary_md = generate_weekly_portfolio_summary(
+                            portfolio_ctx, narrative_ctx, macro_ctx
+                        )
+
+                        if not summary_md or summary_md.startswith("Weekly Summary 생성 실패"):
+                            weekly_status.update(label="❌ 리포트 생성 실패", state="error")
+                            st.error(summary_md or "알 수 없는 오류가 발생했습니다.")
+                        else:
+                            st.write("💾 Narratives 시트에 저장 중...")
+                            ok_save, err_save = _save_weekly_summary_to_narratives(uid_weekly, summary_md)
+                            if not ok_save:
+                                st.warning(f"시트 저장 실패 (리포트는 아래에서 확인 가능): {err_save}")
+                            weekly_status.update(label="✅ 주간 리포트 생성 완료!", state="complete", expanded=False)
+                            st.session_state["_weekly_summary_latest"] = summary_md
+                            st.rerun()
+
+            # ── 생성된 리포트 표시 ─────────────────────────────────────────────
+            # 1순위: 이번 세션에서 방금 생성한 것. 없으면 시트에서 가장 최근 저장본을 복원.
+            latest_summary = st.session_state.get("_weekly_summary_latest", "")
+            latest_saved_at = None
+            if not latest_summary:
+                try:
+                    _all_recs, _ = fetch_narrative_records_from_sheet()
+                    _mine = [
+                        r for r in (_all_recs or [])
+                        if str(r.get("_sheet_user_id", "")).strip().upper() == uid_weekly.upper()
+                        and isinstance(r.get("analysis"), dict)
+                        and r["analysis"].get("source") == "weekly_portfolio_summary"
+                    ]
+                    if _mine:
+                        _latest_rec = max(
+                            _mine,
+                            key=lambda r: _narrative_parse_saved_at_utc(r.get("saved_at"))
+                            or datetime.min.replace(tzinfo=timezone.utc),
+                        )
+                        latest_summary = _latest_rec["analysis"].get("summary", "")
+                        latest_saved_at = _narrative_parse_saved_at_utc(_latest_rec.get("saved_at"))
+                except Exception:
+                    latest_summary = ""
+
+            if latest_summary:
+                st.divider()
+                if latest_saved_at is not None:
+                    _saved_str = latest_saved_at.astimezone(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M")
+                    st.success(f"✅ 가장 최근 저장된 AI 포트폴리오 리포트 ({_saved_str} ET)")
+                else:
+                    st.success("✅ 이번 주 AI 포트폴리오 리포트")
+                st.markdown(latest_summary)
+                st.caption("이 리포트는 `Narratives` 시트에 자동 저장됩니다. 과거 기록은 위의 '📚 이전 주간 요약 기록 보기'에서 볼 수 있어요. 투자 권유가 아닙니다.")
+
 
     elif main_nav == NAV_WATCHLIST:
         # ─────────────────────────────────────────────────────────────────────
@@ -24580,697 +24752,318 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
             _wl_acct_opts = []
         _wl_acct_opts = [a for a in _wl_acct_opts if a]
 
-        # ── 종목 추가 폼 ───────────────────────────────────────────────────
-        with st.expander("➕ 관심 종목 추가", expanded=not wl_items):
-            # 제출 직후 티커칸 비우기 (폼 바깥 위젯이라 clear_on_submit 미적용 → rerun 전 플래그로 처리)
-            if st.session_state.pop("_wl_clear_ticker", False):
-                st.session_state["wl_unified_ticker"] = ""
-            # 티커는 폼 '바깥' 단일 입력 — '제안값 계산'과 'Watchlist 추가'가 같은 티커를 공유.
-            # (st.form 내부 위젯값은 제출 전까지 읽을 수 없어, 제안 계산용으로 폼 바깥에 둔다)
-            st.caption("💡 티커를 넣고 **제안값 계산**을 누르면 ATR·200일선 기준 손절/목표가가 표시됩니다. 같은 티커가 아래 추가에도 그대로 사용됩니다.")
-            _sug_c1, _sug_c2 = st.columns([2, 1])
-            with _sug_c1:
-                wl_ticker = st.text_input(
-                    "티커",
-                    placeholder="예: NVDA",
-                    key="wl_unified_ticker",
-                ).strip().upper()
-            with _sug_c2:
-                _sug_go = st.button("📐 제안값 계산", key="wl_suggest_btn", use_container_width=True)
-            if _sug_go and wl_ticker:
-                with st.spinner(f"{wl_ticker} 손절/목표가 제안 계산 중..."):
-                    _sug = suggest_stop_and_target(wl_ticker)
-                st.session_state["_wl_suggestion"] = {"ticker": wl_ticker, **_sug}
-            _sug_state = st.session_state.get("_wl_suggestion")
-            if _sug_state and _sug_state.get("ticker"):
-                _e = _sug_state.get("entry")
-                if pd.notna(_e):
-                    st.markdown(f"**{_sug_state['ticker']}** 현재가 기준 제안 (진입가 ${_e:.2f})")
-                    _r1, _r2, _r3 = st.columns(3)
-                    with _r1:
-                        if pd.notna(_sug_state.get("stop_atr")):
-                            st.metric(
-                                "손절 (ATR 기준)",
-                                f"${_sug_state['stop_atr']:.2f}",
-                                delta=f"{_sug_state['stop_atr_pct']:+.1f}%",
-                                delta_color="off",
-                            )
-                            st.caption("변동성(ATR×2) 기반. 변동 큰 종목일수록 멀게.")
-                        else:
-                            st.metric("손절 (ATR 기준)", "N/A")
-                    with _r2:
-                        if pd.notna(_sug_state.get("stop_ma200")):
-                            st.metric(
-                                "손절 (200일선 기준)",
-                                f"${_sug_state['stop_ma200']:.2f}",
-                                delta=f"{_sug_state['stop_ma200_pct']:+.1f}%" if pd.notna(_sug_state.get("stop_ma200_pct")) else None,
-                                delta_color="off",
-                            )
-                            st.caption("추세선 바로 아래. 추세 붕괴 시 손절.")
-                        else:
-                            st.metric("손절 (200일선 기준)", "N/A")
-                    with _r3:
-                        if pd.notna(_sug_state.get("target_2r")):
-                            st.metric(
-                                "목표가 (손익비 1:2)",
-                                f"${_sug_state['target_2r']:.2f}",
-                                delta=f"{_sug_state['target_2r_pct']:+.1f}%",
-                                delta_color="off",
-                            )
-                            st.caption("ATR 손절 거리의 2배.")
-                        else:
-                            st.metric("목표가 (손익비 1:2)", "N/A")
-                    st.caption("⚠️ 제안값은 참고용입니다. 종목 특성을 보고 본인이 최종 손절/목표를 정하세요.")
-                else:
-                    st.warning(f"{_sug_state['ticker']} 가격 데이터를 불러오지 못해 제안값을 계산할 수 없습니다.")
-
-            with st.form("watchlist_add_form", clear_on_submit=True):
-                wl_memo = st.text_input(
-                    "메모 (매수 근거)",
-                    placeholder="예: AI Capex 수혜, 어닝 모멘텀",
-                    key="wl_form_memo",
-                )
-                st.markdown("**Alert 조건 설정** _(선택 — 비워두면 엔진의 매수 신호로만 알림)_")
-                st.caption(
-                    "여기 설정한 조건은 장 마감 후 **매매레이더 이메일**로도 발송됩니다 "
-                    "(2일 연속 확정 시 1회 · 깜빡임 방지). 비워두면 엔진이 판단한 "
-                    "🟢 매수 신호 / 🟡 줄이기 알림만 받습니다."
-                )
-                al_col1, al_col2, al_col3 = st.columns(3)
-                with al_col1:
-                    wl_alert_price = st.number_input(
-                        "💰 목표 매수가 ($) 이하",
-                        min_value=0.0,
-                        value=0.0,
-                        step=0.5,
-                        format="%.2f",
-                        key="wl_form_alert_price",
-                        help="현재가가 이 가격 이하로 내려오면 알림(앱·이메일)",
-                    )
-                with al_col2:
-                    wl_alert_rsi = st.number_input(
-                        "📉 RSI(14) 이하",
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=0.0,
-                        step=1.0,
-                        format="%.0f",
-                        key="wl_form_alert_rsi",
-                        help="RSI가 이 값 이하로 내려오면 알림(앱·이메일). 예: 30 = 과매도",
-                    )
-                with al_col3:
-                    wl_alert_ma200 = st.checkbox(
-                        "📊 200일선 ±3% 근접 시",
-                        key="wl_form_alert_ma200",
-                        help="현재가가 200일 이동평균선의 ±3% 이내에 들어오면 알림(앱·이메일)",
-                    )
-
-                st.markdown("**손절 / 목표가** (진입 전 미리 정하면 감정적 보유를 막아줍니다)")
-                sl_col1, sl_col2 = st.columns(2)
-                with sl_col1:
-                    wl_stop_loss = st.number_input(
-                        "🛑 손절가 ($)",
-                        min_value=0.0,
-                        value=0.0,
-                        step=0.5,
-                        format="%.2f",
-                        key="wl_form_stop_loss",
-                        help="여기까지 내려오면 자른다. 위 제안값을 참고하세요.",
-                    )
-                with sl_col2:
-                    wl_target_price = st.number_input(
-                        "🎯 목표가 ($)",
-                        min_value=0.0,
-                        value=0.0,
-                        step=0.5,
-                        format="%.2f",
-                        key="wl_form_target_price",
-                        help="익절 목표. 손익비 1:2 이상이면 기대값이 좋습니다.",
-                    )
-                _add_acct_now = str(st.session_state.get("_active_account") or "").strip()
-                st.caption(
-                    (f"🏦 귀속 계좌: **{_add_acct_now}** (사이드바 활성 계좌) — 각 종목의 "
-                     "'✏️ 알림 · 손절/목표 편집'에서 언제든 바꿀 수 있습니다."
-                     ) if _add_acct_now else
-                    "🏦 귀속 계좌: 미지정 — 포트폴리오에 계좌를 등록하면 자동 지정됩니다."
-                )
-                submitted_wl = st.form_submit_button("Watchlist에 추가", type="primary", use_container_width=True)
-
-            if submitted_wl:
-                if not wl_ticker:
-                    st.warning("티커를 입력해주세요.")
-                else:
-                    with st.spinner(f"{wl_ticker} 저장 중..."):
-                        # ✅ 저장 시점 현재가를 캐시 우회하여 신선하게 조회
-                        try:
-                            fetch_latest_prices_for_tickers.clear()
-                        except Exception:
-                            pass
-                        _wl_form_price = fetch_latest_prices_for_tickers((wl_ticker,)).get(wl_ticker, np.nan)
-                        _sl_val = float(wl_stop_loss) if wl_stop_loss > 0 else None
-                        _tp_val = float(wl_target_price) if wl_target_price > 0 else None
-                        ok_wl, err_wl = add_to_watchlist(
-                            uid_wl, wl_ticker,
-                            memo=wl_memo.strip(),
-                            alert_price=float(wl_alert_price) if wl_alert_price > 0 else None,
-                            alert_rsi=float(wl_alert_rsi) if wl_alert_rsi > 0 else None,
-                            alert_ma200=wl_alert_ma200,
-                            saved_price=float(_wl_form_price) if pd.notna(_wl_form_price) else None,  # ✅ 명시적 전달
-                            stop_loss=_sl_val,
-                            target_price=_tp_val,
-                        )
-                    if ok_wl:
-                        # 손익비(R:R) 피드백
-                        _rr_msg = ""
-                        if _sl_val and _tp_val and pd.notna(_wl_form_price):
-                            _entry = float(_wl_form_price)
-                            _risk = _entry - _sl_val
-                            _reward = _tp_val - _entry
-                            if _risk > 0 and _reward > 0:
-                                _rr = _reward / _risk
-                                if _rr >= 2:
-                                    _rr_msg = f" · 손익비 1:{_rr:.1f} ✅ (기대값 양호)"
-                                elif _rr >= 1:
-                                    _rr_msg = f" · 손익비 1:{_rr:.1f} ⚠️ (1:2 이상 권장)"
-                                else:
-                                    _rr_msg = f" · 손익비 1:{_rr:.1f} 🔴 (위험이 보상보다 큼 — 재검토)"
-                        st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!{_rr_msg}")
-                        st.session_state.pop("_wl_suggestion", None)
-                        st.session_state["_wl_clear_ticker"] = True  # 다음 rerun에서 티커칸 비움
-                        st.rerun()
-                    else:
-                        st.error(f"저장 실패: {err_wl}")
-
+        # ═══════════════════════════════════════════════════════════════════
+        # 구획 — 매수 판단이 목적이다. 등록 폼·유지보수 버튼을 판단 화면에서 뺀다.
+        #   st.tabs 는 미선택 본문도 매 rerun 실행한다. 이 탭은 종목별 지표
+        #   계산이 무거우므로 라디오로 선택된 구획만 돌린다.
+        # ═══════════════════════════════════════════════════════════════════
+        _WL_V1, _WL_V2 = "🎯 매수 판단", "✏️ 등록·관리"
+        _wl_view = st.radio(
+            "구획", [_WL_V1, _WL_V2], horizontal=True,
+            key="wl_view", label_visibility="collapsed",
+        )
         st.divider()
 
-        # ── Watchlist 현황 ─────────────────────────────────────────────────
-        if not wl_items:
-            st.info("등록된 관심 종목이 없어요. 위에서 종목을 추가해주세요.")
-        else:
-            st.markdown(f"### 📋 관심 종목 현황 ({len(wl_items)}개)")
-            # 지표 출처 표시 자리. 실제 값은 아래 계산 블록이 끝난 뒤 채운다.
-            # (계산부에 그냥 두면 헤딩에서 150줄 넘게 밀려나 눈에 띄지 않는다)
-            _wl_meta_slot = st.empty()
-
-            # ── 자동 편입분 일괄 정리 ────────────────────────────────────
-            # 주간 스캐너가 넣은 종목은 Memo 가 "AUTO|" 로 시작한다.
-            # 자동 편입을 켰다가 목록이 불어났을 때 한 번에 되돌릴 수단.
-            _auto_items = [w for w in wl_items
-                           if sc.is_auto_memo(str(w.get("memo", "") or ""))]
-            if _auto_items:
-                _c_a1, _c_a2 = st.columns([3, 1])
-                with _c_a1:
-                    st.caption(
-                        f"🔔 주간 스캐너 자동 편입 {len(_auto_items)}종목 "
-                        f"(전체 {len(wl_items)}개 중) — "
-                        f"{', '.join(str(w.get('ticker','')) for w in _auto_items[:12])}"
-                        + (" …" if len(_auto_items) > 12 else "")
-                    )
-                with _c_a2:
-                    if st.button("🧹 자동 편입분 일괄 삭제", key="wl_purge_auto",
-                                 use_container_width=True,
-                                 help="Memo 가 AUTO| 로 시작하는 행만 삭제합니다. "
-                                      "직접 추가하신 종목과 수정한 손절가·목표가는 "
-                                      "영향을 받지 않습니다."):
-                        st.session_state["_wl_purge_confirm"] = True
-                if st.session_state.get("_wl_purge_confirm"):
-                    st.warning(f"자동 편입 {len(_auto_items)}종목을 삭제합니다. "
-                               f"되돌릴 수 없습니다.")
-                    _c_y, _c_n = st.columns(2)
-                    with _c_y:
-                        if st.button("삭제 확인", key="wl_purge_yes", type="primary",
-                                     use_container_width=True):
-                            _uid_p = str(st.session_state.get("user_id") or "").strip()
-                            _done, _fail = 0, 0
-                            for _w in _auto_items:
-                                _ok_p, _ = delete_from_watchlist(_uid_p,
-                                                                 str(_w.get("ticker", "")))
-                                _done += 1 if _ok_p else 0
-                                _fail += 0 if _ok_p else 1
-                            st.session_state["_wl_purge_confirm"] = False
-                            if _fail:
-                                st.error(f"{_done}종목 삭제, {_fail}종목 실패")
-                            else:
-                                st.success(f"{_done}종목을 삭제했습니다.")
-                            st.rerun()
-                    with _c_n:
-                        if st.button("취소", key="wl_purge_no", use_container_width=True):
-                            st.session_state["_wl_purge_confirm"] = False
-                            st.rerun()
-
-            # ── 📖 배지 설명 (범례) ──────────────────────────────────────
-            with st.expander("📖 배지 설명 (국면 · 매수 타이밍)", expanded=False):
-                st.markdown("**국면(추세 강도)**")
-                st.markdown(
-                    "- 🟢 **강세 (대장주)**: 200일선 위 + 우상향. RSI 40~80 밴드 적용\n"
-                    "- 🟡 **횡보**: 방향성 약한 박스권. RSI 40~70 밴드\n"
-                    "- 🔴 **약세**: 200일선 아래/하락 추세. RSI 20~60 밴드"
-                )
-                st.markdown("**매수 타이밍**")
-                for _c in ("entry", "wait", "overheat", "trend_break", "avoid"):
-                    st.markdown(f"- {rc.TIMING_BADGE[_c]} : {rc.TIMING_HELP[_c]}")
-                st.markdown(f"- {rc.TOPPING_BADGE} : {rc.TOPPING_HELP}")
-                st.caption("강세 종목은 RSI 30까지 잘 안 내려옵니다. 그래서 고정 30/70이 아니라 "
-                           "국면별 RSI 밴드로 '싸진 구간(40대)'을 잡습니다.")
-
-            wl_tickers = [i["ticker"] for i in wl_items]
-
-            # ── 💰 등록가 일괄 복구 버튼 (saved_price 없는 종목 대상) ────────
-            _missing_sp = [i for i in wl_items if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce"))]
-            if _missing_sp:
-                st.warning(f"⚠️ **{len(_missing_sp)}개 종목**의 등록가(Saved Price)가 없어 '등록 시 대비'가 N/A로 표시됩니다.")
-                if st.button("💰 등록가 현재가로 일괄 복구", key="bulk_fix_saved_price", type="secondary"):
-                    with st.spinner("등록가 복구 중..."):
-                        try:
-                            fetch_latest_prices_for_tickers.clear()
-                        except Exception:
-                            pass
-                        _fix_tks = tuple(i["ticker"] for i in _missing_sp)
-                        _fix_prices = fetch_latest_prices_for_tickers(_fix_tks)
-                        _fix_count = 0
-                        for i in wl_items:
-                            if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce")):
-                                _fp = _fix_prices.get(i["ticker"], np.nan)
-                                if pd.notna(_fp):
-                                    i["saved_price"] = float(_fp)
-                                    _fix_count += 1
-                        if _fix_count > 0:
-                            _ok_fix, _err_fix = save_watchlist_sheet(uid_wl, wl_items)
-                            if _ok_fix:
-                                load_watchlist_sheet.clear()
-                                st.success(f"✅ {_fix_count}개 종목 등록가 복구 완료!")
-                                st.rerun()
-                            else:
-                                st.error(f"저장 실패: {_err_fix}")
-                        else:
-                            st.warning("복구할 가격 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
-
-            with st.spinner("실시간 가격 및 지표 계산 중..."):
-                with _timed("WL 현재가"):
-                    price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
-                rsi_map_wl, ma200_map_wl, regime_map_wl = {}, {}, {}
-                atr_map_wl, high_map_wl = {}, {}   # #2 사이징용 ATR·최근고점
-                hist_map_wl, wl_dec_key = {}, {}   # 결정 카드/정렬용
-                # RS(상대강도) 계산용 SPY 종가 — 1회만 조회
-                try:
-                    with _timed("WL SPY 일봉"):
-                        _spy_hist_wl = _fmp_price_history("SPY", lookback_days=fx.HIST_WINDOW_DAYS)
-                    _spy_close_wl = (
-                        _spy_hist_wl["Close"]
-                        if (_spy_hist_wl is not None and not _spy_hist_wl.empty and "Close" in _spy_hist_wl.columns)
-                        else None
-                    )
-                except Exception:
-                    _spy_hist_wl, _spy_close_wl = None, None
-
-                # ── 지표는 자동화가 미리 계산해 둔 Watchlist_Metrics 를 먼저 쓴다 ──
-                #   레짐/타이밍/RSI/MA200/ATR 은 일봉 파생이라 장중에 거의 변하지 않는다.
-                #   빠르게 변하는 현재가는 위 price_map_wl 이 실시간으로 담당한다.
-                #   낡았거나(직전 완료 세션 이전) 시트에 없는 종목만 실시간 계산한다.
-                with _timed("WL 지표시트 로드"):
-                    _wl_metrics = load_watchlist_metrics()
-                _wl_ref_date = wm.last_completed_session(
-                    _spy_hist_wl, datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d"))
-                _wl_live, _wl_cached_n = [], 0
-                for tk in wl_tickers:
-                    if wm.is_fresh(_wl_metrics.get(tk), _wl_ref_date):
-                        _wl_cached_n += 1
-                    else:
-                        _wl_live.append(tk)
-                st.session_state["_wl_metrics_stat"] = {
-                    "cached": _wl_cached_n, "live": len(_wl_live),
-                    "ref": _wl_ref_date,
-                    "updated": (next((m.get("updated_at") for m in _wl_metrics.values()
-                                      if m.get("updated_at")), "") if _wl_metrics else ""),
-                }
-
-                # 일봉은 폴백 계산이 필요한 종목만 받는다.
-                # ⚠️ 예전에는 전 종목을 받았다. 매수 카드(build_buy_card)가 hist 를
-                #    요구하기 때문인데, 카드는 expander 를 펼친 종목에서만 그려진다.
-                #    저장본이 있는 종목의 일봉은 카드를 펼칠 때 그 자리에서 받으면 된다
-                #    (_fmp_price_history 는 프로세스 캐시라 두 번째부터 즉시 반환).
-                with _timed("WL 일봉 프리페치") as _tp:
-                    _hist_pre = _wl_prefetch_histories(tuple(_wl_live)) if _wl_live else {}
-                _perf_note("WL 일봉 프리페치", f"{len(_wl_live)}종목")
-                _t_loop = time.perf_counter()
-                for tk in wl_tickers:
-                    try:
-                        hist = _hist_pre.get(tk)
-                        hist_map_wl[tk] = hist
-                        _m = _wl_metrics.get(tk)
-                        if tk in _wl_live:
-                            # 폴백: 이 종목만 실시간 계산 (SSOT 는 동일 함수)
-                            _m = wm.compute_metrics(tk, hist, spy_close=_spy_close_wl)
-                        if not _m:
-                            raise ValueError("metrics unavailable")
-                        rsi_map_wl[tk] = _m["rsi"]
-                        ma200_map_wl[tk] = _m["ma200"]
-                        atr_map_wl[tk] = _m["atr"]
-                        high_map_wl[tk] = _m["high_120"]
-                        regime_map_wl[tk] = _m["analysis"]
-                        wl_dec_key[tk] = _m.get("dec_key", "na")
-                    except Exception:
-                        rsi_map_wl[tk] = np.nan
-                        ma200_map_wl[tk] = np.nan
-                        regime_map_wl[tk] = None
-                        atr_map_wl[tk] = np.nan
-                        high_map_wl[tk] = np.nan
-                        hist_map_wl[tk] = None
-                        wl_dec_key[tk] = "na"
-                try:
-                    _b = _perf_bucket()
-                    _b["WL 지표 조립"] = {
-                        "n": 1, "sec": time.perf_counter() - _t_loop,
-                        "note": f"저장본 {_wl_cached_n} / 폴백계산 {len(_wl_live)}",
-                    }
-                except Exception:
-                    pass
-
-            # 지표 출처 표시 — 어떤 봉 기준의 판정인지 항상 보이게 한다
-            _wms = st.session_state.get("_wl_metrics_stat") or {}
-            if _wms.get("cached"):
-                _wl_meta_slot.caption(
-                    f"📊 지표 기준일 **{_wms.get('ref') or '?'}** (종가 확정분) · "
-                    f"저장본 {_wms['cached']}종목"
-                    + (f" · 실시간 계산 {_wms['live']}종목" if _wms.get("live") else "")
-                    + (f" · 자동 갱신 {_wms['updated']}" if _wms.get("updated") else "")
-                    + " — 현재가·수익률은 실시간입니다."
-                )
-            elif wl_tickers:
-                _wl_meta_slot.caption(
-                    "📊 지표를 실시간 계산했습니다 — 자동화(마감 후)가 한 번 돌면 "
-                    "다음부터 즉시 표시됩니다."
-                )
-
-            # ── 포지션 플랜 입력 (사이징·R:R) — 개별종목 탭과 세션 공유 (#2) ──
-            _wl_acct = str(st.session_state.get("_active_account") or "").strip()
-            _wl_uid = str(st.session_state.get("user_id") or "").strip()
-            _wl_ctx = None
-            if _wl_acct:
-                try:
-                    _wl_ctx = account_context_memo(_wl_uid, _wl_acct)
-                except Exception:
-                    _wl_ctx = None
-            if _wl_ctx:
-                _wl_prof = _wl_ctx["profile"]
-                _wl_equity = float(_wl_ctx["equity"])
-                _wl_risk_pct = float(_wl_prof["Risk_Pct"])
-                _wl_cash_def = float(_wl_ctx["cash"])
-                _wl_kx = _wl_acct
+        # ── Watchlist 현황 ─────────────────────────────────────────────
+        if _wl_view == _WL_V1:
+            if not wl_items:
+                st.info("등록된 관심 종목이 없어요. `✏️ 등록·관리` 구획에서 종목을 추가해주세요.")
             else:
-                _wl_prof = dict(_ACCOUNT_PROFILE_DEFAULTS)
-                _wl_prof["_exists"] = False
-                _wl_equity = float(st.session_state.get("_size_equity", 10000.0))
-                _wl_risk_pct = float(st.session_state.get("_size_risk_pct", 1.0))
-                _wl_cash_def = float(st.session_state.get("_size_cash", 0.0))
-                _wl_kx = "manual"
-            _wl_cash_in = _wl_cash_def   # 위젯 미렌더(빈 워치리스트) 시 폴백
-            try:
-                _wl_rp = _regime_params(_drg_get("전체")[0])
-            except Exception:
-                _wl_rp = _regime_params({})
-            # 시장 진입 게이트 상태 — 앱은 **표시만** 한다(종목은 숨기지 않음).
-            #   메일(자동화)은 Users.Gate_Market = Y 인 사용자에 한해 실제로 동결한다.
-            #   배너가 없으면 "메일은 안 왔는데 앱엔 매수 신호"가 설명되지 않는다.
-            try:
-                _wl_spy = cached_timing_price_history("SPY")
-                _wl_mkt = rc.market_gate_status(
-                    _wl_spy["Close"] if (_wl_spy is not None and not _wl_spy.empty
-                                         and "Close" in _wl_spy.columns) else None)
-            except Exception:
-                _wl_mkt = {"blocked": False, "available": False, "label": "", "count": None}
-            if _wl_mkt.get("available"):
-                _wl_mkt_names = ", ".join(rc.MARKET_WARNING_LABELS)
-                if _wl_mkt.get("blocked"):
-                    st.warning(_esc_md(
-                        f"{_wl_mkt['label']} — 신규 매수 알림이 **동결**되는 구간입니다 "
-                        f"(임계 {_wl_mkt['threshold']}개). 보유 관리 알림(줄이기·청산)은 정상 발송됩니다.  \n"
-                        f"판정 신호: {_wl_mkt_names}"))
-                else:
-                    st.caption(_esc_md(f"{_wl_mkt['label']} (임계 {_wl_mkt['threshold']}개)"))
-            if wl_items:
-                if _wl_ctx:
-                    st.caption(_esc_md(
-                        f"📍 **{_wl_acct}** 기준 · 자본 ${_wl_ctx['equity']:,.2f} "
-                        f"(현금 ${_wl_ctx['cash']:,.2f} + 보유 ${_wl_ctx['invested_value']:,.2f}) · "
-                        f"슬롯 {_wl_ctx['slots_used']}/{int(_wl_prof['Max_Positions'])}"
-                        + ("" if _wl_prof.get("_exists") else "  ·  ⚙️ 기본값")
-                    ))
-                else:
-                    st.caption("📍 활성 계좌 없음 — 수동 입력으로 계산합니다.")
-                _pc1, _pc2, _pc2b, _pc3 = st.columns([1.1, 0.95, 1.05, 1.4])
-                with _pc1:
-                    _wl_equity = st.number_input(
-                        "계좌 자본금 ($)", min_value=0.0, step=1000.0,
-                        value=_wl_equity, key=f"_wl_size_equity_{_wl_kx}")
-                    st.session_state["_size_equity"] = _wl_equity
-                with _pc2:
-                    _wl_risk_pct = st.number_input(
-                        "거래당 리스크 (%)", min_value=0.1, max_value=10.0, step=0.1,
-                        value=_wl_risk_pct, key=f"_wl_size_risk_{_wl_kx}")
-                    st.session_state["_size_risk_pct"] = _wl_risk_pct
-                with _pc2b:
-                    _wl_cash_in = st.number_input(
-                        "가용 현금 ($)", min_value=0.0, step=50.0,
-                        value=_wl_cash_def, key=f"_wl_size_cash_{_wl_kx}",
-                        help="실제 집행 가능한 현금. 0 = 제한 없음.")
-                    st.session_state["_size_cash"] = _wl_cash_in
-                with _pc3:
-                    st.caption(
-                        "각 종목에 '얼마' 들어갈지 + R:R 게이트를 제안합니다. "
-                        f"국면 {_wl_rp['label']} (ATR×{_wl_rp['atr_mult']}, 목표 1:{_wl_rp['rr']}). "
-                        "손절/목표가를 설정해두면 R:R 게이트가 정확해집니다.")
+                st.markdown(f"### 📋 관심 종목 현황 ({len(wl_items)}개)")
+                # 지표 출처 표시 자리. 실제 값은 아래 계산 블록이 끝난 뒤 채운다.
+                # (계산부에 그냥 두면 헤딩에서 150줄 넘게 밀려나 눈에 띄지 않는다)
+                _wl_meta_slot = st.empty()
 
-            # ── 결정 필터·정렬 (2-5) ──
-            if wl_items:
-                _dec_order = {"buy": 0, "buy_split": 1, "wait_pullback": 2, "wait_range": 3, "na": 4, "avoid": 5}
-                _fc1, _fc2 = st.columns([1, 1])
-                with _fc1:
-                    _wl_dfilter = st.selectbox("결정 필터", ["전체", "🟢 매수 계열", "🟡 대기", "🔴 회피"],
-                                               key="_wl_dec_filter")
-                with _fc2:
-                    _wl_dsort = st.checkbox("결정 순 정렬(매수 먼저)", value=True, key="_wl_dec_sort")
-                _grp = {"🟢 매수 계열": ("buy", "buy_split"), "🟡 대기": ("wait_pullback", "wait_range"),
-                        "🔴 회피": ("avoid",)}.get(_wl_dfilter)
-                if _grp:
-                    wl_items = [it for it in wl_items if wl_dec_key.get(it.get("ticker"), "na") in _grp]
-                if _wl_dsort:
-                    wl_items = sorted(wl_items, key=lambda it: _dec_order.get(wl_dec_key.get(it.get("ticker"), "na"), 9))
-                if not wl_items:
-                    st.caption("해당 결정에 맞는 종목이 없습니다.")
-
-            # ── '매수 완료 → 포트폴리오 등록' 공용 준비값 (루프 밖 1회) ─────
-            _wl_plan_map = {}                      # ticker → build_trade_plan 결과(수량·금액 프리필용)
-            _WL_THESIS_NONE = "(Thesis 없음 - 자동 연결 시도)"
-            _WL_THESIS_CORE = "📈 코어/정기적립 (인덱스 DCA)"
-            try:
-                _wl_thesis_options = get_thesis_options_from_narratives(uid_wl)
-            except Exception:
-                _wl_thesis_options = []
-            _wl_thesis_labels = [_WL_THESIS_NONE, _WL_THESIS_CORE] + [o["label"] for o in _wl_thesis_options]
-            try:
-                _WL_BUY_REASON_IDX = _ENTRY_REASON_OPTIONS.index("🎯 최적 매수 타이밍 (눌림목·RS반전)")
-            except ValueError:
-                _WL_BUY_REASON_IDX = 0
-
-            for idx, item in enumerate(wl_items):
-                tk = item["ticker"]
-                current_price = pd.to_numeric(price_map_wl.get(tk), errors="coerce")
-                saved_price = pd.to_numeric(item.get("saved_price"), errors="coerce")
-                rsi_val = pd.to_numeric(rsi_map_wl.get(tk), errors="coerce")
-                ma200_val = pd.to_numeric(ma200_map_wl.get(tk), errors="coerce")
-                pnl = (float(current_price) / float(saved_price) - 1.0) * 100.0 if pd.notna(current_price) and pd.notna(saved_price) and saved_price > 0 else np.nan
-
-                # 상태 기반 알림: 활성 이벤트 목록 + '지금 활성 조건' 미리보기.
-                # (실제 발동/2일확정/저장은 장 마감 후 자동화가 담당 — 앱은 표시만)
-                _enabled_states = rc.resolve_alert_events(item.get("alert_states"), _WL_ALERT_DEFAULT)
-                _sl_item = pd.to_numeric(item.get("stop_loss"), errors="coerce")
-                _tp_item = pd.to_numeric(item.get("target_price"), errors="coerce")
-                _ap_item = pd.to_numeric(item.get("alert_price"), errors="coerce")
-                _ar_item = pd.to_numeric(item.get("alert_rsi"), errors="coerce")
-                _am_item = bool(item.get("alert_ma200"))
-                _an = regime_map_wl.get(tk)
-                _active_now = []
-                if _an and _an.get("regime", {}).get("enough_data"):
-                    _now_conds = rc.alert_conditions(
-                        _an,
-                        price=float(current_price) if pd.notna(current_price) else None,
-                        stop_loss=float(_sl_item) if pd.notna(_sl_item) else None,
-                        target_price=float(_tp_item) if pd.notna(_tp_item) else None,
-                        alert_price=float(_ap_item) if pd.notna(_ap_item) else None,
-                        alert_rsi=float(_ar_item) if pd.notna(_ar_item) else None,
-                        alert_ma200=_am_item,
-                    )
-                    _active_now = [e for e in ("entry", "risk", "exit", "price", "watch")
-                                   if e in _enabled_states and _now_conds.get(e, (False, ""))[0]]
-                alert_badge = "⚡ 알림 조건 활성!" if _active_now else ""
-
-                # 레짐/타이밍 압축 배지 (regime_core — 개별종목 탭과 동일 엔진)
-                _reg_badge, _tim_badge = "", ""
-                if _an and _an.get("regime", {}).get("enough_data"):
-                    _reg_badge = _an["regime"].get("color", "")
-                    _tv = _an["timing"]
-                    if _tv.get("is_entry"):
-                        _tim_badge = rc.TIMING_BADGE["entry"]
-                    else:
-                        _tim_badge = rc.TIMING_BADGE.get(_tv.get("code"), "")
-                    if _an["regime"].get("topping"):
-                        _tim_badge = (_tim_badge + " " + rc.TOPPING_BADGE).strip()
-                _badge_str = " ".join(b for b in [_reg_badge, _tim_badge] if b)
-
-                with st.expander(
-                    f"**{tk}** {_badge_str} {alert_badge} | "
-                    f"현재가 {'${:.2f}'.format(float(current_price)) if pd.notna(current_price) else 'N/A'} | "
-                    f"RSI {'{:.1f}'.format(float(rsi_val)) if pd.notna(rsi_val) else 'N/A'} | "
-                    f"등록 시 대비 {'{:+.1f}%'.format(pnl) if pd.notna(pnl) else 'N/A'}",
-                    expanded=False,   # 기본 접기 — 활성 알림은 헤더 ⚡ 배지로 식별
-                ):
-                    info_col, alert_col = st.columns([3, 2])
-                    with info_col:
-                        # ── 국면/타이밍 요약 (상세는 개별종목 탭) ──
-                        if _an and _an.get("regime", {}).get("enough_data"):
-                            _rg, _tg = _an["regime"], _an["timing"]
-                            _rlabel = {"strong": "🟢 강세(대장주)", "sideways": "🟡 횡보",
-                                       "weak": "🔴 약세"}.get(_rg["regime"], "⚪ 판정 불가")
-                            _topp = f" · {rc.TOPPING_BADGE}" if _rg.get("topping") else ""
-                            _blo, _bhi = _rg["rsi_band"]
-                            st.markdown(
-                                f"**국면:** {_rlabel}{_topp} "
-                                f"(강도 {_rg['score']:.0f}/100 · RSI밴드 {_blo:.0f}~{_bhi:.0f})"
-                            )
-                            _tg_reasons = " · ".join(_tg.get("reasons", []))
-                            st.markdown(f"**타이밍:** {_tg.get('verdict', '')}"
-                                        + (f" — {_tg_reasons}" if _tg_reasons else ""))
-                            _tg_help = rc.TIMING_HELP.get(_tg.get("code"))
-                            if _tg_help:
-                                st.caption(f"ℹ️ {_tg_help}")
-
-                            def _goto_micro_wl(_t=tk):
-                                st.session_state["selected_ticker"] = _t
-                                st.session_state["main_sidebar_nav"] = NAV_STOCK
-                            st.button(f"🔬 {tk} 정밀 검사로 자세히 보기",
-                                      key=f"wl_goto_micro_{idx}_{tk}",
-                                      on_click=_goto_micro_wl,
-                                      help="3단계 개별 종목 정밀 검사 탭으로 이동합니다.")
-                        st.markdown(f"**메모:** {item.get('memo', '') or '없음'}")
-                        st.markdown(f"**등록일:** {item.get('date_added', 'N/A')}")
-                        st.markdown(f"**200일선:** {'${:.2f}'.format(float(ma200_val)) if pd.notna(ma200_val) else 'N/A'}")
-                        _sl = pd.to_numeric(item.get("stop_loss"), errors="coerce")
-                        _tp = pd.to_numeric(item.get("target_price"), errors="coerce")
-                        if pd.notna(_sl) or pd.notna(_tp):
-                            _sl_txt = f"🛑 손절 ${_sl:.2f}" if pd.notna(_sl) else "🛑 손절 미설정"
-                            _tp_txt = f"🎯 목표 ${_tp:.2f}" if pd.notna(_tp) else "🎯 목표 미설정"
-                            st.markdown(f"**{_sl_txt} · {_tp_txt}**")
-                            # 손익비 표시
-                            if pd.notna(_sl) and pd.notna(_tp) and pd.notna(saved_price) and saved_price > 0:
-                                _rk = float(saved_price) - float(_sl)
-                                _rw = float(_tp) - float(saved_price)
-                                if _rk > 0 and _rw > 0:
-                                    st.caption(f"손익비 1:{_rw/_rk:.1f} (등록가 기준)")
-                            # 실시간 도달 경보
-                            if pd.notna(current_price):
-                                if pd.notna(_sl) and float(current_price) <= float(_sl):
-                                    st.error(f"🛑 손절가 도달! 현재가 ${float(current_price):.2f} ≤ 손절 ${_sl:.2f} — 매도 검토")
-                                elif pd.notna(_tp) and float(current_price) >= float(_tp):
-                                    st.success(f"🎯 목표가 도달! 현재가 ${float(current_price):.2f} ≥ 목표 ${_tp:.2f} — 익절 검토")
-                        else:
-                            st.caption("🛑🎯 손절/목표가 미설정 — 편집에서 추가하면 도달 시 알림을 줍니다.")
-
-                        # ── 포지션 플랜 (사이징·R:R 게이트) — regime_core SSOT (#2) ──
-                        # 종목별 귀속 계좌 → 없으면 활성 계좌 폴백
-                        _it_acct = str(item.get("account", "") or "").strip()
-                        _use_acct = _it_acct or _wl_acct
-                        if _use_acct and _use_acct != _wl_acct:
-                            try:
-                                _it_ctx = account_context_memo(_wl_uid, _use_acct)
-                            except Exception:
-                                _it_ctx = _wl_ctx
-                        else:
-                            _it_ctx = _wl_ctx
-                        if _it_ctx:
-                            _it_prof = _it_ctx["profile"]
-                            _it_eq, _it_cash = float(_it_ctx["equity"]), float(_it_ctx["cash"])
-                        else:
-                            _it_prof, _it_eq, _it_cash = _wl_prof, _wl_equity, float(_wl_cash_in)
-                        if _it_acct:
-                            st.caption(f"🏦 귀속 계좌: **{_it_acct}**")
-                        elif _use_acct:
-                            st.caption(f"🏦 계좌 미지정 — 활성 계좌 **{_use_acct}** 기준으로 계산")
-                        _it_mode = str(_it_prof.get("Sizing_Mode", rc.SIZING_MODE_DEFAULT))
-                        if _an and _an.get("regime", {}).get("enough_data") and pd.notna(current_price) and float(current_price) > 0:
-                            _wl_atr = pd.to_numeric(atr_map_wl.get(tk), errors="coerce")
-                            _wl_hi = pd.to_numeric(high_map_wl.get(tk), errors="coerce")
-                            _wl_plan = rc.build_trade_plan(
-                                verdict_code=_an["timing"].get("code"),
-                                entry=float(current_price),
-                                atr=float(_wl_atr) if pd.notna(_wl_atr) else float("nan"),
-                                ma200=float(ma200_val) if pd.notna(ma200_val) else float("nan"),
-                                equity=_it_eq, risk_pct=float(_it_prof["Risk_Pct"]),
-                                atr_mult=_wl_rp["atr_mult"], rr_target=_wl_rp["rr"],
-                                stop_source=("manual" if pd.notna(_sl_item) else "atr"),
-                                manual_stop=float(_sl_item) if pd.notna(_sl_item) else None,
-                                manual_target=float(_tp_item) if pd.notna(_tp_item) else None,
-                                recent_high=float(_wl_hi) if pd.notna(_wl_hi) else None,
-                                max_position_pct=float(_it_prof["Max_Position_Pct"]),
-                                cash=(_it_cash if _it_cash > 0 else None),
-                                reserve_pct=float(_it_prof["Cash_Reserve_Pct"]),
-                                invested_value=(_it_ctx["invested_value"] if _it_ctx else 0.0),
-                                slots_used=(_it_ctx["slots_used"] if _it_ctx else None),
-                                max_positions=(int(_it_prof["Max_Positions"]) if _it_ctx else None),
-                                min_trade_dollars=float(_it_prof["Min_Trade_Dollars"]),
-                                sizing_mode=_it_mode,
-                            )
-                            _wl_plan_map[tk] = _wl_plan   # ✅ 매수 등록 폼 수량/금액 프리필용
-                            # 프리페치에서 제외된 종목은 카드를 펼치는 이 시점에 받는다
-                            _hist_card = hist_map_wl.get(tk)
-                            if _hist_card is None:
-                                try:
-                                    _hist_card = _fmp_price_history(
-                                        tk, lookback_days=fx.HIST_WINDOW_DAYS)
-                                    hist_map_wl[tk] = _hist_card
-                                except Exception:
-                                    _hist_card = None
-                            _bc = rc.build_buy_card(_hist_card, _an, _wl_plan, confluence=None)
-                            st.markdown(f"**🎯 {_bc['badge']}** · {_bc['glance_num']}")
-                            if _wl_plan["gate"] == "na":
-                                st.caption(f"🧮 플랜: {_wl_plan['gate_label']} — {_wl_plan['gate_reason']}")
-                            else:
-                                if _wl_plan.get("sizing_mode") == "off":
-                                    st.markdown(_esc_md(
-                                        f"**🧮 플랜: {_wl_plan['gate_label']}** · "
-                                        f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
-                                        f"R:R {_wl_plan['rr_label']}  ·  _사이징 미사용 계좌_"
-                                    ))
+                # ── 자동 편입분 일괄 정리 ────────────────────────────────────
+                # 주간 스캐너가 넣은 종목은 Memo 가 "AUTO|" 로 시작한다.
+                # 자동 편입을 켰다가 목록이 불어났을 때 한 번에 되돌릴 수단.
+                _auto_items = [w for w in wl_items
+                               if sc.is_auto_memo(str(w.get("memo", "") or ""))]
+                if _auto_items:
+                    _c_a1, _c_a2 = st.columns([3, 1])
+                    with _c_a1:
+                        st.caption(
+                            f"🔔 주간 스캐너 자동 편입 {len(_auto_items)}종목 "
+                            f"(전체 {len(wl_items)}개 중) — "
+                            f"{', '.join(str(w.get('ticker','')) for w in _auto_items[:12])}"
+                            + (" …" if len(_auto_items) > 12 else "")
+                        )
+                    with _c_a2:
+                        if st.button("🧹 자동 편입분 일괄 삭제", key="wl_purge_auto",
+                                     use_container_width=True,
+                                     help="Memo 가 AUTO| 로 시작하는 행만 삭제합니다. "
+                                          "직접 추가하신 종목과 수정한 손절가·목표가는 "
+                                          "영향을 받지 않습니다."):
+                            st.session_state["_wl_purge_confirm"] = True
+                    if st.session_state.get("_wl_purge_confirm"):
+                        st.warning(f"자동 편입 {len(_auto_items)}종목을 삭제합니다. "
+                                   f"되돌릴 수 없습니다.")
+                        _c_y, _c_n = st.columns(2)
+                        with _c_y:
+                            if st.button("삭제 확인", key="wl_purge_yes", type="primary",
+                                         use_container_width=True):
+                                _uid_p = str(st.session_state.get("user_id") or "").strip()
+                                _done, _fail = 0, 0
+                                for _w in _auto_items:
+                                    _ok_p, _ = delete_from_watchlist(_uid_p,
+                                                                     str(_w.get("ticker", "")))
+                                    _done += 1 if _ok_p else 0
+                                    _fail += 0 if _ok_p else 1
+                                st.session_state["_wl_purge_confirm"] = False
+                                if _fail:
+                                    st.error(f"{_done}종목 삭제, {_fail}종목 실패")
                                 else:
-                                    st.markdown(_esc_md(
-                                        f"**🧮 플랜: {_wl_plan['gate_label']}** · "
-                                        f"${_wl_plan['dollars']:,.2f} ({_wl_plan['shares_exact']:.3f}주 · 정수 {_wl_plan['shares_whole']:,}주 · "
-                                        f"비중 {_wl_plan['position_pct']:.1f}% · 제한 {_wl_plan['binding_label']}) · "
-                                        f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
-                                        f"R:R {_wl_plan['rr_label']} · 1R -${_wl_plan['risk_dollars']:,.0f}"
-                                    ))
-                                if _wl_plan.get("blocked"):
-                                    st.caption(_esc_md(f"↳ 🚧 {_wl_plan['block_reason']}"))
-                                if not _wl_plan.get("rr_measured", False):
-                                    st.caption("↳ ⚠️ R:R 미실측(독립 목표 없음) — 자금 빠듯하면 후순위")
-                                if not _wl_plan["enter_ok"]:
-                                    st.caption(f"↳ {_wl_plan['gate_reason']} — 신규 진입 비권장")
+                                    st.success(f"{_done}종목을 삭제했습니다.")
+                                st.rerun()
+                        with _c_n:
+                            if st.button("취소", key="wl_purge_no", use_container_width=True):
+                                st.session_state["_wl_purge_confirm"] = False
+                                st.rerun()
 
-                    with alert_col:
-                        st.markdown("**🔔 상태 기반 알림:**")
-                        if _enabled_states:
-                            for _e in _WL_ALERT_EVENTS:
-                                if _e in _enabled_states:
-                                    st.caption(f"✅ {rc.ALERT_EVENT_LABELS.get(_e, _e)}")
+                # ── 📖 배지 설명 (범례) ──────────────────────────────────────
+                with st.expander("📖 배지 설명 (국면 · 매수 타이밍)", expanded=False):
+                    st.markdown("**국면(추세 강도)**")
+                    st.markdown(
+                        "- 🟢 **강세 (대장주)**: 200일선 위 + 우상향. RSI 40~80 밴드 적용\n"
+                        "- 🟡 **횡보**: 방향성 약한 박스권. RSI 40~70 밴드\n"
+                        "- 🔴 **약세**: 200일선 아래/하락 추세. RSI 20~60 밴드"
+                    )
+                    st.markdown("**매수 타이밍**")
+                    for _c in ("entry", "wait", "overheat", "trend_break", "avoid"):
+                        st.markdown(f"- {rc.TIMING_BADGE[_c]} : {rc.TIMING_HELP[_c]}")
+                    st.markdown(f"- {rc.TOPPING_BADGE} : {rc.TOPPING_HELP}")
+                    st.caption("강세 종목은 RSI 30까지 잘 안 내려옵니다. 그래서 고정 30/70이 아니라 "
+                               "국면별 RSI 밴드로 '싸진 구간(40대)'을 잡습니다.")
+
+                wl_tickers = [i["ticker"] for i in wl_items]
+                with st.spinner("실시간 가격 및 지표 계산 중..."):
+                    with _timed("WL 현재가"):
+                        price_map_wl = fetch_latest_prices_for_tickers(tuple(wl_tickers))
+                    rsi_map_wl, ma200_map_wl, regime_map_wl = {}, {}, {}
+                    atr_map_wl, high_map_wl = {}, {}   # #2 사이징용 ATR·최근고점
+                    hist_map_wl, wl_dec_key = {}, {}   # 결정 카드/정렬용
+                    # RS(상대강도) 계산용 SPY 종가 — 1회만 조회
+                    try:
+                        with _timed("WL SPY 일봉"):
+                            _spy_hist_wl = _fmp_price_history("SPY", lookback_days=fx.HIST_WINDOW_DAYS)
+                        _spy_close_wl = (
+                            _spy_hist_wl["Close"]
+                            if (_spy_hist_wl is not None and not _spy_hist_wl.empty and "Close" in _spy_hist_wl.columns)
+                            else None
+                        )
+                    except Exception:
+                        _spy_hist_wl, _spy_close_wl = None, None
+
+                    # ── 지표는 자동화가 미리 계산해 둔 Watchlist_Metrics 를 먼저 쓴다 ──
+                    #   레짐/타이밍/RSI/MA200/ATR 은 일봉 파생이라 장중에 거의 변하지 않는다.
+                    #   빠르게 변하는 현재가는 위 price_map_wl 이 실시간으로 담당한다.
+                    #   낡았거나(직전 완료 세션 이전) 시트에 없는 종목만 실시간 계산한다.
+                    with _timed("WL 지표시트 로드"):
+                        _wl_metrics = load_watchlist_metrics()
+                    _wl_ref_date = wm.last_completed_session(
+                        _spy_hist_wl, datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d"))
+                    _wl_live, _wl_cached_n = [], 0
+                    for tk in wl_tickers:
+                        if wm.is_fresh(_wl_metrics.get(tk), _wl_ref_date):
+                            _wl_cached_n += 1
                         else:
-                            st.caption("알림 없음 (메모만)")
-                        if _active_now:
-                            st.info("👉 지금 활성 조건: "
-                                    + ", ".join(rc.ALERT_EVENT_LABELS.get(e, e) for e in _active_now))
-                        st.caption("실제 알림은 장 마감 후 자동화가 2일 확정 시 이메일 발송")
+                            _wl_live.append(tk)
+                    st.session_state["_wl_metrics_stat"] = {
+                        "cached": _wl_cached_n, "live": len(_wl_live),
+                        "ref": _wl_ref_date,
+                        "updated": (next((m.get("updated_at") for m in _wl_metrics.values()
+                                          if m.get("updated_at")), "") if _wl_metrics else ""),
+                    }
 
-                    if _active_now and _an and _an.get("regime", {}).get("enough_data"):
-                        _prev = rc.alert_conditions(
+                    # 일봉은 폴백 계산이 필요한 종목만 받는다.
+                    # ⚠️ 예전에는 전 종목을 받았다. 매수 카드(build_buy_card)가 hist 를
+                    #    요구하기 때문인데, 카드는 expander 를 펼친 종목에서만 그려진다.
+                    #    저장본이 있는 종목의 일봉은 카드를 펼칠 때 그 자리에서 받으면 된다
+                    #    (_fmp_price_history 는 프로세스 캐시라 두 번째부터 즉시 반환).
+                    with _timed("WL 일봉 프리페치") as _tp:
+                        _hist_pre = _wl_prefetch_histories(tuple(_wl_live)) if _wl_live else {}
+                    _perf_note("WL 일봉 프리페치", f"{len(_wl_live)}종목")
+                    _t_loop = time.perf_counter()
+                    for tk in wl_tickers:
+                        try:
+                            hist = _hist_pre.get(tk)
+                            hist_map_wl[tk] = hist
+                            _m = _wl_metrics.get(tk)
+                            if tk in _wl_live:
+                                # 폴백: 이 종목만 실시간 계산 (SSOT 는 동일 함수)
+                                _m = wm.compute_metrics(tk, hist, spy_close=_spy_close_wl)
+                            if not _m:
+                                raise ValueError("metrics unavailable")
+                            rsi_map_wl[tk] = _m["rsi"]
+                            ma200_map_wl[tk] = _m["ma200"]
+                            atr_map_wl[tk] = _m["atr"]
+                            high_map_wl[tk] = _m["high_120"]
+                            regime_map_wl[tk] = _m["analysis"]
+                            wl_dec_key[tk] = _m.get("dec_key", "na")
+                        except Exception:
+                            rsi_map_wl[tk] = np.nan
+                            ma200_map_wl[tk] = np.nan
+                            regime_map_wl[tk] = None
+                            atr_map_wl[tk] = np.nan
+                            high_map_wl[tk] = np.nan
+                            hist_map_wl[tk] = None
+                            wl_dec_key[tk] = "na"
+                    try:
+                        _b = _perf_bucket()
+                        _b["WL 지표 조립"] = {
+                            "n": 1, "sec": time.perf_counter() - _t_loop,
+                            "note": f"저장본 {_wl_cached_n} / 폴백계산 {len(_wl_live)}",
+                        }
+                    except Exception:
+                        pass
+
+                # 지표 출처 표시 — 어떤 봉 기준의 판정인지 항상 보이게 한다
+                _wms = st.session_state.get("_wl_metrics_stat") or {}
+                if _wms.get("cached"):
+                    _wl_meta_slot.caption(
+                        f"📊 지표 기준일 **{_wms.get('ref') or '?'}** (종가 확정분) · "
+                        f"저장본 {_wms['cached']}종목"
+                        + (f" · 실시간 계산 {_wms['live']}종목" if _wms.get("live") else "")
+                        + (f" · 자동 갱신 {_wms['updated']}" if _wms.get("updated") else "")
+                        + " — 현재가·수익률은 실시간입니다."
+                    )
+                elif wl_tickers:
+                    _wl_meta_slot.caption(
+                        "📊 지표를 실시간 계산했습니다 — 자동화(마감 후)가 한 번 돌면 "
+                        "다음부터 즉시 표시됩니다."
+                    )
+
+                # ── 포지션 플랜 입력 (사이징·R:R) — 개별종목 탭과 세션 공유 (#2) ──
+                _wl_acct = str(st.session_state.get("_active_account") or "").strip()
+                _wl_uid = str(st.session_state.get("user_id") or "").strip()
+                _wl_ctx = None
+                if _wl_acct:
+                    try:
+                        _wl_ctx = account_context_memo(_wl_uid, _wl_acct)
+                    except Exception:
+                        _wl_ctx = None
+                if _wl_ctx:
+                    _wl_prof = _wl_ctx["profile"]
+                    _wl_equity = float(_wl_ctx["equity"])
+                    _wl_risk_pct = float(_wl_prof["Risk_Pct"])
+                    _wl_cash_def = float(_wl_ctx["cash"])
+                    _wl_kx = _wl_acct
+                else:
+                    _wl_prof = dict(_ACCOUNT_PROFILE_DEFAULTS)
+                    _wl_prof["_exists"] = False
+                    _wl_equity = float(st.session_state.get("_size_equity", 10000.0))
+                    _wl_risk_pct = float(st.session_state.get("_size_risk_pct", 1.0))
+                    _wl_cash_def = float(st.session_state.get("_size_cash", 0.0))
+                    _wl_kx = "manual"
+                _wl_cash_in = _wl_cash_def   # 위젯 미렌더(빈 워치리스트) 시 폴백
+                try:
+                    _wl_rp = _regime_params(_drg_get("전체")[0])
+                except Exception:
+                    _wl_rp = _regime_params({})
+                # 시장 진입 게이트 상태 — 앱은 **표시만** 한다(종목은 숨기지 않음).
+                #   메일(자동화)은 Users.Gate_Market = Y 인 사용자에 한해 실제로 동결한다.
+                #   배너가 없으면 "메일은 안 왔는데 앱엔 매수 신호"가 설명되지 않는다.
+                try:
+                    _wl_spy = cached_timing_price_history("SPY")
+                    _wl_mkt = rc.market_gate_status(
+                        _wl_spy["Close"] if (_wl_spy is not None and not _wl_spy.empty
+                                             and "Close" in _wl_spy.columns) else None)
+                except Exception:
+                    _wl_mkt = {"blocked": False, "available": False, "label": "", "count": None}
+                if _wl_mkt.get("available"):
+                    _wl_mkt_names = ", ".join(rc.MARKET_WARNING_LABELS)
+                    if _wl_mkt.get("blocked"):
+                        st.warning(_esc_md(
+                            f"{_wl_mkt['label']} — 신규 매수 알림이 **동결**되는 구간입니다 "
+                            f"(임계 {_wl_mkt['threshold']}개). 보유 관리 알림(줄이기·청산)은 정상 발송됩니다.  \n"
+                            f"판정 신호: {_wl_mkt_names}"))
+                    else:
+                        st.caption(_esc_md(f"{_wl_mkt['label']} (임계 {_wl_mkt['threshold']}개)"))
+                if wl_items:
+                    if _wl_ctx:
+                        st.caption(_esc_md(
+                            f"📍 **{_wl_acct}** 기준 · 자본 ${_wl_ctx['equity']:,.2f} "
+                            f"(현금 ${_wl_ctx['cash']:,.2f} + 보유 ${_wl_ctx['invested_value']:,.2f}) · "
+                            f"슬롯 {_wl_ctx['slots_used']}/{int(_wl_prof['Max_Positions'])}"
+                            + ("" if _wl_prof.get("_exists") else "  ·  ⚙️ 기본값")
+                        ))
+                    else:
+                        st.caption("📍 활성 계좌 없음 — 수동 입력으로 계산합니다.")
+                    _pc1, _pc2, _pc2b, _pc3 = st.columns([1.1, 0.95, 1.05, 1.4])
+                    with _pc1:
+                        _wl_equity = st.number_input(
+                            "계좌 자본금 ($)", min_value=0.0, step=1000.0,
+                            value=_wl_equity, key=f"_wl_size_equity_{_wl_kx}")
+                        st.session_state["_size_equity"] = _wl_equity
+                    with _pc2:
+                        _wl_risk_pct = st.number_input(
+                            "거래당 리스크 (%)", min_value=0.1, max_value=10.0, step=0.1,
+                            value=_wl_risk_pct, key=f"_wl_size_risk_{_wl_kx}")
+                        st.session_state["_size_risk_pct"] = _wl_risk_pct
+                    with _pc2b:
+                        _wl_cash_in = st.number_input(
+                            "가용 현금 ($)", min_value=0.0, step=50.0,
+                            value=_wl_cash_def, key=f"_wl_size_cash_{_wl_kx}",
+                            help="실제 집행 가능한 현금. 0 = 제한 없음.")
+                        st.session_state["_size_cash"] = _wl_cash_in
+                    with _pc3:
+                        st.caption(
+                            "각 종목에 '얼마' 들어갈지 + R:R 게이트를 제안합니다. "
+                            f"국면 {_wl_rp['label']} (ATR×{_wl_rp['atr_mult']}, 목표 1:{_wl_rp['rr']}). "
+                            "손절/목표가를 설정해두면 R:R 게이트가 정확해집니다.")
+
+                # ── 결정 필터·정렬 (2-5) ──
+                if wl_items:
+                    _dec_order = {"buy": 0, "buy_split": 1, "wait_pullback": 2, "wait_range": 3, "na": 4, "avoid": 5}
+                    _fc1, _fc2 = st.columns([1, 1])
+                    with _fc1:
+                        _wl_dfilter = st.selectbox("결정 필터", ["전체", "🟢 매수 계열", "🟡 대기", "🔴 회피"],
+                                                   key="_wl_dec_filter")
+                    with _fc2:
+                        _wl_dsort = st.checkbox("결정 순 정렬(매수 먼저)", value=True, key="_wl_dec_sort")
+                    _grp = {"🟢 매수 계열": ("buy", "buy_split"), "🟡 대기": ("wait_pullback", "wait_range"),
+                            "🔴 회피": ("avoid",)}.get(_wl_dfilter)
+                    if _grp:
+                        wl_items = [it for it in wl_items if wl_dec_key.get(it.get("ticker"), "na") in _grp]
+                    if _wl_dsort:
+                        wl_items = sorted(wl_items, key=lambda it: _dec_order.get(wl_dec_key.get(it.get("ticker"), "na"), 9))
+                    if not wl_items:
+                        st.caption("해당 결정에 맞는 종목이 없습니다.")
+
+                # ── '매수 완료 → 포트폴리오 등록' 공용 준비값 (루프 밖 1회) ─────
+                _wl_plan_map = {}                      # ticker → build_trade_plan 결과(수량·금액 프리필용)
+                _WL_THESIS_NONE = "(Thesis 없음 - 자동 연결 시도)"
+                _WL_THESIS_CORE = "📈 코어/정기적립 (인덱스 DCA)"
+                try:
+                    _wl_thesis_options = get_thesis_options_from_narratives(uid_wl)
+                except Exception:
+                    _wl_thesis_options = []
+                _wl_thesis_labels = [_WL_THESIS_NONE, _WL_THESIS_CORE] + [o["label"] for o in _wl_thesis_options]
+                try:
+                    _WL_BUY_REASON_IDX = _ENTRY_REASON_OPTIONS.index("🎯 최적 매수 타이밍 (눌림목·RS반전)")
+                except ValueError:
+                    _WL_BUY_REASON_IDX = 0
+
+                for idx, item in enumerate(wl_items):
+                    tk = item["ticker"]
+                    current_price = pd.to_numeric(price_map_wl.get(tk), errors="coerce")
+                    saved_price = pd.to_numeric(item.get("saved_price"), errors="coerce")
+                    rsi_val = pd.to_numeric(rsi_map_wl.get(tk), errors="coerce")
+                    ma200_val = pd.to_numeric(ma200_map_wl.get(tk), errors="coerce")
+                    pnl = (float(current_price) / float(saved_price) - 1.0) * 100.0 if pd.notna(current_price) and pd.notna(saved_price) and saved_price > 0 else np.nan
+
+                    # 상태 기반 알림: 활성 이벤트 목록 + '지금 활성 조건' 미리보기.
+                    # (실제 발동/2일확정/저장은 장 마감 후 자동화가 담당 — 앱은 표시만)
+                    _enabled_states = rc.resolve_alert_events(item.get("alert_states"), _WL_ALERT_DEFAULT)
+                    _sl_item = pd.to_numeric(item.get("stop_loss"), errors="coerce")
+                    _tp_item = pd.to_numeric(item.get("target_price"), errors="coerce")
+                    _ap_item = pd.to_numeric(item.get("alert_price"), errors="coerce")
+                    _ar_item = pd.to_numeric(item.get("alert_rsi"), errors="coerce")
+                    _am_item = bool(item.get("alert_ma200"))
+                    _an = regime_map_wl.get(tk)
+                    _active_now = []
+                    if _an and _an.get("regime", {}).get("enough_data"):
+                        _now_conds = rc.alert_conditions(
                             _an,
                             price=float(current_price) if pd.notna(current_price) else None,
                             stop_loss=float(_sl_item) if pd.notna(_sl_item) else None,
@@ -25279,574 +25072,812 @@ Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
                             alert_rsi=float(_ar_item) if pd.notna(_ar_item) else None,
                             alert_ma200=_am_item,
                         )
-                        for _e in _active_now:
-                            _msg = _prev.get(_e, (False, ""))[1]
-                            st.success(f"{rc.ALERT_EVENT_LABELS.get(_e, _e)} — {_msg}")
+                        _active_now = [e for e in ("entry", "risk", "exit", "price", "watch")
+                                       if e in _enabled_states and _now_conds.get(e, (False, ""))[0]]
+                    alert_badge = "⚡ 알림 조건 활성!" if _active_now else ""
 
-                    # 알림·손절/목표 편집
-                    with st.expander("✏️ 알림 · 손절/목표 편집", expanded=False):
-                        _cur_states = rc.resolve_alert_events(item.get("alert_states"), _WL_ALERT_DEFAULT)
-                        _opts = list(_WL_ALERT_EVENTS)
-                        new_states = st.multiselect(
-                            "🔔 알림받을 상태",
-                            options=_opts,
-                            default=[s for s in _cur_states if s in _opts],
-                            format_func=lambda c: rc.ALERT_EVENT_LABELS.get(c, c),
-                            key=f"edit_states_{idx}_{tk}",
-                            help="🟢매수신호·🟡줄이기가 기본. 선택한 상태가 2일 연속 확정될 때 1회 알림(깜빡임 방지). "
-                                 "📌손절/목표 도달, 🎯관심가(목표가·RSI·200일선)는 설정값 도달 시 알림.",
-                        )
-                        new_memo = st.text_input(
-                            "📝 메모 수정",
-                            value=str(item.get("memo", "") or ""),
-                            key=f"edit_memo_{idx}_{tk}",
-                        )
-                        _acct_choices = ["(미지정)"] + list(_wl_acct_opts)
-                        _cur_acct = str(item.get("account", "") or "").strip()
-                        _acct_idx = _acct_choices.index(_cur_acct) if _cur_acct in _acct_choices else 0
-                        new_account = st.selectbox(
-                            "🏦 귀속 계좌", _acct_choices, index=_acct_idx,
-                            key=f"edit_acct_{idx}_{tk}",
-                            help="이 종목을 어느 계좌에서 매수할지. 사이징(자본금·현금·슬롯)이 이 계좌 기준으로 계산됩니다. "
-                                 "미지정이면 사이드바의 활성 계좌를 씁니다.",
-                        )
+                    # 레짐/타이밍 압축 배지 (regime_core — 개별종목 탭과 동일 엔진)
+                    _reg_badge, _tim_badge = "", ""
+                    if _an and _an.get("regime", {}).get("enough_data"):
+                        _reg_badge = _an["regime"].get("color", "")
+                        _tv = _an["timing"]
+                        if _tv.get("is_entry"):
+                            _tim_badge = rc.TIMING_BADGE["entry"]
+                        else:
+                            _tim_badge = rc.TIMING_BADGE.get(_tv.get("code"), "")
+                        if _an["regime"].get("topping"):
+                            _tim_badge = (_tim_badge + " " + rc.TOPPING_BADGE).strip()
+                    _badge_str = " ".join(b for b in [_reg_badge, _tim_badge] if b)
 
-                        _sl_cur = float(_sl) if pd.notna(_sl) else 0.0
-                        _tp_cur = float(_tp) if pd.notna(_tp) else 0.0
-                        edit_sl_c1, edit_sl_c2 = st.columns(2)
-                        with edit_sl_c1:
-                            new_sl = st.number_input(
-                                "🛑 손절가 (0=미설정)",
-                                min_value=0.0, value=_sl_cur, step=0.5, format="%.2f",
-                                key=f"edit_sl_{idx}_{tk}",
-                            )
-                        with edit_sl_c2:
-                            new_tp = st.number_input(
-                                "🎯 목표가 (0=미설정)",
-                                min_value=0.0, value=_tp_cur, step=0.5, format="%.2f",
-                                key=f"edit_tp_{idx}_{tk}",
-                            )
-
-                        if st.button("💾 저장", key=f"wl_edit_save_{idx}_{tk}", type="primary", use_container_width=True):
-                            # 기존 항목 삭제 후 새 항목 추가 (행 단위 처리)
-                            # ⚠️ saved_price/stop/target은 재추가 시 보존해야 함
-                            # ⚠️ 알림 설정 변경 시 깜빡임 상태(Alert_LastState)는 초기화됨(다음 자동화에서 재설정)
-                            _upd = {
-                                "memo": new_memo.strip(),
-                                "stop_loss": float(new_sl) if new_sl > 0 else None,
-                                "target_price": float(new_tp) if new_tp > 0 else None,
-                                "alert_states": (",".join(new_states) if new_states else "none"),  # 전부 해제=none
-                                "account": ("" if new_account == "(미지정)" else new_account),
-                            }
-                            _ok_u, _err_u, _ = update_watchlist_row(uid_wl, tk, _upd)
-                            if _ok_u:
-                                st.rerun()
-                            elif _err_u == "not_found":
-                                # 행이 사라진 경우에만 기존 추가 경로로 폴백 (saved_price 보존)
-                                _keep_saved = pd.to_numeric(item.get("saved_price"), errors="coerce")
-                                _ok_add, _err_add = add_to_watchlist(
-                                    uid_wl, tk,
-                                    memo=new_memo.strip(),
-                                    saved_price=float(_keep_saved) if pd.notna(_keep_saved) else None,
-                                    stop_loss=float(new_sl) if new_sl > 0 else None,
-                                    target_price=float(new_tp) if new_tp > 0 else None,
-                                    alert_states=(",".join(new_states) if new_states else "none"),
-                                    account=("" if new_account == "(미지정)" else new_account),
+                    with st.expander(
+                        f"**{tk}** {_badge_str} {alert_badge} | "
+                        f"현재가 {'${:.2f}'.format(float(current_price)) if pd.notna(current_price) else 'N/A'} | "
+                        f"RSI {'{:.1f}'.format(float(rsi_val)) if pd.notna(rsi_val) else 'N/A'} | "
+                        f"등록 시 대비 {'{:+.1f}%'.format(pnl) if pd.notna(pnl) else 'N/A'}",
+                        expanded=False,   # 기본 접기 — 활성 알림은 헤더 ⚡ 배지로 식별
+                    ):
+                        info_col, alert_col = st.columns([3, 2])
+                        with info_col:
+                            # ── 국면/타이밍 요약 (상세는 개별종목 탭) ──
+                            if _an and _an.get("regime", {}).get("enough_data"):
+                                _rg, _tg = _an["regime"], _an["timing"]
+                                _rlabel = {"strong": "🟢 강세(대장주)", "sideways": "🟡 횡보",
+                                           "weak": "🔴 약세"}.get(_rg["regime"], "⚪ 판정 불가")
+                                _topp = f" · {rc.TOPPING_BADGE}" if _rg.get("topping") else ""
+                                _blo, _bhi = _rg["rsi_band"]
+                                st.markdown(
+                                    f"**국면:** {_rlabel}{_topp} "
+                                    f"(강도 {_rg['score']:.0f}/100 · RSI밴드 {_blo:.0f}~{_bhi:.0f})"
                                 )
-                                if _ok_add:
+                                _tg_reasons = " · ".join(_tg.get("reasons", []))
+                                st.markdown(f"**타이밍:** {_tg.get('verdict', '')}"
+                                            + (f" — {_tg_reasons}" if _tg_reasons else ""))
+                                _tg_help = rc.TIMING_HELP.get(_tg.get("code"))
+                                if _tg_help:
+                                    st.caption(f"ℹ️ {_tg_help}")
+
+                                def _goto_micro_wl(_t=tk):
+                                    st.session_state["selected_ticker"] = _t
+                                    st.session_state["main_sidebar_nav"] = NAV_STOCK
+                                st.button(f"🔬 {tk} 정밀 검사로 자세히 보기",
+                                          key=f"wl_goto_micro_{idx}_{tk}",
+                                          on_click=_goto_micro_wl,
+                                          help="3단계 개별 종목 정밀 검사 탭으로 이동합니다.")
+                            st.markdown(f"**메모:** {item.get('memo', '') or '없음'}")
+                            st.markdown(f"**등록일:** {item.get('date_added', 'N/A')}")
+                            st.markdown(f"**200일선:** {'${:.2f}'.format(float(ma200_val)) if pd.notna(ma200_val) else 'N/A'}")
+                            _sl = pd.to_numeric(item.get("stop_loss"), errors="coerce")
+                            _tp = pd.to_numeric(item.get("target_price"), errors="coerce")
+                            if pd.notna(_sl) or pd.notna(_tp):
+                                _sl_txt = f"🛑 손절 ${_sl:.2f}" if pd.notna(_sl) else "🛑 손절 미설정"
+                                _tp_txt = f"🎯 목표 ${_tp:.2f}" if pd.notna(_tp) else "🎯 목표 미설정"
+                                st.markdown(f"**{_sl_txt} · {_tp_txt}**")
+                                # 손익비 표시
+                                if pd.notna(_sl) and pd.notna(_tp) and pd.notna(saved_price) and saved_price > 0:
+                                    _rk = float(saved_price) - float(_sl)
+                                    _rw = float(_tp) - float(saved_price)
+                                    if _rk > 0 and _rw > 0:
+                                        st.caption(f"손익비 1:{_rw/_rk:.1f} (등록가 기준)")
+                                # 실시간 도달 경보
+                                if pd.notna(current_price):
+                                    if pd.notna(_sl) and float(current_price) <= float(_sl):
+                                        st.error(f"🛑 손절가 도달! 현재가 ${float(current_price):.2f} ≤ 손절 ${_sl:.2f} — 매도 검토")
+                                    elif pd.notna(_tp) and float(current_price) >= float(_tp):
+                                        st.success(f"🎯 목표가 도달! 현재가 ${float(current_price):.2f} ≥ 목표 ${_tp:.2f} — 익절 검토")
+                            else:
+                                st.caption("🛑🎯 손절/목표가 미설정 — 편집에서 추가하면 도달 시 알림을 줍니다.")
+
+                            # ── 포지션 플랜 (사이징·R:R 게이트) — regime_core SSOT (#2) ──
+                            # 종목별 귀속 계좌 → 없으면 활성 계좌 폴백
+                            _it_acct = str(item.get("account", "") or "").strip()
+                            _use_acct = _it_acct or _wl_acct
+                            if _use_acct and _use_acct != _wl_acct:
+                                try:
+                                    _it_ctx = account_context_memo(_wl_uid, _use_acct)
+                                except Exception:
+                                    _it_ctx = _wl_ctx
+                            else:
+                                _it_ctx = _wl_ctx
+                            if _it_ctx:
+                                _it_prof = _it_ctx["profile"]
+                                _it_eq, _it_cash = float(_it_ctx["equity"]), float(_it_ctx["cash"])
+                            else:
+                                _it_prof, _it_eq, _it_cash = _wl_prof, _wl_equity, float(_wl_cash_in)
+                            if _it_acct:
+                                st.caption(f"🏦 귀속 계좌: **{_it_acct}**")
+                            elif _use_acct:
+                                st.caption(f"🏦 계좌 미지정 — 활성 계좌 **{_use_acct}** 기준으로 계산")
+                            _it_mode = str(_it_prof.get("Sizing_Mode", rc.SIZING_MODE_DEFAULT))
+                            if _an and _an.get("regime", {}).get("enough_data") and pd.notna(current_price) and float(current_price) > 0:
+                                _wl_atr = pd.to_numeric(atr_map_wl.get(tk), errors="coerce")
+                                _wl_hi = pd.to_numeric(high_map_wl.get(tk), errors="coerce")
+                                _wl_plan = rc.build_trade_plan(
+                                    verdict_code=_an["timing"].get("code"),
+                                    entry=float(current_price),
+                                    atr=float(_wl_atr) if pd.notna(_wl_atr) else float("nan"),
+                                    ma200=float(ma200_val) if pd.notna(ma200_val) else float("nan"),
+                                    equity=_it_eq, risk_pct=float(_it_prof["Risk_Pct"]),
+                                    atr_mult=_wl_rp["atr_mult"], rr_target=_wl_rp["rr"],
+                                    stop_source=("manual" if pd.notna(_sl_item) else "atr"),
+                                    manual_stop=float(_sl_item) if pd.notna(_sl_item) else None,
+                                    manual_target=float(_tp_item) if pd.notna(_tp_item) else None,
+                                    recent_high=float(_wl_hi) if pd.notna(_wl_hi) else None,
+                                    max_position_pct=float(_it_prof["Max_Position_Pct"]),
+                                    cash=(_it_cash if _it_cash > 0 else None),
+                                    reserve_pct=float(_it_prof["Cash_Reserve_Pct"]),
+                                    invested_value=(_it_ctx["invested_value"] if _it_ctx else 0.0),
+                                    slots_used=(_it_ctx["slots_used"] if _it_ctx else None),
+                                    max_positions=(int(_it_prof["Max_Positions"]) if _it_ctx else None),
+                                    min_trade_dollars=float(_it_prof["Min_Trade_Dollars"]),
+                                    sizing_mode=_it_mode,
+                                )
+                                _wl_plan_map[tk] = _wl_plan   # ✅ 매수 등록 폼 수량/금액 프리필용
+                                # 프리페치에서 제외된 종목은 카드를 펼치는 이 시점에 받는다
+                                _hist_card = hist_map_wl.get(tk)
+                                if _hist_card is None:
+                                    try:
+                                        _hist_card = _fmp_price_history(
+                                            tk, lookback_days=fx.HIST_WINDOW_DAYS)
+                                        hist_map_wl[tk] = _hist_card
+                                    except Exception:
+                                        _hist_card = None
+                                _bc = rc.build_buy_card(_hist_card, _an, _wl_plan, confluence=None)
+                                st.markdown(f"**🎯 {_bc['badge']}** · {_bc['glance_num']}")
+                                if _wl_plan["gate"] == "na":
+                                    st.caption(f"🧮 플랜: {_wl_plan['gate_label']} — {_wl_plan['gate_reason']}")
+                                else:
+                                    if _wl_plan.get("sizing_mode") == "off":
+                                        st.markdown(_esc_md(
+                                            f"**🧮 플랜: {_wl_plan['gate_label']}** · "
+                                            f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
+                                            f"R:R {_wl_plan['rr_label']}  ·  _사이징 미사용 계좌_"
+                                        ))
+                                    else:
+                                        st.markdown(_esc_md(
+                                            f"**🧮 플랜: {_wl_plan['gate_label']}** · "
+                                            f"${_wl_plan['dollars']:,.2f} ({_wl_plan['shares_exact']:.3f}주 · 정수 {_wl_plan['shares_whole']:,}주 · "
+                                            f"비중 {_wl_plan['position_pct']:.1f}% · 제한 {_wl_plan['binding_label']}) · "
+                                            f"손절 ${_wl_plan['stop']:.2f}({_wl_plan['stop_pct']:.1f}%) · "
+                                            f"R:R {_wl_plan['rr_label']} · 1R -${_wl_plan['risk_dollars']:,.0f}"
+                                        ))
+                                    if _wl_plan.get("blocked"):
+                                        st.caption(_esc_md(f"↳ 🚧 {_wl_plan['block_reason']}"))
+                                    if not _wl_plan.get("rr_measured", False):
+                                        st.caption("↳ ⚠️ R:R 미실측(독립 목표 없음) — 자금 빠듯하면 후순위")
+                                    if not _wl_plan["enter_ok"]:
+                                        st.caption(f"↳ {_wl_plan['gate_reason']} — 신규 진입 비권장")
+
+                        with alert_col:
+                            st.markdown("**🔔 상태 기반 알림:**")
+                            if _enabled_states:
+                                for _e in _WL_ALERT_EVENTS:
+                                    if _e in _enabled_states:
+                                        st.caption(f"✅ {rc.ALERT_EVENT_LABELS.get(_e, _e)}")
+                            else:
+                                st.caption("알림 없음 (메모만)")
+                            if _active_now:
+                                st.info("👉 지금 활성 조건: "
+                                        + ", ".join(rc.ALERT_EVENT_LABELS.get(e, e) for e in _active_now))
+                            st.caption("실제 알림은 장 마감 후 자동화가 2일 확정 시 이메일 발송")
+
+                        if _active_now and _an and _an.get("regime", {}).get("enough_data"):
+                            _prev = rc.alert_conditions(
+                                _an,
+                                price=float(current_price) if pd.notna(current_price) else None,
+                                stop_loss=float(_sl_item) if pd.notna(_sl_item) else None,
+                                target_price=float(_tp_item) if pd.notna(_tp_item) else None,
+                                alert_price=float(_ap_item) if pd.notna(_ap_item) else None,
+                                alert_rsi=float(_ar_item) if pd.notna(_ar_item) else None,
+                                alert_ma200=_am_item,
+                            )
+                            for _e in _active_now:
+                                _msg = _prev.get(_e, (False, ""))[1]
+                                st.success(f"{rc.ALERT_EVENT_LABELS.get(_e, _e)} — {_msg}")
+
+                        # 알림·손절/목표 편집
+                        with st.expander("✏️ 알림 · 손절/목표 편집", expanded=False):
+                            _cur_states = rc.resolve_alert_events(item.get("alert_states"), _WL_ALERT_DEFAULT)
+                            _opts = list(_WL_ALERT_EVENTS)
+                            new_states = st.multiselect(
+                                "🔔 알림받을 상태",
+                                options=_opts,
+                                default=[s for s in _cur_states if s in _opts],
+                                format_func=lambda c: rc.ALERT_EVENT_LABELS.get(c, c),
+                                key=f"edit_states_{idx}_{tk}",
+                                help="🟢매수신호·🟡줄이기가 기본. 선택한 상태가 2일 연속 확정될 때 1회 알림(깜빡임 방지). "
+                                     "📌손절/목표 도달, 🎯관심가(목표가·RSI·200일선)는 설정값 도달 시 알림.",
+                            )
+                            new_memo = st.text_input(
+                                "📝 메모 수정",
+                                value=str(item.get("memo", "") or ""),
+                                key=f"edit_memo_{idx}_{tk}",
+                            )
+                            _acct_choices = ["(미지정)"] + list(_wl_acct_opts)
+                            _cur_acct = str(item.get("account", "") or "").strip()
+                            _acct_idx = _acct_choices.index(_cur_acct) if _cur_acct in _acct_choices else 0
+                            new_account = st.selectbox(
+                                "🏦 귀속 계좌", _acct_choices, index=_acct_idx,
+                                key=f"edit_acct_{idx}_{tk}",
+                                help="이 종목을 어느 계좌에서 매수할지. 사이징(자본금·현금·슬롯)이 이 계좌 기준으로 계산됩니다. "
+                                     "미지정이면 사이드바의 활성 계좌를 씁니다.",
+                            )
+
+                            _sl_cur = float(_sl) if pd.notna(_sl) else 0.0
+                            _tp_cur = float(_tp) if pd.notna(_tp) else 0.0
+                            edit_sl_c1, edit_sl_c2 = st.columns(2)
+                            with edit_sl_c1:
+                                new_sl = st.number_input(
+                                    "🛑 손절가 (0=미설정)",
+                                    min_value=0.0, value=_sl_cur, step=0.5, format="%.2f",
+                                    key=f"edit_sl_{idx}_{tk}",
+                                )
+                            with edit_sl_c2:
+                                new_tp = st.number_input(
+                                    "🎯 목표가 (0=미설정)",
+                                    min_value=0.0, value=_tp_cur, step=0.5, format="%.2f",
+                                    key=f"edit_tp_{idx}_{tk}",
+                                )
+
+                            if st.button("💾 저장", key=f"wl_edit_save_{idx}_{tk}", type="primary", use_container_width=True):
+                                # 기존 항목 삭제 후 새 항목 추가 (행 단위 처리)
+                                # ⚠️ saved_price/stop/target은 재추가 시 보존해야 함
+                                # ⚠️ 알림 설정 변경 시 깜빡임 상태(Alert_LastState)는 초기화됨(다음 자동화에서 재설정)
+                                _upd = {
+                                    "memo": new_memo.strip(),
+                                    "stop_loss": float(new_sl) if new_sl > 0 else None,
+                                    "target_price": float(new_tp) if new_tp > 0 else None,
+                                    "alert_states": (",".join(new_states) if new_states else "none"),  # 전부 해제=none
+                                    "account": ("" if new_account == "(미지정)" else new_account),
+                                }
+                                _ok_u, _err_u, _ = update_watchlist_row(uid_wl, tk, _upd)
+                                if _ok_u:
                                     st.rerun()
+                                elif _err_u == "not_found":
+                                    # 행이 사라진 경우에만 기존 추가 경로로 폴백 (saved_price 보존)
+                                    _keep_saved = pd.to_numeric(item.get("saved_price"), errors="coerce")
+                                    _ok_add, _err_add = add_to_watchlist(
+                                        uid_wl, tk,
+                                        memo=new_memo.strip(),
+                                        saved_price=float(_keep_saved) if pd.notna(_keep_saved) else None,
+                                        stop_loss=float(new_sl) if new_sl > 0 else None,
+                                        target_price=float(new_tp) if new_tp > 0 else None,
+                                        alert_states=(",".join(new_states) if new_states else "none"),
+                                        account=("" if new_account == "(미지정)" else new_account),
+                                    )
+                                    if _ok_add:
+                                        st.rerun()
+                                    else:
+                                        st.error(f"저장 실패: {_err_add}")
                                 else:
-                                    st.error(f"저장 실패: {_err_add}")
-                            else:
-                                st.error(f"저장 실패: {_err_u}")
+                                    st.error(f"저장 실패: {_err_u}")
 
-                    # ── ✅ 매수 완료 → 포트폴리오 등록 (Watchlist 원클릭) ──────────
-                    #   이메일 알림 → 실제 매수 → 여기서 즉시 등록. 포트폴리오 탭 이동 불필요.
-                    #   Trade_History·Thesis·손절/목표 플랜까지 한 번에 기록하고,
-                    #   Watchlist 제거는 항상 '마지막'에 수행(앞 단계 실패 시 재시도 가능).
-                    with st.expander("✅ 매수 완료 → 포트폴리오 등록", expanded=False):
-                        st.caption(
-                            "알림을 보고 실제로 매수했다면 여기서 바로 등록하세요. "
-                            "포트폴리오 탭으로 이동할 필요 없이 매매기록·플랜까지 함께 저장됩니다."
-                        )
-                        _bp_plan = _wl_plan_map.get(tk) or {}
-                        _bp_d = pd.to_numeric(_bp_plan.get("dollars"), errors="coerce")
-                        _bp_s = pd.to_numeric(_bp_plan.get("shares_exact"), errors="coerce")
-                        _bp_dollars_def = float(_bp_d) if (pd.notna(_bp_d) and float(_bp_d) > 0) else 0.0
-                        _bp_shares_def = round(float(_bp_s), 4) if (pd.notna(_bp_s) and float(_bp_s) > 0) else 0.0
-                        if _bp_dollars_def > 0 or _bp_shares_def > 0:
+                        # ── ✅ 매수 완료 → 포트폴리오 등록 (Watchlist 원클릭) ──────────
+                        #   이메일 알림 → 실제 매수 → 여기서 즉시 등록. 포트폴리오 탭 이동 불필요.
+                        #   Trade_History·Thesis·손절/목표 플랜까지 한 번에 기록하고,
+                        #   Watchlist 제거는 항상 '마지막'에 수행(앞 단계 실패 시 재시도 가능).
+                        with st.expander("✅ 매수 완료 → 포트폴리오 등록", expanded=False):
                             st.caption(
-                                f"🧮 사이징 제안: ${_bp_dollars_def:,.2f} · {_bp_shares_def:g}주 "
-                                "— 실제 체결 수량으로 수정하세요."
+                                "알림을 보고 실제로 매수했다면 여기서 바로 등록하세요. "
+                                "포트폴리오 탭으로 이동할 필요 없이 매매기록·플랜까지 함께 저장됩니다."
                             )
+                            _bp_plan = _wl_plan_map.get(tk) or {}
+                            _bp_d = pd.to_numeric(_bp_plan.get("dollars"), errors="coerce")
+                            _bp_s = pd.to_numeric(_bp_plan.get("shares_exact"), errors="coerce")
+                            _bp_dollars_def = float(_bp_d) if (pd.notna(_bp_d) and float(_bp_d) > 0) else 0.0
+                            _bp_shares_def = round(float(_bp_s), 4) if (pd.notna(_bp_s) and float(_bp_s) > 0) else 0.0
+                            if _bp_dollars_def > 0 or _bp_shares_def > 0:
+                                st.caption(
+                                    f"🧮 사이징 제안: ${_bp_dollars_def:,.2f} · {_bp_shares_def:g}주 "
+                                    "— 실제 체결 수량으로 수정하세요."
+                                )
 
-                        _bp_acct_cur = str(item.get("account", "") or "").strip() or _wl_acct
-                        _bp_acct_opts = list(_wl_acct_opts) + ["직접 입력"]
-                        _bp_acct_idx = (_bp_acct_opts.index(_bp_acct_cur)
-                                        if _bp_acct_cur in _bp_acct_opts else len(_bp_acct_opts) - 1)
+                            _bp_acct_cur = str(item.get("account", "") or "").strip() or _wl_acct
+                            _bp_acct_opts = list(_wl_acct_opts) + ["직접 입력"]
+                            _bp_acct_idx = (_bp_acct_opts.index(_bp_acct_cur)
+                                            if _bp_acct_cur in _bp_acct_opts else len(_bp_acct_opts) - 1)
 
-                        # ⚠️ 계좌 selectbox·입력방식 radio 는 반드시 st.form **안**에 둔다.
-                        #    폼 밖 위젯은 값이 바뀔 때마다 스크립트를 통째로 재실행하므로
-                        #    워치리스트 전 종목이 재계산되고 expander 가 접힌다.
-                        #    폼 안에서는 조건부 렌더가 제출 전까지 갱신되지 않으니,
-                        #    '직접 입력' 칸과 수량/금액 칸을 **항상 노출**하고 제출 시점에 판정한다.
-                        #    (제출 로직은 _bp_acct_sel / _bp_mode 로 사용할 칸을 고르므로 불변)
-                        with st.form(f"wl_buy_form_{idx}_{tk}", clear_on_submit=False):
-                            _bp_acct_sel = st.selectbox(
-                                "🏦 매수한 계좌", _bp_acct_opts, index=_bp_acct_idx,
-                                key=f"wl_buy_acct_{idx}_{tk}",
-                                help="워치리스트 귀속 계좌가 기본값입니다.",
-                            )
-                            _bp_acct_custom = st.text_input(
-                                "계좌명 직접 입력 (위에서 '직접 입력'을 고른 경우에만 사용)", value="",
-                                placeholder="예: robinhood, Fidelity Roth",
-                                key=f"wl_buy_acct_custom_{idx}_{tk}",
-                            )
-                            _bp_price = st.number_input(
-                                "💵 실제 매수가", min_value=0.0,
-                                value=(float(current_price) if pd.notna(current_price) else 0.0),
-                                step=0.01, format="%.2f", key=f"wl_buy_px_{idx}_{tk}",
-                                help="현재가가 기본값입니다. 실제 체결가로 수정하세요.",
-                            )
-                            _bp_mode = st.radio(
-                                "입력 방식", ["수량으로", "금액($)으로"], horizontal=True,
-                                key=f"wl_buy_mode_{idx}_{tk}",
-                                help="선택한 쪽 칸만 사용합니다. 금액 방식은 금액 ÷ 매수가로 수량을 자동 계산합니다.",
-                            )
-                            _bp_qty = st.number_input(
-                                "수량 — '수량으로' 선택 시 사용", min_value=0.0, value=_bp_shares_def,
-                                step=1.0, format="%.4f", key=f"wl_buy_qty_{idx}_{tk}",
-                            )
-                            _bp_amt = st.number_input(
-                                "투입 금액 ($) — '금액($)으로' 선택 시 사용", min_value=0.0,
-                                value=_bp_dollars_def,
-                                step=10.0, format="%.2f", key=f"wl_buy_amt_{idx}_{tk}",
-                            )
-                            _bp_thesis = st.selectbox(
-                                "📌 투자 Thesis", options=_wl_thesis_labels, index=0,
-                                key=f"wl_buy_thesis_{idx}_{tk}",
-                                help="그대로 두면 최근 내러티브에서 이 티커를 추천한 테마를 자동 연결합니다.",
-                            )
-                            _bp_reason = st.selectbox(
-                                "🎬 진입 사유", options=_ENTRY_REASON_OPTIONS,
-                                index=_WL_BUY_REASON_IDX, key=f"wl_buy_reason_{idx}_{tk}",
-                                help="워치리스트 알림으로 매수했다면 기본값이 맞습니다. 매매 복기의 진입신호별 성과 분석에 쓰입니다.",
-                            )
-                            _bp_date = st.date_input(
-                                "📅 매수일 (실제 산 날짜)",
-                                value=datetime.now(_MARKET_ET_TZ).date(),
-                                key=f"wl_buy_date_{idx}_{tk}",
-                                help="트레일링 스톱은 이 날짜 이후의 고점을 기준으로 계산합니다.",
-                            )
-                            _inh_sl = float(_sl_item) if (pd.notna(_sl_item) and float(_sl_item) > 0) else None
-                            _inh_tp = float(_tp_item) if (pd.notna(_tp_item) and float(_tp_item) > 0) else None
-                            _bp_inherit = st.checkbox(
-                                "📐 Watchlist 손절/목표를 포트폴리오 플랜으로 승계",
-                                value=True, key=f"wl_buy_inherit_{idx}_{tk}",
-                                help="해제하면 매수가 기준 ATR 플랜을 새로 계산합니다. "
-                                     "워치리스트에서 직접 설정한 기준을 유지하려면 켜두세요.",
-                            )
-                            if _inh_sl is not None or _inh_tp is not None:
-                                _inh_bits = []
-                                if _inh_sl is not None:
-                                    _inh_bits.append(f"손절 ${_inh_sl:.2f}")
-                                if _inh_tp is not None:
-                                    _inh_bits.append(f"목표 ${_inh_tp:.2f}")
-                                st.caption("↳ 승계할 값: " + " · ".join(_inh_bits))
-                            else:
-                                st.caption("↳ Watchlist에 손절/목표가 없음 — 승계 대신 ATR 플랜을 자동 계산합니다.")
-                            _bp_remove = st.checkbox(
-                                "🗑️ 등록 후 Watchlist에서 제거",
-                                value=(wl_dec_key.get(tk) != "buy_split"),
-                                key=f"wl_buy_remove_{idx}_{tk}",
-                                help="분할 매수 중이면 해제하세요 — 남겨두면 다음 분할 진입 신호를 계속 받습니다.",
-                            )
-                            _bp_submit = st.form_submit_button(
-                                "✅ 포트폴리오에 등록", type="primary", use_container_width=True
-                            )
-
-                            if _bp_submit:
-                                _bp_acct = (str(_bp_acct_custom or "").strip()
-                                            if _bp_acct_sel == "직접 입력"
-                                            else str(_bp_acct_sel or "").strip())
-                                if not uid_wl:
-                                    st.error("로그인 user_id가 없습니다. 다시 로그인해 주세요.")
-                                elif not _bp_acct:
-                                    st.warning("계좌명을 선택하거나 직접 입력해주세요.")
+                            # ⚠️ 계좌 selectbox·입력방식 radio 는 반드시 st.form **안**에 둔다.
+                            #    폼 밖 위젯은 값이 바뀔 때마다 스크립트를 통째로 재실행하므로
+                            #    워치리스트 전 종목이 재계산되고 expander 가 접힌다.
+                            #    폼 안에서는 조건부 렌더가 제출 전까지 갱신되지 않으니,
+                            #    '직접 입력' 칸과 수량/금액 칸을 **항상 노출**하고 제출 시점에 판정한다.
+                            #    (제출 로직은 _bp_acct_sel / _bp_mode 로 사용할 칸을 고르므로 불변)
+                            with st.form(f"wl_buy_form_{idx}_{tk}", clear_on_submit=False):
+                                _bp_acct_sel = st.selectbox(
+                                    "🏦 매수한 계좌", _bp_acct_opts, index=_bp_acct_idx,
+                                    key=f"wl_buy_acct_{idx}_{tk}",
+                                    help="워치리스트 귀속 계좌가 기본값입니다.",
+                                )
+                                _bp_acct_custom = st.text_input(
+                                    "계좌명 직접 입력 (위에서 '직접 입력'을 고른 경우에만 사용)", value="",
+                                    placeholder="예: robinhood, Fidelity Roth",
+                                    key=f"wl_buy_acct_custom_{idx}_{tk}",
+                                )
+                                _bp_price = st.number_input(
+                                    "💵 실제 매수가", min_value=0.0,
+                                    value=(float(current_price) if pd.notna(current_price) else 0.0),
+                                    step=0.01, format="%.2f", key=f"wl_buy_px_{idx}_{tk}",
+                                    help="현재가가 기본값입니다. 실제 체결가로 수정하세요.",
+                                )
+                                _bp_mode = st.radio(
+                                    "입력 방식", ["수량으로", "금액($)으로"], horizontal=True,
+                                    key=f"wl_buy_mode_{idx}_{tk}",
+                                    help="선택한 쪽 칸만 사용합니다. 금액 방식은 금액 ÷ 매수가로 수량을 자동 계산합니다.",
+                                )
+                                _bp_qty = st.number_input(
+                                    "수량 — '수량으로' 선택 시 사용", min_value=0.0, value=_bp_shares_def,
+                                    step=1.0, format="%.4f", key=f"wl_buy_qty_{idx}_{tk}",
+                                )
+                                _bp_amt = st.number_input(
+                                    "투입 금액 ($) — '금액($)으로' 선택 시 사용", min_value=0.0,
+                                    value=_bp_dollars_def,
+                                    step=10.0, format="%.2f", key=f"wl_buy_amt_{idx}_{tk}",
+                                )
+                                _bp_thesis = st.selectbox(
+                                    "📌 투자 Thesis", options=_wl_thesis_labels, index=0,
+                                    key=f"wl_buy_thesis_{idx}_{tk}",
+                                    help="그대로 두면 최근 내러티브에서 이 티커를 추천한 테마를 자동 연결합니다.",
+                                )
+                                _bp_reason = st.selectbox(
+                                    "🎬 진입 사유", options=_ENTRY_REASON_OPTIONS,
+                                    index=_WL_BUY_REASON_IDX, key=f"wl_buy_reason_{idx}_{tk}",
+                                    help="워치리스트 알림으로 매수했다면 기본값이 맞습니다. 매매 복기의 진입신호별 성과 분석에 쓰입니다.",
+                                )
+                                _bp_date = st.date_input(
+                                    "📅 매수일 (실제 산 날짜)",
+                                    value=datetime.now(_MARKET_ET_TZ).date(),
+                                    key=f"wl_buy_date_{idx}_{tk}",
+                                    help="트레일링 스톱은 이 날짜 이후의 고점을 기준으로 계산합니다.",
+                                )
+                                _inh_sl = float(_sl_item) if (pd.notna(_sl_item) and float(_sl_item) > 0) else None
+                                _inh_tp = float(_tp_item) if (pd.notna(_tp_item) and float(_tp_item) > 0) else None
+                                _bp_inherit = st.checkbox(
+                                    "📐 Watchlist 손절/목표를 포트폴리오 플랜으로 승계",
+                                    value=True, key=f"wl_buy_inherit_{idx}_{tk}",
+                                    help="해제하면 매수가 기준 ATR 플랜을 새로 계산합니다. "
+                                         "워치리스트에서 직접 설정한 기준을 유지하려면 켜두세요.",
+                                )
+                                if _inh_sl is not None or _inh_tp is not None:
+                                    _inh_bits = []
+                                    if _inh_sl is not None:
+                                        _inh_bits.append(f"손절 ${_inh_sl:.2f}")
+                                    if _inh_tp is not None:
+                                        _inh_bits.append(f"목표 ${_inh_tp:.2f}")
+                                    st.caption("↳ 승계할 값: " + " · ".join(_inh_bits))
                                 else:
-                                    _ok_px, _px_v, _err_px = _validate_positive_portfolio_number("매수가", _bp_price)
-                                    if _bp_mode == "금액($)으로":
-                                        _ok_amt, _amt_v, _err_amt = _validate_positive_portfolio_number("금액", _bp_amt)
-                                        if _ok_px and _ok_amt:
-                                            _ok_q, _qty_v, _err_q = True, (_amt_v / _px_v), ""
-                                        else:
-                                            _ok_q, _qty_v, _err_q = _ok_amt, 0.0, _err_amt
+                                    st.caption("↳ Watchlist에 손절/목표가 없음 — 승계 대신 ATR 플랜을 자동 계산합니다.")
+                                _bp_remove = st.checkbox(
+                                    "🗑️ 등록 후 Watchlist에서 제거",
+                                    value=(wl_dec_key.get(tk) != "buy_split"),
+                                    key=f"wl_buy_remove_{idx}_{tk}",
+                                    help="분할 매수 중이면 해제하세요 — 남겨두면 다음 분할 진입 신호를 계속 받습니다.",
+                                )
+                                _bp_submit = st.form_submit_button(
+                                    "✅ 포트폴리오에 등록", type="primary", use_container_width=True
+                                )
+
+                                if _bp_submit:
+                                    _bp_acct = (str(_bp_acct_custom or "").strip()
+                                                if _bp_acct_sel == "직접 입력"
+                                                else str(_bp_acct_sel or "").strip())
+                                    if not uid_wl:
+                                        st.error("로그인 user_id가 없습니다. 다시 로그인해 주세요.")
+                                    elif not _bp_acct:
+                                        st.warning("계좌명을 선택하거나 직접 입력해주세요.")
                                     else:
-                                        _ok_q, _qty_v, _err_q = _validate_positive_portfolio_number("수량", _bp_qty)
-                                    if not _ok_px:
-                                        st.error(_err_px)
-                                    elif not _ok_q:
-                                        st.error(_err_q)
-                                    else:
-                                        _pf_now = load_portfolio()
-                                        if not isinstance(_pf_now, pd.DataFrame):
-                                            _pf_now = pd.DataFrame()
-                                        _pf_now = _pf_now.copy()
-                                        for _c in ("Account", "Ticker", "Date_Added"):
-                                            if _c not in _pf_now.columns:
-                                                _pf_now[_c] = ""
-                                        for _c in ("Purchase_Price", "Quantity"):
-                                            if _c not in _pf_now.columns:
-                                                _pf_now[_c] = np.nan
-                                        _bp_date_s = _bp_date.strftime("%Y-%m-%d")
-
-                                        # 워치리스트 등록 정보 → 매매 복기용으로 메모에 박제
-                                        # (Watchlist 행이 삭제돼도 '등록가 → 실제 매수가' 추적 가능)
-                                        _wl_sp = pd.to_numeric(item.get("saved_price"), errors="coerce")
-                                        _wl_da = str(item.get("date_added", "") or "").strip()
-                                        _wl_tag_bits = []
-                                        if pd.notna(_wl_sp) and float(_wl_sp) > 0:
-                                            _wl_tag_bits.append(f"WL등록가 ${float(_wl_sp):.2f}")
-                                        if _wl_da:
-                                            _wl_tag_bits.append(f"WL등록일 {_wl_da[:10]}")
-                                        _wl_tag = (" · " + " · ".join(_wl_tag_bits)) if _wl_tag_bits else ""
-
-                                        _proceed, _base_memo, _plan_entry = False, "신규 매수", _px_v
-                                        _mask_bp = (
-                                            _pf_now["Account"].astype(str).str.strip().eq(_bp_acct)
-                                            & _pf_now["Ticker"].astype(str).str.strip().str.upper().eq(tk)
-                                        ) if not _pf_now.empty else None
-                                        if _mask_bp is not None and bool(_mask_bp.any()):
-                                            _mi = _pf_now.index[_mask_bp][0]
-                                            _old_q = pd.to_numeric(_pf_now.loc[_mi, "Quantity"], errors="coerce")
-                                            _old_p = pd.to_numeric(_pf_now.loc[_mi, "Purchase_Price"], errors="coerce")
-                                            _ok_oq, _, _err_oq = _validate_positive_portfolio_number("기존 수량", _old_q)
-                                            _ok_op, _, _err_op = _validate_positive_portfolio_number("기존 평단가", _old_p)
-                                            if not (_ok_oq and _ok_op):
-                                                st.error(
-                                                    f"저장된 데이터 오류: {_err_oq or _err_op} "
-                                                    "포트폴리오 [데이터 수정하기]에서 바로잡아 주세요."
-                                                )
+                                        _ok_px, _px_v, _err_px = _validate_positive_portfolio_number("매수가", _bp_price)
+                                        if _bp_mode == "금액($)으로":
+                                            _ok_amt, _amt_v, _err_amt = _validate_positive_portfolio_number("금액", _bp_amt)
+                                            if _ok_px and _ok_amt:
+                                                _ok_q, _qty_v, _err_q = True, (_amt_v / _px_v), ""
                                             else:
-                                                _new_q = float(_old_q) + float(_qty_v)
-                                                _new_avg = ((float(_old_p) * float(_old_q))
-                                                            + (float(_px_v) * float(_qty_v))) / _new_q
-                                                _pf_now.loc[_mi, "Quantity"] = _new_q
-                                                _pf_now.loc[_mi, "Purchase_Price"] = _new_avg
-                                                _proceed, _base_memo, _plan_entry = True, "추가 매수", _new_avg
+                                                _ok_q, _qty_v, _err_q = _ok_amt, 0.0, _err_amt
                                         else:
-                                            _pf_now = pd.concat(
-                                                [_pf_now, pd.DataFrame([{
-                                                    "Account": _bp_acct,
-                                                    "Ticker": tk,
-                                                    "Purchase_Price": _px_v,
-                                                    "Quantity": _qty_v,
-                                                    "Date_Added": _bp_date_s,
-                                                }])],
-                                                ignore_index=True,
-                                            )
-                                            _proceed, _base_memo, _plan_entry = True, "신규 매수", _px_v
+                                            _ok_q, _qty_v, _err_q = _validate_positive_portfolio_number("수량", _bp_qty)
+                                        if not _ok_px:
+                                            st.error(_err_px)
+                                        elif not _ok_q:
+                                            st.error(_err_q)
+                                        else:
+                                            _pf_now = load_portfolio()
+                                            if not isinstance(_pf_now, pd.DataFrame):
+                                                _pf_now = pd.DataFrame()
+                                            _pf_now = _pf_now.copy()
+                                            for _c in ("Account", "Ticker", "Date_Added"):
+                                                if _c not in _pf_now.columns:
+                                                    _pf_now[_c] = ""
+                                            for _c in ("Purchase_Price", "Quantity"):
+                                                if _c not in _pf_now.columns:
+                                                    _pf_now[_c] = np.nan
+                                            _bp_date_s = _bp_date.strftime("%Y-%m-%d")
 
-                                        if _proceed:
-                                            save_portfolio(_pf_now)
-                                            append_trade_history_row(
-                                                uid_wl, _bp_acct, tk, "BUY",
-                                                float(_qty_v), float(_px_v), _bp_date_s,
-                                                _build_entry_memo(_bp_reason, f"{_base_memo}{_wl_tag}"),
-                                            )
-                                            # ── Thesis 연결 (포트폴리오 탭과 동일 규칙) ──
-                                            _th_msg = ""
-                                            try:
-                                                if _bp_thesis == _WL_THESIS_CORE:
-                                                    save_thesis_row(uid_wl, tk, _bp_acct,
-                                                                    "코어/정기적립 (DCA)", "core_dca", "")
-                                                    _th_msg = " · 📈 코어/정기적립으로 기록"
-                                                elif _bp_thesis != _WL_THESIS_NONE:
-                                                    _m = next((o for o in _wl_thesis_options
-                                                               if o["label"] == _bp_thesis), None)
-                                                    if _m:
-                                                        save_thesis_row(uid_wl, tk, _bp_acct,
-                                                                        _m["thesis_title"],
-                                                                        _m["narrative_category"],
-                                                                        _m["narrative_date"])
-                                                        _th_msg = f" · Thesis: {_m['thesis_title']}"
+                                            # 워치리스트 등록 정보 → 매매 복기용으로 메모에 박제
+                                            # (Watchlist 행이 삭제돼도 '등록가 → 실제 매수가' 추적 가능)
+                                            _wl_sp = pd.to_numeric(item.get("saved_price"), errors="coerce")
+                                            _wl_da = str(item.get("date_added", "") or "").strip()
+                                            _wl_tag_bits = []
+                                            if pd.notna(_wl_sp) and float(_wl_sp) > 0:
+                                                _wl_tag_bits.append(f"WL등록가 ${float(_wl_sp):.2f}")
+                                            if _wl_da:
+                                                _wl_tag_bits.append(f"WL등록일 {_wl_da[:10]}")
+                                            _wl_tag = (" · " + " · ".join(_wl_tag_bits)) if _wl_tag_bits else ""
+
+                                            _proceed, _base_memo, _plan_entry = False, "신규 매수", _px_v
+                                            _mask_bp = (
+                                                _pf_now["Account"].astype(str).str.strip().eq(_bp_acct)
+                                                & _pf_now["Ticker"].astype(str).str.strip().str.upper().eq(tk)
+                                            ) if not _pf_now.empty else None
+                                            if _mask_bp is not None and bool(_mask_bp.any()):
+                                                _mi = _pf_now.index[_mask_bp][0]
+                                                _old_q = pd.to_numeric(_pf_now.loc[_mi, "Quantity"], errors="coerce")
+                                                _old_p = pd.to_numeric(_pf_now.loc[_mi, "Purchase_Price"], errors="coerce")
+                                                _ok_oq, _, _err_oq = _validate_positive_portfolio_number("기존 수량", _old_q)
+                                                _ok_op, _, _err_op = _validate_positive_portfolio_number("기존 평단가", _old_p)
+                                                if not (_ok_oq and _ok_op):
+                                                    st.error(
+                                                        f"저장된 데이터 오류: {_err_oq or _err_op} "
+                                                        "포트폴리오 [데이터 수정하기]에서 바로잡아 주세요."
+                                                    )
                                                 else:
-                                                    _auto = find_thesis_for_ticker(uid_wl, tk)
-                                                    if _auto:
+                                                    _new_q = float(_old_q) + float(_qty_v)
+                                                    _new_avg = ((float(_old_p) * float(_old_q))
+                                                                + (float(_px_v) * float(_qty_v))) / _new_q
+                                                    _pf_now.loc[_mi, "Quantity"] = _new_q
+                                                    _pf_now.loc[_mi, "Purchase_Price"] = _new_avg
+                                                    _proceed, _base_memo, _plan_entry = True, "추가 매수", _new_avg
+                                            else:
+                                                _pf_now = pd.concat(
+                                                    [_pf_now, pd.DataFrame([{
+                                                        "Account": _bp_acct,
+                                                        "Ticker": tk,
+                                                        "Purchase_Price": _px_v,
+                                                        "Quantity": _qty_v,
+                                                        "Date_Added": _bp_date_s,
+                                                    }])],
+                                                    ignore_index=True,
+                                                )
+                                                _proceed, _base_memo, _plan_entry = True, "신규 매수", _px_v
+
+                                            if _proceed:
+                                                save_portfolio(_pf_now)
+                                                append_trade_history_row(
+                                                    uid_wl, _bp_acct, tk, "BUY",
+                                                    float(_qty_v), float(_px_v), _bp_date_s,
+                                                    _build_entry_memo(_bp_reason, f"{_base_memo}{_wl_tag}"),
+                                                )
+                                                # ── Thesis 연결 (포트폴리오 탭과 동일 규칙) ──
+                                                _th_msg = ""
+                                                try:
+                                                    if _bp_thesis == _WL_THESIS_CORE:
                                                         save_thesis_row(uid_wl, tk, _bp_acct,
-                                                                        _auto["thesis_title"],
-                                                                        _auto["narrative_category"],
-                                                                        _auto["narrative_date"])
-                                                        _th_msg = f" · 🔗 자동 연결: {_auto['thesis_title']}"
-                                            except Exception as _exc_th:
-                                                _th_msg = f" · ⚠️ Thesis 연결 실패: {_exc_th}"
+                                                                        "코어/정기적립 (DCA)", "core_dca", "")
+                                                        _th_msg = " · 📈 코어/정기적립으로 기록"
+                                                    elif _bp_thesis != _WL_THESIS_NONE:
+                                                        _m = next((o for o in _wl_thesis_options
+                                                                   if o["label"] == _bp_thesis), None)
+                                                        if _m:
+                                                            save_thesis_row(uid_wl, tk, _bp_acct,
+                                                                            _m["thesis_title"],
+                                                                            _m["narrative_category"],
+                                                                            _m["narrative_date"])
+                                                            _th_msg = f" · Thesis: {_m['thesis_title']}"
+                                                    else:
+                                                        _auto = find_thesis_for_ticker(uid_wl, tk)
+                                                        if _auto:
+                                                            save_thesis_row(uid_wl, tk, _bp_acct,
+                                                                            _auto["thesis_title"],
+                                                                            _auto["narrative_category"],
+                                                                            _auto["narrative_date"])
+                                                            _th_msg = f" · 🔗 자동 연결: {_auto['thesis_title']}"
+                                                except Exception as _exc_th:
+                                                    _th_msg = f" · ⚠️ Thesis 연결 실패: {_exc_th}"
 
-                                            # ── 플랜: Watchlist 손절/목표 승계 우선 ──
-                                            if _bp_inherit and (_inh_sl is not None or _inh_tp is not None):
-                                                _ok_pl, _err_pl = save_portfolio_plan_setting(
-                                                    uid_wl, _bp_acct, tk, _inh_sl, _inh_tp
-                                                )
-                                                if _ok_pl:
-                                                    _pl_bits = []
-                                                    if _inh_sl is not None:
-                                                        _pl_bits.append(f"손절 ${_inh_sl:.2f}")
-                                                    if _inh_tp is not None:
-                                                        _pl_bits.append(f"목표 ${_inh_tp:.2f}")
-                                                    _pl_msg = " · 📐 Watchlist 플랜 승계 (" + " · ".join(_pl_bits) + ")"
+                                                # ── 플랜: Watchlist 손절/목표 승계 우선 ──
+                                                if _bp_inherit and (_inh_sl is not None or _inh_tp is not None):
+                                                    _ok_pl, _err_pl = save_portfolio_plan_setting(
+                                                        uid_wl, _bp_acct, tk, _inh_sl, _inh_tp
+                                                    )
+                                                    if _ok_pl:
+                                                        _pl_bits = []
+                                                        if _inh_sl is not None:
+                                                            _pl_bits.append(f"손절 ${_inh_sl:.2f}")
+                                                        if _inh_tp is not None:
+                                                            _pl_bits.append(f"목표 ${_inh_tp:.2f}")
+                                                        _pl_msg = " · 📐 Watchlist 플랜 승계 (" + " · ".join(_pl_bits) + ")"
+                                                    else:
+                                                        _pl_msg = f" · ⚠️ 플랜 승계 실패: {_err_pl}"
                                                 else:
-                                                    _pl_msg = f" · ⚠️ 플랜 승계 실패: {_err_pl}"
-                                            else:
-                                                _pl_msg = auto_save_plan_after_add(
-                                                    uid_wl, _bp_acct, tk, _plan_entry
+                                                    _pl_msg = auto_save_plan_after_add(
+                                                        uid_wl, _bp_acct, tk, _plan_entry
+                                                    )
+
+                                                # ⚠️ Watchlist 제거는 항상 마지막 — 앞 단계 실패 시 재시도 가능
+                                                if _bp_remove:
+                                                    _ok_rm, _err_rm = delete_from_watchlist(uid_wl, tk)
+                                                    _rm_msg = (" · 🗑️ Watchlist에서 제거"
+                                                               if _ok_rm else f" · ⚠️ Watchlist 제거 실패: {_err_rm}")
+                                                else:
+                                                    _rm_msg = " · 🔔 Watchlist 유지"
+
+                                                st.success(
+                                                    f"✅ {_bp_acct} / {tk} — {float(_qty_v):g}주 @ "
+                                                    f"${float(_px_v):.2f} 등록 완료{_th_msg}{_pl_msg}{_rm_msg}"
                                                 )
+                                                st.rerun()
 
-                                            # ⚠️ Watchlist 제거는 항상 마지막 — 앞 단계 실패 시 재시도 가능
-                                            if _bp_remove:
-                                                _ok_rm, _err_rm = delete_from_watchlist(uid_wl, tk)
-                                                _rm_msg = (" · 🗑️ Watchlist에서 제거"
-                                                           if _ok_rm else f" · ⚠️ Watchlist 제거 실패: {_err_rm}")
-                                            else:
-                                                _rm_msg = " · 🔔 Watchlist 유지"
+                        btn_col1, btn_col2 = st.columns(2)
+                        with btn_col1:
+                            def _goto_analysis(ticker=tk):
+                                st.session_state["selected_ticker"] = ticker
+                                st.session_state["main_sidebar_nav"] = NAV_STOCK
+                            st.button(
+                                f"📌 {tk} 분석하기",
+                                key=f"wl_pick_{idx}",
+                                use_container_width=True,
+                                on_click=_goto_analysis,
+                            )
+                        with btn_col2:
+                            def _do_wl_delete(tk_del=tk, uid_del=uid_wl):
+                                _ok_d, _err_d = delete_from_watchlist(uid_del, tk_del)
+                            st.button(
+                                f"🗑️ 삭제",
+                                key=f"wl_del_{idx}",
+                                use_container_width=True,
+                                on_click=_do_wl_delete,
+                            )
 
-                                            st.success(
-                                                f"✅ {_bp_acct} / {tk} — {float(_qty_v):g}주 @ "
-                                                f"${float(_px_v):.2f} 등록 완료{_th_msg}{_pl_msg}{_rm_msg}"
-                                            )
-                                            st.rerun()
 
-                    btn_col1, btn_col2 = st.columns(2)
-                    with btn_col1:
-                        def _goto_analysis(ticker=tk):
-                            st.session_state["selected_ticker"] = ticker
-                            st.session_state["main_sidebar_nav"] = NAV_STOCK
-                        st.button(
-                            f"📌 {tk} 분석하기",
-                            key=f"wl_pick_{idx}",
-                            use_container_width=True,
-                            on_click=_goto_analysis,
+                # Alert 재체크 버튼
+                st.divider()
+                if st.button("🔄 Alert 조건 다시 체크", key="wl_recheck_btn", use_container_width=True):
+                    st.session_state["_watchlist_alert_checked"] = False
+                    st.session_state.pop("_watchlist_triggered_alerts", None)
+                    st.rerun()
+
+        else:
+            # ── 종목 추가 폼 ───────────────────────────────────────────────────
+            with st.expander("➕ 관심 종목 추가", expanded=not wl_items):
+                # 제출 직후 티커칸 비우기 (폼 바깥 위젯이라 clear_on_submit 미적용 → rerun 전 플래그로 처리)
+                if st.session_state.pop("_wl_clear_ticker", False):
+                    st.session_state["wl_unified_ticker"] = ""
+                # 티커는 폼 '바깥' 단일 입력 — '제안값 계산'과 'Watchlist 추가'가 같은 티커를 공유.
+                # (st.form 내부 위젯값은 제출 전까지 읽을 수 없어, 제안 계산용으로 폼 바깥에 둔다)
+                st.caption("💡 티커를 넣고 **제안값 계산**을 누르면 ATR·200일선 기준 손절/목표가가 표시됩니다. 같은 티커가 아래 추가에도 그대로 사용됩니다.")
+                _sug_c1, _sug_c2 = st.columns([2, 1])
+                with _sug_c1:
+                    wl_ticker = st.text_input(
+                        "티커",
+                        placeholder="예: NVDA",
+                        key="wl_unified_ticker",
+                    ).strip().upper()
+                with _sug_c2:
+                    _sug_go = st.button("📐 제안값 계산", key="wl_suggest_btn", use_container_width=True)
+                if _sug_go and wl_ticker:
+                    with st.spinner(f"{wl_ticker} 손절/목표가 제안 계산 중..."):
+                        _sug = suggest_stop_and_target(wl_ticker)
+                    st.session_state["_wl_suggestion"] = {"ticker": wl_ticker, **_sug}
+                _sug_state = st.session_state.get("_wl_suggestion")
+                if _sug_state and _sug_state.get("ticker"):
+                    _e = _sug_state.get("entry")
+                    if pd.notna(_e):
+                        st.markdown(f"**{_sug_state['ticker']}** 현재가 기준 제안 (진입가 ${_e:.2f})")
+                        _r1, _r2, _r3 = st.columns(3)
+                        with _r1:
+                            if pd.notna(_sug_state.get("stop_atr")):
+                                st.metric(
+                                    "손절 (ATR 기준)",
+                                    f"${_sug_state['stop_atr']:.2f}",
+                                    delta=f"{_sug_state['stop_atr_pct']:+.1f}%",
+                                    delta_color="off",
+                                )
+                                st.caption("변동성(ATR×2) 기반. 변동 큰 종목일수록 멀게.")
+                            else:
+                                st.metric("손절 (ATR 기준)", "N/A")
+                        with _r2:
+                            if pd.notna(_sug_state.get("stop_ma200")):
+                                st.metric(
+                                    "손절 (200일선 기준)",
+                                    f"${_sug_state['stop_ma200']:.2f}",
+                                    delta=f"{_sug_state['stop_ma200_pct']:+.1f}%" if pd.notna(_sug_state.get("stop_ma200_pct")) else None,
+                                    delta_color="off",
+                                )
+                                st.caption("추세선 바로 아래. 추세 붕괴 시 손절.")
+                            else:
+                                st.metric("손절 (200일선 기준)", "N/A")
+                        with _r3:
+                            if pd.notna(_sug_state.get("target_2r")):
+                                st.metric(
+                                    "목표가 (손익비 1:2)",
+                                    f"${_sug_state['target_2r']:.2f}",
+                                    delta=f"{_sug_state['target_2r_pct']:+.1f}%",
+                                    delta_color="off",
+                                )
+                                st.caption("ATR 손절 거리의 2배.")
+                            else:
+                                st.metric("목표가 (손익비 1:2)", "N/A")
+                        st.caption("⚠️ 제안값은 참고용입니다. 종목 특성을 보고 본인이 최종 손절/목표를 정하세요.")
+                    else:
+                        st.warning(f"{_sug_state['ticker']} 가격 데이터를 불러오지 못해 제안값을 계산할 수 없습니다.")
+
+                with st.form("watchlist_add_form", clear_on_submit=True):
+                    wl_memo = st.text_input(
+                        "메모 (매수 근거)",
+                        placeholder="예: AI Capex 수혜, 어닝 모멘텀",
+                        key="wl_form_memo",
+                    )
+                    st.markdown("**Alert 조건 설정** _(선택 — 비워두면 엔진의 매수 신호로만 알림)_")
+                    st.caption(
+                        "여기 설정한 조건은 장 마감 후 **매매레이더 이메일**로도 발송됩니다 "
+                        "(2일 연속 확정 시 1회 · 깜빡임 방지). 비워두면 엔진이 판단한 "
+                        "🟢 매수 신호 / 🟡 줄이기 알림만 받습니다."
+                    )
+                    al_col1, al_col2, al_col3 = st.columns(3)
+                    with al_col1:
+                        wl_alert_price = st.number_input(
+                            "💰 목표 매수가 ($) 이하",
+                            min_value=0.0,
+                            value=0.0,
+                            step=0.5,
+                            format="%.2f",
+                            key="wl_form_alert_price",
+                            help="현재가가 이 가격 이하로 내려오면 알림(앱·이메일)",
                         )
-                    with btn_col2:
-                        def _do_wl_delete(tk_del=tk, uid_del=uid_wl):
-                            _ok_d, _err_d = delete_from_watchlist(uid_del, tk_del)
-                        st.button(
-                            f"🗑️ 삭제",
-                            key=f"wl_del_{idx}",
-                            use_container_width=True,
-                            on_click=_do_wl_delete,
+                    with al_col2:
+                        wl_alert_rsi = st.number_input(
+                            "📉 RSI(14) 이하",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=0.0,
+                            step=1.0,
+                            format="%.0f",
+                            key="wl_form_alert_rsi",
+                            help="RSI가 이 값 이하로 내려오면 알림(앱·이메일). 예: 30 = 과매도",
+                        )
+                    with al_col3:
+                        wl_alert_ma200 = st.checkbox(
+                            "📊 200일선 ±3% 근접 시",
+                            key="wl_form_alert_ma200",
+                            help="현재가가 200일 이동평균선의 ±3% 이내에 들어오면 알림(앱·이메일)",
                         )
 
+                    st.markdown("**손절 / 목표가** (진입 전 미리 정하면 감정적 보유를 막아줍니다)")
+                    sl_col1, sl_col2 = st.columns(2)
+                    with sl_col1:
+                        wl_stop_loss = st.number_input(
+                            "🛑 손절가 ($)",
+                            min_value=0.0,
+                            value=0.0,
+                            step=0.5,
+                            format="%.2f",
+                            key="wl_form_stop_loss",
+                            help="여기까지 내려오면 자른다. 위 제안값을 참고하세요.",
+                        )
+                    with sl_col2:
+                        wl_target_price = st.number_input(
+                            "🎯 목표가 ($)",
+                            min_value=0.0,
+                            value=0.0,
+                            step=0.5,
+                            format="%.2f",
+                            key="wl_form_target_price",
+                            help="익절 목표. 손익비 1:2 이상이면 기대값이 좋습니다.",
+                        )
+                    _add_acct_now = str(st.session_state.get("_active_account") or "").strip()
+                    st.caption(
+                        (f"🏦 귀속 계좌: **{_add_acct_now}** (사이드바 활성 계좌) — 각 종목의 "
+                         "'✏️ 알림 · 손절/목표 편집'에서 언제든 바꿀 수 있습니다."
+                         ) if _add_acct_now else
+                        "🏦 귀속 계좌: 미지정 — 포트폴리오에 계좌를 등록하면 자동 지정됩니다."
+                    )
+                    submitted_wl = st.form_submit_button("Watchlist에 추가", type="primary", use_container_width=True)
 
-            # Alert 재체크 버튼
-            st.divider()
-            if st.button("🔄 Alert 조건 다시 체크", key="wl_recheck_btn", use_container_width=True):
-                st.session_state["_watchlist_alert_checked"] = False
-                st.session_state.pop("_watchlist_triggered_alerts", None)
-                st.rerun()
-
-            st.divider()
-            st.markdown("### 🗑️ Watchlist 전체 초기화")
-            st.caption("등록된 모든 종목을 삭제합니다. Alert 조건은 🔔 Buy Watchlist & Alert 탭에서 새로 추가하세요.")
-            if st.button("🗑️ Watchlist 전체 삭제", key="wl_clear_all_btn", use_container_width=True):
-                st.session_state["_wl_clear_confirm"] = True
-
-            if st.session_state.get("_wl_clear_confirm"):
-                st.error("⚠️ 정말 모두 삭제할까요? 이 작업은 되돌릴 수 없어요.")
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("✅ 네, 전부 삭제", key="wl_clear_yes", use_container_width=True, type="primary"):
-                        ok_clear, err_clear = save_watchlist_sheet(uid_wl, [])
-                        if ok_clear:
-                            st.session_state.pop("_wl_clear_confirm", None)
-                            load_watchlist_sheet.clear()
-                            st.session_state.pop("_sidebar_wl_count", None)
-                            st.session_state["_watchlist_alert_checked"] = False
-                            st.success("✅ Watchlist를 모두 삭제했어요!")
+                if submitted_wl:
+                    if not wl_ticker:
+                        st.warning("티커를 입력해주세요.")
+                    else:
+                        with st.spinner(f"{wl_ticker} 저장 중..."):
+                            # ✅ 저장 시점 현재가를 캐시 우회하여 신선하게 조회
+                            try:
+                                fetch_latest_prices_for_tickers.clear()
+                            except Exception:
+                                pass
+                            _wl_form_price = fetch_latest_prices_for_tickers((wl_ticker,)).get(wl_ticker, np.nan)
+                            _sl_val = float(wl_stop_loss) if wl_stop_loss > 0 else None
+                            _tp_val = float(wl_target_price) if wl_target_price > 0 else None
+                            ok_wl, err_wl = add_to_watchlist(
+                                uid_wl, wl_ticker,
+                                memo=wl_memo.strip(),
+                                alert_price=float(wl_alert_price) if wl_alert_price > 0 else None,
+                                alert_rsi=float(wl_alert_rsi) if wl_alert_rsi > 0 else None,
+                                alert_ma200=wl_alert_ma200,
+                                saved_price=float(_wl_form_price) if pd.notna(_wl_form_price) else None,  # ✅ 명시적 전달
+                                stop_loss=_sl_val,
+                                target_price=_tp_val,
+                            )
+                        if ok_wl:
+                            # 손익비(R:R) 피드백
+                            _rr_msg = ""
+                            if _sl_val and _tp_val and pd.notna(_wl_form_price):
+                                _entry = float(_wl_form_price)
+                                _risk = _entry - _sl_val
+                                _reward = _tp_val - _entry
+                                if _risk > 0 and _reward > 0:
+                                    _rr = _reward / _risk
+                                    if _rr >= 2:
+                                        _rr_msg = f" · 손익비 1:{_rr:.1f} ✅ (기대값 양호)"
+                                    elif _rr >= 1:
+                                        _rr_msg = f" · 손익비 1:{_rr:.1f} ⚠️ (1:2 이상 권장)"
+                                    else:
+                                        _rr_msg = f" · 손익비 1:{_rr:.1f} 🔴 (위험이 보상보다 큼 — 재검토)"
+                            st.success(f"✅ {wl_ticker} Watchlist에 추가했습니다!{_rr_msg}")
+                            st.session_state.pop("_wl_suggestion", None)
+                            st.session_state["_wl_clear_ticker"] = True  # 다음 rerun에서 티커칸 비움
                             st.rerun()
                         else:
-                            st.error(f"삭제 실패: {err_clear}")
-                with c2:
-                    if st.button("❌ 취소", key="wl_clear_no", use_container_width=True):
-                        st.session_state.pop("_wl_clear_confirm", None)
-                        st.rerun()
+                            st.error(f"저장 실패: {err_wl}")
 
-            # ── saved_price 일괄 복구 ──────────────────────────────────────
-            missing_price = [i for i in wl_items if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce"))]
-            if missing_price:
-                st.warning(f"⚠️ **{len(missing_price)}개 종목**의 등록 시 가격이 없어서 수익률이 0%로 표시돼요.")
-                if st.button("💰 현재가로 등록 가격 일괄 복구", key="wl_fix_price_btn", type="primary", use_container_width=True):
-                    with st.spinner("현재가 조회 중..."):
-                        fix_tickers = tuple(i["ticker"] for i in missing_price)
-                        fix_price_map = fetch_latest_prices_for_tickers(fix_tickers)
-                    fixed_count = 0
-                    updated_items = []
-                    for item in wl_items:
-                        tk = item["ticker"]
-                        if pd.isna(pd.to_numeric(item.get("saved_price"), errors="coerce")):
-                            new_price = fix_price_map.get(tk, np.nan)
-                            if pd.notna(new_price):
-                                item = dict(item)
-                                item["saved_price"] = float(new_price)
-                                fixed_count += 1
-                        updated_items.append(item)
-                    ok_fix, err_fix = save_watchlist_sheet(uid_wl, updated_items)
-                    if ok_fix:
-                        st.success(f"✅ {fixed_count}개 종목의 등록 가격을 현재가로 복구했어요!")
-                        st.session_state.pop("_sidebar_wl_count", None)
-                        st.rerun()
-                    else:
-                        st.error(f"저장 실패: {err_fix}")
-
-    elif main_nav == NAV_EMERGING:
-        render_sync_button("sync_tab_emerging", [], "Emerging 추적 데이터를 다시 불러옵니다.")
-        # ─────────────────────────────────────────────────────────────────────
-        # 📡 Emerging 종목 추적기
-        # ─────────────────────────────────────────────────────────────────────
-        st.subheader("📡 Emerging 종목 추적기")
-        st.caption(
-            "AI 내러티브 분석 후 Emerging 종목 검증을 실행할 때마다 자동으로 기록이 쌓입니다. "
-            "같은 종목이 반복 등장할수록 신뢰도 높은 신호예요."
-        )
-
-        uid_et = _shared_owner_uid()  # Emerging 추적은 자동화(관리자 소유) 누적 데이터 열람
-
-        with st.spinner("Emerging 추적 기록 불러오는 중..."):
-            et_df = load_emerging_tracker(uid_et)
-            et_df = _augment_emerging_with_freshness(et_df)
-
-        if et_df.empty:
-            st.info(
-                "아직 추적 기록이 없어요. "
-                "[1단계] 시장 내러티브에서 AI 분석 후 **Emerging 종목 검증 실행** 버튼을 누르면 "
-                "자동으로 기록이 쌓입니다."
-            )
-        else:
-            # ── 요약 지표 ──────────────────────────────────────────────────
-            total = len(et_df)
-            hot = (et_df["Count"].astype(int) >= 3).sum() if "Count" in et_df.columns else 0
-            new_ones = (et_df["Status"].str.contains("신규", na=False)).sum()
-            # 매수 신호: 검증 라벨이 최적/얼리버드 AND 최근 10일 내 등장(신선)만
-            _is_stale_col = et_df["_is_stale"] if "_is_stale" in et_df.columns else pd.Series(False, index=et_df.index)
-            best_ones = et_df[
-                et_df["Best_Verdict"].str.contains("최적|얼리버드", na=False)
-                & (~_is_stale_col.fillna(False).astype(bool))
-            ]
-            stale_count = int(_is_stale_col.fillna(False).astype(bool).sum())
-
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric("전체 추적 종목", f"{total}개")
-            with m2:
-                st.metric("🔥 반복 등장 (3회+)", f"{hot}개")
-            with m3:
-                st.metric("🆕 신규 등장", f"{new_ones}개")
-            with m4:
-                st.metric("🎯 매수 신호 (신선)", f"{len(best_ones)}개")
-
-            if stale_count > 0:
-                st.caption(
-                    f"⏳ {stale_count}개 종목은 마지막 등장이 {_EMERGING_STALE_DAYS}일을 넘어 '오래된 신호'로 분류됐어요. "
-                    "매수 신호 섹션에서는 제외되며, 전체 목록에는 배지와 함께 남습니다."
-                )
-
-            # ── 최우선 관심 종목 ───────────────────────────────────────────
-            if not best_ones.empty:
+            if wl_items:
+                # ── 💰 등록가 일괄 복구 버튼 (saved_price 없는 종목 대상) ────────
+                _missing_sp = [i for i in wl_items if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce"))]
+                if _missing_sp:
+                    st.warning(f"⚠️ **{len(_missing_sp)}개 종목**의 등록가(Saved Price)가 없어 '등록 시 대비'가 N/A로 표시됩니다.")
+                    if st.button("💰 등록가 현재가로 일괄 복구", key="bulk_fix_saved_price", type="secondary"):
+                        with st.spinner("등록가 복구 중..."):
+                            try:
+                                fetch_latest_prices_for_tickers.clear()
+                            except Exception:
+                                pass
+                            _fix_tks = tuple(i["ticker"] for i in _missing_sp)
+                            _fix_prices = fetch_latest_prices_for_tickers(_fix_tks)
+                            _fix_count = 0
+                            for i in wl_items:
+                                if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce")):
+                                    _fp = _fix_prices.get(i["ticker"], np.nan)
+                                    if pd.notna(_fp):
+                                        i["saved_price"] = float(_fp)
+                                        _fix_count += 1
+                            if _fix_count > 0:
+                                _ok_fix, _err_fix = save_watchlist_sheet(uid_wl, wl_items)
+                                if _ok_fix:
+                                    load_watchlist_sheet.clear()
+                                    st.success(f"✅ {_fix_count}개 종목 등록가 복구 완료!")
+                                    st.rerun()
+                                else:
+                                    st.error(f"저장 실패: {_err_fix}")
+                            else:
+                                st.warning("복구할 가격 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요.")
                 st.divider()
-                st.markdown("### 🎯 매수 신호 종목 (최적/얼리버드 · 최근 10일 내)")
-                st.caption("정량 검증에서 '최적 매수 타이밍' 또는 '얼리버드 기회'로 분류된 **신선한** 종목들이에요. RS 값은 등장 당시 검증값입니다.")
-                for _, row in best_ones.sort_values("Count", ascending=False).iterrows():
-                    count = int(row["Count"]) if str(row["Count"]).isdigit() else 1
-                    rs_str = f"RS {float(row['RS_Score']):.1f}%p(당시)" if row["RS_Score"] else ""
-                    _days_old = row.get("_days_old", np.nan)
-                    _fresh = f"{_days_old:.0f}일 전" if pd.notna(_days_old) else row["Last_Seen"]
-                    st.markdown(
-                        f"**{row['Ticker']}** — {row['Best_Verdict']} | "
-                        f"등장 **{count}회** | {rs_str} | 최근: {_fresh}"
-                    )
-                    col_a, col_b = st.columns([1, 4])
-                    with col_a:
-                        def _goto_stock(tk=row["Ticker"]):
-                            st.session_state["selected_ticker"] = tk
-                            st.session_state["main_sidebar_nav"] = NAV_STOCK
-                        st.button(f"🔬 {row['Ticker']} 분석", key=f"et_goto_{row['Ticker']}", on_click=_goto_stock)
+                st.markdown("### 🗑️ Watchlist 전체 초기화")
+                st.caption("등록된 모든 종목을 삭제합니다. Alert 조건은 🔔 Buy Watchlist & Alert 탭에서 새로 추가하세요.")
+                if st.button("🗑️ Watchlist 전체 삭제", key="wl_clear_all_btn", use_container_width=True):
+                    st.session_state["_wl_clear_confirm"] = True
 
-            # ── 반복 등장 종목 ─────────────────────────────────────────────
-            st.divider()
-            st.markdown("### 🔥 반복 등장 종목 (관심 집중)")
+                if st.session_state.get("_wl_clear_confirm"):
+                    st.error("⚠️ 정말 모두 삭제할까요? 이 작업은 되돌릴 수 없어요.")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("✅ 네, 전부 삭제", key="wl_clear_yes", use_container_width=True, type="primary"):
+                            ok_clear, err_clear = save_watchlist_sheet(uid_wl, [])
+                            if ok_clear:
+                                st.session_state.pop("_wl_clear_confirm", None)
+                                load_watchlist_sheet.clear()
+                                st.session_state.pop("_sidebar_wl_count", None)
+                                st.session_state["_watchlist_alert_checked"] = False
+                                st.success("✅ Watchlist를 모두 삭제했어요!")
+                                st.rerun()
+                            else:
+                                st.error(f"삭제 실패: {err_clear}")
+                    with c2:
+                        if st.button("❌ 취소", key="wl_clear_no", use_container_width=True):
+                            st.session_state.pop("_wl_clear_confirm", None)
+                            st.rerun()
 
-            hot_df = et_df[et_df["Count"].astype(int) >= 2].sort_values("Count", ascending=False)
-            if hot_df.empty:
-                st.info("아직 2회 이상 등장한 종목이 없어요. 내러티브 분석을 더 진행하면 쌓입니다.")
-            else:
-                def _style_count(val):
-                    v = int(val) if str(val).isdigit() else 0
-                    if v >= 5: return "color:#dc2626;font-weight:700"
-                    if v >= 3: return "color:#f97316;font-weight:600"
-                    return "color:#16a34a"
-
-                def _style_verdict(val):
-                    if "최적" in str(val): return "color:#16a34a;font-weight:700"
-                    if "얼리" in str(val): return "color:#0ea5e9;font-weight:600"
-                    return ""
-
-                def _freshness_badge(days_old):
-                    if pd.isna(days_old):
-                        return "—"
-                    d = float(days_old)
-                    if d > _EMERGING_STALE_DAYS:
-                        return f"⏳ 오래됨 ({d:.0f}일 전)"
-                    if d <= 2:
-                        return f"🟢 최신 ({d:.0f}일 전)"
-                    return f"🟡 {d:.0f}일 전"
-
-                hot_disp = hot_df.copy()
-                hot_disp["신선도"] = hot_disp["_days_old"].apply(_freshness_badge)
-
-                def _style_freshness(val):
-                    if "오래됨" in str(val): return "color:#9ca3af;font-style:italic"
-                    if "최신" in str(val): return "color:#16a34a;font-weight:600"
-                    return "color:#f59e0b"
-
-                styled_hot = (
-                    hot_disp[["Ticker", "Theme", "First_Seen", "Last_Seen", "신선도", "Count", "Best_Verdict", "RS_Score", "Status"]]
-                    .style
-                    .map(_style_count, subset=["Count"])
-                    .map(_style_verdict, subset=["Best_Verdict"])
-                    .map(_style_freshness, subset=["신선도"])
-                )
-                st.dataframe(styled_hot, use_container_width=True, hide_index=True)
-                st.caption("RS_Score는 종목이 마지막으로 검증된 **당시 값**입니다(실시간 아님). '오래됨' 종목은 매수 판단에서 제외하세요.")
-
-            # ── 전체 목록 ──────────────────────────────────────────────────
-            st.divider()
-            st.markdown("### 📋 전체 추적 목록")
-            with st.expander("전체 보기", expanded=False):
-                _full = et_df.sort_values("Count", ascending=False).copy()
-                if "_days_old" in _full.columns:
-                    _full["경과일"] = _full["_days_old"].apply(
-                        lambda d: f"{d:.0f}일 전" if pd.notna(d) else "—"
-                    )
-                _drop = [c for c in ("_days_old", "_is_stale") if c in _full.columns]
-                st.dataframe(
-                    _full.drop(columns=_drop),
-                    use_container_width=True, hide_index=True
-                )
-
-            # ── 개별 삭제 ──────────────────────────────────────────────────
-            st.divider()
-            st.markdown("### 🗑️ 종목 삭제")
-            del_ticker = st.selectbox(
-                "삭제할 종목 선택",
-                options=[""] + et_df["Ticker"].tolist(),
-                key="et_del_select"
-            )
-            if del_ticker and st.button("🗑️ 선택 종목 삭제", key="et_del_btn", disabled=not _is_admin(), help="관리자 전용 — 자동화가 대신 실행합니다"):
-                ok_del, err_del = delete_emerging_tracker_row(uid_et, del_ticker)
-                if ok_del:
-                    st.success(f"✅ {del_ticker} 삭제 완료")
-                    st.rerun()
-                else:
-                    st.error(f"삭제 실패: {err_del}")
-
+                # ── saved_price 일괄 복구 ──────────────────────────────────────
+                missing_price = [i for i in wl_items if pd.isna(pd.to_numeric(i.get("saved_price"), errors="coerce"))]
+                if missing_price:
+                    st.warning(f"⚠️ **{len(missing_price)}개 종목**의 등록 시 가격이 없어서 수익률이 0%로 표시돼요.")
+                    if st.button("💰 현재가로 등록 가격 일괄 복구", key="wl_fix_price_btn", type="primary", use_container_width=True):
+                        with st.spinner("현재가 조회 중..."):
+                            fix_tickers = tuple(i["ticker"] for i in missing_price)
+                            fix_price_map = fetch_latest_prices_for_tickers(fix_tickers)
+                        fixed_count = 0
+                        updated_items = []
+                        for item in wl_items:
+                            tk = item["ticker"]
+                            if pd.isna(pd.to_numeric(item.get("saved_price"), errors="coerce")):
+                                new_price = fix_price_map.get(tk, np.nan)
+                                if pd.notna(new_price):
+                                    item = dict(item)
+                                    item["saved_price"] = float(new_price)
+                                    fixed_count += 1
+                            updated_items.append(item)
+                        ok_fix, err_fix = save_watchlist_sheet(uid_wl, updated_items)
+                        if ok_fix:
+                            st.success(f"✅ {fixed_count}개 종목의 등록 가격을 현재가로 복구했어요!")
+                            st.session_state.pop("_sidebar_wl_count", None)
+                            st.rerun()
+                        else:
+                            st.error(f"저장 실패: {err_fix}")
     elif main_nav == NAV_REVIEW:
         # ─────────────────────────────────────────────────────────────────────
         # 📊 매매 복기 (Trade Review) — Chunk 1
@@ -26582,25 +26613,25 @@ Users 시트 `Gate_Market` 토글로 사용자별 on/off — 기본값은 꺼짐
         with _g_tab3:
             st.markdown("### 🤖 AI 인사이트 & 자동화·검증")
 
-            with st.expander("📊 **[AI] 내러티브 적중률 트래커**", expanded=False):
+            with st.expander("📊 **[AI] 내러티브 성과 → 적중률 트래커**", expanded=False):
                 st.markdown("""
 과거 내러티브의 Winners·Emerging이 실제로 어떻게 됐는지 수익률로 팩트체크.
 평균 수익률 · 적중률 · Best/Worst 5. 어떤 내러티브 타입·섹터에서 AI가 강한지 파악.
 """)
 
-            with st.expander("💡 **[AI] Idea-to-Portfolio 추적**", expanded=False):
+            with st.expander("💡 **[AI] 내 포트폴리오 리뷰 → Idea-to-Portfolio**", expanded=False):
                 st.markdown("""
 AI 추천 종목의 포트폴리오 편입 여부 추적 — 보유 ✅ / 미편입 → 빠른 검사. 추천 이후 수익률 비교.
 """)
 
-            with st.expander("📡 **[AI] Emerging 종목 추적기**", expanded=False):
+            with st.expander("📡 **[AI] 내러티브 성과 → Emerging 추적기**", expanded=False):
                 st.markdown("""
 내러티브 Emerging(아직 안 오른 2차 수혜 후보)을 `Emerging_Tracker` 시트에 누적하고
 정량 검증(RS·1개월 모멘텀·MA200·거래량 급증)으로 "진짜로 움직이기 시작했는지" 추적합니다.
 Early Signal의 종목판 — 여기서 뜨기 시작한 종목이 Watchlist 후보입니다.
 """)
 
-            with st.expander("📋 **[AI] 주간 포트폴리오 요약**", expanded=False):
+            with st.expander("📋 **[AI] 내 포트폴리오 리뷰 → 주간 요약**", expanded=False):
                 st.markdown("""
 주 1회: 손익 현황 + 최근 내러티브와 보유 종목 연관성 + 거시 리스크 평가 + 전략 제언.
 [4단계] 탭을 먼저 열어 수익률 동기화 후 생성하세요.
