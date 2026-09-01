@@ -10852,6 +10852,11 @@ def build_portfolio_sell_radar_df(portfolio_df):
         "1개월 수익률",
         "자산 비중(%)",
         "유니버스 랭킹(Universe Rank)",
+        # 교체 판정용 강도 — classify_regime 의 0~100 점수. 후보(정밀검사)와
+        # **같은 자**여야 비교가 성립하므로 다른 척도를 새로 만들지 않는다.
+        # 숫자형을 유지한다(정렬 가능해야 최약을 찾을 수 있다) — 봉 부족 표시는
+        # 별표가 아니라 '판정 근거(Why)' 에 붙인다.
+        "강도(Score)",
         "상태(Status)",
         "판정 근거(Why)",
     ]
@@ -10880,13 +10885,18 @@ def build_portfolio_sell_radar_df(portfolio_df):
     close_df = close_df_full
 
     # SPY 1개월 수익률 (Alpha 기준선)
+    # spy_close_series 는 아래 강도(classify_regime) 계산의 RS 입력으로도 쓴다 —
+    # 이미 받아둔 열이므로 FMP 추가 호출이 없다.
     spy_1m_return = np.nan
+    spy_close_series = None
     try:
         if "SPY" in close_df_full.columns:
             spy_series = pd.to_numeric(close_df_full["SPY"], errors="coerce").dropna()
+            spy_close_series = spy_series if not spy_series.empty else None
             spy_1m_return = calculate_period_return(spy_series, 21)
     except Exception:
         spy_1m_return = np.nan
+        spy_close_series = None
 
     universe_list = read_etf_universe_file_tickers()
     universe_set = set(str(x).strip().upper() for x in universe_list if str(x).strip())
@@ -10943,6 +10953,19 @@ def build_portfolio_sell_radar_df(portfolio_df):
             bool(current_price > ma200) if (pd.notna(current_price) and pd.notna(ma200)) else None
         )
 
+        # ── 교체 판정용 강도 ─────────────────────────────────────────────
+        #   이미 받아둔 종가(400일 창 ≈ 275봉)와 SPY 로 계산한다. FMP 추가 호출 0.
+        #   classify_regime 은 Close 열만 요구하고, 봉 부족(<50)은 내부에서
+        #   unknown/NaN 으로 처리한다 — 여기서 따로 막지 않는다.
+        _reg = {}
+        try:
+            if not clean_series.empty:
+                _reg = rc.classify_regime(pd.DataFrame({"Close": clean_series}),
+                                          spy_close=spy_close_series)
+        except Exception:
+            _reg = {}
+        _reg_score = pd.to_numeric(_reg.get("score"), errors="coerce")
+
         symbol_stats[ticker] = {
             "current_price": current_price,
             "ma200": ma200,
@@ -10950,6 +10973,9 @@ def build_portfolio_sell_radar_df(portfolio_df):
             "above_ma200": above_ma200_flag,
             "sig": sig,
             "close_series": clean_series,  # 매수일 기준 고점 슬라이싱용
+            "score": (float(_reg_score) if pd.notna(_reg_score) else np.nan),
+            "full_metrics": bool(_reg.get("full_metrics", False)),
+            "bars": int(_reg.get("bars", 0) or 0),
         }
 
     total_market_value = 0.0
@@ -11039,6 +11065,18 @@ def build_portfolio_sell_radar_df(portfolio_df):
         if pd.notna(one_month_return) and pd.notna(spy_1m_return):
             spy_alpha = float(one_month_return) - float(spy_1m_return)
 
+        # 강도 — 숫자형 그대로 둔다(정렬용). 봉이 252 미만이면 52주 창·200일선
+        # 기울기가 미수렴이라 다른 종목과 같은 자가 아니므로, 값은 보여주되
+        # 근거에 명시하고 최약 지목에서는 제외한다(rank_weakest 가 처리).
+        _score_val = pd.to_numeric(stat.get("score"), errors="coerce")
+        _score_val = float(_score_val) if pd.notna(_score_val) else np.nan
+        _score_full = bool(stat.get("full_metrics", False))
+        if pd.notna(_score_val) and not _score_full:
+            _bars_n = int(stat.get("bars", 0) or 0)
+            status_reason = (status_reason + " · "
+                             + f"⚠️ 봉 {_bars_n}개(1년 미만) — 강도 참고용, 교체 후보 제외"
+                             ).strip(" ·")
+
         rows.append(
             {
                 "계좌": account,
@@ -11055,13 +11093,40 @@ def build_portfolio_sell_radar_df(portfolio_df):
                 "1개월 수익률": one_month_return,
                 "자산 비중(%)": weight_pct,
                 "유니버스 랭킹(Universe Rank)": universe_rank_cell,
+                "강도(Score)": _score_val,
                 "상태(Status)": status,
                 "판정 근거(Why)": status_reason,
                 "_dd_data_error": bool(dd_data_error),
+                "_score_full": bool(_score_full),
             }
         )
 
     out_df = pd.DataFrame(rows)
+
+    # ── 계좌별 최약 보유 스냅샷 (교체 허들용) ────────────────────────────
+    #   정밀검사 화면이 여기서 계산한 값을 재사용한다. 정밀검사에서 직접 계산하면
+    #   보유 종목 히스토리를 다시 받아야 해서 N콜이 붙는다 — 사이드바에 FMP 를
+    #   넣었다가 가이드 페이지가 62콜 19.3초 걸렸던 것과 같은 실패 모드다.
+    #   따라서 '레이더를 한 번 연 세션'에서만 허들 카드가 뜬다(소비처가 안내).
+    try:
+        _weak_src = {}
+        for _r in rows:
+            _acct = str(_r.get("계좌", "") or "").strip()
+            _weak_src.setdefault(_acct, []).append({
+                "ticker": _r.get("티커", ""),
+                "account": _acct,
+                "score": _r.get("강도(Score)"),
+                "status": _r.get("상태(Status)"),
+                "full_metrics": bool(_r.get("_score_full", False)),
+            })
+        st.session_state["_pf_weakest"] = {
+            "by_account": {k: rc.rank_weakest(v) for k, v in _weak_src.items()},
+            "margin": float(rc.REPLACE_SCORE_MARGIN),
+            "ts": datetime.now(_MARKET_ET_TZ).strftime("%Y-%m-%d %H:%M"),
+        }
+    except Exception:
+        pass
+
     return out_df
 
 
@@ -20341,6 +20406,42 @@ if st.session_state.get("logged_in"):
                                     ))
                                 if _plan["blocked"]:
                                     st.warning(_esc_md(f"🚧 {_plan['block_reason']}"))
+                                # ── 교체 허들 (슬롯 만석일 때만) ────────────────
+                                #   최약 보유 강도는 매도 레이더가 계산해 둔 값을 쓴다.
+                                #   여기서 직접 계산하면 보유 종목 히스토리를 다시
+                                #   받아야 해서 N콜이 붙는다.
+                                if _plan.get("slots_full"):
+                                    _hz = st.session_state.get("_pf_weakest") or {}
+                                    _hz_rows = (_hz.get("by_account") or {}).get(_act_acct) or []
+                                    _cand_score = pd.to_numeric(
+                                        (_regime_res or {}).get("score"), errors="coerce")
+                                    if not _hz_rows:
+                                        st.caption(
+                                            "🔄 교체 판정: 최약 보유 강도가 아직 없습니다 — "
+                                            "`🛡️ 매도 레이더 → 🎯 매도 판단` 을 한 번 열면 "
+                                            "이 자리에 허들 판정이 표시됩니다."
+                                        )
+                                    elif pd.isna(_cand_score):
+                                        st.caption("🔄 교체 판정: 후보 강도를 산출할 수 없어 판정하지 않습니다.")
+                                    else:
+                                        _hz_w = _hz_rows[0]
+                                        _hz_res = rc.replacement_hurdle(
+                                            float(_cand_score), _hz_w.get("score"),
+                                            _hz_w.get("status"),
+                                            margin=float(_hz.get("margin", rc.REPLACE_SCORE_MARGIN)),
+                                        )
+                                        _hz_fn = st.success if _hz_res["passed"] else st.warning
+                                        _hz_fn(_esc_md(
+                                            f"🔄 **교체 판정 — {'성립' if _hz_res['passed'] else '불성립'}** "
+                                            f"· 최약 보유 **{_hz_w.get('ticker', '')}** (강도 {float(_hz_w.get('score', 0)):.0f} · "
+                                            f"{_hz_w.get('status', '')})\n\n"
+                                            f"{_hz_res['reason']}"
+                                        ))
+                                        st.caption(_esc_md(
+                                            f"강도 조건 {'✅' if _hz_res['score_ok'] else '❌'} · "
+                                            f"상태 조건 {'✅' if _hz_res['status_ok'] else '❌'} · "
+                                            f"기준 {_hz.get('ts', '')} 매도 레이더"
+                                        ))
                                 if _plan["binding"] == "cash":
                                     st.caption("💵 가용 현금이 사이즈를 결정했습니다 — 부분 집행입니다. 현금 보충 후 재검토하세요.")
                                 if not _plan["rr_measured"]:
@@ -21514,6 +21615,63 @@ if st.session_state.get("logged_in"):
                     )
                     st.caption("알림은 2PM 장중(잠정) + 5PM 마감 후(확정) 자동 발송. 이메일에도 스윙·포지션 둘 다 표기됩니다.")
 
+                # ── 🔄 슬롯 · 최약 보유 (교체 검토용) ─────────────────────────
+                #   슬롯이 만석일 때 신규 신호가 오면 교체 말고는 길이 없다.
+                #   여기서 '누가 최약인가'를 후보와 **같은 척도**로 보여준다.
+                #   계산은 위 build_portfolio_sell_radar_df 가 이미 끝냈다 —
+                #   FMP 추가 호출 0.
+                try:
+                    _wk_meta = st.session_state.get("_pf_weakest") or {}
+                    _wk_by_acct = _wk_meta.get("by_account") or {}
+                    if _wk_by_acct and not sell_radar_df.empty:
+                        st.markdown("#### 🔄 슬롯 · 최약 보유 — 교체 검토")
+                        st.caption(_esc_md(
+                            f"강도는 정밀검사 후보와 **같은 척도**(regime_core 0~100)입니다. "
+                            f"교체는 「후보 강도 ≥ 최약 강도 + {float(_wk_meta.get('margin', rc.REPLACE_SCORE_MARGIN)):.0f}」 "
+                            f"**그리고** 「최약이 이미 매도/경고 상태」일 때만 성립합니다 — "
+                            f"한쪽만 맞으면 교체하지 않습니다."
+                        ))
+                        _wk_uid = str(st.session_state.get("user_id") or "").strip()
+                        for _wk_acct in sorted(_wk_by_acct.keys()):
+                            _wk_rows = _wk_by_acct.get(_wk_acct) or []
+                            _wk_prof = get_account_profile(_wk_uid, _wk_acct)
+                            _wk_max = int(_wk_prof.get("Max_Positions", rc.DEFAULT_MAX_POSITIONS))
+                            _wk_held = int((sell_radar_df["계좌"].astype(str).str.strip() == _wk_acct).sum())
+                            _wk_full = _wk_held >= _wk_max > 0
+                            _wk_badge = ("🔴 만석" if _wk_held > _wk_max else
+                                         ("🟠 만석" if _wk_full else "🟢 여유"))
+                            st.markdown(_esc_md(
+                                f"**🏦 {_wk_acct}** — 슬롯 {_wk_held}/{_wk_max} {_wk_badge}"
+                                + ("  ·  ⚠️ 상한 초과 — 교체 이전에 초과분부터 정리하세요."
+                                   if _wk_held > _wk_max else "")
+                            ))
+                            if not _wk_rows:
+                                st.caption("강도를 산출할 수 있는 보유가 없습니다(봉 부족 또는 데이터 미수신).")
+                                continue
+                            _wk_tbl = pd.DataFrame([{
+                                "순": _i + 1,
+                                "티커": _w.get("ticker", ""),
+                                "강도": _w.get("score"),
+                                "포지션(Status)": _w.get("status", ""),
+                                "정리 대상": ("✅ 예" if _w.get("weak") else "— 아니오"),
+                                "교체 필요 강도": (float(_w.get("score", 0.0))
+                                              + float(_wk_meta.get("margin", rc.REPLACE_SCORE_MARGIN))),
+                            } for _i, _w in enumerate(_wk_rows[:3])])
+                            st.dataframe(
+                                _wk_tbl.style.format({"강도": "{:.0f}", "교체 필요 강도": "{:.0f}"},
+                                                     na_rep="N/A"),
+                                use_container_width=True, hide_index=True,
+                            )
+                            _wk_excl = _wk_held - len(_wk_rows)
+                            if _wk_excl > 0:
+                                st.caption(
+                                    f"※ {_wk_excl}종목은 최약 후보에서 제외했습니다 — 봉 1년 미만이라 "
+                                    "52주 창·200일선 기울기가 미수렴이라 같은 자로 비교할 수 없습니다."
+                                )
+                        st.divider()
+                except Exception as _wk_e:
+                    st.caption(f"최약 보유 요약을 계산할 수 없습니다: {_wk_e}")
+
                 _pf_states = load_portfolio_alert_states()
                 try:
                     _spy_pf = _fmp_price_history("SPY", lookback_days=fx.HIST_WINDOW_DAYS)
@@ -22010,7 +22168,8 @@ if st.session_state.get("logged_in"):
                     pass
 
                 # 표시용에서 내부 플래그 컬럼 제거
-                _display_radar_df = sell_radar_df.drop(columns=["_dd_data_error"], errors="ignore")
+                _display_radar_df = sell_radar_df.drop(
+                    columns=["_dd_data_error", "_score_full"], errors="ignore")
                 # 상태(Status)=포지션(중장기)으로 명시 + 스윙(단기)을 바로 앞에 배치
                 _display_radar_df = _display_radar_df.rename(columns={"상태(Status)": "포지션(Status)"})
                 if "스윙(Status)" in _display_radar_df.columns and "포지션(Status)" in _display_radar_df.columns:
@@ -22033,6 +22192,7 @@ if st.session_state.get("logged_in"):
                             "200일선": "{:,.2f}",
                             "1개월 수익률": "{:.2f}%",
                             "자산 비중(%)": "{:.2f}%",
+                            "강도(Score)": "{:.0f}",
                         },
                         na_rep="N/A",
                     )

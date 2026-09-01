@@ -1254,6 +1254,29 @@ BINDING_LABELS = {
     "none":    "-",
 }
 
+# 투입 금액이 0 일 때의 **부족 사유 문구**. BINDING_LABELS 와 분리한다.
+#   BINDING_LABELS 는 "제한: 투자 여유" 처럼 *무엇이 금액을 결정했나*를 말하는
+#   명사구이고, 이쪽은 *무엇이 없나*를 말하는 완결된 문장이다. 예전에는 라벨 뒤에
+#   " 여유 없음" 을 이어 붙여서 reserve 가 **"투자 여유 여유 없음"** 으로 나왔고,
+#   risk/event 도 "리스크 기준 여유 없음"처럼 어색했다. 두 문구는 쓰임이 다르므로
+#   한쪽을 고치면 다른 쪽이 깨진다 — 그래서 맵을 둘로 나눈다.
+_SHORTAGE_MSG = {
+    "risk":    "리스크 예산 없음",
+    "event":   "이벤트 갭 여유 없음",
+    "cap":     "비중 상한 도달",
+    "reserve": "투자 여유 없음",
+    "cash":    "가용 현금 없음",
+    "equal":   "균등 배분 몫 없음",
+}
+
+
+def shortage_message(binding) -> str:
+    """binding 코드 → 부족 사유 문구. 미등록 코드는 라벨 기반으로 폴백한다."""
+    key = str(binding or "").strip()
+    if key in _SHORTAGE_MSG:
+        return _SHORTAGE_MSG[key]
+    return f"{BINDING_LABELS.get(key, key or '-')} 여유 없음"
+
 # 계좌별 사이징 모드 — Account_Profile.Sizing_Mode 와 동일 코드계 (SSOT)
 SIZING_MODES = ("risk_based", "equal_weight", "off")
 SIZING_MODE_DEFAULT = "risk_based"
@@ -1436,7 +1459,7 @@ def position_size(equity, risk_pct, entry, stop,
     if slots_full:
         reasons.append(f"슬롯 만석 ({slots_used}/{max_positions}) — 최약 보유와 교체 검토")
     if dollars <= 0:
-        reasons.append(f"{BINDING_LABELS.get(binding, binding)} 여유 없음")
+        reasons.append(shortage_message(binding))
     if below_min:
         reasons.append(f"최소 거래금액 ${_min:,.0f} 미만")
 
@@ -2264,6 +2287,13 @@ POSITION_MONTH_DROP_PCT = -5.0
 MA200_GAP_BASE_SCORE = 2.0
 MA200_GAP_FULL_PCT = 8.0
 
+# 판정 라벨 — 문자열을 코드 안에 흩뿌리지 않는다. 9-b) 의 is_weak_status 가
+# **동일성 비교**로 읽으므로, 문구를 바꾸려면 반드시 여기를 고쳐야 한다.
+VERDICT_SELL = "🔴 청산 (SELL)"
+VERDICT_TRIM = "🟡 줄이기 (일부 익절)"
+VERDICT_HOLD = "✅ 보유 (HOLD)"
+VERDICT_WEAK_LABELS = (VERDICT_SELL, VERDICT_TRIM)
+
 
 def integrated_sell_verdict(*, above_ma200, one_month_return, rsi, macd_signal,
                             pct_from_52w_high, drawdown_from_high_pct,
@@ -2303,14 +2333,174 @@ def integrated_sell_verdict(*, above_ma200, one_month_return, rsi, macd_signal,
         score += 1.0
         reasons.append(f"RSI {rsi:.0f} 과열 + 신고가 부근(단기 조정 위험)")
     if score >= 4:
-        label = "🔴 청산 (SELL)"
+        label = VERDICT_SELL
     elif score >= 2:
-        label = "🟡 줄이기 (일부 익절)"
+        label = VERDICT_TRIM
     else:
-        label = "✅ 보유 (HOLD)"
+        label = VERDICT_HOLD
         if not reasons:
             reasons.append("추세 유지 · 이상 신호 없음")
     return label, " · ".join(reasons)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 9-b) 슬롯 만석 시 교체(Replacement) 판정 — SSOT
+#   슬롯 상한을 지키면서 신규 신호를 받으려면 최약 보유와 교체하는 수밖에 없다.
+#   다만 아무 조건 없이 교체하면 "신호 올 때마다 갈아타기"가 되어 상한이 의미를
+#   잃고 회전율만 오른다. 그래서 **두 조건을 모두** 요구한다.
+#     조건 A(score_ok) : 후보 강도 >= 최약 보유 강도 + REPLACE_SCORE_MARGIN
+#     조건 B(status_ok): 최약 보유가 이미 매도/경고 상태(integrated_sell_verdict)
+#   한쪽만 충족하면 교체하지 않는다. 조건 B가 참이면 교체와 무관하게 그 종목은
+#   어차피 정리 대상이므로, 실질적으로는 "정리할 것을 정리하면서 더 나은 것으로
+#   갈아탄다"만 허용하는 규칙이다.
+#
+#   강도(score)는 classify_regime 의 0~100 점수를 쓴다 — 후보와 보유를 **같은
+#   자로** 재야 비교가 성립한다. 매도 레이더의 200일선·Alpha·랭킹·낙폭 조합은
+#   사람이 눈으로 보는 휴리스틱이지 후보 강도와 같은 척도가 아니다.
+#
+#   소비처: app.py(매도 레이더 표시·정밀검사 허들 카드).
+#   향후 자동화(매수 알림 동봉)도 이 함수를 그대로 호출한다 — 규칙을 두 벌
+#   만들면 화면과 이메일이 다른 답을 내놓는다.
+# ──────────────────────────────────────────────────────────────────────────
+
+REPLACE_SCORE_MARGIN = 15.0
+
+# 구버전/외부(시트·스냅샷) 문자열용 폴백. 문구가 아니라 **선두 이모지**만 본다.
+#   ⚠️ 한글 본문("청산"/"익절")에 substring 검색을 걸지 않는다. 예전에 같은 방식의
+#      분류기가 "줄이기 (일부 청산)" 같은 변형을 전량 청산으로 오분류했는데,
+#      테스트가 그 변형을 담지 않아 전부 통과했다(뮤테이션 테스트에서 발각).
+#      신호등 색은 판정 단계와 1:1 이라 문구보다 안정적이다.
+_VERDICT_WEAK_MARKS = ("🔴", "🟡")
+_VERDICT_OK_MARKS = ("✅", "🟢")
+
+
+def is_weak_status(label) -> bool:
+    """매도 판정 라벨이 '이미 정리 대상(매도/경고)'인가.
+
+    판정 순서: 상수 동일성 → 선두 이모지 폴백 → 불명은 False.
+
+    **불명을 False 로 두는 것이 안전 방향이다.** 교체 허들은 이 값이 True 여야
+    통과하므로, 모르면 교체하지 않는다(= 회전을 늘리지 않는다). 반대로 두면
+    판정 불명인 종목이 자동으로 교체 대상이 되어 멀쩡한 보유를 팔게 된다.
+    """
+    s = str(label or "").strip()
+    if not s:
+        return False
+    if s in VERDICT_WEAK_LABELS:
+        return True
+    if s == VERDICT_HOLD:
+        return False
+    head = s[:1]
+    if head in _VERDICT_OK_MARKS:
+        return False
+    if head in _VERDICT_WEAK_MARKS:
+        return True
+    return False
+
+
+def rank_weakest(rows, *, require_full_metrics: bool = True, limit=None) -> list:
+    """보유 목록을 '약한 순'으로 정렬해 돌려준다.
+
+    rows: [{"ticker","account","score","status","full_metrics", ...}, ...]
+    반환: 같은 dict 들의 리스트(입력을 변형하지 않는다) + "weak" 키 추가.
+
+    제외 규칙 — 둘 다 "모르면 지목하지 않는다":
+      · score 가 없거나 NaN → 제외. 판단 불가를 최약으로 오인하면 멀쩡한
+        종목을 팔게 된다.
+      · require_full_metrics 이고 full_metrics=False → 제외. 봉이
+        MIN_BARS_FULL(252) 미만이면 52주 창이 짧아지고 200일선 기울기가
+        미수렴이라 다른 종목과 **같은 자가 아니다**. 상장 1년 미만 종목이
+        낮은 강도로 계산되어 자동으로 최약이 되는 것을 막는다.
+
+    정렬: 강도 오름차순, 동점 시 티커 오름차순.
+      동점 타이브레이크를 명시하는 이유는 정렬 안정성이다 — 같은 입력이면
+      항상 같은 최약이 나와야 화면과 이메일이 어긋나지 않는다.
+    """
+    out = []
+    for r in (rows or []):
+        if not isinstance(r, dict):
+            continue
+        # to_numeric 이 None·문자열·변환불가를 전부 NaN 으로 접어주므로 유한성
+        # 검사 **한 번**이면 충분하다. 예전에는 pd.notna 검사를 앞에 하나 더 뒀는데
+        # 뒤 검사가 같은 값을 다시 걸러 앞이 죽은 코드였다 — 뮤테이션 테스트에서
+        # 생존 뮤턴트(M8)로 드러났다. 가드를 둘로 나누면 한쪽은 검증되지 않는다.
+        try:
+            sc = float(pd.to_numeric(r.get("score"), errors="coerce"))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(sc):
+            continue
+        if require_full_metrics and not bool(r.get("full_metrics", False)):
+            continue
+        d = dict(r)
+        d["score"] = sc
+        d["ticker"] = str(r.get("ticker", "") or "").strip().upper()
+        d["weak"] = is_weak_status(r.get("status"))
+        out.append(d)
+    out.sort(key=lambda x: (x["score"], x["ticker"]))
+    if limit is not None:
+        try:
+            n = int(limit)
+        except (TypeError, ValueError):
+            n = None
+        if n is not None and n >= 0:
+            out = out[:n]
+    return out
+
+
+def replacement_hurdle(candidate_score, weakest_score, weakest_status,
+                       *, margin: float = REPLACE_SCORE_MARGIN) -> dict:
+    """슬롯 만석 상태에서 '최약 보유와 교체해도 되는가'.
+
+    반환 dict:
+      passed        : score_ok 와 status_ok 가 **모두** 참
+      score_ok      : 후보 강도 >= 최약 강도 + margin
+      status_ok     : 최약 보유가 매도/경고 상태
+      margin_needed : 요구 마진(= margin)
+      margin_actual : 후보 강도 - 최약 강도 (산출 불가 시 NaN)
+      reason        : 사람이 읽는 한 줄 설명
+
+    입력이 하나라도 산출 불가면 passed=False 로 돌려준다 — 모르면 교체하지 않는다.
+    """
+    out = {"passed": False, "score_ok": False, "status_ok": False,
+           "margin_needed": float(margin), "margin_actual": np.nan, "reason": ""}
+    try:
+        m = float(margin)
+    except (TypeError, ValueError):
+        m = REPLACE_SCORE_MARGIN
+    if not (np.isfinite(m) and m >= 0):
+        m = REPLACE_SCORE_MARGIN
+    out["margin_needed"] = m
+
+    cs = pd.to_numeric(candidate_score, errors="coerce")
+    ws = pd.to_numeric(weakest_score, errors="coerce")
+    if not (pd.notna(cs) and pd.notna(ws)):
+        out["reason"] = "강도를 산출할 수 없어 교체를 판정하지 않습니다."
+        return out
+    cs, ws = float(cs), float(ws)
+    if not (np.isfinite(cs) and np.isfinite(ws)):
+        out["reason"] = "강도를 산출할 수 없어 교체를 판정하지 않습니다."
+        return out
+
+    gap = cs - ws
+    out["margin_actual"] = round(gap, 1)
+    out["score_ok"] = bool(gap >= m)
+    out["status_ok"] = is_weak_status(weakest_status)
+    out["passed"] = bool(out["score_ok"] and out["status_ok"])
+
+    if out["passed"]:
+        out["reason"] = (f"후보 {cs:.0f} vs 최약 {ws:.0f} · 마진 {gap:+.0f} ≥ {m:.0f} "
+                         f"그리고 최약이 정리 대상 → 교체 성립")
+    elif not out["score_ok"] and not out["status_ok"]:
+        out["reason"] = (f"마진 {gap:+.0f} < {m:.0f} 이고 최약이 아직 보유 상태 "
+                         f"→ 교체하지 않습니다(두 조건 모두 미충족)")
+    elif not out["score_ok"]:
+        out["reason"] = (f"후보 {cs:.0f} vs 최약 {ws:.0f} · 마진 {gap:+.0f} < {m:.0f} "
+                         f"→ 명백한 업그레이드가 아닙니다")
+    else:
+        out["reason"] = (f"마진 {gap:+.0f} 는 충분하지만 최약 보유가 아직 정리 대상이 "
+                         f"아닙니다 → 교체하지 않습니다")
+    return out
 
 
 _DD_FALLBACK_WINDOW = 252     # 매수가·매수일 둘 다 없을 때 폴백 고점 룩백(약 1년)
