@@ -104,7 +104,7 @@ for n in TREE.body:
 
 if _nav is not None:
     elts = _nav.value.elts
-    check("항목 17개", len(elts) == 17, f"got {len(elts)}")
+    check("항목 15개", len(elts) == 15, f"got {len(elts)}")
     # 문자열 리터럴이 섞이면 상수 결합이 깨진 것이다 — 그 항목만 이름이 없다
     lits = [ast.get_source_segment(SRC, e) for e in elts
             if not isinstance(e, ast.Name)]
@@ -156,7 +156,7 @@ check("표시 순서 재배치 로직 제거됨",
 check("이동 통로는 라벨 기반", 'st.session_state.pop("main_nav_goto"' in CODE)
 
 _branch = re.findall(r"main_nav == (NAV_[A-Z_]+)", CODE)
-check("dispatch 분기 17개", len(_branch) == 17, f"got {len(_branch)}")
+check("dispatch 분기 15개", len(_branch) == 15, f"got {len(_branch)}")
 check("분기가 상수당 정확히 1회",
       len(set(_branch)) == len(_branch),
       f"중복 {[x for x in set(_branch) if _branch.count(x) > 1]}")
@@ -168,6 +168,15 @@ check("그룹 expander 로 그린다", "st.sidebar.expander(_gname" in CODE)
 check("탭 버튼이 콜백으로 이동", "on_click=_nav_go" in CODE)
 check("활성 탭 강조", 'type=("primary" if _t == _cur_nav else "secondary")' in CODE)
 check("관리자 항목이 그룹에 편입", "_nav_groups[-1][1].append(_NAV_ADMIN_APPROVAL)" in CODE)
+# ── 탭 내부 구획(B·C단계) — 목적 밖 내용이 판단 화면에 되돌아오면 안 된다 ──
+for _k in ("pf_radar_view", "ai_perf_view", "ai_review_view", "wl_view"):
+    check(f"구획 라디오 {_k}", f'key="{_k}"' in CODE)
+for _old in ("NAV_HITRATE", "NAV_IDEA", "NAV_WEEKLY", "NAV_EMERGING"):
+    check(f"통합 전 상수 {_old} 잔재 0", _old not in CODE)
+_i_v1 = CODE.find("_wl_view == _WL_V1")
+_i_add = CODE.find("➕ 관심 종목 추가")
+check("워치리스트 등록 폼이 판단 구획 밖", _i_v1 != -1 and _i_add > _i_v1,
+      f"판단 {_i_v1} / 등록폼 {_i_add}")
 check("관리자 분기 유지", "main_nav == _NAV_ADMIN_APPROVAL" in CODE)
 check("_render_home 호출", "_render_home()" in CODE)
 
