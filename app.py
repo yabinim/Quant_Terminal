@@ -19504,1801 +19504,1831 @@ if st.session_state.get("logged_in"):
 
         # ── 밸류에이션 정밀 분석 (DCF·목표가 분포·동종업계·매출 세그먼트) ──
         #    fmp_extras 신규 엔드포인트. 개별 주식에만 표시(ETF 제외).
-        if not is_etf_mode:
-            with st.expander("💰 밸류에이션 정밀 분석 (DCF · 목표가 · 동종업계 · 매출 구성)", expanded=False):
-                _vt = str(selected_ticker).strip().upper()
-                try:
-                    _dcf = fx.fmp_dcf(_vt)
-                    _pts = fx.fmp_price_target_summary(_vt)
-                    _vc1, _vc2 = st.columns(2)
-                    with _vc1:
-                        st.markdown("**DCF 적정주가**")
-                        if _dcf:
-                            st.metric(
-                                "DCF vs 현재가",
-                                f"${_dcf['dcf']:.2f}",
-                                delta=f"{_dcf['gap_pct']:+.1f}% (현재 ${_dcf['price']:.2f})",
-                            )
-                            st.caption(_dcf["verdict"])
-                        else:
-                            st.caption("DCF 데이터 없음 (해당 종목 미지원일 수 있음)")
-                    with _vc2:
-                        st.markdown("**애널리스트 목표가 분포**")
-                        if _pts:
-                            _avg = _pts.get("avg")
-                            st.metric("평균 목표가", f"${_avg:.2f}" if _avg else "N/A")
-                            _lo, _hi = _pts.get("low"), _pts.get("high")
-                            if _lo and _hi:
-                                st.caption(f"범위 ${_lo:.2f} ~ ${_hi:.2f}"
-                                           + (f" · 의견 {int(_pts['count'])}건" if _pts.get("count") else ""))
-                        else:
-                            st.caption("목표가 데이터 없음")
-                except Exception as _ve:
-                    st.warning(f"밸류에이션 조회 실패: {_ve}")
 
-                # 동종업계 peers
-                try:
-                    _peers = fx.fmp_stock_peers(_vt)
-                    if _peers:
-                        st.markdown("**🤝 동종업계 (Peers)**")
-                        st.caption(" · ".join(_peers))
-                except Exception:
-                    pass
-
-                # 매출 세그먼트 (제품별 / 지역별)
-                try:
-                    _prod = fx.fmp_revenue_product_segmentation(_vt)
-                    _geo = fx.fmp_revenue_geographic_segmentation(_vt)
-                    _sc1, _sc2 = st.columns(2)
-                    with _sc1:
-                        if _prod:
-                            st.markdown("**📦 제품별 매출 비중**")
-                            _pdf = pd.DataFrame(
-                                sorted(_prod.items(), key=lambda x: x[1], reverse=True)[:8],
-                                columns=["제품", "비중%"],
-                            )
-                            st.dataframe(_pdf, hide_index=True, use_container_width=True)
-                    with _sc2:
-                        if _geo:
-                            st.markdown("**🌍 지역별 매출 비중**")
-                            _gdf = pd.DataFrame(
-                                sorted(_geo.items(), key=lambda x: x[1], reverse=True)[:8],
-                                columns=["지역", "비중%"],
-                            )
-                            st.dataframe(_gdf, hide_index=True, use_container_width=True)
-                except Exception:
-                    pass
-
-        # ── 회사 기본 정보 ────────────────────────────────────────────────
-        try:
-            with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
-                with _timed("정밀 회사정보"):
-                    co = fetch_company_overview(str(selected_ticker).strip().upper())
-        except Exception as _co_err:
-            co = {}
-            st.warning(f"회사 기본정보 조회 실패: {_co_err}")
-
-        if co:
-            name_str = co.get("name", selected_ticker)
-            website = co.get("website", "")
-            is_etf_co = co.get("is_etf", False)
-            etf_badge = " 🏷️ ETF" if is_etf_co else ""
-            st.markdown(
-                f"## {name_str}{etf_badge}"
-                + (f"  [{website.replace('https://','').replace('http://','')[:35]}]({website})" if website else "")
-            )
-            info_c1, info_c2, info_c3, info_c4 = st.columns(4)
-            with info_c1:
-                sector_display = co.get("sector", "N/A")
-                sector_en = co.get("sector_en", "")
-                st.metric("섹터", sector_display)
-                if sector_en and sector_en != sector_display:
-                    st.caption(sector_en)
-            with info_c2:
-                industry_display = co.get("industry", "N/A")
-                industry_en = co.get("industry_en", "")
-                st.metric("산업", industry_display[:18] if industry_display else "N/A")
-                if industry_en and industry_en != industry_display:
-                    st.caption(industry_en[:25])
-                # 업종 모멘텀 백분위 — 신호가 아니라 **정보**다.
-                # 백테스트에서 무작위 대조군은 이겼지만(순위에 정보 있음)
-                # 워크포워드는 실패했다(거래 규칙으로는 전환 안 됨).
-                # 그래서 매매 판정에는 연결하지 않고 보여주기만 한다.
-                _ind_cap = _industry_rank_caption(industry_en, bool(is_etf_co))
-                if _ind_cap:
-                    st.caption(_ind_cap)
-            with info_c3:
-                mc = co.get("market_cap")
-                st.metric("시가총액", usd_short_str(mc) if mc else "N/A")
-            with info_c4:
-                ne = co.get("next_earnings")
-                if ne:
-                    try:
-                        days_to_earn = (datetime.strptime(ne[:10], "%Y-%m-%d") - datetime.now(_MARKET_ET_TZ).replace(tzinfo=None)).days
-                        earn_label = f"D-{days_to_earn}일" if days_to_earn >= 0 else f"{abs(days_to_earn)}일 전"
-                        st.metric("다음 실적 발표", ne[:10], delta=earn_label)
-                        st.caption("※ FMP 제공 예정일. 미확인 상태일 수 있습니다.")
-                    except Exception:
-                        st.metric("다음 실적 발표", ne[:10])
-                else:
-                    st.metric("다음 실적 발표", "N/A")
-
-            # ── 회사 소개: 항상 한글로 표시 (자동 번역) ─────────────────
-            summary_en = co.get("summary_en", "")
-            if summary_en:
-                _sum_key = f"_co_summary_kr_{selected_ticker}"
-                with st.expander("📋 회사 소개", expanded=True):
-                    if st.session_state.get(_sum_key):
-                        st.markdown(st.session_state[_sum_key])
-                        if st.button("🔄 다시 번역", key=f"retranslate_{selected_ticker}"):
-                            del st.session_state[_sum_key]
-                            st.rerun()
-                    else:
-                        # 한글 번역본 없으면 자동 번역 실행
-                        with st.spinner("회사 소개 번역 중..."):
-                            try:
-                                _words_list = summary_en.split()
-                                _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
-                                _tr_model = _GenAIModel(
-                                    "gemini-2.5-flash",
-                                    generation_config={"temperature": 0.0, "max_output_tokens": 8192, "thinking_budget": 0}
-                                )
-                                _tr_resp = _tr_model.generate_content(
-                                    "다음 영문 회사 소개를 한국어로 번역하세요. "
-                                    "모든 문장을 빠짐없이 번역하고, 번역문만 출력하세요.\n\n" + _capped
-                                )
-                                _tr_text = (_gemini_response_text_utf8_safe(_tr_resp) or "").strip()
-                                if _tr_text:
-                                    st.session_state[_sum_key] = _tr_text
-                                    st.markdown(_tr_text)
-                                else:
-                                    st.markdown(summary_en)
-                            except Exception:
-                                st.markdown(summary_en)
-
-        # ── 이 종목을 보유한 ETF 목록 (기본 접힘) ────────────────────────
-        if not is_etf_mode:
-            with st.expander("📊 이 종목을 보유한 ETF 목록", expanded=False):
-                st.caption("현재 FMP 요금제에서 ETF 보유종목 조회가 지원되지 않습니다.")
-                _etf_list_key = f"_etf_holding_{selected_ticker}"
-                if st.session_state.get(_etf_list_key) is None:
-                    try:
-                        _etf_list = find_etfs_holding_stock(selected_ticker)
-                        st.session_state[_etf_list_key] = _etf_list
-                    except Exception as _etf_err:
-                        st.session_state[_etf_list_key] = []
-                        st.warning(f"ETF 보유 목록 조회 실패: {_etf_err}")
-                _etf_result = st.session_state.get(_etf_list_key, [])
-                if _etf_result:
-                    st.success(f"**{selected_ticker}** 를 보유한 ETF **{len(_etf_result)}개** 발견!")
-                    _etf_rows = []
-                    for e in _etf_result:
-                        _etf_rows.append({
-                            "ETF": e["etf"],
-                            "보유 비중": f"{e['weight']:.2f}%" if e.get("weight") else "N/A",
-                            "보유 순위": f"Top {e['rank']}" if e.get("rank") else "N/A",
-                        })
-                    st.dataframe(pd.DataFrame(_etf_rows), use_container_width=True, hide_index=True)
-                else:
-                    # "찾지 못했다"고 쓰면 조회했는데 보유 ETF 가 없다는 뜻이 된다.
-                    # 실제로는 조회 자체가 불가하다 — 거짓 음성을 만들지 않는다.
-                    st.info(
-                        "ETF 보유종목 데이터는 현재 요금제에서 제공되지 않습니다. "
-                        f"{selected_ticker}를 보유한 ETF가 없다는 뜻이 아닙니다."
-                    )
-                if st.button("🔄 다시 조회", key=f"re_find_etf_{selected_ticker}"):
-                    st.session_state.pop(_etf_list_key, None)
-                    find_etfs_holding_stock.clear()
-                    st.rerun()
-
-        st.divider()
-
-        # ── 기간별 주가 차트 ──────────────────────────────────────────────
-        st.markdown("### 📈 주가 차트")
-        period_options = ["1D", "1M", "3M", "YTD", "1Y", "5Y", "MAX"]
-        selected_period = st.radio(
-            "기간 선택",
-            period_options,
-            index=4,  # 기본값 1Y
+        # ═══════════════════════════════════════════════════════════════════
+        # 구획 — 종목 하나를 두고 묻는 질문이 다섯 가지다.
+        #   개요(뭐 하는 회사인가) · 기술적(지금 들어갈 타이밍인가) ·
+        #   펀더멘털(회사가 건강한가) · 수급(누가 사고 파는가) · AI 종합.
+        #   전에는 다섯을 한 번에 다 계산했다. 라디오로 선택분만 돌린다.
+        #   (st.tabs 는 미선택 본문도 매 rerun 실행하므로 쓰지 않는다)
+        # ═══════════════════════════════════════════════════════════════════
+        _SI_V1, _SI_V2, _SI_V3, _SI_V4, _SI_V5 = (
+            "🔍 개요", "📊 기술적", "📋 펀더멘털", "🏦 수급·기관", "🤖 AI 진단")
+        _si_view = st.radio(
+            "구획",
+            [_SI_V1, _SI_V2, _SI_V3, _SI_V4, _SI_V5],
             horizontal=True,
-            key="stock_chart_period",
+            key="stock_inspect_view",
             label_visibility="collapsed",
         )
-        with st.spinner(f"{selected_ticker} {selected_period} 차트 로딩 중..."):
-            with _timed("정밀 차트 일봉"):
-                period_hist = fetch_price_history_by_period(str(selected_ticker).strip().upper(), selected_period)
 
-        if period_hist is not None and not period_hist.empty and "Close" in period_hist.columns:
-            close_p = pd.to_numeric(period_hist["Close"], errors="coerce").dropna()
-            if not close_p.empty:
-                first_p = float(close_p.iloc[0])
-                last_p = float(close_p.iloc[-1])
-                change_pct = (last_p / first_p - 1) * 100 if first_p > 0 else 0
-                chg_col1, chg_col2, chg_col3 = st.columns(3)
-                with chg_col1:
-                    st.metric("현재가", f"${last_p:.2f}")
-                with chg_col2:
-                    st.metric(f"{selected_period} 수익률", f"{change_pct:+.2f}%")
-                with chg_col3:
-                    high_p = float(close_p.max())
-                    low_p = float(close_p.min())
-                    st.metric("기간 고점/저점", f"${high_p:.2f} / ${low_p:.2f}")
-
-                chart_pdf = pd.DataFrame({"Close": close_p})
-                st.line_chart(chart_pdf, use_container_width=True, height=260)
-        else:
-            st.warning("차트 데이터를 가져오지 못했습니다.")
-
-        st.divider()
-        st.markdown("### 체력 검사 (Fundamentals)")
-        st.caption("FMP 기반 KPI 점검 (Pass/Fail)")
-    
-        try:
-            if is_etf_mode:
-                st.info("📊 ETF 분석 모드입니다. 개별 기업의 재무제표 대신 펀드 건전성 지표를 제공합니다.")
-    
-                total_assets = to_float(selected_ticker_info.get("totalAssets"))
-                expense_ratio_raw = to_float(selected_ticker_info.get("expenseRatio"))
-                etf_yield_raw = to_float(selected_ticker_info.get("yield"))
-    
-                expense_ratio_pct = expense_ratio_raw * 100 if not pd.isna(expense_ratio_raw) else np.nan
-                etf_yield_pct = etf_yield_raw * 100 if not pd.isna(etf_yield_raw) else np.nan
-    
-                asset_col, fee_col, yield_col = st.columns(3)
-                with asset_col:
-                    st.metric("순자산 규모 (AUM)", usd_short_str(total_assets))
-                with fee_col:
-                    fee_delta = "✅ Pass (<0.5%)" if (pd.notna(expense_ratio_pct) and expense_ratio_pct < 0.5) else "🟡 Warning (>=0.5%)"
-                    if pd.isna(expense_ratio_pct):
-                        fee_delta = "N/A"
-                    st.metric("운용 보수", pct_points_str(expense_ratio_pct), delta=fee_delta)
-                with yield_col:
-                    st.metric("배당 수익률", pct_points_str(etf_yield_pct))
-    
-                st.success("✅ [ETF 패스] 분산 투자된 펀드이므로 개별 재무 건전성 킬 스위치를 면제합니다.")
-    
-                with st.spinner(f"{selected_ticker} 보유 종목(Top Holdings) 불러오는 중..."):
-                    with _timed("정밀 보유ETF검색"):
-                        holdings_universe = cached_etf_holdings_universe_str(selected_ticker)
-                    if holdings_universe is None or holdings_universe.empty:
-                        holdings_top10 = pd.DataFrame(columns=["Ticker", "Weight(%)"])
-                        etf_perf_df = pd.DataFrame()
-                    else:
-                        holdings_top10 = holdings_universe.head(10).reset_index(drop=True)
-                        perf_key = _etf_holdings_perf_cache_key(holdings_top10)
-                        with _timed("정밀 ETF성과쌍"):
-                            etf_perf_df = cached_build_etf_holdings_performance_pairs(perf_key)
-    
-                if holdings_universe is None or holdings_universe.empty:
-                    st.info("해당 ETF의 세부 종목 데이터를 야후 파이낸스에서 불러올 수 없습니다.")
-                elif etf_perf_df.empty:
-                    st.markdown("### 보유 종목 TOP 10 (Top Holdings)")
-                    st.dataframe(holdings_top10, use_container_width=True, hide_index=True)
-                    st.warning("보유 종목 가격·수익률 데이터를 불러오지 못했습니다. 위 표는 티커·비중만 표시합니다.")
-                else:
-                    order = holdings_top10["Ticker"].tolist()
-                    etf_perf_df = etf_perf_df.set_index("Ticker").reindex(order).reset_index()
-    
-                    return_cols = ["1개월(%)", "3개월(%)", "6개월(%)", "12개월(%)"]
-                    styled_top10 = (
-                        etf_perf_df.style.format(
-                            {
-                                "현재가": "${:,.2f}",
-                                "1개월(%)": "{:.2f}%",
-                                "3개월(%)": "{:.2f}%",
-                                "6개월(%)": "{:.2f}%",
-                                "12개월(%)": "{:.2f}%",
-                                "비중(%)": "{:.2f}%",
-                            },
-                            na_rep="N/A",
-                        )
-                        .background_gradient(cmap="RdYlGn", subset=return_cols, axis=0)
-                    )
-    
-                    st.divider()
-                    st.markdown("### 보유 종목 TOP 10 (Top Holdings)")
-                    st.dataframe(styled_top10, use_container_width=True, hide_index=True)
-            else:
-                with st.spinner(f"{selected_ticker} 데이터 불러오는 중..."):
-                    with _timed("정밀 KPI 스냅샷"):
-                        kpi_df, _c_pass, _c_fail, _c_nodata, margin_context = cached_evaluate_kpis_snapshot(
-                            selected_ticker
-                        )
-                # 캐시된 카운트 무시 — kpi_df에서 직접 계산 (캐시 형식 불일치 방지)
-                _pp = kpi_df["Pass"].astype(str)
-                pass_count   = int((_pp.str.contains("Pass",  case=False) & ~_pp.str.contains("Fail", case=False)).sum())
-                fail_count   = int(_pp.str.contains("Fail",   case=False).sum())
-                nodata_count = int((_pp.str.contains("N/A|No Data", case=False) & ~_pp.str.contains("Fail|Pass", case=False)).sum())
-
-                c1, c2, c3, c4 = st.columns(4)
-                total_kpis = len(kpi_df)
-                c1.metric("총 KPI", total_kpis)
-                c2.metric("Pass", pass_count)
-                c3.metric("Fail", fail_count)
-                c4.metric("No Data", nodata_count)
-    
-                with st.container():
-                    final_core_pass = bool(margin_context.get("core_fcf_pass"))
-                    if final_core_pass:
-                        st.success("✅ [최종 합격] 필수 재무 건전성(현금창출력)이 검증된 종목입니다.")
-                    else:
-                        st.error("🚨 [최종 불합격] 잉여현금흐름 적자 기업. 투자를 권장하지 않습니다.")
-    
-                st.divider()
-                st.subheader(f"{selected_ticker} KPI 대시보드")
-
-                # ── 투자 스타일 점수 (KPI 위) ─────────────────────────────
-                st.markdown("#### 🎯 투자 스타일 적합도")
-                st.caption("CAN SLIM · 가치투자 · 장기 우량주 3가지 관점에서 이 종목을 평가합니다.")
-                with st.spinner("투자 스타일 점수 계산 중..."):
+        # ── ① 🔍 개요 — 회사 프로필 · 밸류에이션 · 주가 차트 ──────────────
+        if _si_view == _SI_V1:
+            if not is_etf_mode:
+                with st.expander("💰 밸류에이션 정밀 분석 (DCF · 목표가 · 동종업계 · 매출 구성)", expanded=False):
+                    _vt = str(selected_ticker).strip().upper()
                     try:
-                        _style = calculate_style_scores(
-                            str(selected_ticker).strip().upper(),
-                            margin_context,
-                            kpi_df,
-                        )
-                        _sc1, _sc2, _sc3 = st.columns(3)
-                        for _col, _key, _label, _desc in [
-                            (_sc1, "canslim",  "📈 CAN SLIM",    "고성장 모멘텀"),
-                            (_sc2, "value",    "💰 가치투자",    "저평가 발굴"),
-                            (_sc3, "quality",  "🏆 장기 우량주", "퀄리티 투자"),
-                        ]:
-                            _d = _style[_key]
-                            with _col:
-                                st.markdown(
-                                    f"<div style='background:#1e293b;border-radius:12px;padding:16px;"
-                                    f"border-top:4px solid {_d['color']};text-align:center;'>"
-                                    f"<div style='font-size:14px;color:#94a3b8;'>{_label}</div>"
-                                    f"<div style='font-size:36px;font-weight:800;color:{_d['color']};'>{_d['score']}</div>"
-                                    f"<div style='font-size:13px;color:#cbd5e1;'>/ 100점</div>"
-                                    f"<div style='font-size:15px;margin-top:4px;'>{_d['grade']}</div>"
-                                    f"<div style='font-size:11px;color:#64748b;margin-top:2px;'>{_desc}</div>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-
-                        # 주도 스타일 배너
-                        _dom = _style["dominant"]
-                        _dom_score = _style["scores"][_dom]
-                        st.markdown(
-                            f"<div style='background:#0f172a;border:1px solid #334155;"
-                            f"border-radius:8px;padding:10px 16px;margin-top:12px;'>"
-                            f"<span style='color:#94a3b8;'>💡 이 종목의 주도 스타일: </span>"
-                            f"<strong style='color:#f1f5f9;font-size:16px;'>{_dom}</strong>"
-                            f"<span style='color:#64748b;font-size:13px;'> ({_dom_score}점)</span>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                        # 세부 점수 expander
-                        with st.expander("📊 세부 점수 보기", expanded=False):
-                            _det_c1, _det_c2, _det_c3 = st.columns(3)
-                            for _dc, _key, _label in [
-                                (_det_c1, "canslim",  "📈 CAN SLIM"),
-                                (_det_c2, "value",    "💰 가치투자"),
-                                (_det_c3, "quality",  "🏆 장기 우량주"),
-                            ]:
-                                with _dc:
-                                    st.markdown(f"**{_label}**")
-                                    for _k, _v in _style[_key]["detail"].items():
-                                        _kname = _k.replace("_", " ")
-                                        st.caption(f"{_kname}: {_v}")
-
-                    except Exception as _se:
-                        st.warning(f"스타일 점수 계산 오류: {_se}")
-
-                st.divider()
-    
-                category_order = [
-                    "수익성 (Profitability)",
-                    "건전성 (Financial Strength)",
-                    "밸류에이션 (Valuation)",
-                    "모멘텀 (Momentum)",
-                ]
-    
-                for category in category_order:
-                    st.markdown(f"### {category}")
-                    cat_df = kpi_df[kpi_df["Category"] == category].reset_index(drop=True)
-
-                    if category == "모멘텀 (Momentum)":
-                        # 모멘텀은 값이 길어서 카드 형태로 별도 표시
-                        for _, row in cat_df.iterrows():
-                            _pass_str = str(row["Pass"])
-                            _is_pass = "Pass" in _pass_str and "Fail" not in _pass_str
-                            _is_fail = "Fail" in _pass_str
-                            _is_nodata = "No Data" in _pass_str
-                            _card_color = "#16a34a" if _is_pass else ("#dc2626" if _is_fail else "#94a3b8")
-                            _pass_label = "✅ Pass" if _is_pass else ("❌ Fail" if _is_fail else "⚫ 데이터 없음")
-                            _val = str(row["Value"])
-                            _parts = [p.strip() for p in _val.split("/") if p.strip()]
-                            _html = (
-                                f"<div style='background:#1e293b;border-radius:10px;padding:14px 16px;"
-                                f"border-left:4px solid {_card_color};margin:6px 0;'>"
-                                f"<div style='color:{_card_color};font-weight:700;font-size:15px;margin-bottom:8px;'>"
-                                f"{_pass_label} — {row['Rule']}</div>"
-                            )
-                            for _p in _parts:
-                                _html += f"<div style='font-size:14px;color:#e2e8f0;margin:2px 0;'>• {_p}</div>"
-                            _html += "</div>"
-                            st.markdown(_html, unsafe_allow_html=True)
-                    else:
-                        for idx in range(0, len(cat_df), 2):
-                            cols = st.columns(2)
-                            for j in range(2):
-                                row_idx = idx + j
-                                if row_idx >= len(cat_df):
-                                    continue
-                                row = cat_df.iloc[row_idx]
-                                with cols[j]:
-                                    st.metric(label=row["KPI"], value=row["Value"], delta=row["Rule"])
-                                    st.markdown(f"판정: {row['Pass']}")
-
-                    if category == "밸류에이션 (Valuation)":
-                        _fpe  = margin_context.get("forward_pe")
-                        _tpe  = margin_context.get("trailing_pe")
-                        _pb   = margin_context.get("price_to_book")
-                        _ev   = margin_context.get("ev_to_ebitda")
-                        _evs  = margin_context.get("ev_to_sales")
-                        _evf  = margin_context.get("ev_to_fcf")
-                        _iv   = margin_context.get("intrinsic_value")
-                        _mos  = margin_context.get("margin_of_safety")
-                        _cp   = margin_context.get("current_price")
-
-                        # Valuation 지표는 위 카드에서 이미 표시됨 — 중복 제거
-
-                        # Graham 적정주가 — 가치주 조건 만족 시에만 표시
-                        # 조건: EPS > 0, 성장률 0~20%, P/E < 25 (성장주·적자기업 제외)
-                        _eps_val    = margin_context.get("trailing_eps")
-                        _growth_val = margin_context.get("growth_percent")
-                        _pe_val     = _tpe if pd.notna(_tpe) else _fpe
-
-                        _is_value_stock = (
-                            pd.notna(_eps_val) and _eps_val > 0
-                            and pd.notna(_growth_val) and 0 < _growth_val < 20
-                            and (pd.isna(_pe_val) or _pe_val < 25)
-                        )
-
-                        if _is_value_stock and pd.notna(_iv) and pd.notna(_mos):
-                            st.divider()
-                            st.caption(
-                                "📌 **Graham 안전마진** — 저PER·저성장 가치주 전용 지표입니다. "
-                                "성장주(P/E ≥ 25 또는 성장률 ≥ 20%)에는 표시되지 않습니다."
-                            )
-                            intrinsic_col, mos_col = st.columns(2)
-                            with intrinsic_col:
+                        _dcf = fx.fmp_dcf(_vt)
+                        _pts = fx.fmp_price_target_summary(_vt)
+                        _vc1, _vc2 = st.columns(2)
+                        with _vc1:
+                            st.markdown("**DCF 적정주가**")
+                            if _dcf:
                                 st.metric(
-                                    "적정 주가 (Graham)",
-                                    f"${num_str(_iv)}",
-                                    delta=(
-                                        f"EPS {num_str(_eps_val)} / "
-                                        f"성장률 {pct_points_str(_growth_val)}"
-                                    ),
+                                    "DCF vs 현재가",
+                                    f"${_dcf['dcf']:.2f}",
+                                    delta=f"{_dcf['gap_pct']:+.1f}% (현재 ${_dcf['price']:.2f})",
                                 )
-                            with mos_col:
-                                _mos_color = "normal" if _mos >= 20 else "inverse"
-                                st.metric(
-                                    "안전마진 (Margin of Safety %)",
-                                    pct_points_str(_mos),
-                                    delta=f"현재가 ${num_str(_cp)}",
-                                    delta_color=_mos_color,
-                                )
-                            if _mos < 0:
-                                st.warning("⚠️ 현재가가 Graham 적정가보다 높습니다. 고평가 구간일 수 있습니다.")
-                            elif _mos >= 20:
-                                st.success(f"✅ 안전마진 {_mos:.1f}% — Graham 기준 매력적인 가격대입니다.")
-
-                    st.divider()
-
-    
-                # ── Altman Z-Score + Piotroski F-Score ──────────────────────
-                with st.expander("🏦 재무 건전성 점수 (Altman Z / Piotroski F)", expanded=True):
-                    st.caption("FMP `/financial-scores` 기반. Altman Z는 파산 위험, Piotroski F는 재무 종합 점수(0~9).")
-                    with st.spinner(f"{selected_ticker} 재무 건전성 점수 조회 중..."):
-                        with _timed("정밀 재무건전성"):
-                            _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
-                    if _fs:
-                        _az = to_float(_fs.get("altmanZScore"))
-                        _ps = to_float(_fs.get("piotroskiScore"))
-                        _az_col, _ps_col = st.columns(2)
-                        with _az_col:
-                            if pd.notna(_az):
-                                if _az >= 3.0:
-                                    _az_label = "✅ 안전 구간 (≥3.0)"
-                                    _az_color = "#16a34a"
-                                elif _az >= 1.81:
-                                    _az_label = "⚠️ 회색 구간 (1.81~3.0)"
-                                    _az_color = "#d97706"
-                                else:
-                                    _az_label = "🚨 위험 구간 (<1.81)"
-                                    _az_color = "#dc2626"
-                                st.markdown(
-                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
-                                    f"border-left:4px solid {_az_color};'>"
-                                    f"<div style='color:#94a3b8;font-size:12px;'>Altman Z-Score</div>"
-                                    f"<div style='color:{_az_color};font-size:26px;font-weight:900;'>{_az:.2f}</div>"
-                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_az_label}</div>"
-                                    f"<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
-                                    f"≥3.0 안전 · 1.81~3.0 주의 · &lt;1.81 파산위험</div>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
+                                st.caption(_dcf["verdict"])
                             else:
-                                st.metric("Altman Z-Score", "N/A")
-                        with _ps_col:
-                            if pd.notna(_ps):
-                                _ps_int = int(_ps)
-                                if _ps_int >= 7:
-                                    _ps_label = "✅ 강한 재무 (7~9)"
-                                    _ps_color = "#16a34a"
-                                elif _ps_int >= 4:
-                                    _ps_label = "🟡 중립 (4~6)"
-                                    _ps_color = "#d97706"
-                                else:
-                                    _ps_label = "🚨 약한 재무 (0~3)"
-                                    _ps_color = "#dc2626"
-                                _ps_bar = "█" * _ps_int + "░" * (9 - _ps_int)
-                                st.markdown(
-                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
-                                    f"border-left:4px solid {_ps_color};'>"
-                                    f"<div style='color:#94a3b8;font-size:12px;'>Piotroski F-Score</div>"
-                                    f"<div style='color:{_ps_color};font-size:26px;font-weight:900;'>{_ps_int} / 9</div>"
-                                    f"<div style='color:{_ps_color};font-size:14px;font-family:monospace;'>{_ps_bar}</div>"
-                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_ps_label}</div>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
+                                st.caption("DCF 데이터 없음 (해당 종목 미지원일 수 있음)")
+                        with _vc2:
+                            st.markdown("**애널리스트 목표가 분포**")
+                            if _pts:
+                                _avg = _pts.get("avg")
+                                st.metric("평균 목표가", f"${_avg:.2f}" if _avg else "N/A")
+                                _lo, _hi = _pts.get("low"), _pts.get("high")
+                                if _lo and _hi:
+                                    st.caption(f"범위 ${_lo:.2f} ~ ${_hi:.2f}"
+                                               + (f" · 의견 {int(_pts['count'])}건" if _pts.get("count") else ""))
                             else:
-                                st.metric("Piotroski F-Score", "N/A")
-                    else:
-                        st.caption("재무 건전성 데이터를 조회할 수 없습니다.")
+                                st.caption("목표가 데이터 없음")
+                    except Exception as _ve:
+                        st.warning(f"밸류에이션 조회 실패: {_ve}")
 
-                with st.expander("원본 KPI 테이블 보기"):
-                    st.dataframe(
-                        kpi_df[["Category", "KPI", "Value", "Rule", "Pass"]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-    
-        except Exception as e:
-            st.error("펀더멘털(체력 검사) 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
-            st.exception(e)
+                    # 동종업계 peers
+                    try:
+                        _peers = fx.fmp_stock_peers(_vt)
+                        if _peers:
+                            st.markdown("**🤝 동종업계 (Peers)**")
+                            st.caption(" · ".join(_peers))
+                    except Exception:
+                        pass
 
-        # ── 어닝콜 트랜스크립트 AI 요약 ───────────────────────────────────
-        st.divider()
-        st.markdown("### 📞 어닝콜 트랜스크립트 AI 요약")
-        st.caption("직전 분기 실적발표 원문 → Gemini 3줄 요약 (가이던스·경영진 톤·주요 리스크)")
-        _tc_key = f"_transcript_summary_{selected_ticker}"
-        _tc_raw_key = f"_transcript_raw_{selected_ticker}"
-        _tc_col1, _tc_col2 = st.columns([1, 1])
-        with _tc_col1:
-            if st.button("🤖 트랜스크립트 AI 요약 실행", key=f"tc_btn_{selected_ticker}", use_container_width=True):
-                with st.spinner("어닝콜 원문 조회 중..."):
-                    with _timed("정밀 어닝콜원문"):
-                        _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
-                st.session_state[_tc_raw_key] = _tc_data
-                if _tc_data and _tc_data.get("content"):
-                    _tc_text = str(_tc_data["content"])[:6000]
-                    _tc_q = _tc_data.get("quarter", "")
-                    _tc_y = _tc_data.get("year", "")
-                    _tc_prompt = (
-                        f"{selected_ticker} {_tc_y}년 Q{_tc_q} 어닝콜 트랜스크립트를 분석하세요.\n\n"
-                        "다음 3가지를 각각 2~3문장으로 요약하세요:\n"
-                        "1) 📈 가이던스 (상향/하향/유지 여부, 구체 수치)\n"
-                        "2) 🎙️ 경영진 톤 (자신감/우려/방어적 등 분위기)\n"
-                        "3) ⚠️ 주요 리스크 (경영진이 언급한 위험 요인)\n\n"
-                        "한국어로 답변하세요.\n\n"
-                        f"[트랜스크립트 원문]\n{_tc_text}"
-                    )
-                    with st.spinner("Gemini 요약 중..."):
-                        try:
-                            _tc_model = _GenAIModel(
-                                "gemini-2.5-flash",
-                                generation_config={"temperature": 0.1, "max_output_tokens": 4096, "thinking_budget": 0},
-                            )
-                            _tc_resp = _tc_model.generate_content(_tc_prompt)
-                            _tc_summary = (_gemini_response_text_utf8_safe(_tc_resp) or "").strip()
-                            st.session_state[_tc_key] = {
-                                "summary": _tc_summary,
-                                "quarter": _tc_q,
-                                "year": _tc_y,
-                            }
-                        except Exception as _tc_err:
-                            st.error(f"Gemini 요약 실패: {_tc_err}")
-                else:
-                    st.warning("어닝콜 트랜스크립트 데이터를 찾을 수 없습니다.")
-        with _tc_col2:
-            if st.session_state.get(_tc_key):
-                _tc_sum = st.session_state[_tc_key]
-                st.caption(f"📅 {_tc_sum.get('year')}년 Q{_tc_sum.get('quarter')} 어닝콜")
-        if st.session_state.get(_tc_key) and st.session_state[_tc_key].get("summary"):
-            st.markdown(st.session_state[_tc_key]["summary"])
-            _tc_raw = st.session_state.get(_tc_raw_key, {})
-            if _tc_raw and _tc_raw.get("content"):
-                with st.expander("📄 원문 보기 (영문)", expanded=False):
-                    st.text(str(_tc_raw["content"])[:3000] + ("..." if len(str(_tc_raw.get("content",""))) > 3000 else ""))
+                    # 매출 세그먼트 (제품별 / 지역별)
+                    try:
+                        _prod = fx.fmp_revenue_product_segmentation(_vt)
+                        _geo = fx.fmp_revenue_geographic_segmentation(_vt)
+                        _sc1, _sc2 = st.columns(2)
+                        with _sc1:
+                            if _prod:
+                                st.markdown("**📦 제품별 매출 비중**")
+                                _pdf = pd.DataFrame(
+                                    sorted(_prod.items(), key=lambda x: x[1], reverse=True)[:8],
+                                    columns=["제품", "비중%"],
+                                )
+                                st.dataframe(_pdf, hide_index=True, use_container_width=True)
+                        with _sc2:
+                            if _geo:
+                                st.markdown("**🌍 지역별 매출 비중**")
+                                _gdf = pd.DataFrame(
+                                    sorted(_geo.items(), key=lambda x: x[1], reverse=True)[:8],
+                                    columns=["지역", "비중%"],
+                                )
+                                st.dataframe(_gdf, hide_index=True, use_container_width=True)
+                    except Exception:
+                        pass
 
-        st.divider()
-        st.markdown("### 📊 기술적 분석 (Technical Analysis)")
-        st.caption("RSI · MACD · 볼린저밴드 · 거래량으로 진입 구간 점검")
-        # 기술적 분석 sync는 탭 상단 버튼과 통합됨
+            # ── 회사 기본 정보 ────────────────────────────────────────────────
+            try:
+                with st.spinner(f"{selected_ticker} 기본 정보 불러오는 중..."):
+                    with _timed("정밀 회사정보"):
+                        co = fetch_company_overview(str(selected_ticker).strip().upper())
+            except Exception as _co_err:
+                co = {}
+                st.warning(f"회사 기본정보 조회 실패: {_co_err}")
 
-        try:
-            with st.spinner(f"{selected_ticker} 타이밍 데이터를 불러오는 중..."):
-                with _timed("정밀 타이밍일봉"):
-                    timing_history = cached_timing_price_history(str(selected_ticker).strip())
-
-            if timing_history is None or timing_history.empty or "Close" not in timing_history.columns:
-                st.warning("가격 데이터를 불러오지 못했습니다. 티커를 확인해주세요.")
-            else:
-                close = pd.to_numeric(timing_history["Close"], errors="coerce")
-                volume = pd.to_numeric(timing_history.get("Volume", pd.Series(dtype=float)), errors="coerce")
-                current_price = float(close.dropna().iloc[-1]) if not close.dropna().empty else np.nan
-                high_52w = float(close.dropna().max())
-                low_52w = float(close.dropna().min())
-
-                ma20 = close.rolling(window=20, min_periods=20).mean()
-                ma50 = close.rolling(window=50, min_periods=50).mean()
-                ma200 = close.rolling(window=200, min_periods=200).mean()
-                rsi_series = calculate_rsi(close, window=14)
-                current_rsi = float(rsi_series.dropna().iloc[-1]) if not rsi_series.dropna().empty else np.nan
-                current_ma20 = float(ma20.dropna().iloc[-1]) if not ma20.dropna().empty else np.nan
-                current_ma50 = float(ma50.dropna().iloc[-1]) if not ma50.dropna().empty else np.nan
-                current_ma200 = float(ma200.dropna().iloc[-1]) if not ma200.dropna().empty else np.nan
-
-                # MACD
-                macd_line, signal_line, histogram = calculate_macd(close.dropna())
-                current_macd = float(macd_line.iloc[-1]) if not macd_line.empty else np.nan
-                current_signal = float(signal_line.iloc[-1]) if not signal_line.empty else np.nan
-                current_hist = float(histogram.iloc[-1]) if not histogram.empty else np.nan
-                macd_bullish = pd.notna(current_hist) and current_hist > 0
-
-                # 볼린저밴드
-                bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(close)
-                current_bb_upper = float(bb_upper.dropna().iloc[-1]) if not bb_upper.dropna().empty else np.nan
-                current_bb_lower = float(bb_lower.dropna().iloc[-1]) if not bb_lower.dropna().empty else np.nan
-
-                # 52주 위치
-                pct_from_high = ((current_price / high_52w) - 1) * 100 if pd.notna(current_price) and high_52w > 0 else np.nan
-                pct_from_low = ((current_price / low_52w) - 1) * 100 if pd.notna(current_price) and low_52w > 0 else np.nan
-
-                # 거래량 급증
-                vol_surge = np.nan
-                if not volume.dropna().empty and len(volume.dropna()) >= 21:
-                    recent_vol = float(volume.dropna().tail(5).mean())
-                    baseline_vol = float(volume.dropna().tail(21).mean())
-                    vol_surge = recent_vol / baseline_vol if baseline_vol > 0 else np.nan
-
-                # 눌림목 포착
-                is_buy_on_dip = (
-                    pd.notna(current_price) and pd.notna(current_ma200)
-                    and current_price > current_ma200
-                    and pd.notna(current_rsi) and current_rsi < 50
-                    and (
-                        (pd.notna(current_ma20) and current_price <= current_ma20 * 1.02)
-                        or (pd.notna(current_ma50) and current_price <= current_ma50 * 1.02)
-                    )
+            if co:
+                name_str = co.get("name", selected_ticker)
+                website = co.get("website", "")
+                is_etf_co = co.get("is_etf", False)
+                etf_badge = " 🏷️ ETF" if is_etf_co else ""
+                st.markdown(
+                    f"## {name_str}{etf_badge}"
+                    + (f"  [{website.replace('https://','').replace('http://','')[:35]}]({website})" if website else "")
                 )
-
-                # ── 지표 요약 메트릭 ──────────────────────────────────────
-                m1, m2, m3, m4, m5 = st.columns(5)
-                with m1:
-                    rsi_delta = "과매수🚨" if pd.notna(current_rsi) and current_rsi >= 70 else ("조정구간✅" if pd.notna(current_rsi) and current_rsi < 50 else "중립🟡")
-                    st.metric("RSI (14)", f"{current_rsi:.1f}" if pd.notna(current_rsi) else "N/A", delta=rsi_delta)
-                with m2:
-                    macd_delta = "상승전환🟢" if macd_bullish else "하락전환🔴"
-                    st.metric("MACD 히스토그램", f"{current_hist:+.3f}" if pd.notna(current_hist) else "N/A", delta=macd_delta)
-                with m3:
-                    ma200_delta = "200일선 위✅" if pd.notna(current_price) and pd.notna(current_ma200) and current_price > current_ma200 else "200일선 아래❌"
-                    st.metric("200일선", f"${current_ma200:.2f}" if pd.notna(current_ma200) else "N/A", delta=ma200_delta)
-                with m4:
-                    st.metric("52주 고점 대비", f"{pct_from_high:+.1f}%" if pd.notna(pct_from_high) else "N/A",
-                              delta="신고가 근접🔥" if pd.notna(pct_from_high) and pct_from_high >= -5 else "조정구간" if pd.notna(pct_from_high) and pct_from_high <= -20 else "")
-                with m5:
-                    vol_str = f"{vol_surge:.1f}x" if pd.notna(vol_surge) else "N/A"
-                    vol_delta = "거래량 급증🔥" if pd.notna(vol_surge) and vol_surge >= 1.5 else ("평균 이하" if pd.notna(vol_surge) and vol_surge < 0.8 else "")
-                    st.metric("거래량 (5일/21일)", vol_str, delta=vol_delta)
-
-                # ── 레짐(국면) 기반 매수 타이밍 판정 — regime_core 엔진 (SSOT) ──
-                #    고정 30/70 대신 종목의 추세 강도(대장주/횡보/약세)에 맞춰
-                #    Cardwell RSI 밴드(강세 40·80 / 횡보 40·70 / 약세 20·60)를 적용.
-                try:
-                    with _timed("정밀 SPY일봉"):
-                        _spy_hist = cached_timing_price_history("SPY")
-                    _spy_close = (
-                        _spy_hist["Close"]
-                        if (_spy_hist is not None and not _spy_hist.empty and "Close" in _spy_hist.columns)
-                        else None
-                    )
-                except Exception:
-                    _spy_close = None
-                _regime_res = rc.classify_regime(timing_history, spy_close=_spy_close)
-                _timing_res = rc.evaluate_timing(timing_history, _regime_res)
-
-                # ── 🎯 매수 결정 카드 (헤드라인) — regime_core SSOT (2-2) ──
-                if _regime_res.get("enough_data") and pd.notna(current_price) and float(current_price) > 0:
-                    _exit_card = rc.compute_exit_signals(timing_history)
-                    try:
-                        _rp_card = _regime_params(_drg_get("전체")[0])
-                    except Exception:
-                        _rp_card = _regime_params({})
-                    _atr_card = rc.compute_atr(timing_history)
-                    _ma200_card = float("nan")
-                    try:
-                        _csc = pd.to_numeric(close, errors="coerce").dropna()
-                        if len(_csc) >= 150:
-                            _ma200_card = float(_csc.rolling(200, min_periods=150).mean().dropna().iloc[-1])
-                    except Exception:
-                        pass
-                    _rhigh_card = float("nan")
-                    try:
-                        _hsrc = timing_history["High"] if "High" in timing_history.columns else close
-                        _rhigh_card = float(pd.to_numeric(_hsrc, errors="coerce").dropna().tail(120).max())
-                    except Exception:
-                        pass
-                    _plan_card = rc.build_trade_plan(
-                        verdict_code=_timing_res.get("code"), entry=float(current_price),
-                        atr=_atr_card, ma200=_ma200_card,
-                        equity=float(st.session_state.get("_size_equity", 10000.0)),
-                        risk_pct=float(st.session_state.get("_size_risk_pct", 1.0)),
-                        atr_mult=_rp_card["atr_mult"], rr_target=_rp_card["rr"],
-                        recent_high=_rhigh_card,
-                    )
-                    _card = rc.build_buy_card(
-                        timing_history,
-                        {"timing": _timing_res, "regime": _regime_res, "exit": _exit_card},
-                        _plan_card, confluence=None,
-                    )
-                    _tone_fn = {"success": st.success, "warning": st.warning,
-                                "error": st.error, "info": st.info}.get(_card["tone"], st.info)
-                    _msg = f"**{_card['label']}** — {_card['headline']}"
-                    if _card["trigger"]:
-                        _msg += f"\n\n✅ **트리거:** {_card['trigger']}"
-                    if _card["invalidation"]:
-                        _msg += f"\n\n⛔ **무효화/손절:** {_card['invalidation']}"
-                    if _card["plan_line"]:
-                        _msg += f"\n\n🧮 {_card['plan_line']}"
-                    _tone_fn(_msg)
-                    st.caption(f"왜 ▸ {_card['why']}  ·  아래는 세부 근거")
-
-                # ── ⓪ 왜 이 종목인가 — 근거 중첩도(Confluence) (#3) ──
-                with st.container(border=True):
-                    st.markdown("##### 🧩 왜 이 종목인가 — 근거 중첩도")
-                    if not _regime_res.get("enough_data"):
-                        st.info("근거 종합에 필요한 데이터가 부족합니다.")
-                    else:
-                        # 상대강도(RS): 종목 63일 − SPY 63일 초과수익
-                        _rs_excess = None
+                info_c1, info_c2, info_c3, info_c4 = st.columns(4)
+                with info_c1:
+                    sector_display = co.get("sector", "N/A")
+                    sector_en = co.get("sector_en", "")
+                    st.metric("섹터", sector_display)
+                    if sector_en and sector_en != sector_display:
+                        st.caption(sector_en)
+                with info_c2:
+                    industry_display = co.get("industry", "N/A")
+                    industry_en = co.get("industry_en", "")
+                    st.metric("산업", industry_display[:18] if industry_display else "N/A")
+                    if industry_en and industry_en != industry_display:
+                        st.caption(industry_en[:25])
+                    # 업종 모멘텀 백분위 — 신호가 아니라 **정보**다.
+                    # 백테스트에서 무작위 대조군은 이겼지만(순위에 정보 있음)
+                    # 워크포워드는 실패했다(거래 규칙으로는 전환 안 됨).
+                    # 그래서 매매 판정에는 연결하지 않고 보여주기만 한다.
+                    _ind_cap = _industry_rank_caption(industry_en, bool(is_etf_co))
+                    if _ind_cap:
+                        st.caption(_ind_cap)
+                with info_c3:
+                    mc = co.get("market_cap")
+                    st.metric("시가총액", usd_short_str(mc) if mc else "N/A")
+                with info_c4:
+                    ne = co.get("next_earnings")
+                    if ne:
                         try:
-                            _cc = pd.to_numeric(close, errors="coerce").dropna()
-                            if len(_cc) >= 64:
-                                _st63 = float(_cc.iloc[-1]) / float(_cc.iloc[-64]) - 1.0
-                                _sp63 = None
-                                if _spy_close is not None:
-                                    _sc = pd.to_numeric(_spy_close, errors="coerce").dropna()
-                                    if len(_sc) >= 64:
-                                        _sp63 = float(_sc.iloc[-1]) / float(_sc.iloc[-64]) - 1.0
-                                _rs_excess = (_st63 - _sp63) if _sp63 is not None else None
+                            days_to_earn = (datetime.strptime(ne[:10], "%Y-%m-%d") - datetime.now(_MARKET_ET_TZ).replace(tzinfo=None)).days
+                            earn_label = f"D-{days_to_earn}일" if days_to_earn >= 0 else f"{abs(days_to_earn)}일 전"
+                            st.metric("다음 실적 발표", ne[:10], delta=earn_label)
+                            st.caption("※ FMP 제공 예정일. 미확인 상태일 수 있습니다.")
                         except Exception:
-                            _rs_excess = None
+                            st.metric("다음 실적 발표", ne[:10])
+                    else:
+                        st.metric("다음 실적 발표", "N/A")
 
-                        # 펀더멘털·내부자·애널리스트·공매도·어닝 — 개별주만(ETF 제외)
-                        _piotroski = _altman = _insider_ratio = _analyst_up = _short = _edays = None
-                        if not is_etf_mode:
-                            _tkr_u = str(selected_ticker).strip().upper()
-                            with st.spinner("근거 종합 중..."):
-                              with _timed("정밀 합류점수 부가지표",
-                                          "재무점수·내부자·목표가·공매도·실적일(병렬)"):
-                                # 5개 조회는 서로 의존하지 않는다 → 병렬로 동시에 받는다.
-                                # 순차 실행 시 캐시가 비면 3초 넘게 걸리던 구간이다.
-                                # ⚠️ 워커에서 st.* 를 건드리지 않는다(스레드에서 st 접근은 실패).
-                                #    각 작업은 순수 데이터 조회만 하고, 판정은 아래에서 한다.
-                                def _cf_scores():
-                                    return _fmp_financial_scores(_tkr_u)
-
-                                def _cf_insider():
-                                    return fetch_insider_statistics(_tkr_u)
-
-                                def _cf_target():
-                                    return fetch_analyst_price_targets(_tkr_u)
-
-                                def _cf_short():
-                                    return fetch_short_interest(_tkr_u)
-
-                                def _cf_earn():
-                                    return fetch_earnings_calendar((_tkr_u,))
-
-                                _cf_res = {}
+                # ── 회사 소개: 항상 한글로 표시 (자동 번역) ─────────────────
+                summary_en = co.get("summary_en", "")
+                if summary_en:
+                    _sum_key = f"_co_summary_kr_{selected_ticker}"
+                    with st.expander("📋 회사 소개", expanded=True):
+                        if st.session_state.get(_sum_key):
+                            st.markdown(st.session_state[_sum_key])
+                            if st.button("🔄 다시 번역", key=f"retranslate_{selected_ticker}"):
+                                del st.session_state[_sum_key]
+                                st.rerun()
+                        else:
+                            # 한글 번역본 없으면 자동 번역 실행
+                            with st.spinner("회사 소개 번역 중..."):
                                 try:
-                                    import concurrent.futures as _cf_ex
-                                    _cf_jobs = {
-                                        "scores": _cf_scores, "insider": _cf_insider,
-                                        "target": _cf_target, "short": _cf_short,
-                                        "earn": _cf_earn,
-                                    }
-                                    with _cf_ex.ThreadPoolExecutor(max_workers=5) as _ex_cf:
-                                        _futs = {k: _ex_cf.submit(f) for k, f in _cf_jobs.items()}
-                                        for _k, _fu in _futs.items():
+                                    _words_list = summary_en.split()
+                                    _capped = " ".join(_words_list[:800]) + ("..." if len(_words_list) > 800 else "")
+                                    _tr_model = _GenAIModel(
+                                        "gemini-2.5-flash",
+                                        generation_config={"temperature": 0.0, "max_output_tokens": 8192, "thinking_budget": 0}
+                                    )
+                                    _tr_resp = _tr_model.generate_content(
+                                        "다음 영문 회사 소개를 한국어로 번역하세요. "
+                                        "모든 문장을 빠짐없이 번역하고, 번역문만 출력하세요.\n\n" + _capped
+                                    )
+                                    _tr_text = (_gemini_response_text_utf8_safe(_tr_resp) or "").strip()
+                                    if _tr_text:
+                                        st.session_state[_sum_key] = _tr_text
+                                        st.markdown(_tr_text)
+                                    else:
+                                        st.markdown(summary_en)
+                                except Exception:
+                                    st.markdown(summary_en)
+
+            # ── 이 종목을 보유한 ETF 목록 (기본 접힘) ────────────────────────
+            if not is_etf_mode:
+                with st.expander("📊 이 종목을 보유한 ETF 목록", expanded=False):
+                    st.caption("현재 FMP 요금제에서 ETF 보유종목 조회가 지원되지 않습니다.")
+                    _etf_list_key = f"_etf_holding_{selected_ticker}"
+                    if st.session_state.get(_etf_list_key) is None:
+                        try:
+                            _etf_list = find_etfs_holding_stock(selected_ticker)
+                            st.session_state[_etf_list_key] = _etf_list
+                        except Exception as _etf_err:
+                            st.session_state[_etf_list_key] = []
+                            st.warning(f"ETF 보유 목록 조회 실패: {_etf_err}")
+                    _etf_result = st.session_state.get(_etf_list_key, [])
+                    if _etf_result:
+                        st.success(f"**{selected_ticker}** 를 보유한 ETF **{len(_etf_result)}개** 발견!")
+                        _etf_rows = []
+                        for e in _etf_result:
+                            _etf_rows.append({
+                                "ETF": e["etf"],
+                                "보유 비중": f"{e['weight']:.2f}%" if e.get("weight") else "N/A",
+                                "보유 순위": f"Top {e['rank']}" if e.get("rank") else "N/A",
+                            })
+                        st.dataframe(pd.DataFrame(_etf_rows), use_container_width=True, hide_index=True)
+                    else:
+                        # "찾지 못했다"고 쓰면 조회했는데 보유 ETF 가 없다는 뜻이 된다.
+                        # 실제로는 조회 자체가 불가하다 — 거짓 음성을 만들지 않는다.
+                        st.info(
+                            "ETF 보유종목 데이터는 현재 요금제에서 제공되지 않습니다. "
+                            f"{selected_ticker}를 보유한 ETF가 없다는 뜻이 아닙니다."
+                        )
+                    if st.button("🔄 다시 조회", key=f"re_find_etf_{selected_ticker}"):
+                        st.session_state.pop(_etf_list_key, None)
+                        find_etfs_holding_stock.clear()
+                        st.rerun()
+
+            st.divider()
+
+            # ── 기간별 주가 차트 ──────────────────────────────────────────────
+            st.markdown("### 📈 주가 차트")
+            period_options = ["1D", "1M", "3M", "YTD", "1Y", "5Y", "MAX"]
+            selected_period = st.radio(
+                "기간 선택",
+                period_options,
+                index=4,  # 기본값 1Y
+                horizontal=True,
+                key="stock_chart_period",
+                label_visibility="collapsed",
+            )
+            with st.spinner(f"{selected_ticker} {selected_period} 차트 로딩 중..."):
+                with _timed("정밀 차트 일봉"):
+                    period_hist = fetch_price_history_by_period(str(selected_ticker).strip().upper(), selected_period)
+
+            if period_hist is not None and not period_hist.empty and "Close" in period_hist.columns:
+                close_p = pd.to_numeric(period_hist["Close"], errors="coerce").dropna()
+                if not close_p.empty:
+                    first_p = float(close_p.iloc[0])
+                    last_p = float(close_p.iloc[-1])
+                    change_pct = (last_p / first_p - 1) * 100 if first_p > 0 else 0
+                    chg_col1, chg_col2, chg_col3 = st.columns(3)
+                    with chg_col1:
+                        st.metric("현재가", f"${last_p:.2f}")
+                    with chg_col2:
+                        st.metric(f"{selected_period} 수익률", f"{change_pct:+.2f}%")
+                    with chg_col3:
+                        high_p = float(close_p.max())
+                        low_p = float(close_p.min())
+                        st.metric("기간 고점/저점", f"${high_p:.2f} / ${low_p:.2f}")
+
+                    chart_pdf = pd.DataFrame({"Close": close_p})
+                    st.line_chart(chart_pdf, use_container_width=True, height=260)
+            else:
+                st.warning("차트 데이터를 가져오지 못했습니다.")
+
+        # ── ② 📊 기술적 — RSI · MACD · 볼린저밴드 · 거래량 ────────────────
+        elif _si_view == _SI_V2:
+            st.divider()
+            st.markdown("### 📊 기술적 분석 (Technical Analysis)")
+            st.caption("RSI · MACD · 볼린저밴드 · 거래량으로 진입 구간 점검")
+            # 기술적 분석 sync는 탭 상단 버튼과 통합됨
+
+            try:
+                with st.spinner(f"{selected_ticker} 타이밍 데이터를 불러오는 중..."):
+                    with _timed("정밀 타이밍일봉"):
+                        timing_history = cached_timing_price_history(str(selected_ticker).strip())
+
+                if timing_history is None or timing_history.empty or "Close" not in timing_history.columns:
+                    st.warning("가격 데이터를 불러오지 못했습니다. 티커를 확인해주세요.")
+                else:
+                    close = pd.to_numeric(timing_history["Close"], errors="coerce")
+                    volume = pd.to_numeric(timing_history.get("Volume", pd.Series(dtype=float)), errors="coerce")
+                    current_price = float(close.dropna().iloc[-1]) if not close.dropna().empty else np.nan
+                    high_52w = float(close.dropna().max())
+                    low_52w = float(close.dropna().min())
+
+                    ma20 = close.rolling(window=20, min_periods=20).mean()
+                    ma50 = close.rolling(window=50, min_periods=50).mean()
+                    ma200 = close.rolling(window=200, min_periods=200).mean()
+                    rsi_series = calculate_rsi(close, window=14)
+                    current_rsi = float(rsi_series.dropna().iloc[-1]) if not rsi_series.dropna().empty else np.nan
+                    current_ma20 = float(ma20.dropna().iloc[-1]) if not ma20.dropna().empty else np.nan
+                    current_ma50 = float(ma50.dropna().iloc[-1]) if not ma50.dropna().empty else np.nan
+                    current_ma200 = float(ma200.dropna().iloc[-1]) if not ma200.dropna().empty else np.nan
+
+                    # MACD
+                    macd_line, signal_line, histogram = calculate_macd(close.dropna())
+                    current_macd = float(macd_line.iloc[-1]) if not macd_line.empty else np.nan
+                    current_signal = float(signal_line.iloc[-1]) if not signal_line.empty else np.nan
+                    current_hist = float(histogram.iloc[-1]) if not histogram.empty else np.nan
+                    macd_bullish = pd.notna(current_hist) and current_hist > 0
+
+                    # 볼린저밴드
+                    bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(close)
+                    current_bb_upper = float(bb_upper.dropna().iloc[-1]) if not bb_upper.dropna().empty else np.nan
+                    current_bb_lower = float(bb_lower.dropna().iloc[-1]) if not bb_lower.dropna().empty else np.nan
+
+                    # 52주 위치
+                    pct_from_high = ((current_price / high_52w) - 1) * 100 if pd.notna(current_price) and high_52w > 0 else np.nan
+                    pct_from_low = ((current_price / low_52w) - 1) * 100 if pd.notna(current_price) and low_52w > 0 else np.nan
+
+                    # 거래량 급증
+                    vol_surge = np.nan
+                    if not volume.dropna().empty and len(volume.dropna()) >= 21:
+                        recent_vol = float(volume.dropna().tail(5).mean())
+                        baseline_vol = float(volume.dropna().tail(21).mean())
+                        vol_surge = recent_vol / baseline_vol if baseline_vol > 0 else np.nan
+
+                    # 눌림목 포착
+                    is_buy_on_dip = (
+                        pd.notna(current_price) and pd.notna(current_ma200)
+                        and current_price > current_ma200
+                        and pd.notna(current_rsi) and current_rsi < 50
+                        and (
+                            (pd.notna(current_ma20) and current_price <= current_ma20 * 1.02)
+                            or (pd.notna(current_ma50) and current_price <= current_ma50 * 1.02)
+                        )
+                    )
+
+                    # ── 지표 요약 메트릭 ──────────────────────────────────────
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    with m1:
+                        rsi_delta = "과매수🚨" if pd.notna(current_rsi) and current_rsi >= 70 else ("조정구간✅" if pd.notna(current_rsi) and current_rsi < 50 else "중립🟡")
+                        st.metric("RSI (14)", f"{current_rsi:.1f}" if pd.notna(current_rsi) else "N/A", delta=rsi_delta)
+                    with m2:
+                        macd_delta = "상승전환🟢" if macd_bullish else "하락전환🔴"
+                        st.metric("MACD 히스토그램", f"{current_hist:+.3f}" if pd.notna(current_hist) else "N/A", delta=macd_delta)
+                    with m3:
+                        ma200_delta = "200일선 위✅" if pd.notna(current_price) and pd.notna(current_ma200) and current_price > current_ma200 else "200일선 아래❌"
+                        st.metric("200일선", f"${current_ma200:.2f}" if pd.notna(current_ma200) else "N/A", delta=ma200_delta)
+                    with m4:
+                        st.metric("52주 고점 대비", f"{pct_from_high:+.1f}%" if pd.notna(pct_from_high) else "N/A",
+                                  delta="신고가 근접🔥" if pd.notna(pct_from_high) and pct_from_high >= -5 else "조정구간" if pd.notna(pct_from_high) and pct_from_high <= -20 else "")
+                    with m5:
+                        vol_str = f"{vol_surge:.1f}x" if pd.notna(vol_surge) else "N/A"
+                        vol_delta = "거래량 급증🔥" if pd.notna(vol_surge) and vol_surge >= 1.5 else ("평균 이하" if pd.notna(vol_surge) and vol_surge < 0.8 else "")
+                        st.metric("거래량 (5일/21일)", vol_str, delta=vol_delta)
+
+                    # ── 레짐(국면) 기반 매수 타이밍 판정 — regime_core 엔진 (SSOT) ──
+                    #    고정 30/70 대신 종목의 추세 강도(대장주/횡보/약세)에 맞춰
+                    #    Cardwell RSI 밴드(강세 40·80 / 횡보 40·70 / 약세 20·60)를 적용.
+                    try:
+                        with _timed("정밀 SPY일봉"):
+                            _spy_hist = cached_timing_price_history("SPY")
+                        _spy_close = (
+                            _spy_hist["Close"]
+                            if (_spy_hist is not None and not _spy_hist.empty and "Close" in _spy_hist.columns)
+                            else None
+                        )
+                    except Exception:
+                        _spy_close = None
+                    _regime_res = rc.classify_regime(timing_history, spy_close=_spy_close)
+                    _timing_res = rc.evaluate_timing(timing_history, _regime_res)
+
+                    # ── 🎯 매수 결정 카드 (헤드라인) — regime_core SSOT (2-2) ──
+                    if _regime_res.get("enough_data") and pd.notna(current_price) and float(current_price) > 0:
+                        _exit_card = rc.compute_exit_signals(timing_history)
+                        try:
+                            _rp_card = _regime_params(_drg_get("전체")[0])
+                        except Exception:
+                            _rp_card = _regime_params({})
+                        _atr_card = rc.compute_atr(timing_history)
+                        _ma200_card = float("nan")
+                        try:
+                            _csc = pd.to_numeric(close, errors="coerce").dropna()
+                            if len(_csc) >= 150:
+                                _ma200_card = float(_csc.rolling(200, min_periods=150).mean().dropna().iloc[-1])
+                        except Exception:
+                            pass
+                        _rhigh_card = float("nan")
+                        try:
+                            _hsrc = timing_history["High"] if "High" in timing_history.columns else close
+                            _rhigh_card = float(pd.to_numeric(_hsrc, errors="coerce").dropna().tail(120).max())
+                        except Exception:
+                            pass
+                        _plan_card = rc.build_trade_plan(
+                            verdict_code=_timing_res.get("code"), entry=float(current_price),
+                            atr=_atr_card, ma200=_ma200_card,
+                            equity=float(st.session_state.get("_size_equity", 10000.0)),
+                            risk_pct=float(st.session_state.get("_size_risk_pct", 1.0)),
+                            atr_mult=_rp_card["atr_mult"], rr_target=_rp_card["rr"],
+                            recent_high=_rhigh_card,
+                        )
+                        _card = rc.build_buy_card(
+                            timing_history,
+                            {"timing": _timing_res, "regime": _regime_res, "exit": _exit_card},
+                            _plan_card, confluence=None,
+                        )
+                        _tone_fn = {"success": st.success, "warning": st.warning,
+                                    "error": st.error, "info": st.info}.get(_card["tone"], st.info)
+                        _msg = f"**{_card['label']}** — {_card['headline']}"
+                        if _card["trigger"]:
+                            _msg += f"\n\n✅ **트리거:** {_card['trigger']}"
+                        if _card["invalidation"]:
+                            _msg += f"\n\n⛔ **무효화/손절:** {_card['invalidation']}"
+                        if _card["plan_line"]:
+                            _msg += f"\n\n🧮 {_card['plan_line']}"
+                        _tone_fn(_msg)
+                        st.caption(f"왜 ▸ {_card['why']}  ·  아래는 세부 근거")
+
+                    # ── ⓪ 왜 이 종목인가 — 근거 중첩도(Confluence) (#3) ──
+                    with st.container(border=True):
+                        st.markdown("##### 🧩 왜 이 종목인가 — 근거 중첩도")
+                        if not _regime_res.get("enough_data"):
+                            st.info("근거 종합에 필요한 데이터가 부족합니다.")
+                        else:
+                            # 상대강도(RS): 종목 63일 − SPY 63일 초과수익
+                            _rs_excess = None
+                            try:
+                                _cc = pd.to_numeric(close, errors="coerce").dropna()
+                                if len(_cc) >= 64:
+                                    _st63 = float(_cc.iloc[-1]) / float(_cc.iloc[-64]) - 1.0
+                                    _sp63 = None
+                                    if _spy_close is not None:
+                                        _sc = pd.to_numeric(_spy_close, errors="coerce").dropna()
+                                        if len(_sc) >= 64:
+                                            _sp63 = float(_sc.iloc[-1]) / float(_sc.iloc[-64]) - 1.0
+                                    _rs_excess = (_st63 - _sp63) if _sp63 is not None else None
+                            except Exception:
+                                _rs_excess = None
+
+                            # 펀더멘털·내부자·애널리스트·공매도·어닝 — 개별주만(ETF 제외)
+                            _piotroski = _altman = _insider_ratio = _analyst_up = _short = _edays = None
+                            if not is_etf_mode:
+                                _tkr_u = str(selected_ticker).strip().upper()
+                                with st.spinner("근거 종합 중..."):
+                                  with _timed("정밀 합류점수 부가지표",
+                                              "재무점수·내부자·목표가·공매도·실적일(병렬)"):
+                                    # 5개 조회는 서로 의존하지 않는다 → 병렬로 동시에 받는다.
+                                    # 순차 실행 시 캐시가 비면 3초 넘게 걸리던 구간이다.
+                                    # ⚠️ 워커에서 st.* 를 건드리지 않는다(스레드에서 st 접근은 실패).
+                                    #    각 작업은 순수 데이터 조회만 하고, 판정은 아래에서 한다.
+                                    def _cf_scores():
+                                        return _fmp_financial_scores(_tkr_u)
+
+                                    def _cf_insider():
+                                        return fetch_insider_statistics(_tkr_u)
+
+                                    def _cf_target():
+                                        return fetch_analyst_price_targets(_tkr_u)
+
+                                    def _cf_short():
+                                        return fetch_short_interest(_tkr_u)
+
+                                    def _cf_earn():
+                                        return fetch_earnings_calendar((_tkr_u,))
+
+                                    _cf_res = {}
+                                    try:
+                                        import concurrent.futures as _cf_ex
+                                        _cf_jobs = {
+                                            "scores": _cf_scores, "insider": _cf_insider,
+                                            "target": _cf_target, "short": _cf_short,
+                                            "earn": _cf_earn,
+                                        }
+                                        with _cf_ex.ThreadPoolExecutor(max_workers=5) as _ex_cf:
+                                            _futs = {k: _ex_cf.submit(f) for k, f in _cf_jobs.items()}
+                                            for _k, _fu in _futs.items():
+                                                try:
+                                                    _cf_res[_k] = _fu.result(timeout=20)
+                                                except Exception:
+                                                    _cf_res[_k] = None
+                                    except Exception:
+                                        _cf_res = {}
+
+                                    # ⚠️ 조용한 성능저하 방지 가드.
+                                    #    이 5개는 @st.cache_data 함수라 워커 스레드에서는
+                                    #    ScriptRunContext 부재로 실패할 수 있다. 그 경우 값이
+                                    #    전부 None 이 되어 합류점수가 **말없이 낮게** 나온다.
+                                    #    판정이 틀어지는 건 느린 것보다 훨씬 나쁘므로,
+                                    #    전부 비면 메인 스레드에서 순차로 다시 받는다.
+                                    if not any(v is not None for v in _cf_res.values()):
+                                        for _k, _f in (("scores", _cf_scores), ("insider", _cf_insider),
+                                                       ("target", _cf_target), ("short", _cf_short),
+                                                       ("earn", _cf_earn)):
                                             try:
-                                                _cf_res[_k] = _fu.result(timeout=20)
+                                                _cf_res[_k] = _f()
                                             except Exception:
                                                 _cf_res[_k] = None
-                                except Exception:
-                                    _cf_res = {}
+                                        _perf_note("정밀 합류점수 부가지표",
+                                                   "순차 폴백(병렬 결과 없음)")
 
-                                # ⚠️ 조용한 성능저하 방지 가드.
-                                #    이 5개는 @st.cache_data 함수라 워커 스레드에서는
-                                #    ScriptRunContext 부재로 실패할 수 있다. 그 경우 값이
-                                #    전부 None 이 되어 합류점수가 **말없이 낮게** 나온다.
-                                #    판정이 틀어지는 건 느린 것보다 훨씬 나쁘므로,
-                                #    전부 비면 메인 스레드에서 순차로 다시 받는다.
-                                if not any(v is not None for v in _cf_res.values()):
-                                    for _k, _f in (("scores", _cf_scores), ("insider", _cf_insider),
-                                                   ("target", _cf_target), ("short", _cf_short),
-                                                   ("earn", _cf_earn)):
-                                        try:
-                                            _cf_res[_k] = _f()
-                                        except Exception:
-                                            _cf_res[_k] = None
-                                    _perf_note("정밀 합류점수 부가지표",
-                                               "순차 폴백(병렬 결과 없음)")
+                                    try:
+                                        _fsc = _cf_res.get("scores") or {}
+                                        _piotroski = to_float(_fsc.get("piotroskiScore"))
+                                        _altman = to_float(_fsc.get("altmanZScore"))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        _insider_ratio = to_float((_cf_res.get("insider") or {}).get("ratio"))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        _tm = to_float((_cf_res.get("target") or {}).get("target_mean"))
+                                        if pd.notna(_tm) and pd.notna(current_price) and float(current_price) > 0:
+                                            _analyst_up = float(_tm) / float(current_price) - 1.0
+                                    except Exception:
+                                        pass
+                                    try:
+                                        _short = to_float((_cf_res.get("short") or {}).get("short_pct"))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        _ec = _cf_res.get("earn")
+                                        if _ec:
+                                            _edays = _ec[0].get("days_until")
+                                    except Exception:
+                                        pass
 
-                                try:
-                                    _fsc = _cf_res.get("scores") or {}
-                                    _piotroski = to_float(_fsc.get("piotroskiScore"))
-                                    _altman = to_float(_fsc.get("altmanZScore"))
-                                except Exception:
-                                    pass
-                                try:
-                                    _insider_ratio = to_float((_cf_res.get("insider") or {}).get("ratio"))
-                                except Exception:
-                                    pass
-                                try:
-                                    _tm = to_float((_cf_res.get("target") or {}).get("target_mean"))
-                                    if pd.notna(_tm) and pd.notna(current_price) and float(current_price) > 0:
-                                        _analyst_up = float(_tm) / float(current_price) - 1.0
-                                except Exception:
-                                    pass
-                                try:
-                                    _short = to_float((_cf_res.get("short") or {}).get("short_pct"))
-                                except Exception:
-                                    pass
-                                try:
-                                    _ec = _cf_res.get("earn")
-                                    if _ec:
-                                        _edays = _ec[0].get("days_until")
-                                except Exception:
-                                    pass
-
-                        _conf = rc.confluence_score(
-                            verdict_code=_timing_res.get("code"),
-                            rs_excess=_rs_excess,
-                            piotroski=float(_piotroski) if pd.notna(_piotroski) else None,
-                            altman_z=float(_altman) if pd.notna(_altman) else None,
-                            insider_ratio=float(_insider_ratio) if pd.notna(_insider_ratio) else None,
-                            analyst_upside=_analyst_up,
-                            short_pct=float(_short) if pd.notna(_short) else None,
-                            earnings_days=_edays,
-                        )
-
-                        _cc1, _cc2 = st.columns([1, 2.4])
-                        with _cc1:
-                            _score_txt = f"{_conf['score']:.0f}/100" if _conf["score"] is not None else "N/A"
-                            st.metric("근거 중첩도", _score_txt, _conf["label"])
-                        with _cc2:
-                            if _conf["avoid_flag"]:
-                                st.error("⛔ **회피 우선** — 약세 회피 구간. 근거 점수와 무관하게 신규 진입을 권하지 않습니다(백테스트상 음의 초과수익).")
-                            st.caption(f"가용 근거 {_conf['n_factors']}개로 산출. " + (_conf["short_note"] or ""))
-                            if _conf["earnings_warning"]:
-                                st.warning("⚠️ 실적 발표 D-5 이내 — 갭 리스크. 진입·사이징 신중.")
-
-                        def _conf_icon(_s):
-                            return "✅" if _s > 0 else ("⚠️" if _s < 0 else "⚪")
-                        _conf_rows = [{
-                            "근거": _b["label"],
-                            "신호": (_conf_icon(_b["signal"]) if _b["available"] else "—"),
-                            "내용": _b["value"],
-                        } for _b in _conf["breakdown"]]
-                        st.dataframe(pd.DataFrame(_conf_rows), use_container_width=True, hide_index=True)
-                        st.caption(
-                            "**근거 중첩도**는 독립 근거들이 같은 방향을 가리키는 정도 — 상승 *확률을 높이는 근거의 합*이지 "
-                            "*보장*이 아닙니다. 점수가 높아도 진입 타이밍의 실증 엣지는 작으니, 사이징은 아래 **포지션 플랜**대로 보수적으로."
-                        )
-
-                # ── 관점별 신호 (대상별로 묶어 표시: 신규 진입 / 보유 관리 / 단기) ──
-                # ① 신규 진입 관점 — 아직 안 샀다면 ('지금 새로 살까?')
-                with st.container(border=True):
-                    st.markdown("##### 🛒 신규 진입 관점")
-                    st.caption("아직 안 샀다면 — '지금 새로 살까?'")
-                    if not _regime_res.get("enough_data"):
-                        st.info("레짐 판정에 필요한 가격 데이터가 부족합니다(약 50거래일 이상 필요).")
-                    else:
-                        _band_lo, _band_hi = _regime_res["rsi_band"]
-                        _regime_label = {
-                            "strong": "🟢 강세 추세 (대장주)",
-                            "sideways": "🟡 횡보",
-                            "weak": "🔴 약세/하락",
-                        }.get(_regime_res["regime"], "⚪ 판정 불가")
-                        _topping_txt = " · ⚠️ 천장 신호" if _regime_res.get("topping") else ""
-                        st.markdown(
-                            f"**국면 판정:** {_regime_label}{_topping_txt} "
-                            f"(강도 {_regime_res['score']:.0f}/100 · 적용 RSI 밴드 {_band_lo:.0f}~{_band_hi:.0f})"
-                        )
-                        _verdict = _timing_res.get("verdict", "")
-                        _reasons = " · ".join(_timing_res.get("reasons", []))
-                        _code = _timing_res.get("code")
-                        if _timing_res.get("is_entry"):
-                            st.success(f"🎯 **{_verdict}** — {_reasons}\n\n분할 매수 고려 구간입니다.")
-                        elif _code == "overheat":
-                            st.error(
-                                f"⛔ **{_verdict}** — {_reasons}.\n\n지금 진입하면 고점 매수 위험. "
-                                f"RSI가 밴드 지지선({_band_lo:.0f})까지 식거나 상승 이평선 눌림을 기다리는 편이 유리합니다."
+                            _conf = rc.confluence_score(
+                                verdict_code=_timing_res.get("code"),
+                                rs_excess=_rs_excess,
+                                piotroski=float(_piotroski) if pd.notna(_piotroski) else None,
+                                altman_z=float(_altman) if pd.notna(_altman) else None,
+                                insider_ratio=float(_insider_ratio) if pd.notna(_insider_ratio) else None,
+                                analyst_upside=_analyst_up,
+                                short_pct=float(_short) if pd.notna(_short) else None,
+                                earnings_days=_edays,
                             )
-                        elif _code == "trend_break":
-                            st.error(f"🚫 **{_verdict}** — {_reasons}.\n\n추세가 약해지는 신호입니다. 신규 진입 자제.")
-                        elif _code == "avoid":
-                            st.warning(f"**{_verdict}** — {_reasons}.")
+
+                            _cc1, _cc2 = st.columns([1, 2.4])
+                            with _cc1:
+                                _score_txt = f"{_conf['score']:.0f}/100" if _conf["score"] is not None else "N/A"
+                                st.metric("근거 중첩도", _score_txt, _conf["label"])
+                            with _cc2:
+                                if _conf["avoid_flag"]:
+                                    st.error("⛔ **회피 우선** — 약세 회피 구간. 근거 점수와 무관하게 신규 진입을 권하지 않습니다(백테스트상 음의 초과수익).")
+                                st.caption(f"가용 근거 {_conf['n_factors']}개로 산출. " + (_conf["short_note"] or ""))
+                                if _conf["earnings_warning"]:
+                                    st.warning("⚠️ 실적 발표 D-5 이내 — 갭 리스크. 진입·사이징 신중.")
+
+                            def _conf_icon(_s):
+                                return "✅" if _s > 0 else ("⚠️" if _s < 0 else "⚪")
+                            _conf_rows = [{
+                                "근거": _b["label"],
+                                "신호": (_conf_icon(_b["signal"]) if _b["available"] else "—"),
+                                "내용": _b["value"],
+                            } for _b in _conf["breakdown"]]
+                            st.dataframe(pd.DataFrame(_conf_rows), use_container_width=True, hide_index=True)
+                            st.caption(
+                                "**근거 중첩도**는 독립 근거들이 같은 방향을 가리키는 정도 — 상승 *확률을 높이는 근거의 합*이지 "
+                                "*보장*이 아닙니다. 점수가 높아도 진입 타이밍의 실증 엣지는 작으니, 사이징은 아래 **포지션 플랜**대로 보수적으로."
+                            )
+
+                    # ── 관점별 신호 (대상별로 묶어 표시: 신규 진입 / 보유 관리 / 단기) ──
+                    # ① 신규 진입 관점 — 아직 안 샀다면 ('지금 새로 살까?')
+                    with st.container(border=True):
+                        st.markdown("##### 🛒 신규 진입 관점")
+                        st.caption("아직 안 샀다면 — '지금 새로 살까?'")
+                        if not _regime_res.get("enough_data"):
+                            st.info("레짐 판정에 필요한 가격 데이터가 부족합니다(약 50거래일 이상 필요).")
                         else:
-                            st.info(f"⏳ **{_verdict}** — {_reasons}.")
-
-                # ② 보유 관리 관점 — 이미 보유 중이라면 ('청산할까?')
-                with st.container(border=True):
-                    st.markdown("##### 💼 보유 관리 관점")
-                    st.caption("이미 보유 중이라면 — '청산할까?'")
-                    _exit_res = rc.compute_exit_signals(timing_history)
-                    if _exit_res.get("is_exit"):
-                        st.warning(
-                            "💰 **청산 신호 감지** (점검 필요): "
-                            + " · ".join(_exit_res.get("reasons", []))
-                        )
-                    else:
-                        st.success("✅ 현재 청산 신호 없음 — 추세 유지 중")
-
-                # ③ 단기 트레이딩 관점 — 단타·반등 (참고용)
-                with st.container(border=True):
-                    st.markdown("##### ⚡ 단기 트레이딩 관점")
-                    st.caption("단타·반등 노린다면 — 추세 역행이라 고위험 (참고용)")
-                    if pd.notna(current_price) and pd.notna(current_bb_lower) and pd.notna(current_bb_upper):
-                        if current_price <= current_bb_lower:
-                            st.info(f"📊 볼린저밴드 하단 터치 (${current_bb_lower:.2f}) — 단기 반등 가능성.")
-                        elif current_price >= current_bb_upper:
-                            st.warning(f"📊 볼린저밴드 상단 터치 (${current_bb_upper:.2f}) — 단기 과열 주의.")
-                        else:
-                            st.caption("밴드 중앙 구간 — 단기 시그널 없음.")
-                    else:
-                        st.caption("볼린저밴드 데이터 부족.")
-
-                # ── ④ 포지션 플랜 (사이징 · R:R 게이트) — regime_core SSOT (#2) ──
-                with st.container(border=True):
-                    st.markdown("##### 🧮 포지션 플랜 (사이징 · R:R)")
-                    st.caption("이 자리에 '얼마' 들어갈지 + 손익비가 받쳐주는지. 거래당 리스크 고정(고정 분율).")
-                    if not _regime_res.get("enough_data") or not (pd.notna(current_price) and current_price > 0):
-                        st.info("사이징에 필요한 가격/레짐 데이터가 부족합니다.")
-                    else:
-                        # ── 활성 계좌 컨텍스트 (없으면 수동 입력 폴백) ──
-                        _act_acct = str(st.session_state.get("_active_account") or "").strip()
-                        _uid_size = str(st.session_state.get("user_id") or "").strip()
-                        _ctx_size = None
-                        if _act_acct:
-                            try:
-                                _ctx_size = account_context_memo(_uid_size, _act_acct)
-                            except Exception:
-                                _ctx_size = None
-                        if _ctx_size:
-                            _pf_s = _ctx_size["profile"]
-                            _def_eq = float(_ctx_size["equity"])
-                            _def_risk = float(_pf_s["Risk_Pct"])
-                            _def_cash = float(_ctx_size["cash"])
-                            _kx = _act_acct
-                            st.caption(_esc_md(
-                                f"📍 **{_act_acct}** 기준 · 자본 ${_ctx_size['equity']:,.2f} "
-                                f"(현금 ${_ctx_size['cash']:,.2f} + 보유 ${_ctx_size['invested_value']:,.2f}) · "
-                                f"슬롯 {_ctx_size['slots_used']}/{int(_pf_s['Max_Positions'])} · "
-                                f"상한 {float(_pf_s['Max_Position_Pct']):.0f}%"
-                                + ("" if _pf_s.get("_exists") else "  ·  ⚙️ 기본값 (포트폴리오 탭에서 프로필 저장 가능)")
-                            ))
-                            if not _ctx_size["priced_ok"]:
-                                st.caption("⚠️ 일부 보유 종목 시세 미수신 — 매수 평단으로 대체 계산: "
-                                           + ", ".join(_ctx_size["missing"][:8]))
-                        else:
-                            _pf_s = dict(_ACCOUNT_PROFILE_DEFAULTS)
-                            _pf_s["_exists"] = False
-                            _def_eq = float(st.session_state.get("_size_equity", 10000.0))
-                            _def_risk = float(st.session_state.get("_size_risk_pct", 1.0))
-                            _def_cash = float(st.session_state.get("_size_cash", 0.0))
-                            _kx = "manual"
-                            st.caption("📍 활성 계좌 없음 — 수동 입력으로 계산합니다. 사이드바에서 계좌를 선택하면 자동 반영됩니다.")
-
-                        _c1, _c2, _c3, _c4 = st.columns([1.15, 1, 1.15, 1.2])
-                        with _c1:
-                            _equity = st.number_input(
-                                "계좌 자본금 ($)", min_value=0.0, step=1000.0,
-                                value=_def_eq, key=f"_size_equity_input_{_kx}",
-                                help="현금 + 보유주식 평가액 (계좌 총액). 현금만 넣으면 사이즈가 과소 산출됩니다.",
+                            _band_lo, _band_hi = _regime_res["rsi_band"]
+                            _regime_label = {
+                                "strong": "🟢 강세 추세 (대장주)",
+                                "sideways": "🟡 횡보",
+                                "weak": "🔴 약세/하락",
+                            }.get(_regime_res["regime"], "⚪ 판정 불가")
+                            _topping_txt = " · ⚠️ 천장 신호" if _regime_res.get("topping") else ""
+                            st.markdown(
+                                f"**국면 판정:** {_regime_label}{_topping_txt} "
+                                f"(강도 {_regime_res['score']:.0f}/100 · 적용 RSI 밴드 {_band_lo:.0f}~{_band_hi:.0f})"
                             )
-                            st.session_state["_size_equity"] = _equity
-                        with _c2:
-                            _risk_pct = st.number_input(
-                                "거래당 리스크 (%)", min_value=0.1, max_value=5.0, step=0.1,
-                                value=_def_risk, key=f"_size_risk_pct_input_{_kx}",
-                            )
-                            st.session_state["_size_risk_pct"] = _risk_pct
-                        with _c3:
-                            _cash_in = st.number_input(
-                                "가용 현금 ($)", min_value=0.0, step=50.0,
-                                value=_def_cash, key=f"_size_cash_input_{_kx}",
-                                help="실제 집행 가능한 현금. 0 = 제한 없음(현금 게이트 미적용).",
-                            )
-                            st.session_state["_size_cash"] = _cash_in
-                        _cash_val = float(_cash_in) if _cash_in > 0 else None
-                        with _c4:
-                            _stop_src = st.selectbox(
-                                "손절 기준", ["ATR(변동성)", "200일선", "직접 입력"],
-                                index=0, key=f"_size_stopsrc_{selected_ticker}",
-                            )
-                        _src_map = {"ATR(변동성)": "atr", "200일선": "ma200", "직접 입력": "manual"}
-                        _manual_stop = None
-                        _manual_target = None
-                        if _src_map[_stop_src] == "manual":
-                            _mc1, _mc2 = st.columns(2)
-                            with _mc1:
-                                _manual_stop = st.number_input(
-                                    "손절가 ($)", min_value=0.0, step=0.5,
-                                    value=float(round(float(current_price) * 0.95, 2)),
-                                    key=f"_size_mstop_{selected_ticker}",
+                            _verdict = _timing_res.get("verdict", "")
+                            _reasons = " · ".join(_timing_res.get("reasons", []))
+                            _code = _timing_res.get("code")
+                            if _timing_res.get("is_entry"):
+                                st.success(f"🎯 **{_verdict}** — {_reasons}\n\n분할 매수 고려 구간입니다.")
+                            elif _code == "overheat":
+                                st.error(
+                                    f"⛔ **{_verdict}** — {_reasons}.\n\n지금 진입하면 고점 매수 위험. "
+                                    f"RSI가 밴드 지지선({_band_lo:.0f})까지 식거나 상승 이평선 눌림을 기다리는 편이 유리합니다."
                                 )
-                            with _mc2:
+                            elif _code == "trend_break":
+                                st.error(f"🚫 **{_verdict}** — {_reasons}.\n\n추세가 약해지는 신호입니다. 신규 진입 자제.")
+                            elif _code == "avoid":
+                                st.warning(f"**{_verdict}** — {_reasons}.")
+                            else:
+                                st.info(f"⏳ **{_verdict}** — {_reasons}.")
+
+                    # ② 보유 관리 관점 — 이미 보유 중이라면 ('청산할까?')
+                    with st.container(border=True):
+                        st.markdown("##### 💼 보유 관리 관점")
+                        st.caption("이미 보유 중이라면 — '청산할까?'")
+                        _exit_res = rc.compute_exit_signals(timing_history)
+                        if _exit_res.get("is_exit"):
+                            st.warning(
+                                "💰 **청산 신호 감지** (점검 필요): "
+                                + " · ".join(_exit_res.get("reasons", []))
+                            )
+                        else:
+                            st.success("✅ 현재 청산 신호 없음 — 추세 유지 중")
+
+                    # ③ 단기 트레이딩 관점 — 단타·반등 (참고용)
+                    with st.container(border=True):
+                        st.markdown("##### ⚡ 단기 트레이딩 관점")
+                        st.caption("단타·반등 노린다면 — 추세 역행이라 고위험 (참고용)")
+                        if pd.notna(current_price) and pd.notna(current_bb_lower) and pd.notna(current_bb_upper):
+                            if current_price <= current_bb_lower:
+                                st.info(f"📊 볼린저밴드 하단 터치 (${current_bb_lower:.2f}) — 단기 반등 가능성.")
+                            elif current_price >= current_bb_upper:
+                                st.warning(f"📊 볼린저밴드 상단 터치 (${current_bb_upper:.2f}) — 단기 과열 주의.")
+                            else:
+                                st.caption("밴드 중앙 구간 — 단기 시그널 없음.")
+                        else:
+                            st.caption("볼린저밴드 데이터 부족.")
+
+                    # ── ④ 포지션 플랜 (사이징 · R:R 게이트) — regime_core SSOT (#2) ──
+                    with st.container(border=True):
+                        st.markdown("##### 🧮 포지션 플랜 (사이징 · R:R)")
+                        st.caption("이 자리에 '얼마' 들어갈지 + 손익비가 받쳐주는지. 거래당 리스크 고정(고정 분율).")
+                        if not _regime_res.get("enough_data") or not (pd.notna(current_price) and current_price > 0):
+                            st.info("사이징에 필요한 가격/레짐 데이터가 부족합니다.")
+                        else:
+                            # ── 활성 계좌 컨텍스트 (없으면 수동 입력 폴백) ──
+                            _act_acct = str(st.session_state.get("_active_account") or "").strip()
+                            _uid_size = str(st.session_state.get("user_id") or "").strip()
+                            _ctx_size = None
+                            if _act_acct:
+                                try:
+                                    _ctx_size = account_context_memo(_uid_size, _act_acct)
+                                except Exception:
+                                    _ctx_size = None
+                            if _ctx_size:
+                                _pf_s = _ctx_size["profile"]
+                                _def_eq = float(_ctx_size["equity"])
+                                _def_risk = float(_pf_s["Risk_Pct"])
+                                _def_cash = float(_ctx_size["cash"])
+                                _kx = _act_acct
+                                st.caption(_esc_md(
+                                    f"📍 **{_act_acct}** 기준 · 자본 ${_ctx_size['equity']:,.2f} "
+                                    f"(현금 ${_ctx_size['cash']:,.2f} + 보유 ${_ctx_size['invested_value']:,.2f}) · "
+                                    f"슬롯 {_ctx_size['slots_used']}/{int(_pf_s['Max_Positions'])} · "
+                                    f"상한 {float(_pf_s['Max_Position_Pct']):.0f}%"
+                                    + ("" if _pf_s.get("_exists") else "  ·  ⚙️ 기본값 (포트폴리오 탭에서 프로필 저장 가능)")
+                                ))
+                                if not _ctx_size["priced_ok"]:
+                                    st.caption("⚠️ 일부 보유 종목 시세 미수신 — 매수 평단으로 대체 계산: "
+                                               + ", ".join(_ctx_size["missing"][:8]))
+                            else:
+                                _pf_s = dict(_ACCOUNT_PROFILE_DEFAULTS)
+                                _pf_s["_exists"] = False
+                                _def_eq = float(st.session_state.get("_size_equity", 10000.0))
+                                _def_risk = float(st.session_state.get("_size_risk_pct", 1.0))
+                                _def_cash = float(st.session_state.get("_size_cash", 0.0))
+                                _kx = "manual"
+                                st.caption("📍 활성 계좌 없음 — 수동 입력으로 계산합니다. 사이드바에서 계좌를 선택하면 자동 반영됩니다.")
+
+                            _c1, _c2, _c3, _c4 = st.columns([1.15, 1, 1.15, 1.2])
+                            with _c1:
+                                _equity = st.number_input(
+                                    "계좌 자본금 ($)", min_value=0.0, step=1000.0,
+                                    value=_def_eq, key=f"_size_equity_input_{_kx}",
+                                    help="현금 + 보유주식 평가액 (계좌 총액). 현금만 넣으면 사이즈가 과소 산출됩니다.",
+                                )
+                                st.session_state["_size_equity"] = _equity
+                            with _c2:
+                                _risk_pct = st.number_input(
+                                    "거래당 리스크 (%)", min_value=0.1, max_value=5.0, step=0.1,
+                                    value=_def_risk, key=f"_size_risk_pct_input_{_kx}",
+                                )
+                                st.session_state["_size_risk_pct"] = _risk_pct
+                            with _c3:
+                                _cash_in = st.number_input(
+                                    "가용 현금 ($)", min_value=0.0, step=50.0,
+                                    value=_def_cash, key=f"_size_cash_input_{_kx}",
+                                    help="실제 집행 가능한 현금. 0 = 제한 없음(현금 게이트 미적용).",
+                                )
+                                st.session_state["_size_cash"] = _cash_in
+                            _cash_val = float(_cash_in) if _cash_in > 0 else None
+                            with _c4:
+                                _stop_src = st.selectbox(
+                                    "손절 기준", ["ATR(변동성)", "200일선", "직접 입력"],
+                                    index=0, key=f"_size_stopsrc_{selected_ticker}",
+                                )
+                            _src_map = {"ATR(변동성)": "atr", "200일선": "ma200", "직접 입력": "manual"}
+                            _manual_stop = None
+                            _manual_target = None
+                            if _src_map[_stop_src] == "manual":
+                                _mc1, _mc2 = st.columns(2)
+                                with _mc1:
+                                    _manual_stop = st.number_input(
+                                        "손절가 ($)", min_value=0.0, step=0.5,
+                                        value=float(round(float(current_price) * 0.95, 2)),
+                                        key=f"_size_mstop_{selected_ticker}",
+                                    )
+                                with _mc2:
+                                    _mt = st.number_input(
+                                        "목표가 ($, 선택)", min_value=0.0, step=0.5, value=0.0,
+                                        key=f"_size_mtgt_{selected_ticker}",
+                                    )
+                                    _manual_target = _mt if _mt > 0 else None
+                            else:
                                 _mt = st.number_input(
-                                    "목표가 ($, 선택)", min_value=0.0, step=0.5, value=0.0,
-                                    key=f"_size_mtgt_{selected_ticker}",
+                                    "목표가 ($, 선택 — 비우면 최근 고점/파생)", min_value=0.0, step=0.5,
+                                    value=0.0, key=f"_size_tgt_{selected_ticker}",
                                 )
                                 _manual_target = _mt if _mt > 0 else None
-                        else:
-                            _mt = st.number_input(
-                                "목표가 ($, 선택 — 비우면 최근 고점/파생)", min_value=0.0, step=0.5,
-                                value=0.0, key=f"_size_tgt_{selected_ticker}",
-                            )
-                            _manual_target = _mt if _mt > 0 else None
 
-                        # 국면 적응 배수/손익비 (이미 있는 _regime_params + 캐시된 DRG 재사용)
-                        try:
-                            _drg_plan = _drg_get("전체")[0]
-                        except Exception:
-                            _drg_plan = {}
-                        _rp = _regime_params(_drg_plan)
-
-                        # 사이징 입력값 산출 (scope 내 close/timing_history 사용 — 의존 최소화)
-                        try:
-                            _atr_val = rc.compute_atr(timing_history)
-                        except Exception:
-                            _atr_val = float("nan")
-                        _ma200_val = float("nan")
-                        try:
-                            _cs = pd.to_numeric(close, errors="coerce").dropna()
-                            if len(_cs) >= 150:
-                                _ma_ser = _cs.rolling(200, min_periods=150).mean().dropna()
-                                if not _ma_ser.empty:
-                                    _ma200_val = float(_ma_ser.iloc[-1])
-                        except Exception:
-                            pass
-                        _recent_high = float("nan")
-                        try:
-                            _hi_src = timing_history["High"] if "High" in timing_history.columns else timing_history["Close"]
-                            _recent_high = float(pd.to_numeric(_hi_src, errors="coerce").dropna().tail(120).max())
-                        except Exception:
-                            pass
-
-                        # ── 📅 실적 갭 제약 (earnings_core SSOT) ──────────
-                        # 갭은 손절 주문을 통과해 체결된다. 손절폭보다 큰 갭이 예정돼
-                        # 있으면 리스크 계산의 전제가 이미 깨진 상태이므로 사이즈로 방어한다.
-                        _ev_ann, _ev_days, _ev_move_pct = {}, None, None
-                        if not is_etf_mode:
+                            # 국면 적응 배수/손익비 (이미 있는 _regime_params + 캐시된 DRG 재사용)
                             try:
-                                _tk_u = str(selected_ticker).strip().upper()
-                                # 캘린더(시트) 우선 — 워치리스트/보유 종목은 FMP 호출 0
-                                _crow = (load_earnings_calendar() or {}).get(_tk_u)
-                                if _crow is not None:
-                                    _ev_days = ec.days_until_from_row(
-                                        _crow, datetime.now(_MARKET_ET_TZ).date())
-                                    _ev_ann = {"earnings_date": str(_crow.get("Earnings_Date") or ""),
-                                               "date_source": str(_crow.get("Date_Source") or ""),
-                                               "timing": str(_crow.get("Timing") or ""),
-                                               "days_until": _ev_days}
-                                    _ev_mv = ec.move_from_row(_crow)
-                                else:
-                                    # 캘린더 밖 임의 티커 — 이때만 실시간 조회
-                                    _ev_ann = cached_next_earnings(_tk_u) or {}
-                                    _ev_days = _ev_ann.get("days_until")
-                                    _ev_mv = (cached_expected_move(_tk_u)
-                                              if (_ev_days is not None
-                                                  and 0 <= int(_ev_days) <= ec.SCAN_HORIZON_DAYS)
-                                              else {"ok": False})
-                                if (_ev_days is not None and 0 <= int(_ev_days) <= ec.SCAN_HORIZON_DAYS
-                                        and _ev_mv.get("ok")):
-                                    _ev_move_pct = float(_ev_mv["median_pct"])
-                                else:
-                                    _ev_move_pct = None
+                                _drg_plan = _drg_get("전체")[0]
                             except Exception:
-                                _ev_ann, _ev_days, _ev_move_pct = {}, None, None
+                                _drg_plan = {}
+                            _rp = _regime_params(_drg_plan)
 
-                        _plan = rc.build_trade_plan(
-                            verdict_code=_timing_res.get("code"),
-                            entry=float(current_price), atr=_atr_val, ma200=_ma200_val,
-                            equity=_equity, risk_pct=_risk_pct,
-                            atr_mult=_rp["atr_mult"], rr_target=_rp["rr"],
-                            stop_source=_src_map[_stop_src],
-                            manual_stop=_manual_stop, manual_target=_manual_target,
-                            recent_high=_recent_high,
-                            max_position_pct=float(_pf_s["Max_Position_Pct"]),
-                            cash=_cash_val,
-                            reserve_pct=float(_pf_s["Cash_Reserve_Pct"]),
-                            invested_value=(_ctx_size["invested_value"] if _ctx_size else 0.0),
-                            slots_used=(_ctx_size["slots_used"] if _ctx_size else None),
-                            max_positions=(int(_pf_s["Max_Positions"]) if _ctx_size else None),
-                            min_trade_dollars=float(_pf_s["Min_Trade_Dollars"]),
-                            sizing_mode=str(_pf_s.get("Sizing_Mode", rc.SIZING_MODE_DEFAULT)),
-                            event_move_pct=_ev_move_pct,
-                        )
+                            # 사이징 입력값 산출 (scope 내 close/timing_history 사용 — 의존 최소화)
+                            try:
+                                _atr_val = rc.compute_atr(timing_history)
+                            except Exception:
+                                _atr_val = float("nan")
+                            _ma200_val = float("nan")
+                            try:
+                                _cs = pd.to_numeric(close, errors="coerce").dropna()
+                                if len(_cs) >= 150:
+                                    _ma_ser = _cs.rolling(200, min_periods=150).mean().dropna()
+                                    if not _ma_ser.empty:
+                                        _ma200_val = float(_ma_ser.iloc[-1])
+                            except Exception:
+                                pass
+                            _recent_high = float("nan")
+                            try:
+                                _hi_src = timing_history["High"] if "High" in timing_history.columns else timing_history["Close"]
+                                _recent_high = float(pd.to_numeric(_hi_src, errors="coerce").dropna().tail(120).max())
+                            except Exception:
+                                pass
 
-                        if _plan.get("binding") == "event":
-                            st.warning(
-                                f"📅 **실적 D-{_ev_days} — 갭이 손절을 통과합니다.** "
-                                f"예상 ±{_ev_move_pct:.1f}% > 손절 {abs(_plan.get('stop_pct') or 0):.1f}% → "
-                                f"투입 금액을 갭 기준으로 축소했습니다. "
-                                f"손절가 자체는 그대로이며, '손절이 지켜진다'는 전제가 깨진 구간이라 "
-                                f"사이즈로만 방어합니다."
+                            # ── 📅 실적 갭 제약 (earnings_core SSOT) ──────────
+                            # 갭은 손절 주문을 통과해 체결된다. 손절폭보다 큰 갭이 예정돼
+                            # 있으면 리스크 계산의 전제가 이미 깨진 상태이므로 사이즈로 방어한다.
+                            _ev_ann, _ev_days, _ev_move_pct = {}, None, None
+                            if not is_etf_mode:
+                                try:
+                                    _tk_u = str(selected_ticker).strip().upper()
+                                    # 캘린더(시트) 우선 — 워치리스트/보유 종목은 FMP 호출 0
+                                    _crow = (load_earnings_calendar() or {}).get(_tk_u)
+                                    if _crow is not None:
+                                        _ev_days = ec.days_until_from_row(
+                                            _crow, datetime.now(_MARKET_ET_TZ).date())
+                                        _ev_ann = {"earnings_date": str(_crow.get("Earnings_Date") or ""),
+                                                   "date_source": str(_crow.get("Date_Source") or ""),
+                                                   "timing": str(_crow.get("Timing") or ""),
+                                                   "days_until": _ev_days}
+                                        _ev_mv = ec.move_from_row(_crow)
+                                    else:
+                                        # 캘린더 밖 임의 티커 — 이때만 실시간 조회
+                                        _ev_ann = cached_next_earnings(_tk_u) or {}
+                                        _ev_days = _ev_ann.get("days_until")
+                                        _ev_mv = (cached_expected_move(_tk_u)
+                                                  if (_ev_days is not None
+                                                      and 0 <= int(_ev_days) <= ec.SCAN_HORIZON_DAYS)
+                                                  else {"ok": False})
+                                    if (_ev_days is not None and 0 <= int(_ev_days) <= ec.SCAN_HORIZON_DAYS
+                                            and _ev_mv.get("ok")):
+                                        _ev_move_pct = float(_ev_mv["median_pct"])
+                                    else:
+                                        _ev_move_pct = None
+                                except Exception:
+                                    _ev_ann, _ev_days, _ev_move_pct = {}, None, None
+
+                            _plan = rc.build_trade_plan(
+                                verdict_code=_timing_res.get("code"),
+                                entry=float(current_price), atr=_atr_val, ma200=_ma200_val,
+                                equity=_equity, risk_pct=_risk_pct,
+                                atr_mult=_rp["atr_mult"], rr_target=_rp["rr"],
+                                stop_source=_src_map[_stop_src],
+                                manual_stop=_manual_stop, manual_target=_manual_target,
+                                recent_high=_recent_high,
+                                max_position_pct=float(_pf_s["Max_Position_Pct"]),
+                                cash=_cash_val,
+                                reserve_pct=float(_pf_s["Cash_Reserve_Pct"]),
+                                invested_value=(_ctx_size["invested_value"] if _ctx_size else 0.0),
+                                slots_used=(_ctx_size["slots_used"] if _ctx_size else None),
+                                max_positions=(int(_pf_s["Max_Positions"]) if _ctx_size else None),
+                                min_trade_dollars=float(_pf_s["Min_Trade_Dollars"]),
+                                sizing_mode=str(_pf_s.get("Sizing_Mode", rc.SIZING_MODE_DEFAULT)),
+                                event_move_pct=_ev_move_pct,
                             )
-                        elif _ev_days is not None and 0 <= _ev_days <= ec.SCAN_HORIZON_DAYS:
-                            _mv_txt = (f" · 예상 ±{_ev_move_pct:.1f}%" if _ev_move_pct else "")
-                            st.caption(f"📅 실적 D-{_ev_days} ({_ev_ann.get('earnings_date', '')}"
-                                       f"{_ev_ann.get('date_source') and ' · ' + ec.DATE_SOURCE_LABELS.get(_ev_ann['date_source'], '') or ''})"
-                                       f"{_mv_txt}")
 
-                        _gate = _plan["gate"]
-                        _gate_fn = {"fit": st.success, "skip": st.warning, "avoid": st.error,
-                                    "caution": st.warning, "na": st.info}.get(_gate, st.info)
-                        _gate_fn(f"**{_plan['gate_label']}** — {_plan['gate_reason']}")
-
-                        if _gate == "na":
-                            st.caption("손절가를 산출할 수 없어 사이즈를 제안하지 않습니다. 손절 기준을 바꾸거나 직접 입력해 보세요.")
-                        else:
-                            _basis_kr = {"manual": "직접 입력", "structural_high": "최근 고점",
-                                         "rr_derived": "R:R 파생(정보용)", "na": "-"}.get(_plan["target_basis"], "-")
-                            _m1, _m2, _m3 = st.columns(3)
-                            _m1.metric("손절가", f"${_plan['stop']:.2f}",
-                                       f"{_plan['stop_pct']:.1f}% ({str(_plan['stop_source']).upper()})")
-                            _m2.metric(
-                                "목표가",
-                                f"${_plan['target']:.2f}" if pd.notna(_plan["target"]) else "-",
-                                f"{_plan['target_pct']:.1f}% · {_basis_kr}" if pd.notna(_plan["target_pct"]) else _basis_kr,
-                            )
-                            _m3.metric("손익비 (R:R)", _plan["rr_label"], f"목표 1:{_rp['rr']:.1f} (국면적응)")
-                            _mode_now = str(_plan.get("sizing_mode", rc.SIZING_MODE_DEFAULT))
-                            if _mode_now == "off":
-                                st.info("🚫 이 계좌는 **사이징 미사용**(`off`)으로 설정되어 있어 투입 금액을 제안하지 않습니다. "
-                                        "손절가·목표가·R:R 게이트만 참고하세요.")
-                            elif _mode_now == "equal_weight":
-                                st.caption(f"⚖️ **균등 배분** 계좌 — 투입 금액 = 투자가능액 ÷ {int(_pf_s['Max_Positions'])}슬롯. "
-                                           "손절폭은 금액에 영향을 주지 않습니다(손절가는 청산 기준으로만 사용).")
-                            # 금액(dollars)이 불변량 — 수량은 파생값으로 보조 표기
-                            _s1, _s2, _s3 = st.columns(3)
-                            if _mode_now != "off":
-                                _s1.metric("투입 금액", f"${_plan['dollars']:,.2f}",
-                                           f"비중 {_plan['position_pct']:.1f}% · 제한: {_plan['binding_label']}")
-                                _s2.metric("수량 (소수점)", f"{_plan['shares_exact']:,.3f}주",
-                                           f"정수주 {_plan['shares_whole']:,}주")
-                                _s3.metric("최대 손실(1R)", f"-${_plan['risk_dollars']:,.2f}",
-                                           f"자본의 {_risk_pct:.1f}%" if _mode_now == "risk_based" else "손절 도달 시")
-
-                            if _mode_now != "off" and _plan["dollars"] > 0 and not _plan["whole_share_ok"]:
-                                _px_pct = (float(_plan["entry"]) / _equity * 100.0) if _equity > 0 else 0.0
-                                st.warning(_esc_md(
-                                    f"⛔ **정수주로는 진입 불가** — 1주 ${_plan['entry']:,.2f} = 자본의 {_px_pct:.1f}%. "
-                                    f"소수점 매수 시 **${_plan['dollars']:,.2f} ({_plan['shares_exact']:.3f}주)** 를 그대로 집행하세요."
-                                ))
-                            if _plan["blocked"]:
-                                st.warning(_esc_md(f"🚧 {_plan['block_reason']}"))
-                            if _plan["binding"] == "cash":
-                                st.caption("💵 가용 현금이 사이즈를 결정했습니다 — 부분 집행입니다. 현금 보충 후 재검토하세요.")
-                            if not _plan["rr_measured"]:
-                                st.caption(
-                                    "⚠️ 신호 품질: 독립 목표(직접 입력·최근 고점)가 없어 **R:R이 실측되지 않았습니다** — "
-                                    "자금이 빠듯하면 R:R 실측 신호를 우선하세요."
+                            if _plan.get("binding") == "event":
+                                st.warning(
+                                    f"📅 **실적 D-{_ev_days} — 갭이 손절을 통과합니다.** "
+                                    f"예상 ±{_ev_move_pct:.1f}% > 손절 {abs(_plan.get('stop_pct') or 0):.1f}% → "
+                                    f"투입 금액을 갭 기준으로 축소했습니다. "
+                                    f"손절가 자체는 그대로이며, '손절이 지켜진다'는 전제가 깨진 구간이라 "
+                                    f"사이즈로만 방어합니다."
                                 )
-                            if not _plan["enter_ok"]:
-                                st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 금액은 참고용이며, 회피/신중 구간에서는 신규 진입을 권하지 않습니다.")
-                            _cap_pct_eff = float(_pf_s["Max_Position_Pct"])
-                            _turn_note = ("" if _mode_now == "risk_based" else "  (균등 배분 계좌에는 전환점이 적용되지 않습니다)")
-                            _turn_pct = (_risk_pct / _cap_pct_eff * 100.0) if _cap_pct_eff > 0 else float("nan")
-                            st.caption(_esc_md(
-                                f"국면 적응: {_rp['label']} (ATR×{_rp['atr_mult']}, 목표 1:{_rp['rr']}). "
-                                f"전환점 — 손절폭이 **{_turn_pct:.1f}%** 를 넘으면 리스크 기준이, 그 이하면 "
-                                f"비중 상한({_cap_pct_eff:.0f}%)이 금액을 결정합니다. "
-                                "손익비는 독립 목표가 있을 때만 게이트 필터로 작동합니다." + _turn_note
-                            ))
+                            elif _ev_days is not None and 0 <= _ev_days <= ec.SCAN_HORIZON_DAYS:
+                                _mv_txt = (f" · 예상 ±{_ev_move_pct:.1f}%" if _ev_move_pct else "")
+                                st.caption(f"📅 실적 D-{_ev_days} ({_ev_ann.get('earnings_date', '')}"
+                                           f"{_ev_ann.get('date_source') and ' · ' + ec.DATE_SOURCE_LABELS.get(_ev_ann['date_source'], '') or ''})"
+                                           f"{_mv_txt}")
 
-                # ── 차트 탭 ───────────────────────────────────────────────
-                chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📈 가격 + 이평선 + 볼린저밴드", "📊 MACD", "📦 거래량"])
+                            _gate = _plan["gate"]
+                            _gate_fn = {"fit": st.success, "skip": st.warning, "avoid": st.error,
+                                        "caution": st.warning, "na": st.info}.get(_gate, st.info)
+                            _gate_fn(f"**{_plan['gate_label']}** — {_plan['gate_reason']}")
 
-                with chart_tab1:
-                    chart_df = pd.DataFrame({
-                        "Close": close,
-                        "MA20": ma20,
-                        "MA50": ma50,
-                        "MA200": ma200,
-                        "BB_Upper": bb_upper,
-                        "BB_Lower": bb_lower,
-                    }).dropna(how="all")
-                    if not chart_df.empty:
-                        st.line_chart(chart_df[["Close", "MA20", "MA50", "MA200", "BB_Upper", "BB_Lower"]], use_container_width=True)
-                        st.caption("파란선=Close, MA20/50/200, BB_Upper/Lower (볼린저밴드)")
-                    else:
-                        st.warning("차트 데이터 부족")
+                            if _gate == "na":
+                                st.caption("손절가를 산출할 수 없어 사이즈를 제안하지 않습니다. 손절 기준을 바꾸거나 직접 입력해 보세요.")
+                            else:
+                                _basis_kr = {"manual": "직접 입력", "structural_high": "최근 고점",
+                                             "rr_derived": "R:R 파생(정보용)", "na": "-"}.get(_plan["target_basis"], "-")
+                                _m1, _m2, _m3 = st.columns(3)
+                                _m1.metric("손절가", f"${_plan['stop']:.2f}",
+                                           f"{_plan['stop_pct']:.1f}% ({str(_plan['stop_source']).upper()})")
+                                _m2.metric(
+                                    "목표가",
+                                    f"${_plan['target']:.2f}" if pd.notna(_plan["target"]) else "-",
+                                    f"{_plan['target_pct']:.1f}% · {_basis_kr}" if pd.notna(_plan["target_pct"]) else _basis_kr,
+                                )
+                                _m3.metric("손익비 (R:R)", _plan["rr_label"], f"목표 1:{_rp['rr']:.1f} (국면적응)")
+                                _mode_now = str(_plan.get("sizing_mode", rc.SIZING_MODE_DEFAULT))
+                                if _mode_now == "off":
+                                    st.info("🚫 이 계좌는 **사이징 미사용**(`off`)으로 설정되어 있어 투입 금액을 제안하지 않습니다. "
+                                            "손절가·목표가·R:R 게이트만 참고하세요.")
+                                elif _mode_now == "equal_weight":
+                                    st.caption(f"⚖️ **균등 배분** 계좌 — 투입 금액 = 투자가능액 ÷ {int(_pf_s['Max_Positions'])}슬롯. "
+                                               "손절폭은 금액에 영향을 주지 않습니다(손절가는 청산 기준으로만 사용).")
+                                # 금액(dollars)이 불변량 — 수량은 파생값으로 보조 표기
+                                _s1, _s2, _s3 = st.columns(3)
+                                if _mode_now != "off":
+                                    _s1.metric("투입 금액", f"${_plan['dollars']:,.2f}",
+                                               f"비중 {_plan['position_pct']:.1f}% · 제한: {_plan['binding_label']}")
+                                    _s2.metric("수량 (소수점)", f"{_plan['shares_exact']:,.3f}주",
+                                               f"정수주 {_plan['shares_whole']:,}주")
+                                    _s3.metric("최대 손실(1R)", f"-${_plan['risk_dollars']:,.2f}",
+                                               f"자본의 {_risk_pct:.1f}%" if _mode_now == "risk_based" else "손절 도달 시")
 
-                with chart_tab2:
-                    macd_df = pd.DataFrame({
-                        "MACD": macd_line,
-                        "Signal": signal_line,
-                        "Histogram": histogram,
-                    }).dropna(how="all")
-                    if not macd_df.empty:
-                        st.line_chart(macd_df[["MACD", "Signal"]], use_container_width=True)
-                        st.bar_chart(macd_df[["Histogram"]], use_container_width=True)
-                        st.caption("MACD가 Signal 위로 올라오면 상승 전환 신호. Histogram이 양수(+)면 상승 모멘텀.")
-                    else:
-                        st.warning("MACD 데이터 부족")
+                                if _mode_now != "off" and _plan["dollars"] > 0 and not _plan["whole_share_ok"]:
+                                    _px_pct = (float(_plan["entry"]) / _equity * 100.0) if _equity > 0 else 0.0
+                                    st.warning(_esc_md(
+                                        f"⛔ **정수주로는 진입 불가** — 1주 ${_plan['entry']:,.2f} = 자본의 {_px_pct:.1f}%. "
+                                        f"소수점 매수 시 **${_plan['dollars']:,.2f} ({_plan['shares_exact']:.3f}주)** 를 그대로 집행하세요."
+                                    ))
+                                if _plan["blocked"]:
+                                    st.warning(_esc_md(f"🚧 {_plan['block_reason']}"))
+                                if _plan["binding"] == "cash":
+                                    st.caption("💵 가용 현금이 사이즈를 결정했습니다 — 부분 집행입니다. 현금 보충 후 재검토하세요.")
+                                if not _plan["rr_measured"]:
+                                    st.caption(
+                                        "⚠️ 신호 품질: 독립 목표(직접 입력·최근 고점)가 없어 **R:R이 실측되지 않았습니다** — "
+                                        "자금이 빠듯하면 R:R 실측 신호를 우선하세요."
+                                    )
+                                if not _plan["enter_ok"]:
+                                    st.caption("⚠️ 게이트가 '진입 적합'이 아닙니다 — 위 금액은 참고용이며, 회피/신중 구간에서는 신규 진입을 권하지 않습니다.")
+                                _cap_pct_eff = float(_pf_s["Max_Position_Pct"])
+                                _turn_note = ("" if _mode_now == "risk_based" else "  (균등 배분 계좌에는 전환점이 적용되지 않습니다)")
+                                _turn_pct = (_risk_pct / _cap_pct_eff * 100.0) if _cap_pct_eff > 0 else float("nan")
+                                st.caption(_esc_md(
+                                    f"국면 적응: {_rp['label']} (ATR×{_rp['atr_mult']}, 목표 1:{_rp['rr']}). "
+                                    f"전환점 — 손절폭이 **{_turn_pct:.1f}%** 를 넘으면 리스크 기준이, 그 이하면 "
+                                    f"비중 상한({_cap_pct_eff:.0f}%)이 금액을 결정합니다. "
+                                    "손익비는 독립 목표가 있을 때만 게이트 필터로 작동합니다." + _turn_note
+                                ))
 
-                with chart_tab3:
-                    if not volume.dropna().empty:
-                        vol_df = pd.DataFrame({"Volume": volume}).dropna()
-                        st.bar_chart(vol_df, use_container_width=True)
-                        st.caption("거래량 급증 + 가격 상승 = 강한 신호. 거래량 감소 + 가격 상승 = 약한 신호.")
-                    else:
-                        st.warning("거래량 데이터 없음")
+                    # ── 차트 탭 ───────────────────────────────────────────────
+                    chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📈 가격 + 이평선 + 볼린저밴드", "📊 MACD", "📦 거래량"])
 
-        except Exception as e:
-            st.error("매수 타점 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
-            st.exception(e)
+                    with chart_tab1:
+                        chart_df = pd.DataFrame({
+                            "Close": close,
+                            "MA20": ma20,
+                            "MA50": ma50,
+                            "MA200": ma200,
+                            "BB_Upper": bb_upper,
+                            "BB_Lower": bb_lower,
+                        }).dropna(how="all")
+                        if not chart_df.empty:
+                            st.line_chart(chart_df[["Close", "MA20", "MA50", "MA200", "BB_Upper", "BB_Lower"]], use_container_width=True)
+                            st.caption("파란선=Close, MA20/50/200, BB_Upper/Lower (볼린저밴드)")
+                        else:
+                            st.warning("차트 데이터 부족")
 
-        # ── Earnings Surprise 히스토리 ────────────────────────────────────
-        if not is_etf_mode:
+                    with chart_tab2:
+                        macd_df = pd.DataFrame({
+                            "MACD": macd_line,
+                            "Signal": signal_line,
+                            "Histogram": histogram,
+                        }).dropna(how="all")
+                        if not macd_df.empty:
+                            st.line_chart(macd_df[["MACD", "Signal"]], use_container_width=True)
+                            st.bar_chart(macd_df[["Histogram"]], use_container_width=True)
+                            st.caption("MACD가 Signal 위로 올라오면 상승 전환 신호. Histogram이 양수(+)면 상승 모멘텀.")
+                        else:
+                            st.warning("MACD 데이터 부족")
+
+                    with chart_tab3:
+                        if not volume.dropna().empty:
+                            vol_df = pd.DataFrame({"Volume": volume}).dropna()
+                            st.bar_chart(vol_df, use_container_width=True)
+                            st.caption("거래량 급증 + 가격 상승 = 강한 신호. 거래량 감소 + 가격 상승 = 약한 신호.")
+                        else:
+                            st.warning("거래량 데이터 없음")
+
+            except Exception as e:
+                st.error("매수 타점 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
+                st.exception(e)
+
+        # ── ③ 📋 펀더멘털 — 체력 검사 · 어닝콜 요약 · 실적 서프라이즈 ─────
+        elif _si_view == _SI_V3:
             st.divider()
-            st.markdown("### 📅 Earnings Surprise 히스토리")
-            st.caption("최근 분기별 EPS 예상 대비 실제 Beat/Miss 현황입니다.")
+            st.markdown("### 체력 검사 (Fundamentals)")
+            st.caption("FMP 기반 KPI 점검 (Pass/Fail)")
+    
             try:
-                with st.spinner("어닝 데이터 불러오는 중..."):
-                    with _timed("정밀 실적히스토리"):
-                        earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
-
-                if earn_df.empty:
-                    st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
-                else:
-                    earn_df.columns = [str(c).strip() for c in earn_df.columns]
-
-                    # ── Beat/Miss 판정 ──────────────────────────────────────
-                    # 방법 1: "어닝 서프라이즈" 컬럼이 이미 있으면 바로 사용
-                    _surp_col = next((c for c in earn_df.columns if "서프라이즈" in c or "surprise" in c.lower()), None)
-                    if _surp_col:
-                        # "+1.2%" 형태 → 수치 파싱
-                        _sv = pd.to_numeric(
-                            earn_df[_surp_col].astype(str).str.replace(r"[%+]","",regex=True),
-                            errors="coerce"
-                        )
-                        earn_df["판정"] = _sv.apply(
-                            lambda x: "✅ Beat" if pd.notna(x) and x > 0 else ("❌ Miss" if pd.notna(x) and x < 0 else "—")
-                        )
+                if is_etf_mode:
+                    st.info("📊 ETF 분석 모드입니다. 개별 기업의 재무제표 대신 펀드 건전성 지표를 제공합니다.")
+    
+                    total_assets = to_float(selected_ticker_info.get("totalAssets"))
+                    expense_ratio_raw = to_float(selected_ticker_info.get("expenseRatio"))
+                    etf_yield_raw = to_float(selected_ticker_info.get("yield"))
+    
+                    expense_ratio_pct = expense_ratio_raw * 100 if not pd.isna(expense_ratio_raw) else np.nan
+                    etf_yield_pct = etf_yield_raw * 100 if not pd.isna(etf_yield_raw) else np.nan
+    
+                    asset_col, fee_col, yield_col = st.columns(3)
+                    with asset_col:
+                        st.metric("순자산 규모 (AUM)", usd_short_str(total_assets))
+                    with fee_col:
+                        fee_delta = "✅ Pass (<0.5%)" if (pd.notna(expense_ratio_pct) and expense_ratio_pct < 0.5) else "🟡 Warning (>=0.5%)"
+                        if pd.isna(expense_ratio_pct):
+                            fee_delta = "N/A"
+                        st.metric("운용 보수", pct_points_str(expense_ratio_pct), delta=fee_delta)
+                    with yield_col:
+                        st.metric("배당 수익률", pct_points_str(etf_yield_pct))
+    
+                    st.success("✅ [ETF 패스] 분산 투자된 펀드이므로 개별 재무 건전성 킬 스위치를 면제합니다.")
+    
+                    with st.spinner(f"{selected_ticker} 보유 종목(Top Holdings) 불러오는 중..."):
+                        with _timed("정밀 보유ETF검색"):
+                            holdings_universe = cached_etf_holdings_universe_str(selected_ticker)
+                        if holdings_universe is None or holdings_universe.empty:
+                            holdings_top10 = pd.DataFrame(columns=["Ticker", "Weight(%)"])
+                            etf_perf_df = pd.DataFrame()
+                        else:
+                            holdings_top10 = holdings_universe.head(10).reset_index(drop=True)
+                            perf_key = _etf_holdings_perf_cache_key(holdings_top10)
+                            with _timed("정밀 ETF성과쌍"):
+                                etf_perf_df = cached_build_etf_holdings_performance_pairs(perf_key)
+    
+                    if holdings_universe is None or holdings_universe.empty:
+                        st.info("해당 ETF의 세부 종목 데이터를 야후 파이낸스에서 불러올 수 없습니다.")
+                    elif etf_perf_df.empty:
+                        st.markdown("### 보유 종목 TOP 10 (Top Holdings)")
+                        st.dataframe(holdings_top10, use_container_width=True, hide_index=True)
+                        st.warning("보유 종목 가격·수익률 데이터를 불러오지 못했습니다. 위 표는 티커·비중만 표시합니다.")
                     else:
-                        # 방법 2: EPS 예상/실제 컬럼에서 직접 계산
-                        est_col = next((c for c in earn_df.columns
-                            if "estimate" in c.lower() or "eps 예상" in c.lower() or "예상" in c.lower()), None)
-                        act_col = next((c for c in earn_df.columns
-                            if "actual" in c.lower() or "reported" in c.lower()
-                               or "eps 실제" in c.lower() or "실제" in c.lower()), None)
-                        if est_col and act_col:
-                            _en = pd.to_numeric(earn_df[est_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
-                            _an = pd.to_numeric(earn_df[act_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
-                            _diff = ((_an - _en) / _en.abs() * 100).round(1)
-                            earn_df["어닝 서프라이즈"] = _diff.apply(
-                                lambda x: f"{x:+.1f}%" if pd.notna(x) else "N/A"
+                        order = holdings_top10["Ticker"].tolist()
+                        etf_perf_df = etf_perf_df.set_index("Ticker").reindex(order).reset_index()
+    
+                        return_cols = ["1개월(%)", "3개월(%)", "6개월(%)", "12개월(%)"]
+                        styled_top10 = (
+                            etf_perf_df.style.format(
+                                {
+                                    "현재가": "${:,.2f}",
+                                    "1개월(%)": "{:.2f}%",
+                                    "3개월(%)": "{:.2f}%",
+                                    "6개월(%)": "{:.2f}%",
+                                    "12개월(%)": "{:.2f}%",
+                                    "비중(%)": "{:.2f}%",
+                                },
+                                na_rep="N/A",
                             )
-                            earn_df["판정"] = _diff.apply(
+                            .background_gradient(cmap="RdYlGn", subset=return_cols, axis=0)
+                        )
+    
+                        st.divider()
+                        st.markdown("### 보유 종목 TOP 10 (Top Holdings)")
+                        st.dataframe(styled_top10, use_container_width=True, hide_index=True)
+                else:
+                    with st.spinner(f"{selected_ticker} 데이터 불러오는 중..."):
+                        with _timed("정밀 KPI 스냅샷"):
+                            kpi_df, _c_pass, _c_fail, _c_nodata, margin_context = cached_evaluate_kpis_snapshot(
+                                selected_ticker
+                            )
+                    # 캐시된 카운트 무시 — kpi_df에서 직접 계산 (캐시 형식 불일치 방지)
+                    _pp = kpi_df["Pass"].astype(str)
+                    pass_count   = int((_pp.str.contains("Pass",  case=False) & ~_pp.str.contains("Fail", case=False)).sum())
+                    fail_count   = int(_pp.str.contains("Fail",   case=False).sum())
+                    nodata_count = int((_pp.str.contains("N/A|No Data", case=False) & ~_pp.str.contains("Fail|Pass", case=False)).sum())
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    total_kpis = len(kpi_df)
+                    c1.metric("총 KPI", total_kpis)
+                    c2.metric("Pass", pass_count)
+                    c3.metric("Fail", fail_count)
+                    c4.metric("No Data", nodata_count)
+    
+                    with st.container():
+                        final_core_pass = bool(margin_context.get("core_fcf_pass"))
+                        if final_core_pass:
+                            st.success("✅ [최종 합격] 필수 재무 건전성(현금창출력)이 검증된 종목입니다.")
+                        else:
+                            st.error("🚨 [최종 불합격] 잉여현금흐름 적자 기업. 투자를 권장하지 않습니다.")
+    
+                    st.divider()
+                    st.subheader(f"{selected_ticker} KPI 대시보드")
+
+                    # ── 투자 스타일 점수 (KPI 위) ─────────────────────────────
+                    st.markdown("#### 🎯 투자 스타일 적합도")
+                    st.caption("CAN SLIM · 가치투자 · 장기 우량주 3가지 관점에서 이 종목을 평가합니다.")
+                    with st.spinner("투자 스타일 점수 계산 중..."):
+                        try:
+                            _style = calculate_style_scores(
+                                str(selected_ticker).strip().upper(),
+                                margin_context,
+                                kpi_df,
+                            )
+                            _sc1, _sc2, _sc3 = st.columns(3)
+                            for _col, _key, _label, _desc in [
+                                (_sc1, "canslim",  "📈 CAN SLIM",    "고성장 모멘텀"),
+                                (_sc2, "value",    "💰 가치투자",    "저평가 발굴"),
+                                (_sc3, "quality",  "🏆 장기 우량주", "퀄리티 투자"),
+                            ]:
+                                _d = _style[_key]
+                                with _col:
+                                    st.markdown(
+                                        f"<div style='background:#1e293b;border-radius:12px;padding:16px;"
+                                        f"border-top:4px solid {_d['color']};text-align:center;'>"
+                                        f"<div style='font-size:14px;color:#94a3b8;'>{_label}</div>"
+                                        f"<div style='font-size:36px;font-weight:800;color:{_d['color']};'>{_d['score']}</div>"
+                                        f"<div style='font-size:13px;color:#cbd5e1;'>/ 100점</div>"
+                                        f"<div style='font-size:15px;margin-top:4px;'>{_d['grade']}</div>"
+                                        f"<div style='font-size:11px;color:#64748b;margin-top:2px;'>{_desc}</div>"
+                                        f"</div>",
+                                        unsafe_allow_html=True,
+                                    )
+
+                            # 주도 스타일 배너
+                            _dom = _style["dominant"]
+                            _dom_score = _style["scores"][_dom]
+                            st.markdown(
+                                f"<div style='background:#0f172a;border:1px solid #334155;"
+                                f"border-radius:8px;padding:10px 16px;margin-top:12px;'>"
+                                f"<span style='color:#94a3b8;'>💡 이 종목의 주도 스타일: </span>"
+                                f"<strong style='color:#f1f5f9;font-size:16px;'>{_dom}</strong>"
+                                f"<span style='color:#64748b;font-size:13px;'> ({_dom_score}점)</span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                            # 세부 점수 expander
+                            with st.expander("📊 세부 점수 보기", expanded=False):
+                                _det_c1, _det_c2, _det_c3 = st.columns(3)
+                                for _dc, _key, _label in [
+                                    (_det_c1, "canslim",  "📈 CAN SLIM"),
+                                    (_det_c2, "value",    "💰 가치투자"),
+                                    (_det_c3, "quality",  "🏆 장기 우량주"),
+                                ]:
+                                    with _dc:
+                                        st.markdown(f"**{_label}**")
+                                        for _k, _v in _style[_key]["detail"].items():
+                                            _kname = _k.replace("_", " ")
+                                            st.caption(f"{_kname}: {_v}")
+
+                        except Exception as _se:
+                            st.warning(f"스타일 점수 계산 오류: {_se}")
+
+                    st.divider()
+    
+                    category_order = [
+                        "수익성 (Profitability)",
+                        "건전성 (Financial Strength)",
+                        "밸류에이션 (Valuation)",
+                        "모멘텀 (Momentum)",
+                    ]
+    
+                    for category in category_order:
+                        st.markdown(f"### {category}")
+                        cat_df = kpi_df[kpi_df["Category"] == category].reset_index(drop=True)
+
+                        if category == "모멘텀 (Momentum)":
+                            # 모멘텀은 값이 길어서 카드 형태로 별도 표시
+                            for _, row in cat_df.iterrows():
+                                _pass_str = str(row["Pass"])
+                                _is_pass = "Pass" in _pass_str and "Fail" not in _pass_str
+                                _is_fail = "Fail" in _pass_str
+                                _is_nodata = "No Data" in _pass_str
+                                _card_color = "#16a34a" if _is_pass else ("#dc2626" if _is_fail else "#94a3b8")
+                                _pass_label = "✅ Pass" if _is_pass else ("❌ Fail" if _is_fail else "⚫ 데이터 없음")
+                                _val = str(row["Value"])
+                                _parts = [p.strip() for p in _val.split("/") if p.strip()]
+                                _html = (
+                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px 16px;"
+                                    f"border-left:4px solid {_card_color};margin:6px 0;'>"
+                                    f"<div style='color:{_card_color};font-weight:700;font-size:15px;margin-bottom:8px;'>"
+                                    f"{_pass_label} — {row['Rule']}</div>"
+                                )
+                                for _p in _parts:
+                                    _html += f"<div style='font-size:14px;color:#e2e8f0;margin:2px 0;'>• {_p}</div>"
+                                _html += "</div>"
+                                st.markdown(_html, unsafe_allow_html=True)
+                        else:
+                            for idx in range(0, len(cat_df), 2):
+                                cols = st.columns(2)
+                                for j in range(2):
+                                    row_idx = idx + j
+                                    if row_idx >= len(cat_df):
+                                        continue
+                                    row = cat_df.iloc[row_idx]
+                                    with cols[j]:
+                                        st.metric(label=row["KPI"], value=row["Value"], delta=row["Rule"])
+                                        st.markdown(f"판정: {row['Pass']}")
+
+                        if category == "밸류에이션 (Valuation)":
+                            _fpe  = margin_context.get("forward_pe")
+                            _tpe  = margin_context.get("trailing_pe")
+                            _pb   = margin_context.get("price_to_book")
+                            _ev   = margin_context.get("ev_to_ebitda")
+                            _evs  = margin_context.get("ev_to_sales")
+                            _evf  = margin_context.get("ev_to_fcf")
+                            _iv   = margin_context.get("intrinsic_value")
+                            _mos  = margin_context.get("margin_of_safety")
+                            _cp   = margin_context.get("current_price")
+
+                            # Valuation 지표는 위 카드에서 이미 표시됨 — 중복 제거
+
+                            # Graham 적정주가 — 가치주 조건 만족 시에만 표시
+                            # 조건: EPS > 0, 성장률 0~20%, P/E < 25 (성장주·적자기업 제외)
+                            _eps_val    = margin_context.get("trailing_eps")
+                            _growth_val = margin_context.get("growth_percent")
+                            _pe_val     = _tpe if pd.notna(_tpe) else _fpe
+
+                            _is_value_stock = (
+                                pd.notna(_eps_val) and _eps_val > 0
+                                and pd.notna(_growth_val) and 0 < _growth_val < 20
+                                and (pd.isna(_pe_val) or _pe_val < 25)
+                            )
+
+                            if _is_value_stock and pd.notna(_iv) and pd.notna(_mos):
+                                st.divider()
+                                st.caption(
+                                    "📌 **Graham 안전마진** — 저PER·저성장 가치주 전용 지표입니다. "
+                                    "성장주(P/E ≥ 25 또는 성장률 ≥ 20%)에는 표시되지 않습니다."
+                                )
+                                intrinsic_col, mos_col = st.columns(2)
+                                with intrinsic_col:
+                                    st.metric(
+                                        "적정 주가 (Graham)",
+                                        f"${num_str(_iv)}",
+                                        delta=(
+                                            f"EPS {num_str(_eps_val)} / "
+                                            f"성장률 {pct_points_str(_growth_val)}"
+                                        ),
+                                    )
+                                with mos_col:
+                                    _mos_color = "normal" if _mos >= 20 else "inverse"
+                                    st.metric(
+                                        "안전마진 (Margin of Safety %)",
+                                        pct_points_str(_mos),
+                                        delta=f"현재가 ${num_str(_cp)}",
+                                        delta_color=_mos_color,
+                                    )
+                                if _mos < 0:
+                                    st.warning("⚠️ 현재가가 Graham 적정가보다 높습니다. 고평가 구간일 수 있습니다.")
+                                elif _mos >= 20:
+                                    st.success(f"✅ 안전마진 {_mos:.1f}% — Graham 기준 매력적인 가격대입니다.")
+
+                        st.divider()
+
+    
+                    # ── Altman Z-Score + Piotroski F-Score ──────────────────────
+                    with st.expander("🏦 재무 건전성 점수 (Altman Z / Piotroski F)", expanded=True):
+                        st.caption("FMP `/financial-scores` 기반. Altman Z는 파산 위험, Piotroski F는 재무 종합 점수(0~9).")
+                        with st.spinner(f"{selected_ticker} 재무 건전성 점수 조회 중..."):
+                            with _timed("정밀 재무건전성"):
+                                _fs = _fmp_financial_scores(str(selected_ticker).strip().upper())
+                        if _fs:
+                            _az = to_float(_fs.get("altmanZScore"))
+                            _ps = to_float(_fs.get("piotroskiScore"))
+                            _az_col, _ps_col = st.columns(2)
+                            with _az_col:
+                                if pd.notna(_az):
+                                    if _az >= 3.0:
+                                        _az_label = "✅ 안전 구간 (≥3.0)"
+                                        _az_color = "#16a34a"
+                                    elif _az >= 1.81:
+                                        _az_label = "⚠️ 회색 구간 (1.81~3.0)"
+                                        _az_color = "#d97706"
+                                    else:
+                                        _az_label = "🚨 위험 구간 (<1.81)"
+                                        _az_color = "#dc2626"
+                                    st.markdown(
+                                        f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
+                                        f"border-left:4px solid {_az_color};'>"
+                                        f"<div style='color:#94a3b8;font-size:12px;'>Altman Z-Score</div>"
+                                        f"<div style='color:{_az_color};font-size:26px;font-weight:900;'>{_az:.2f}</div>"
+                                        f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_az_label}</div>"
+                                        f"<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
+                                        f"≥3.0 안전 · 1.81~3.0 주의 · &lt;1.81 파산위험</div>"
+                                        f"</div>",
+                                        unsafe_allow_html=True,
+                                    )
+                                else:
+                                    st.metric("Altman Z-Score", "N/A")
+                            with _ps_col:
+                                if pd.notna(_ps):
+                                    _ps_int = int(_ps)
+                                    if _ps_int >= 7:
+                                        _ps_label = "✅ 강한 재무 (7~9)"
+                                        _ps_color = "#16a34a"
+                                    elif _ps_int >= 4:
+                                        _ps_label = "🟡 중립 (4~6)"
+                                        _ps_color = "#d97706"
+                                    else:
+                                        _ps_label = "🚨 약한 재무 (0~3)"
+                                        _ps_color = "#dc2626"
+                                    _ps_bar = "█" * _ps_int + "░" * (9 - _ps_int)
+                                    st.markdown(
+                                        f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
+                                        f"border-left:4px solid {_ps_color};'>"
+                                        f"<div style='color:#94a3b8;font-size:12px;'>Piotroski F-Score</div>"
+                                        f"<div style='color:{_ps_color};font-size:26px;font-weight:900;'>{_ps_int} / 9</div>"
+                                        f"<div style='color:{_ps_color};font-size:14px;font-family:monospace;'>{_ps_bar}</div>"
+                                        f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>{_ps_label}</div>"
+                                        f"</div>",
+                                        unsafe_allow_html=True,
+                                    )
+                                else:
+                                    st.metric("Piotroski F-Score", "N/A")
+                        else:
+                            st.caption("재무 건전성 데이터를 조회할 수 없습니다.")
+
+                    with st.expander("원본 KPI 테이블 보기"):
+                        st.dataframe(
+                            kpi_df[["Category", "KPI", "Value", "Rule", "Pass"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+    
+            except Exception as e:
+                st.error("펀더멘털(체력 검사) 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
+                st.exception(e)
+
+            # ── 어닝콜 트랜스크립트 AI 요약 ───────────────────────────────────
+            st.divider()
+            st.markdown("### 📞 어닝콜 트랜스크립트 AI 요약")
+            st.caption("직전 분기 실적발표 원문 → Gemini 3줄 요약 (가이던스·경영진 톤·주요 리스크)")
+            _tc_key = f"_transcript_summary_{selected_ticker}"
+            _tc_raw_key = f"_transcript_raw_{selected_ticker}"
+            _tc_col1, _tc_col2 = st.columns([1, 1])
+            with _tc_col1:
+                if st.button("🤖 트랜스크립트 AI 요약 실행", key=f"tc_btn_{selected_ticker}", use_container_width=True):
+                    with st.spinner("어닝콜 원문 조회 중..."):
+                        with _timed("정밀 어닝콜원문"):
+                            _tc_data = _fmp_earnings_transcript(str(selected_ticker).strip().upper())
+                    st.session_state[_tc_raw_key] = _tc_data
+                    if _tc_data and _tc_data.get("content"):
+                        _tc_text = str(_tc_data["content"])[:6000]
+                        _tc_q = _tc_data.get("quarter", "")
+                        _tc_y = _tc_data.get("year", "")
+                        _tc_prompt = (
+                            f"{selected_ticker} {_tc_y}년 Q{_tc_q} 어닝콜 트랜스크립트를 분석하세요.\n\n"
+                            "다음 3가지를 각각 2~3문장으로 요약하세요:\n"
+                            "1) 📈 가이던스 (상향/하향/유지 여부, 구체 수치)\n"
+                            "2) 🎙️ 경영진 톤 (자신감/우려/방어적 등 분위기)\n"
+                            "3) ⚠️ 주요 리스크 (경영진이 언급한 위험 요인)\n\n"
+                            "한국어로 답변하세요.\n\n"
+                            f"[트랜스크립트 원문]\n{_tc_text}"
+                        )
+                        with st.spinner("Gemini 요약 중..."):
+                            try:
+                                _tc_model = _GenAIModel(
+                                    "gemini-2.5-flash",
+                                    generation_config={"temperature": 0.1, "max_output_tokens": 4096, "thinking_budget": 0},
+                                )
+                                _tc_resp = _tc_model.generate_content(_tc_prompt)
+                                _tc_summary = (_gemini_response_text_utf8_safe(_tc_resp) or "").strip()
+                                st.session_state[_tc_key] = {
+                                    "summary": _tc_summary,
+                                    "quarter": _tc_q,
+                                    "year": _tc_y,
+                                }
+                            except Exception as _tc_err:
+                                st.error(f"Gemini 요약 실패: {_tc_err}")
+                    else:
+                        st.warning("어닝콜 트랜스크립트 데이터를 찾을 수 없습니다.")
+            with _tc_col2:
+                if st.session_state.get(_tc_key):
+                    _tc_sum = st.session_state[_tc_key]
+                    st.caption(f"📅 {_tc_sum.get('year')}년 Q{_tc_sum.get('quarter')} 어닝콜")
+            if st.session_state.get(_tc_key) and st.session_state[_tc_key].get("summary"):
+                st.markdown(st.session_state[_tc_key]["summary"])
+                _tc_raw = st.session_state.get(_tc_raw_key, {})
+                if _tc_raw and _tc_raw.get("content"):
+                    with st.expander("📄 원문 보기 (영문)", expanded=False):
+                        st.text(str(_tc_raw["content"])[:3000] + ("..." if len(str(_tc_raw.get("content",""))) > 3000 else ""))
+
+            # ── Earnings Surprise 히스토리 ─────────────────────────────
+            if not is_etf_mode:
+                st.divider()
+                st.markdown("### 📅 Earnings Surprise 히스토리")
+                st.caption("최근 분기별 EPS 예상 대비 실제 Beat/Miss 현황입니다.")
+                try:
+                    with st.spinner("어닝 데이터 불러오는 중..."):
+                        with _timed("정밀 실적히스토리"):
+                            earn_df = cached_earnings_history(str(selected_ticker).strip().upper())
+
+                    if earn_df.empty:
+                        st.info("어닝 히스토리 데이터를 가져오지 못했습니다.")
+                    else:
+                        earn_df.columns = [str(c).strip() for c in earn_df.columns]
+
+                        # ── Beat/Miss 판정 ──────────────────────────────────────
+                        # 방법 1: "어닝 서프라이즈" 컬럼이 이미 있으면 바로 사용
+                        _surp_col = next((c for c in earn_df.columns if "서프라이즈" in c or "surprise" in c.lower()), None)
+                        if _surp_col:
+                            # "+1.2%" 형태 → 수치 파싱
+                            _sv = pd.to_numeric(
+                                earn_df[_surp_col].astype(str).str.replace(r"[%+]","",regex=True),
+                                errors="coerce"
+                            )
+                            earn_df["판정"] = _sv.apply(
                                 lambda x: "✅ Beat" if pd.notna(x) and x > 0 else ("❌ Miss" if pd.notna(x) and x < 0 else "—")
                             )
-
-                    # ── Beat 비율 요약 ──────────────────────────────────────
-                    if "판정" in earn_df.columns:
-                        beat_count  = (earn_df["판정"] == "✅ Beat").sum()
-                        total_count = len(earn_df[earn_df["판정"] != "—"])
-                        if total_count > 0:
-                            beat_rate = beat_count / total_count * 100
-                            msg = f"어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}분기)"
-                            if beat_rate >= 75:   st.success(f"🏆 {msg} — 실적 퀄리티 우수")
-                            elif beat_rate >= 50: st.warning(f"🟡 {msg} — 보통")
-                            else:                 st.error(f"🔴 {msg} — 실적 부진")
-
-                    # ── 색상 스타일 적용 ────────────────────────────────────
-                    def _style_surp(val):
-                        v = pd.to_numeric(str(val).replace("%","").replace("+",""), errors="coerce")
-                        if pd.isna(v): return ""
-                        return "color:#16a34a;font-weight:600" if v > 0 else "color:#dc2626;font-weight:600"
-
-                    _style_cols = [c for c in earn_df.columns if "서프라이즈" in c or "surprise" in c.lower()]
-                    if _style_cols:
-                        st.dataframe(earn_df.style.map(_style_surp, subset=_style_cols), use_container_width=True, hide_index=True)
-                    else:
-                        st.dataframe(earn_df, use_container_width=True, hide_index=True)
-            except Exception as _ee:
-                st.warning(f"어닝 히스토리 로드 오류: {_ee}")
-
-            # ── 기관 보유 비중 ────────────────────────────────────────────
-            st.divider()
-            st.markdown("### 🏦 기관 투자자 보유 현황")
-            st.caption("상위 기관의 보유 비중. 기관 보유 비중이 높고 증가 추세이면 스마트머니 유입 신호입니다.")
-            try:
-                _tk_inst = str(selected_ticker).strip().upper()
-                _k_inst  = _fmp_key()
-                _shown   = False
-
-                with st.spinner("애널리스트 데이터 불러오는 중..."):
-                    if _k_inst:
-                        # grades-consensus 단일 소스.
-                        # ratings-snapshot 선행 시도를 제거했다 — 그 엔드포인트에는
-                        # strongBuy/buy/hold/sell/strongSell 이 없어 항상 _tot=0 으로
-                        # 떨어졌고, 결국 매번 1콜을 버리고 여기로 내려왔다.
-                        # (상세 근거는 8074 주석)
-                        try:
-                            _r2 = requests.get(
-                                f"{_FMP_BASE}/grades-consensus?symbol={_tk_inst}&apikey={_k_inst}",
-                                timeout=_FMP_TIMEOUT
-                            )
-                            if _r2.status_code == 200:
-                                _rd2 = _r2.json()
-                                _gc  = _rd2[0] if isinstance(_rd2, list) and _rd2 else (
-                                       _rd2 if isinstance(_rd2, dict) else {})
-                                if _gc:
-                                    _sb2 = int(to_float(_gc.get("strongBuy")  or 0) or 0)
-                                    _b2  = int(to_float(_gc.get("buy")        or 0) or 0)
-                                    _h2  = int(to_float(_gc.get("hold")       or 0) or 0)
-                                    _s2  = int(to_float(_gc.get("sell")       or 0) or 0)
-                                    _ss2 = int(to_float(_gc.get("strongSell") or 0) or 0)
-                                    _tot2 = _sb2+_b2+_h2+_s2+_ss2
-                                    if _tot2 > 0:
-                                        _bp2 = round((_sb2+_b2)/_tot2*100, 1)
-                                        ic1, ic2, ic3 = st.columns(3)
-                                        ic1.metric("매수 의견 비율", f"{_bp2:.0f}%", f"Strong Buy {_sb2} + Buy {_b2}명")
-                                        ic2.metric("Hold", f"{_h2}명")
-                                        ic3.metric("Sell / Strong Sell", f"{_s2+_ss2}명", f"총 {_tot2}명")
-                                        # 종합 의견 배지 — grades-consensus 의 consensus 필드가
-                                        # 진짜 애널리스트 컨센서스 라벨("Buy"/"Hold" 등)이다.
-                                        # 구버전은 이 배지를 ratings-snapshot 쪽에만 달아 놨고
-                                        # 그 분기는 한 번도 실행된 적이 없다 → 배지가 영영 안 떴다.
-                                        _rlabel = str(_gc.get("consensus") or "").strip()
-                                        if _rlabel:
-                                            _col = "#16a34a" if _bp2 >= 60 else ("#f59e0b" if _bp2 >= 40 else "#dc2626")
-                                            st.markdown(
-                                                f"<div style='background:#1e293b;border-radius:8px;padding:10px 16px;"
-                                                f"border-left:4px solid {_col};margin-top:8px;'>"
-                                                f"<span style='color:{_col};font-weight:700;'>📊 종합 의견: {_rlabel}</span></div>",
-                                                unsafe_allow_html=True)
-                                        _shown = True
-                        except Exception:
-                            pass
-
-                if not _shown:
-                    # FMP API에서 데이터 없음 — 직접 응답 내용 디버그
-                    st.info("애널리스트 컨센서스 데이터를 가져오지 못했습니다. (FMP API 응답 없음)")
-            except Exception as _ie:
-                st.warning(f"데이터 로드 오류: {_ie}")
-
-
-
-            # ── 인사이더 트레이딩 ─────────────────────────────────────────
-            st.divider()
-            st.markdown("### 🕵️ 인사이더 트레이딩")
-            st.caption("CEO·CFO 등 내부자의 실제 매수/매도 거래. 대량 매수는 강한 내부 확신 신호입니다.")
-            try:
-                with st.spinner("인사이더 거래 데이터 불러오는 중..."):
-                    _tk_ins = str(selected_ticker).strip().upper()
-                    with _timed("정밀 내부자거래"):
-                        insider_df = fetch_insider_trading(_tk_ins)
-                    with _timed("정밀 내부자통계"):
-                        insider_stats = fetch_insider_statistics(_tk_ins)
-
-                # 통계 요약 먼저 표시
-                if insider_stats or not insider_df.empty:
-                    purchases = to_float(insider_stats.get("total_purchases") or insider_stats.get("acquired")) if insider_stats else None
-                    sales     = to_float(insider_stats.get("total_sales")     or insider_stats.get("disposed"))  if insider_stats else None
-                    ins_c1, ins_c2, ins_c3 = st.columns(3)
-                    with ins_c1:
-                        p_n = int(purchases) if purchases is not None and pd.notna(purchases) else 0
-                        st.metric("내부자 매수 건수", f"{p_n}건")
-                    with ins_c2:
-                        s_n = int(sales) if sales is not None and pd.notna(sales) else 0
-                        st.metric("내부자 매도 건수", f"{s_n}건")
-                    with ins_c3:
-                        p_v = float(purchases) if purchases is not None and pd.notna(purchases) else 0.0
-                        s_v = float(sales)     if sales     is not None and pd.notna(sales)     else 0.0
-                        if p_v > 0 or s_v > 0:
-                            signal = "🟢 매수 우세" if p_v > s_v else ("🔴 매도 우세" if s_v > p_v else "⚪ 중립")
-                        elif not insider_df.empty and "거래유형" in insider_df.columns:
-                            buy_cnt  = insider_df["거래유형"].str.contains("매수", na=False).sum()
-                            sell_cnt = insider_df["거래유형"].str.contains("매도", na=False).sum()
-                            signal   = "🟢 매수 우세" if buy_cnt > sell_cnt else ("🔴 매도 우세" if sell_cnt > buy_cnt else "⚪ 중립")
                         else:
-                            signal = "집계 중"
-                        st.metric("내부자 방향성", signal)
+                            # 방법 2: EPS 예상/실제 컬럼에서 직접 계산
+                            est_col = next((c for c in earn_df.columns
+                                if "estimate" in c.lower() or "eps 예상" in c.lower() or "예상" in c.lower()), None)
+                            act_col = next((c for c in earn_df.columns
+                                if "actual" in c.lower() or "reported" in c.lower()
+                                   or "eps 실제" in c.lower() or "실제" in c.lower()), None)
+                            if est_col and act_col:
+                                _en = pd.to_numeric(earn_df[est_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
+                                _an = pd.to_numeric(earn_df[act_col].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce")
+                                _diff = ((_an - _en) / _en.abs() * 100).round(1)
+                                earn_df["어닝 서프라이즈"] = _diff.apply(
+                                    lambda x: f"{x:+.1f}%" if pd.notna(x) else "N/A"
+                                )
+                                earn_df["판정"] = _diff.apply(
+                                    lambda x: "✅ Beat" if pd.notna(x) and x > 0 else ("❌ Miss" if pd.notna(x) and x < 0 else "—")
+                                )
 
-                if insider_df.empty:
-                    st.info("인사이더 트레이딩 상세 내역이 없습니다.")
-                else:
-                    st.dataframe(insider_df, use_container_width=True, hide_index=True)
-            except Exception as _ins_e:
-                st.warning(f"인사이더 트레이딩 로드 오류: {_ins_e}")
+                        # ── Beat 비율 요약 ──────────────────────────────────────
+                        if "판정" in earn_df.columns:
+                            beat_count  = (earn_df["판정"] == "✅ Beat").sum()
+                            total_count = len(earn_df[earn_df["판정"] != "—"])
+                            if total_count > 0:
+                                beat_rate = beat_count / total_count * 100
+                                msg = f"어닝 Beat 비율: {beat_rate:.0f}% ({beat_count}/{total_count}분기)"
+                                if beat_rate >= 75:   st.success(f"🏆 {msg} — 실적 퀄리티 우수")
+                                elif beat_rate >= 50: st.warning(f"🟡 {msg} — 보통")
+                                else:                 st.error(f"🔴 {msg} — 실적 부진")
 
-            # ── 애널리스트 목표주가 ──────────────────────────────────────────
-            st.divider()
-            st.markdown("### 🎯 애널리스트 목표주가")
-            st.caption("월가 애널리스트들의 목표주가 컨센서스. 현재가 대비 상승여력을 확인합니다.")
-            try:
-                with st.spinner("애널리스트 데이터 불러오는 중..."):
-                    with _timed("정밀 애널리스트"):
-                        analyst_data = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
-                if not analyst_data:
-                    st.info("애널리스트 목표주가 데이터를 가져오지 못했습니다.")
-                else:
-                    cur_price = to_float(
-                        selected_ticker_info.get("price") or
-                        selected_ticker_info.get("currentPrice") or
-                        selected_ticker_info.get("regularMarketPrice") or
-                        selected_ticker_info.get("lastPrice")
-                    )
-                    tgt_mean = analyst_data.get("target_mean")
-                    tgt_high = analyst_data.get("target_high")
-                    tgt_low = analyst_data.get("target_low")
-                    tgt_med = analyst_data.get("target_median")
+                        # ── 색상 스타일 적용 ────────────────────────────────────
+                        def _style_surp(val):
+                            v = pd.to_numeric(str(val).replace("%","").replace("+",""), errors="coerce")
+                            if pd.isna(v): return ""
+                            return "color:#16a34a;font-weight:600" if v > 0 else "color:#dc2626;font-weight:600"
 
-                    at_c1, at_c2, at_c3, at_c4 = st.columns(4)
-                    with at_c1:
-                        upside = f"{((tgt_mean / cur_price - 1) * 100):+.1f}%" if tgt_mean and cur_price else "N/A"
-                        st.metric("평균 목표가", f"${tgt_mean:.2f}" if tgt_mean else "N/A", delta=upside)
-                    with at_c2:
-                        st.metric("중간값 목표가", f"${tgt_med:.2f}" if tgt_med else "N/A")
-                    with at_c3:
-                        st.metric("최고 목표가", f"${tgt_high:.2f}" if tgt_high else "N/A")
-                    with at_c4:
-                        st.metric("최저 목표가", f"${tgt_low:.2f}" if tgt_low else "N/A")
+                        _style_cols = [c for c in earn_df.columns if "서프라이즈" in c or "surprise" in c.lower()]
+                        if _style_cols:
+                            st.dataframe(earn_df.style.map(_style_surp, subset=_style_cols), use_container_width=True, hide_index=True)
+                        else:
+                            st.dataframe(earn_df, use_container_width=True, hide_index=True)
+                except Exception as _ee:
+                    st.warning(f"어닝 히스토리 로드 오류: {_ee}")
 
-                    recent = analyst_data.get("recent", [])
-                    if recent:
-                        st.markdown("**최근 애널리스트 추천**")
-                        st.dataframe(pd.DataFrame(recent), use_container_width=True, hide_index=True)
-            except Exception as _at_e:
-                st.warning(f"애널리스트 데이터 로드 오류: {_at_e}")
 
-            # ── 상원/하원 의원 거래 ──────────────────────────────────────────
-            st.divider()
-            st.markdown("### 🏛️ 상원/하원 의원 거래")
-            st.caption("미국 의회 의원 주식 거래 공시. ⚠️ 공시 지연이 큽니다 — 실측 중앙값 "
-                       "상원 약 1.5년 · 하원 약 1개월(최근 100건 기준). 선행 지표가 아니라 "
-                       "사후 참고용이며, 반드시 아래 표의 `거래일`을 함께 보십시오.")
-            try:
-                with st.spinner("의회 거래 데이터 불러오는 중..."):
-                    with _timed("정밀 의회거래"):
-                        congress_df = fetch_senate_house_trading(str(selected_ticker).strip().upper())
-                if congress_df.empty:
-                    st.info("의회 거래 데이터를 가져오지 못했습니다. (FMP Starter 플랜 제공 범위 외)")
-                else:
-                    buy_cnt = congress_df[congress_df["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)]
-                    sell_cnt = congress_df[congress_df["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)]
-                    cg_c1, cg_c2 = st.columns(2)
-                    with cg_c1:
-                        st.metric("의회 매수 건수", f"{len(buy_cnt)}건")
-                    with cg_c2:
-                        st.metric("의회 매도 건수", f"{len(sell_cnt)}건")
-                    st.dataframe(congress_df, use_container_width=True, hide_index=True)
-            except Exception as _cg_e:
-                st.warning(f"의회 거래 데이터 로드 오류: {_cg_e}")
-
-        # ── AI 종합 진단 ─────────────────────────────────────────────────
-        st.divider()
-        st.markdown("### 🤖 AI 종합 진단")
-        st.caption("단순 정리가 아닌 시그널 충돌 분석·핵심 투자포인트·구체적 액션을 제시합니다. 결과는 탭 이동 후에도 유지됩니다.")
-
-        # session_state로 결과 유지 (종목 바뀌면 초기화)
-        _diag_sk = f"ai_diag_{str(selected_ticker).strip().upper()}"
-        _diag_tk = "ai_diag_last_ticker"
-        if st.session_state.get(_diag_tk) != str(selected_ticker).strip().upper():
-            st.session_state[_diag_tk] = str(selected_ticker).strip().upper()
-            st.session_state.pop(_diag_sk, None)
-
-        if st.button("🤖 AI 종합 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
-            try:
-                # 이미 위에서 계산된 값들을 최대한 재사용
-                with _timed("정밀 타이밍일봉"):
-                    _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
-                _diag_close = pd.to_numeric(_diag_timing["Close"], errors="coerce").dropna() if not _diag_timing.empty else pd.Series(dtype=float)
-                _diag_rsi = float(calculate_rsi(_diag_close).dropna().iloc[-1]) if len(_diag_close) > 14 else np.nan
-                _diag_ma200 = float(_diag_close.rolling(200, min_periods=150).mean().iloc[-1]) if len(_diag_close) >= 150 else np.nan
-                _diag_ma50 = float(_diag_close.rolling(50, min_periods=50).mean().iloc[-1]) if len(_diag_close) >= 50 else np.nan
-                _diag_price = float(_diag_close.iloc[-1]) if not _diag_close.empty else np.nan
-                _diag_52w_high = float(_diag_close.max()) if not _diag_close.empty else np.nan
-                _diag_pct_from_high = ((_diag_price / _diag_52w_high) - 1) * 100 if pd.notna(_diag_price) and pd.notna(_diag_52w_high) and _diag_52w_high > 0 else np.nan
-
-                # MACD - 명시적으로 양수/음수 체크
-                _diag_macd_line, _diag_sig_line, _diag_hist_series = calculate_macd(_diag_close)
-                _diag_hist_val = float(_diag_hist_series.iloc[-1]) if not _diag_hist_series.empty else np.nan
-                _macd_direction = "상승모멘텀 (양수)" if (pd.notna(_diag_hist_val) and _diag_hist_val > 0) else "하락모멘텀 (음수)" if (pd.notna(_diag_hist_val) and _diag_hist_val < 0) else "중립"
-
-                # 볼린저밴드
-                _bb_upper, _bb_mid, _bb_lower = calculate_bollinger_bands(_diag_close)
-                _bb_upper_val = float(_bb_upper.dropna().iloc[-1]) if not _bb_upper.dropna().empty else np.nan
-                _bb_lower_val = float(_bb_lower.dropna().iloc[-1]) if not _bb_lower.dropna().empty else np.nan
-                _bb_position = "하단 터치 (반등 가능)" if pd.notna(_diag_price) and pd.notna(_bb_lower_val) and _diag_price <= _bb_lower_val * 1.01 else \
-                               "상단 터치 (과열)" if pd.notna(_diag_price) and pd.notna(_bb_upper_val) and _diag_price >= _bb_upper_val * 0.99 else "밴드 내부"
-
-                # KPI 요약
-                _kpi_summary = ""
-                _kpi_details = ""
+        # ── ④ 🏦 수급·기관 — 기관 보유 · 인사이더 · 목표주가 · 의원 거래 ──
+        elif _si_view == _SI_V4:
+            if not is_etf_mode:
+                # ── 기관 보유 비중 ────────────────────────────────────────────
+                st.divider()
+                st.markdown("### 🏦 기관 투자자 보유 현황")
+                st.caption("상위 기관의 보유 비중. 기관 보유 비중이 높고 증가 추세이면 스마트머니 유입 신호입니다.")
                 try:
-                    with _timed("정밀 KPI 스냅샷"):
-                        _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
-                    _kpi_summary = f"KPI: {_pass_n}개 통과 / {_fail_n}개 실패"
-                    _safety = _margin.get('margin_of_safety')
-                    _intrinsic = _margin.get('intrinsic_value')
-                    _kpi_details = (
-                        f"안전마진: {_safety:.1f}% / 적정주가: ${_intrinsic:.2f}"
-                        if pd.notna(_safety) and pd.notna(_intrinsic) else "밸류에이션 데이터 없음"
-                    )
-                    # 실패한 KPI 목록
-                    _fail_items = _kpi_df[_kpi_df["Pass"].str.contains("Fail", na=False)]["KPI"].tolist() if not _kpi_df.empty else []
-                    if _fail_items:
-                        _kpi_details += f" / 실패 항목: {', '.join(_fail_items[:3])}"
-                except Exception:
-                    _kpi_summary = "KPI 데이터 없음"
-                    _kpi_details = ""
+                    _tk_inst = str(selected_ticker).strip().upper()
+                    _k_inst  = _fmp_key()
+                    _shown   = False
 
-                # 기관 보유
-                _inst_pct = "데이터 없음"
+                    with st.spinner("애널리스트 데이터 불러오는 중..."):
+                        if _k_inst:
+                            # grades-consensus 단일 소스.
+                            # ratings-snapshot 선행 시도를 제거했다 — 그 엔드포인트에는
+                            # strongBuy/buy/hold/sell/strongSell 이 없어 항상 _tot=0 으로
+                            # 떨어졌고, 결국 매번 1콜을 버리고 여기로 내려왔다.
+                            # (상세 근거는 8074 주석)
+                            try:
+                                _r2 = requests.get(
+                                    f"{_FMP_BASE}/grades-consensus?symbol={_tk_inst}&apikey={_k_inst}",
+                                    timeout=_FMP_TIMEOUT
+                                )
+                                if _r2.status_code == 200:
+                                    _rd2 = _r2.json()
+                                    _gc  = _rd2[0] if isinstance(_rd2, list) and _rd2 else (
+                                           _rd2 if isinstance(_rd2, dict) else {})
+                                    if _gc:
+                                        _sb2 = int(to_float(_gc.get("strongBuy")  or 0) or 0)
+                                        _b2  = int(to_float(_gc.get("buy")        or 0) or 0)
+                                        _h2  = int(to_float(_gc.get("hold")       or 0) or 0)
+                                        _s2  = int(to_float(_gc.get("sell")       or 0) or 0)
+                                        _ss2 = int(to_float(_gc.get("strongSell") or 0) or 0)
+                                        _tot2 = _sb2+_b2+_h2+_s2+_ss2
+                                        if _tot2 > 0:
+                                            _bp2 = round((_sb2+_b2)/_tot2*100, 1)
+                                            ic1, ic2, ic3 = st.columns(3)
+                                            ic1.metric("매수 의견 비율", f"{_bp2:.0f}%", f"Strong Buy {_sb2} + Buy {_b2}명")
+                                            ic2.metric("Hold", f"{_h2}명")
+                                            ic3.metric("Sell / Strong Sell", f"{_s2+_ss2}명", f"총 {_tot2}명")
+                                            # 종합 의견 배지 — grades-consensus 의 consensus 필드가
+                                            # 진짜 애널리스트 컨센서스 라벨("Buy"/"Hold" 등)이다.
+                                            # 구버전은 이 배지를 ratings-snapshot 쪽에만 달아 놨고
+                                            # 그 분기는 한 번도 실행된 적이 없다 → 배지가 영영 안 떴다.
+                                            _rlabel = str(_gc.get("consensus") or "").strip()
+                                            if _rlabel:
+                                                _col = "#16a34a" if _bp2 >= 60 else ("#f59e0b" if _bp2 >= 40 else "#dc2626")
+                                                st.markdown(
+                                                    f"<div style='background:#1e293b;border-radius:8px;padding:10px 16px;"
+                                                    f"border-left:4px solid {_col};margin-top:8px;'>"
+                                                    f"<span style='color:{_col};font-weight:700;'>📊 종합 의견: {_rlabel}</span></div>",
+                                                    unsafe_allow_html=True)
+                                            _shown = True
+                            except Exception:
+                                pass
+
+                    if not _shown:
+                        # FMP API에서 데이터 없음 — 직접 응답 내용 디버그
+                        st.info("애널리스트 컨센서스 데이터를 가져오지 못했습니다. (FMP API 응답 없음)")
+                except Exception as _ie:
+                    st.warning(f"데이터 로드 오류: {_ie}")
+
+
+
+                # ── 인사이더 트레이딩 ─────────────────────────────────────────
+                st.divider()
+                st.markdown("### 🕵️ 인사이더 트레이딩")
+                st.caption("CEO·CFO 등 내부자의 실제 매수/매도 거래. 대량 매수는 강한 내부 확신 신호입니다.")
                 try:
-                    with _timed("정밀 기관보유"):
-                        _inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
-                    if not _inst_df.empty:
-                        _pct_col = next((c for c in _inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
-                        if _pct_col:
-                            _total = _inst_df[_pct_col].sum()
-                            _total_pct = _total * 100 if _total <= 1 else _total
-                            _inst_pct = f"{_total_pct:.1f}%"
-                except Exception:
-                    pass
+                    with st.spinner("인사이더 거래 데이터 불러오는 중..."):
+                        _tk_ins = str(selected_ticker).strip().upper()
+                        with _timed("정밀 내부자거래"):
+                            insider_df = fetch_insider_trading(_tk_ins)
+                        with _timed("정밀 내부자통계"):
+                            insider_stats = fetch_insider_statistics(_tk_ins)
 
-                # ── 기술적 지표 추가 수집 ──────────────────────────────────────
-                # KPI 데이터 재사용
-                _diag_pass_items, _diag_fail_items = [], []
-                _diag_fpe = _diag_tpe = _diag_pb = _diag_ev = _diag_evs = _diag_evf = np.nan
-                _diag_mos = _diag_iv = np.nan
-                _diag_cs = _diag_vs = _diag_qs = 0
-                _diag_cs_det = _diag_vs_det = _diag_qs_det = _diag_dom = ""
+                    # 통계 요약 먼저 표시
+                    if insider_stats or not insider_df.empty:
+                        purchases = to_float(insider_stats.get("total_purchases") or insider_stats.get("acquired")) if insider_stats else None
+                        sales     = to_float(insider_stats.get("total_sales")     or insider_stats.get("disposed"))  if insider_stats else None
+                        ins_c1, ins_c2, ins_c3 = st.columns(3)
+                        with ins_c1:
+                            p_n = int(purchases) if purchases is not None and pd.notna(purchases) else 0
+                            st.metric("내부자 매수 건수", f"{p_n}건")
+                        with ins_c2:
+                            s_n = int(sales) if sales is not None and pd.notna(sales) else 0
+                            st.metric("내부자 매도 건수", f"{s_n}건")
+                        with ins_c3:
+                            p_v = float(purchases) if purchases is not None and pd.notna(purchases) else 0.0
+                            s_v = float(sales)     if sales     is not None and pd.notna(sales)     else 0.0
+                            if p_v > 0 or s_v > 0:
+                                signal = "🟢 매수 우세" if p_v > s_v else ("🔴 매도 우세" if s_v > p_v else "⚪ 중립")
+                            elif not insider_df.empty and "거래유형" in insider_df.columns:
+                                buy_cnt  = insider_df["거래유형"].str.contains("매수", na=False).sum()
+                                sell_cnt = insider_df["거래유형"].str.contains("매도", na=False).sum()
+                                signal   = "🟢 매수 우세" if buy_cnt > sell_cnt else ("🔴 매도 우세" if sell_cnt > buy_cnt else "⚪ 중립")
+                            else:
+                                signal = "집계 중"
+                            st.metric("내부자 방향성", signal)
+
+                    if insider_df.empty:
+                        st.info("인사이더 트레이딩 상세 내역이 없습니다.")
+                    else:
+                        st.dataframe(insider_df, use_container_width=True, hide_index=True)
+                except Exception as _ins_e:
+                    st.warning(f"인사이더 트레이딩 로드 오류: {_ins_e}")
+
+                # ── 애널리스트 목표주가 ──────────────────────────────────────────
+                st.divider()
+                st.markdown("### 🎯 애널리스트 목표주가")
+                st.caption("월가 애널리스트들의 목표주가 컨센서스. 현재가 대비 상승여력을 확인합니다.")
                 try:
-                    with _timed("정밀 KPI 스냅샷"):
-                        _dk, _, _, _, _dm = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
-                    _dpp = _dk["Pass"].astype(str)
-                    _diag_pass_items = _dk[_dpp.str.contains("Pass", case=False) & ~_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
-                    _diag_fail_items = _dk[_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
-                    _diag_fpe  = _dm.get("forward_pe");    _diag_tpe = _dm.get("trailing_pe")
-                    _diag_pb   = _dm.get("price_to_book"); _diag_ev  = _dm.get("ev_to_ebitda")
-                    _diag_evs  = _dm.get("ev_to_sales");   _diag_evf = _dm.get("ev_to_fcf")
-                    _diag_mos  = _dm.get("margin_of_safety"); _diag_iv = _dm.get("intrinsic_value")
-                    _diag_style = calculate_style_scores(str(selected_ticker).strip().upper(), _dm, _dk)
-                    _diag_cs  = _diag_style["canslim"]["score"]
-                    _diag_vs  = _diag_style["value"]["score"]
-                    _diag_qs  = _diag_style["quality"]["score"]
-                    _diag_dom = _diag_style["dominant"]
-                    _diag_cs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["canslim"]["detail"].items())
-                    _diag_vs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["value"]["detail"].items())
-                    _diag_qs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["quality"]["detail"].items())
-                except Exception:
-                    pass
+                    with st.spinner("애널리스트 데이터 불러오는 중..."):
+                        with _timed("정밀 애널리스트"):
+                            analyst_data = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
+                    if not analyst_data:
+                        st.info("애널리스트 목표주가 데이터를 가져오지 못했습니다.")
+                    else:
+                        cur_price = to_float(
+                            selected_ticker_info.get("price") or
+                            selected_ticker_info.get("currentPrice") or
+                            selected_ticker_info.get("regularMarketPrice") or
+                            selected_ticker_info.get("lastPrice")
+                        )
+                        tgt_mean = analyst_data.get("target_mean")
+                        tgt_high = analyst_data.get("target_high")
+                        tgt_low = analyst_data.get("target_low")
+                        tgt_med = analyst_data.get("target_median")
 
-                # 인사이더 방향
-                _diag_ins_buy = _diag_ins_sell = 0
+                        at_c1, at_c2, at_c3, at_c4 = st.columns(4)
+                        with at_c1:
+                            upside = f"{((tgt_mean / cur_price - 1) * 100):+.1f}%" if tgt_mean and cur_price else "N/A"
+                            st.metric("평균 목표가", f"${tgt_mean:.2f}" if tgt_mean else "N/A", delta=upside)
+                        with at_c2:
+                            st.metric("중간값 목표가", f"${tgt_med:.2f}" if tgt_med else "N/A")
+                        with at_c3:
+                            st.metric("최고 목표가", f"${tgt_high:.2f}" if tgt_high else "N/A")
+                        with at_c4:
+                            st.metric("최저 목표가", f"${tgt_low:.2f}" if tgt_low else "N/A")
+
+                        recent = analyst_data.get("recent", [])
+                        if recent:
+                            st.markdown("**최근 애널리스트 추천**")
+                            st.dataframe(pd.DataFrame(recent), use_container_width=True, hide_index=True)
+                except Exception as _at_e:
+                    st.warning(f"애널리스트 데이터 로드 오류: {_at_e}")
+
+                # ── 상원/하원 의원 거래 ──────────────────────────────────────────
+                st.divider()
+                st.markdown("### 🏛️ 상원/하원 의원 거래")
+                st.caption("미국 의회 의원 주식 거래 공시. ⚠️ 공시 지연이 큽니다 — 실측 중앙값 "
+                           "상원 약 1.5년 · 하원 약 1개월(최근 100건 기준). 선행 지표가 아니라 "
+                           "사후 참고용이며, 반드시 아래 표의 `거래일`을 함께 보십시오.")
                 try:
-                    with _timed("정밀 내부자통계"):
-                        _dis = fetch_insider_statistics(str(selected_ticker).strip().upper())
-                    _diag_ins_buy  = int(to_float(_dis.get("total_purchases") or _dis.get("acquired") or 0) or 0)
-                    _diag_ins_sell = int(to_float(_dis.get("total_sales")     or _dis.get("disposed")  or 0) or 0)
-                except Exception:
-                    pass
-
-                # 어닝 Beat 비율
-                _diag_beat_rate = _diag_beat_n = _diag_earn_n = 0
-                _diag_earn_rows = []
-                try:
-                    with _timed("정밀 실적히스토리"):
-                        _dea = cached_earnings_history(str(selected_ticker).strip().upper())
-                    if not _dea.empty and "판정" in _dea.columns:
-                        _diag_beat_n  = int((_dea["판정"] == "✅ Beat").sum())
-                        _diag_earn_n  = len(_dea[_dea["판정"] != "—"])
-                        _diag_beat_rate = int(_diag_beat_n / _diag_earn_n * 100) if _diag_earn_n else 0
-                    _sc_e = next((c for c in _dea.columns if "서프라이즈" in c), None)
-                    _ac_e = next((c for c in _dea.columns if "eps 실제" in c.lower() or "실제" in c.lower()), None)
-                    for _, _er in _dea.head(4).iterrows():
-                        _rs = str(_er.get("분기",""))
-                        if _ac_e: _rs += f" EPS={_er.get(_ac_e,'')}"
-                        if _sc_e: _rs += f" 서프라이즈={_er.get(_sc_e,'')}"
-                        _diag_earn_rows.append(_rs)
-                except Exception:
-                    pass
-
-                # 애널리스트 목표가 & 매수비율
-                _diag_tgt_mean = _diag_tgt_high = _diag_tgt_low = None
-                _diag_buy_pct = _diag_rat_label = _diag_rat_tot = ""
-                _diag_rec_list = []
-                try:
-                    with _timed("정밀 애널리스트"):
-                        _dan = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
-                    if _dan:
-                        _diag_tgt_mean = _dan.get("target_mean")
-                        _diag_tgt_high = _dan.get("target_high")
-                        _diag_tgt_low  = _dan.get("target_low")
-                        _diag_rec_list = [f"{r.get('기관','')}: {r.get('등급','')}" for r in _dan.get("recent",[])[:3]]
-                    _k_r = _fmp_key()
-                    if _k_r:
-                        # grades-consensus. 구버전은 ratings-snapshot 을 불렀고 폴백이
-                        # 없어서 _rt 가 늘 0 이었다 → 아래 세 변수가 영구히 ""로 남아
-                        # AI 프롬프트에 "애널리스트 매수의견:  () | 종합의견: " 처럼
-                        # 빈 필드가 나갔다. 애널리스트 컨센서스가 정밀검사에 한 번도
-                        # 들어간 적이 없다. (상세 근거는 8074 주석)
-                        _r_r = requests.get(f"{_FMP_BASE}/grades-consensus?symbol={str(selected_ticker).strip().upper()}&apikey={_k_r}", timeout=_FMP_TIMEOUT)
-                        if _r_r.status_code == 200:
-                            _rrd = _r_r.json()
-                            _rri = _rrd[0] if isinstance(_rrd, list) and _rrd else {}
-                            if _rri:
-                                _rsb=int(to_float(_rri.get("strongBuy") or 0) or 0); _rb=int(to_float(_rri.get("buy") or 0) or 0)
-                                _rh=int(to_float(_rri.get("hold") or 0) or 0); _rs=int(to_float(_rri.get("sell") or 0) or 0); _rss=int(to_float(_rri.get("strongSell") or 0) or 0)
-                                _rt=_rsb+_rb+_rh+_rs+_rss
-                                if _rt > 0:
-                                    _diag_buy_pct   = f"{round((_rsb+_rb)/_rt*100,1):.0f}%"
-                                    _diag_rat_label = str(_rri.get("consensus") or "").strip()
-                                    _diag_rat_tot   = f"{_rsb+_rb}/{_rt}명"
-                except Exception:
-                    pass
-
-                # 의회 거래 — AI 프롬프트에서 **의도적으로 제외**했다. 되돌리지 말 것.
-                #
-                # tierD 실측(VERDICT_2026-08-22_congress_trades_terminated.md):
-                #   상원  공시 지연 중앙값 572일 · p90 875일 · **최소 15일** · 7일이내 0%
-                #   하원  중앙값 27일 · p90 704일 · 최소 6일 · 7일이내 3%
-                #
-                # 여기서 넘기던 건 건수뿐이라 날짜가 없었다. 평균 1.5년 묵은 거래가
-                # 시점 표기 없이 "매수 N건 vs 매도 M건"으로 들어가면, 판단을 요구받는
-                # LLM 은 그걸 현재 신호로 취급할 수밖에 없다. 표시가 아니라 판단 입력이다.
-                #
-                # 화면 표(위 '🏛️ 상원/하원 의원 거래' 섹션)는 **그대로 유지**한다.
-                # 거기엔 `거래일` 컬럼이 있어 사람이 지연을 직접 보고 할인할 수 있다.
-                # VERDICT 108행의 "표시 전용으로 유지"가 가리키는 게 그쪽이다.
-                #
-                # ⚠️ [2026-08-28 정정] 이전 주석은 "정밀검사 1회당 FMP 2콜 절감"이라고
-                #    적었으나 **실제 절감은 0콜**이다. fetch_senate_house_trading 은
-                #    @st.cache_data(ttl=3600) 이고, 같은 탭의 화면 표(위 '🏛️ 상원/하원
-                #    의원 거래' 섹션)가 어차피 같은 인자로 먼저 호출한다 — 프롬프트에서
-                #    빼도 캐시 히트가 하나 줄 뿐 네트워크 콜은 그대로다.
-                #    이 변경의 실제 이득은 콜 절감이 아니라 **낡은 데이터가 LLM 판단
-                #    입력으로 들어가지 않는 것**이다. 그 이유만으로 충분하다.
-
-                def _nv(v, fmt=".2f", pre="", suf=""):
-                    return f"{pre}{v:{fmt}}{suf}" if pd.notna(v) else "N/A"
-
-                # ── 프롬프트: 정리 말고 판단을 요청 ──────────────────────────
-                _diag_prompt = f"""당신은 15년 경력의 헤지펀드 포트폴리오 매니저입니다.
-아래는 {selected_ticker}에 대한 실제 정량 데이터입니다.
-
-당신의 역할:
-- 데이터를 단순 나열하지 마세요. 이미 사용자가 알고 있습니다.
-- 시그널들이 서로 일치하는지, 충돌하는지를 분석하세요.
-- 충돌하는 시그널이 있다면 어느 쪽을 더 신뢰해야 하는지 근거를 대세요.
-- 최종적으로 지금 이 종목을 어떻게 다뤄야 하는지 명확한 의견을 내세요.
-
---- 데이터 ---
-[기술적]
-현재가 {_nv(_diag_price,".2f","$")} | 52주 고점 대비 {_nv(_diag_pct_from_high,"+.1f","","%")}
-RSI {_nv(_diag_rsi,".1f")} | MACD 히스토그램 {_nv(_diag_hist_val,"+.4f")} ({_macd_direction}) | 볼린저밴드 {_bb_position}
-MA50 {_nv(_diag_ma50,".2f","$")} / MA200 {_nv(_diag_ma200,".2f","$")} → {"정배열" if pd.notna(_diag_price) and pd.notna(_diag_ma50) and pd.notna(_diag_ma200) and _diag_price>_diag_ma50>_diag_ma200 else "역배열" if pd.notna(_diag_price) and pd.notna(_diag_ma200) and _diag_price<_diag_ma200 else "부분배열"}
-
-[투자 스타일 점수]
-CAN SLIM {_diag_cs}점 | 가치투자 {_diag_vs}점 | 장기우량주 {_diag_qs}점 → 주도스타일: {_diag_dom}
-CAN SLIM 세부: {_diag_cs_det}
-가치투자 세부: {_diag_vs_det}
-장기우량주 세부: {_diag_qs_det}
-
-[체력검사 KPI]
-통과: {', '.join(_diag_pass_items) if _diag_pass_items else '없음'}
-실패: {', '.join(_diag_fail_items) if _diag_fail_items else '없음'}
-밸류에이션: Forward P/E={_nv(_diag_fpe)} Trailing P/E={_nv(_diag_tpe)} P/B={_nv(_diag_pb)} EV/EBITDA={_nv(_diag_ev)} EV/Sales={_nv(_diag_evs)} EV/FCF={_nv(_diag_evf)}
-Graham 안전마진={_nv(_diag_mos,".1f","","%")} | {_kpi_details}
-
-[Earnings Surprise 최근 {_diag_earn_n}분기]
-Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
-
-[수급 시그널]
-인사이더: 매수 {_diag_ins_buy}건 vs 매도 {_diag_ins_sell}건 → {"매수 우세" if _diag_ins_buy > _diag_ins_sell else "매도 우세" if _diag_ins_sell > _diag_ins_buy else "중립"}
-애널리스트 매수의견: {_diag_buy_pct or "N/A"} ({_diag_rat_tot or "N/A"}) | 종합의견: {_diag_rat_label or "N/A"}
-애널리스트 목표가: 평균 {_nv(_diag_tgt_mean,".2f","$")} / 최고 {_nv(_diag_tgt_high,".2f","$")} / 최저 {_nv(_diag_tgt_low,".2f","$")}
-최근 추천: {" | ".join(_diag_rec_list) if _diag_rec_list else "N/A"}
-
---- 작성 지침 ---
-아래 형식으로 작성하되, 각 섹션에서 데이터를 나열하지 말고 해석과 판단만 쓰세요.
-
-## 🎯 종합 판단: [매수 고려 / 관망 / 매도 고려]
-한 줄 핵심 근거 (가장 결정적인 이유 하나)
-
-**📡 시그널 충돌 분석:**
-기술적·펀더멘털·수급 시그널이 같은 방향을 가리키는지, 엇갈리는지 분석하세요.
-예: "기술적으로는 강하지만 인사이더가 대규모 매도 중" 같은 충돌을 짚고, 어느 쪽에 무게를 두어야 하는지 판단하세요.
-
-**💡 이 종목의 핵심 투자 포인트:**
-지금 이 종목을 매수할 만한 가장 강력한 이유 (데이터 기반). 없다면 "현재 없음"이라고 쓰세요.
-
-**💣 가장 큰 리스크:**
-지금 이 종목을 피해야 할 가장 강력한 이유 (데이터 기반). 숫자로 근거를 대세요.
-
-**🎯 구체적 액션 플랜:**
-지금 당장 어떻게 해야 하는지. 매수라면 어떤 조건이 추가로 확인되어야 하는지. 관망이라면 어떤 시그널이 나올 때 진입/회피할지. 막연한 표현 금지.
-
-*본 분석은 참고용이며 투자 권유가 아닙니다.*"""
-
-                with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
-                    _diag_model = _GenAIModel(
-                        "gemini-2.5-flash",
-                        generation_config={"temperature": 0.4, "max_output_tokens": 16384, "thinking_budget": 0}
-                    )
-                    _diag_response = _diag_model.generate_content(_diag_prompt)
-                    _diag_text = _gemini_response_text_utf8_safe(_diag_response)
-
-                if _diag_text:
-                    st.session_state[_diag_sk] = _diag_text
-                else:
-                    st.warning("AI 진단 결과를 받지 못했습니다.")
-            except Exception as _ae:
-                st.error(f"AI 진단 오류: {_ae}")
-
-        # 저장된 결과 표시 (버튼 눌러도, 탭 이동해도 유지)
-        if st.session_state.get(_diag_sk):
-            _saved_diag = st.session_state[_diag_sk]
-            if "매수 고려" in _saved_diag:
-                st.success(_saved_diag)
-            elif "매도 고려" in _saved_diag:
-                st.error(_saved_diag)
+                    with st.spinner("의회 거래 데이터 불러오는 중..."):
+                        with _timed("정밀 의회거래"):
+                            congress_df = fetch_senate_house_trading(str(selected_ticker).strip().upper())
+                    if congress_df.empty:
+                        st.info("의회 거래 데이터를 가져오지 못했습니다. (FMP Starter 플랜 제공 범위 외)")
+                    else:
+                        buy_cnt = congress_df[congress_df["거래유형"].str.upper().str.contains("PURCHASE|BUY|매수", na=False)]
+                        sell_cnt = congress_df[congress_df["거래유형"].str.upper().str.contains("SALE|SELL|매도", na=False)]
+                        cg_c1, cg_c2 = st.columns(2)
+                        with cg_c1:
+                            st.metric("의회 매수 건수", f"{len(buy_cnt)}건")
+                        with cg_c2:
+                            st.metric("의회 매도 건수", f"{len(sell_cnt)}건")
+                        st.dataframe(congress_df, use_container_width=True, hide_index=True)
+                except Exception as _cg_e:
+                    st.warning(f"의회 거래 데이터 로드 오류: {_cg_e}")
             else:
-                st.warning(_saved_diag)
-            if st.button("🗑️ 진단 초기화", key="ai_diag_reset"):
-                st.session_state.pop(_diag_sk, None)
-                st.rerun()
+                st.info("ETF 는 기관 보유·인사이더 지표를 제공하지 않습니다. 아래 등급 히스토리만 표시합니다.")
+            # ── 애널리스트 등급 변경 히스토리 ────────────────────────────────
+            st.divider()
+            st.markdown("### 📊 애널리스트 등급 변경 히스토리")
+            st.caption("주요 기관의 상향/하향/유지 이력 (FMP grades-historical, 최근 15건)")
+            with st.spinner(f"{selected_ticker} 등급 히스토리 조회 중..."):
+                _rating_hist = _fmp_historical_ratings(str(selected_ticker).strip().upper())
+            if _rating_hist:
+                _rh_rows = []
+                for _rh in _rating_hist:
+                    _action = str(_rh.get("action") or _rh.get("ratingChange") or "").strip()
+                    _action_emoji = (
+                        "🟢 상향" if any(w in _action.lower() for w in ["upgrade", "initiated", "initiated at"]) else
+                        "🔴 하향" if "downgrade" in _action.lower() else
+                        "⚪ 유지"
+                    )
+                    _rh_rows.append({
+                        "날짜": str(_rh.get("date") or "")[:10],
+                        "기관": str(_rh.get("gradingCompany") or _rh.get("company") or ""),
+                        "변경": _action_emoji,
+                        "이전": str(_rh.get("previousGrade") or ""),
+                        "현재": str(_rh.get("newGrade") or ""),
+                    })
+                _rh_df = pd.DataFrame(_rh_rows)
+                st.dataframe(_rh_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("등급 변경 히스토리 데이터를 찾을 수 없습니다.")
 
-        # ── 애널리스트 등급 변경 히스토리 ────────────────────────────────
-        st.divider()
-        st.markdown("### 📊 애널리스트 등급 변경 히스토리")
-        st.caption("주요 기관의 상향/하향/유지 이력 (FMP grades-historical, 최근 15건)")
-        with st.spinner(f"{selected_ticker} 등급 히스토리 조회 중..."):
-            _rating_hist = _fmp_historical_ratings(str(selected_ticker).strip().upper())
-        if _rating_hist:
-            _rh_rows = []
-            for _rh in _rating_hist:
-                _action = str(_rh.get("action") or _rh.get("ratingChange") or "").strip()
-                _action_emoji = (
-                    "🟢 상향" if any(w in _action.lower() for w in ["upgrade", "initiated", "initiated at"]) else
-                    "🔴 하향" if "downgrade" in _action.lower() else
-                    "⚪ 유지"
-                )
-                _rh_rows.append({
-                    "날짜": str(_rh.get("date") or "")[:10],
-                    "기관": str(_rh.get("gradingCompany") or _rh.get("company") or ""),
-                    "변경": _action_emoji,
-                    "이전": str(_rh.get("previousGrade") or ""),
-                    "현재": str(_rh.get("newGrade") or ""),
-                })
-            _rh_df = pd.DataFrame(_rh_rows)
-            st.dataframe(_rh_df, use_container_width=True, hide_index=True)
+        # ── ⑤ 🤖 AI 종합 진단 ────────────────────────────────────────────
         else:
-            st.caption("등급 변경 히스토리 데이터를 찾을 수 없습니다.")
+            st.divider()
+            st.markdown("### 🤖 AI 종합 진단")
+            st.caption("단순 정리가 아닌 시그널 충돌 분석·핵심 투자포인트·구체적 액션을 제시합니다. 결과는 탭 이동 후에도 유지됩니다.")
+
+            # session_state로 결과 유지 (종목 바뀌면 초기화)
+            _diag_sk = f"ai_diag_{str(selected_ticker).strip().upper()}"
+            _diag_tk = "ai_diag_last_ticker"
+            if st.session_state.get(_diag_tk) != str(selected_ticker).strip().upper():
+                st.session_state[_diag_tk] = str(selected_ticker).strip().upper()
+                st.session_state.pop(_diag_sk, None)
+
+            if st.button("🤖 AI 종합 진단 실행", key="ai_diagnosis_btn", type="primary", use_container_width=True):
+                try:
+                    # 이미 위에서 계산된 값들을 최대한 재사용
+                    with _timed("정밀 타이밍일봉"):
+                        _diag_timing = cached_timing_price_history(str(selected_ticker).strip())
+                    _diag_close = pd.to_numeric(_diag_timing["Close"], errors="coerce").dropna() if not _diag_timing.empty else pd.Series(dtype=float)
+                    _diag_rsi = float(calculate_rsi(_diag_close).dropna().iloc[-1]) if len(_diag_close) > 14 else np.nan
+                    _diag_ma200 = float(_diag_close.rolling(200, min_periods=150).mean().iloc[-1]) if len(_diag_close) >= 150 else np.nan
+                    _diag_ma50 = float(_diag_close.rolling(50, min_periods=50).mean().iloc[-1]) if len(_diag_close) >= 50 else np.nan
+                    _diag_price = float(_diag_close.iloc[-1]) if not _diag_close.empty else np.nan
+                    _diag_52w_high = float(_diag_close.max()) if not _diag_close.empty else np.nan
+                    _diag_pct_from_high = ((_diag_price / _diag_52w_high) - 1) * 100 if pd.notna(_diag_price) and pd.notna(_diag_52w_high) and _diag_52w_high > 0 else np.nan
+
+                    # MACD - 명시적으로 양수/음수 체크
+                    _diag_macd_line, _diag_sig_line, _diag_hist_series = calculate_macd(_diag_close)
+                    _diag_hist_val = float(_diag_hist_series.iloc[-1]) if not _diag_hist_series.empty else np.nan
+                    _macd_direction = "상승모멘텀 (양수)" if (pd.notna(_diag_hist_val) and _diag_hist_val > 0) else "하락모멘텀 (음수)" if (pd.notna(_diag_hist_val) and _diag_hist_val < 0) else "중립"
+
+                    # 볼린저밴드
+                    _bb_upper, _bb_mid, _bb_lower = calculate_bollinger_bands(_diag_close)
+                    _bb_upper_val = float(_bb_upper.dropna().iloc[-1]) if not _bb_upper.dropna().empty else np.nan
+                    _bb_lower_val = float(_bb_lower.dropna().iloc[-1]) if not _bb_lower.dropna().empty else np.nan
+                    _bb_position = "하단 터치 (반등 가능)" if pd.notna(_diag_price) and pd.notna(_bb_lower_val) and _diag_price <= _bb_lower_val * 1.01 else \
+                                   "상단 터치 (과열)" if pd.notna(_diag_price) and pd.notna(_bb_upper_val) and _diag_price >= _bb_upper_val * 0.99 else "밴드 내부"
+
+                    # KPI 요약
+                    _kpi_summary = ""
+                    _kpi_details = ""
+                    try:
+                        with _timed("정밀 KPI 스냅샷"):
+                            _kpi_df, _pass_n, _fail_n, _, _margin = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
+                        _kpi_summary = f"KPI: {_pass_n}개 통과 / {_fail_n}개 실패"
+                        _safety = _margin.get('margin_of_safety')
+                        _intrinsic = _margin.get('intrinsic_value')
+                        _kpi_details = (
+                            f"안전마진: {_safety:.1f}% / 적정주가: ${_intrinsic:.2f}"
+                            if pd.notna(_safety) and pd.notna(_intrinsic) else "밸류에이션 데이터 없음"
+                        )
+                        # 실패한 KPI 목록
+                        _fail_items = _kpi_df[_kpi_df["Pass"].str.contains("Fail", na=False)]["KPI"].tolist() if not _kpi_df.empty else []
+                        if _fail_items:
+                            _kpi_details += f" / 실패 항목: {', '.join(_fail_items[:3])}"
+                    except Exception:
+                        _kpi_summary = "KPI 데이터 없음"
+                        _kpi_details = ""
+
+                    # 기관 보유
+                    _inst_pct = "데이터 없음"
+                    try:
+                        with _timed("정밀 기관보유"):
+                            _inst_df = cached_institutional_holders(str(selected_ticker).strip().upper())
+                        if not _inst_df.empty:
+                            _pct_col = next((c for c in _inst_df.columns if "%" in c or "pct" in c.lower() or "held" in c.lower()), None)
+                            if _pct_col:
+                                _total = _inst_df[_pct_col].sum()
+                                _total_pct = _total * 100 if _total <= 1 else _total
+                                _inst_pct = f"{_total_pct:.1f}%"
+                    except Exception:
+                        pass
+
+                    # ── 기술적 지표 추가 수집 ──────────────────────────────────────
+                    # KPI 데이터 재사용
+                    _diag_pass_items, _diag_fail_items = [], []
+                    _diag_fpe = _diag_tpe = _diag_pb = _diag_ev = _diag_evs = _diag_evf = np.nan
+                    _diag_mos = _diag_iv = np.nan
+                    _diag_cs = _diag_vs = _diag_qs = 0
+                    _diag_cs_det = _diag_vs_det = _diag_qs_det = _diag_dom = ""
+                    try:
+                        with _timed("정밀 KPI 스냅샷"):
+                            _dk, _, _, _, _dm = cached_evaluate_kpis_snapshot(str(selected_ticker).strip().upper())
+                        _dpp = _dk["Pass"].astype(str)
+                        _diag_pass_items = _dk[_dpp.str.contains("Pass", case=False) & ~_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
+                        _diag_fail_items = _dk[_dpp.str.contains("Fail", case=False)]["KPI"].tolist()
+                        _diag_fpe  = _dm.get("forward_pe");    _diag_tpe = _dm.get("trailing_pe")
+                        _diag_pb   = _dm.get("price_to_book"); _diag_ev  = _dm.get("ev_to_ebitda")
+                        _diag_evs  = _dm.get("ev_to_sales");   _diag_evf = _dm.get("ev_to_fcf")
+                        _diag_mos  = _dm.get("margin_of_safety"); _diag_iv = _dm.get("intrinsic_value")
+                        _diag_style = calculate_style_scores(str(selected_ticker).strip().upper(), _dm, _dk)
+                        _diag_cs  = _diag_style["canslim"]["score"]
+                        _diag_vs  = _diag_style["value"]["score"]
+                        _diag_qs  = _diag_style["quality"]["score"]
+                        _diag_dom = _diag_style["dominant"]
+                        _diag_cs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["canslim"]["detail"].items())
+                        _diag_vs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["value"]["detail"].items())
+                        _diag_qs_det = " / ".join(f"{k}:{v}" for k,v in _diag_style["quality"]["detail"].items())
+                    except Exception:
+                        pass
+
+                    # 인사이더 방향
+                    _diag_ins_buy = _diag_ins_sell = 0
+                    try:
+                        with _timed("정밀 내부자통계"):
+                            _dis = fetch_insider_statistics(str(selected_ticker).strip().upper())
+                        _diag_ins_buy  = int(to_float(_dis.get("total_purchases") or _dis.get("acquired") or 0) or 0)
+                        _diag_ins_sell = int(to_float(_dis.get("total_sales")     or _dis.get("disposed")  or 0) or 0)
+                    except Exception:
+                        pass
+
+                    # 어닝 Beat 비율
+                    _diag_beat_rate = _diag_beat_n = _diag_earn_n = 0
+                    _diag_earn_rows = []
+                    try:
+                        with _timed("정밀 실적히스토리"):
+                            _dea = cached_earnings_history(str(selected_ticker).strip().upper())
+                        if not _dea.empty and "판정" in _dea.columns:
+                            _diag_beat_n  = int((_dea["판정"] == "✅ Beat").sum())
+                            _diag_earn_n  = len(_dea[_dea["판정"] != "—"])
+                            _diag_beat_rate = int(_diag_beat_n / _diag_earn_n * 100) if _diag_earn_n else 0
+                        _sc_e = next((c for c in _dea.columns if "서프라이즈" in c), None)
+                        _ac_e = next((c for c in _dea.columns if "eps 실제" in c.lower() or "실제" in c.lower()), None)
+                        for _, _er in _dea.head(4).iterrows():
+                            _rs = str(_er.get("분기",""))
+                            if _ac_e: _rs += f" EPS={_er.get(_ac_e,'')}"
+                            if _sc_e: _rs += f" 서프라이즈={_er.get(_sc_e,'')}"
+                            _diag_earn_rows.append(_rs)
+                    except Exception:
+                        pass
+
+                    # 애널리스트 목표가 & 매수비율
+                    _diag_tgt_mean = _diag_tgt_high = _diag_tgt_low = None
+                    _diag_buy_pct = _diag_rat_label = _diag_rat_tot = ""
+                    _diag_rec_list = []
+                    try:
+                        with _timed("정밀 애널리스트"):
+                            _dan = fetch_analyst_price_targets(str(selected_ticker).strip().upper())
+                        if _dan:
+                            _diag_tgt_mean = _dan.get("target_mean")
+                            _diag_tgt_high = _dan.get("target_high")
+                            _diag_tgt_low  = _dan.get("target_low")
+                            _diag_rec_list = [f"{r.get('기관','')}: {r.get('등급','')}" for r in _dan.get("recent",[])[:3]]
+                        _k_r = _fmp_key()
+                        if _k_r:
+                            # grades-consensus. 구버전은 ratings-snapshot 을 불렀고 폴백이
+                            # 없어서 _rt 가 늘 0 이었다 → 아래 세 변수가 영구히 ""로 남아
+                            # AI 프롬프트에 "애널리스트 매수의견:  () | 종합의견: " 처럼
+                            # 빈 필드가 나갔다. 애널리스트 컨센서스가 정밀검사에 한 번도
+                            # 들어간 적이 없다. (상세 근거는 8074 주석)
+                            _r_r = requests.get(f"{_FMP_BASE}/grades-consensus?symbol={str(selected_ticker).strip().upper()}&apikey={_k_r}", timeout=_FMP_TIMEOUT)
+                            if _r_r.status_code == 200:
+                                _rrd = _r_r.json()
+                                _rri = _rrd[0] if isinstance(_rrd, list) and _rrd else {}
+                                if _rri:
+                                    _rsb=int(to_float(_rri.get("strongBuy") or 0) or 0); _rb=int(to_float(_rri.get("buy") or 0) or 0)
+                                    _rh=int(to_float(_rri.get("hold") or 0) or 0); _rs=int(to_float(_rri.get("sell") or 0) or 0); _rss=int(to_float(_rri.get("strongSell") or 0) or 0)
+                                    _rt=_rsb+_rb+_rh+_rs+_rss
+                                    if _rt > 0:
+                                        _diag_buy_pct   = f"{round((_rsb+_rb)/_rt*100,1):.0f}%"
+                                        _diag_rat_label = str(_rri.get("consensus") or "").strip()
+                                        _diag_rat_tot   = f"{_rsb+_rb}/{_rt}명"
+                    except Exception:
+                        pass
+
+                    # 의회 거래 — AI 프롬프트에서 **의도적으로 제외**했다. 되돌리지 말 것.
+                    #
+                    # tierD 실측(VERDICT_2026-08-22_congress_trades_terminated.md):
+                    #   상원  공시 지연 중앙값 572일 · p90 875일 · **최소 15일** · 7일이내 0%
+                    #   하원  중앙값 27일 · p90 704일 · 최소 6일 · 7일이내 3%
+                    #
+                    # 여기서 넘기던 건 건수뿐이라 날짜가 없었다. 평균 1.5년 묵은 거래가
+                    # 시점 표기 없이 "매수 N건 vs 매도 M건"으로 들어가면, 판단을 요구받는
+                    # LLM 은 그걸 현재 신호로 취급할 수밖에 없다. 표시가 아니라 판단 입력이다.
+                    #
+                    # 화면 표(위 '🏛️ 상원/하원 의원 거래' 섹션)는 **그대로 유지**한다.
+                    # 거기엔 `거래일` 컬럼이 있어 사람이 지연을 직접 보고 할인할 수 있다.
+                    # VERDICT 108행의 "표시 전용으로 유지"가 가리키는 게 그쪽이다.
+                    #
+                    # ⚠️ [2026-08-28 정정] 이전 주석은 "정밀검사 1회당 FMP 2콜 절감"이라고
+                    #    적었으나 **실제 절감은 0콜**이다. fetch_senate_house_trading 은
+                    #    @st.cache_data(ttl=3600) 이고, 같은 탭의 화면 표(위 '🏛️ 상원/하원
+                    #    의원 거래' 섹션)가 어차피 같은 인자로 먼저 호출한다 — 프롬프트에서
+                    #    빼도 캐시 히트가 하나 줄 뿐 네트워크 콜은 그대로다.
+                    #    이 변경의 실제 이득은 콜 절감이 아니라 **낡은 데이터가 LLM 판단
+                    #    입력으로 들어가지 않는 것**이다. 그 이유만으로 충분하다.
+
+                    def _nv(v, fmt=".2f", pre="", suf=""):
+                        return f"{pre}{v:{fmt}}{suf}" if pd.notna(v) else "N/A"
+
+                    # ── 프롬프트: 정리 말고 판단을 요청 ──────────────────────────
+                    _diag_prompt = f"""당신은 15년 경력의 헤지펀드 포트폴리오 매니저입니다.
+    아래는 {selected_ticker}에 대한 실제 정량 데이터입니다.
+
+    당신의 역할:
+    - 데이터를 단순 나열하지 마세요. 이미 사용자가 알고 있습니다.
+    - 시그널들이 서로 일치하는지, 충돌하는지를 분석하세요.
+    - 충돌하는 시그널이 있다면 어느 쪽을 더 신뢰해야 하는지 근거를 대세요.
+    - 최종적으로 지금 이 종목을 어떻게 다뤄야 하는지 명확한 의견을 내세요.
+
+    --- 데이터 ---
+    [기술적]
+    현재가 {_nv(_diag_price,".2f","$")} | 52주 고점 대비 {_nv(_diag_pct_from_high,"+.1f","","%")}
+    RSI {_nv(_diag_rsi,".1f")} | MACD 히스토그램 {_nv(_diag_hist_val,"+.4f")} ({_macd_direction}) | 볼린저밴드 {_bb_position}
+    MA50 {_nv(_diag_ma50,".2f","$")} / MA200 {_nv(_diag_ma200,".2f","$")} → {"정배열" if pd.notna(_diag_price) and pd.notna(_diag_ma50) and pd.notna(_diag_ma200) and _diag_price>_diag_ma50>_diag_ma200 else "역배열" if pd.notna(_diag_price) and pd.notna(_diag_ma200) and _diag_price<_diag_ma200 else "부분배열"}
+
+    [투자 스타일 점수]
+    CAN SLIM {_diag_cs}점 | 가치투자 {_diag_vs}점 | 장기우량주 {_diag_qs}점 → 주도스타일: {_diag_dom}
+    CAN SLIM 세부: {_diag_cs_det}
+    가치투자 세부: {_diag_vs_det}
+    장기우량주 세부: {_diag_qs_det}
+
+    [체력검사 KPI]
+    통과: {', '.join(_diag_pass_items) if _diag_pass_items else '없음'}
+    실패: {', '.join(_diag_fail_items) if _diag_fail_items else '없음'}
+    밸류에이션: Forward P/E={_nv(_diag_fpe)} Trailing P/E={_nv(_diag_tpe)} P/B={_nv(_diag_pb)} EV/EBITDA={_nv(_diag_ev)} EV/Sales={_nv(_diag_evs)} EV/FCF={_nv(_diag_evf)}
+    Graham 안전마진={_nv(_diag_mos,".1f","","%")} | {_kpi_details}
+
+    [Earnings Surprise 최근 {_diag_earn_n}분기]
+    Beat {_diag_beat_n}회 ({_diag_beat_rate}%) | {" / ".join(_diag_earn_rows)}
+
+    [수급 시그널]
+    인사이더: 매수 {_diag_ins_buy}건 vs 매도 {_diag_ins_sell}건 → {"매수 우세" if _diag_ins_buy > _diag_ins_sell else "매도 우세" if _diag_ins_sell > _diag_ins_buy else "중립"}
+    애널리스트 매수의견: {_diag_buy_pct or "N/A"} ({_diag_rat_tot or "N/A"}) | 종합의견: {_diag_rat_label or "N/A"}
+    애널리스트 목표가: 평균 {_nv(_diag_tgt_mean,".2f","$")} / 최고 {_nv(_diag_tgt_high,".2f","$")} / 최저 {_nv(_diag_tgt_low,".2f","$")}
+    최근 추천: {" | ".join(_diag_rec_list) if _diag_rec_list else "N/A"}
+
+    --- 작성 지침 ---
+    아래 형식으로 작성하되, 각 섹션에서 데이터를 나열하지 말고 해석과 판단만 쓰세요.
+
+    ## 🎯 종합 판단: [매수 고려 / 관망 / 매도 고려]
+    한 줄 핵심 근거 (가장 결정적인 이유 하나)
+
+    **📡 시그널 충돌 분석:**
+    기술적·펀더멘털·수급 시그널이 같은 방향을 가리키는지, 엇갈리는지 분석하세요.
+    예: "기술적으로는 강하지만 인사이더가 대규모 매도 중" 같은 충돌을 짚고, 어느 쪽에 무게를 두어야 하는지 판단하세요.
+
+    **💡 이 종목의 핵심 투자 포인트:**
+    지금 이 종목을 매수할 만한 가장 강력한 이유 (데이터 기반). 없다면 "현재 없음"이라고 쓰세요.
+
+    **💣 가장 큰 리스크:**
+    지금 이 종목을 피해야 할 가장 강력한 이유 (데이터 기반). 숫자로 근거를 대세요.
+
+    **🎯 구체적 액션 플랜:**
+    지금 당장 어떻게 해야 하는지. 매수라면 어떤 조건이 추가로 확인되어야 하는지. 관망이라면 어떤 시그널이 나올 때 진입/회피할지. 막연한 표현 금지.
+
+    *본 분석은 참고용이며 투자 권유가 아닙니다.*"""
+
+                    with st.spinner("Gemini AI가 종합 진단 중... (약 15초 소요)"):
+                        _diag_model = _GenAIModel(
+                            "gemini-2.5-flash",
+                            generation_config={"temperature": 0.4, "max_output_tokens": 16384, "thinking_budget": 0}
+                        )
+                        _diag_response = _diag_model.generate_content(_diag_prompt)
+                        _diag_text = _gemini_response_text_utf8_safe(_diag_response)
+
+                    if _diag_text:
+                        st.session_state[_diag_sk] = _diag_text
+                    else:
+                        st.warning("AI 진단 결과를 받지 못했습니다.")
+                except Exception as _ae:
+                    st.error(f"AI 진단 오류: {_ae}")
+
+            # 저장된 결과 표시 (버튼 눌러도, 탭 이동해도 유지)
+            if st.session_state.get(_diag_sk):
+                _saved_diag = st.session_state[_diag_sk]
+                if "매수 고려" in _saved_diag:
+                    st.success(_saved_diag)
+                elif "매도 고려" in _saved_diag:
+                    st.error(_saved_diag)
+                else:
+                    st.warning(_saved_diag)
+                if st.button("🗑️ 진단 초기화", key="ai_diag_reset"):
+                    st.session_state.pop(_diag_sk, None)
+                    st.rerun()
 
     elif main_nav == NAV_RADAR:
         syn_p1, syn_p2 = st.columns([1, 3])
