@@ -64,6 +64,23 @@ CORR_MIN_OVERLAP: int = 40               # 공통 관측일이 이보다 적으�
 HOLD_SLOTS: int = 5                      # 실제 보유 슬롯
 CRYPTO_SLOT_CAP: int = 2                 # Top 5 중 크립토 최대 슬롯
 
+# ρ 가 이 값 이상이면 '같은 기초자산의 다른 래퍼'로 본다 — 수익률 차이는 노이즈고
+# 실제로 갈리는 것은 체결 비용이다. CORR_THRESHOLD(0.90, 중복 판정)보다 높다.
+#
+# ⚠️ 이 값은 관측 데이터에서 고르지 않았다. 2026-09-02 관측은 4쌍(1.00·1.00·
+#    0.99·0.97)뿐이고 여기서 임계값을 유도하면 4표본 과적합이다. 대신 사전
+#    정의로 박는다 — 비트코인 현물 ETF 끼리, 같은 지수를 추종하는 ETF 끼리는
+#    구조적으로 0.98 이상이 나오고, 다른 금속(금광 vs 은광)은 그 아래다.
+#    결과를 보고 조정하지 않는다.
+TIE_RHO: float = 0.98
+
+# 승격 마진 — 도전자의 거래대금이 원래 선두의 이 배수 이상일 때만 대표를 바꾼다.
+# 없으면 미세차로 대표가 뒤집힌다: 같은 기초자산의 래퍼들은 주수가 비슷하고
+# 가격만 조금 달라서, 거래대금 차이가 노이즈 수준인 경우가 흔하다(진단 G 픽스처
+# 에서 실제로 재현됐다 — HYPE 3형제의 대표가 무작위로 갈렸다).
+# 노이즈 수준 차이면 모멘텀 순위가 이기고, **의미 있게 더 유동적일 때만** 뒤집는다.
+TIE_ADV_MARGIN: float = 2.0
+
 # 상관 계산에 필요한 봉 수 — 호출부가 이 값으로 창을 잡는다.
 # CORR_LOOKBACK 은 *수익률* 개수라 종가는 +1 봉이 필요하고,
 # 1개월 수익률(calculate_period_return(s, 21) → iloc[-22])도 함께 만족해야 한다.
@@ -260,6 +277,96 @@ def dedup_by_correlation(
     return kept, dropped
 
 
+def promote_by_tradability(
+    ordered: list,
+    rets: pd.DataFrame,
+    adv_map: dict | None = None,
+    tie_rho: float = TIE_RHO,
+    margin: float = TIE_ADV_MARGIN,
+    min_overlap: int = CORR_MIN_OVERLAP,
+) -> tuple[list, dict]:
+    """고상관 묶음 안에서 **거래대금이 큰 쪽을 앞으로** 올린다.
+
+    왜 필요한가 (2026-09-02 실측)
+    ────────────────────────────
+    dedup_by_correlation 은 그리디라 '먼저 채택된 쪽'이 남는다. 입력이 모멘텀
+    순위이므로, ρ=1.00 인 ARKB/IBIT 쌍에서 **$73B 짜리 IBIT 를 버리고 소형
+    ARKB 를 남겼다.** GDX(ρ=0.99)도 GDXJ 에 1개월 0.4%p 차이로 밀렸다.
+    ρ 가 1 에 가까우면 두 상품의 수익률 차이는 노이즈다 — 실제로 손익을 가르는
+    것은 스프레드와 슬리피지이고, 그 대리변수가 거래대금이다.
+
+    왜 AUM 이 아니라 거래대금인가
+    ─────────────────────────────
+    ① 실제 비용은 체결에서 난다.  ② AUM(marketCap)은 신규 상장에서 갱신이
+    늦다 — THYP 에서 marketCap $15.6M vs 실제 순자산 $86.0M 로 5.5배 벌어졌다.
+    ③ 거래대금은 유동성 게이트에서 **이미 계산이 끝나 있다** (추가 비용 0).
+
+    ⚠️ 이 함수는 **재정렬만** 한다. 무엇을 떨굴지는 여전히
+       dedup_by_correlation 이 정한다. 두 책임을 한 함수에 넣으면 어느 쪽이
+       이겼는지 모르는 조용한 실패가 난다 (I7 과 같은 이유).
+
+    묶음 밖 순서는 바꾸지 않는다. 판정 불가(이력 부족·거래대금 미상)면
+    **원래 순서를 유지한다** — 모르면 건드리지 않는다.
+
+    거래대금 차이가 TIE_ADV_MARGIN 배 미만이면 노이즈로 보고 모멘텀 순위를
+    유지한다. 같은 기초자산의 래퍼들은 주수가 비슷해 거래대금이 사실상 동률인
+    경우가 흔하고, 그때 미세차로 대표가 뒤집히면 주마다 결과가 흔들린다.
+
+    반환: (재정렬된 목록, {승격된 티커: (밀려난 원래 선두, 상관계수)})
+    """
+    out: list = []
+    promoted: dict = {}
+    if not ordered:
+        return out, promoted
+    adv_map = adv_map or {}
+    have = (
+        isinstance(rets, pd.DataFrame)
+        and not rets.empty
+        and len(getattr(rets, "columns", [])) > 0
+    )
+    seq = [str(t).strip().upper() for t in ordered if str(t).strip()]
+    if not have:
+        return list(seq), promoted
+
+    assigned: set = set()
+    for idx, seed in enumerate(seq):
+        if seed in assigned:
+            continue
+        cluster = [seed]
+        rhos = {}
+        if seed in rets.columns:
+            s1 = pd.to_numeric(rets[seed], errors="coerce")
+            for other in seq[idx + 1:]:
+                if other in assigned or other not in rets.columns:
+                    continue
+                s2 = pd.to_numeric(rets[other], errors="coerce")
+                pair = pd.concat([s1, s2], axis=1).dropna()
+                if len(pair) < int(min_overlap):
+                    continue        # 판정 불가 → 묶지 않는다
+                rho = pair.iloc[:, 0].corr(pair.iloc[:, 1])
+                if pd.notna(rho) and float(rho) >= float(tie_rho):
+                    cluster.append(other)
+                    rhos[other] = float(rho)
+        assigned.update(cluster)
+
+        if len(cluster) > 1:
+            # 거래대금 미상은 승격 후보에서 뺀다 — 모르면 올리지 않는다.
+            cand = [t for t in cluster if adv_map.get(t) is not None]
+            head_adv = adv_map.get(cluster[0])
+            if cand and head_adv is not None:
+                # max 는 첫 최대값을 돌려주므로 동률이면 원래 순서가 이긴다(안정).
+                best = max(cand, key=lambda t: float(adv_map[t]))
+                # 마진 미달이면 노이즈로 보고 모멘텀 순위를 유지한다.
+                if float(adv_map[best]) < float(head_adv) * float(margin):
+                    best = cluster[0]
+                if best != cluster[0]:
+                    promoted[best] = (cluster[0], rhos.get(best, float("nan")))
+                    cluster.remove(best)
+                    cluster.insert(0, best)
+        out.extend(cluster)
+    return out, promoted
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # B-2. 슬롯 선정 (크립토 캡 적용)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,12 +428,14 @@ def apply_rotation_gates(
       detail    : {티커: 사람이 읽을 부가정보 문자열}
       adv       : {티커: 평균 달러거래대금 or None}
       crypto    : {티커: bool}
+      promoted  : {승격된 티커: (밀려난 원래 선두, ρ)} — 고상관 묶음 대표 교체 내역
 
     ⚠️ `ranked` 의 정렬을 여기서 다시 하지 않는다. 정렬 책임은 호출부에 있고,
        이 함수는 주어진 순서를 신뢰한다. 두 곳에서 정렬하면 어느 쪽이 이겼는지
        모르는 조용한 실패가 난다.
     """
-    out = {"selected": [], "excluded": {}, "detail": {}, "adv": {}, "crypto": {}}
+    out = {"selected": [], "excluded": {}, "detail": {}, "adv": {}, "crypto": {},
+           "promoted": {}}
     if ranked is None or not isinstance(ranked, pd.DataFrame) or ranked.empty:
         return out
     if ticker_col not in ranked.columns:
@@ -371,7 +480,12 @@ def apply_rotation_gates(
         cols = [t for t in after_c if t in close_df.columns]
         if cols:
             sub = daily_returns_frame(close_df[cols])
-    kept, dropped = dedup_by_correlation(after_c, sub if sub is not None else pd.DataFrame())
+    _rets = sub if sub is not None else pd.DataFrame()
+    # 떨구기 **전에** 묶음 안 대표를 거래대금 기준으로 바로잡는다. 순서만 바뀌고
+    # 구성원은 그대로이므로, 무엇이 제외되는지는 여전히 dedup 이 정한다.
+    _ordered_c, _promoted = promote_by_tradability(after_c, _rets, out["adv"])
+    out["promoted"] = _promoted
+    kept, dropped = dedup_by_correlation(_ordered_c, _rets)
     for t, (keeper, rho) in dropped.items():
         out["excluded"][t] = "duplicate"
         out["detail"][t] = f"{keeper} 와 ρ={rho:.2f}"
