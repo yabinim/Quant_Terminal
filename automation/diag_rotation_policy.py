@@ -457,6 +457,32 @@ if _app_src and _rha_src:
         )
         chk("W-11 랭킹 캐시는 게이트로 걸러내지 않는다 (표는 전원 유지)", _inside, False)
 
+    # 게이트 경로 안에 레거시 AUM 키가 남아 있으면 안 된다. 문자열 검색이
+    # 아니라 **함수 본문 AST** 를 본다 — 다른 함수의 같은 글자에 안 걸린다.
+    for _lbl, _s, _fn in (("app.py", _app_src, "cached_hidden_alpha_gates"),
+                          ("run_hidden_alpha", _rha_src, "verify_and_gate")):
+        _node = _func_node(_s, _fn)
+        _body = ast.unparse(_node) if _node is not None else ""
+        _bad = sorted(k for k in ("totalAssets", "mktCap") if k in _body)
+        chk(f"W-13 {_lbl}.{_fn} 에 레거시 AUM 키가 없다", _bad, [])
+        chk(f"W-14 {_lbl}.{_fn} 이 marketCap 을 읽는다", "marketCap" in _body, True)
+
+    # 🔴 되돌릴 수 없는 연산의 가드. cleanup_low_quality_etfs_from_sheet 는
+    # 시트 행을 **삭제**한다. 2026-09-02 이전에는 aum 이 항상 0 이라
+    # `aum < min_aum_m` 이 항상 참이었고, 상장 6개월 지난 ETF 가 거래대금과
+    # 무관하게 전부 삭제 후보였다(silent 모드 배경 실행). 필드를 고쳐도
+    # 조회 실패 한 번에 같은 일이 재발할 수 있으므로 '판정 불가 = 보존'
+    # 가드를 못 박는다. 이 함수는 Streamlit·gspread 의존이라 실행 시험이
+    # 불가능하다 — 구조 검사가 유일한 방어선이다.
+    _cl = _func_node(_app_src, "cleanup_low_quality_etfs_from_sheet")
+    chk("W-15 저품질 정리 함수가 존재한다", _cl is not None, True)
+    if _cl is not None:
+        _cl_src = ast.unparse(_cl)
+        chk("W-16 AUM/거래대금 미상이면 삭제하지 않는다 (판정 불가 = 보존)",
+            "aum <= 0" in _cl_src and "avg_vol_m <= 0" in _cl_src, True)
+        chk("W-17 저품질 정리도 레거시 AUM 키를 읽지 않는다",
+            sorted(k for k in ("totalAssets", "mktCap") if k in _cl_src), [])
+
     # 버튼 경로가 게이트 함수를 실제로 부르는가
     chk("W-12 버튼 경로가 cached_hidden_alpha_gates 를 호출한다",
         any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
@@ -518,9 +544,12 @@ if _gatefn is not None:
             return out
 
         def _prof(t):
+            # ⚠️ 스텁이 **실제 응답 키**를 써야 한다. 2026-09-02 이전 스텁은
+            #    totalAssets 를 돌려줬는데 /stable/profile 에는 그 키가 없다.
+            #    그래서 "AUM 이 안 온다"는 실결함을 이 검사가 정확히 가렸다.
             return (profiles or {}).get(t, {"companyName": t + " ETF",
                                             "sector": "Tech",
-                                            "totalAssets": 500_000_000})
+                                            "marketCap": 500_000_000})
 
         return {
             "pd": pd, "np": np, "fx": fx, "rot": rc,
@@ -560,7 +589,7 @@ if _gatefn is not None:
     _g = _run(_make_ns(names={"DDD": "Boring Broad Index Fund"},
                        profiles={"DDD": {"companyName": "Direxion Daily 2X Shares",
                                          "sector": "Tech",
-                                         "totalAssets": 500_000_000}}), _ORDER)
+                                         "marketCap": 500_000_000}}), _ORDER)
     chk("W-R6 profile 이름이 시트 이름을 이기고 레버리지가 잡힌다",
         _g["excluded"].get("DDD"), "leverage")
 
@@ -582,6 +611,17 @@ if _gatefn is not None:
     # meta 를 함께 돌려준다 (화면이 이름·AUM 을 쓴다)
     chk("W-R11 meta 를 함께 반환한다",
         bool(_run(_make_ns(), _ORDER).get("meta")), True)
+
+    # 🔴 회귀 검사 — 레거시 키를 읽으면 안 된다.
+    # /stable/profile 은 marketCap 만 준다. mktCap 은 레거시 v3, totalAssets 는
+    # 재무제표 필드다. 코드가 이 둘을 읽던 동안 aum 은 전 종목 None 이었고
+    # 상위 15개가 전원 '순자산 미달'로 떨어졌다(2026-09-02 실측).
+    # 레거시 키만 주면 **미상 처리**되어야 한다 — 값이 커도 통과하면 안 된다.
+    _g = _run(_make_ns(profiles={"CCC": {"companyName": "CCC ETF", "sector": "Tech",
+                                         "totalAssets": 9_000_000_000,
+                                         "mktCap": 9_000_000_000}}), _ORDER)
+    chk("W-R12 레거시 키(totalAssets/mktCap)만 오면 AUM 미상으로 제외",
+        _g["excluded"].get("CCC"), "aum")
 
 # ── 양성 대조: 위 AST 헬퍼가 알려진 불량 소스에서 실제로 실패하는가 ──────────
 _BAD = "import rotation_core as rot\nx = rot.something_else()\nMIN_AUM_M = 1.0\n"

@@ -386,7 +386,12 @@ def discover_and_add_new_etfs(ws) -> int:
                 _cn = str(p.get("companyName") or "").strip()
                 if _cn:
                     etf["name"] = _cn[:80]
-                _raw = p.get("totalAssets") or p.get("mktCap")
+                # [2026-09-02] totalAssets/mktCap → marketCap. 앞의 두 키는
+                #   /stable/profile 에 **존재하지 않는다** (mktCap 은 레거시 v3,
+                #   totalAssets 는 재무제표 필드). 그래서 aum 이 항상 None 이었고
+                #   '모르면 제외'가 전 종목에 걸렸다. 프로브 diag_aum_field 로
+                #   marketCap 확정 (GDX profile/etf-info 비 = 1.014).
+                _raw = p.get("marketCap")
                 aum = (float(_raw) / 1_000_000) if _raw not in (None, "", 0) else None
                 # ⚠️ 옛 조건은 `if aum and aum < MIN: continue` 였다. falsy(0/None)가
                 #    통과했고, 신규 상장 직후엔 totalAssets 가 거의 항상 비므로
@@ -514,7 +519,8 @@ def verify_and_gate(ranked: pd.DataFrame, close_df: pd.DataFrame,
             if cn:
                 nm = cn            # profile 이름이 가장 정확 — 있으면 이긴다
             sector = str(prof.get("sector") or prof.get("industry") or "")
-            raw = prof.get("totalAssets") or prof.get("mktCap")
+            # [2026-09-02] marketCap 이 정답 — diag_aum_field 프로브 참조.
+            raw = prof.get("marketCap")
             if raw not in (None, "", 0):
                 try:
                     aum_m = float(raw) / 1_000_000
