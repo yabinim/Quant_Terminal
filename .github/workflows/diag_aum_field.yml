@@ -1,0 +1,81 @@
+name: 🔬 진단 — 로테이션 게이트 AUM 필드 실측 (6콜 · 수동 전용)
+
+# 언제 쓰나:
+#   2026-09-02, app.py 히든알파 버튼에 rotation_core 게이트를 연결하자 상위 15개가
+#   **전원** "순자산 미달 · 데이터 없음"으로 떨어졌다. GDX·IBIT·USO 포함이다.
+#   게이트가 아니라 값이 안 오는 것이다.
+#
+#   코드는 `prof.get("totalAssets") or prof.get("mktCap")` 을 읽는데,
+#   api-docs 상 /stable/profile 의 필드는 **marketCap** 이다.
+#     · mktCap      = 레거시 v3. stable 에는 search-exchange-variants 에만 남음
+#     · totalAssets = 재무제표 필드. profile 에 없음
+#   두 키 모두 영원히 안 잡혀 aum_m 이 항상 None → passes_aum(None)=False → 전원 제외.
+#
+# 왜 고치기 전에 재나:
+#   ETF 의 marketCap 이 순자산과 같은 수인지는 문서에 없다. /stable/etf/info 의
+#   assetsUnderManagement 라는 대안도 있다. 실매매 슬롯을 가르는 게이트이므로
+#   추측으로 고치지 않는다.
+#
+# ⚠️ 판별자:
+#   "필드가 있고 0 이 아니다"는 판별력이 없다 — 주가도 발행좌수도 그 조건을
+#   만족한다. 그래서 **크기**(GDX·IBIT ≥ $1,000M)와 **분리**(THYP 가 자릿수로
+#   작은가)를 함께 요구한다. 세 티커가 비슷한 수면 그 필드는 순자산이 아니다.
+#
+# 사전 확정 기준 (결과를 보기 전에 정함 — 본 뒤에 바꾸지 않는다):
+#   A안  profile.marketCap                크기✅ + 분리✅ → 추가 콜 0
+#   B안  etf/info.assetsUnderManagement   A안 불성립 시 → 티커당 +1콜
+#   둘 다 ❌                              게이트 재설계로 넘김
+#   A·B 동시 성립 → A안. 단 두 값의 비가 3배 이상 어긋나면 B안(같은 것을 안 재는 것).
+#
+# 종료 코드:
+#   0 = A안 또는 B안 확정   /   1 = 둘 다 미달 (또는 키 없음)
+#
+# 급한 이유:
+#   게이트는 자동화에서 아직 한 번도 안 돌았다(9/1 배포, 마지막 실행 8/29).
+#   다음 토요일 5PM 이 첫 실행인데 지금 상태면 selected=[] 이 되고,
+#   compute_actions 의 cur_top5 가 빈 목록이라 **지난주 보유 전부가 매도로** 나간다.
+#
+# 안전성:
+#   · 시트 접근 없음 — 읽지도 쓰지도 않는다
+#   · 이메일 없음 · 알림 상태 머신 미접촉
+#   · 프로젝트 모듈 import 없음 (requests 만 사용) → 사본 신선도와 무관
+#   · 총 6콜. 몇 번을 돌려도 부작용이 없다.
+#
+# ⚠️ repository_dispatch / schedule 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성
+        run: pip install requests
+
+      # 임포트 스모크 (콜 0) — 문법이 아니라 **모듈 최상단이 실제로 도나**를 본다.
+      # FMP_API_KEY 를 주지 않으므로 네트워크는 만지지 않는다.
+      - name: 🧪 임포트 스모크 (콜 0)
+        run: |
+          python -c "import sys; sys.path.insert(0,'automation'); import diag_aum_field; print('import OK')"
+
+      - name: 🔬 AUM 필드 실측 (6콜)
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python automation/diag_aum_field.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        if: always()
+        run: >
+          python check_py311.py
+          automation/diag_aum_field.py
