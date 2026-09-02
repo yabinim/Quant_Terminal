@@ -14,16 +14,25 @@
   I5  게이트에 걸린 종목은 슬롯을 비우지 않고 **다음 순위가 승계**한다.
   I6  크립토 캡은 정확히 CRYPTO_SLOT_CAP 개까지만 통과시킨다.
   I7  상관 제거는 점수 높은 쪽을 남긴다 (입력 순서 의존 — 정렬 책임은 호출부).
+  I8  **소비자 배선** — app.py 와 run_hidden_alpha.py 가 둘 다 rotation_core 를
+      실제로 호출하고, 임계값·슬롯·창 깊이를 로컬에 다시 쓰지 않는다.
+      순수 함수만 검사하면 "게이트는 완벽한데 아무도 안 부른다"를 못 잡는다 —
+      2026-09-02 에 app.py 버튼 경로가 정확히 그 상태였다.
 
 ⚠️ 양성 대조(G)는 **알려진 불량 입력**에 대해 진단이 실제로 실패하는지 본다.
    초록불이 옳은 이유로 켜졌는지 확인하지 않으면 초록불은 정보가 아니다.
 
 사용법:  python3 automation/diag_rotation_policy.py
 """
+import ast
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.normpath(os.path.join(_HERE, ".."))
+for _p in (_HERE, _ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import numpy as np                # noqa: E402
 import pandas as pd               # noqa: E402
@@ -288,6 +297,303 @@ chk("H-5 [양성대조] REQUIRED_BARS 가 상관 요구를 실제로 덮는가",
     rc.REQUIRED_BARS >= rc.CORR_LOOKBACK + 1, True)
 chk("H-6 [양성대조] REQUIRED_BARS 가 1개월 수익률 요구(22봉)를 덮는가",
     rc.REQUIRED_BARS >= 22, True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# W. 소비자 배선 (정적 분석 + 스텁 실행)
+# ══════════════════════════════════════════════════════════════════════════════
+# 왜 필요한가: A~H 는 rotation_core 의 순수 함수만 본다. 그 함수들이 아무리
+# 옳아도 **호출부가 안 부르면** 화면은 게이트 없는 순위표다. 2026-09-02 에
+# app.py 의 「지금 돈이 몰리는 미지의 ETF 찾기」 버튼이 정확히 그랬고, 이 스위트는
+# 초록불이었다. 정적 분석으로 배선을 못 박고, 함수 본문은 스텁으로 실제 실행한다.
+_APP = os.path.join(_ROOT, "app.py")
+_RHA = os.path.join(_ROOT, "run_hidden_alpha.py")
+_RHA_ALT = os.path.join(_ROOT, "automation", "run_hidden_alpha.py")
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _alias_of(src_text, module):
+    """`import <module> as X` 의 X. 없으면 None. (from-import 는 별칭 개념이 없어 제외)"""
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError:
+        return None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                if a.name == module:
+                    return a.asname or a.name
+    return None
+
+
+def _calls_attr(src_text, alias, attr):
+    """`alias.attr(...)` 호출이 있는가. 문자열 검색이 아니라 AST 다 —
+    주석·문서열의 같은 글자에 속지 않는다."""
+    if not alias:
+        return False
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError:
+        return False
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == attr
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == alias):
+            return True
+    return False
+
+
+def _kwarg_src(src_text, alias, attr, kw):
+    """`alias.attr(..., kw=<expr>)` 의 <expr> 소스. 없으면 None."""
+    if not alias:
+        return None
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError:
+        return None
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == attr
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == alias):
+            for k in n.keywords:
+                if k.arg == kw:
+                    return ast.unparse(k.value)
+    return None
+
+
+def _module_level_names(src_text):
+    """모듈 최상위에 **대입된** 이름 집합."""
+    out = set()
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError:
+        return out
+    for n in tree.body:
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    out.add(t.id)
+        elif isinstance(n, (ast.AnnAssign,)) and isinstance(n.target, ast.Name):
+            out.add(n.target.id)
+    return out
+
+
+def _func_node(src_text, name):
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError:
+        return None
+    for n in tree.body:
+        if isinstance(n, ast.FunctionDef) and n.name == name:
+            return n
+    return None
+
+
+_app_src = _read(_APP)
+_rha_src = _read(_RHA) or _read(_RHA_ALT)
+
+# 사전 확정 임계값 — 호출부가 로컬에 다시 쓰면 두 벌이 되고 조용히 갈라진다.
+_LOCKED = ("MIN_DOLLAR_VOLUME", "MIN_AUM_M", "CORR_THRESHOLD",
+           "CORR_LOOKBACK", "HOLD_SLOTS", "CRYPTO_SLOT_CAP", "REQUIRED_BARS")
+
+chk("W-0a app.py 사본 존재", _app_src is not None, True)
+chk("W-0b run_hidden_alpha.py 사본 존재", _rha_src is not None, True)
+
+if _app_src and _rha_src:
+    _app_alias = _alias_of(_app_src, "rotation_core")
+    _rha_alias = _alias_of(_rha_src, "rotation_core")
+
+    chk("W-1 app.py 가 rotation_core 를 import 한다", _app_alias is not None, True)
+    chk("W-2 run_hidden_alpha 가 rotation_core 를 import 한다", _rha_alias is not None, True)
+
+    # 별칭 충돌: app.py 의 rc 는 regime_core 다. rotation_core 를 rc 로 두면
+    # 나중에 rc.classify_regime 이 AttributeError 로 죽는다.
+    chk("W-3 app.py 의 rotation_core 별칭이 regime_core 별칭과 다르다",
+        (_app_alias is not None
+         and _app_alias != _alias_of(_app_src, "regime_core")), True)
+
+    chk("W-4 app.py 가 apply_rotation_gates 를 실제 호출한다",
+        _calls_attr(_app_src, _app_alias, "apply_rotation_gates"), True)
+    chk("W-5 run_hidden_alpha 가 apply_rotation_gates 를 실제 호출한다",
+        _calls_attr(_rha_src, _rha_alias, "apply_rotation_gates"), True)
+
+    # 슬롯 수를 리터럴로 쓰면 rotation_core 와 갈라진다.
+    _slots_app = _kwarg_src(_app_src, _app_alias, "apply_rotation_gates", "slots")
+    chk("W-6 app.py 의 slots 인자가 rotation_core 를 참조한다 (리터럴 금지)",
+        bool(_slots_app) and _app_alias in str(_slots_app), True)
+
+    # 창 깊이도 마찬가지 — REQUIRED_BARS 가 소유한다.
+    chk("W-7 app.py 가 창 깊이를 REQUIRED_BARS 로 잡는다",
+        f"{_app_alias}.REQUIRED_BARS" in _app_src, True)
+
+    # 제외 사유를 코드 그대로 노출하면 사용자가 못 읽는다.
+    chk("W-8 app.py 가 reason_label 로 사유를 번역한다",
+        _calls_attr(_app_src, _app_alias, "reason_label"), True)
+
+    # 임계값 로컬 재정의 금지 (run_hidden_alpha 의 `_HOLD_SLOTS = rc.HOLD_SLOTS`
+    # 같은 위임 대입은 이름이 달라 걸리지 않는다 — 금지 대상은 동명 재정의다)
+    for _f, _s, _lbl in ((_APP, _app_src, "app.py"), (_RHA, _rha_src, "run_hidden_alpha")):
+        _dup = sorted(_module_level_names(_s) & set(_LOCKED))
+        chk(f"W-9 {_lbl} 가 사전확정 임계값을 로컬 재정의하지 않는다", _dup, [])
+
+    # 랭킹 표는 전원 유지 — 랭킹 캐시 안에서 게이트를 걸면 다른 소비자
+    # (build_pool_monthly_returns_table)의 목록이 조용히 줄어든다.
+    _rank_fn = _func_node(_app_src, "cached_etf_universe_rankings_full")
+    chk("W-10 랭킹 캐시 함수가 존재한다", _rank_fn is not None, True)
+    if _rank_fn is not None:
+        _inside = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "apply_rotation_gates"
+            for n in ast.walk(_rank_fn)
+        )
+        chk("W-11 랭킹 캐시는 게이트로 걸러내지 않는다 (표는 전원 유지)", _inside, False)
+
+    # 버튼 경로가 게이트 함수를 실제로 부르는가
+    chk("W-12 버튼 경로가 cached_hidden_alpha_gates 를 호출한다",
+        any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "cached_hidden_alpha_gates"
+            for n in ast.walk(ast.parse(_app_src))), True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# W-R. app.py 게이트 함수 **본문 실행** (네트워크 0 · 스텁)
+# ══════════════════════════════════════════════════════════════════════════════
+# 정적 분석은 "부르긴 부른다"까지만 증명한다. 넘기는 자료의 모양이 틀리면
+# (거래량 프레임이 비어 있다든지, 메타 키 이름이 다르다든지) 게이트는 조용히
+# 전원 제외를 돌려주고 화면은 "슬롯 0" 이 된다. 그래서 함수 본문을 떼어내
+# 스텁 위에서 실제로 돌린다. app.py 전체를 import 하지 않는 이유는 Streamlit
+# 의존 때문이다 — 필요한 것은 함수 하나뿐이다.
+_gatefn = _func_node(_app_src, "cached_hidden_alpha_gates") if _app_src else None
+chk("W-R0 게이트 함수가 app.py 에 정의돼 있다", _gatefn is not None, True)
+
+if _gatefn is not None:
+    _gatefn.decorator_list = []          # st.cache_data 제거
+    _mod = ast.Module(body=[_gatefn], type_ignores=[])
+    ast.fix_missing_locations(_mod)
+
+    _px = pd.DataFrame(
+        {"d": pd.date_range("2026-01-01", periods=90, freq="B")}).set_index("d")
+
+    def _mk(seed, n=90):
+        rng = np.random.default_rng(seed)
+        return pd.Series(100 + np.cumsum(rng.normal(0, 1, n)),
+                         index=_px.index[:n])
+
+    _base = _mk(1)
+    _SERIES = {
+        "AAA": _base,
+        "BBB": _base * 1.5 + 0.001,      # AAA 와 ρ≈1 → 중복
+        "CCC": _mk(7),
+        "DDD": _mk(9),
+        "EEE": _mk(11),
+        "FFF": _mk(13),
+    }
+    _BIGVOL = pd.Series(5_000_000.0, index=_px.index[:90])   # 종가×거래량 ≫ 임계
+    _TINYVOL = pd.Series(1.0, index=_px.index[:90])
+
+    def _make_ns(*, vol_for=None, profiles=None, names=None, raise_batch=False,
+                 tickers=None):
+        tickers = tickers or list(_SERIES)
+        vol_for = list(_SERIES) if vol_for is None else vol_for
+
+        def _batch(tks, *, lookback_days):
+            if raise_batch:
+                raise RuntimeError("네트워크 실패 시뮬레이션")
+            out = {}
+            for t in tks:
+                if t not in _SERIES:
+                    continue
+                d = pd.DataFrame({"Close": _SERIES[t]})
+                if t in vol_for:
+                    d["Volume"] = (_BIGVOL if vol_for is not True else _BIGVOL)
+                out[t] = d
+            return out
+
+        def _prof(t):
+            return (profiles or {}).get(t, {"companyName": t + " ETF",
+                                            "sector": "Tech",
+                                            "totalAssets": 500_000_000})
+
+        return {
+            "pd": pd, "np": np, "fx": fx, "rot": rc,
+            "_HA_VERIFY_TOP_N": 15,
+            "_fmp_batch_price_history": _batch,
+            "_fmp_etf_symbol_name_map": lambda: (names or {}),
+            "_fmp_profile": _prof,
+        }
+
+    def _run(ns, order):
+        exec(compile(_mod, "<app_gate>", "exec"), ns)          # noqa: S102
+        return ns["cached_hidden_alpha_gates"](tuple(order))
+
+    # ⚠️ 알파벳 순이 **아니어야** 한다. 정렬된 픽스처를 쓰면 "호출부가 순서를
+    #    다시 정렬한다"는 변이가 무동작이 되어 W-R3 가 통과해 버린다(실측).
+    _ORDER = ["EEE", "AAA", "BBB", "CCC", "DDD", "FFF"]
+
+    # 정상 경로 — AAA/BBB 는 ρ≈1 이라 하나만 남고 나머지가 승계한다.
+    _g = _run(_make_ns(), _ORDER)
+    chk("W-R1 정상 입력에서 슬롯이 찬다", len(_g["selected"]), rc.HOLD_SLOTS)
+    chk("W-R2 상관 중복이 실제로 제거된다", _g["excluded"].get("BBB"), "duplicate")
+    chk("W-R3 입력 순서(=랭킹)를 재정렬하지 않는다", _g["selected"][0], "EEE")
+
+    # 거래량이 없는 티커 → '판정 불가' → 제외 (모르면 안 산다)
+    _g = _run(_make_ns(vol_for=["AAA", "CCC", "DDD", "EEE", "FFF"]), _ORDER)
+    chk("W-R4 거래량 없는 티커는 유동성 제외", _g["excluded"].get("BBB"), "liquidity")
+
+    # AUM 미상 → 제외
+    _g = _run(_make_ns(profiles={"CCC": {"companyName": "CCC ETF", "sector": "Tech"}}),
+              _ORDER)
+    chk("W-R5 AUM 미상은 제외", _g["excluded"].get("CCC"), "aum")
+
+    # 레버리지 — 이름은 profile.companyName 으로 처음 채워진다 (SPAX 경로)
+    # names 에 **무해한 이름**을 미리 넣는다. 비워 두면 `if cn and not nm` 같은
+    # 변이(= profile 이름이 시트 이름을 못 이김)가 보이지 않는다(실측). 이 경로가
+    # SPAX 가 뚫렸던 자리이므로 '이긴다'를 반드시 못 박아야 한다.
+    _g = _run(_make_ns(names={"DDD": "Boring Broad Index Fund"},
+                       profiles={"DDD": {"companyName": "Direxion Daily 2X Shares",
+                                         "sector": "Tech",
+                                         "totalAssets": 500_000_000}}), _ORDER)
+    chk("W-R6 profile 이름이 시트 이름을 이기고 레버리지가 잡힌다",
+        _g["excluded"].get("DDD"), "leverage")
+
+    # 배치 실패 → 크래시 없이 전원 유동성 제외
+    _g = _run(_make_ns(raise_batch=True), _ORDER)
+    chk("W-R7 가격 조회 실패 시 크래시하지 않는다", isinstance(_g, dict), True)
+    chk("W-R8 가격 조회 실패 시 슬롯을 채우지 않는다", _g["selected"], [])
+
+    # 빈 입력
+    chk("W-R9 빈 입력은 조용히 빈 결과", _run(_make_ns(), [])["selected"], [])
+
+    # 상위 N 개만 판정한다
+    _ns = _make_ns()
+    _ns["_HA_VERIFY_TOP_N"] = 2
+    _g = _run(_ns, _ORDER)
+    chk("W-R10 상위 N 개만 판정 대상에 들어간다",
+        sorted(set(_g["selected"]) | set(_g["excluded"])), ["AAA", "EEE"])
+
+    # meta 를 함께 돌려준다 (화면이 이름·AUM 을 쓴다)
+    chk("W-R11 meta 를 함께 반환한다",
+        bool(_run(_make_ns(), _ORDER).get("meta")), True)
+
+# ── 양성 대조: 위 AST 헬퍼가 알려진 불량 소스에서 실제로 실패하는가 ──────────
+_BAD = "import rotation_core as rot\nx = rot.something_else()\nMIN_AUM_M = 1.0\n"
+chk("W-P1 [양성대조] 호출이 없으면 _calls_attr 가 False 를 낸다",
+    _calls_attr(_BAD, "rot", "apply_rotation_gates"), False)
+chk("W-P2 [양성대조] 로컬 재정의를 실제로 잡는다",
+    sorted(_module_level_names(_BAD) & set(_LOCKED)), ["MIN_AUM_M"])
+chk("W-P3 [양성대조] 없는 모듈에는 별칭이 안 잡힌다",
+    _alias_of(_BAD, "regime_core"), None)
+chk("W-P4 [양성대조] 문서열 속 글자에 속지 않는다",
+    _calls_attr('"""rot.apply_rotation_gates(x)"""\n', "rot", "apply_rotation_gates"),
+    False)
 
 # ══════════════════════════════════════════════════════════════════════════════
 print("=" * 74)
