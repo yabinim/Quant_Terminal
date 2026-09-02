@@ -610,8 +610,30 @@ if _app_src and _rha_src:
     chk("W-18 apply_rotation_gates 가 promote_by_tradability 를 호출한다",
         _ag is not None and "promote_by_tradability" in ast.unparse(_ag), True)
     # 이메일 표가 판정 범위와 어긋나면 실제 매수 대상이 표에서 사라진다(2026-09-02).
-    chk("W-19 _TOP_N_EMAIL 이 _VERIFY_TOP_N 에 묶여 있다 (리터럴 금지)",
-        "_TOP_N_EMAIL = _VERIFY_TOP_N" in _rha_src, True)
+    # 표 기본 행수는 판정 깊이와 **다르다**(100행 이메일은 못 읽는다). 대신
+    # 15위 밖 ⭐ 를 덧붙이는 함수가 반드시 배선돼 있어야 한다 — 없으면
+    # 실제 매수 대상이 표에서 사라진다(2026-09-02 에 USO·IBIT 가 그랬다).
+    chk("W-19 이메일 표가 email_table_rows 로 조립된다",
+        any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "email_table_rows"
+            for n in ast.walk(ast.parse(_rha_src))), True)
+
+    # 판정 깊이가 두 파일에서 다르면 화면과 이메일이 서로 다른 슬롯을 말한다.
+    def _int_const(src_text, name):
+        for nd in ast.parse(src_text).body:
+            if (isinstance(nd, ast.Assign) and len(nd.targets) == 1
+                    and isinstance(nd.targets[0], ast.Name)
+                    and nd.targets[0].id == name
+                    and isinstance(nd.value, ast.Constant)):
+                return nd.value.value
+        return None
+
+    _d_app = _int_const(_app_src, "_HA_VERIFY_TOP_N")
+    _d_rha = _int_const(_rha_src, "_VERIFY_TOP_N")
+    chk("W-20 앱과 자동화의 판정 깊이가 같다", (_d_app, _d_rha),
+        (_d_rha, _d_rha) if _d_rha is not None else (None, None))
+    chk("W-21 판정 깊이가 슬롯 수보다 충분히 깊다 (5칸을 채울 여지)",
+        isinstance(_d_rha, int) and _d_rha >= rc.HOLD_SLOTS * 10, True)
 
     # 버튼 경로가 게이트 함수를 실제로 부르는가
     chk("W-12 버튼 경로가 cached_hidden_alpha_gates 를 호출한다",
@@ -769,6 +791,62 @@ chk("W-P3 [양성대조] 없는 모듈에는 별칭이 안 잡힌다",
 chk("W-P4 [양성대조] 문서열 속 글자에 속지 않는다",
     _calls_attr('"""rot.apply_rotation_gates(x)"""\n', "rot", "apply_rotation_gates"),
     False)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E. 이메일 표 행 선택 (email_table_rows)
+# ══════════════════════════════════════════════════════════════════════════════
+# 판정 깊이 100 · 표 기본 15. 5번째 슬롯이 60위에서 나올 수 있으므로 표를 그냥
+# 자르면 실제 매수 대상이 사라진다. 2026-09-02 에 USO·IBIT 가 11위 밖이라
+# 사라졌고, 이메일만 보면 살 것이 GDXJ 하나로 보였다.
+# run_hidden_alpha 를 통째로 import 하지 않는다 — gspread 등 무거운 의존이
+# 걸려 있고, 진단은 네트워크·시트 없이 돌아야 한다. W-R 과 같은 방식으로
+# 함수 본문만 AST 로 떼어내 실행한다.
+_rha_src_e = _read(_RHA) or _read(_RHA_ALT) or ""
+
+
+def _load_fn(src_text, name, ns):
+    node = _func_node(src_text, name)
+    if node is None:
+        return None
+    node.decorator_list = []
+    mod = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    exec(compile(mod, "<rha>", "exec"), ns)      # noqa: S102
+    return ns.get(name)
+
+
+_e_ns = {"pd": pd, "_TOP_N_EMAIL": 15}
+_etr = _load_fn(_rha_src_e, "email_table_rows", _e_ns)
+chk("E-0 email_table_rows 가 정의돼 있다", _etr is not None, True)
+
+if _etr is not None:
+    _rk = pd.DataFrame({
+        "rank": range(1, 41),
+        "Ticker": [f"T{i:02d}" for i in range(1, 41)],
+    })
+
+    _b, _x = _etr(_rk, ["T01", "T03"], base_n=15)
+    chk("E-1 기본 행수만큼 자른다", len(_b), 15)
+    chk("E-2 안쪽 ⭐ 는 덧붙이지 않는다 (중복 행 금지)", len(_x), 0)
+
+    _b, _x = _etr(_rk, ["T01", "T22", "T37"], base_n=15)
+    chk("E-3 밖의 ⭐ 를 덧붙인다", sorted(_x["Ticker"].tolist()), ["T22", "T37"])
+    chk("E-4 덧붙인 행이 실제 순위를 유지한다", _x["rank"].tolist(), [22, 37])
+    chk("E-5 [핵심] 선정 슬롯이 전부 표에 들어간다",
+        {"T01", "T22", "T37"} <= set(_b["Ticker"]) | set(_x["Ticker"]), True)
+
+    chk("E-6 선정이 없으면 추가 행도 없다", len(_etr(_rk, [], base_n=15)[1]), 0)
+    chk("E-7 선정이 None 이어도 죽지 않는다", len(_etr(_rk, None, base_n=15)[0]), 15)
+    chk("E-8 소문자·공백 티커도 매칭된다",
+        _etr(_rk, [" t22 "], base_n=15)[1]["Ticker"].tolist(), ["T22"])
+    chk("E-9 빈 랭킹은 조용히 통과", len(_etr(pd.DataFrame(), ["T01"], base_n=15)[0]), 0)
+    chk("E-10 랭킹이 기본 행수보다 짧으면 있는 만큼만",
+        len(_etr(_rk.head(7), ["T03"], base_n=15)[0]), 7)
+
+    # 양성 대조 — 자르기만 하면 밖의 ⭐ 가 사라진다(고치기 전 동작).
+    chk("E-P1 [양성대조] 단순 절단이면 T22 가 사라진다",
+        "T22" in set(_rk.head(15)["Ticker"]), False)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 print("=" * 74)
