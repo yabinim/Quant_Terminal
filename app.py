@@ -5766,11 +5766,18 @@ def cached_etf_universe_rankings_full(universe_tickers_tuple: tuple[str, ...]):
     return out
 
 
-# 게이트 판정 대상 상위 후보 수. run_hidden_alpha._VERIFY_TOP_N 과 **같은 정책**이다.
-# 유니버스 전체(~350종목)에 profile 을 돌리면 콜이 폭발하는데, 게이트는 최종 슬롯
-# 선정에만 영향을 주므로 상위권만 정확하면 된다. 15 는 게이트가 10개를 떨궈도
-# Top 5 가 차는 여유값이다.
-_HA_VERIFY_TOP_N = 15
+# 게이트 판정 깊이. run_hidden_alpha._VERIFY_TOP_N 과 **반드시 같아야 한다** —
+# 다르면 화면과 토요일 이메일이 서로 다른 슬롯을 말한다. diag W-20 이 감시한다.
+#
+# [2026-09-02] 15 → 100. 계좌는 5칸 로테이션으로 운용되는데 상위 15개 중 12개가
+#   중복·저유동성으로 탈락해 슬롯이 3개만 찼다(실측). 3개면 40% 가 의도치 않은
+#   현금이다. 게이트를 강화했으면 탐색도 넓혀야 했다.
+#   ⚠️ 옛 주석은 "15 는 10개를 떨궈도 Top 5 가 차는 여유값"이라고 했는데
+#      근거 없는 낙관이었다. 실측은 12개 탈락이었다.
+#   비용: 가격 100 + profile 100 = 약 200콜. 관리자가 손으로 누를 때만이지만
+#   랭킹 계산까지 합치면 **3분 가까이** 걸린다. 자동화와 같은 결과를 내야 하므로
+#   앱만 얕게 볼 수는 없다.
+_HA_VERIFY_TOP_N = 100
 
 
 @st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
@@ -5793,9 +5800,9 @@ def cached_hidden_alpha_gates(ranked_tickers_tuple: tuple[str, ...]) -> dict:
     신뢰하고 재정렬하지 않으므로, 호출부가 정렬을 끝내서 넘겨야 한다.
     튜플인 이유는 st.cache_data 해시 때문이다.
 
-    콜 비용: 가격 최대 15 + profile 최대 15 = 30. 관리자가 손으로 누를 때만이라
-    레이트(300/분) 대비 무의미하다. 창 깊이는 rotation_core 가 소유한다
-    (REQUIRED_BARS) — 여기에 숫자를 다시 쓰면 두 벌이 된다.
+    콜 비용: 가격 최대 100 + profile 최대 100 = 200. 레이트(300/분)에는 여유가
+    있지만 **체감 시간이 길다**(랭킹 포함 3분 가까이). 창 깊이는 rotation_core 가
+    소유한다 (REQUIRED_BARS) — 여기에 숫자를 다시 쓰면 두 벌이 된다.
     """
     empty = {"selected": [], "excluded": {}, "detail": {}, "adv": {}, "crypto": {}, "meta": {}}
     head = [str(t).strip().upper() for t in (ranked_tickers_tuple or ())[:_HA_VERIFY_TOP_N]
@@ -19392,7 +19399,10 @@ if st.session_state.get("logged_in"):
                     st.session_state["_hidden_alpha_df"] = _ha_result
                     # 랭킹과 **보유 슬롯은 다른 것**이다. 순위표는 전원 유지하고,
                     # 실제 슬롯은 자동화 이메일과 같은 게이트를 통과한 것만 남긴다.
-                    with st.spinner("로테이션 게이트(유동성·기초자산 중복·크립토 캡) 적용 중..."):
+                    with st.spinner(
+                        f"로테이션 게이트(유동성·기초자산 중복·크립토 캡) 적용 중 — "
+                        f"상위 {_HA_VERIFY_TOP_N}개 판정, 1~2분 걸립니다..."
+                    ):
                         st.session_state["_hidden_alpha_gates"] = cached_hidden_alpha_gates(
                             tuple(_ha_result["Ticker"].tolist())
                         )
@@ -19460,7 +19470,8 @@ if st.session_state.get("logged_in"):
                     f"✅ 표시 = 게이트 통과 슬롯(최대 {rot.HOLD_SLOTS}개). 🔥 표시는 **순위 기준 주도주 표식일 뿐 "
                     "보유 판정이 아닙니다** — 순위가 높아도 거래대금·순자산 미달이거나 이미 담은 "
                     "기초자산과 중복이면 슬롯에 들어가지 않습니다. "
-                    f"판정 대상은 상위 {_HA_VERIFY_TOP_N}개이며, 그 아래 순위는 판정하지 않습니다."
+                    f"판정 대상은 상위 {_HA_VERIFY_TOP_N}개이며, 그 아래 순위는 판정하지 않습니다. "
+                    "슬롯이 5개에 못 미치면 그 깊이까지 봐도 서로 다른 매수 대상이 그만큼뿐이라는 뜻입니다."
                 )
                 st.markdown(
                     "💡 [Ryan's Alpha Strategy] 분할 투자 대상은 위 **✅ 최종 슬롯**입니다. "
