@@ -25,6 +25,9 @@ COLS = [
     "Earn_Preset", "Earn_Trim_Cap_Pct",
     # ── 트랜치 매도 사이징 (동일하게 맨 뒤 append) ──
     "Swing_Weight_Pct", "Trim_Ratio_Pct",
+    # ── 매도 규모 표시 스위치 (맨 뒤 append) ──
+    # 빈칸 = 켜짐. 이 열이 없던 시절의 행이 자동으로 켜진 상태가 된다.
+    "Trim_Size_Show",
 ]
 NCOL = len(COLS)
 
@@ -44,6 +47,12 @@ DEFAULTS = {
     #    설정한 적 없는 계좌가 포지션 전용으로 오해된다.
     "Swing_Weight_Pct": None,
     "Trim_Ratio_Pct": rc.TRIM_RATIO_DEFAULT_PCT,
+    # 기본 켜짐. Swing_Weight_Pct 가 None 이어도 표시된다 — 미설정 계좌는
+    # rc.TRIM_SWING_WEIGHT_FALLBACK_PCT 분할로 계산되고 assumed 로 고지된다.
+    # ⚠️ 이 스위치는 Swing_Weight_Pct 와 **독립**이다. 표시를 켜기 위해
+    #    Swing_Weight_Pct 에 값을 써 넣으면 default_events_for_weight 가
+    #    미설정 종목의 알림 이벤트까지 바꿔버린다(스윙 알림 소실).
+    "Trim_Size_Show": True,
 }
 
 SIZING_MODE_LABELS = {
@@ -130,6 +139,9 @@ def _coerce_row(row: list) -> dict:
     if pd.notna(v) and float(v) > 0:
         prof["Trim_Ratio_Pct"] = float(
             max(rc.TRIM_RATIO_MIN_PCT, min(rc.TRIM_RATIO_MAX_PCT, float(v))))
+    # 빈칸/미인식 → 켜짐(rc 가 SSOT). 끄기는 명시적 'N' 계열만.
+    prof["Trim_Size_Show"] = rc.resolve_trim_size_show(
+        r[idx["Trim_Size_Show"]], True)
     return prof
 
 
@@ -183,6 +195,10 @@ def to_row(user_id: str, account: str, prof: dict, now_et: str) -> list:
          else float(prof.get("Swing_Weight_Pct"))),
         float(prof.get("Trim_Ratio_Pct", rc.TRIM_RATIO_DEFAULT_PCT)
               or rc.TRIM_RATIO_DEFAULT_PCT),
+        # 켜짐도 명시적으로 'Y' 를 쓴다. 빈칸으로 두면 사람이 시트를 봤을 때
+        # '미설정'과 '켜기로 선택함'이 구분되지 않는다.
+        ("Y" if rc.resolve_trim_size_show(prof.get("Trim_Size_Show"), True)
+         else "N"),
     ]
 
 

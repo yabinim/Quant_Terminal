@@ -21843,20 +21843,31 @@ if st.session_state.get("logged_in"):
                                 trim_ratio_pct=_prof_tr.get("Trim_Ratio_Pct",
                                                             rc.TRIM_RATIO_DEFAULT_PCT),
                                 swing_label=_sw_lbl, position_label=_po_lbl,
-                                min_trade_dollars=_prof_tr.get("Min_Trade_Dollars", 0.0))
+                                min_trade_dollars=_prof_tr.get("Min_Trade_Dollars", 0.0),
+                                show=bool(_prof_tr.get("Trim_Size_Show", True)))
 
                             with st.container(border=True):
                                 st.markdown(f"**{_tk}** · {_rlabel} · 평단 {_avg_s} {_qty_s}")
                                 st.markdown(f"📈 스윙(단기): {_verdict_md(_sw_lbl)} — {_sw_why}")
                                 st.markdown(f"🛡 포지션(중장기): {_verdict_md(_po_lbl)} — {_po_why}")
                                 if _trim_plan.get("enabled") and _trim_plan.get("label"):
+                                    # ⚠️ muted(신호는 났는데 그 호흡 몫이 0%)를 빼먹으면
+                                    #    수량 0 이라 어느 분기에도 안 걸려 label 이 통째로
+                                    #    사라진다. '판정은 줄이기인데 아무 말이 없는' 상태다.
+                                    #    반대로 '매도 신호 없음'(muted=False)은 보유 전
+                                    #    종목에 뜨는 소음이므로 계속 숨긴다.
+                                    _shown = True
                                     if _trim_plan.get("blocked"):
                                         st.info(f"✂️ {_trim_plan['label']}")
                                     elif _trim_plan.get("full_exit"):
                                         st.error(f"✂️ {_trim_plan['label']}")
                                     elif _trim_plan.get("qty", 0) > 0:
                                         st.warning(f"✂️ {_trim_plan['label']}")
-                                    if _trim_plan.get("note"):
+                                    elif _trim_plan.get("muted"):
+                                        st.caption(f"✂️ {_trim_plan['label']}")
+                                    else:
+                                        _shown = False
+                                    if _shown and _trim_plan.get("note"):
                                         st.caption(_trim_plan["note"])
 
                             # 종목별 알림 토글 (Portfolio_Alert_State 에 저장)
@@ -23218,15 +23229,31 @@ if st.session_state.get("logged_in"):
                         #    위젯은 제출 전까지 rerun 을 일으키지 않으므로 체크박스를
                         #    켜도 슬라이더가 그 자리에서 나타나지 않고, 제출 시점에
                         #    처음 생성되면서 사용자가 만진 적 없는 기본값이 저장된다.
-                        #    항상 렌더하고 체크박스는 저장 시 None 여부만 결정한다.
+                        #    항상 렌더하고 체크박스는 저장 시 값만 결정한다.
+                        #
+                        # ⚠️ 체크박스가 **두 개**인 이유 — 표시 스위치와 몫 비율은
+                        #    반드시 분리해야 한다. 하나로 합치면 "수량을 보고 싶다"는
+                        #    이유만으로 Swing_Weight_Pct 에 값이 써지고, 그 순간
+                        #    default_events_for_weight() 가 Alert_States 미설정
+                        #    종목의 기본 알림을 스윙(exit,risk)에서 포지션(pexit,
+                        #    ptrim)으로 갈아엎는다. 받던 알림이 조용히 사라진다.
+                        _v_swshow = st.checkbox(
+                            "매도 권장 수량 표시", value=bool(_p.get("Trim_Size_Show", True)),
+                            key=f"_prof_swshow_{_pa}",
+                            help="끄면 판정 라벨만 표시하고 수량은 제안하지 않습니다. "
+                                 "기본은 켜짐입니다.")
                         _v_swuse = st.checkbox(
-                            "매도 권장 수량 표시", value=(_sw_saved is not None),
+                            "스윙/포지션 몫 직접 지정", value=(_sw_saved is not None),
                             key=f"_prof_swuse_{_pa}",
-                            help="끄면 지금처럼 판정 라벨만 표시하고 수량은 제안하지 않습니다. "
-                                 "아래 값은 켤 때 함께 저장됩니다.")
+                            help="끄면 기본 분할(스윙 "
+                                 f"{rc.TRIM_SWING_WEIGHT_FALLBACK_PCT:.0f}% · 포지션 "
+                                 f"{100 - rc.TRIM_SWING_WEIGHT_FALLBACK_PCT:.0f}%)로 계산합니다. "
+                                 "이 체크를 켜야 아래 슬라이더 값이 저장되며, 알림 이벤트 "
+                                 "기본 해석도 함께 바뀝니다.")
                         _v_sw = float(st.slider(
                             "스윙 몫 (%) — 나머지는 포지션 몫", min_value=0, max_value=100, step=5,
-                            value=int(_sw_saved if _sw_saved is not None else 0),
+                            value=int(_sw_saved if _sw_saved is not None
+                                      else rc.TRIM_SWING_WEIGHT_FALLBACK_PCT),
                             key=f"_prof_sw_{_pa}"))
                         _v_trim = float(st.number_input(
                             "줄이기 1회 축소폭 (해당 몫의 %)",
@@ -23234,11 +23261,19 @@ if st.session_state.get("logged_in"):
                             max_value=float(rc.TRIM_RATIO_MAX_PCT), step=1.0,
                             value=float(_p.get("Trim_Ratio_Pct", rc.TRIM_RATIO_DEFAULT_PCT)),
                             key=f"_prof_trim_{_pa}"))
+                        if not _v_swshow:
+                            st.caption("표시가 꺼져 있습니다 — 판정 라벨만 나옵니다. "
+                                       "아래 값은 저장되지만 적용되지 않습니다.")
+                        _w_eff_prev = (_v_sw if _v_swuse
+                                       else float(rc.TRIM_SWING_WEIGHT_FALLBACK_PCT))
+                        st.caption(
+                            f"스윙 {_w_eff_prev:.0f}% / 포지션 {100 - _w_eff_prev:.0f}% · "
+                            f"줄이기 = 해당 몫의 {_v_trim:.0f}%"
+                            + ("" if _v_swuse else " (기본 분할 — 저장 안 함)")
+                        )
                         if _v_swuse:
                             st.caption(
-                                f"스윙 {_v_sw:.0f}% / 포지션 {100 - _v_sw:.0f}% · "
-                                f"줄이기 = 해당 몫의 {_v_trim:.0f}% · "
-                                f"미설정 알림 이벤트는 "
+                                "미설정 종목의 알림 이벤트는 "
                                 f"`{rc.default_events_for_weight(_v_sw)}` 로 해석됩니다."
                             )
                             if 0 < _v_sw < 100:
@@ -23246,14 +23281,17 @@ if st.session_state.get("logged_in"):
                                     "⚠️ 중간 비율입니다. 한쪽 몫만 먼저 판 뒤에도 잔여가 이 비율대로 "
                                     "남아 있다고 가정해 계산합니다(트랜치 실행 추적 미구현)."
                                 )
-                            if float(_v_min) <= 0:
-                                st.caption(
-                                    "💡 최소 거래금액이 0이라 아주 작은 축소도 그대로 제안됩니다. "
-                                    "소액 계좌라면 값을 지정하는 편이 좋습니다."
-                                )
                         else:
-                            st.caption("체크를 켜야 위 비율이 저장·적용됩니다. "
-                                       "지금은 판정 라벨만 표시합니다.")
+                            st.caption(
+                                "몫 미지정 — 알림 이벤트 기본 해석은 종전 그대로입니다"
+                                f"(`{_PORTFOLIO_ALERT_DEFAULT}`). "
+                                "스윙 몫이 0%라 스윙 신호에는 수량이 나오지 않습니다."
+                            )
+                        if _v_swshow and float(_v_min) <= 0:
+                            st.caption(
+                                "💡 최소 거래금액이 0이라 아주 작은 축소도 그대로 제안됩니다. "
+                                "소액 계좌라면 값을 지정하는 편이 좋습니다."
+                            )
                         if not _v_swuse:
                             _v_sw = None
 
@@ -23377,6 +23415,7 @@ if st.session_state.get("logged_in"):
                             "Cash_Reserve_Pct": float(_v_res), "Min_Trade_Dollars": float(_v_min),
                             "Earn_Preset": str(_v_preset), "Earn_Trim_Cap_Pct": float(_v_ecap),
                             "Swing_Weight_Pct": _v_sw, "Trim_Ratio_Pct": float(_v_trim),
+                            "Trim_Size_Show": bool(_v_swshow),
                         })
                         if _ok_p:
                             _invalidate_account_context_memo()

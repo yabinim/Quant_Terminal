@@ -746,9 +746,24 @@ def resolve_alert_events(raw, default_csv: str = "entry,risk") -> list:
 # 두 호흡(스윙/포지션) 판정은 이미 독립적으로 계산된다. 지금까지는 '정보'로만
 # 표시하고 수량과 연결되지 않아, 사용자가 "줄이기"를 보고도 얼마를 팔지 스스로
 # 정해야 했다. 보유를 두 몫으로 나눠 각 몫에 해당 호흡의 판정을 적용한다.
-TRIM_RATIO_DEFAULT_PCT = 50.0
+TRIM_RATIO_DEFAULT_PCT = 33.0      # 3회 분할 축소를 기본으로 본다.
 TRIM_RATIO_MIN_PCT = 10.0
 TRIM_RATIO_MAX_PCT = 90.0
+
+# 몫 비율을 한 번도 지정하지 않은 계좌에 적용할 기본 분할.
+# 0 = 스윙 0% / 포지션 100% — "단기 흔들림에는 팔지 않는다"가 기본 태도다.
+#
+# ⚠️ 이 상수는 **수량 계산에만** 쓴다. default_events_for_weight() 에는 절대
+#    넘기지 않는다. 넘기면 Alert_States 미설정 종목의 기본 알림이 스윙 계열
+#    (exit,risk)에서 포지션 계열(pexit,ptrim)로 조용히 갈아엎어져 사용자가
+#    받던 알림이 사라진다. 미설정의 '이벤트 해석'은 종전 그대로 둔다.
+TRIM_SWING_WEIGHT_FALLBACK_PCT = 0.0
+
+# Trim_Size_Show 를 끔으로 읽을 값들. 빈칸·미설정은 **켜짐**이다 —
+# 스키마가 늘기 전에 저장된 행에는 이 열이 아예 없으므로, 빈칸을 끔으로
+# 읽으면 기존 계좌 전부가 기능이 꺼진 채로 남는다.
+_TRIM_SHOW_FALSE = {"n", "no", "off", "false", "0", "끔", "미사용", "안함"}
+_TRIM_SHOW_TRUE = {"y", "yes", "on", "true", "1", "켬", "사용", "함"}
 
 
 def resolve_swing_weight(ticker_override=None, account_default=None):
@@ -772,6 +787,27 @@ def resolve_swing_weight(ticker_override=None, account_default=None):
             continue
         return max(0.0, min(100.0, f))
     return None
+
+
+def resolve_trim_size_show(raw, default: bool = True) -> bool:
+    """Trim_Size_Show 시트값 → 매도 규모 표시 여부. 빈칸/미설정 = 켜짐.
+
+    ⚠️ 알아볼 수 없는 값은 default(켜짐)로 떨어뜨린다. 표시를 못 하는 것보다
+       뜻밖의 값 하나로 **매도 규모가 통째로 사라지는** 쪽이 위험하다.
+       끄기는 반드시 명시적으로 저장된 'N' 계열이어야 한다.
+    """
+    if raw is None:
+        return bool(default)
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if not s:
+        return bool(default)
+    if s in _TRIM_SHOW_FALSE:
+        return False
+    if s in _TRIM_SHOW_TRUE:
+        return True
+    return bool(default)
 
 
 def default_events_for_weight(w, fallback_csv: str = "exit,risk") -> str:
@@ -822,17 +858,23 @@ def verdict_action(label) -> str:
 def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
                    trim_ratio_pct=TRIM_RATIO_DEFAULT_PCT,
                    swing_label=None, position_label=None,
-                   min_trade_dollars: float = 0.0) -> dict:
+                   min_trade_dollars: float = 0.0,
+                   show: bool = True) -> dict:
     """두 호흡 판정 + 트랜치 비율 → 권장 매도 수량.
 
     반환 dict:
-      enabled   : 비율 미설정이면 False (권고 자체를 표시하지 않는다)
+      enabled   : 계좌가 표시를 껐으면 False (권고 자체를 표시하지 않는다)
       qty/pct   : 권장 매도 주식 수 · 현재 보유 대비 %
       dollars   : 권장 금액 (price 없으면 None)
       full_exit : 전량 청산 여부
       blocked   : 최소 거래금액 미달로 '전량 또는 보유' 선택으로 전환됐는지
+      assumed   : 몫 비율을 사용자가 지정하지 않아 기본 분할을 쓴 경우 True
       label     : 표시용 한 줄
       note      : 가정/제약 설명 (없으면 "")
+
+    ⚠️ 비율 미설정은 더 이상 '기능 끔'이 아니다. 기본 분할
+       (TRIM_SWING_WEIGHT_FALLBACK_PCT)을 적용하고 assumed=True 로 고지한다.
+       끄는 것은 오직 show=False(계좌 프로필의 명시적 선택)뿐이다.
 
     ⚠️ 최소 거래금액 게이트는 **부분 축소에만** 건다. 전량 청산에는 절대 걸지
        않는다 — 금액이 작다고 청산 신호를 숨기는 것은 손실 방지의 정반대다.
@@ -844,11 +886,17 @@ def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
     ⚠️ 주식 수를 정수로 반올림하지 않는다. 소수점 주식 보유가 실제로 존재한다.
     """
     out = {"enabled": False, "qty": 0.0, "pct": 0.0, "dollars": None,
-           "full_exit": False, "blocked": False, "label": "", "note": ""}
+           "full_exit": False, "blocked": False, "assumed": False,
+           "muted": False, "label": "", "note": ""}
+
+    if not show:
+        return out
 
     w = resolve_swing_weight(swing_weight_pct, None)
-    if w is None:
-        return out
+    assumed = w is None
+    if assumed:
+        w = TRIM_SWING_WEIGHT_FALLBACK_PCT
+    out["assumed"] = assumed
     try:
         q = float(qty)
     except (TypeError, ValueError):
@@ -886,8 +934,26 @@ def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
             sell += p_share * tr
             parts.append(f"포지션 몫의 {tr * 100:.0f}%")
 
+    # ⚠️ 몫이 0 이라 억제된 것과 애초에 매도 신호가 없는 것은 다르다. 둘을 같은
+    #    문구로 묶으면 "🟡 줄이기" 바로 밑에 "매도 신호 없음"이 붙어 **거짓말**이
+    #    된다. 신호는 실제로 났고, 그 호흡 몫이 0% 라서 수량이 없을 뿐이다.
+    _muted = []
+    if s_share <= 0 and sa in ("exit", "trim"):
+        _muted.append("스윙")
+    if p_share <= 0 and pa in ("exit", "trim"):
+        _muted.append("포지션")
+
     if sell <= 0:
-        out["label"] = "권장 매도 없음 — 해당 호흡에 매도 신호 없음"
+        if _muted:
+            out["muted"] = True
+            _hz = "·".join(_muted)
+            _src = "기본값" if assumed else "설정"
+            out["label"] = f"권장 매도 없음 — {_hz} 몫 0% (참고용 신호)"
+            out["note"] = (f"{_hz} 몫이 0%({_src})입니다 — 이 호흡의 신호에는 "
+                           f"매도하지 않습니다. 계좌 프로필의 '스윙 몫'에서 "
+                           f"바꿀 수 있습니다.")
+        else:
+            out["label"] = "권장 매도 없음 — 해당 호흡에 매도 신호 없음"
         return out
 
     full = bool(sell >= q * 0.999)
@@ -930,8 +996,13 @@ def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
     else:
         out["label"] = (f"권장 매도 {sell:g}주 · 보유의 {out['pct']:.0f}%{_d}"
                         f" — {' + '.join(parts)}")
+    _notes = []
+    if assumed:
+        _notes.append(f"몫 미설정 — 기본값(스윙 {w:.0f}% · 포지션 {100 - w:.0f}%)"
+                      f"으로 계산했습니다.")
     if 0 < w < 100:
-        out["note"] = "잔여 물량이 설정 비율대로 남아 있다고 가정합니다."
+        _notes.append("잔여 물량이 설정 비율대로 남아 있다고 가정합니다.")
+    out["note"] = " ".join(_notes)
     return out
 
 
