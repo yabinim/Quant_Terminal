@@ -41,6 +41,10 @@ import fmp_http as fh  # FMP 레이트리밋/429·402 분류 SSOT — 자동화�
 #      `limit` 은 FMP 가 무시하므로 historical-price-eod 창은 from/to 로만 지정한다.
 import narrative_core  # 공유 뉴스 파이프라인(SSOT) — 자동화(run_narrative)와 동일 모듈
 import regime_core as rc  # 공유 레짐/타이밍 엔진(SSOT) — 자동화와 동일 모듈
+import rotation_core as rot  # 로테이션 게이트(유동성·중복·크립토 캡) SSOT — run_hidden_alpha 와 동일 모듈
+# ⚠️ 별칭이 자동화와 **다른** 이유: 이 파일에서 `rc` 는 이미 regime_core 다(바로 위 줄).
+#    run_hidden_alpha.py 는 regime_core 를 안 쓰므로 거기선 `rc` 가 rotation_core 다.
+#    같은 이름이 두 모듈을 가리키니 두 파일 사이에 코드를 옮겨 붙일 때 반드시 확인할 것.
 import users_core as uc  # Users 시트/비밀번호 해시/이메일 수신자 SSOT — 자동화와 동일 모듈
 import accounts_core as ac  # 계좌 프로필/자본금 순수 로직 SSOT — 자동화와 동일 모듈
 import earnings_core as ec
@@ -5760,6 +5764,119 @@ def cached_etf_universe_rankings_full(universe_tickers_tuple: tuple[str, ...]):
         & (out["1개월(%)"] > 0)
     )
     return out
+
+
+# 게이트 판정 대상 상위 후보 수. run_hidden_alpha._VERIFY_TOP_N 과 **같은 정책**이다.
+# 유니버스 전체(~350종목)에 profile 을 돌리면 콜이 폭발하는데, 게이트는 최종 슬롯
+# 선정에만 영향을 주므로 상위권만 정확하면 된다. 15 는 게이트가 10개를 떨궈도
+# Top 5 가 차는 여유값이다.
+_HA_VERIFY_TOP_N = 15
+
+
+@st.cache_data(ttl=_DATA_CACHE_TTL, show_spinner=False)
+def cached_hidden_alpha_gates(ranked_tickers_tuple: tuple[str, ...]) -> dict:
+    """랭킹 상위 후보에 rotation_core 게이트를 적용 → 자동화 이메일과 동일한 슬롯.
+
+    [2026-09-02] 신설. 관리자 전용 「지금 돈이 몰리는 미지의 ETF 찾기」 버튼만
+      라이브 재계산 경로였는데, 이 경로에는 게이트가 **하나도** 걸려 있지 않았다.
+      화면의 주 경로(load_hidden_alpha_ranks → 스냅샷)는 2026-09-01 에 이미
+      자동화의 selected 를 읽도록 정리됐지만, 이 버튼만 1개월 수익률 정렬
+      그대로였다. 결과가 그대로 매매 판단에 쓰이면 저유동성(KMCA)·래퍼 중복
+      (THYP/BHYP/HYPG)이 다시 상위로 올라온다.
+
+    ⚠️ **랭킹 표 자체는 걸러내지 않는다.** 게이트는 `selected`/`excluded` 를
+       별도로 돌려줄 뿐이고, 순위표는 전원 유지한다. rotation_core 의 설계
+       의도(정렬 책임은 호출부, 게이트는 슬롯 선정만)와 같고,
+       build_pool_monthly_returns_table(다른 소비자)도 전원 목록을 기대한다.
+
+    입력은 **순위 오름차순 티커 튜플**이다. apply_rotation_gates 는 주어진 순서를
+    신뢰하고 재정렬하지 않으므로, 호출부가 정렬을 끝내서 넘겨야 한다.
+    튜플인 이유는 st.cache_data 해시 때문이다.
+
+    콜 비용: 가격 최대 15 + profile 최대 15 = 30. 관리자가 손으로 누를 때만이라
+    레이트(300/분) 대비 무의미하다. 창 깊이는 rotation_core 가 소유한다
+    (REQUIRED_BARS) — 여기에 숫자를 다시 쓰면 두 벌이 된다.
+    """
+    empty = {"selected": [], "excluded": {}, "detail": {}, "adv": {}, "crypto": {}, "meta": {}}
+    head = [str(t).strip().upper() for t in (ranked_tickers_tuple or ())[:_HA_VERIFY_TOP_N]
+            if str(t).strip()]
+    if not head:
+        return empty
+
+    # ── 가격·거래량 ──────────────────────────────────────────────────────────
+    # scanner_core._fmp_price_history 가 이미 Close/Volume 을 함께 돌려준다.
+    # 별도 OHLCV 헬퍼를 새로 만들지 않는 이유가 이것이다(있는 배관을 쓴다).
+    close_df, volume_df = pd.DataFrame(), pd.DataFrame()
+    try:
+        batch = _fmp_batch_price_history(
+            head, lookback_days=fx.hist_days_for_bars(rot.REQUIRED_BARS)
+        ) or {}
+        _c, _v = {}, {}
+        for tk, df in batch.items():
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            # FMP 가 간혹 같은 날짜를 중복 반환 — 중복 라벨은 DataFrame 조립 시
+            # "cannot reindex on an axis with duplicate labels" 를 유발한다.
+            keep = ~df.index.duplicated(keep="last")
+            if "Close" in df.columns:
+                _s = pd.to_numeric(df.loc[keep, "Close"], errors="coerce").dropna()
+                if not _s.empty:
+                    _c[tk] = _s
+            if "Volume" in df.columns:
+                # 빈 시리즈는 넣지 않는다 → rotation_core 가 '판정 불가'로 보고
+                # 제외한다. 0 으로 채우지 않는다 — 0 은 '거래 없음'이라는 다른 주장이다.
+                _s = pd.to_numeric(df.loc[keep, "Volume"], errors="coerce").dropna()
+                if not _s.empty:
+                    _v[tk] = _s
+        close_df = pd.DataFrame(_c).sort_index() if _c else pd.DataFrame()
+        volume_df = pd.DataFrame(_v).sort_index() if _v else pd.DataFrame()
+    except Exception:
+        pass
+
+    # ── 메타(이름·섹터·AUM·레버리지) ─────────────────────────────────────────
+    # run_hidden_alpha.verify_and_gate 와 동일한 조립 순서다. profile 의
+    # companyName 이 가장 정확하므로 있으면 시트/etf-list 이름을 이긴다 —
+    # 신규 상장 ETF 는 이름이 여기서 처음 채워지고, 레버리지 정규식은 이름이
+    # 없으면 아무것도 주장하지 못한다(SPAX 가 뚫렸던 자리).
+    try:
+        name_map = _fmp_etf_symbol_name_map() or {}
+    except Exception:
+        name_map = {}
+    meta: dict = {}
+    for tk in head:
+        nm = str(name_map.get(tk, "") or "")
+        sector, aum_m = "", None
+        try:
+            prof = _fmp_profile(tk) or {}
+        except Exception:
+            prof = {}
+        if prof:
+            cn = str(prof.get("companyName") or "").strip()
+            if cn:
+                nm = cn
+            sector = str(prof.get("sector") or prof.get("industry") or "")
+            raw = prof.get("totalAssets") or prof.get("mktCap")
+            if raw not in (None, "", 0):
+                try:
+                    aum_m = float(raw) / 1_000_000
+                except (TypeError, ValueError):
+                    aum_m = None
+        try:
+            lev = bool(fx.is_rotation_excluded(tk, nm))
+        except Exception:
+            lev = False
+        meta[tk] = {"name": nm, "sector": sector, "aum_m": aum_m, "leveraged": lev}
+
+    try:
+        gates = rot.apply_rotation_gates(
+            pd.DataFrame({"Ticker": head}),
+            close_df=close_df, volume_df=volume_df,
+            meta=meta, slots=rot.HOLD_SLOTS,
+        )
+    except Exception:
+        return empty
+    gates["meta"] = meta
+    return gates
 
 
 def cached_etf_universe_momentum_rankings(universe_tickers_tuple: tuple[str, ...]):
@@ -19249,9 +19366,16 @@ if st.session_state.get("logged_in"):
                     _ha_result = cached_etf_universe_rankings_full(etf_universe_sorted_tuple)
                 if _ha_result is None or _ha_result.empty:
                     st.session_state["_hidden_alpha_df"] = None
+                    st.session_state["_hidden_alpha_gates"] = None
                     st.warning("유니버스 랭킹을 계산하지 못했습니다. `ETF_Universe` 시트 티커·네트워크를 확인해주세요.")
                 else:
                     st.session_state["_hidden_alpha_df"] = _ha_result
+                    # 랭킹과 **보유 슬롯은 다른 것**이다. 순위표는 전원 유지하고,
+                    # 실제 슬롯은 자동화 이메일과 같은 게이트를 통과한 것만 남긴다.
+                    with st.spinner("로테이션 게이트(유동성·기초자산 중복·크립토 캡) 적용 중..."):
+                        st.session_state["_hidden_alpha_gates"] = cached_hidden_alpha_gates(
+                            tuple(_ha_result["Ticker"].tolist())
+                        )
 
         # 결과를 session_state에서 표시 (rerun 후에도 유지)
         _ha_df = st.session_state.get("_hidden_alpha_df")
@@ -19262,6 +19386,15 @@ if st.session_state.get("logged_in"):
                 lambda r: f"{r['Ticker']} 🔥{leverage_badge(r['Ticker'])}" if bool(r["주도주"])
                 else f"{r['Ticker']}{leverage_badge(r['Ticker'])}", axis=1
             )
+            _ha_gates = st.session_state.get("_hidden_alpha_gates") or {}
+            _ha_sel = [str(t).upper() for t in (_ha_gates.get("selected") or [])]
+            if _ha_sel:
+                # ✅ = 게이트 통과 슬롯. 🔥(주도주)는 **순위 기준 표시일 뿐**이고
+                #    보유 판정이 아니다 — 둘을 같은 열에 두되 의미는 아래 캡션에서 가른다.
+                tmp_show["티커"] = tmp_show.apply(
+                    lambda r: ("✅ " if str(r["Ticker"]).upper() in _ha_sel else "") + r["티커"],
+                    axis=1,
+                )
             display_cols = ["순위", "티커", "1주(%)", "2주(%)", "1개월(%)", "3개월(%)"]
             display_df = tmp_show[display_cols].copy()
             fmt = {c: "{:.2f}%" for c in ret_cols}
@@ -19272,10 +19405,57 @@ if st.session_state.get("logged_in"):
             st.caption(
                 "과거 구간 데이터가 부족한 ETF는 해당 칸이 N/A일 수 있으나, 유니버스 순위는 포트폴리오 화면과 동일한 1개월 기준입니다."
             )
-            st.markdown(
-                "💡 [Ryan's Alpha Strategy] 1주와 1개월 수익률이 모두 초록색인 상위 3~5개 ETF에 분할 투자하는 방식은 "
-                f"'추세 추종(Momentum)'의 정석입니다. 단, 매수 전 「{NAV_SCANNER}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
-            )
+
+            # ── 로테이션 게이트 결과 ─────────────────────────────────────────
+            # 이 블록이 없던 동안 이 화면은 게이트 미적용 순위표였고, 그 상태로
+            # "상위 3~5개에 분할 투자" 를 권하고 있었다. 저유동성·래퍼 중복이
+            # 그대로 상위에 올라오던 자리다.
+            if _ha_gates:
+                _ha_exc = dict(_ha_gates.get("excluded") or {})
+                _ha_det = dict(_ha_gates.get("detail") or {})
+                st.markdown("##### 🔒 로테이션 게이트 — 자동화 이메일과 동일 기준")
+                _gc1, _gc2 = st.columns([2, 3])
+                with _gc1:
+                    if _ha_sel:
+                        st.success(
+                            f"**최종 슬롯 {len(_ha_sel)}/{rot.HOLD_SLOTS}**\n\n"
+                            + "\n".join(f"{i}. {t}" for i, t in enumerate(_ha_sel, 1))
+                        )
+                    else:
+                        st.error(
+                            f"**최종 슬롯 0/{rot.HOLD_SLOTS}**\n\n"
+                            "상위 후보가 전원 게이트에 걸렸습니다. 오른쪽 사유를 확인하세요."
+                        )
+                with _gc2:
+                    if _ha_exc:
+                        _lines = []
+                        for _tk, _why in _ha_exc.items():
+                            _d = str(_ha_det.get(_tk, "") or "")
+                            _lines.append(f"- **{_tk}** — {rot.reason_label(_why)}"
+                                          + (f" · {_d}" if _d else ""))
+                        st.warning(f"**제외 {len(_ha_exc)}건**\n\n" + "\n".join(_lines))
+                    else:
+                        st.info(f"상위 {_HA_VERIFY_TOP_N}개 후보 중 게이트 탈락 없음")
+                st.caption(
+                    f"✅ 표시 = 게이트 통과 슬롯(최대 {rot.HOLD_SLOTS}개). 🔥 표시는 **순위 기준 주도주 표식일 뿐 "
+                    "보유 판정이 아닙니다** — 순위가 높아도 거래대금·순자산 미달이거나 이미 담은 "
+                    "기초자산과 중복이면 슬롯에 들어가지 않습니다. "
+                    f"판정 대상은 상위 {_HA_VERIFY_TOP_N}개이며, 그 아래 순위는 판정하지 않습니다."
+                )
+                st.markdown(
+                    "💡 [Ryan's Alpha Strategy] 분할 투자 대상은 위 **✅ 최종 슬롯**입니다. "
+                    f"단, 매수 전 「{NAV_SCANNER}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
+                )
+            else:
+                st.markdown(
+                    "💡 [Ryan's Alpha Strategy] 1주와 1개월 수익률이 모두 초록색인 상위 ETF는 "
+                    f"'추세 추종(Momentum)'의 정석입니다. 단, 매수 전 「{NAV_SCANNER}」의 매수 타점에서 RSI가 과열(70 이상)인지 반드시 확인하세요."
+                )
+                st.caption(
+                    "⚠️ 이 표는 **로테이션 게이트가 적용되지 않은 원시 순위**입니다. "
+                    "거래대금·순자산·기초자산 중복·크립토 한도가 반영된 실제 슬롯을 보려면 "
+                    "위 버튼으로 다시 계산하세요."
+                )
 
         st.info(
             "💡 이 레이더에 잡힌 생소한 티커를 왼쪽 사이드바에 입력하여 해당 테마를 이끄는 개별 주도주를 찾아보세요."

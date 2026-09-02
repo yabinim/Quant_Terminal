@@ -23,22 +23,22 @@ ROOT = sys.argv[1] if len(sys.argv) > 1 else "/mnt/project"
 # 모듈: 존재를 확인할 기능 마커 (있으면 그 시점 이후 버전)
 MARKERS = {
     "app.py": ["_SSOT_NEEDS", "load_earnings_universe", "TIMING_LABELS_INFERRED",
-               "_open_quant_db", "update_watchlist_row", "시장 이벤트 지형"],
+               "_open_quant_db", "update_watchlist_row", "시장 이벤트 지형",
+               "cached_hidden_alpha_gates"],
     "earnings_core.py": ["infer_timing", "fetch_market_calendar_map", "SOURCE_UNIVERSE",
                          "UNIVERSE_WORKSHEET", "_timing_from_utc", "TIMING_LABELS_INFERRED"],
     "run_earnings_watch.py": ["pass_universe", "_batch_update", "_merge_runs",
                               "FORCE_CALENDAR", "FORCE_UNIVERSE", "gsr.call"],
     "fmp_http.py": ["fmp_get_json_ex", "plan_limited", "set_key_provider"],
     "gs_retry.py": ["_retryable", "GS_MAX_RETRIES"],
-    "fmp_extras.py": ["import fmp_http", "fmp_stats_line", "is_leverage_suspect",
-                      "_LEV_MAG_NX"],
-    "rotation_core.py": ["apply_rotation_gates", "passes_liquidity", "passes_aum",
-                         "dedup_by_correlation", "select_top_slots", "CRYPTO_SLOT_CAP"],
-    "run_hidden_alpha.py": ["_fmp_etf_symbol_name_map", "verify_and_gate",
-                            "_fmp_batch_ohlcv_df", "import rotation_core"],
+    "fmp_extras.py": ["import fmp_http", "fmp_stats_line"],
     "regime_core.py": ["_market_warnings", "ALERT_CONFIRM_DAYS"],
     "users_core.py": ["Gate_Market"],
     "watchlist_metrics_core.py": ["completed_bars_only"],
+    "rotation_core.py": ["apply_rotation_gates", "dedup_by_correlation",
+                         "select_top_slots", "CRYPTO_SLOT_CAP", "REQUIRED_BARS"],
+    "run_hidden_alpha.py": ["verify_and_gate", "_fmp_batch_ohlcv_df",
+                            "import rotation_core"],
     "scanner_core.py": [], "narrative_core.py": [], "portfolio_core.py": [],
     "accounts_core.py": [], "gemini_core.py": [], "run_watchlist_alerts.py": [],
 }
@@ -76,7 +76,16 @@ def top_level_names(src: str) -> set:
 
 
 def path(name):
-    return os.path.join(ROOT, name)
+    """루트 우선, 없으면 automation/ 아래를 본다.
+
+    저장소에서 자동화 스크립트는 `automation/` 하위에 있고 프로젝트 사본은
+    평평하다. 폴백이 없으면 둘 중 한 배치에서 영구히 '사본 없음'이 뜬다.
+    """
+    direct = os.path.join(ROOT, name)
+    if os.path.exists(direct):
+        return direct
+    nested = os.path.join(ROOT, "automation", name)
+    return nested if os.path.exists(nested) else direct
 
 
 def read(name):
@@ -151,7 +160,9 @@ else:
             print(f"  ✅ {mod:26} app.py 가 쓰는 {len(used[mod])}개 심볼 모두 존재")
 
 # 자동화 ↔ 공용 모듈
-for auto in ("run_earnings_watch.py", "run_watchlist_alerts.py"):
+# 자동화 파일이 공용 모듈에서 쓰는 심볼이 실제로 있는지 — 여기서 반쪽 배포가 드러난다.
+AUTOMATION = ("run_earnings_watch.py", "run_watchlist_alerts.py", "run_hidden_alpha.py")
+for auto in AUTOMATION:
     asrc = srcs.get(auto)
     if not asrc:
         continue
