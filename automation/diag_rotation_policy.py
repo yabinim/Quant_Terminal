@@ -300,6 +300,126 @@ chk("H-6 [양성대조] REQUIRED_BARS 가 1개월 수익률 요구(22봉)를 덮
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# T. 고상관 묶음 대표 교체 (promote_by_tradability)
+# ══════════════════════════════════════════════════════════════════════════════
+# 왜 필요한가 (2026-09-02 실측): dedup 은 그리디라 '먼저 채택된 쪽'이 남는데,
+# 입력이 모멘텀 순위라 ρ=1.00 인 ARKB/IBIT 에서 $73B 짜리 IBIT 를 버리고 소형
+# ARKB 를 남겼다. ρ 가 1 에 가까우면 수익률 차이는 노이즈이고, 실제 손익은
+# 체결 비용에서 갈린다.
+_T_IDX = pd.date_range("2026-01-01", periods=90, freq="B")
+
+
+def _t_series(seed, n=90):
+    _r = np.random.default_rng(seed)
+    return pd.Series(100 + np.cumsum(_r.normal(0, 1, n)), index=_T_IDX[:n])
+
+
+_t_base = _t_series(101)
+# X 와 Y 는 ρ≈1 (같은 기초자산의 다른 래퍼). Z 는 무관.
+_T_RETS = pd.DataFrame({
+    "X": _t_base.pct_change(),
+    "Y": (_t_base * 2.0 + 0.0001).pct_change(),
+    "Z": _t_series(202).pct_change(),
+})
+# M — X 와 ρ 가 CORR_THRESHOLD(0.90)와 TIE_RHO(0.98) **사이**인 짝.
+# 이 구간이 있어야 "0.90 은 중복이지만 대표 교체는 아니다"를 잴 수 있다.
+# 이 짝이 없으면 TIE_RHO 를 0.90 으로 낮추는 변이가 통과해 버린다(실측).
+_T_RETS["M"] = (0.72 * _T_RETS["X"].fillna(0)
+                + 0.28 * _T_RETS["Z"].fillna(0))
+_T_RETS = _T_RETS.dropna()
+_RHO_XM = float(_T_RETS["X"].corr(_T_RETS["M"]))
+
+_pt = rc.promote_by_tradability
+
+# X 가 앞이지만 Y 의 거래대금이 10배 → Y 가 대표가 되어야 한다.
+_o, _p = _pt(["X", "Y", "Z"], _T_RETS, {"X": 1e6, "Y": 1e7, "Z": 5e6})
+chk("T-1 고상관 묶음에서 거래대금 큰 쪽이 앞으로", _o[0], "Y")
+chk("T-2 묶음 구성원은 그대로 (순서만 바뀐다)", sorted(_o), ["X", "Y", "Z"])
+chk("T-3 묶음 밖(Z)의 상대 순서는 불변", _o[-1], "Z")
+chk("T-4 승격 내역을 기록한다", _p.get("Y", ("", 0))[0], "X")
+
+# 거래대금이 원래 선두 쪽이 크면 교체하지 않는다.
+_o, _p = _pt(["X", "Y", "Z"], _T_RETS, {"X": 1e7, "Y": 1e6, "Z": 5e6})
+chk("T-5 원래 선두가 더 크면 교체 없음", _o[0], "X")
+chk("T-6 교체 없으면 승격 내역도 비어 있다", _p, {})
+
+# 판정 불가 → 건드리지 않는다
+chk("T-7 거래대금 전원 미상이면 순서 유지",
+    _pt(["X", "Y", "Z"], _T_RETS, {})[0], ["X", "Y", "Z"])
+chk("T-8 수익률 프레임이 없으면 순서 유지",
+    _pt(["X", "Y", "Z"], pd.DataFrame(), {"X": 1e6, "Y": 1e7})[0], ["X", "Y", "Z"])
+chk("T-9 거래대금 동률이면 원래 순서가 이긴다 (안정)",
+    _pt(["X", "Y"], _T_RETS, {"X": 1e6, "Y": 1e6})[0], ["X", "Y"])
+chk("T-10 빈 입력은 빈 결과", _pt([], _T_RETS, {})[0], [])
+
+# 임계값 아래는 순위 우선 — 다른 금속(금광 vs 은광 ρ≈0.97)은 묶지 않는다.
+_o, _p = _pt(["X", "Z"], _T_RETS, {"X": 1e6, "Z": 1e9})
+chk("T-11 ρ < TIE_RHO 면 거래대금이 커도 승격 없음", _o, ["X", "Z"])
+
+# [P] 픽스처 자체 검증 — ρ 가 정말 두 임계값 사이인가. 이게 틀리면 T-11e 는
+# 판별력이 없다. 픽스처를 믿지 않고 매번 확인한다.
+chk("T-11d [P] 중간 ρ 짝이 CORR_THRESHOLD 와 TIE_RHO 사이에 있다",
+    rc.CORR_THRESHOLD <= _RHO_XM < rc.TIE_RHO, True)
+chk("T-11e 중복 임계는 넘지만 TIE_RHO 미만이면 승격 없음",
+    _pt(["X", "M"], _T_RETS, {"X": 1e6, "M": 1e9})[0], ["X", "M"])
+
+# 마진 — 노이즈 수준 차이로 대표가 뒤집히면 안 된다.
+# (진단 G 픽스처에서 HYPE 3형제 대표가 무작위로 갈리며 실제로 재현됐다.)
+chk("T-11h 마진 미달(1.5배)이면 승격 없음",
+    _pt(["X", "Y"], _T_RETS, {"X": 1e6, "Y": 1.5e6})[0], ["X", "Y"])
+chk("T-11i 마진 정확히 충족(2.0배)이면 승격",
+    _pt(["X", "Y"], _T_RETS, {"X": 1e6, "Y": 2e6})[0], ["Y", "X"])
+chk("T-11f 원래 선두의 거래대금이 미상이면 승격하지 않는다",
+    _pt(["X", "Y"], _T_RETS, {"Y": 1e9})[0], ["X", "Y"])
+# 도전자 쪽이 미상인 경우 — 미상을 0 으로 취급하면 조용히 잘못된 비교가 된다.
+chk("T-11g 도전자의 거래대금이 미상이면 승격하지 않는다 (예외도 없다)",
+    _pt(["X", "Y"], _T_RETS, {"X": 1e6})[0], ["X", "Y"])
+
+# 관측 겹침 부족 → 묶지 않는다
+_short = _T_RETS.copy()
+_short.loc[_short.index[5:], "Y"] = np.nan
+chk("T-12 공통 관측 부족이면 묶지 않는다",
+    _pt(["X", "Y"], _short, {"X": 1e6, "Y": 1e9})[0], ["X", "Y"])
+
+# ── 통합: ARKB/IBIT 시나리오 재현 ────────────────────────────────────────────
+# 사전 확정 검증 기준(2026-09-02): 이 수정이 성공하면 모멘텀이 앞서지만
+# 거래대금이 작은 쪽이 밀려나고, 큰 쪽이 슬롯에 들어가야 한다.
+_px = pd.DataFrame({
+    "ARKB": _t_base,
+    "IBIT": _t_base * 3.0 + 0.0001,
+    "GLDX": _t_series(303),
+})
+_vol = pd.DataFrame({
+    # ⚠️ 둘 다 유동성 하한($3M)은 **넘어야** 한다. 넘지 못하면 유동성에서 먼저
+    #    떨어져 중복 판정까지 가지 않고, 이 시험이 재는 것이 사라진다(실측).
+    "ARKB": pd.Series(100_000.0, index=_T_IDX),     # 종가~100 → ADV ~$10M (소형)
+    "IBIT": pd.Series(1_000_000.0, index=_T_IDX),   # 종가~300 → ADV ~$300M (대형)
+    "GLDX": pd.Series(500_000.0, index=_T_IDX),
+})
+_meta = {t: {"name": t, "sector": "", "aum_m": 5_000.0, "leveraged": False}
+         for t in ("ARKB", "IBIT", "GLDX")}
+_g = rc.apply_rotation_gates(
+    pd.DataFrame({"Ticker": ["ARKB", "IBIT", "GLDX"]}),   # 모멘텀 순위: ARKB 가 앞
+    close_df=_px, volume_df=_vol, meta=_meta, slots=5,
+)
+chk("T-13 [사전확정] 거래대금이 큰 IBIT 가 슬롯에 들어간다", "IBIT" in _g["selected"], True)
+chk("T-14 [사전확정] 모멘텀이 앞서던 ARKB 가 중복으로 제외된다",
+    _g["excluded"].get("ARKB"), "duplicate")
+chk("T-15 제외 사유에 남긴 쪽이 명시된다", "IBIT" in str(_g["detail"].get("ARKB", "")), True)
+chk("T-16 승격 내역이 게이트 결과에 실린다", "IBIT" in (_g.get("promoted") or {}), True)
+chk("T-17 승격은 남는 개수를 바꾸지 않는다 (대표만 교체)", len(_g["selected"]), 2)
+
+# 양성 대조 — 거래대금을 뒤집으면 결과도 뒤집혀야 한다(검사가 살아 있는가).
+_vol2 = _vol.copy()
+_vol2["ARKB"], _vol2["IBIT"] = _vol["IBIT"], _vol["ARKB"]
+_g2 = rc.apply_rotation_gates(
+    pd.DataFrame({"Ticker": ["ARKB", "IBIT", "GLDX"]}),
+    close_df=_px, volume_df=_vol2, meta=_meta, slots=5,
+)
+chk("T-P1 [양성대조] 거래대금을 뒤집으면 ARKB 가 남는다", "ARKB" in _g2["selected"], True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # W. 소비자 배선 (정적 분석 + 스텁 실행)
 # ══════════════════════════════════════════════════════════════════════════════
 # 왜 필요한가: A~H 는 rotation_core 의 순수 함수만 본다. 그 함수들이 아무리
@@ -403,7 +523,8 @@ _rha_src = _read(_RHA) or _read(_RHA_ALT)
 
 # 사전 확정 임계값 — 호출부가 로컬에 다시 쓰면 두 벌이 되고 조용히 갈라진다.
 _LOCKED = ("MIN_DOLLAR_VOLUME", "MIN_AUM_M", "CORR_THRESHOLD",
-           "CORR_LOOKBACK", "HOLD_SLOTS", "CRYPTO_SLOT_CAP", "REQUIRED_BARS")
+           "CORR_LOOKBACK", "HOLD_SLOTS", "CRYPTO_SLOT_CAP", "REQUIRED_BARS",
+           "TIE_RHO", "TIE_ADV_MARGIN")
 
 chk("W-0a app.py 사본 존재", _app_src is not None, True)
 chk("W-0b run_hidden_alpha.py 사본 존재", _rha_src is not None, True)
@@ -483,6 +604,15 @@ if _app_src and _rha_src:
         chk("W-17 저품질 정리도 레거시 AUM 키를 읽지 않는다",
             sorted(k for k in ("totalAssets", "mktCap") if k in _cl_src), [])
 
+    # 승격 단계가 게이트 안에 실제로 배선돼 있는가 + 이메일 표가 판정 범위에 묶였는가
+    _ag = _func_node(_read(os.path.join(_ROOT, "rotation_core.py")) or "",
+                     "apply_rotation_gates")
+    chk("W-18 apply_rotation_gates 가 promote_by_tradability 를 호출한다",
+        _ag is not None and "promote_by_tradability" in ast.unparse(_ag), True)
+    # 이메일 표가 판정 범위와 어긋나면 실제 매수 대상이 표에서 사라진다(2026-09-02).
+    chk("W-19 _TOP_N_EMAIL 이 _VERIFY_TOP_N 에 묶여 있다 (리터럴 금지)",
+        "_TOP_N_EMAIL = _VERIFY_TOP_N" in _rha_src, True)
+
     # 버튼 경로가 게이트 함수를 실제로 부르는가
     chk("W-12 버튼 경로가 cached_hidden_alpha_gates 를 호출한다",
         any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
@@ -523,6 +653,11 @@ if _gatefn is not None:
         "FFF": _mk(13),
     }
     _BIGVOL = pd.Series(5_000_000.0, index=_px.index[:90])   # 종가×거래량 ≫ 임계
+    # ⚠️ AAA 는 BBB 보다 **거래대금이 커야** 한다. BBB 는 종가가 1.5배라 같은
+    #    주수면 거래대금이 더 크고, 그러면 promote_by_tradability 가 BBB 를
+    #    대표로 올려 W-R2/R3 의 의도가 뒤집힌다(실측). 여기서 재려는 것은
+    #    승격이 아니라 '중복이 제거되는가'이므로 픽스처로 고정한다.
+    _AAAVOL = pd.Series(20_000_000.0, index=_px.index[:90])
     _TINYVOL = pd.Series(1.0, index=_px.index[:90])
 
     def _make_ns(*, vol_for=None, profiles=None, names=None, raise_batch=False,
@@ -539,7 +674,7 @@ if _gatefn is not None:
                     continue
                 d = pd.DataFrame({"Close": _SERIES[t]})
                 if t in vol_for:
-                    d["Volume"] = (_BIGVOL if vol_for is not True else _BIGVOL)
+                    d["Volume"] = _AAAVOL if t == "AAA" else _BIGVOL
                 out[t] = d
             return out
 

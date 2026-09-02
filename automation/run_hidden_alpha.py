@@ -82,7 +82,14 @@ _FMP_TIMEOUT = 8
 _W_MONTH = 0.7
 _W_WEEK  = 0.3
 
-_TOP_N_EMAIL = 10   # 이메일에 표시할 순위 수
+# 이메일 표는 **게이트가 판정한 범위와 같아야 한다**.
+# [2026-09-02 실측] 판정 대상 15개 중 12개가 제외되어 슬롯 3개(GDXJ 6위 ·
+#   USO · ARKB)가 남았는데, 뒤 둘은 11위 밖이라 Top 10 표에서 **사라졌다**.
+#   실제 매수 대상이 이메일에 안 보이는 상태였다.
+# 16위 밖으로 늘리지 않는 이유: 게이트가 판정하지 않은 구간이라 ⭐ 도 🚫 도
+#   아닌 행이 생긴다 — 없는 판정을 있는 것처럼 보이게 한다.
+# 그래서 숫자를 따로 두지 않고 _VERIFY_TOP_N 에 **묶는다**. 판정 범위가 바뀌면
+#   표도 따라간다. 두 벌로 두면 오늘과 같은 어긋남이 다시 난다.
 # 보유 슬롯 수는 rotation_core 가 소유한다 — 여기에 5 를 다시 쓰면 두 벌이 되고,
 # 한쪽만 바뀌어도 아무도 모른다. 상수를 복사하지 않는다.
 _HOLD_SLOTS  = rc.HOLD_SLOTS
@@ -490,6 +497,7 @@ def build_ranked_table(tickers: list) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
 
 # ── [STEP 4.5] A-2 상위 후보 재검증 + 게이트 적용 ─────────────────────────────
 _VERIFY_TOP_N = 15   # profile 재조회 대상 (콜 15개)
+_TOP_N_EMAIL = _VERIFY_TOP_N   # 이메일 표 = 판정 범위 (위 주석 참조)
 
 
 def verify_and_gate(ranked: pd.DataFrame, close_df: pd.DataFrame,
@@ -797,6 +805,7 @@ def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
 
   <div style="background:#1e293b;border-radius:10px;padding:14px 16px;margin-bottom:16px;">
     <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:10px;">📊 Top {_TOP_N_EMAIL} 랭킹 (⭐ = 실제 보유 대상 · 🚫 = 게이트 제외)</div>
+    <div style="font-size:11px;color:#64748b;margin:-6px 0 8px;">게이트 판정 대상은 상위 {_TOP_N_EMAIL}개입니다. 그 아래 순위는 판정하지 않으므로 표시하지 않습니다.</div>
     <table style="width:100%;border-collapse:collapse;font-size:13px;">
       <thead>
         <tr style="color:#94a3b8;border-bottom:1px solid #334155;">
