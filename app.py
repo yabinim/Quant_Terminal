@@ -5855,7 +5855,9 @@ def cached_hidden_alpha_gates(ranked_tickers_tuple: tuple[str, ...]) -> dict:
             if cn:
                 nm = cn
             sector = str(prof.get("sector") or prof.get("industry") or "")
-            raw = prof.get("totalAssets") or prof.get("mktCap")
+            # [2026-09-02] marketCap 이 정답 — diag_aum_field 프로브 확정.
+            # run_hidden_alpha.verify_and_gate 와 같은 키를 읽어야 한다.
+            raw = prof.get("marketCap")
             if raw not in (None, "", 0):
                 try:
                     aum_m = float(raw) / 1_000_000
@@ -11382,7 +11384,7 @@ def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) ->
     [새 방식]
       1) /stable/ipos-calendar 로 최근 N일 신규 상장(상장일·거래소 포함) 목록을 받고
       2) /stable/etf-list(심볼 집합)와 교집합해 'ETF인 것'만 남긴 뒤
-      3) /stable/profile 로 AUM(totalAssets)을 확인한다.
+      3) /stable/profile 로 AUM(marketCap)을 확인한다.
     - days_lookback: 최근 N일 이내 상장
     - min_aum_m: 최소 AUM (백만달러). AUM 데이터가 없으면(신규라 미집계) 일단 통과시킨다.
     """
@@ -11452,7 +11454,12 @@ def fetch_new_etfs_from_fmp(days_lookback: int = 90, min_aum_m: float = 50.0) ->
         for etf in candidates[:60]:
             try:
                 p = _fmp_profile(etf["ticker"])
-                aum = float(p.get("totalAssets") or p.get("mktCap") or 0) / 1_000_000
+                # [2026-09-02] marketCap 이 정답 — diag_aum_field 프로브 확정.
+                #   ⚠️ 지금까지 이 값은 **항상 0** 이었다(두 키 모두 존재하지 않음).
+                #      그래서 `if aum and aum < min` 이 한 번도 걸리지 않았고,
+                #      AUM 필터가 사실상 없었다. 이제 실제로 동작한다 —
+                #      편입되는 신규 ETF 수가 줄어드는 것이 정상이다.
+                aum = float(p.get("marketCap") or 0) / 1_000_000
                 # AUM 집계가 안 된 신규 ETF는 일단 통과(빈 값), 집계됐는데 기준 미달이면 제외
                 if aum and aum < min_aum_m:
                     continue
@@ -11509,10 +11516,23 @@ def cleanup_low_quality_etfs_from_sheet(min_avg_volume_m: float = 1.0, min_aum_m
             # FMP로 AUM + 거래량 체크
             try:
                 p = _fmp_profile(ticker)
-                aum = float(p.get("totalAssets") or p.get("mktCap") or 0) / 1_000_000
+                # [2026-09-02] marketCap 이 정답 — diag_aum_field 프로브 확정.
+                #   🔴 이 함수는 시트 행을 **삭제**한다. 그런데 지금까지
+                #      aum 은 항상 0 이었고(두 키 모두 존재하지 않음),
+                #      `aum < min_aum_m` 은 **항상 참**이었다. 상장 6개월이
+                #      지난 ETF 는 거래대금과 무관하게 전부 삭제 후보였다는 뜻이다.
+                #      (silent 모드에서 배경 실행되므로 조용히 지워진다.)
+                aum = float(p.get("marketCap") or 0) / 1_000_000
                 avg_vol = float(p.get("volAvg") or p.get("averageVolume") or 0)
                 price = float(p.get("price") or p.get("regularMarketPrice") or 0)
                 avg_vol_m = avg_vol * price / 1_000_000
+
+                # ⚠️ 모르면 **지우지 않는다**. 매수 게이트의 "모르면 안 산다"와
+                #    방향이 반대다 — 여기서 미상을 미달로 취급하면 조회 실패
+                #    한 번에 유니버스가 삭제된다. 되돌릴 수 없는 연산이므로
+                #    판정 불가는 보존 쪽으로 넘어간다.
+                if aum <= 0 or avg_vol_m <= 0:
+                    continue
 
                 if aum < min_aum_m or avg_vol_m < min_avg_volume_m:
                     rows_to_delete.append(i)
