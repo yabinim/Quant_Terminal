@@ -6,12 +6,17 @@ default_events_for_weight / verdict_action / trim_size_plan) + accounts_core 의
 실제 파서. 로직을 복사하지 않는다.
 
 불변식:
-  I1  비율 미설정(None) → enabled=False. 기존 사용자 동작이 절대 안 바뀐다.
-  I2  0 과 None 은 다르다. 0 = 포지션 100%(명시), None = 기능 미사용.
+  I1  표시를 끄는 것은 오직 Trim_Size_Show=N 뿐이다. 비율 미설정(None)은
+      기본 분할로 계산하고 assumed=True 로 고지한다(기본 켜짐).
+  I2  0 과 None 은 여전히 다르다. 둘 다 수량은 같게 나오지만, None 은
+      default_events_for_weight 를 건드리지 않는다(알림 이벤트 불변).
   I3  최소 거래금액 게이트는 부분 축소에만 걸린다. 전량 청산은 금액 무관 통과.
   I4  두 호흡 모두 청산이면 전량. 어느 쪽도 매도 신호 없으면 0.
   I5  스윙 몫이 0 이면 스윙 판정은 수량에 영향을 주지 않는다(반대도 동일).
   I6  default_events_for_weight 는 미설정에서 fallback 을 그대로 돌려준다.
+  I7  Trim_Size_Show 빈칸/미인식 → 켜짐. 스키마 확장 전 행이 꺼지면 안 된다.
+  I8  신호는 났는데 그 호흡 몫이 0% 인 경우(muted)와 애초에 매도 신호가 없는
+      경우는 구분된다. 전자를 "매도 신호 없음" 으로 표시하면 거짓말이다.
 
 사용법:  python3 automation/diag_trim_size.py
 """
@@ -45,13 +50,29 @@ def plan(**kw):
     return rc.trim_size_plan(**kw)
 
 
-# ── A군: 미설정 보호 (I1, I2) ────────────────────────────────────────────
-chk("A-1 None → enabled=False",
-    plan(swing_weight_pct=None, swing_label=EXIT_S)["enabled"], False)
-chk("A-2 빈 문자열 → enabled=False",
-    plan(swing_weight_pct="", swing_label=EXIT_S)["enabled"], False)
+# ── A군: 기본 켜짐 + 끄기 경로 (I1, I2, I7) ──────────────────────────────
+# ⚠️ 계약 반전: 예전에는 None → enabled=False 였다(기능 미사용). 이제 None 은
+#    기본 분할로 계산되고, 끄기는 Trim_Size_Show=N 만이 한다.
+chk("A-1 None → enabled=True (기본 켜짐)",
+    plan(swing_weight_pct=None, position_label=EXIT_P)["enabled"], True)
+chk("A-1b None → assumed=True 로 고지",
+    plan(swing_weight_pct=None, position_label=EXIT_P)["assumed"], True)
+chk("A-2 빈 문자열도 기본 분할로 동작",
+    plan(swing_weight_pct="", position_label=EXIT_P)["enabled"], True)
+chk("A-2b 명시 0 은 assumed=False",
+    plan(swing_weight_pct=0, position_label=EXIT_P)["assumed"], False)
 chk("A-3 0 은 명시값 → enabled=True",
     plan(swing_weight_pct=0, position_label=EXIT_P)["enabled"], True)
+# 끄기 경로 잠금 — 이게 없으면 끄기가 조용히 깨져도 아무도 모른다.
+chk("A-3a show=False → enabled=False",
+    plan(swing_weight_pct=0, position_label=EXIT_P, show=False)["enabled"], False)
+chk("A-3b show=False 는 수량도 0",
+    plan(swing_weight_pct=50, swing_label=EXIT_S, position_label=EXIT_P,
+         show=False)["qty"], 0.0)
+chk("A-3c 기본 분할 상수 = 스윙 0%", rc.TRIM_SWING_WEIGHT_FALLBACK_PCT, 0.0)
+chk("A-3d 미설정 수량 == 명시 0 수량 (fallback 이 실제로 0 인지 판별)",
+    plan(swing_weight_pct=None, position_label=TRIM_P)["qty"],
+    plan(swing_weight_pct=0, position_label=TRIM_P)["qty"])
 chk("A-4 resolve: 오버라이드 우선",
     rc.resolve_swing_weight(70, 20), 70.0)
 chk("A-5 resolve: 오버라이드 빈칸 → 계좌 기본",
@@ -67,7 +88,7 @@ chk("A-8 resolve: 범위 클램프",
 # ── B군: 수량 계산 (I4, I5) ──────────────────────────────────────────────
 # 기본 트림폭은 제품 결정이다. 상수를 조용히 바꾸면 전 사용자의 매도 규모가
 # 바뀌므로 값 자체를 고정한다(아래 B-1 은 자기참조라 값 변경을 못 잡는다).
-chk("B-0 기본 트림폭 = 50%", rc.TRIM_RATIO_DEFAULT_PCT, 50.0)
+chk("B-0 기본 트림폭 = 33%", rc.TRIM_RATIO_DEFAULT_PCT, 33.0)
 chk("B-1 0:100 · 포지션 줄이기 → 30주의 기본 트림폭",
     plan(swing_weight_pct=0, position_label=TRIM_P)["qty"],
     round(30.0 * rc.TRIM_RATIO_DEFAULT_PCT / 100.0, 4))
@@ -157,10 +178,14 @@ chk("F-4 트림폭 클램프", ac._coerce_row(_base + ["", "500"])["Trim_Ratio_P
 chk("F-5 범위 밖 비율은 무시(기본 유지)",
     ac._coerce_row(_base + ["150", ""])["Swing_Weight_Pct"], None)
 _p0 = ac._coerce_row(_base + ["0", "40"])
-chk("F-6 to_row 왕복: 0 은 0 으로", ac.to_row("yab", "Roth", _p0, "n")[-2], 0.0)
+# ⚠️ 음수 인덱스를 쓰지 않는다. 열이 하나 늘 때마다 조용히 다른 칸을 검사하게 된다.
+_IX_SW = ac.COLS.index("Swing_Weight_Pct")
+_IX_SHOW = ac.COLS.index("Trim_Size_Show")
+chk("F-6 to_row 왕복: 0 은 0 으로",
+    ac.to_row("yab", "Roth", _p0, "n")[_IX_SW], 0.0)
 chk("F-7 to_row 왕복: None 은 빈칸으로",
-    ac.to_row("yab", "Roth", ac.default_profile("Roth"), "n")[-2], "")
-chk("F-8 COLS 폭", ac.NCOL, 14)
+    ac.to_row("yab", "Roth", ac.default_profile("Roth"), "n")[_IX_SW], "")
+chk("F-8 COLS 폭", ac.NCOL, 15)
 # 날짜 서식 함정: get_all_values 가 0 을 "1899-12-30 0:00" 로 돌려주던 케이스.
 # 파서는 이를 숫자로 오인하지 않고 미설정(None)으로 떨어뜨려야 한다.
 chk("F-9 날짜 문자열은 비율로 해석되지 않는다",
@@ -168,11 +193,55 @@ chk("F-9 날짜 문자열은 비율로 해석되지 않는다",
 chk("F-10 숫자 0(문자열 아님)도 정상 파싱",
     ac._coerce_row(_base + [0, ""])["Swing_Weight_Pct"], 0.0)
 
+# ── H군: Trim_Size_Show 파싱 + muted 문구 (I7, I8) ───────────────────────
+chk("H-1 빈칸 → 켜짐(스키마 확장 전 행 보호)",
+    ac._coerce_row(_base + ["", ""])["Trim_Size_Show"], True)
+chk("H-2 열 자체가 없는 옛 행(14칸) → 켜짐",
+    ac._coerce_row(_base + ["0", "40"])["Trim_Size_Show"], True)
+chk("H-3 'N' → 꺼짐", ac._coerce_row(_base + ["", "", "N"])["Trim_Size_Show"], False)
+chk("H-4 'Y' → 켜짐", ac._coerce_row(_base + ["", "", "Y"])["Trim_Size_Show"], True)
+chk("H-5 알 수 없는 값 → 켜짐(기능이 통째로 사라지는 쪽이 위험)",
+    ac._coerce_row(_base + ["", "", "???"])["Trim_Size_Show"], True)
+chk("H-6 to_row 왕복: 꺼짐은 'N'",
+    ac.to_row("yab", "Roth",
+              ac._coerce_row(_base + ["", "", "N"]), "n")[_IX_SHOW], "N")
+chk("H-7 to_row 왕복: 기본은 'Y'",
+    ac.to_row("yab", "Roth", ac.default_profile("Roth"), "n")[_IX_SHOW], "Y")
+chk("H-8 resolve: 0 은 꺼짐, 빈칸은 켜짐",
+    (rc.resolve_trim_size_show(0), rc.resolve_trim_size_show("")), (False, True))
+
+# muted — 신호는 났는데 그 호흡 몫이 0%.
+_m = plan(swing_weight_pct=0, swing_label=TRIM_S)
+chk("H-9 스윙 줄이기 + 스윙 몫 0 → muted=True", _m["muted"], True)
+chk("H-10 muted 라벨에 '매도 신호 없음' 이 들어가면 거짓말",
+    ("매도 신호 없음" in _m["label"]), False)
+chk("H-11 muted 여도 수량은 0", _m["qty"], 0.0)
+chk("H-12 muted 는 어느 호흡인지 밝힌다", ("스윙" in _m["label"]), True)
+_n = plan(swing_weight_pct=0)          # 둘 다 보유 — 진짜 신호 없음
+chk("H-13 진짜 신호 없음은 muted=False", _n["muted"], False)
+chk("H-14 진짜 신호 없음의 문구는 유지",
+    ("매도 신호 없음" in _n["label"]), True)
+chk("H-15 포지션 몫 0(스윙 100)에서 포지션 줄이기도 muted",
+    plan(swing_weight_pct=100, position_label=TRIM_P)["muted"], True)
+chk("H-16 수량이 나오면 muted 아님",
+    plan(swing_weight_pct=0, position_label=TRIM_P)["muted"], False)
+
 # ── G군: 양성 대조 — 하네스가 진짜 결함을 잡는지 ─────────────────────────
 # 게이트를 전량 청산까지 걸도록 '고장낸' 구현이 C-4 를 실제로 깨뜨리는지 확인.
 _broken_blocked = (30.0 * 10.0) < 99999.0   # full_exit 를 무시한 잘못된 판정
 chk("G-1 양성대조(게이트를 전량에도 걸면 C-4 가 깨진다)",
     (_broken_blocked, _f["blocked"]), (True, False))
+# 양성대조 2 — 기본 분할이 fallback 을 실제로 타는지. 만약 미설정이 여전히
+# '기능 끔' 으로 처리되면 아래 두 값이 (False, ...) 로 갈려 잡힌다.
+chk("G-2 양성대조(미설정이 꺼져 있으면 enabled 가 갈린다)",
+    (plan(swing_weight_pct=None, position_label=TRIM_P)["enabled"],
+     plan(swing_weight_pct=0, position_label=TRIM_P)["enabled"]), (True, True))
+# 양성대조 3 — show 게이트가 진짜 게이트인지. 상수 True 를 반환하도록 고장나면
+# 아래가 (False, True) 가 아니라 (True, True) 로 나온다.
+chk("G-3 양성대조(show 게이트가 동작하는지)",
+    (plan(swing_weight_pct=0, position_label=EXIT_P, show=False)["enabled"],
+     plan(swing_weight_pct=0, position_label=EXIT_P, show=True)["enabled"]),
+    (False, True))
 
 print("=" * 70)
 print(f"통과 {len(PASS)} / 실패 {len(FAIL)}  (총 {len(PASS) + len(FAIL)})")

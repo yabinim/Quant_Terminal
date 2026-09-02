@@ -1307,10 +1307,17 @@ def _render_hit_card(h) -> str:
                      f"<span style='color:{_vcolor(po[0])};font-weight:700'>{po[0]}</span>"
                      + (f" — {po[1]}" if po[1] else "") + "</div>")
         # 권장 매도 수량 — 트랜치 비율이 설정된 계좌·종목만 표시한다.
+        # ⚠️ '매도 신호 없음'(muted=False · qty 0)은 표시하지 않는다 — 발동 카드에
+        #    붙으면 다른 호흡의 판정을 부정하는 것처럼 읽힌다. 반대로 muted=True
+        #    (신호는 났고 그 호흡 몫이 0%)는 반드시 보여야 사용자가 왜 수량이
+        #    없는지 알고 설정을 고칠 수 있다.
         _tp = h.get("trim") or {}
-        if _tp.get("enabled") and _tp.get("label"):
+        _tp_qty = float(_tp.get("qty", 0.0) or 0.0)
+        _tp_show = bool(_tp.get("enabled") and _tp.get("label")
+                        and (_tp_qty > 0 or _tp.get("blocked") or _tp.get("muted")))
+        if _tp_show:
             _tc = "#d62728" if _tp.get("full_exit") else (
-                "#6b7280" if _tp.get("blocked") else "#f59e0b")
+                "#6b7280" if (_tp.get("blocked") or _tp.get("muted")) else "#f59e0b")
             html += (f"<div style='margin-top:6px;padding:6px 8px;border-radius:6px;"
                      f"background:#f8f9fa'>✂️ <b>매도 규모</b>: "
                      f"<span style='color:{_tc};font-weight:700'>{_tp['label']}</span>")
@@ -1785,7 +1792,8 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
                     trim_ratio_pct=_prof.get("Trim_Ratio_Pct",
                                              rc.TRIM_RATIO_DEFAULT_PCT),
                     swing_label=_swc["label"], position_label=_posv[0],
-                    min_trade_dollars=_prof.get("Min_Trade_Dollars", 0.0))
+                    min_trade_dollars=_prof.get("Min_Trade_Dollars", 0.0),
+                    show=bool(_prof.get("Trim_Size_Show", True)))
                 fired_by_user.setdefault(uid, []).append(
                     {"ticker": tk, "account": account, "fired": fired, "an": an,
                      "swing": (_swc["label"], _swc["detail"] or _swc["headline"]),
