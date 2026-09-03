@@ -45,6 +45,7 @@
 실행:  python3 automation/diag_universe_funnel.py
 """
 import ast
+import inspect
 import os
 import sys
 
@@ -140,6 +141,46 @@ def env_names(src: str) -> set:
     return out
 
 
+def _body_mentions(fn, needle: str) -> bool:
+    """함수 **코드**에 문자열이 있는가. 독스트링·주석은 제외한다.
+
+    ast.unparse 는 주석을 애초에 버린다. 남는 것은 독스트링뿐이라 그것만 뗀다.
+    get_source_segment 를 쓰면 주석까지 세어 거짓 실패가 난다 —
+    diag_regime_window.price_window_ok 가 같은 함정을 밟고 고친 이력이 있다.
+    """
+    if fn is None:
+        return False
+    body = fn.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    try:
+        code = "\n".join(ast.unparse(st) for st in body)
+    except Exception:
+        return False
+    return needle in code
+
+
+def _is_kwonly(fn, arg: str) -> bool:
+    """`arg` 가 키워드 전용(*, arg)인가. 위치 인자면 False."""
+    if fn is None:
+        return False
+    if any(a.arg == arg for a in fn.args.args):
+        return False        # 위치로도 받힌다 — 옛 호출이 조용히 통과한다
+    return any(a.arg == arg for a in fn.args.kwonlyargs)
+
+
+def _has_kwdefault(fn, arg: str) -> bool:
+    """키워드 전용 인자에 기본값이 달려 있는가."""
+    if fn is None:
+        return False
+    for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults):
+        if a.arg == arg:
+            return d is not None
+    return False
+
+
 def wiring(src: str) -> dict:
     """실제 소스에서 배선 사실만 뽑는다. 값 판정은 하지 않는다."""
     out = {
@@ -153,6 +194,13 @@ def wiring(src: str) -> dict:
         "hash_sorted": False,    # universe_hash 가 sorted 를 거치는가
         "ok_guarded": False,     # ok_by_seg 수집이 d0 통과 분기 안에 있는가
         "reason_counted": False,  # _batch_fetch_history 가 사유를 센다
+        # ── v2.9 창 정책 (limit → from/to) ──
+        "import_fx": False,      # fmp_extras 를 임포트하는가
+        "url_has_limit": True,   # _fmp_price_history 본문이 limit 을 URL 에 넣는가(넣으면 안 됨)
+        "uses_range": False,     # fmp_extras 의 창 헬퍼로 from/to 를 만드는가
+        "kwonly_bars": False,    # _fmp_price_history(*, bars) 키워드 전용인가
+        "batch_kwonly_bars": False,   # _batch_fetch_history(*, bars) 키워드 전용인가
+        "bars_defaults": True,   # 두 함수에 bars 기본값이 있는가(있으면 안 됨)
     }
     try:
         tree = ast.parse(src)
@@ -164,6 +212,8 @@ def wiring(src: str) -> dict:
             for a in n.names:
                 if a.name == "fmp_http":
                     out["import_fh"] = True
+                if a.name == "fmp_extras":
+                    out["import_fx"] = True
 
     f = _fn(tree, "_fmp_price_history")
     if f is not None:
@@ -177,12 +227,27 @@ def wiring(src: str) -> dict:
                 raw = True
         out["raw_get"] = raw
 
+        # ── v2.9 창 정책 ──
+        # ⚠️ 파일 전역 문자열 검색으로 하면 안 된다. 이 파일의 독스트링·주석에는
+        #    전환 이력을 설명하는 "limit" 이 잔뜩 들어 있어 영구 빨간불이 된다
+        #    (diag_regime_window 가 실제로 그 함정을 밟았다). 함수 본문으로
+        #    범위를 좁히고, ast.unparse 로 **주석을 버린 뒤** 독스트링도 뗀다.
+        out["url_has_limit"] = _body_mentions(f, "limit=")
+        out["uses_range"] = _calls_attr(f, "hist_range_params")
+        out["kwonly_bars"] = _is_kwonly(f, "bars")
+
     b = _fn(tree, "_batch_fetch_history")
     if b is not None:
         for c in ast.walk(b):
             if (isinstance(c, ast.Subscript) and isinstance(c.value, ast.Name)
                     and c.value.id == "reasons"):
                 out["reason_counted"] = True
+        out["batch_kwonly_bars"] = _is_kwonly(b, "bars")
+
+    # bars 기본값 금지 — 두 함수 중 **하나라도** 기본값이 있으면 True
+    out["bars_defaults"] = any(
+        _has_kwdefault(_fn(tree, nm), "bars")
+        for nm in ("_fmp_price_history", "_batch_fetch_history"))
 
     h = _fn(tree, "universe_hash")
     if h is not None:
@@ -237,20 +302,42 @@ check("S2  _fmp_price_history 가 fmp_get_ex 를 호출한다", W["ssot_call"], 
 check("S3  _fmp_price_history 에 원시 requests.get 이 없다", W["raw_get"], False)
 check("S4  타임아웃이 15초 이상 (1,255봉 페이로드)", bt._FMP_TIMEOUT >= 15, True)
 
+# ── v2.9 창 정책 (limit → from/to) ─────────────────────────────────────
+# 왜 여기에 두는가: 이 파일이 이미 _fmp_price_history 를 AST 로 들여다보는
+# 유일한 관문이다. run_signal_backtest 는 diag_hist_window[S](run_watchlist_alerts
+# 전용)·diag_hist_window_consumers[H](rotation_core 전용) 어디에도 안 들어가
+# **창 정책을 지키는 관문이 하나도 없었다.** 새 파일을 만드는 대신 여기 붙인다.
+#
+# S6 이 왜 중요한가: FMP 는 limit 을 조용히 무시한다. 되살아나도 URL 만 바뀌고
+# 데이터는 그대로다 — 에러도 경고도 없다. HISTORY_BARS 를 올렸는데 평가 구간이
+# 안 늘어나는 형태로만 드러나고, 그건 사람이 알아채기 어렵다(v2.4 에서 실제로
+# 놓쳤고 v2.8 에서 원인을 오진했다).
+check("S5  fmp_extras(창 환산 SSOT)를 임포트한다", W["import_fx"], True)
+check("S6  _fmp_price_history 코드에 limit= 이 없다", W["url_has_limit"], False)
+check("S7  fmp_extras.hist_range_params 로 from/to 를 만든다", W["uses_range"], True)
+check("S8  _fmp_price_history(*, bars) 가 키워드 전용", W["kwonly_bars"], True)
+check("S8b _batch_fetch_history(*, bars) 가 키워드 전용", W["batch_kwonly_bars"], True)
+# S9: 기본값이 있으면 호출부가 창 요구를 빠뜨려도 '그럴듯한 값'으로 메워진다.
+#     SPY 와 유니버스가 서로 다른 창을 받는 갈림이 그렇게 생긴다.
+check("S9  bars 인자에 기본값이 없다 (§7)", W["bars_defaults"], False)
+check("S10 HISTORY_BARS 로 개명됐다 (옛 HISTORY_LIMIT 부재)",
+      (hasattr(bt, "HISTORY_BARS"), hasattr(bt, "HISTORY_LIMIT")), (True, False))
+
 # ── 선행 조건 — 2절 이하는 v2.8 심볼이 있어야 돌아간다 ────────────────────
 # 없으면 AttributeError 로 죽는데, 그러면 "몇 건이 왜 실패했는지" 가 안 보인다.
 # 부분 롤백 상태에서 돌렸을 때 스택 트레이스 대신 진단을 내놓아야 한다.
-_NEED = ("fh", "_fmp_price_history", "_batch_fetch_history", "universe_hash",
-         "_env_fetch_rate", "MIN_FETCH_RATE", "build_rt_rows", "build_result_rows")
+_NEED = ("fh", "fx", "_fmp_price_history", "_batch_fetch_history", "universe_hash",
+         "_env_fetch_rate", "MIN_FETCH_RATE", "build_rt_rows", "build_result_rows",
+         "HISTORY_BARS")
 _MISSING = [a for a in _NEED if not hasattr(bt, a)]
 if _MISSING:
     print()
     print("=" * 74)
-    print("❌ 중단 — run_signal_backtest 가 v2.8 이전 버전이다")
+    print("❌ 중단 — run_signal_backtest 가 v2.9 이전 버전이다")
     print("=" * 74)
     print("   없는 심볼: " + ", ".join(_MISSING))
     print("   2절 이하(분류·집계·게이트·지문·기록)는 실행할 수 없다.")
-    print("   → run_signal_backtest.py 를 v2.8 로 올린 뒤 다시 돌릴 것."
+    print("   → run_signal_backtest.py 를 v2.9 로 올린 뒤 다시 돌릴 것."
           " 락스텝 쌍이다.")
     print("   실패 " + str(len(_fails) + len(_MISSING)) + "건 / 통과 "
           + str(_passes) + "건")
@@ -288,7 +375,7 @@ def _probe(stub_ret, key="TESTKEY"):
     bt.FMP_API_KEY = key
     bt.fh.fmp_get_ex = lambda url, timeout=None, retries=None: stub_ret
     try:
-        return bt._fmp_price_history("XYZ")
+        return bt._fmp_price_history("XYZ", bars=bt.HISTORY_BARS)
     finally:
         bt.fh.fmp_get_ex = _real_get_ex
         bt.FMP_API_KEY = _real_key
@@ -331,7 +418,11 @@ _TK = [f"T{i:02d}" for i in range(10)]
 _PLAN = {"T00": "rate_limited", "T01": "rate_limited", "T02": "plan_limited"}
 
 
-def _stub_hist(tk, limit=None):
+# ⚠️ 스텁 시그니처는 v2.9 실물과 **같아야** 한다. 옛 `(tk, limit=None)` 으로
+#    두면 _batch_fetch_history 가 bars= 로 넘길 때 TypeError 가 나는데,
+#    그 예외를 배치 루프의 `except Exception` 이 삼켜 전부 "exception" 으로
+#    집계된다. 크래시가 아니라 **틀린 숫자로 조용히 실패**한다.
+def _stub_hist(tk, *, bars=None):
     k = _PLAN.get(tk)
     if k:
         return pd.DataFrame(), k
@@ -340,7 +431,8 @@ def _stub_hist(tk, limit=None):
 
 bt._fmp_price_history = _stub_hist
 try:
-    _cache, _reasons, _failed = bt._batch_fetch_history(_TK)
+    _cache, _reasons, _failed = bt._batch_fetch_history(_TK,
+                                                        bars=bt.HISTORY_BARS)
 finally:
     bt._fmp_price_history = _real_hist
 
@@ -352,20 +444,25 @@ check("B3  카운트 합계 = 입력 종목수 (누락 없음)", sum(_reasons.va
 check("B4  탈락 목록에 티커와 사유가 함께 남는다",
       sorted(_failed), [("T00", "rate_limited"), ("T01", "rate_limited"),
                        ("T02", "plan_limited")])
-check("B5  빈 입력도 3-튜플을 돌려준다", len(bt._batch_fetch_history([])), 3)
+check("B5  빈 입력도 3-튜플을 돌려준다",
+      len(bt._batch_fetch_history([], bars=bt.HISTORY_BARS)), 3)
 
 
-def _boom_hist(tk, limit=None):
+# ⚠️ 여기도 v2.9 시그니처여야 한다. 옛 `(tk, limit=None)` 이면 bars= 를 받다가
+#    TypeError 가 나는데, 이 스텁은 어차피 예외를 던지므로 B6 는 **통과한다** —
+#    의도한 RuntimeError 가 아니라 시그니처 불일치로 통과하는 가짜 초록불이다.
+def _boom_hist(tk, *, bars=None):
     raise RuntimeError("worker died")
 
 
 bt._fmp_price_history = _boom_hist
 try:
-    _c2, _r2, _f2 = bt._batch_fetch_history(["A", "B"])
+    _c2, _r2, _f2 = bt._batch_fetch_history(["A", "B"], bars=bt.HISTORY_BARS)
 finally:
     bt._fmp_price_history = _real_hist
 check("B6  워커 예외도 삼키지 않고 'exception' 으로 센다",
       (_r2.get("exception"), len(_f2)), (2, 2))
+
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -571,19 +668,39 @@ else:
 # ── 7c. 양성대조 — 분류/집계 검사가 정말 판별력이 있는가 ─────────────────
 # 모든 실패를 빈 DataFrame 하나로 뭉개는 옛 동작을 재현해, 2·3절이 실제로
 # 깨지는지 본다. "항상 통과하는 스위트" 방지.
-def _old_style(tk, limit=None):
+def _old_style(tk, *, bars=None):
     return pd.DataFrame(), "ok"      # 옛 코드: 실패해도 사유가 남지 않음
 
 
 bt._fmp_price_history = _old_style
 try:
-    _c3, _r3, _f3 = bt._batch_fetch_history(_TK)
+    _c3, _r3, _f3 = bt._batch_fetch_history(_TK, bars=bt.HISTORY_BARS)
 finally:
     bt._fmp_price_history = _real_hist
 check("P1  양성대조: 사유를 뭉개면 B2(사유별 카운트)가 깨진다",
       _r3.get("rate_limited"), None)
 check("P2  양성대조: 그때 캐시는 0건인데 사유는 전부 ok 로 보인다",
       (len(_c3), _r3.get("ok")), (0, 10))
+
+
+# ── P3 하네스 자기검증 — 스텁이 실물 시그니처와 호환인가 ───────────────────
+# 왜 필요한가: 스텁이 옛 `(tk, limit=None)` 이면 _batch_fetch_history 가 bars= 로
+# 부를 때 TypeError 가 나는데, 배치 루프의 `except Exception` 이 그것을 삼켜
+# 전부 "exception" 으로 집계한다. B1/B2 는 틀린 숫자로 실패하고(그건 잡힌다),
+# **B6 는 오히려 통과한다** — 의도한 RuntimeError 가 아니라 시그니처 불일치로
+# 통과하는 가짜 초록불이다. 2026-09-03 뮤테이션 N9 에서 실측 확인했다.
+# 검사가 아니라 검사 도구를 검사하는 항목이다.
+def _stub_sig_ok(fn) -> bool:
+    try:
+        inspect.signature(fn).bind("X", bars=1)
+        return True
+    except TypeError:
+        return False
+
+
+check("P3  스텁 3종이 실물 (tk, *, bars) 시그니처와 호환",
+      tuple(_stub_sig_ok(f) for f in (_stub_hist, _boom_hist, _old_style)),
+      (True, True, True))
 
 
 # ══════════════════════════════════════════════════════════════════════════

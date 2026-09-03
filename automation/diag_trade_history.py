@@ -150,7 +150,10 @@ def attach_spy(t: pd.DataFrame) -> pd.DataFrame:
     # ⚠️ v2.8 부터 (DataFrame, kind) 튜플이다. 단일 이름으로 받으면 바로 아래
     #    `.empty` 에서 AttributeError 가 나고, main() 이 감싸지 않아 STEP3 직전에
     #    통째로 죽는다 — STEP1·STEP2 를 다 출력한 뒤라 더 헷갈린다.
-    spy, _spy_kind = bt._fmp_price_history(SPY_TICKER, limit=bt.HISTORY_LIMIT)
+    # ⚠️ v2.9 부터 인자가 keyword-only `bars=` 이고 상수는 HISTORY_BARS 다.
+    #    옛 이름(limit=/HISTORY_LIMIT)이 남아 있으면 TypeError·AttributeError 로
+    #    즉시 죽는다 — 조용히 다른 창을 받는 것보다 낫다. 락스텝 배포 대상.
+    spy, _spy_kind = bt._fmp_price_history(SPY_TICKER, bars=bt.HISTORY_BARS)
     if spy is None or spy.empty:
         print(f"[WARN] SPY 이력 fetch 실패({_spy_kind}) — 초과수익(excess_pct) 생략")
         t["excess_pct"] = np.nan

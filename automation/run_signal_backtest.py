@@ -132,6 +132,10 @@ import pytz
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import regime_core as rc  # noqa: E402
 import fmp_http as fh     # noqa: E402
+import fmp_extras as fx   # noqa: E402
+#   ⚠️ v2.9: 조회 창(봉수 → 달력일) 환산 정책은 fmp_extras 가 유일 소유자다.
+#      여기서 0.6871 이나 창 상수를 복제하면 정책이 두 벌이 되고, 한쪽만
+#      갱신됐을 때 창이 조용히 짧아진다 — 그 실패는 에러 로그를 남기지 않는다.
 #   ⚠️ v2.8: FMP 호출은 반드시 fmp_http 를 거친다. 원시 requests.get 은
 #      레이트리밋을 우회해 분당 300 을 넘기고, 초과분이 429 → 빈 DataFrame 으로
 #      조용히 사라진다. 2026-08-26 진단: 474종목 중 174종목이 몇 주간 무성 탈락
@@ -190,6 +194,12 @@ MIN_PRIOR_BARS = 220           # 200일선 산출 위한 최소 선행 봉수
 TEST_LOOKBACK  = 934           # v2.5: 평가 구간(거래일 ≈ 3.7년) — FMP 이력 한도에 맞춘 상한.
 #   진단(diag_fmp_depth) 결과: FMP 계정은 limit 값과 무관하게 항상 1255봉(정확히 5년,
 #   롤링)만 반환한다. 500 을 요청하든 5000 을 요청하든 시작일이 동일했다.
+#   ⚠️ v2.9(2026-09-03): 그래서 이 파일은 **limit 을 더 이상 보내지 않는다.**
+#      `from`/`to` 달력일 창으로 바꿨다(fmp_extras 가 환산 정책 소유). 이유는
+#      스타일이 아니다 — limit 이 남아 있으면 이 상수를 올렸을 때 URL 만 바뀌고
+#      데이터는 그대로여서 **에러도 경고도 없이 평가 구간이 안 늘어난다.**
+#      v2.4 에서 1260→2140 으로 올렸을 때 실제로 그렇게 됐고, 원인을 오진해
+#      아래 v2.8 정정까지 두 번을 돌았다. 같은 함정을 구조적으로 제거한다.
 #   → 2018 Q4·2020 코로나 폭락은 데이터 자체가 없어 아웃오브샘플 검증이 불가능하다.
 #   가능한 최대 = 1255 − MIN_PRIOR_BARS(220) − 꼬리(101) = 934.
 #   ⚠️ v2.8 정정: 예전 주석은 '2140 이 한도를 넘어 종목이 조건 미달 탈락해
@@ -283,7 +293,20 @@ COOLDOWN_DAYS  = 5             # v1.1: 같은 code 재기록 최소 간격(경�
 ENTRY_LAG_DAYS = 1             # v1.2: 신호일(t) 대비 실제 진입 거래일 지연.
                                #   1 = 메일(16:00 ET) 받고 '다음 거래일' 매수 = 라이브 구조.
                                #   0 = 구버전(신호일 종가 진입) — 체결 불가능. 비교용으로만.
-HISTORY_LIMIT  = MIN_PRIOR_BARS + TEST_LOOKBACK + max(HORIZONS) + ENTRY_LAG_DAYS + 40
+HISTORY_BARS   = MIN_PRIOR_BARS + TEST_LOOKBACK + max(HORIZONS) + ENTRY_LAG_DAYS + 40
+#   v2.9: 이름이 HISTORY_LIMIT 이었다. 단위는 그때도 **봉수**였지만 이름이
+#   FMP 의 `limit` 파라미터와 같아, 이 값을 올리면 조회가 깊어진다는 착시를
+#   줬다(실제로는 무시됐다). 개명은 장식이 아니다 — 이 상수를 빌려 쓰는
+#   진단 파일이 옛 이름으로 남아 있으면 AttributeError 로 **크게** 죽는다.
+#   조용히 옛 단위로 통과하는 것보다 낫다.
+#
+#   ⚠️ 숫자상 실제 구속 조건은 1255 가 아니라 MIN_PRIOR_BARS + TEST_LOOKBACK
+#      = 1154 봉이다(`start_i = max(min_prior, n - test_lookback)`).
+#      1255봉 요구는 hist_days_for_bars 에서 HIST_MAX_DAYS(1826일)로 클램프되어
+#      실측 ≈1254봉이 온다 — pad 5봉은 상한에 먹힌다. 그래도 1154 대비 여유
+#      100봉이 남으므로 평가 구간 934일은 온전하다. 이 여유가 사라지려면
+#      TEST_LOOKBACK 이 1034 를 넘어야 하는데, 그 시점엔 FMP 5년 한도 자체가
+#      먼저 막는다.
 
 # 결과 시트 provenance — 어떤 진입 규칙으로 잰 행인지 표시(구/신 혼재 방지)
 _ENTRY_RULE_LABEL = f"close[t+{ENTRY_LAG_DAYS}]"
@@ -1028,11 +1051,22 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
-def _fmp_price_history(ticker: str, limit: int = HISTORY_LIMIT):
+def _fmp_price_history(ticker: str, *, bars: int):
     """app.py·run_watchlist_alerts 와 동일한 /stable historical-price-eod/full.
+
+    bars : 하류가 실제로 소비하는 **봉수**. 달력일 환산은 fmp_extras 가 한다.
+           기본값을 두지 않는다 — 호출부가 자기 요구를 명시하게 강제한다.
 
     반환: (DataFrame, kind). kind ∈ {"ok","empty","no_key","rate_limited",
     "plan_limited","http_error","exception"}
+
+    v2.9: `limit` → `from`/`to` 창.
+      · 인자를 **키워드 전용**으로 못박았다. 옛 코드의 `_fmp_price_history(tk, 600)`
+        같은 위치 인자가 새 의미로 조용히 통과하는 경로를 구조적으로 막는다
+        (run_watchlist_alerts._fmp_price_history 가 같은 이유로 keyword-only 다).
+      · 기본값도 없앴다. §7 "bars 인자에 기본값 금지" — 중간층까지 포함이다.
+        여기서는 SPY(벤치마크)와 유니버스가 서로 다른 창을 받는 사고를 막는다.
+        SPY 창만 짧아지면 초과수익(alpha)이 조용히 다른 기간 대비로 계산된다.
 
     v2.8: 두 가지를 고쳤다.
       1) requests.get → fh.fmp_get_ex — 레이트리밋(슬라이딩 윈도우) + 429 지수
@@ -1043,8 +1077,9 @@ def _fmp_price_history(ticker: str, limit: int = HISTORY_LIMIT):
     """
     if not FMP_API_KEY:
         return pd.DataFrame(), "no_key"
+    _win = fx.hist_range_params(fx.hist_days_for_bars(bars))
     url = (f"{_FMP_BASE}/historical-price-eod/full"
-           f"?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}")
+           f"?symbol={ticker}{_win}&apikey={FMP_API_KEY}")
     r, _status, kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT)
     if r is None or kind != "ok":
         return pd.DataFrame(), kind
@@ -1068,12 +1103,16 @@ def _fmp_price_history(ticker: str, limit: int = HISTORY_LIMIT):
         return pd.DataFrame(), "exception"
 
 
-def _batch_fetch_history(tickers: list, limit: int = HISTORY_LIMIT):
+def _batch_fetch_history(tickers: list, *, bars: int):
     """ThreadPoolExecutor 병렬 fetch → (cache, reasons, failed).
 
     cache   : {ticker: DataFrame}
     reasons : {kind: count} — 성공/실패 사유 분포
     failed  : [(ticker, kind), ...] — 탈락 종목과 그 이유
+
+    v2.9: 중간층에도 기본값을 두지 않는다. 중간층 기본값은 상위 호출부가
+    창 요구를 빠뜨려도 "그럴듯한 값"으로 메워주기 때문에, 요구가 바뀌었을 때
+    한쪽만 갱신되는 사고를 만든다.
 
     v2.8: 이전에는 `except: pass` 로 예외까지 삼켜 탈락 사유가 하나도 남지
     않았다. 스로틀은 fh.fmp_get_ex 안에 있으므로 워커 수는 그대로 둔다
@@ -1085,7 +1124,8 @@ def _batch_fetch_history(tickers: list, limit: int = HISTORY_LIMIT):
     if not tickers:
         return out, reasons, failed
     with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
-        futs = {ex.submit(_fmp_price_history, tk, limit): tk for tk in tickers}
+        futs = {ex.submit(_fmp_price_history, tk, bars=bars): tk
+                for tk in tickers}
         for fut in concurrent.futures.as_completed(futs):
             tk = futs[fut]
             try:
@@ -1481,10 +1521,14 @@ def main():
         print("[INFO] 유니버스 비어 있음 — 중단")
         return 0
 
-    spy_hist, _spy_kind = _fmp_price_history("SPY")
+    # v2.9: 두 호출 모두 창 요구를 명시한다. 같은 값을 두 번 쓰는 것이 중복처럼
+    #       보이지만, SPY 와 유니버스가 서로 다른 창을 받으면 초과수익 계산이
+    #       조용히 다른 기간 대비가 된다 — 기본값에 맡기면 그 갈림이 안 보인다.
+    spy_hist, _spy_kind = _fmp_price_history("SPY", bars=HISTORY_BARS)
     if spy_hist.empty:
         print(f"[WARN] SPY 이력 fetch 실패({_spy_kind}) — 초과수익 NaN 으로 진행")
-    hist_cache, _reasons, _failed = _batch_fetch_history(universe)
+    hist_cache, _reasons, _failed = _batch_fetch_history(universe,
+                                                        bars=HISTORY_BARS)
 
     _n_uni = len(universe)
     _rate = (len(hist_cache) / _n_uni) if _n_uni else 1.0
