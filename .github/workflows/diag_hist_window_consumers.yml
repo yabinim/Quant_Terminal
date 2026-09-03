@@ -1,7 +1,7 @@
 name: 🔬 진단 — historical-price-eod 소비처 조회 창 검증 (수동 전용)
 
 # 언제 쓰나:
-#   · fmp_extras._closes / run_hidden_alpha._fmp_price_history_close /
+#   · fmp_extras._closes / run_hidden_alpha._fmp_price_history_ohlcv /
 #     run_narrative._fmp_close_series / run_drg_verify.verify_prediction /
 #     run_earnings_watch.fmp_price_history 의 FMP 호출부나 `bars=` 선언을
 #     건드린 직후, 배포 전
@@ -13,6 +13,9 @@ name: 🔬 진단 — historical-price-eod 소비처 조회 창 검증 (수동 �
 #     역산하므로 하류가 더 깊은 꼬리를 요구하기 시작하면 여기서 먼저 빨간불이 켜진다.
 #   · `fmp_extras.hist_days_for_bars` / `HIST_MIN_DAYS` / `HIST_TD_PER_CD` 를
 #     건드린 직후 — 이 4곳의 창이 전부 그 정책에서 나온다.
+#   · `rotation_core.REQUIRED_BARS` · `CORR_LOOKBACK` · `DOLLAR_VOLUME_WINDOW`
+#     를 건드린 직후 — Hidden Alpha 의 창 깊이가 그 상수에서 나오므로
+#     [H] 군이 락스텝을 지킨다.
 #
 # 왜 필요한가 — 이 결함군은 전부 조용하다:
 #   1) FMP `historical-price-eod` 의 `limit` 은 **무시된다**. 무엇을 적어도 약
@@ -46,7 +49,7 @@ name: 🔬 진단 — historical-price-eod 소비처 조회 창 검증 (수동 �
 #      통째로 사라진다), run_drg_verify 는 `.json()` 이 예외로 튀어 그날 검증이
 #      사라진다. 둘 다 로그에 아무것도 안 남는다.
 #
-# 무엇을 검사하나 (114항목):
+# 무엇을 검사하나 (125항목):
 #   [C] 정적 배선 — URL 의 limit 부재 · from/to 결합 · import requests 부재(래칫)
 #                   · 창 함수 정의부의 **기본값 금지** · 호출부의 bars= 명시
 #                   · 순수 환산기 직접 호출 금지 · 0.6871 복제 금지
@@ -68,7 +71,24 @@ name: 🔬 진단 — historical-price-eod 소비처 조회 창 검증 (수동 �
 #                   들고 있으면 `GAP_QUARTERS + 4` 를 `GAP_QUARTERS` 로 바꿔도
 #                   통과하는 가짜 초록불이 된다. `_hist_window_bound` 판별자의
 #                   양방향 동작(창 하단 접촉 True / 짧은 이력 False)도 여기서 본다.
+#   [H] Hidden Alpha 창 — run_hidden_alpha 의 창 깊이는 **rotation_core 가
+#                   소유한다**(`REQUIRED_BARS = max(CORR_LOOKBACK+1,
+#                   DOLLAR_VOLUME_WINDOW, 22)`). 창 하나를 세 소비자가 나눠
+#                   쓰고 그중 둘이 다른 모듈에 있어서 [R] 의 `==` 대조가
+#                   성립하지 않는다. 지키는 명제를 바꿨다 —
+#                     H1 호출부가 정책을 **이름으로 참조**하는가(리터럴 복사 금지)
+#                     H2 정책이 max(...) 로 살아 있는가(리터럴로 굳지 않았는가)
+#                     H3 세 요구의 이름이 정책의 max 안에 실제로 있는가
+#                     H4 정책 안의 **리터럴**이 국소 소비자 역산치와 일치하는가
+#                     H5 정책 값이 국소 요구를 덮는가
+#                     H6 창이 한 벌인가
+#                   H1+H4 가 과다 선언을 양방향으로 잡는다. `≥` 로 완화하지
+#                   **않은** 이유가 이것이다 — 완화는 P2(과다 선언)를 못 잡는다.
 #   [B] 비상휴장 — 7달력일 연속 휴장(2001-09-11 급)을 주입하고 [E] 전부 재실행
+#
+#   ⚠️ rotation_core 는 `_MODULES` 에 넣지 않는다. FMP URL 이 없어 C1a
+#      ("historical-price-eod URL 을 찾았다")가 오탐한다. 창 깊이의 **정책
+#      소유자**일 뿐 소비처가 아니므로 [H] 군에서만 본다.
 #
 #   ⚠️ run_earnings_watch 만 `bars=` 인자가 없고 **모듈 상수 하나**로 창을 정한다.
 #      호출부 6곳이 `hist_cache` 를 공유하기 때문이다 — 창이 여러 벌이면 캐시
@@ -133,6 +153,41 @@ name: 🔬 진단 — historical-price-eod 소비처 조회 창 검증 (수동 �
 #      "&from=" 이 둘 다 들어 있는데, 독스트링 배제가 Expr 노드가 아니라 내부
 #      Constant 의 id 를 비교하고 있었다. 문자열만 있는 Expr 을 통째로 제외한다.
 #
+# 6차 변이 (2026-09-03, run_hidden_alpha 진단 배선 복구 · 16건 전건 탐지):
+#   P3   fmp_extras._closes 기본값 부활                    → C4b
+#   P13  _fmp_batch_ohlcv_df 기본값 부활(중간 계층)        → C4b
+#   P13b _fmp_price_history_ohlcv 기본값 부활              → C4b
+#   H1a  호출부에 리터럴 61 하드코딩(정책 복사)            → H1
+#   H1b  과다 선언 리터럴 200 (P2 형)                      → H1
+#   H1c  bars= 를 위치 인자로                              → C5 H1
+#   H2   REQUIRED_BARS 를 리터럴 61 로 굳힘                → H2
+#   H3a  daily_returns_frame 기본값을 리터럴 60 으로       → H3a
+#   H3b  max 에서 DOLLAR_VOLUME_WINDOW 항 누락             → H3b
+#   H4a  국소 요구 21→63, 정책 리터럴은 그대로             → H4 **H5**
+#   H4b  정책 리터럴 과다 22→200                           → H4
+#   H4c  정책 리터럴 축소 22→6 (P5 형)                     → H4
+#   H6   배치 호출을 두 벌로                               → H6
+#   E5e  거래량 대신 종가를 두 번 반환                     → E5e
+#   C1b  URL 에 limit= 부활                                → C1b (+C-STOP)
+#   C4a  리네임 되돌리기                                   → C4a
+#
+#   ⚠️ 이 커밋 직전 진단은 **68/74 로 빨간불**이었고, 그보다 나쁜 것은 죽은
+#      관문이 로그 없이 4개 있었다는 점이다. 9-01 에 Close 단일 → (Close,
+#      Volume) 쌍으로 리네임하면서 진단이 따라가지 않았다:
+#        · C4a 가 정의를 못 찾아 `continue` → **C4b(기본값 금지)가 미실행**
+#          (검증된 변이 P3 · P13 을 못 잡는 상태였다)
+#        · C5 는 스캔 대상을 _DEFS 에서 뽑는데 옛 이름이라 `calls_to` 가 0건 →
+#          `miss=[]` 로 **공허하게 초록**이었다(위치 인자 금지가 무력)
+#        · R1a/R1b 가 `rc.REQUIRED_BARS`(ast.Attribute)를 못 접어 영구 실패
+#        · E0 이 그 판독 실패로 **런타임 군 [E]·[B] 를 통째로 스킵**
+#      → 교훈: 공유 모듈의 함수를 리네임하면 `automation/diag_*.py` 를 grep
+#        해야 한다. 실패 개수(6건)만 보면 죽은 관문 4개가 안 보인다.
+#
+#   ⚠️ 반환형이 Series → 튜플로 바뀐 자리에서 **리네임만 하면** E5 는
+#      `len(ser)==2` 로 "공급 2봉"을 보고하고 E5c 에서 스택 트레이스로 죽는다
+#      (`ValueError: Buffer has wrong number of dimensions`). 실측 확인했다 —
+#      조용한 오답이 아니라 요란한 크래시지만, [B] 군이 통째로 안 돈다.
+#
 #   ⚠️ P15 도 한 번 갈렸다. 기준선이 **1** 인 파일에서 호출을 별칭으로 바꾸면
 #      개수가 그대로 1 이라 A1 은 정상적으로 통과한다 — 그건 우회가 아니다.
 #      래칫을 시험하려면 **기준선에서 제거된 파일**(0)에 새로 만들어야 한다.
@@ -147,6 +202,7 @@ name: 🔬 진단 — historical-price-eod 소비처 조회 창 검증 (수동 �
 #     **get 이 아니라 대괄호로** 읽으므로 없으면 임포트가 KeyError 로 죽는다.
 #     import 순서가 계약이다 — `import diag_hist_window as dhw` 가
 #     `import run_earnings_watch as rew` 보다 **먼저** 와야 한다.
+#   · rotation_core 는 순수 계산 모듈이라 임포트 부작용이 없다.
 #   · 부작용 없음. 몇 번을 돌려도 같은 결과.
 
 on:
@@ -215,4 +271,5 @@ jobs:
           automation/diag_fmp_ssot.py
           automation/diag_hist_window_consumers.py
           automation/run_earnings_watch.py
+          rotation_core.py
           check_freshness.py
