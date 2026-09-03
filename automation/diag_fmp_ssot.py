@@ -177,6 +177,18 @@ _RAW_GET_BASELINE = {
     "diag_fmp_newcaps.py": 1,
     "diag_industry_momentum.py": 1,
     "diag_nodata_cause.py": 1,
+    # ── 2026-09-03 신규 등재 ──
+    # ⚠️ 이 파일은 **의도적으로** 원시 requests 를 쓴다. 63행이 사유를 밝힌다:
+    #    "프로젝트 모듈 import 없음 (requests 만 사용) → 사본 신선도와 무관".
+    #    fmp_extras/fmp_http 를 임포트하는 순간 그 독립성이 깨진다 — 사본이
+    #    낡았을 때 API 사실을 확인할 수단이 없어진다(9-02 marketCap 프로브가
+    #    정확히 그 상황에서 쓰였다). 그래서 SSOT 전환 대상이 아니라 **예외**다.
+    #    위 diag_* 여섯 항목과 같은 성격이다.
+    # ⚠️ 등재를 빠뜨린 대가가 컸다. A1 이 빨간불이면 워크플로가 exit 1 로
+    #    끊겨 **뒤 스텝이 통째로 스킵된다** — diag_hist_window_consumers.yml
+    #    에서 check_freshness.py(락스텝 업로드 누락 탐지)와 check_py311.py 가
+    #    한 번도 돌지 못했다(2026-09-03 실측). 부채 한 건이 관문 둘을 실명시켰다.
+    "diag_aum_field.py": 1,
     # diag_sell_verdict.py 는 2026-08-27 에 fmp_http 로 전환됐다(1 → 0).
     # 기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
     # 전환 이유는 스타일이 아니었다: 이 진단은 6워커 병렬로 유니버스를 훑는데
