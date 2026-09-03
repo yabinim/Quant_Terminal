@@ -51,6 +51,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -153,7 +154,15 @@ COMMISSION_PER_TRADE = 0.0    # Fidelity HSA: 미국 주식·ETF 온라인 매�
 #   있는지는 Fidelity 목록에서 직접 확인해야 한다. 민감도 테스트용 노브로 남겨둔다.
 SELL_ASSESSMENT = 0.00002     # 매도 시 SEC 부과금 ≈ 원금 $1,000당 $0.02
 ENTRY_LAG_DAYS = 1            # 신호일 → 체결일 (금 종가 신호 → 월 종가 체결)
-HISTORY_LIMIT  = 1300         # FMP 실제 상한 1255봉 — 여유 요청
+HISTORY_BARS   = 1300         # 요구 **봉수**. 창 환산은 fmp_extras 가 한다.
+#   ⚠️ v2.9 개명: 옛 이름은 HISTORY_LIMIT 이었다. 단위는 처음부터 봉수였고
+#      이름만 FMP 의 `limit` 파라미터를 따라갔다. 개명은 장식이 아니라 락스텝
+#      장치다 — 이 상수를 빌려 쓰는 파일이 옛 이름으로 남아 있으면
+#      AttributeError 로 **크게** 죽는다. 조용히 다른 값을 쓰는 것보다 낫다.
+#   ⚠️ 이 값을 올려도 받는 봉수는 안 늘어난다. fmp_extras.HIST_MAX_DAYS(1826일
+#      ≈ 1,254봉)가 상한이고, 그 위에 FMP 자체 상한(~1,255봉)이 또 있다.
+#      상한에 걸리면 _window_days_for() 가 경고를 한 줄 찍는다 — 조용히 잘리지
+#      않게 하려는 것이 그 경고의 유일한 목적이다.
 
 SEG_BARS       = 252          # 연도별 분해 단위(12개월)
 SEG_MAX        = 6            # 최대 분해 구간 수
@@ -188,7 +197,44 @@ _RESULT_COLS = [
 # ══════════════════════════════════════════════════════════════════════════════
 # 데이터 수집
 # ══════════════════════════════════════════════════════════════════════════════
-def _fmp_eod(ticker: str, endpoint: str, limit: int = HISTORY_LIMIT) -> pd.DataFrame:
+_WARNED_CEILING = set()          # 경고 1회 제한 — 8워커가 동시에 찍으면 못 읽는다
+_WARN_LOCK = threading.Lock()
+
+
+def _window_days_for(bars: int, warn=print) -> int:
+    """요구 봉수 → 조회 창(달력일). 상한에 걸리면 **한 번** 경고한다.
+
+    환산 정책은 `fmp_extras` 가 유일 소유자다. 여기서 0.6871 이나 창 상수를
+    복제하지 않는다 — 복제하면 0.6871 은 한 벌이어도 정책이 여러 벌이 되고,
+    나중에 한쪽만 갱신된다. 그 실패는 로그를 남기지 않는다.
+
+    경고가 왜 필요한가
+    ──────────────────
+    `limit` 을 `from`/`to` 로 바꾸는 것만으로는 원래 위험이 사라지지 않는다.
+    "숫자를 올려도 아무 일 없음"이 FMP 의 미공개 quirk 에서 `HIST_MAX_DAYS`
+    상한으로 **자리만 옮길** 뿐이다. HISTORY_BARS 를 1,500 으로 올려도 창은
+    여전히 1,826일(≈1,254봉)이고, 에러도 경고도 없이 같은 데이터가 온다.
+
+    이게 실제로 사고를 냈다. run_signal_backtest v2.4 에서 TEST_LOOKBACK 을
+    올렸을 때 URL 은 바뀌고 데이터는 안 바뀌었는데, 원인을 "종목이 조건 미달로
+    탈락했다"로 오진해 v2.8 에서 정정하는 데 두 번을 돌았다. 그 오진의 비용이
+    이 한 줄보다 훨씬 컸다.
+
+    warn: 주입 가능 — 진단이 경고 발생 여부를 관찰하기 위함.
+    """
+    days = fx.hist_days_for_bars(bars)
+    if days >= fx.HIST_MAX_DAYS:
+        with _WARN_LOCK:
+            if bars not in _WARNED_CEILING:
+                _WARNED_CEILING.add(bars)
+                warn(f"[WARN] 요구 {bars}봉은 조회 상한에 잘린다 — "
+                     f"창 {days}달력일 ≈ {int(days * fx.HIST_TD_PER_CD)}봉 "
+                     f"(fmp_extras.HIST_MAX_DAYS={fx.HIST_MAX_DAYS}). "
+                     f"이 값을 더 올려도 받는 봉수는 늘지 않는다.")
+    return days
+
+
+def _fmp_eod(ticker: str, endpoint: str, *, bars: int) -> tuple:
     """/stable/historical-price-eod/{endpoint} → DatetimeIndex + 'px' 컬럼.
 
     endpoint='full'              : 원 종가 (랭킹용 — 라이브 compute_satellite_top10 과 동일)
@@ -196,6 +242,16 @@ def _fmp_eod(ticker: str, endpoint: str, limit: int = HISTORY_LIMIT) -> pd.DataF
 
     반환: (DataFrame, kind). kind ∈ {"ok","empty","no_key","rate_limited",
     "plan_limited","http_error","exception"}
+
+    v2.9: `&limit=` 을 `from`/`to` 창으로 바꿨다.
+      FMP 는 `historical-price-eod` 의 `limit` 을 **조용히 무시**한다(§7 확정
+      사실). 지금까지 무해했던 이유는 우연이다 — HISTORY_LIMIT=1,300 이 FMP 가
+      항상 돌려주는 봉수(~1,255)보다 커서 늘 전량을 받았을 뿐이다.
+      위험은 값이 아니라 구조에 있었다. 자세한 것은 `_window_days_for` 참조.
+
+      `bars` 는 **키워드 전용 · 기본값 없음**이다(§7). 기본값을 두면 호출부가
+      요구를 빠뜨려도 그럴듯한 값으로 메워져, 요구가 바뀔 때 한쪽만 갱신되는
+      사고를 만든다.
 
     v2.8: 두 가지를 고쳤다.
       1) requests.get → fh.fmp_get_ex. 이 경로만 SSOT 를 우회하고 있었다.
@@ -210,7 +266,8 @@ def _fmp_eod(ticker: str, endpoint: str, limit: int = HISTORY_LIMIT) -> pd.DataF
     if not FMP_API_KEY:
         return pd.DataFrame(), "no_key"
     url = (f"{_FMP_BASE}/historical-price-eod/{endpoint}"
-           f"?symbol={ticker}&limit={limit}&apikey={FMP_API_KEY}")
+           f"?symbol={ticker}&apikey={FMP_API_KEY}"
+           + fx.hist_range_params(_window_days_for(bars)))
     r, _status, kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT)
     if r is None or kind != "ok":
         return pd.DataFrame(), kind
@@ -237,11 +294,17 @@ def _fmp_eod(ticker: str, endpoint: str, limit: int = HISTORY_LIMIT) -> pd.DataF
         return pd.DataFrame(), "exception"
 
 
-def _batch_fetch(tickers: list) -> tuple:
+def _batch_fetch(tickers: list, *, bars: int) -> tuple:
     """(raw_close{}, div_adj{}, fallback_list, reasons{}, failed[]) — 병렬 수집.
 
     reasons : {(endpoint, kind): count} — 엔드포인트별 성공/실패 사유 분포
     failed  : [(ticker, endpoint, kind), ...] — 탈락 항목과 그 이유
+
+    v2.9: `bars` 를 **중간층까지 키워드 전용 · 기본값 없이** 받는다(§7).
+      중간층에 기본값을 두면 상위가 요구를 빠뜨려도 조용히 메워진다. 여기서는
+      특히 나쁘다 — 랭킹용(full)과 성과측정용(dividend-adjusted)이 같은 창을
+      받아야 하는데, 한쪽만 다른 창을 받으면 **수익률 기준이 서로 다른 기간**이
+      되고 결과 행 모양은 똑같아서 사후에 골라낼 수 없다.
 
     v2.8: 이전에는 `except Exception: df = pd.DataFrame()` 로 예외까지 삼켜
     탈락 사유가 하나도 남지 않았다. 특히 dividend-adjusted 실패는 바로 아래에서
@@ -255,7 +318,7 @@ def _batch_fetch(tickers: list) -> tuple:
         return raw, adj, [], reasons, failed
     jobs = [(tk, "full") for tk in tickers] + [(tk, "dividend-adjusted") for tk in tickers]
     with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
-        futs = {ex.submit(_fmp_eod, tk, ep): (tk, ep) for tk, ep in jobs}
+        futs = {ex.submit(_fmp_eod, tk, ep, bars=bars): (tk, ep) for tk, ep in jobs}
         for fut in concurrent.futures.as_completed(futs):
             tk, ep = futs[fut]
             try:
@@ -1100,7 +1163,12 @@ def main() -> int:
     fetch_list = sorted(set(universe) | set(BENCH_TICKERS))
     print(f"[STEP 1] 후보 풀 {len(universe)}개 + 벤치 {len(BENCH_TICKERS)}개 = "
           f"{len(fetch_list)}종목 × 2엔드포인트(원종가·배당조정) 수집 중...")
-    raw, adjmap, fallback, _reasons, _failed = _batch_fetch(fetch_list)
+    # 창을 먼저 확정해 로그로 남긴다. 실제로 몇 봉을 요청했는지가 결과 해석의
+    # 전제인데, v2.8 까지는 어디에도 남지 않아 사후에 확인할 방법이 없었다.
+    _win_days = _window_days_for(HISTORY_BARS)
+    print(f"[STEP 1] 조회 창 — 요구 {HISTORY_BARS}봉 → {_win_days}달력일 "
+          f"({fx.hist_range_params(_win_days).lstrip('&').replace('&', ' ')})")
+    raw, adjmap, fallback, _reasons, _failed = _batch_fetch(fetch_list, bars=HISTORY_BARS)
 
     _n = len(fetch_list)
     _rate = (len(raw) / _n) if _n else 1.0

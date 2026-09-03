@@ -627,6 +627,9 @@ import pandas as pd   # noqa: E402
 
 import diag_satellite_backtest as sb   # noqa: E402
 import run_signal_backtest as bt       # noqa: E402
+# 창 환산 SSOT. `sb.fx` 로 우회하지 않는다 — 옛 사본이면 그쪽이 AttributeError 를
+# 내면서 아래 _NEED 의 친절한 중단 메시지를 삼켜버린다.
+import fmp_extras as fx                # noqa: E402
 
 SB_SRC = SRCS.get("diag_satellite_backtest", "")
 SB_TREE = TREES.get("diag_satellite_backtest")
@@ -680,12 +683,80 @@ def _mentions(node, ident):
     return False
 
 
+def _body_mentions(fn, needle: str) -> bool:
+    """함수 **코드**에 문자열이 있는가. 독스트링·주석은 제외한다.
+
+    ⚠️ 파일 전역 문자열 검색으로 하면 안 된다. `_fmp_eod` 의 독스트링은 전환
+       이력을 설명하느라 "limit" 을 세 번 언급하고, 같은 파일 `build_panels`
+       에는 pandas 의 `ffill(limit=3)` 이 두 줄 있다. 전자는 주석이고 후자는
+       FMP 와 무관한데, 전역 검색은 셋 다 걸어 **영구 빨간불**을 만든다.
+
+    ast.unparse 는 주석을 애초에 버린다. 남는 것은 독스트링뿐이라 그것만 뗀다.
+    get_source_segment 를 쓰면 주석까지 세어 거짓 실패가 난다 —
+    diag_regime_window.price_window_ok 와 diag_universe_funnel.S6 이 같은
+    함정을 밟고 고친 이력이 있어 그 기법을 그대로 가져왔다.
+    """
+    if fn is None:
+        return False
+    body = fn.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    try:
+        code = "\n".join(ast.unparse(st) for st in body)
+    except Exception:
+        return False
+    return needle in code
+
+
+def _is_kwonly(fn, arg: str) -> bool:
+    """`arg` 가 키워드 전용(*, arg)인가. 위치로도 받히면 False."""
+    if fn is None:
+        return False
+    if any(a.arg == arg for a in fn.args.args):
+        return False        # 위치로도 받힌다 — 옛 호출이 조용히 통과한다
+    return any(a.arg == arg for a in fn.args.kwonlyargs)
+
+
+def _has_default(fn, arg: str) -> bool:
+    """`arg` 에 기본값이 달려 있는가(§7 — 달려 있으면 안 된다).
+
+    ⚠️ 키워드 전용만 보면 안 된다. 초안은 `kwonlyargs` 만 훑었는데, 뮤테이션
+       M-d/M-e(`*, bars` → `bars=1300`)에서 인자가 **위치로 내려가는 순간**
+       kwonlyargs 에서 사라져 "기본값 없음"으로 통과했다(2026-09-03 실측).
+       그 뮤테이션은 마침 B4d/B4e 가 잡았지만, 그러면 방어가 한 겹뿐이다.
+       두 검사가 독립적이어야 한쪽을 완화해도 다른 쪽이 남는다.
+    """
+    if fn is None:
+        return False
+    a = fn.args
+    # 위치 인자: defaults 는 **뒤에서부터** 대응한다 (앞쪽 인자는 기본값 없음)
+    pos = list(a.posonlyargs) + list(a.args)
+    off = len(pos) - len(a.defaults)
+    for i, p in enumerate(pos):
+        if p.arg == arg:
+            return i >= off
+    for p, d in zip(a.kwonlyargs, a.kw_defaults):
+        if p.arg == arg:
+            return d is not None
+    return False
+
+
 def sb_wiring(src: str) -> dict:
     """실제 소스에서 배선 사실만 뽑는다. 값 판정은 하지 않는다."""
     out = {
         "import_fh": False,
+        "import_fx": False,          # fmp_extras(창 환산 SSOT)를 임포트하는가
         "ssot_call": False,          # _fmp_eod 가 fmp_get_ex 를 쓰는가
         "raw_get": True,             # _fmp_eod 에 원시 requests.get 이 있는가(있으면 안 됨)
+        # ── v2.9 창 정책 (limit → from/to) ──────────────────────────────
+        "eod_limit_code": True,      # _fmp_eod **코드**에 limit= 이 있는가(있으면 안 됨)
+        "eod_range_params": False,   # _fmp_eod 가 hist_range_params 로 창을 만드는가
+        "eod_bars_kwonly": False,    # _fmp_eod 의 bars 가 키워드 전용인가
+        "eod_bars_default": True,    # 그 bars 에 기본값이 있는가(있으면 안 됨 §7)
+        "batch_bars_kwonly": False,  # _batch_fetch 의 bars 가 키워드 전용인가
+        "batch_bars_default": True,  # 그 bars 에 기본값이 있는가(있으면 안 됨 §7)
         "reason_counted": False,     # _batch_fetch 가 사유를 세는가
         "gate_exists": False,
         "gate_returns": False,
@@ -704,6 +775,8 @@ def sb_wiring(src: str) -> dict:
             for a in n.names:
                 if a.name == "fmp_http":
                     out["import_fh"] = True
+                if a.name == "fmp_extras":
+                    out["import_fx"] = True
 
     f = _fn(tree, "_fmp_eod")
     if f is not None:
@@ -716,9 +789,18 @@ def sb_wiring(src: str) -> dict:
                     and c.func.value.id == "requests"):
                 raw = True
         out["raw_get"] = raw
+        # 창 정책 — 본문 코드만 본다(독스트링·주석 제외). _body_mentions 참조.
+        out["eod_limit_code"] = _body_mentions(f, "limit=")
+        # 언급이 아니라 **호출**을 본다. 문자열로 보면 "hist_range_params 로
+        # 바꿨다" 는 주석만 남기고 실제 호출을 지운 변경을 놓친다.
+        out["eod_range_params"] = _calls_attr(f, "hist_range_params")
+        out["eod_bars_kwonly"] = _is_kwonly(f, "bars")
+        out["eod_bars_default"] = _has_default(f, "bars")
 
     b = _fn(tree, "_batch_fetch")
     if b is not None:
+        out["batch_bars_kwonly"] = _is_kwonly(b, "bars")
+        out["batch_bars_default"] = _has_default(b, "bars")
         for c in ast.walk(b):
             if (isinstance(c, ast.Subscript) and isinstance(c.value, ast.Name)
                     and c.value.id == "reasons"):
@@ -768,20 +850,86 @@ print("=" * 76)
 check("B1  fmp_http 를 임포트한다", SW["import_fh"], True)
 check("B2  _fmp_eod 가 fmp_get_ex 를 호출한다", SW["ssot_call"], True)
 check("B3  _fmp_eod 에 원시 requests.get 이 없다", SW["raw_get"], False)
-check("B4  타임아웃이 15초 이상 (1,300봉 페이로드)", sb._FMP_TIMEOUT >= 15, True)
+check("B4  타임아웃이 15초 이상 (HISTORY_BARS 급 페이로드)", sb._FMP_TIMEOUT >= 15, True)
+
+# ── v2.9: limit → from/to 창 정책 래칫 ────────────────────────────────────
+# ⚠️ 이 6개가 없으면 고쳐도 되돌아온다. run_signal_backtest 가 정확히 그랬다 —
+#    diag_hist_window[S] 는 run_watchlist_alerts 전용, diag_hist_window_consumers[H]
+#    는 rotation_core 전용이라 어느 래칫에도 없는 파일이었다.
+check("B4a fmp_extras(창 환산 SSOT)를 임포트한다", SW["import_fx"], True)
+check("B4b _fmp_eod **코드**에 limit= 이 없다", SW["eod_limit_code"], False)
+check("B4c _fmp_eod 가 hist_range_params 로 from/to 를 만든다",
+      SW["eod_range_params"], True)
+check("B4d _fmp_eod 의 bars 가 키워드 전용이다", SW["eod_bars_kwonly"], True)
+check("B4e _batch_fetch 의 bars 도 키워드 전용이다 (중간층 포함)",
+      SW["batch_bars_kwonly"], True)
+check("B4f bars 에 기본값이 없다 (§7 — 두 층 모두)",
+      (SW["eod_bars_default"], SW["batch_bars_default"]), (False, False))
+
+# ── v2.9: 개명 래칫 ──────────────────────────────────────────────────────
+# 개명은 장식이 아니다. 옛 이름을 남겨두면 이 상수를 빌려 쓰는 파일이 조용히
+# 다른 값을 쓴다. 지워야 AttributeError 로 **크게** 죽는다.
+check("B4g HISTORY_BARS 로 개명 · 옛 HISTORY_LIMIT 부재",
+      (hasattr(sb, "HISTORY_BARS"), hasattr(sb, "HISTORY_LIMIT")), (True, False))
+
+# 창 환산 정책을 이 파일이 복제하지 않는가 — 복제하면 비율은 한 벌이어도
+# 정책이 여러 벌이 되고 나중에 한쪽만 갱신된다.
+#
+# ⚠️ 문자열 검색으로 하면 안 된다. 초안에서 `"0.6871" in SB_SRC` 로 짰다가
+#    `_window_days_for` 독스트링의 **"여기서 0.6871 을 복제하지 않는다"** 라는
+#    문장에 걸려 곧바로 오탐이 났다(2026-09-03 실측). 규칙을 적어둔 주석이
+#    규칙 위반으로 집계되는 것이 이 계열 검사의 고질적 실패다.
+#    숫자 리터럴만 보면 주석(파서가 버림)과 독스트링(문자열 상수)이 둘 다 빠진다.
+def _has_float_literal(tree, value: float) -> bool:
+    if tree is None:
+        return False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Constant) and isinstance(n.value, float) \
+                and abs(n.value - value) < 1e-12:
+            return True
+    return False
+
+
+check("B4h 환산 비율을 숫자 리터럴로 복제하지 않는다 (fmp_extras 소유)",
+      _has_float_literal(SB_TREE, fx.HIST_TD_PER_CD), False)
+
+# ⚠️ 상한 경고의 **런타임** 검증(B4i~B4k)은 아래 _NEED 관문 뒤에 있다.
+#    여기서 sb._window_days_for 를 만지면 옛 사본일 때 AttributeError 로
+#    터져서, 아래의 "v2.8 이전 버전이다" 라는 친절한 중단 메시지가 영영
+#    안 나온다. 진단이 왜 죽었는지 읽을 수 없는 것이 가장 나쁜 실패다.
 
 # ── 선행 조건 — 이하는 v2.8 심볼이 있어야 돌아간다 ────────────────────────
-_NEED = ("fh", "_fmp_eod", "_batch_fetch", "universe_hash",
-         "_env_fetch_rate", "MIN_FETCH_RATE", "_INFRA_KINDS")
+_NEED = ("fh", "fx", "_fmp_eod", "_batch_fetch", "universe_hash",
+         "_env_fetch_rate", "MIN_FETCH_RATE", "_INFRA_KINDS",
+         # v2.9 — 옛 사본이면 여기서 크게 죽는다. 조용히 통과하는 것보다 낫다.
+         "HISTORY_BARS", "_window_days_for", "_WARNED_CEILING")
 _MISSING = [a for a in _NEED if not hasattr(sb, a)]
 if _MISSING:
     print()
     print("=" * 76)
-    print("❌ 중단 — diag_satellite_backtest 가 v2.8 이전 버전이다")
+    print("❌ 중단 — diag_satellite_backtest 가 v2.9 이전 버전이다")
     print("   없는 심볼: " + ", ".join(_MISSING))
     print("   두 파일을 함께 배포할 것 (락스텝)")
     print("=" * 76)
     sys.exit(1)
+
+# ── v2.9: 상한 경고 런타임 검증 ──────────────────────────────────────────
+# limit 을 from/to 로 바꾸는 것만으로는 원래 위험이 안 없어진다. "숫자를 올려도
+# 아무 일 없음"이 FMP 의 미공개 quirk 에서 HIST_MAX_DAYS 상한으로 **자리만
+# 옮긴다.** 경고가 그 이동을 눈에 보이게 하는 유일한 장치이므로 래칫으로 조인다.
+_warned, _quiet = [], []
+sb._WARNED_CEILING.clear()
+sb._window_days_for(99_999, warn=_warned.append)      # 반드시 상한에 걸린다
+sb._WARNED_CEILING.clear()
+sb._window_days_for(50, warn=_quiet.append)           # 상한과 무관
+check("B4i 상한에 걸리면 경고한다", len(_warned), 1)
+check("B4j 상한 미만이면 조용하다", len(_quiet), 0)
+sb._WARNED_CEILING.clear()
+_dup = []
+sb._window_days_for(99_999, warn=_dup.append)
+sb._window_days_for(99_999, warn=_dup.append)         # 같은 bars 재호출
+check("B4k 같은 요구는 1회만 경고한다 (8워커 동시호출 대비)", len(_dup), 1)
+sb._WARNED_CEILING.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -798,8 +946,15 @@ def _mk_px():
     return pd.DataFrame({"px": [100.0 + i for i in range(30)]}, index=idx)
 
 
-def _stub_eod(tk, ep, limit=None):
-    """티커별로 서로 다른 실패 사유를 낸다 — 사유가 보존되는지 보기 위함."""
+def _stub_eod(tk, ep, *, bars=None):
+    """티커별로 서로 다른 실패 사유를 낸다 — 사유가 보존되는지 보기 위함.
+
+    v2.9: 시그니처를 `(tk, ep, *, bars=None)` 으로 맞췄다. 옛 `limit=None` 으로
+    두면 `_batch_fetch` 가 `bars=` 로 부르는 순간 TypeError 가 나고, 그것을
+    워커의 `except Exception` 이 삼켜 **전 항목이 조용히 "exception" 으로
+    집계된다.** B5~B9 가 전부 실패하는데 원인은 스텁 쪽이라, 진단이 대상
+    코드를 잘못 고발하게 된다. 아래 P2 가 이 상황을 명시적으로 재현한다.
+    """
     i = int(tk[1:])
     if ep == "full":
         if i == 8:
@@ -817,7 +972,7 @@ def _stub_eod(tk, ep, limit=None):
 _real_eod = sb._fmp_eod
 sb._fmp_eod = _stub_eod
 try:
-    _raw, _adj, _fb, _rs, _fd = sb._batch_fetch(_TK)
+    _raw, _adj, _fb, _rs, _fd = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS)
 finally:
     sb._fmp_eod = _real_eod
 
@@ -832,34 +987,106 @@ check("B8  카운트 합계 = 티커 × 엔드포인트 (누락 없음)",
 check("B9  탈락 목록에 티커·엔드포인트·사유가 함께 남는다", len(_fd), 6)
 
 
-def _boom_eod(tk, ep, limit=None):
+def _boom_eod(tk, ep, *, bars=None):
     raise RuntimeError("worker died")
 
 
 sb._fmp_eod = _boom_eod
 try:
-    _r2, _a2, _f2, _rs2, _fd2 = sb._batch_fetch(_TK)
+    _r2, _a2, _f2, _rs2, _fd2 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS)
 finally:
     sb._fmp_eod = _real_eod
 
 check("B10 워커 예외가 삼켜지지 않고 'exception' 으로 집계된다",
       _rs2.get(("full", "exception")), 10)
-check("B11 빈 입력도 5-튜플을 돌려준다", len(sb._batch_fetch([])), 5)
+check("B11 빈 입력도 5-튜플을 돌려준다",
+      len(sb._batch_fetch([], bars=sb.HISTORY_BARS)), 5)
 
 
 # ── 양성대조 — 옛 계약으로 되돌리면 실제로 깨지는가 ────────────────────────
-def _old_style_eod(tk, ep, limit=None):
+def _old_style_eod(tk, ep, *, bars=None):
     return pd.DataFrame()          # v2.7 이하: kind 없이 DataFrame 만
 
 
 sb._fmp_eod = _old_style_eod
 try:
-    _r3, _a3, _f3, _rs3, _fd3 = sb._batch_fetch(_TK)
+    _r3, _a3, _f3, _rs3, _fd3 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS)
 finally:
     sb._fmp_eod = _real_eod
 
 check("P1  양성대조: 옛 계약으로 되돌리면 전량 exception 으로 잡힌다",
       (len(_r3), _rs3.get(("full", "exception"))), (0, 10))
+
+
+# ── P2 하네스 자기검증 — 스텁 시그니처가 낡으면 어떻게 보이는가 ────────────
+# 위 B5~B9 는 "스텁이 제대로 불린다"는 전제 위에 서 있다. 그 전제가 깨지면
+# 어떻게 되는지를 여기서 **직접 재현**한다: `_batch_fetch` 는 `bars=` 로 부르는데
+# 스텁이 옛 `limit=` 만 받으면 TypeError 가 나고, 워커의 `except Exception` 이
+# 그것을 삼켜 전 항목이 "exception" 으로 집계된다.
+#
+# 이게 왜 중요한가 — 그 모습은 **대상 코드가 고장난 것과 구별되지 않는다.**
+# 2026-09-03 diag_universe_funnel 에서 실제로 같은 함정을 밟았다. P2 가 있으면
+# B5~B9 가 무더기로 빨간불일 때 "스텁을 안 고쳤나?" 를 먼저 의심할 수 있다.
+def _unmigrated_stub(tk, ep, limit=None):        # 일부러 옛 시그니처
+    return _mk_px(), "ok"
+
+
+sb._fmp_eod = _unmigrated_stub
+try:
+    _r4, _a4, _f4, _rs4, _fd4 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS)
+finally:
+    sb._fmp_eod = _real_eod
+
+check("P2  하네스 자기검증: 스텁이 옛 시그니처면 전량 exception 이 된다 "
+      "(대상 코드 고장과 구별 불가 — 스텁부터 의심할 것)",
+      (len(_r4), _rs4.get(("full", "exception"))), (0, 10))
+
+
+# ── P3 양성대조 — bars 가 실제로 URL 까지 도달하는가 ──────────────────────
+# B4c 는 `hist_range_params` 를 **호출**하는지만 본다. 호출해놓고 결과를 URL 에
+# 안 붙이면 통과한다. 실제 URL 을 잡아 눈으로 확인하는 것이 유일한 확인이다.
+_urls = []
+
+
+def _capture(url, timeout=None):
+    _urls.append(url)
+    return None, 429, "rate_limited"
+
+
+_real_get, _real_key = sb.fh.fmp_get_ex, sb.FMP_API_KEY
+sb.fh.fmp_get_ex, sb.FMP_API_KEY = _capture, "TESTKEY"
+try:
+    sb._fmp_eod("SPY", "full", bars=400)
+finally:
+    sb.fh.fmp_get_ex, sb.FMP_API_KEY = _real_get, _real_key
+
+def _from_of(url: str) -> str:
+    """URL 의 `from=` 값. 없으면 빈 문자열.
+
+    ⚠️ `url.split("from=")[1]` 로 짰다가 뮤테이션 M-l(창을 만들되 URL 에 안
+       붙임)에서 IndexError 로 **진단 전체가 죽었다**(2026-09-03 실측).
+       요약 줄조차 못 찍어서, 몇 건이 실패했는지도 알 수 없었다.
+       검사는 빨간불이 되어야지 크래시하면 안 된다 — 크래시는 빨간불보다 나쁘다.
+    """
+    if "from=" not in url:
+        return ""
+    return url.split("from=", 1)[1].split("&", 1)[0]
+
+
+_u = _urls[0] if _urls else ""
+check("P3  실제 URL 에 limit= 이 없다", "limit=" in _u, False)
+check("P4  실제 URL 에 from=/to= 가 있다",
+      ("from=" in _u and "to=" in _u), True)
+# 창이 bars 를 따라 움직이는가 — 상수를 URL 에 박아둔 변경을 잡는다.
+_urls.clear()
+sb.fh.fmp_get_ex, sb.FMP_API_KEY = _capture, "TESTKEY"
+try:
+    sb._fmp_eod("SPY", "full", bars=40)
+finally:
+    sb.fh.fmp_get_ex, sb.FMP_API_KEY = _real_get, _real_key
+_u2 = _urls[0] if _urls else ""
+check("P5  bars 를 줄이면 from= 도 따라 움직인다 (창이 고정값이 아니다)",
+      (_from_of(_u2) != "" and _from_of(_u2) != _from_of(_u)), True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
