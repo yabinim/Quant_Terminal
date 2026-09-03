@@ -4,7 +4,7 @@
 
 무엇을 지키는가
 ---------------
-`fmp_extras._closes` · `run_hidden_alpha._fmp_price_history_close` ·
+`fmp_extras._closes` · `run_hidden_alpha._fmp_price_history_ohlcv` ·
 `run_narrative._fmp_close_series` · `run_drg_verify.verify_prediction` 이
 `limit`(무시되는 파라미터) 대신 `from`/`to` 창을 쓰고, 그 창이 **하류가 실제로
 소비하는 꼬리 깊이**를 덮는지 본다.
@@ -64,6 +64,9 @@ import fmp_extras as fx
 import run_narrative as nrt
 import run_drg_verify as drv
 import run_hidden_alpha as hid
+# rotation_core 는 _MODULES 에 넣지 않는다 — FMP URL 이 없어 C1a 가 오탐한다.
+# 창 깊이의 **정책 소유자**로서 [H] 군에서만 본다.
+import rotation_core as rc
 import run_earnings_watch as rew
 import earnings_core as ec
 
@@ -371,8 +374,8 @@ _MODULES = {"fmp_extras": fx, "run_hidden_alpha": hid,
 # 창을 만드는 정의부 — 여기에 기본값이 있으면 호출부가 요구를 안 밝혀도 통과한다.
 _DEFS = [
     ("fmp_extras", "_closes", "bars"),
-    ("run_hidden_alpha", "_fmp_price_history_close", "bars"),
-    ("run_hidden_alpha", "_fmp_batch_close_df", "bars"),   # 중간 계층도 마찬가지
+    ("run_hidden_alpha", "_fmp_price_history_ohlcv", "bars"),
+    ("run_hidden_alpha", "_fmp_batch_ohlcv_df", "bars"),   # 중간 계층도 마찬가지
     ("run_narrative", "_fmp_close_series", "bars"),
 ]
 
@@ -385,12 +388,25 @@ _DEFS = [
 #      · 요구치 → 소비 구문(rolling·tail·iloc)에서 역산
 #      · 선언치 → 호출부의 `bars=` 키워드에서 판독
 #    두 경로는 서로 독립이므로 대조가 공허해지지 않는다.
+#
+# ⚠️ run_hidden_alpha 는 [2026-09-03] 여기서 빠졌다. 이 표의 전제는 "선언하는
+#    함수가 곧 유일한 소비자"인데 그 사이트만 아니다. `build_ranked_table` 이
+#    선언하는 창 하나를 **세 소비자**가 나눠 쓴다:
+#      · build_ranked_table 자신  calculate_period_return(s,21) → iloc[-22] → 22봉
+#      · rotation_core 상관        CORR_LOOKBACK+1                          → 61봉
+#      · rotation_core 달러거래대금 DOLLAR_VOLUME_WINDOW                     → 20봉
+#    뒤 둘은 `main` → `verify_and_gate` → `rc.apply_rotation_gates` 로 흘러가
+#    **다른 모듈**에서 소비된다. 그래서 `rc.REQUIRED_BARS`(=셋의 최대)가 창
+#    깊이의 소유자가 됐고, 한 소비자에서 역산한 22 와 `==` 로 묶는 것은 이제
+#    틀린 모델이다. run_earnings_watch 를 [Q] 로 뺀 것과 같은 사유다.
+#    → [H] 군 참조. `≥` 로 완화하지 **않았다** — 완화는 과다 선언(P2 형)을
+#      못 잡는다. H1(이름 참조 강제) + H4(리터럴 == 역산)로 양방향을 유지한다.
 _SITES = [
     ("fmp_extras", "compute_satellite_top10", "_closes", {"spy"}),
     ("fmp_extras", "compute_satellite_top10", "_closes", {"s"}),
     ("run_narrative", "verify_emerging_with_quant", "_fmp_close_series", {"spy_close"}),
     ("run_narrative", "verify_emerging_with_quant", "_fmp_close_series", {"s", "vol"}),
-    ("run_hidden_alpha", "build_ranked_table", "_fmp_batch_close_df", {"close_df"}),
+    # run_hidden_alpha 는 여기 없다 — [H] 군으로 이관했다(아래 사유).
 ]
 
 
@@ -704,6 +720,154 @@ def f(src):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# [H] Hidden Alpha 창 — rotation_core 가 소유하는 정책
+# ══════════════════════════════════════════════════════════════════════════════
+# 왜 [R] 이 아니라 전용 군인가
+# ---------------------------
+# [R] 의 전제는 "창을 선언하는 함수가 곧 유일한 소비자"다. 그래야 소비 구문에서
+# 역산한 값과 `bars=` 선언치를 `==` 로 묶는 것이 뜻을 갖는다. 이 사이트만 그
+# 전제가 깨진다 — `build_ranked_table` 이 선언하는 창 **하나**를 세 소비자가
+# 나눠 쓰고, 그중 둘은 다른 모듈(`rotation_core`)에 있다:
+#
+#     build_ranked_table  calculate_period_return(s,21) → iloc[-22]  →  22봉
+#     rc.daily_returns_frame   lookback=CORR_LOOKBACK, +1(pct_change) →  61봉
+#     rc.avg_dollar_volume     window=DOLLAR_VOLUME_WINDOW           →  20봉
+#
+# `rc.REQUIRED_BARS = max(...)` 가 셋을 합류시키므로 창 깊이의 소유권은 이제
+# rotation_core 에 있다. 한 소비자에서 역산한 22 와 선언 61 을 `==` 로 묶으면
+# 영원히 빨간불이고, `≥` 로 완화하면 **과다 선언을 못 잡는다**(검증된 변이 P2
+# = "SPY bars 64→200" 이 정확히 그 형태다).
+#
+# 그래서 지키는 명제를 바꾼다. "숫자가 같은가"가 아니라:
+#   H1 호출부가 정책을 **복사하지 않고 이름으로 참조**하는가
+#   H2 정책이 리터럴로 굳지 않았는가 (max 정의 유지)
+#   H3 세 요구의 이름이 정책의 max 안에 실제로 있는가
+#   H4 정책 안의 **리터럴**이 국소 소비자의 역산치와 일치하는가  ← 양방향
+#   H5 정책 값이 국소 요구를 덮는가
+#   H6 창이 한 벌인가 (여러 벌이면 깊이가 갈린다)
+#
+# H1 과 H4 가 과다 선언을 양방향으로 잡는다: 호출부에 리터럴 61 을 박으면 H1 이,
+# `max(..., 22)` 의 22 를 200 으로 부풀리면 H4 가 죽는다. 반대로
+# `calculate_period_return(s,21)` → `(s,63)` 으로 요구가 깊어지면 역산 64 ≠
+# 리터럴 22 로 H4 가 잡는다 — **지금 이 자리를 지키는 관문이 하나도 없다.**
+#
+# ⚠️ rotation_core 를 `_MODULES` 에 넣지 않는다. 그 파일에는 FMP URL 이 없어
+#    C1a("historical-price-eod URL 을 찾았다")가 오탐한다. 정책 소유자일 뿐
+#    소비처가 아니다.
+# ⚠️ 역산기(`required_bars_for`)의 양성대조는 [R] 의 R0a/R0b/R0c 가 이미 맡는다.
+#    역산기가 0 을 내면 H4 가 공허해지므로 [H] 는 [R] 보다 **뒤에** 돌린다.
+
+# rotation_core 에서 창 깊이를 요구하는 소비자 — (함수, 창 인자)
+_H_CONSUMERS = [
+    ("daily_returns_frame", "lookback"),   # 상관 dedup (ρ=0.90)
+    ("avg_dollar_volume", "window"),       # 유동성 게이트 (달러거래대금)
+]
+
+
+def _const_assign_value(t: ast.Module, name: str):
+    """모듈 상수 정의부의 우변 노드. `X: int = ...`(AnnAssign)도 본다."""
+    for n in ast.walk(t):
+        tgt = None
+        if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)):
+            tgt = n.targets[0].id
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            tgt = n.target.id
+        if tgt == name:
+            return n.value
+    return None
+
+
+def _default_name_of(t: ast.Module, fname: str, arg: str):
+    """시그니처 기본값이 **이름**이면 그 이름. 리터럴이면 None."""
+    f = find_func(t, fname)
+    if f is None:
+        return None
+    names = [a.arg for a in f.args.args]
+    if arg not in names:
+        return None
+    pos = names.index(arg)
+    n_def = len(f.args.defaults)
+    if pos < len(names) - n_def:
+        return None
+    d = f.args.defaults[pos - (len(names) - n_def)]
+    return d.id if isinstance(d, ast.Name) else None
+
+
+def group_H():
+    print("\n[H] Hidden Alpha 창 — rotation_core 소유 정책")
+
+    t_hid, t_rc = tree(hid), tree(rc)
+    f = find_func(t_hid, "build_ranked_table")
+    if f is None:
+        bad("H0", "run_hidden_alpha.build_ranked_table 을 못 찾았다")
+        return
+    derived = required_bars_for(f, {"close_df"}, t_hid)
+
+    # ── H1 정책을 이름으로 참조하는가 (리터럴 복사 금지) ──
+    node = None
+    for stmt in ast.walk(f):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if _assign_targets(stmt) != {"close_df", "volume_df"}:
+            continue
+        v = stmt.value
+        if isinstance(v, ast.Call):
+            nm = (v.func.id if isinstance(v.func, ast.Name)
+                  else getattr(v.func, "attr", None))
+            if nm == "_fmp_batch_ohlcv_df":
+                node = v
+                break
+    kwv = next((k.value for k in node.keywords if k.arg == "bars"), None) if node else None
+    is_ref = isinstance(kwv, ast.Attribute) and kwv.attr == "REQUIRED_BARS"
+    chk(is_ref, "H1",
+        "build_ranked_table: bars= 가 rc.REQUIRED_BARS 이름 참조"
+        + ("" if is_ref else f" — 실제 {ast.unparse(kwv) if kwv is not None else '없음'}"))
+
+    # ── H2 정책이 max(...) 로 살아 있는가 ──
+    mx = _const_assign_value(t_rc, "REQUIRED_BARS")
+    is_max = (isinstance(mx, ast.Call) and isinstance(mx.func, ast.Name)
+              and mx.func.id == "max")
+    chk(is_max, "H2",
+        "rotation_core.REQUIRED_BARS 가 max(...) 정의"
+        + ("" if is_max else f" — 실제 {ast.unparse(mx) if mx is not None else '정의 없음'}"))
+    if not is_max:
+        return
+
+    # 이름은 중첩까지 훑고(예: `CORR_LOOKBACK + 1`), 리터럴은 **최상위 인자만**
+    # 센다. 중첩까지 세면 `CORR_LOOKBACK + 1` 의 1 이 섞여 H4 가 무너진다.
+    names_in_max = {n.id for a in mx.args for n in ast.walk(a)
+                    if isinstance(n, ast.Name)}
+    lits_in_max = {a.value for a in mx.args
+                   if isinstance(a, ast.Constant) and isinstance(a.value, int)}
+
+    # ── H3 세 요구의 이름이 정책 안에 있는가 ──
+    for fname, arg in _H_CONSUMERS:
+        nm = _default_name_of(t_rc, fname, arg)
+        chk(nm is not None, "H3a",
+            f"rotation_core.{fname}({arg}=): 기본값이 이름 ({nm})")
+        if nm is not None:
+            chk(nm in names_in_max, "H3b",
+                f"{nm} 이 REQUIRED_BARS 의 max 안에 있음 — {sorted(names_in_max)}")
+
+    # ── H4 정책 안의 리터럴 == 국소 소비자 역산치 (양방향) ──
+    chk(lits_in_max == {derived}, "H4",
+        f"REQUIRED_BARS 리터럴 {sorted(lits_in_max)} == "
+        f"build_ranked_table 역산 {derived}봉")
+
+    # ── H5 공급이 국소 요구를 덮는가 ──
+    got = getattr(rc, "REQUIRED_BARS", None)
+    chk(isinstance(got, int) and got >= derived, "H5",
+        f"rc.REQUIRED_BARS {got} ≥ 역산 {derived}봉")
+
+    # ── H6 창이 한 벌인가 ──
+    n_batch = len(calls_to(t_hid, "_fmp_batch_ohlcv_df"))
+    chk(n_batch == 1, "H6",
+        f"run_hidden_alpha: _fmp_batch_ohlcv_df 호출 {n_batch}건 "
+        "(2건 이상이면 창이 여러 벌 — 깊이가 갈린다)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # [E] 런타임 — 스텁 FMP 위에서 실제로 실행하고 결과를 관측한다
 # ══════════════════════════════════════════════════════════════════════════════
 def _win_of(path: str):
@@ -794,8 +958,12 @@ def group_E(blackout=None, tag_suffix=""):
                        "_fmp_close_series", {"s", "vol"})
     B_SPY_F = _bars_at("fmp_extras", "compute_satellite_top10", "_closes", {"spy"})
     B_CND_F = _bars_at("fmp_extras", "compute_satellite_top10", "_closes", {"s"})
-    B_HID = _bars_at("run_hidden_alpha", "build_ranked_table",
-                     "_fmp_batch_close_df", {"close_df"})
+    # run_hidden_alpha 의 창은 rotation_core 가 소유한다([H] 군 참조).
+    # 호출부의 `bars=rc.REQUIRED_BARS` 는 `ast.Attribute` 라 _const_int 가 접지
+    # 못한다. 그래서 여기서만 **정책 소유자에서 직접** 읽는다 — 진단이 들고
+    # 있는 숫자가 아니라 소스의 값이므로 대조가 공허해지지 않는다.
+    # 이름 참조가 유지되는지는 H1 이 별도로 지킨다(리터럴로 바꾸면 H1 이 죽는다).
+    B_HID = getattr(rc, "REQUIRED_BARS", None)
     if None in (B_SPY_N, B_TKR_N, B_SPY_F, B_CND_F, B_HID):
         bad(f"E0{tag_suffix}", "호출부 bars= 판독 실패 — 런타임 군을 구동할 수 없다")
         return
@@ -865,8 +1033,11 @@ def group_E(blackout=None, tag_suffix=""):
     chk(len(s2) >= B_CND_F, f"E4d{tag_suffix}", f"fmp_extras 후보: {len(s2)}봉 ≥ {B_CND_F}")
 
     # ── E5 run_hidden_alpha (응답 객체 경로) ──
+    # ⚠️ [2026-09-03] 반환형이 Series → **튜플 (close, volume)** 로 바뀌었다.
+    #    `ser = ...` 로 두면 예외 없이 len(ser)==2 가 되어 E5b 가 **틀린 답**을
+    #    낸다(요구가 2봉 이하일 때 조용히 통과). 언패킹이 계약이다.
     with _StubResp(blackout) as st:
-        ser = hid._fmp_price_history_close("CCC", bars=B_HID)
+        ser, vol_s = hid._fmp_price_history_ohlcv("CCC", bars=B_HID)
     wins = [_win_of(p)[0] for p in st.log if "historical-price-eod" in p]
     chk(_expect_window(B_HID) in wins, f"E5a{tag_suffix}",
         f"run_hidden_alpha: 관측 창 {wins} 에 {_expect_window(B_HID)}일 포함")
@@ -875,6 +1046,12 @@ def group_E(blackout=None, tag_suffix=""):
     ret = hid.calculate_period_return(ser, 21)
     chk(ret is not None and not pd.isna(ret), f"E5c{tag_suffix}",
         f"run_hidden_alpha: 1개월 수익률 산출됨 ({ret}) — NaN 이면 창이 22봉 미만")
+    # 거래량 계약 — 유동성 게이트가 이 두 번째 반환값에 전적으로 의존한다.
+    chk(len(vol_s) == len(ser), f"E5d{tag_suffix}",
+        f"run_hidden_alpha: 거래량 {len(vol_s)}봉 == 종가 {len(ser)}봉")
+    chk(len(vol_s) > 0 and not ser.equals(vol_s), f"E5e{tag_suffix}",
+        "run_hidden_alpha: 거래량이 종가와 다른 시리즈 "
+        "— 같으면 avg_dollar_volume 이 종가² 를 평균낸다(게이트가 조용히 틀린다)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -898,12 +1075,14 @@ def main():
     for name, mod in _MODULES.items():
         print(f"  {name:18s}: {mod.__file__}")
     print(f"  earnings_core     : {ec.__file__}")
+    print(f"  rotation_core     : {rc.__file__} (창 깊이 정책 소유자)")
     print(f"  하네스             : {dhw.__file__} (스텁·AST 헬퍼 재사용)")
     print("=" * 78)
 
     group_C()
     group_R()
     group_Q()
+    group_H()
     if c_stop():
         group_E()
         group_B()
