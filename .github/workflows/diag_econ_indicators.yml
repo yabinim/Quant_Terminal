@@ -64,19 +64,36 @@ jobs:
       - name: 📦 의존성
         run: pip install requests
 
+      # ── 파일 존재 확인 (콜 0) ─────────────────────────────────────────
+      # ⚠️ 2026-09-04: 이 관문이 없어서 첫 실행이 헛돌았다. 스크립트는
+      #    automation/ 에 있는데 워크플로가 루트에서 불렀다. 그런데 그때
+      #    스모크 스텝이 `|| echo "정상"` 으로 되어 있어서 **파일 없음(exit 2)을
+      #    키 없음(exit 1)으로 뭉개고 초록불을 냈다.** 잘못된 이유로 통과한
+      #    테스트다. 경로부터 명시적으로 확인한다.
+      - name: 📁 스크립트 존재 확인
+        run: test -f automation/diag_econ_indicators.py
+
       # ── 임포트 스모크 (콜 0) ──────────────────────────────────────────
       # 2026-08-22 선례: _DETAIL 이 아래에 정의된 렌더러를 참조해 NameError 로
       # 죽었는데 ast.parse 와 check_py311 은 둘 다 통과했다 — 문법은 멀쩡했고
       # 모듈 최상단을 아무도 실행하지 않았기 때문이다. 여기서 실제로 임포트한다.
-      # FMP_API_KEY 를 주지 않으므로 네트워크를 만지지 않는다(키 없으면 즉시 종료).
       - name: 🧪 임포트 스모크 (FMP 콜 0)
         run: |
-          python -c "import diag_econ_indicators" && echo "임포트 OK"
-          python diag_econ_indicators.py && echo "키 없이 종료 경로 OK" || \
-            echo "키 없음 종료(exit 1) — 정상"
+          python -c "import sys; sys.path.insert(0,'automation'); import diag_econ_indicators; print('import OK')"
+
+      # 키 없이 돌렸을 때 **정확히 exit 1** 인지 본다. `|| echo 정상` 을 쓰지
+      # 않는 이유: 그러면 2(파일 없음)도 127(파이썬 없음)도 전부 '정상'이 된다.
+      - name: 🧪 키 없음 경로 (FMP 콜 0)
+        run: |
+          set +e
+          python automation/diag_econ_indicators.py
+          rc=$?
+          set -e
+          echo "exit=$rc"
+          test "$rc" -eq 1
 
       - name: 🔬 실측
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           PROBE_TIER: ${{ inputs.tier }}
-        run: python diag_econ_indicators.py
+        run: python automation/diag_econ_indicators.py
