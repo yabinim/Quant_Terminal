@@ -20,9 +20,13 @@
   E. 시트 파싱    — 헤더 결손·깨진 행에도 예외 없이 빈 결과
   F. FMP 대조     — 임시 휴장(국장일) 검출 경로가 실제로 동작하는가
   H. 반일장       — 조기 마감(13:00) 규칙 골든 7년 + 마감시각 계약
+  I. 소비자 배선  — automation 파일이 calendar_core 를 **실제로** 부르는가.
+                    하드코딩 날짜 집합 재발 금지(AST 래칫) + 역검증 픽스처
   G. 뮤테이션     — 규칙 엔진에 의도적 버그를 심어 검사가 **잡아내는지** 확인
 
-G 가 핵심이다. 통과만 하는 테스트는 통과만 하는 코드를 보증하지 않는다.
+G 와 I 가 핵심이다. 통과만 하는 테스트는 통과만 하는 코드를 보증하지 않고,
+모듈만 검사하는 스위트는 소비자가 그 모듈을 안 쓰는 것을 보증하지 않는다
+(I 군은 실제로 그 사고 — run_earnings_watch 미이관 — 뒤에 추가됐다).
 """
 import os
 import sys
@@ -292,6 +296,331 @@ def test_halfday():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# I. 소비자 배선 — calendar_core 를 **실제로** 쓰는가
+#
+# 왜 이 검사군이 필요한가 (이 스위트가 4개월간 놓친 것)
+# ─────────────────────────────────────────────────────
+# A~H 는 calendar_core **자체**만 본다. 규칙 엔진이 완벽해도 소비자가 그걸 안
+# 부르면 아무 의미가 없는데, 그 확인이 어디에도 없었다.
+#
+# 실제로 그렇게 됐다. calendar_core 는 5개 자동화 파일의 하드코딩 휴장일을
+# 대체하려고 만들었는데 `run_earnings_watch.py` 하나가 이관되지 않은 채로
+# 남았다(2026-12-25 에서 끝나는 집합 그대로). 스위트는 그동안 계속 초록불이었다.
+# 게이트가 **공허하게 통과**한 것이다 — 0건 검사는 0건 실패다.
+#
+# 두 갈래로 나눈 이유
+# ───────────────────
+#   ① 하드코딩 금지 → automation 전 파일에 적용. 고정 목록이 아니라 **탐색**이라
+#      나중에 추가되는 파일도 자동으로 걸린다. 이게 래칫이다.
+#   ② import + 호출 존재 → 게이트 소비자 5개에만 적용. 새 스크립트가 캘린더를
+#      쓸 이유가 없을 수도 있으므로 전 파일에 강제하지 않는다.
+#
+# ⚠️ 탐색이 0건이면 조용히 전부 통과한다. I-0 이 하한을 못 박는 이유다.
+# ⚠️ 문자열 검색이 아니라 AST 다. 주석·독스트링의 날짜(이 파일 위쪽 골든 설명,
+#    calendar_core 독스트링 등)를 오탐하지 않으려면 그래야 한다.
+# ══════════════════════════════════════════════════════════════════════════
+import ast   # noqa: E402  — I군 전용. 상단에 두면 A~H 가 쓰지 않는 의존이 된다.
+import re    # noqa: E402
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# 개장 여부로 실행을 멈추는 파일. import 와 호출이 **둘 다** 있어야 한다.
+GATE_CONSUMERS = [
+    "run_watchlist_alerts.py",
+    "run_drg_predict.py",
+    "run_drg_verify.py",
+    "run_narrative.py",
+    "run_earnings_watch.py",
+]
+
+# 하드코딩 금지 대상 탐색 접두사. diag_* 는 제외한다 — 골든 픽스처가 정당하게
+# 날짜 집합을 갖는다(이 파일의 GOLDEN 이 바로 그것이다).
+SCAN_PREFIXES = ("run_", "refresh_", "backfill_", "seed_")
+
+_MIN_SCAN = 8        # 탐색 하한. 실측 13개이므로 여유가 있다.
+_HARDCODE_MIN = 3    # 컬렉션 안 날짜 리터럴이 이 개수 이상이면 '휴장일표'로 본다
+
+
+def _scan_dirs():
+    """automation/ 우선, 없으면 평면 배치도 받아준다 (diag_halfday_gate 관용구)."""
+    return [_HERE, os.path.join(_ROOT, "automation"), _ROOT]
+
+
+def _discover():
+    """{파일명: 경로}. 같은 이름은 먼저 찾은 쪽이 이긴다."""
+    found = {}
+    for base in _scan_dirs():
+        if not os.path.isdir(base):
+            continue
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for nm in names:
+            if not nm.endswith(".py") or nm in found:
+                continue
+            if nm.startswith(SCAN_PREFIXES):
+                found[nm] = os.path.join(base, nm)
+    return found
+
+
+def _parse(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return ast.parse(f.read())
+    except Exception:
+        return None
+
+
+# ── 무엇이 '휴장일표'인가 — 이름이 아니라 **형상**으로 판정한다 ────────────
+# 처음엔 (파일, 변수명) 면제 목록으로 갔다가 버렸다. 두 가지가 걸렸다.
+#
+#   ① `_HARDCODED_CALENDAR_2026` (run_drg_predict / run_narrative)
+#      FOMC·CPI·NFP **발표 일정** 32일. 휴장일이 아니다.
+#   ② `SEEDS` (seed_reminders)
+#      리마인더 설정 구조 안에 흩어진 due 날짜 4개.
+#
+# 면제 목록으로 막으면 새 파일이 생길 때마다 목록을 늘려야 하고, 무엇보다
+# **`_NYSE_HOLIDAYS` 를 면제된 이름으로 바꾸는 것만으로 래칫을 빠져나간다.**
+#
+# 판별자는 따로 있다 — 휴장일표는 정의상 NYSE 휴장일과 겹친다.
+#
+#     _NYSE_HOLIDAYS (이관 전)   20일 중 20일 겹침   100%
+#     _HARDCODED_CALENDAR_2026   32일 중  1일 겹침     3%   ← 2026-04-03
+#     SEEDS                       4일 중  0일 겹침     0%       굿프라이데이에도
+#                                                              BLS 는 NFP 를 낸다
+#
+# 이 기준은 이름·파일·변수 구조와 무관하다. 면제 목록도 필요 없다.
+#
+# ⚠️ 이 판정은 cc.nyse_regular_holidays 에 의존한다. 그게 빈 값을 돌려주면
+#    겹침이 0 이 되어 **전부 조용히 통과한다.** I-R0 이 그 전제를 먼저 못 박는다.
+_HOLIDAY_OVERLAP_MIN = 3      # 겹침 절대 개수 하한
+_HOLIDAY_OVERLAP_RATIO = 0.5  # 겹침 비율 하한
+
+
+def _holiday_overlap(dates):
+    """날짜 목록 중 실제 NYSE 정규 휴장일인 것의 개수."""
+    hol = set()
+    for d in dates:
+        try:
+            hol |= set(cc.nyse_regular_holidays(int(d[:4])))
+        except Exception:
+            pass
+    return len(set(dates) & hol)
+
+
+def date_literal_groups(tree, fname=""):
+    """대입문 안의 **휴장일표로 보이는** 날짜 뭉치 → [(줄번호, 개수, 이름, 겹침)].
+
+    set / list / tuple / dict 를 전부 본다. dict 는 키·값 양쪽 —
+    {"2025-01-01": "New Year's Day", ...} 형태가 실제로 쓰이는 모양이다.
+
+    ⚠️ **대입문 단위**로 본다. 익명 리터럴이 아니라 이름을 알아야 실패 메시지가
+       쓸모 있다("줄 116" 보다 "_NYSE_HOLIDAYS" 가 낫다).
+
+    낱개 날짜(창 경계, 상수 1~2개)는 _HARDCODE_MIN 미만이라 애초에 통과한다.
+
+    ⚠️ fname 은 **판정에 쓰이지 않는다.** 초안에서 (파일, 변수명) 면제 목록을
+       운용하려고 받았는데, 형상 기준으로 바꾸면서 불필요해졌다. 인자를 남긴
+       이유는 하나다 — 파일별 예외가 필요해지는 순간 호출부를 안 고치고 여기서만
+       분기할 수 있게. 그런 예외가 끝내 안 생기면 지워도 된다.
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            name = getattr(node.targets[0], "id", "") if node.targets else ""
+            body = node.value
+        elif isinstance(node, ast.AnnAssign):
+            name = getattr(node.target, "id", "")
+            body = node.value
+        else:
+            continue
+        if body is None:
+            continue
+        dates = [v.value for v in ast.walk(body)
+                 if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                 and _DATE_RE.match(v.value)]
+        if len(dates) < _HARDCODE_MIN:
+            continue
+        ov = _holiday_overlap(dates)
+        if ov < _HOLIDAY_OVERLAP_MIN:
+            continue
+        if ov / float(len(set(dates))) < _HOLIDAY_OVERLAP_RATIO:
+            continue
+        hits.append((getattr(node, "lineno", 0), len(dates),
+                     name or "<익명>", ov))
+    return hits
+
+
+def calendar_alias(tree):
+    """`import calendar_core as X` 의 X. 없으면 None."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "calendar_core":
+                    return a.asname or "calendar_core"
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "calendar_core":
+                return ""      # from calendar_core import ... — 별칭 없음
+    return None
+
+
+def calls_open_check(tree, alias):
+    """alias.is_market_open* 를 실제로 부르는가.
+
+    import 만 하고 배선을 잊는 것이 가장 그럴듯한 회귀다 — 그러면 파일은
+    '이관 완료'처럼 보이면서 게이트는 사라진다. import 존재만으로는 못 잡는다.
+    """
+    if alias is None:
+        return False
+    if alias == "":                       # from-import 형태
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id.startswith("is_market_open")):
+                return True
+        return False
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == alias
+                and node.attr.startswith("is_market_open")):
+            return True
+    return False
+
+
+# ── 역검증 픽스처 — 이관 **전** run_earnings_watch.py 의 실제 모양 ──────────
+# 검사를 믿기 전에 '알려진 나쁜 입력'에서 반드시 빨간불이 나는지 확인한다.
+# 이 픽스처가 곧 회귀 케이스다(이 결함이 재발하면 여기서 먼저 걸린다).
+_BAD_FIXTURE = '''
+_NYSE_HOLIDAYS = {
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+}
+
+
+def is_market_open_today() -> bool:
+    now = datetime.now(_ET)
+    return now.weekday() < 5 and now.strftime("%Y-%m-%d") not in _NYSE_HOLIDAYS
+'''
+
+# 이관 **후** 의 모양. 통과해야 한다 — 아니면 검사가 과민한 것이다.
+_GOOD_FIXTURE = '''
+import calendar_core as cc
+
+
+def is_market_open_today() -> bool:
+    return cc.is_market_open_today()
+'''
+
+# import 만 하고 배선을 잊은 모양. import 검사는 통과하고 호출 검사는 실패해야
+# 한다 — 두 검사가 서로 다른 것을 본다는 증거다.
+_LIMP_FIXTURE = '''
+import calendar_core as cc
+
+_CUTOFF = 5
+
+
+def is_market_open_today() -> bool:
+    return True
+'''
+
+
+def test_wiring():
+    print("\n── I. 소비자 배선 (calendar_core 를 실제로 쓰는가)")
+
+    files = _discover()
+    # I-0 · I-1: 탐색이 살아 있는가. 이게 없으면 아래 전부가 공허하게 통과한다.
+    check("I-0  automation 파일 탐색 " + str(len(files)) + "개 (하한 "
+          + str(_MIN_SCAN) + ")", len(files) >= _MIN_SCAN,
+          "탐색 실패 — 아래 검사가 전부 무의미해진다. 실행 경로 확인 필요")
+    missing = [f for f in GATE_CONSUMERS if f not in files]
+    check("I-1  게이트 소비자 5개 전원 탐색됨", not missing,
+          "누락=" + str(missing))
+
+    # I-2군: 하드코딩 금지 — 탐색된 **전 파일**. 새 파일도 자동으로 걸린다.
+    for nm in sorted(files):
+        tree = _parse(files[nm])
+        if tree is None:
+            check("I-2  " + nm + " 파싱", False, "AST 파싱 실패")
+            continue
+        hits = date_literal_groups(tree, nm)
+        check("I-2  " + nm + " 하드코딩 휴장일표 0건", not hits,
+              ", ".join(who + " 줄" + str(ln) + " (날짜 " + str(n)
+                        + "개 중 휴장일 " + str(ov) + "개 일치)"
+                        for ln, n, who, ov in hits))
+
+    # I-3군: 게이트 소비자는 import + 호출이 둘 다 있어야 한다.
+    for nm in GATE_CONSUMERS:
+        p = files.get(nm)
+        if not p:
+            continue                       # I-1 이 이미 실패로 보고했다
+        tree = _parse(p)
+        if tree is None:
+            continue
+        alias = calendar_alias(tree)
+        check("I-3  " + nm + " calendar_core import", alias is not None,
+              "import 없음")
+        check("I-4  " + nm + " is_market_open* 호출",
+              calls_open_check(tree, alias),
+              "import 만 있고 배선이 없다")
+
+    # ── 역검증 — 검사가 알려진 나쁜 입력에서 실제로 빨간불이 나는가 ──────
+    bad = ast.parse(_BAD_FIXTURE)
+    good = ast.parse(_GOOD_FIXTURE)
+    limp = ast.parse(_LIMP_FIXTURE)
+
+    check("I-R1 이관 전 픽스처 → 날짜 집합 검출됨",
+          bool(date_literal_groups(bad, "run_earnings_watch.py")),
+          "검출 못 함 — 이 검사는 판별력이 없다")
+    check("I-R2 이관 전 픽스처 → import 없음으로 판정",
+          calendar_alias(bad) is None)
+    check("I-R3 이관 후 픽스처 → 날짜 집합 0건 (과민하지 않음)",
+          not date_literal_groups(good, "run_earnings_watch.py"))
+    check("I-R4 이관 후 픽스처 → import + 호출 둘 다 인식",
+          calendar_alias(good) == "cc"
+          and calls_open_check(good, calendar_alias(good)))
+    check("I-R5 import 만 있고 배선 없는 픽스처 → 호출 검사만 실패",
+          calendar_alias(limp) == "cc"
+          and not calls_open_check(limp, calendar_alias(limp)),
+          "두 검사가 같은 것을 보고 있다 — 하나는 잉여다")
+    check("I-R6 낱개 날짜 2개는 통과 (문턱 " + str(_HARDCODE_MIN) + ")",
+          not date_literal_groups(ast.parse('X = ["2025-01-01", "2025-02-01"]')))
+    check("I-R7 dict 형태 휴장일표도 검출",
+          bool(date_literal_groups(ast.parse(
+              'H = {"2025-01-01": "a", "2025-01-20": "b", "2025-02-17": "c"}'))))
+
+    # ── 형상 기준이 실제로 판별하는가 ────────────────────────────────────
+    # 이름 면제 목록을 버리고 '휴장일과 겹치는가'로 판정한다. R8~R11 이 그
+    # 기준의 양쪽 끝을 고정한다 — 이름을 바꿔도 잡히고, 다른 날짜표는 통과한다.
+    _hol26 = ", ".join('"' + d + '"' for d in
+                       sorted(cc.nyse_regular_holidays(2026)))
+    check("I-R8 이름을 바꿔도 휴장일표는 검출 (이름 우회 불가)",
+          bool(date_literal_groups(
+              ast.parse("_MY_HARMLESS_DATES = {" + _hol26 + "}"),
+              "run_earnings_watch.py")),
+          "이름만 바꾸면 래칫을 빠져나간다")
+    check("I-R9 경제지표 발표 일정은 통과 (겹침 없음)",
+          not date_literal_groups(ast.parse(
+              '_C = {"CPI": ["2026-01-14", "2026-02-11", "2026-03-11", '
+              '"2026-04-10", "2026-05-13"]}')))
+    check("I-R10 설정 구조에 흩어진 날짜는 통과 (seed_reminders 형태)",
+          not date_literal_groups(ast.parse(
+              '_S = [D(due="2026-10-15"), D(due="2026-11-03"), '
+              'D(due="2026-11-15"), D(due="2027-02-02")]')))
+    check("I-R11 휴장일 절반 섞인 표도 검출 (비율 "
+          + str(_HOLIDAY_OVERLAP_RATIO) + ")",
+          bool(date_literal_groups(ast.parse(
+              '_M = ["2026-01-01", "2026-07-03", "2026-12-25", '
+              '"2026-03-11", "2026-05-13"]'))))
+
+    # ⚠️ 위 판정은 전부 cc.nyse_regular_holidays 에 기댄다. 그게 비면 겹침이
+    #    0 이 되어 I-2 가 **조용히 전부 통과**한다. 전제를 여기서 못 박는다.
+    check("I-R0 겹침 판정의 전제 — 2026 휴장일 10개가 실제로 나온다",
+          len(cc.nyse_regular_holidays(2026)) == 10,
+          "calendar_core 가 비었다면 I-2 는 전부 공허한 통과다")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # G. 뮤테이션 — 의도적 버그를 검사가 잡는가
 # ══════════════════════════════════════════════════════════════════════════
 def test_mutation():
@@ -445,6 +774,7 @@ def main():
     test_parse()
     test_diff()
     test_halfday()
+    test_wiring()
     test_mutation()
 
     print("")

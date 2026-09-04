@@ -41,6 +41,7 @@ from google.oauth2.service_account import Credentials
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import accounts_core as ac    # noqa: E402
+import calendar_core as cc   # noqa: E402  — 시장 캘린더(휴장일) SSOT
 import earnings_core as ec    # noqa: E402
 # ⚠️ fmp_extras 는 선택이 아니다 — 모든 FMP 호출이 fx.fmp_get(레이트 리미터)을
 #    거쳐야 429 가 조용히 빈 응답으로 사라지지 않는다(diag_fmp_ssot A1).
@@ -113,17 +114,24 @@ _HIST_EDGE_TOL_DAYS = 7
 _THESIS_WORKSHEET = "Thesis"     # app.py _THESIS_SHEET_COLS 와 lockstep
 _CORE_CATEGORY = "core_dca"      # 코어/정기적립 마커 (app.py save_thesis_row 와 동일)
 
-_NYSE_HOLIDAYS = {
-    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
-    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
-    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
-    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
-}
-
-
+# ── 휴장일 판정 — calendar_core SSOT 로 단일화 ────────────────────────────────
+# 기존 하드코딩 집합은 2026-12-25 에서 끝나 2027-01-01 부터 모든 휴장일을
+# 거래일로 오판했다. 같은 상수가 5개 자동화 파일에 중복돼 있었고, 이 파일이
+# 그중 **마지막 미이관분**이었다(나머지 4개는 이미 calendar_core 로 넘어갔다).
+#
+# 오판의 결과가 조용하다는 게 문제다 — 휴장일에 실적 레이더가 돌면
+# Earnings_Events 에 존재하지 않는 세션 기준 행이 쌓이고, 그 시트를 공유 상태로
+# 쓰는 워치리스트 진입 차단 게이트가 그 값을 그대로 읽는다. 로그에 에러는 없다.
+#
+# calendar_core 는 **규칙 계산**이라 FMP·시트 접근이 없다. 이 가드는 시트를
+# 열기 전 main() 최상단에 있으므로, 네트워크나 시트 왕복을 붙이면 "휴장일이라
+# 즉시 종료"하는 실행에까지 비용이 생긴다. 호출 비용은 기존과 같은 0 이다.
+#
+# ⚠️ 여기에 날짜 집합을 다시 하드코딩하지 말 것.
+#    diag_market_calendar.py C군이 automation/ 전 파일을 AST 로 훑어
+#    날짜 리터럴 집합을 금지한다 — 되살리면 배포 게이트가 막는다.
 def is_market_open_today() -> bool:
-    now = datetime.now(_ET)
-    return now.weekday() < 5 and now.strftime("%Y-%m-%d") not in _NYSE_HOLIDAYS
+    return cc.is_market_open_today()
 
 
 # ── Sheets ────────────────────────────────────────────────────────────────
