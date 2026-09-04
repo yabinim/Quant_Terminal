@@ -160,7 +160,19 @@ _RAW_GET_BASELINE = {
     #   이름이 좁으면 다음 사람이 대화형 경로에 또 생 호출을 단다 —
     #   방금 합친 grades-consensus 3곳이 정확히 그렇게 생긴 것이다.
     #   나머지 47곳은 계속 래칫으로 조인다(인수인계 §6-B5).
-    "app.py": 47,
+    # 2026-09-04c: 47 → 46. **코드는 안 바뀌었다. 탐지기가 고쳐졌다.**
+    #   `fetch_targeted_news` 는 Google News RSS(`news.google.com/rss/search`)를
+    #   부르는데 FMP 호출로 세고 있었다. 원인은 두 가지였고 둘 다 오탐이다:
+    #     ① 이름을 **모듈 전체**에서 모아 판정 — 어느 함수에서든
+    #        `url = f"{_FMP_BASE}/…"` 이 한 번 나오면 파일 안 모든
+    #        `requests.get(url)` 이 걸렸다.
+    #     ② 이름 전파가 부분 문자열 매칭 — `_`·`a`·`k` 가 집합에 들어가며
+    #        폭주했다. app.py 대입 3,131개 중 2,937개(93.8%) 포획.
+    #   ⚠️ 오탐은 "엄격해지기" 로는 절대 안 잡힌다. 숫자가 늘기만 하니
+    #      아무도 의심하지 않는다. 하마터면 이 오탐을 근거로 Google News 를
+    #      FMP 레이트리미터에 태울 뻔했다. M11 이 회귀 케이스다.
+    #   나머지 46곳은 계속 래칫으로 조인다(인수인계 §6-B5).
+    "app.py": 46,
     # run_drg_predict.py 는 2026-08-28 에 11곳 전부 fmp_http 로 전환됐다(11 → 0).
     #   requests 임포트 자체를 지웠다 — 되살리려면 임포트를 다시 추가해야 한다.
     #   기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
@@ -253,8 +265,14 @@ _RAW_GET_BASELINE = {
 _RAW_GET_EXEMPT = {"fmp_http"}
 
 
+# FMP 주소임을 알려주는 **긴 고유 토큰**들. 부분 문자열 검사는 여기서만 한다 —
+# 셋 다 우연히 다른 코드에 나올 리 없는 길이다. 짧은 이름으로 부분 문자열을
+# 돌리면 폭주한다(아래 _fmp_url_names 주석 참조).
+_FMP_URL_MARKERS = ("financialmodelingprep", "apikey", "_FMP_BASE", "FMP_BASE")
+
+
 def _fmp_url_names(tree) -> set:
-    """모듈 안에서 FMP 주소가 바인딩된 이름들 (_FMP_BASE · url · 그 파생).
+    """스코프 안에서 FMP 주소가 바인딩된 이름들 (_FMP_BASE · url · 그 파생).
 
     ⚠️ 2026-08-27: 이전 구현은 **문자열 상수 직접 대입만** 봤다. 그래서
 
@@ -266,9 +284,24 @@ def _fmp_url_names(tree) -> set:
     뮤테이션으로 실증했다(M9). 저장소에 이 모양이 10곳 있었고 그중 하나는
     **코어 모듈**(`calendar_core`)이었다.
 
-    그래서 **고정점까지 전파**한다: 값의 소스에 FMP 표식이나 이미 알려진
-    FMP 이름이 등장하면 그 대입 대상도 FMP 이름이다. 증강 대입(`url += …`)도
-    같이 본다 — 조각을 나눠 붙이면 표식이 첫 줄에만 있다.
+    그래서 **고정점까지 전파**한다: 값이 이미 알려진 FMP 이름을 참조하면 그
+    대입 대상도 FMP 이름이다. 증강 대입(`url += …`)도 같이 본다 — 조각을
+    나눠 붙이면 표식이 첫 줄에만 있다.
+
+    ⚠️ 2026-09-04: 전파 조건이 `any(nm in src for nm in out)` 이었다.
+       **부분 문자열 매칭이라 폭주했다.** `_` · `a` · `b` · `k` 같은 짧은
+       이름이 집합에 들어가는 순간 거의 모든 대입이 걸린다:
+
+           '_' in "x = data['_key']"      → True
+           'k' in "kind = 'x'"            → True
+
+       실측: app.py 의 대입 대상 3,131개 중 **2,937개(93.8%)** 가 "FMP 주소를
+       담은 이름" 으로 판정됐다. 기준선 8개 파일이 전부 62~94% 포획 상태였다.
+       `raw_fmp_gets` 는 이미 같은 교훈으로 **AST 이름 노드** 매칭으로 고쳐져
+       있었는데(그 주석 참조 — narrative_core 가 2 → 3 으로 부풀었던 건),
+       그 수정이 이 함수까지 오지 않았다. 같은 버그의 나머지 절반이다.
+       → 이제 `refs & out` 으로 **실제 Name 참조**만 본다. 부분 문자열은
+         위 _FMP_URL_MARKERS 의 긴 토큰에만 쓴다.
     """
     out = set()
     for _ in range(6):          # 고정점. 실측 2회면 수렴하나 여유를 둔다.
@@ -280,11 +313,11 @@ def _fmp_url_names(tree) -> set:
                 targets, val = [n.target], n.value
             else:
                 continue
-            src = _unparse(val)
-            if not src:
+            if val is None:
                 continue
-            hit = ("financialmodelingprep" in src or "apikey" in src
-                   or any(nm in src for nm in out))
+            src = _unparse(val)
+            refs = {x.id for x in ast.walk(val) if isinstance(x, ast.Name)}
+            hit = any(m in src for m in _FMP_URL_MARKERS) or bool(refs & out)
             if not hit:
                 continue
             for t in targets:
@@ -328,12 +361,41 @@ def _requests_names(tree):
     return mods, gets
 
 
+def _enclosing_fn_map(tree):
+    """줄번호 → 그 줄을 감싸는 **가장 안쪽** FunctionDef. 없으면 None."""
+    out = {}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for ln in range(n.lineno, (n.end_lineno or n.lineno) + 1):
+                cur = out.get(ln)
+                if cur is None or n.lineno > cur.lineno:
+                    out[ln] = n
+    return out
+
+
+def _assigned_in(scope, name: str) -> bool:
+    """이 스코프 안에서 name 에 대입이 있는가."""
+    for n in ast.walk(scope):
+        if isinstance(n, ast.Assign):
+            tgs = n.targets
+        elif isinstance(n, ast.AugAssign):
+            tgs = [n.target]
+        else:
+            continue
+        for t in tgs:
+            if isinstance(t, ast.Name) and t.id == name:
+                return True
+    return False
+
+
 def raw_fmp_gets(mod: str) -> list:
     """[(lineno, 호출식 요약)] — requests.get 으로 FMP 를 직접 때리는 지점."""
     tree = TREES.get(mod)
     if tree is None or mod in _RAW_GET_EXEMPT:
         return []
     names = _fmp_url_names(tree)
+    fnmap = _enclosing_fn_map(tree)
+    _scope_cache = {}
     rq_mods, rq_gets = _requests_names(tree)
     hits = []
     for c in ast.walk(tree):
@@ -351,8 +413,26 @@ def raw_fmp_gets(mod: str) -> list:
         #    narrative_core 가 2 → 3 으로 부풀었다.
         argn = {x.id for x in ast.walk(c.args[0])
                 if isinstance(x, ast.Name)} if c.args else set()
-        if ("financialmodelingprep" in arg or "apikey" in arg
-                or (argn & names)):
+
+        # ⚠️ 2026-09-04: **스코프를 본다.** 예전엔 모듈 전체에서 모은 이름
+        #    하나로 판정해서, 어느 함수에서든 `url = f"{_FMP_BASE}/…"` 이
+        #    한 번 나오면 **파일 안의 모든** `requests.get(url)` 이 걸렸다.
+        #    실제 피해: app.py 의 `fetch_targeted_news` 는 Google News RSS
+        #    (`news.google.com/rss/search`)를 부르는데 FMP 호출로 계수됐다.
+        #    그 오탐을 근거로 "FMP 레이트리미터에 태우자"는 수정이 설계될 뻔했다.
+        #    → 인자 이름이 **감싼 함수 안에서 대입된 지역 이름**이면 그 함수
+        #      스코프로만 판정한다. 지역 대입이 없으면 모듈 이름으로 폴백한다
+        #      (모듈 상수를 쓰는 정상 경로는 그대로 잡힌다).
+        use = names
+        fn = fnmap.get(c.lineno)
+        if fn is not None and any(_assigned_in(fn, a) for a in argn):
+            key = id(fn)
+            if key not in _scope_cache:
+                _scope_cache[key] = _fmp_url_names(fn)
+            use = _scope_cache[key]
+
+        if (any(m in arg for m in _FMP_URL_MARKERS)
+                or (argn & use)):
             hits.append((c.lineno, arg[:60]))
     return hits
 
@@ -1462,6 +1542,96 @@ else:
     print("  ❌ M9 실패 — 변수URL=" + str(_m9a) + "(1) · 오탐=" + str(_m9b)
           + "(0) · 다단전파=" + str(_m9c) + "(1) · 증강대입=" + str(_m9d) + "(1)")
     _fails.append("M9 A1 변수 URL 탐지")
+
+
+# ── M11 — 스코프 충돌 오탐 · 부분 문자열 폭주 (2026-09-04) ──────────────────
+# 이번에 잡은 결함 둘을 회귀 케이스로 박는다. 둘 다 **오탐** 방향이라
+# "엄격해지기" 로는 절대 발견되지 않는다 — 숫자가 늘어나기만 하니 아무도
+# 의심하지 않는다. 실제로 app.py 의 `fetch_targeted_news` 는 Google News RSS
+# (`news.google.com/rss/search`)를 부르는데 FMP 호출로 계수되고 있었고,
+# **그 오탐을 근거로 "FMP 레이트리미터에 태우자"는 수정이 설계될 뻔했다.**
+#
+# 결함 ①: 모듈 전체에서 이름을 모아 판정했다. 어느 함수에서든
+#   `url = f"{_FMP_BASE}/…"` 이 한 번 나오면 파일 안의 **모든**
+#   `requests.get(url)` 이 걸린다. M11a/b 가 이걸 건다(정의 순서 무관).
+# 결함 ②: 이름 전파가 `any(nm in src for nm in out)` 부분 문자열이었다.
+#   `_` · `a` · `k` 가 집합에 들어가는 순간 폭주한다. 실측 app.py 3,131개 중
+#   2,937개(93.8%) 포획. M11d 가 이걸 건다.
+# M11c 는 반대편 — 지역 대입이 없으면 모듈 이름으로 폴백해야 한다.
+#   이게 없으면 스코프 좁히기가 과하게 나가도 아무도 모른다.
+_M11A = """
+import requests
+_FMP_BASE = "https://financialmodelingprep.com/stable"
+def fmp_call(ticker):
+    url = f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k}"
+    return requests.get(url, timeout=7)
+def google_news(q):
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-US"
+    return requests.get(url, timeout=8)
+"""
+_M11B = """
+import requests
+_FMP_BASE = "https://financialmodelingprep.com/stable"
+def google_news(q):
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-US"
+    return requests.get(url, timeout=8)
+def fmp_call(ticker):
+    url = f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k}"
+    return requests.get(url, timeout=7)
+"""
+_M11C = """
+import requests
+URL = "https://financialmodelingprep.com/stable/quote?apikey=K"
+def go():
+    return requests.get(URL, timeout=7)
+"""
+_M11D = """
+import requests
+_FMP_BASE = "https://financialmodelingprep.com/stable"
+def go(data):
+    a = 1
+    k = "kind"
+    _ = data["_key"]
+    feed = "https://example.com/rss"
+    return requests.get(feed, timeout=8)
+"""
+_m11 = [_a1_hits_on(s) for s in (_M11A, _M11B, _M11C, _M11D)]
+if _m11 == [1, 1, 1, 0]:
+    _passes += 1
+    print("  ✅ M11 스코프 충돌 오탐 없음(a·b) · 모듈 폴백 유지(c) · "
+          "짧은 이름 폭주 없음(d)")
+else:
+    _fails.append(f"M11 오탐 방어 — 기대 [1,1,1,0], 실제 {_m11}")
+    print(f"  ❌ M11 오탐 방어 — 기대 [1,1,1,0], 실제 {_m11}")
+
+# M11e — 폭주 지표를 **저장소 실물**에서 잰다. 케이스별 검사는 정해진 모양만
+# 보지만, 이건 전파가 다시 새는지를 실제 파일에서 본다. 부분 문자열 매칭
+# 시절 app.py 는 93.8% 였다. 정상 범위는 한참 아래다.
+_m11e_bad = []
+for _m11_mod in ("app", "narrative_core", "scanner_core"):
+    _t11 = TREES.get(_m11_mod)
+    if _t11 is None:
+        continue
+    _cap11 = _fmp_url_names(_t11)
+    _all11 = set()
+    for _n11 in ast.walk(_t11):
+        if isinstance(_n11, ast.Assign):
+            _tg11 = _n11.targets
+        elif isinstance(_n11, ast.AugAssign):
+            _tg11 = [_n11.target]
+        else:
+            continue
+        for _t211 in _tg11:
+            if isinstance(_t211, ast.Name):
+                _all11.add(_t211.id)
+    if _all11 and len(_cap11) / len(_all11) > 0.75:
+        _m11e_bad.append(f"{_m11_mod}={len(_cap11)}/{len(_all11)}")
+if not _m11e_bad:
+    _passes += 1
+    print("  ✅ M11e 이름 포획률 정상 (부분 문자열 폭주 없음)")
+else:
+    _fails.append("M11e 이름 전파 폭주 — " + ", ".join(_m11e_bad))
+    print("  ❌ M11e 이름 전파 폭주 — " + ", ".join(_m11e_bad))
 
 
 # ══════════════════════════════════════════════════════════════════════════
