@@ -67,7 +67,12 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #       3년이면 → 검증창 6개가 한 국면(상승장) 연속 6분기에 갇힌다
 #       5년이면 → 학습창에 2022 하락장이 들어온다
 #
-#   tierC (4콜) — 탐색적
+#   tierC — ✅ 2026-08-22 실행 완료. **드롭다운에서 제거됨.**
+#     senate/house-latest       ✅ 200 이지만 tierD 가 전제를 무너뜨림 → 종결
+#     holder-performance-summary  🔒 402 플랜 미포함 → 영구 제외
+#     historical-industry-pe    ✅ 200 · 65건 · 키 date/exchange/industry/pe
+#                               from/to 가 실제로 먹는다(90일 요청 → 65건).
+#                               ⚠️ 단, 깊이는 못 쟀다 → tierE 로 이월
 #
 #   tierD (4콜) — 설계 전에 재야 하는 두 가지 (2026-08-22)
 #     D-1/D-2 의회 거래 공시 지연 실측
@@ -83,14 +88,33 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 #       먹어야 워치리스트 실사용이 가능하다. 무필터 1787건이라는 **측정된
 #       기준선**이 있어서 여기서는 건수 비교가 유효하다.
 #       from/to 는 건수만 보지 않는다 — 응답 날짜가 요청 구간 안인지도 본다.
-#     senate-latest · house-latest
-#     institutional-ownership/holder-performance-summary · historical-industry-pe
+#     ── 실측 결과 (2026-08-22 03:32 UTC) ────────────────────────────────
+#     D-1 상원  지연 중앙값 572일 · p90 875일 · 7일 이내 0%  🔴 종결
+#     D-2 하원  지연 중앙값  27일 · p90 704일 · 7일 이내 3%  🟡 조건부
+#         → app.py:21546 · VERDICT_2026-08-22_congress_trades_terminated.md
+#     D-3 limit=10   → 1787건. 🔴 무시됨
+#     D-4 from/to 1년 → 1787건 · 응답 날짜 2012-02-08~2026-08-10 · 구간 밖 1674건
+#         🔴 무시됨. **워치리스트 전체 적용 불가**로 확정
 #
-#   grades (3콜) — 미결 과제
-#     grades / grades-consensus / ratings-snapshot 의 응답 키를 나란히 출력.
-#     "grades?symbol= 가 기존 등급 엔드포인트와 겹치는가"에 대한 직접 답.
+#   grades — 🔴 **콜 없이 종결.** 드롭다운에서 제거됨.
+#     grades 키           action/date/gradingCompany/newGrade/previousGrade/symbol
+#     grades-consensus 키 strongBuy/buy/hold/sell/strongSell/consensus/symbol
+#     ratings-snapshot    이미 제거 완료(호출 0건 · diag_analyst_congress A-1 래칫)
+#     → 겹치는 필드는 symbol 뿐. **중복이 아니다** — 이벤트 로그 vs 스냅샷 집계.
 #
-#   all (32콜)
+#   tierE (1콜) — tierC 의 유일한 잔여분 (2026-09-03)
+#     historical-industry-pe 를 **7년** 요청해 이력 깊이를 잰다.
+#     tierC 는 90일을 요청해 90일을 받았다. 그건 깊이를 못 잰 것이다 —
+#     tierB3 와 정확히 같은 요청값 종속 함정이다.
+#     판별자: min(date) − 요청 from   (≈0 한도 미도달 / ≫0 한도 발견)
+#     사전 확정: 확보 폭 5년 이상 → 기록 후 보류 / 5년 미만 → 종결
+#     ⚠️ ✅ 라도 자동 착공이 아니다. 기능화하려면 백필 149콜 + 새 와이드 시트 +
+#        일일 유지콜(`industry-pe-snapshot` 존재 여부 미확인)이 필요하고,
+#        형제 신호인 업종 모멘텀은 2026-09-01 워크포워드에서 1/6 로 부결됐다.
+#
+#   all (30콜)
+#     ⚠️ 이 숫자를 손으로 세지 마라. 실행 헤더의 `호출 N콜` 이 len() 기반
+#        진짜 값이다. 과거에 py 32 · yml 주석 32 · yml 설명 36 으로 갈렸다.
 #
 # ── 판정 읽는 법 ──────────────────────────────────────────────────────
 #   ✅ LIVE    200 + 데이터 + 필요 필드 전부 존재    → 설계 진행 가능
@@ -112,20 +136,24 @@ name: 🔬 진단 — FMP 미사용 엔드포인트 실측 (신규 기능 후보
 on:
   workflow_dispatch:
     inputs:
+      # ⚠️ 기본값이 tierE 다(1콜). 예전 기본값은 tierA(5콜)였는데, tierA~tierD 는
+      #    전부 판정이 끝난 그룹이라 실수로 눌리면 닫힌 질문에 콜이 나간다.
+      #    지금 열려 있는 질문은 tierE 하나뿐이므로 그게 기본값이어야 한다.
+      # ⚠️ tierC / grades 는 제거됐다. 낡은 북마크로 그 값이 들어오면 스크립트가
+      #    조용히 tierA(5콜)로 떨어진다 — 실행 헤더의 `티어:` 줄을 꼭 확인할 것.
       tier:
-        description: "확인 티어 (tierA=결함해결 5콜 / tierB=기능강화 9콜 / tierB2=B후속 5콜 / tierB3=B-1직전 3콜 / tierB4=깊이재측정 3콜 / tierC=탐색 4콜 / tierD=공시지연·grades파라미터 4콜 / grades=등급중복 3콜 / all=36콜)"
+        description: "확인 티어 (tierE=업종PER깊이 1콜 ★유일한 미결 / tierA=결함해결 5콜 ✅종결 / tierB=기능강화 9콜 ✅종결 / tierB2=B후속 5콜 ✅종결 / tierB3=B-1직전 3콜 ✅종결 / tierB4=깊이재측정 3콜 ✅종결 / tierD=공시지연·grades파라미터 4콜 ✅종결 / all=30콜)"
         type: choice
         options:
+          - tierE
           - tierA
           - tierB
           - tierB2
           - tierB3
           - tierB4
-          - tierC
           - tierD
-          - grades
           - all
-        default: tierA
+        default: tierE
 
 jobs:
   probe:
