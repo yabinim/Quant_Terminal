@@ -521,24 +521,29 @@ def fetch_calendar_fmp(api_key: str, years, exchange: str = DEFAULT_EXCHANGE,
 
     판정 경로가 이 함수에 의존하지 않으므로, 실패해도 시스템은 규칙 계산으로
     정상 동작한다. 그래서 조용히 실패해도 안전하다.
+
+    ⚠️ fmp_http 경유가 **필수**다. 예전엔 여기서 URL 을 직접 조립해
+       requests.get 을 때렸고, diag_fmp_ssot 의 A1 기준선에 부채로 잡혀
+       있었다. 주 1회 1콜이라 부하 위험은 없었지만, fmp_http 는 레이트리밋
+       SSOT 이고 **예외 없는 SSOT 는 지킬 수 없는 SSOT** 다.
+
+    ⚠️ import 를 함수 안에 둘 것. 이 모듈은 지금도 프로젝트 모듈을 모듈
+       레벨에서 **하나도** import 하지 않는다 — 순수 규칙 계산이라 어디서
+       import 해도 비용이 0 이어야 한다. app.py 의 시장 상태 헤더가 매
+       rerun 마다 이 모듈을 쓴다.
     """
-    import requests                                  # 지연 import — 임포트 비용 회피
+    import fmp_http as fh                            # 지연 import — 임포트 비용 회피
 
     key = str(api_key or "").strip()
     if not key or not years:
         return []
     ys = sorted({int(y) for y in years})
-    url = ("https://financialmodelingprep.com/stable/holidays-by-exchange"
-           "?exchange=" + str(exchange)
-           + "&from=" + str(ys[0]) + "-01-01"
-           + "&to=" + str(ys[-1]) + "-12-31"
-           + "&apikey=" + key)
-    try:
-        r = requests.get(url, timeout=timeout)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-    except Exception:
+    path = ("holidays-by-exchange"
+            "?exchange=" + str(exchange)
+            + "&from=" + str(ys[0]) + "-01-01"
+            + "&to=" + str(ys[-1]) + "-12-31")
+    data, _status, kind = fh.fmp_get_json_ex(path, timeout=timeout, key=key)
+    if kind != "ok":
         return []
     if not isinstance(data, list):
         return []

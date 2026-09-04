@@ -498,20 +498,40 @@ def describe_compact(rank_row) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 # FMP 조회 — 자동화 전용. 표시 경로에서는 절대 호출하지 않는다.
 # ══════════════════════════════════════════════════════════════════════════
-_BASE = "https://financialmodelingprep.com/stable"
+# ⚠️ 여기에 _BASE 같은 URL 상수를 다시 두지 말 것. URL 조립은 fmp_http.fmp_url
+#    이 한다. 예전엔 이 자리에 _BASE 가 있었고 _get 이 직접 requests.get 을
+#    때렸다 — diag_fmp_ssot 의 A1 기준선에 부채로 잡혀 있던 자리다.
 
 
 def _get(path, key, timeout=20.0):
-    import requests                          # 지연 import — 임포트 비용 회피
-    sep = "&" if "?" in path else "?"
-    try:
-        r = requests.get(_BASE + "/" + path + sep + "apikey=" + str(key),
-                         timeout=timeout)
-        if r.status_code != 200:
-            return None, "HTTP " + str(r.status_code)
-        d = r.json()
-    except Exception as e:
-        return None, type(e).__name__
+    """FMP 조회. Returns: (list | None, err) — err 은 성공 시 빈 문자열.
+
+    ⚠️ fmp_http 경유가 **필수**다. 이 함수는 refresh_industry_perf --backfill
+       에서 업종 수(현재 159개)만큼 슬립 없이 연속 호출된다. 생 requests.get
+       이던 시절엔 그 159콜이 레이트리미터 밖이었고, 429 가 뜨면 즉시
+       "HTTP 429" 를 돌려줘 **그 업종 열이 통째로 유실**됐다 — 로그엔 경고
+       한 줄만 남는다. fmp_get_json_ex 는 429·5xx 를 지수 백오프로 재시도한다.
+       (402=플랜 제한은 fmp_http 가 재시도 없이 즉시 포기한다.)
+
+    ⚠️ 지연 import 를 유지할 것 — 모듈 상단으로 올리면 app.py 가
+       industry_core 를 import 하는 순간 requests 까지 딸려 온다.
+       이 파일의 의존성 정책(맨 위 독스트링)이 그것을 금지한다.
+    """
+    import fmp_http as fh                     # 지연 import — 임포트 비용 회피
+    d, status, kind = fh.fmp_get_json_ex(path, timeout=timeout, key=str(key))
+    if kind != "ok":
+        # 옛 계약 보존: 비200 은 "HTTP {코드}" 였다. 호출부는 err 의 참/거짓만
+        # 보지만(refresh_industry_perf 168·262행), 로그에 그대로 찍히므로
+        # 사람이 읽던 모양을 바꾸지 않는다.
+        # ⚠️ bad_json 을 status 보다 **먼저** 본다. 그러지 않으면 200 을 받고
+        #    본문 파싱에 실패한 경우가 로그에 "HTTP 200" 으로 찍힌다 —
+        #    성공처럼 읽히는데 데이터는 없다. 옛 구현은 여기서
+        #    "JSONDecodeError" 를 돌려줬다.
+        if kind == "bad_json":
+            return None, "BAD_JSON"
+        if status is not None:
+            return None, "HTTP " + str(status)
+        return None, {"no_key": "NO_KEY"}.get(kind, kind.upper())
     if isinstance(d, dict):
         return None, "ERRMSG"
     if not isinstance(d, list):
@@ -533,8 +553,12 @@ def fetch_snapshot(key, date_str):
 
 
 def fetch_history(key, industry, d_from, d_to):
-    import requests
-    q = requests.utils.quote(str(industry))
+    # ⚠️ requests.utils.quote 가 아니라 stdlib 를 쓴다. 그것이 이 모듈의
+    #    **마지막** requests 참조였다 — 인코딩 결과는 완전히 같다
+    #    (requests.utils.quote 자체가 urllib.parse.quote 다. 실제 업종명
+    #     'Aerospace & Defense' · 'Oil & Gas E&P' 등으로 바이트 일치 확인).
+    from urllib.parse import quote
+    q = quote(str(industry))
     d, err = _get("historical-industry-performance?industry=" + q
                   + "&from=" + str(d_from) + "&to=" + str(d_to), key)
     return (d or []), err
