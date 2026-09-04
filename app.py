@@ -3561,6 +3561,33 @@ def _yield_spread_note(spread: float, t10: float, t3m: float, source: str) -> tu
     return spread, status, note
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 매크로 지표 FMP GET — fmp_http 경유 (레이트리밋/429·402 분류 SSOT)
+# ══════════════════════════════════════════════════════════════════════════
+# ⚠️ 재시도 예산을 **여기 한 곳**에만 둔다. 12개 호출부에 복제하면 나중에
+#    하나만 바뀌어도 아무도 모른다 — fmp_extras 의 창 환산 정책과 같은 이유다.
+#
+# 왜 1회인가: 이 블록은 전부 @st.cache_data 가 붙은 **대화형 경로**다.
+#   fmp_http 기본값(3회 + 지수 백오프)을 그대로 쓰면 429 한 번에 화면이
+#   수십 초 멈춘다. 자동화 러너는 기다려도 되지만 사람은 못 기다린다.
+#   1회면 일시적 429 는 넘기고, 지속 장애면 FRED 폴백/N-A 로 빠르게 떨어진다.
+#   캐시 TTL 이 1800~3600초라 성공 한 번이면 30분~1시간 버틴다.
+#   최악 지연 ≈ 타임아웃 7초 × 2 + 백오프 2.0~3.5초.
+#
+# ⚠️ 반환 계약: fmp_get_ex 는 **200 일 때만** Response 를 준다. 402·4xx·5xx·
+#    네트워크 예외는 전부 None 이다. 그래서 호출부의 `if r.status_code == 200`
+#    은 `if r is not None` 과 정확히 같은 뜻이 된다 — 옛 동작과 완전히 동일하되
+#    None 접근으로 예외가 나지 않게 호출부에서 명시적으로 판별한다.
+_FMP_MACRO_RETRIES = 1
+
+
+def _fmp_macro_get(url: str):
+    """매크로 지표용 FMP GET. Returns: requests.Response | None (200 일 때만 non-None)."""
+    r, _st, _kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT,
+                                  retries=_FMP_MACRO_RETRIES)
+    return r
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yield_spread_latest():
     """10Y-3M 국채 금리차.
@@ -3571,11 +3598,8 @@ def fetch_yield_spread_latest():
     # ── FMP 실시간 시도 ─────────────────────────────────────────────────
     if k:
         try:
-            r = requests.get(
-                f"{_FMP_BASE}/treasury-rates?apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
+            r = _fmp_macro_get(f"{_FMP_BASE}/treasury-rates?apikey={k}")
+            if r is not None:
                 data = r.json()
                 if isinstance(data, list) and data:
                     latest = data[0]
@@ -3635,12 +3659,10 @@ def fetch_vix_latest_and_history():
             # 위해서다.** 맞추지 않으면 Fear&Greed 백분위의 분모가 소스에 따라
             # 1년/5년으로 갈린다(아래 계산이 len(_vix_s) 로 나눈다). 같은 VIX 값에
             # 다른 점수가 나오고, 어느 쪽이 맞는지 화면에는 아무 표시도 없다.
-            r = requests.get(
+            r = _fmp_macro_get(
                 f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX"
-                f"{fx.hist_range_params(400)}&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
+                f"{fx.hist_range_params(400)}&apikey={k}")
+            if r is not None:
                 data = r.json()
                 rows = data.get("historical", data) if isinstance(data, dict) else data
                 if isinstance(rows, list) and rows:
@@ -3692,12 +3714,10 @@ def fetch_wti_latest():
                     # 최신 1봉만 쓴다(rows[0], FMP 는 최신순 반환). 20달력일이면
                     # 연휴가 겹쳐도 최소 1봉은 확보된다. limit=5 는 무시되던 값이라
                     # 실제로는 5년 전체 피드(≈1,254행)를 받아 첫 행만 쓰고 버렸다.
-                    r = requests.get(
+                    r = _fmp_macro_get(
                         f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}"
-                        f"{fx.hist_range_params(20)}&apikey={k}",
-                        timeout=_FMP_TIMEOUT,
-                    )
-                    if r.status_code == 200:
+                        f"{fx.hist_range_params(20)}&apikey={k}")
+                    if r is not None:
                         d = r.json()
                         rows = d.get("historical", d) if isinstance(d, dict) else d
                         if isinstance(rows, list) and rows:
@@ -3726,11 +3746,9 @@ def _fetch_unrate_series() -> pd.Series:
     try:
         k = _fmp_key()
         if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=unemploymentRate&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
+            r = _fmp_macro_get(
+                f"{_FMP_BASE}/economic-indicators?name=unemploymentRate&apikey={k}")
+            if r is not None:
                 data = r.json()
                 if isinstance(data, list) and data:
                     df = pd.DataFrame(data)
@@ -3795,11 +3813,9 @@ def _fetch_cpi_series() -> pd.Series:
     try:
         k = _fmp_key()
         if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=CPI&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
+            r = _fmp_macro_get(
+                f"{_FMP_BASE}/economic-indicators?name=CPI&apikey={k}")
+            if r is not None:
                 data = r.json()
                 if isinstance(data, list) and data:
                     df = pd.DataFrame(data)
@@ -3880,12 +3896,10 @@ def fetch_dxy_latest_and_mean_deviation():
         if k:
             # _calc 는 rolling(252, min_periods=63).iloc[-1] 만 본다 → 구속 252봉.
             # 600달력일 ≈ 412봉으로 FRED 경로의 s.tail(400) 과 같은 깊이를 맞춘다.
-            r = requests.get(
+            r = _fmp_macro_get(
                 f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP"
-                f"{fx.hist_range_params(600)}&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
+                f"{fx.hist_range_params(600)}&apikey={k}")
+            if r is not None:
                 d = r.json()
                 rows = d.get("historical", d) if isinstance(d, dict) else d
                 if isinstance(rows, list) and rows:
@@ -4069,11 +4083,9 @@ def fetch_fed_funds_rate() -> tuple[float, str]:
     try:
         k = _fmp_key()
         if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
+            r = _fmp_macro_get(
+                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}")
+            if r is not None:
                 data = r.json()
                 if isinstance(data, list) and data:
                     rate = to_float(data[0].get("value"))
@@ -4095,11 +4107,9 @@ def _hist_fetch_fedfunds() -> pd.Series:
     try:
         k = _fmp_key()
         if k:
-            r = requests.get(
-                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
+            r = _fmp_macro_get(
+                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}")
+            if r is not None:
                 data = r.json()
                 if isinstance(data, list) and data:
                     df = pd.DataFrame(data)[["date", "value"]].copy()
@@ -4124,12 +4134,10 @@ def _hist_fetch_dxy() -> pd.Series:
         if k:
             # 아래 tail(500) 이 구속 조건 → 500봉 필요. 800달력일 ≈ 549봉.
             # FRED 경로도 tail(500) 이라 두 소스의 차트 길이가 같아진다.
-            r = requests.get(
+            r = _fmp_macro_get(
                 f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP"
-                f"{fx.hist_range_params(800)}&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
+                f"{fx.hist_range_params(800)}&apikey={k}")
+            if r is not None:
                 d = r.json()
                 rows = d.get("historical", d) if isinstance(d, dict) else d
                 if isinstance(rows, list) and rows:
@@ -4199,11 +4207,9 @@ def fetch_fmp_economic_indicator(name: str) -> tuple[float, float, str]:
     if not k:
         return np.nan, np.nan, ""
     try:
-        r = requests.get(
-            f"{_FMP_BASE}/economic-indicators?name={name}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code != 200:
+        r = _fmp_macro_get(
+            f"{_FMP_BASE}/economic-indicators?name={name}&apikey={k}")
+        if r is None:
             return np.nan, np.nan, ""
         data = r.json()
         if not isinstance(data, list) or not data:
@@ -4223,11 +4229,8 @@ def fetch_fmp_market_risk_premium() -> tuple[float, str]:
     if not k:
         return np.nan, "FMP API 키 없음"
     try:
-        r = requests.get(
-            f"{_FMP_BASE}/market-risk-premium?apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code != 200:
+        r = _fmp_macro_get(f"{_FMP_BASE}/market-risk-premium?apikey={k}")
+        if r is None:
             return np.nan, "데이터 없음"
         data = r.json()
         if not isinstance(data, list) or not data:
@@ -4268,11 +4271,9 @@ def fetch_fmp_economic_calendar_risk() -> tuple[list, bool]:
         today = datetime.now(_MARKET_ET_TZ).date()  # 시장 기준일 = 미 동부시간
         from_date = (today - timedelta(days=2)).strftime("%Y-%m-%d")
         to_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
-        r = requests.get(
-            f"{_FMP_BASE}/economic-calendar?from={from_date}&to={to_date}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code != 200:
+        r = _fmp_macro_get(
+            f"{_FMP_BASE}/economic-calendar?from={from_date}&to={to_date}&apikey={k}")
+        if r is None:
             return [], False
         data = r.json()
         if not isinstance(data, list):
