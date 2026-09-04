@@ -49,7 +49,6 @@ import concurrent.futures
 import hashlib
 import json
 import os
-import random
 import sys
 import threading
 import time
@@ -68,6 +67,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
 
 import fmp_extras as fx  # noqa: E402  — 후보 풀 SSOT
 import fmp_http as fh    # noqa: E402  — FMP 레이트리밋/429 SSOT
+import gs_retry as gsr   # noqa: E402  — Sheets 재시도 SSOT
 
 # ── 환경 ──────────────────────────────────────────────────────────────────────
 FMP_API_KEY      = os.environ.get("FMP_API_KEY", "")
@@ -905,49 +905,22 @@ def print_factor_summary(win_label: str, results: dict) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # Google Sheets 기록
 # ══════════════════════════════════════════════════════════════════════════════
-_GS_MAX_ATTEMPTS = 6
-_GS_BACKOFF = (2, 4, 8, 16, 32, 60)
-_GS_RETRY_STATUS = {429, 500, 502, 503, 504}
-
-
-def _gs_is_transient(exc) -> bool:
-    import requests
-    if isinstance(exc, (requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout,
-                        requests.exceptions.ChunkedEncodingError)):
-        return True
-    code = None
-    resp = getattr(exc, "response", None)
-    if resp is not None:
-        code = getattr(resp, "status_code", None)
-    if code is None:
-        try:
-            a0 = exc.args[0]
-            if isinstance(a0, dict):
-                code = int((a0.get("error") or {}).get("code") or a0.get("code"))
-        except Exception:
-            code = None
-    return code is not None and int(code) in _GS_RETRY_STATUS
-
-
+# 2026-09-04: `_gs_is_transient` + `_gs` 구현 55줄을 gs_retry.py 로 위임했다.
+# run_signal_backtest.py 에 거의 같은 55줄이 또 있었고 gs_retry 와도 정책이
+# 겹쳤다 — 같은 로직 세 벌. 자세한 배경은 gs_retry.py 의 '재시도 프로파일' 절.
+#
+# 예산 62초는 유지한다(PROFILE_BATCH). 이 진단은 유니버스 전체를 훑은 뒤
+# 마지막에 Satellite_Backtest 시트에 쓰므로, 그 한 번의 실패가 런 전체를
+# 무효로 만든다. gs_retry 기본값 22초는 알림 경로용이라 여기 맞지 않는다.
+#
+# ⚠️ 의도적 변경 1건: 상태를 못 읽는 예외(google.auth TransportError,
+#    ssl.SSLError, RemoteDisconnected 등)를 이전에는 재시도하지 않고 죽였다.
+#    이제 gs_retry 정책에 따라 재시도한다 — 버그 수정이다.
+#
+# 호출부 11곳은 무변경.
 def _gs(fn, *args, **kwargs):
-    import gspread
-    last = None
-    for attempt in range(_GS_MAX_ATTEMPTS):
-        try:
-            return fn(*args, **kwargs)
-        except (gspread.exceptions.SpreadsheetNotFound,
-                gspread.exceptions.WorksheetNotFound):
-            raise
-        except Exception as exc:  # noqa: BLE001
-            if not _gs_is_transient(exc) or attempt == _GS_MAX_ATTEMPTS - 1:
-                raise
-            last = exc
-            wait = _GS_BACKOFF[min(attempt, len(_GS_BACKOFF) - 1)]
-            wait += random.uniform(0, wait * 0.25)
-            print(f"[WARN] Sheets 일시 오류 — {wait:.1f}초 후 재시도: {exc}", flush=True)
-            time.sleep(wait)
-    raise last
+    """gspread 호출 재시도 래퍼 (gs_retry SSOT · 배치 프로파일)."""
+    return gsr.call(fn, *args, _profile=gsr.PROFILE_BATCH, **kwargs)
 
 
 def _safe_append_rows(ws, rows, ncols: int) -> None:
@@ -1377,6 +1350,8 @@ def main() -> int:
     print("   3) 이 룰의 실거래 기록은 아직 없다 — 리밸런싱 로그가 과거 실계좌와 겹쳐 보여도")
     print("      그건 검증이 아니다. 진짜 대조는 앞으로 쌓일 주차 기록으로만 가능하다.")
     print("   → 절대 수익률이 아니라 '조건 간 상대 비교'만 신뢰할 것.")
+    # gs_retry 위임 확인용 — 이 줄이 없으면 gs_retry.py 락스텝 업로드 누락.
+    print("[GS] " + gsr.stats_line())
     print(f"[DONE] {time.time() - t0:.0f}초 소요")
     print("=" * 108)
     return 0

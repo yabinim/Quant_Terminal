@@ -118,7 +118,6 @@ import os
 import sys
 import json
 import time
-import random
 import concurrent.futures
 import hashlib
 from datetime import datetime
@@ -133,6 +132,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import regime_core as rc  # noqa: E402
 import fmp_http as fh     # noqa: E402
 import fmp_extras as fx   # noqa: E402
+import gs_retry as gsr    # noqa: E402  Sheets 재시도 SSOT
 #   ⚠️ v2.9: 조회 창(봉수 → 달력일) 환산 정책은 fmp_extras 가 유일 소유자다.
 #      여기서 0.6871 이나 창 상수를 복제하면 정책이 두 벌이 되고, 한쪽만
 #      갱신됐을 때 창이 조용히 짧아진다 — 그 실패는 에러 로그를 남기지 않는다.
@@ -984,60 +984,31 @@ def build_result_rows(agg: dict, run_date: str, hist_start: str, hist_end: str,
 # I/O — FMP 데이터 / Google Sheets (자동화 전용)
 # ════════════════════════════════════════════════════════════════════════════
 
-# ── Sheets 일시 장애 재시도 (v1.3) ────────────────────────────────────────────
-_GS_MAX_ATTEMPTS = 6
-_GS_BACKOFF      = (2, 4, 8, 16, 32, 60)   # 초 — 누적 최대 약 2분
-_GS_RETRY_STATUS = {429, 500, 502, 503, 504}
-
-
-def _gs_is_transient(exc) -> bool:
-    """재시도할 가치가 있는 예외인가? (인증/권한/부재 오류는 재시도 무의미)"""
-    import requests
-    if isinstance(exc, (requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout,
-                        requests.exceptions.ChunkedEncodingError)):
-        return True
-    code = None
-    resp = getattr(exc, "response", None)
-    if resp is not None:
-        code = getattr(resp, "status_code", None)
-    if code is None:
-        # gspread APIError 는 args[0] 에 dict 를 담기도 한다
-        try:
-            a0 = exc.args[0]
-            if isinstance(a0, dict):
-                code = int((a0.get("error") or {}).get("code") or a0.get("code"))
-        except Exception:
-            code = None
-    if code is None:
-        return False
-    return int(code) in _GS_RETRY_STATUS
-
-
+# ── Sheets 일시 장애 재시도 (v1.4 — gs_retry SSOT 위임) ───────────────────────
+# 2026-09-04 까지 이 자리에는 `_gs_is_transient` + `_gs` 구현 55줄이 있었고,
+# diag_satellite_backtest.py 에 거의 같은 55줄이 또 있었다. 둘 다 gs_retry.py 와
+# 정책이 겹쳤다 — 같은 로직 세 벌.
+#
+# 합치되 **예산은 지킨다.** 이 스크립트는 몇 시간치 FMP 수집이 끝난 맨 마지막에
+# 시트에 쓴다. 그 한 번이 실패하면 런 전체가 날아가므로 62초를 기다릴 값어치가
+# 있다. gs_retry 의 기본값 22초는 5PM 알림 경로용이라 여기 맞지 않는다.
+# → PROFILE_BATCH 가 이전 `_gs` 의 값(6시도 · 2/4/8/16/32초 · 지터 25%)을
+#   그대로 들고 있다. diag_gs_retry.py G2 가 초 단위로 대조한다.
+#
+# ⚠️ 통합하면서 **한 가지가 의도적으로 바뀌었다.** 이전 `_gs_is_transient` 는
+#    HTTP 상태를 못 읽는 예외를 재시도하지 않았다(requests 예외 3종만 이름으로
+#    잡았다). 그래서 google.auth TransportError · ssl.SSLError ·
+#    RemoteDisconnected 가 오면 **재시도 없이 런이 죽었다.** gs_retry 는 이런
+#    예외를 네트워크 계열로 보고 재시도한다(실패 방향이 안전하다).
+#    정책 변경이 아니라 버그 수정이다.
+#
+# 호출부 16곳은 한 글자도 바뀌지 않는다 — 이 별칭이 시그니처를 그대로 받는다.
 def _gs(fn, *args, **kwargs):
-    """gspread 호출 재시도 래퍼. 일시 오류만 지수 백오프 + 지터로 재시도.
+    """gspread 호출 재시도 래퍼 (gs_retry SSOT · 배치 프로파일).
 
     사용: _gs(gc.open, TITLE) / _gs(ws.get_all_values) / _gs(ws.update, rows, range_name=...)
     """
-    import gspread
-    last = None
-    for attempt in range(_GS_MAX_ATTEMPTS):
-        try:
-            return fn(*args, **kwargs)
-        except gspread.exceptions.SpreadsheetNotFound:
-            raise                                  # 영구 오류 — 재시도 무의미
-        except gspread.exceptions.WorksheetNotFound:
-            raise
-        except Exception as exc:                   # noqa: BLE001
-            if not _gs_is_transient(exc) or attempt == _GS_MAX_ATTEMPTS - 1:
-                raise
-            last = exc
-            wait = _GS_BACKOFF[min(attempt, len(_GS_BACKOFF) - 1)]
-            wait += random.uniform(0, wait * 0.25)  # 지터 — 동시 재시도 충돌 완화
-            print(f"[WARN] Sheets 일시 오류({type(exc).__name__}) — "
-                  f"{wait:.1f}초 후 재시도 {attempt + 1}/{_GS_MAX_ATTEMPTS - 1}: {exc}", flush=True)
-            time.sleep(wait)
-    raise last  # 도달 불가(방어)
+    return gsr.call(fn, *args, _profile=gsr.PROFILE_BATCH, **kwargs)
 
 
 def get_gspread_client():
@@ -1588,6 +1559,9 @@ def main():
     except Exception as e:
         print(f"[WARN] 왕복 결과 저장 실패(본 결과는 저장됨): {e}")
 
+    # gs_retry 위임이 실제로 살아 있는지 배포 직후 눈으로 확인하는 줄이다.
+    # 이 줄이 안 보이면 gs_retry.py 락스텝 업로드가 빠진 것이다.
+    print("[GS] " + gsr.stats_line())
     print(f"[DONE] {time.time() - t0:.1f}s")
     return 0
 
