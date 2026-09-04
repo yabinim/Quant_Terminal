@@ -40,6 +40,7 @@ import os as _os
 import random as _random
 import threading as _threading
 import time as _time
+from typing import NamedTuple as _NamedTuple
 
 SSOT_VERSION = "2026-08-13a"
 
@@ -68,6 +69,67 @@ GS_BACKOFF_BASE = 1.5     # 초. 1.5 → 3 → 6 → 12 (+지터)
 GS_BACKOFF_CAP = 20.0
 
 RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 재시도 프로파일 (2026-09-04)
+# ══════════════════════════════════════════════════════════════════════════
+# 왜 프로파일이 필요한가
+# ──────────────────────
+# run_signal_backtest.py 와 diag_satellite_backtest.py 는 이 모듈과 **거의 같은**
+# 재시도 래퍼(`_gs` / `_gs_is_transient`)를 각자 복사해 갖고 있었다. 지우고
+# gsr.call 로 기계적으로 치환하면 재시도 예산이 **62초 → 22초로 조용히 줄어든다.**
+#
+# 그 62초는 우연이 아니다. 백테스트는 몇 시간치 FMP 수집이 끝난 **맨 마지막에**
+# 시트에 쓴다. 그 한 번의 쓰기가 실패하면 런 전체가 날아간다. 반대로 이 모듈의
+# 기본 22초는 5PM 알림 경로용이고, 거기서는 늦는 것 자체가 실패다.
+# **예산 차이는 유지해야 할 설계 결정이지 정리 대상이 아니다.**
+#
+# 그래서 구현을 하나로 합치되 정책은 호출부가 고르게 한다. 중복은 사라지고
+# 차이는 한 줄 선언으로 눈에 보이게 남는다.
+#
+# 통합하면서 **의도적으로 바꾼 것 하나**
+# ────────────────────────────────────
+# 백테스트 쪽 `_gs_is_transient` 는 HTTP 상태를 못 읽는 예외를 **재시도하지 않았다**
+# (`code is None → False`). requests 의 ConnectionError/Timeout/ChunkedEncodingError
+# 세 종류만 이름으로 잡았다. 그래서 `google.auth.exceptions.TransportError`,
+# `ssl.SSLError`, `http.client.RemoteDisconnected` 같은 것들이 오면
+# **재시도 없이 런이 죽었다.** 이 모듈의 `_retryable` 은 반대로 보수적 재시도를
+# 택한다(실패 방향이 안전하다). 통합 후에는 이 모듈 정책을 따른다 —
+# 정책 선택이 아니라 저쪽 버그를 고치는 것이다.
+class RetryProfile(_NamedTuple):
+    """재시도 정책 묶음. 스케줄과 지터가 따로 놀지 않도록 한 덩어리로 묶는다."""
+    retries: int            # None 이면 GS_MAX_RETRIES
+    backoff: tuple          # 고정 대기 스케줄(초). 비어 있으면 기하 백오프
+    jitter_frac: float      # 0 이면 균등 0~1.0초, >0 이면 대기의 그 비율만큼
+    name: str
+
+
+# 백테스트 프로파일 — 이전 `_gs` 의 값을 **그대로** 옮겼다.
+#   시도 6회(재시도 5) · 2→4→8→16→32초 · 지터 대기의 0~25%  ≒ 총 예산 62초
+BATCH_BACKOFF = (2, 4, 8, 16, 32, 60)
+PROFILE_BATCH = RetryProfile(retries=5, backoff=BATCH_BACKOFF,
+                             jitter_frac=0.25, name="batch")
+
+
+def _wait_for(attempt: int, backoff: tuple, jitter_frac: float) -> float:
+    """attempt(0-based) 회차의 대기 시간(초).
+
+    ⚠️ backoff 가 비고 jitter_frac 이 0 이면 **2026-09-04 이전 공식과 완전히
+       동일하다** — 같은 식, 같은 난수 호출 횟수. 기존 소비자 7개
+       (run_earnings_watch · refresh_market_calendar · refresh_industry_perf ·
+       backfill_insider_stats · diag_earnings_batchwrite 등)의 동작이
+       한 톨도 바뀌면 안 된다.
+    """
+    if backoff:
+        wait = float(backoff[min(attempt, len(backoff) - 1)])
+    else:
+        wait = min(GS_BACKOFF_BASE * (2 ** attempt), GS_BACKOFF_CAP)
+    if jitter_frac and jitter_frac > 0:
+        wait += _random.uniform(0, wait * jitter_frac)
+    else:
+        wait += _random.uniform(0, 1.0)
+    return wait
 
 _lock = _threading.Lock()
 _stats = {"ok": 0, "retries": 0, "recovered": 0, "gave_up": 0,
@@ -106,13 +168,28 @@ def _retryable(exc) -> bool:
     return st in RETRYABLE_STATUS
 
 
-def call(fn, *args, _retries: int = None, _label: str = "", **kwargs):
+def call(fn, *args, _retries: int = None, _label: str = "",
+         _profile: "RetryProfile" = None, **kwargs):
     """gspread 호출을 재시도로 감싼다. 마지막 시도도 실패하면 예외를 그대로 올린다.
 
-    _retries: 기본 GS_MAX_RETRIES. 0 이면 재시도 없음.
+    _retries: 기본 GS_MAX_RETRIES(또는 _profile.retries). 0 이면 재시도 없음.
+              명시하면 프로파일보다 우선한다.
     _label  : 로그용 이름(생략 가능).
+    _profile: RetryProfile. None 이면 기존 기본 정책(기하 백오프 · 22초 예산).
+              장시간 배치는 PROFILE_BATCH 를 넘긴다.
+
+    ⚠️ _profile=None 경로는 2026-09-04 이전과 **동작이 동일해야 한다.**
+       diag_gs_retry.py 의 G1~G3 가 대기열을 초 단위로 대조해 이를 못 박는다.
     """
-    n = GS_MAX_RETRIES if _retries is None else max(0, int(_retries))
+    prof = _profile
+    backoff = tuple(prof.backoff) if prof is not None else ()
+    jitter = float(prof.jitter_frac) if prof is not None else 0.0
+    if _retries is not None:
+        n = max(0, int(_retries))
+    elif prof is not None and prof.retries is not None:
+        n = max(0, int(prof.retries))
+    else:
+        n = GS_MAX_RETRIES
     name = _label or getattr(fn, "__name__", "gs_call")
 
     for attempt in range(n + 1):
@@ -130,8 +207,7 @@ def call(fn, *args, _retries: int = None, _label: str = "", **kwargs):
                     else:
                         _stats["fatal"] += 1
                 raise
-            wait = min(GS_BACKOFF_BASE * (2 ** attempt), GS_BACKOFF_CAP)
-            wait += _random.uniform(0, 1.0)
+            wait = _wait_for(attempt, backoff, jitter)
             with _lock:
                 _stats["retries"] += 1
                 _stats["wait_sec"] += wait

@@ -10,13 +10,30 @@
 import re
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from urllib.parse import urlencode
 
+# ⚠️ requests 는 **RSS 폴백 전용**이다(_rss_news_fallback). FMP 호출에 쓰면
+#    아키텍처 불변식 위반이고 diag_fmp_ssot.py 의 A1 래칫이 실패한다.
+#    (다른 모듈들은 전환 후 `import requests` 자체를 지워 재발을 임포트 단계에서
+#     막았지만, 이 파일은 RSS 때문에 임포트를 남길 수밖에 없다 — 대신 아래
+#     `_FMP_BASE` 상수를 삭제해 같은 역할을 하게 했다. 주석 참조.)
 import requests
 import feedparser
 import pytz
 
+# FMP HTTP SSOT — 레이트리밋 · 429/5xx 재시도 · URL 조립. 키는 호출자가 인자로
+# 넘긴 값을 그대로 전달한다(app: st.secrets, 자동화: 환경변수) — 이 파일이
+# 키 출처를 알지 않는다는 기존 불변식은 유지된다.
+import fmp_http as fh
+
 _ET = pytz.timezone("America/New_York")
-_FMP_BASE = "https://financialmodelingprep.com/stable"
+
+# ⚠️ `_FMP_BASE` 상수는 2026-09-04 에 **의도적으로 삭제**했다.
+#    이 파일의 FMP 호출 2곳(_fmp_news_fetch · _fmp_validate_symbols_ex)이
+#    fmp_http 로 넘어가면서 미사용이 됐는데, 단순 정리가 아니라 **재발 방지
+#    장치**다. 원시 requests 호출을 되살리려면 상수를 다시 만들거나 URL 을
+#    하드코딩해야 하고, 둘 다 A1 탐지기가 즉시 잡는다.
+#    (RSS 때문에 `import requests` 를 지울 수 없으므로 이것이 그 대체물이다.)
 
 
 def _clean_news_text(raw_text, max_len: int = 0) -> str:
@@ -32,15 +49,22 @@ def _clean_news_text(raw_text, max_len: int = 0) -> str:
 
 
 def _fmp_news_fetch(endpoint: str, params: dict, fmp_key: str, timeout: int = 8) -> list:
-    """FMP 뉴스 API 단일 호출 래퍼."""
+    """FMP 뉴스 API 단일 호출 래퍼. (fmp_http SSOT 경유 — 레이트리밋 · 429 재시도)
+
+    반환 계약은 전환 전과 동일하다: 성공 시 list, 그 외 전부 [].
+    실패를 [] 로 뭉개는 것이 여기서는 안전하다 — 호출부가 3개 레이어를 합치고
+    전 레이어 0건이면 RSS 폴백으로 넘어가기 때문이다.
+
+    ⚠️ `limit` 은 **뉴스 엔드포인트의 파라미터**다. historical-price-eod 가
+       limit 을 조용히 무시한다는 사실(§7)은 이 경로와 무관하다.
+    """
     if not fmp_key:
         return []
     try:
-        p = {**params, "apikey": fmp_key}
-        r = requests.get(f"{_FMP_BASE}/{endpoint}", params=p, timeout=timeout)
-        if r.status_code != 200:
-            return []
-        data = r.json()
+        ep = str(endpoint or "").lstrip("/")
+        qs = urlencode({k: v for k, v in (params or {}).items()})
+        path = f"{ep}?{qs}" if qs else ep
+        data = fh.fmp_get_json(path, timeout=timeout, key=fmp_key)
         return data if isinstance(data, list) else []
     except Exception:
         return []
@@ -565,12 +589,20 @@ def _fmp_validate_symbols_ex(symbols, fmp_key: str, timeout: int = 8):
     import concurrent.futures as _cf
 
     def _one(s):
+        # fmp_http 의 (data, status, kind) 3원 반환이 이 함수의 3상태 계약과
+        # 정확히 대응한다:
+        #   kind=="ok"  → HTTP 200 + JSON 파싱 성공 → 아래에서 존재/부재 판정
+        #   그 외 전부  → 보류(None). rate_limited(429 재시도 소진) ·
+        #                 plan_limited(402) · http_error · exception · bad_json ·
+        #                 no_key 가 모두 여기 들어온다.
+        # ⚠️ 전환 전에는 429 한 번이면 곧장 보류였고, 보류는 '유지'이므로
+        #    **fake 티커가 그대로 살아남았다** — 이 함수가 막으려던 바로 그것.
+        #    이제 fmp_http 가 429/5xx 를 백오프 재시도로 흡수한 뒤에야 보류가 된다.
         try:
-            r = requests.get(f"{_FMP_BASE}/quote",
-                             params={"symbol": s, "apikey": fmp_key}, timeout=timeout)
-            if r.status_code != 200:
-                return s, None  # 일시 실패 → 보류
-            d = r.json()
+            d, _status, kind = fh.fmp_get_json_ex(
+                f"quote?symbol={s}", timeout=timeout, key=fmp_key)
+            if kind != "ok":
+                return s, None  # 일시 실패/플랜제한/키없음 → 보류
             if isinstance(d, list):
                 if not d:
                     return s, False  # 200+빈 = 존재하지 않음(fake)
@@ -587,7 +619,7 @@ def _fmp_validate_symbols_ex(symbols, fmp_key: str, timeout: int = 8):
                     return s, True  # 행이 있으면 존재로 간주
             return s, None
         except Exception:
-            return s, None  # 타임아웃/커넥션 → 보류
+            return s, None  # 방어 — fmp_http 가 예외를 삼키지만 계약은 유지
 
     valid, got_any = set(), False
     try:
