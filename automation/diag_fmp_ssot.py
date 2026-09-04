@@ -172,17 +172,35 @@ _RAW_GET_BASELINE = {
     #   전환 이유는 스타일이 아니다: fmp_price_history 가 429 를 조용히 삼키면
     #   빈 DataFrame 이 돌아가고, 그러면 실적 갭 표본이 줄어든 것이 "종목 이력이
     #   짧다"와 **구분되지 않는다.** 예상 변동폭 confidence 가 조용히 강등된다.
-    "industry_core.py": 1,
+    # industry_core.py 는 2026-09-04 에 1곳 전환됐다(1 → 0). `_BASE` 상수와
+    #   `import requests` 를 **둘 다** 지웠다 — fetch_history 가 쓰던
+    #   requests.utils.quote 도 urllib.parse.quote 로 바꿨다. 되살리려면
+    #   임포트를 다시 추가하거나 URL 을 하드코딩해야 하고 둘 다 이 탐지기가 잡는다.
+    #   기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
+    #   ⚠️ 전환 이유는 스타일이 아니다. 이건 **부하 결함**이었다:
+    #   refresh_industry_perf --backfill 이 `for nm in names` 로 업종 수(159)
+    #   만큼 **슬립 없이** _get 을 부르는데 그 전부가 레이트리미터 밖이었다.
+    #   그리고 429 가 뜨면 즉시 "HTTP 429" 를 돌려줘 그 업종이 empty 로 빠진다
+    #   — **Industry_Perf 시트의 열 하나가 통째로 유실되는데 로그엔 경고 한 줄
+    #   뿐이다.** 와이드 포맷이라 열 유실은 그 업종의 전 기간 이력 손실이다.
     "diag_earnings_preview_backtest.py": 1,
     "diag_industry_mapping.py": 1,
     # ── 2026-08-27 신규 노출 (강화된 탐지기가 처음 본 것들 · 코드 변경 아님) ──
     # 전부 `url = FMP_BASE + … + "apikey=" + KEY` → `requests.get(url)` 모양이라
     # 이전 탐지기가 통째로 놓쳤다. 이제 보이므로 기준선에 명시해 부채로 남긴다.
     #
-    # ⚠️ calendar_core 는 **코어 모듈**이다(진단이 아니다). holidays-by-exchange
-    #    호출로, refresh_market_calendar 가 주말마다 타는 경로다. 429 재시도가
-    #    없어 실패하면 캘린더가 조용히 낡는다 — 우선 정리 대상.
-    "calendar_core.py": 1,
+    # calendar_core.py 는 2026-09-04 에 1곳 전환됐다(1 → 0). 위 주석이
+    #   "우선 정리 대상"이라고 적어둔 그 항목이다. URL 하드코딩과
+    #   `import requests` 를 둘 다 지웠다 — 되살리려면 임포트를 다시 추가하거나
+    #   URL 을 하드코딩해야 하고 둘 다 이 탐지기가 잡는다.
+    #   기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
+    #   ⚠️ 부하는 주 1회 1콜이라 위험이 없었다. 그런데도 고친 이유는 이 파일이
+    #   **코어 모듈**이기 때문이다 — 예외를 허용하는 SSOT 는 지킬 수 없는
+    #   SSOT 다. 실패 시 조용히 [] 를 돌려주는 계약은 그대로 유지했다.
+    #   ⚠️ import 는 **함수 안**에 있다. calendar_core 는 프로젝트 모듈을 모듈
+    #   레벨에서 하나도 import 하지 않는다 — app.py 의 시장 상태 헤더가 매
+    #   rerun 마다 이 모듈을 타는 핫 패스라 임포트 비용이 0 이어야 한다.
+    #   모듈 상단으로 올리면 그 제약이 깨진다.
     "diag_fmp_endpoints.py": 1,
     "diag_fmp_newcaps.py": 1,
     "diag_industry_momentum.py": 1,
