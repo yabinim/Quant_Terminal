@@ -3733,7 +3733,7 @@ def fetch_wti_latest():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_unrate_series() -> pd.Series:
-    """UNRATE — FRED 1순위, FMP unemploymentRate 2순위."""
+    """UNRATE — FRED 전용. (FMP 폴백은 2026-09-04 삭제, 아래 주석 참조.)"""
     # FRED
     try:
         s = fred.get_series("UNRATE")
@@ -3742,25 +3742,14 @@ def _fetch_unrate_series() -> pd.Series:
             return s
     except Exception:
         pass
-    # FMP economic-indicators
-    try:
-        k = _fmp_key()
-        if k:
-            r = _fmp_macro_get(
-                f"{_FMP_BASE}/economic-indicators?name=unemploymentRate&apikey={k}")
-            if r is not None:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    df = pd.DataFrame(data)
-                    if "date" in df.columns and "value" in df.columns:
-                        df = df[["date", "value"]].copy()
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        s = pd.to_numeric(df["value"], errors="coerce").dropna()
-                        if len(s) >= 5:
-                            return s
-    except Exception:
-        pass
+    # ⚠️ FMP 폴백을 **삭제했다**(2026-09-04). 되살리지 말 것.
+    #    여기 있던 `economic-indicators?name=unemploymentRate` 분기는 채택
+    #    임계값이 5건이었는데, FMP 가 창을 90일로 절단하므로 한 응답에 들어가는
+    #    월초는 **최소 2 · 최대 4개**다. 임계값 5는 구조적으로 도달 불가 —
+    #    즉 이 분기는 배포 이래 **단 한 번도 채택된 적이 없다.** 매 로드마다
+    #    FMP 콜만 하나 쓰고 결과를 버렸다.
+    #    임계값을 낮추는 것도 답이 아니다. 2~4점짜리 실업률 시계열로는
+    #    12개월 최저·3개월 평균(샴 근접)을 계산할 수 없다.
     return pd.Series(dtype=float)
 
 
@@ -3800,7 +3789,7 @@ def evaluate_unemployment_sahm_series():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_cpi_series() -> pd.Series:
-    """CPIAUCSL — FRED 1순위, FMP CPI 2순위."""
+    """CPIAUCSL — FRED 전용. (FMP 폴백은 2026-09-04 삭제, 아래 주석 참조.)"""
     # FRED
     try:
         s = fred.get_series("CPIAUCSL")
@@ -3809,25 +3798,12 @@ def _fetch_cpi_series() -> pd.Series:
             return s
     except Exception:
         pass
-    # FMP economic-indicators (name=CPI)
-    try:
-        k = _fmp_key()
-        if k:
-            r = _fmp_macro_get(
-                f"{_FMP_BASE}/economic-indicators?name=CPI&apikey={k}")
-            if r is not None:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    df = pd.DataFrame(data)
-                    if "date" in df.columns and "value" in df.columns:
-                        df = df[["date", "value"]].copy()
-                        df["date"] = pd.to_datetime(df["date"])
-                        df = df.set_index("date").sort_index()
-                        s = pd.to_numeric(df["value"], errors="coerce").dropna()
-                        if len(s) >= 5:
-                            return s
-    except Exception:
-        pass
+    # ⚠️ FMP 폴백을 **삭제했다**(2026-09-04). 되살리지 말 것.
+    #    `economic-indicators?name=CPI` 분기는 채택 임계값이 5건이었는데,
+    #    FMP 가 창을 90일로 절단하므로 한 응답의 월초는 최소 2 · 최대 4개다.
+    #    임계값 5는 구조적으로 도달 불가 — 배포 이래 한 번도 채택된 적이 없다.
+    #    임계값을 낮춰도 소용없다. CPI YoY 는 13개월 전 값이 필요한데
+    #    90일 창으로는 어떤 조합으로도 1년 전을 못 가져온다.
     return pd.Series(dtype=float)
 
 
@@ -4062,7 +4038,7 @@ def fetch_earnings_calendar_smart(tickers: tuple) -> list[dict]:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fed_funds_rate() -> tuple[float, str]:
     """현재 기준금리.
-    1순위: FRED FEDFUNDS  2순위: FMP federalFundsRate
+    1순위: FRED FEDFUNDS  2순위: FMP federalFunds
     """
     def _fed_note(rate: float) -> str:
         if rate >= 5.0:
@@ -4079,12 +4055,17 @@ def fetch_fed_funds_rate() -> tuple[float, str]:
                 return rate, _fed_note(rate)
     except Exception:
         pass
-    # FMP federalFundsRate
+    # FMP federalFunds
     try:
         k = _fmp_key()
         if k:
+            # ⚠️ 이름은 `federalFunds` 다. 예전엔 `federalFundsRate` 였는데
+            #    그건 **무효 이름**이다 — 2026-09-04 프로브에서 확실한 무효
+            #    이름(__NOPE__)과 **완전히 같이** 행동했다(둘 다 status=200 인데
+            #    본문이 JSON 이 아니라 파싱 실패). 200 이 오니까 아무도 못 봤고,
+            #    FRED 가 1순위라 이 폴백이 한 번도 성공한 적이 없다.
             r = _fmp_macro_get(
-                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}")
+                f"{_FMP_BASE}/economic-indicators?name=federalFunds&apikey={k}")
             if r is not None:
                 data = r.json()
                 if isinstance(data, list) and data:
@@ -4107,8 +4088,12 @@ def _hist_fetch_fedfunds() -> pd.Series:
     try:
         k = _fmp_key()
         if k:
+            # ⚠️ `federalFundsRate` 는 무효 이름이었다(위 fetch_fed_funds_rate
+            #    주석 참조). 고쳐도 이 폴백은 **열화 상태**다: FMP 의 90일 창
+            #    때문에 2~4점만 온다. tail(24) 는 24개월을 기대하지만 24점을
+            #    받을 방법이 없다. FRED 가 살아 있는 한 여기는 안 탄다.
             r = _fmp_macro_get(
-                f"{_FMP_BASE}/economic-indicators?name=federalFundsRate&apikey={k}")
+                f"{_FMP_BASE}/economic-indicators?name=federalFunds&apikey={k}")
             if r is not None:
                 data = r.json()
                 if isinstance(data, list) and data:
@@ -4198,11 +4183,63 @@ def fetch_macro_history_series() -> dict:
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 경제 지표 — FRED 1순위, FMP economic-indicators 2순위
+# ══════════════════════════════════════════════════════════════════════════
+# ⚠️ FMP `economic-indicators` 는 **창을 90일로 강제 절단한다.** 문서에 없는
+#    동작이고, 2026-09-04 프로브 15개 관측이 전부 이 규칙 하나로 설명됐다:
+#      from+to →  to 에서 뒤로 90일 (from 은 무시된다)
+#      from 만 →  from 에서 앞으로 90일
+#      둘 다 X →  2025-09-02~2025-12-01 (FMP 쪽 고정 기본값 — 낡았다)
+#
+#    결과: 3년 창을 줘도 90일만 온다. 그래서
+#      · 분기 지표(GDP)  — 분기 시작일 간격이 90·91·92일이라 90일 창에는
+#        **최대 1개**만 들어간다. QoQ 는 한 번의 호출로 **구조적으로 불가능**하다.
+#        창 튜닝 문제가 아니라 산술이다. realGDP 도 같다(무창 1건).
+#      · 월별 지표       — 월초가 최소 2 · 최대 4개. MoM 은 되기도 하고
+#        안 되기도 한다(발표 지연에 따라). 2026-09-04 실측에서 소매판매는
+#        1건이었다 — 2026-06-01 이 창 시작(06-06)보다 5일 앞서 잘렸다.
+#
+# 그래서 FRED 를 1순위로 둔다. 이 변경은 **순수 가산**이다: FRED 가 죽으면
+# 아래 FMP 경로가 그대로 돌아 예전 동작으로 떨어진다. 회귀 위험이 없다.
+#
+# ⚠️ 값이 다르면 매핑이 틀린 것이다. FMP 실측값(2026-09-04):
+#      GDP         2025-10-01  31422.526   (명목 GDP, 10억 달러, SAAR)
+#      retailSales 2026-07-01  660047      (소매+외식 총액, 100만 달러)
+#    FRED GDP / RSAFS 는 같은 BEA·Census 원자료라 값이 맞아야 한다.
+#    화면 숫자가 크게 튀면 시리즈 ID 를 의심할 것.
+_ECON_FRED_SERIES = {
+    "GDP": "GDP",                 # 명목 GDP, 분기, 10억 달러 SAAR
+    "realGDP": "GDPC1",           # 실질 GDP, 분기, 2017년 연쇄 10억 달러
+    "retailSales": "RSAFS",       # 소매+외식 총액, 월별, 100만 달러 SA
+    "unemploymentRate": "UNRATE",
+    "CPI": "CPIAUCSL",
+    "federalFunds": "FEDFUNDS",
+}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fmp_economic_indicator(name: str) -> tuple[float, float, str]:
-    """FMP Economic Indicators API — (latest_val, prev_val, date_str).
-    name 예: 'GDP', 'retailSales', 'unemploymentRate', 'consumerConfidence'
+    """경제 지표 — (latest_val, prev_val, date_str).
+
+    이름은 FMP 표기를 그대로 받는다('GDP', 'retailSales', …). 함수명에 fmp 가
+    남아 있는 것은 호출부 호환 때문이고, 실제로는 FRED 가 1순위다.
     """
+    # ── FRED 1순위 — 전체 시계열이 오므로 prev 가 항상 잡힌다.
+    #    FMP 는 90일 창 때문에 분기 지표의 prev 를 절대 못 준다(위 주석 참조).
+    sid = _ECON_FRED_SERIES.get(name)
+    if sid:
+        try:
+            s = fred.get_series(sid)
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            if len(s) >= 2:
+                return (float(s.iloc[-1]), float(s.iloc[-2]),
+                        str(s.index[-1].date()))
+        except Exception:
+            pass
+
+    # ── FMP 2순위 — 예전 동작 그대로. FRED 가 죽었을 때의 안전망이다.
+    #    분기 지표는 여기서 prev 가 NaN 이 되는 게 정상이다(90일 창 한계).
     k = _fmp_key()
     if not k:
         return np.nan, np.nan, ""
