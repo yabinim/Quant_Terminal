@@ -47,15 +47,14 @@ diag_fmp_endpoints.py 와 무엇이 다른가
     dividends-calendar                 DRIP 예정 배당 사전 파악
     mergers-acquisitions-latest        보유·워치 종목 M&A 이벤트
 
-  tierC (4콜) — 탐색적 신규 기능
-    senate-latest / house-latest       역방향 조기 발굴 (현재는 종목별 조회만)
-    institutional-ownership/holder-performance-summary
-    historical-industry-pe
+  tierC (4콜) — 탐색적 신규 기능   ★ 2026-08-22 실행 완료 · 실행 그룹 삭제됨
+  grades (3콜) — 등급 중복 확인    ★ 콜 없이 종결 · 실행 그룹 삭제됨
+    두 그룹의 판정은 아래 §7 블록에 기록돼 있다. 다시 돌릴 이유가 없다.
 
-  grades (3콜) — 미결 과제 정리
-    grades / grades-consensus / ratings-snapshot 의 **필드 집합을 나란히 출력**한다.
-    "grades?symbol= 가 기존 등급 엔드포인트와 겹치는가"는 지난 감사의 미검토
-    잔여 건이다. 응답 키를 직접 비교하는 것이 가장 빠른 답이다.
+  tierE (1콜) — tierC 의 유일한 잔여분
+    historical-industry-pe             tierC 는 90일을 요청해 90일을 받았다.
+                                       그건 깊이를 못 잰 것이다(tierB3 와 동일한
+                                       요청값 종속 함정). 7년을 요청해 다시 잰다.
 
 안전성
 ──────
@@ -75,10 +74,13 @@ fmp_get 은 402/429 를 삼키고 None 을 돌려주는데, 프로브는 **원�
     PROBE_TIER=tierB2  5콜   ← tierB 후속 확인
     PROBE_TIER=tierB3  3콜   ← B-1 설계 직전 (이력 깊이 + 분류명 전체)
     PROBE_TIER=tierB4  3콜   ← tierB3 의 깊이 판정 재측정 (요청값 종속 착오 교정)
-    PROBE_TIER=tierC   4콜
     PROBE_TIER=tierD   4콜   ← 공시 지연 실측 + grades 파라미터 지원
-    PROBE_TIER=grades  3콜
-    PROBE_TIER=all    32콜
+    PROBE_TIER=tierE   1콜   ← 업종 PER 이력 깊이 (tierC 잔여분)
+    PROBE_TIER=all    30콜
+
+⚠️ all 은 5+9+5+3+3+4+1 = 30 이다. **이 숫자를 손으로 세지 마라.** 실행하면
+   헤더에 `호출 N콜` 이 찍히는데 그게 len() 으로 계산된 진짜 값이다. 과거에
+   docstring 32 · yml 주석 32 · yml 입력설명 36 으로 세 군데가 갈렸다.
 
 실행
 ────
@@ -101,7 +103,10 @@ _KEY = str(os.environ.get("FMP_API_KEY", "") or "").strip()
 
 _TIER = str(os.environ.get("PROBE_TIER", "") or "tierA").strip().lower()
 if _TIER not in ("tiera", "tierb", "tierb2", "tierb3", "tierb4",
-                 "tierc", "tierd", "grades", "all"):
+                 "tierd", "tiere", "all"):
+    # ⚠️ 낡은 yml 이 tierC / grades 를 보내면 여기서 조용히 tierA 로 떨어진다.
+    #    그 상태로도 5콜이 나가고 로그 헤더에는 `티어: tiera` 가 찍힌다 —
+    #    "왜 업종 PER 결과가 없지"의 원인이 되므로 헤더를 반드시 확인할 것.
     _TIER = "tiera"
 
 
@@ -447,34 +452,82 @@ TIER_B4 = [
     ),
 ]
 
-TIER_C = [
+# ══════════════════════════════════════════════════════════════════════════
+# §7 Tier C — 2026-08-22 00:28 UTC 실행 완료. **실행 그룹을 삭제했다.**
+# ══════════════════════════════════════════════════════════════════════════
+# 4콜 전부 판정이 났다. 드롭다운에 남겨두면 닫힌 질문에 콜이 나간다.
+# 판정만 남긴다 — 재검토 금지.
+#
+#   senate-latest?page=0&limit=10          ✅ 200 · 10건 · symbol 있음
+#   house-latest?page=0&limit=10           ✅ 200 · 10건 · symbol 있음
+#     → 경로는 살아 있지만 **tierD 가 전제를 무너뜨렸다.**
+#        상원 지연 중앙값 572일 / 하원 27일 · 7일 이내 3%.
+#        VERDICT_2026-08-22_congress_trades_terminated.md · app.py:21546.
+#        "최신 피드가 온다"는 판별력이 없었다 — 45일 늦은 것도 최신 피드다.
+#
+#   institutional-ownership/holder-performance-summary   🔒 402
+#     → 경로는 맞고 플랜에 미포함. 코드로 해결되지 않는다. 영구 제외.
+#
+#   historical-industry-pe                 ✅ 200 · 65건
+#     응답 키: date, exchange, industry, pe
+#     from=today-90d 로 65건 → 90 캘린더일 ≈ 62 거래일이므로 **from/to 가
+#     실제로 먹는다**(grades 와 정반대다). 범위 통제는 여기서 통과했다.
+#     ⚠️ 그러나 **깊이는 재지 못했다.** 90일을 요청해 90일을 받은 것뿐이다.
+#        → tierE 로 이월. 이 파일에서 유일하게 열려 있는 질문이다.
+#
+# ══════════════════════════════════════════════════════════════════════════
+# §7 grades 그룹 — **콜 없이 종결.** 실행 그룹을 삭제했다.
+# ══════════════════════════════════════════════════════════════════════════
+# 원래 질문: "grades?symbol= 가 기존 등급 엔드포인트와 겹치는가" (3콜 예정).
+# 답이 이미 손에 있었다. 콜을 쓸 필요가 없었다.
+#
+#   grades            키: action, date, gradingCompany, newGrade,
+#                         previousGrade, symbol      ← tierD 로그(2026-08-22)
+#   grades-consensus  키: strongBuy, buy, hold, sell, strongSell,
+#                         consensus, symbol          ← app.py:8428 / 21200 파싱부
+#   ratings-snapshot  이미 **제거 완료**. 호출 0건이고 diag_analyst_congress
+#                     A-1 이 래칫으로 잠그고 있다. 비교 대상 자체가 없다.
+#
+# 판정: 겹치는 필드는 `symbol` 뿐이다. **중복이 아니다** —
+#   grades 는 등급 변경 **이벤트 로그**, grades-consensus 는 **현재 스냅샷
+#   집계**다. 축이 다르다.
+#
+# 실사용 제약(tierD 실측): grades 는 limit 도 from/to 도 무시한다. 종목당
+#   전체 이력이 통으로 온다(AAPL 1787건). **워치리스트 전체 적용 불가.**
+#   단일 종목 온디맨드 1콜은 기술적으로 가능하나 그건 신규 기능이지
+#   이 프로브의 잔여 과제가 아니다.
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Tier E — tierC 의 유일한 잔여분 (2026-09-03, 1콜)
+# ══════════════════════════════════════════════════════════════════════════
+# tierC 가 90일을 요청해 90일을 받았다. tierB3 와 **같은 함정**이다:
+# 요청한 날짜부터 데이터가 왔다는 것은 한도를 못 쟀다는 뜻이지 한도가 그
+# 값이라는 뜻이 아니다. 형제 엔드포인트(historical-industry-performance)가
+# 7.0년인 것도 근거가 안 된다 — 형제로 추론하지 않는다는 게 §7 교훈이다.
+#
+# 판별자: min(date) − 요청 from  (render_depth_req)
+#   ≈ 0  → 한도 미도달. 확보된 폭이 얼마인지만 알 수 있다
+#   ≫ 0  → 한도 발견. min(date) 가 실제 상한이다
+#
+# 사전 확정 기준 (결과를 보고 고치지 않는다):
+#   확보 폭 5년 이상 → 데이터는 쓸 만하다. **기록 후 보류**
+#   5년 미만        → 종결. 학습창에 2022 하락장이 안 들어온다
+#
+# ⚠️ ✅ 가 나와도 자동 착공이 아니다. 기능화하려면 industry_core 와 같은
+#    구조가 필요하다: 일회성 백필 149콜 + 새 와이드 시트 + 일일 유지콜
+#    (`industry-pe-snapshot` 존재 여부 **미확인** — 없으면 매일 149콜이라
+#    유지 불가). 게다가 형제 신호인 업종 모멘텀은 2026-09-01 롤링
+#    워크포워드에서 6창 중 1창으로 부결됐다. 착공은 별도 판단이다.
+TIER_E = [
     (
-        "상원 거래 최신 피드",
-        "senate-latest?page=0&limit=10",
-        "현재는 종목별 조회만 쓴다. 최신 피드는 역방향 조기 발굴 입력이 된다.",
-        ["symbol"],
+        "업종 PER 시계열 — 이력 깊이 실측",
+        "historical-industry-pe?industry=Semiconductors&from="
+        + _D_FROM_7Y + "&to=" + _D_TO,
+        "tierC 의 90일 요청은 깊이를 못 쟀다. 7년을 요청해 상한을 찾는다.",
+        ["date", "industry", "pe"],
         None,
-    ),
-    (
-        "하원 거래 최신 피드",
-        "house-latest?page=0&limit=10",
-        "위와 동일.",
-        ["symbol"],
-        None,
-    ),
-    (
-        "기관 보유자 성과 요약",
-        "institutional-ownership/holder-performance-summary?cik=0001067983&page=0",
-        "'성과 좋은 기관이 사는가'로 필터링. cik 은 버크셔(예시).",
-        ["cik"],
-        None,
-    ),
-    (
-        "업종 PER 시계열",
-        "historical-industry-pe?industry=Semiconductors&from=" + _D_FROM_90 + "&to=" + _D_TO,
-        "업종 밸류에이션의 시계열 위치. 현재는 섹터 스냅샷만 있다.",
-        ["date", "industry"],
-        None,
+        "depth_req",
     ),
 ]
 
@@ -541,31 +594,7 @@ TIER_D = [
 ]
 
 
-# 미결 과제 — 등급 계열 3종의 필드 집합을 나란히 본다.
-GRADES = [
-    (
-        "등급 (미검토 잔여 건)",
-        "grades?symbol=AAPL",
-        "지난 감사에서 200(1786건) 확인됐으나 기존 등급 엔드포인트와의 "
-        "중복 여부가 미검토 상태다.",
-        ["symbol"],
-        None,
-    ),
-    (
-        "등급 컨센서스 (현재 사용 중)",
-        "grades-consensus?symbol=AAPL",
-        "app.py 에서 이미 사용. 비교 기준.",
-        ["symbol"],
-        None,
-    ),
-    (
-        "등급 스냅샷 (현재 사용 중)",
-        "ratings-snapshot?symbol=AAPL",
-        "app.py 에서 이미 사용. 비교 기준.",
-        ["symbol"],
-        None,
-    ),
-]
+# GRADES 그룹은 2026-09-03 에 삭제했다. 판정은 위 §7 블록에 있다(콜 0으로 종결).
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1107,15 +1136,15 @@ def main():
     run_b2 = _TIER in ("tierb2", "all")
     run_b3 = _TIER in ("tierb3", "all")
     run_b4 = _TIER in ("tierb4", "all")
-    run_c = _TIER in ("tierc", "all")
     run_d = _TIER in ("tierd", "all")
-    run_g = _TIER in ("grades", "all")
+    run_e = _TIER in ("tiere", "all")
 
+    # ⚠️ 콜 수는 len() 으로만 센다. 주석에 적어둔 숫자를 믿지 말 것 —
+    #    2026-09-03 이전에 docstring 32 · yml 주석 32 · yml 설명 36 이 갈렸다.
     ncalls = (len(TIER_A) if run_a else 0) + (len(TIER_B) if run_b else 0) \
         + (len(TIER_B2) if run_b2 else 0) + (len(TIER_B3) if run_b3 else 0) \
         + (len(TIER_B4) if run_b4 else 0) \
-        + (len(TIER_C) if run_c else 0) + (len(TIER_D) if run_d else 0) \
-        + (len(GRADES) if run_g else 0)
+        + (len(TIER_D) if run_d else 0) + (len(TIER_E) if run_e else 0)
 
     print("=" * 78)
     print("FMP 미사용 엔드포인트 실측 프로브 — 신규 기능 후보")
@@ -1139,13 +1168,12 @@ def main():
     if run_b4:
         run_group("Tier B4 — 이력 깊이 재측정 (tierB3 의 요청값 종속 판정 교정)",
                   TIER_B4, results)
-    if run_c:
-        run_group("Tier C — 탐색적 신규 기능", TIER_C, results)
     if run_d:
         run_group("Tier D — 공시 지연 실측 + grades 파라미터 지원",
                   TIER_D, results)
-    if run_g:
-        run_group("등급 계열 중복 확인 — 필드 집합 비교", GRADES, results)
+    if run_e:
+        run_group("Tier E — 업종 PER 이력 깊이 (tierC 잔여분)",
+                  TIER_E, results)
 
     # ── 최종 판정 ────────────────────────────────────────────────────────
     live, fields, empty, plan, dead, unk = [], [], [], [], [], []
