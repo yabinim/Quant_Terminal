@@ -133,9 +133,22 @@ _RAW_GET_BASELINE = {
     # 2026-08-27: 58 → 63. 코드가 늘어난 게 아니라 **탐지기가 눈을 떴다**
     # (`_fmp_url_names` 가 변수에 담긴 URL 까지 추적). 실제 부채는 처음부터 63 이었다.
     # 2026-08-28: 63 → 62. _fmp_price_history_robust 를 fh.fmp_get_ex 로 위임했다.
-    #   나머지 62곳은 @st.cache_data 대화형 경로다 — 한 번에 손대면 회귀 위험이
+    # 2026-09-04: 62 → 50. **매크로 지표 블록 12곳**을 `_fmp_macro_get` 으로
+    #   전환했다(treasury-rates · ^VIX · WTI · unemploymentRate · CPI · UUP×2 ·
+    #   federalFundsRate×2 · economic-indicators · market-risk-premium ·
+    #   economic-calendar). 함수당 정확히 1곳뿐인 것만 골라 호출 간 상호작용을
+    #   피했다 — compute_daily_risk_gauge(6곳) 같은 다중 호출은 남겼다.
+    #   ⚠️ 전환 이유는 스타일이 아니다. run_drg_predict 는 8-28 에 같은 매크로
+    #   지표들을 이미 전환했고 사유가 이랬다: "429 를 조용히 삼키면 '조회 실패'
+    #   한 줄만 남고 DRG 프롬프트에서 신호가 통째로 빠진다." **app.py 는 그
+    #   지표를 화면에 그리는 반쪽인데 여태 생 호출이었다.** SSOT 방향이
+    #   app.py → automation 인데 automation 만 고쳐져 있던 자리다.
+    #   FRED 폴백이 없는 함수(_fetch_cpi_series 등)는 429 가 곧 N/A 였다.
+    #   ⚠️ 재시도 예산은 `_FMP_MACRO_RETRIES = 1` 한 곳에만 있다. 대화형 경로라
+    #   fmp_http 기본값 3회를 쓰면 화면이 멈춘다 — 호출부 12곳에 복제 금지.
+    #   나머지 50곳은 @st.cache_data 대화형 경로다 — 한 번에 손대면 회귀 위험이
     #   크므로 계속 래칫으로 조인다(인수인계 §6-B5).
-    "app.py": 62,
+    "app.py": 50,
     # run_drg_predict.py 는 2026-08-28 에 11곳 전부 fmp_http 로 전환됐다(11 → 0).
     #   requests 임포트 자체를 지웠다 — 되살리려면 임포트를 다시 추가해야 한다.
     #   기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
