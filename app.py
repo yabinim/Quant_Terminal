@@ -3562,12 +3562,19 @@ def _yield_spread_note(spread: float, t10: float, t3m: float, source: str) -> tu
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 매크로 지표 FMP GET — fmp_http 경유 (레이트리밋/429·402 분류 SSOT)
+# 대화형(UI) 경로 전용 FMP GET — fmp_http 경유 (레이트리밋/429·402 분류 SSOT)
 # ══════════════════════════════════════════════════════════════════════════
-# ⚠️ 재시도 예산을 **여기 한 곳**에만 둔다. 12개 호출부에 복제하면 나중에
+# ⚠️ 이름이 예전엔 `_fmp_macro_get` 이었다(2026-09-04 개명). 근거가 "매크로"가
+#    아니라 **"대화형"** 이라서 바꿨다 — 아래 재시도 1회의 이유를 읽어보면
+#    매크로 지표와 아무 상관이 없다. 이름이 좁으면 다음 사람이 대화형 경로에
+#    또 생 requests.get 을 단다. 실제로 grades-consensus 블록 두 개가 정확히
+#    그렇게 생겼다(21237 은 캐시도 없이 매 rerun 마다 나갔다).
+#    **대화형 경로에서 FMP 를 부를 일이 생기면 여기를 쓴다.**
+#
+# ⚠️ 재시도 예산을 **여기 한 곳**에만 둔다. 호출부에 복제하면 나중에
 #    하나만 바뀌어도 아무도 모른다 — fmp_extras 의 창 환산 정책과 같은 이유다.
 #
-# 왜 1회인가: 이 블록은 전부 @st.cache_data 가 붙은 **대화형 경로**다.
+# 왜 1회인가: 호출부가 전부 @st.cache_data 가 붙은 **대화형 경로**다.
 #   fmp_http 기본값(3회 + 지수 백오프)을 그대로 쓰면 429 한 번에 화면이
 #   수십 초 멈춘다. 자동화 러너는 기다려도 되지만 사람은 못 기다린다.
 #   1회면 일시적 429 는 넘기고, 지속 장애면 FRED 폴백/N-A 로 빠르게 떨어진다.
@@ -3578,13 +3585,13 @@ def _yield_spread_note(spread: float, t10: float, t3m: float, source: str) -> tu
 #    네트워크 예외는 전부 None 이다. 그래서 호출부의 `if r.status_code == 200`
 #    은 `if r is not None` 과 정확히 같은 뜻이 된다 — 옛 동작과 완전히 동일하되
 #    None 접근으로 예외가 나지 않게 호출부에서 명시적으로 판별한다.
-_FMP_MACRO_RETRIES = 1
+_FMP_UI_RETRIES = 1
 
 
-def _fmp_macro_get(url: str):
-    """매크로 지표용 FMP GET. Returns: requests.Response | None (200 일 때만 non-None)."""
+def _fmp_ui_get(url: str):
+    """대화형 경로용 FMP GET. Returns: requests.Response | None (200 일 때만 non-None)."""
     r, _st, _kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT,
-                                  retries=_FMP_MACRO_RETRIES)
+                                  retries=_FMP_UI_RETRIES)
     return r
 
 
@@ -3598,7 +3605,7 @@ def fetch_yield_spread_latest():
     # ── FMP 실시간 시도 ─────────────────────────────────────────────────
     if k:
         try:
-            r = _fmp_macro_get(f"{_FMP_BASE}/treasury-rates?apikey={k}")
+            r = _fmp_ui_get(f"{_FMP_BASE}/treasury-rates?apikey={k}")
             if r is not None:
                 data = r.json()
                 if isinstance(data, list) and data:
@@ -3659,7 +3666,7 @@ def fetch_vix_latest_and_history():
             # 위해서다.** 맞추지 않으면 Fear&Greed 백분위의 분모가 소스에 따라
             # 1년/5년으로 갈린다(아래 계산이 len(_vix_s) 로 나눈다). 같은 VIX 값에
             # 다른 점수가 나오고, 어느 쪽이 맞는지 화면에는 아무 표시도 없다.
-            r = _fmp_macro_get(
+            r = _fmp_ui_get(
                 f"{_FMP_BASE}/historical-price-eod/full?symbol=%5EVIX"
                 f"{fx.hist_range_params(400)}&apikey={k}")
             if r is not None:
@@ -3714,7 +3721,7 @@ def fetch_wti_latest():
                     # 최신 1봉만 쓴다(rows[0], FMP 는 최신순 반환). 20달력일이면
                     # 연휴가 겹쳐도 최소 1봉은 확보된다. limit=5 는 무시되던 값이라
                     # 실제로는 5년 전체 피드(≈1,254행)를 받아 첫 행만 쓰고 버렸다.
-                    r = _fmp_macro_get(
+                    r = _fmp_ui_get(
                         f"{_FMP_BASE}/historical-price-eod/full?symbol={sym}"
                         f"{fx.hist_range_params(20)}&apikey={k}")
                     if r is not None:
@@ -3872,7 +3879,7 @@ def fetch_dxy_latest_and_mean_deviation():
         if k:
             # _calc 는 rolling(252, min_periods=63).iloc[-1] 만 본다 → 구속 252봉.
             # 600달력일 ≈ 412봉으로 FRED 경로의 s.tail(400) 과 같은 깊이를 맞춘다.
-            r = _fmp_macro_get(
+            r = _fmp_ui_get(
                 f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP"
                 f"{fx.hist_range_params(600)}&apikey={k}")
             if r is not None:
@@ -4064,7 +4071,7 @@ def fetch_fed_funds_rate() -> tuple[float, str]:
             #    이름(__NOPE__)과 **완전히 같이** 행동했다(둘 다 status=200 인데
             #    본문이 JSON 이 아니라 파싱 실패). 200 이 오니까 아무도 못 봤고,
             #    FRED 가 1순위라 이 폴백이 한 번도 성공한 적이 없다.
-            r = _fmp_macro_get(
+            r = _fmp_ui_get(
                 f"{_FMP_BASE}/economic-indicators?name=federalFunds&apikey={k}")
             if r is not None:
                 data = r.json()
@@ -4092,7 +4099,7 @@ def _hist_fetch_fedfunds() -> pd.Series:
             #    주석 참조). 고쳐도 이 폴백은 **열화 상태**다: FMP 의 90일 창
             #    때문에 2~4점만 온다. tail(24) 는 24개월을 기대하지만 24점을
             #    받을 방법이 없다. FRED 가 살아 있는 한 여기는 안 탄다.
-            r = _fmp_macro_get(
+            r = _fmp_ui_get(
                 f"{_FMP_BASE}/economic-indicators?name=federalFunds&apikey={k}")
             if r is not None:
                 data = r.json()
@@ -4119,7 +4126,7 @@ def _hist_fetch_dxy() -> pd.Series:
         if k:
             # 아래 tail(500) 이 구속 조건 → 500봉 필요. 800달력일 ≈ 549봉.
             # FRED 경로도 tail(500) 이라 두 소스의 차트 길이가 같아진다.
-            r = _fmp_macro_get(
+            r = _fmp_ui_get(
                 f"{_FMP_BASE}/historical-price-eod/full?symbol=UUP"
                 f"{fx.hist_range_params(800)}&apikey={k}")
             if r is not None:
@@ -4244,7 +4251,7 @@ def fetch_fmp_economic_indicator(name: str) -> tuple[float, float, str]:
     if not k:
         return np.nan, np.nan, ""
     try:
-        r = _fmp_macro_get(
+        r = _fmp_ui_get(
             f"{_FMP_BASE}/economic-indicators?name={name}&apikey={k}")
         if r is None:
             return np.nan, np.nan, ""
@@ -4266,7 +4273,7 @@ def fetch_fmp_market_risk_premium() -> tuple[float, str]:
     if not k:
         return np.nan, "FMP API 키 없음"
     try:
-        r = _fmp_macro_get(f"{_FMP_BASE}/market-risk-premium?apikey={k}")
+        r = _fmp_ui_get(f"{_FMP_BASE}/market-risk-premium?apikey={k}")
         if r is None:
             return np.nan, "데이터 없음"
         data = r.json()
@@ -4308,7 +4315,7 @@ def fetch_fmp_economic_calendar_risk() -> tuple[list, bool]:
         today = datetime.now(_MARKET_ET_TZ).date()  # 시장 기준일 = 미 동부시간
         from_date = (today - timedelta(days=2)).strftime("%Y-%m-%d")
         to_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
-        r = _fmp_macro_get(
+        r = _fmp_ui_get(
             f"{_FMP_BASE}/economic-calendar?from={from_date}&to={to_date}&apikey={k}")
         if r is None:
             return [], False
@@ -7008,6 +7015,58 @@ def fetch_insider_statistics(ticker_upper: str) -> dict:
     return {}
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_grades_consensus(ticker_upper: str) -> dict:
+    """애널리스트 컨센서스(grades-consensus) — 정규화 dict. 실패 시 {}.
+
+    반환: {"sb","b","h","s","ss","tot","buy_pct","consensus"}
+          tot > 0 일 때만 채워진다. tot == 0 이면 {} 를 준다 —
+          호출부가 `if not gc:` 하나로 끝낼 수 있게.
+
+    ⚠️ 왜 함수로 뺐나 (2026-09-04):
+       예전엔 이 파싱이 **두 곳에 복제**돼 있었다. 같은 엔드포인트, 같은
+       티커(selected_ticker), 같은 5필드, 변수명만 `_sb2/_b2/…` 와
+       `_rsb/_rb/…` 로 달랐다. 둘 다 모듈 최상위의 생 requests.get 이었다.
+       그중 기관 보유 현황 뷰(구 21237)는 **@st.cache_data 도 없이 모듈
+       최상위에 있었다** — Streamlit 은 위젯을 건드릴 때마다 스크립트를
+       전부 다시 돌리므로, 사이드바 입력 한 번에 FMP 콜이 하나씩 나갔다.
+       레이트리미터 밖이었고 캐시도 없었다.
+       여기로 모으면서 셋을 한 번에 고쳤다: 캐시 · fh 경유 · 중복 제거.
+
+    ⚠️ ratings-snapshot 을 쓰지 말 것. 그건 FMP 자체 재무 점수라
+       strongBuy/buy/hold/sell/strongSell 필드가 없다 — 항상 tot=0 으로
+       떨어진다. 애널리스트 컨센서스는 grades-consensus 가 유일하다.
+       (상세 근거는 8074 주석)
+    """
+    k = _fmp_key()
+    if not k or not ticker_upper:
+        return {}
+    try:
+        r = _fmp_ui_get(
+            f"{_FMP_BASE}/grades-consensus?symbol={ticker_upper}&apikey={k}")
+        if r is None:
+            return {}
+        d = r.json()
+        # 리스트/단일 dict 양쪽을 받아준다 — 두 옛 호출부가 서로 다르게
+        # 처리하고 있었다(한쪽만 dict 폴백이 있었다). 넓은 쪽으로 통일한다.
+        gc = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+        if not gc:
+            return {}
+        sb = int(to_float(gc.get("strongBuy") or 0) or 0)
+        b = int(to_float(gc.get("buy") or 0) or 0)
+        h = int(to_float(gc.get("hold") or 0) or 0)
+        s = int(to_float(gc.get("sell") or 0) or 0)
+        ss = int(to_float(gc.get("strongSell") or 0) or 0)
+        tot = sb + b + h + s + ss
+        if tot <= 0:
+            return {}
+        return {"sb": sb, "b": b, "h": h, "s": s, "ss": ss, "tot": tot,
+                "buy_pct": round((sb + b) / tot * 100, 1),
+                "consensus": str(gc.get("consensus") or "").strip()}
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_analyst_price_targets(ticker_upper: str) -> dict:
     """애널리스트 목표주가 — FMP stable/price-target-consensus + price-target 사용."""
@@ -8460,28 +8519,15 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     analyst_buy_pct = np.nan
     analyst_label   = ""
 
-    if k_val:
-        try:
-            r_gc = requests.get(
-                f"{_FMP_BASE}/grades-consensus?symbol={ticker_upper}&apikey={k_val}",
-                timeout=_FMP_TIMEOUT
-            )
-            if r_gc.status_code == 200:
-                gc_data = r_gc.json()
-                gc = gc_data[0] if isinstance(gc_data, list) and gc_data else (gc_data if isinstance(gc_data, dict) else {})
-                if gc:
-                    sb  = to_float(gc.get("strongBuy")  or 0)
-                    b   = to_float(gc.get("buy")        or 0)
-                    h   = to_float(gc.get("hold")       or 0)
-                    s   = to_float(gc.get("sell")       or 0)
-                    ss  = to_float(gc.get("strongSell") or 0)
-                    tot = (sb or 0)+(b or 0)+(h or 0)+(s or 0)+(ss or 0)
-                    if tot > 0:
-                        bc = (sb or 0)+(b or 0)
-                        analyst_buy_pct = round(float(bc / tot * 100), 1)
-                        analyst_label = f"매수의견 {analyst_buy_pct:.0f}% ({int(bc)}/{int(tot)}명)"
-        except Exception:
-            pass
+    # 파싱은 fetch_grades_consensus 로 옮겼다(2026-09-04). 이 함수는 모듈
+    # 최상위에서 불리는데 @st.cache_data 가 없어서, 여기 있던 생 호출이
+    # **매 rerun 마다** 나갔다. 이제 헬퍼의 캐시(ttl=1800)가 받아준다.
+    # k_val 검사는 헬퍼 안에도 있어 뺐다 — k_val 은 이 함수의 다른 곳에서 쓴다.
+    _gc = fetch_grades_consensus(ticker_upper)
+    if _gc:
+        analyst_buy_pct = float(_gc["buy_pct"])
+        _bc = _gc["sb"] + _gc["b"]
+        analyst_label = f"매수의견 {analyst_buy_pct:.0f}% ({_bc}/{_gc['tot']}명)"
 
     # 거래량 비율 (최근 5일 / 3개월 평균)
     vol_ratio = np.nan
@@ -21233,41 +21279,37 @@ if st.session_state.get("logged_in"):
                             # strongBuy/buy/hold/sell/strongSell 이 없어 항상 _tot=0 으로
                             # 떨어졌고, 결국 매번 1콜을 버리고 여기로 내려왔다.
                             # (상세 근거는 8074 주석)
+                            # ⚠️ 2026-09-04: 파싱을 fetch_grades_consensus 로 옮겼다.
+                            #    여긴 모듈 최상위라 캐시가 없었다 — Streamlit 은 위젯을
+                            #    건드릴 때마다 스크립트를 다시 돌리므로 사이드바 입력
+                            #    한 번에 FMP 콜이 하나씩 나갔다. 레이트리미터 밖이었다.
                             try:
-                                _r2 = requests.get(
-                                    f"{_FMP_BASE}/grades-consensus?symbol={_tk_inst}&apikey={_k_inst}",
-                                    timeout=_FMP_TIMEOUT
-                                )
-                                if _r2.status_code == 200:
-                                    _rd2 = _r2.json()
-                                    _gc  = _rd2[0] if isinstance(_rd2, list) and _rd2 else (
-                                           _rd2 if isinstance(_rd2, dict) else {})
-                                    if _gc:
-                                        _sb2 = int(to_float(_gc.get("strongBuy")  or 0) or 0)
-                                        _b2  = int(to_float(_gc.get("buy")        or 0) or 0)
-                                        _h2  = int(to_float(_gc.get("hold")       or 0) or 0)
-                                        _s2  = int(to_float(_gc.get("sell")       or 0) or 0)
-                                        _ss2 = int(to_float(_gc.get("strongSell") or 0) or 0)
-                                        _tot2 = _sb2+_b2+_h2+_s2+_ss2
-                                        if _tot2 > 0:
-                                            _bp2 = round((_sb2+_b2)/_tot2*100, 1)
-                                            ic1, ic2, ic3 = st.columns(3)
-                                            ic1.metric("매수 의견 비율", f"{_bp2:.0f}%", f"Strong Buy {_sb2} + Buy {_b2}명")
-                                            ic2.metric("Hold", f"{_h2}명")
-                                            ic3.metric("Sell / Strong Sell", f"{_s2+_ss2}명", f"총 {_tot2}명")
-                                            # 종합 의견 배지 — grades-consensus 의 consensus 필드가
-                                            # 진짜 애널리스트 컨센서스 라벨("Buy"/"Hold" 등)이다.
-                                            # 구버전은 이 배지를 ratings-snapshot 쪽에만 달아 놨고
-                                            # 그 분기는 한 번도 실행된 적이 없다 → 배지가 영영 안 떴다.
-                                            _rlabel = str(_gc.get("consensus") or "").strip()
-                                            if _rlabel:
-                                                _col = "#16a34a" if _bp2 >= 60 else ("#f59e0b" if _bp2 >= 40 else "#dc2626")
-                                                st.markdown(
-                                                    f"<div style='background:#1e293b;border-radius:8px;padding:10px 16px;"
-                                                    f"border-left:4px solid {_col};margin-top:8px;'>"
-                                                    f"<span style='color:{_col};font-weight:700;'>📊 종합 의견: {_rlabel}</span></div>",
-                                                    unsafe_allow_html=True)
-                                            _shown = True
+                                _gc2 = fetch_grades_consensus(_tk_inst)
+                                if _gc2:
+                                    # ⚠️ tot > 0 검사는 헬퍼 안에 있다 — tot 이 0 이면
+                                    #    헬퍼가 {} 를 주므로 위 `if _gc2:` 하나로 끝난다.
+                                    #    옛 코드의 `if _gc:` + `if _tot2 > 0:` 이중 검사와
+                                    #    동일하다.
+                                    _sb2, _b2 = _gc2["sb"], _gc2["b"]
+                                    _h2, _s2, _ss2 = _gc2["h"], _gc2["s"], _gc2["ss"]
+                                    _tot2, _bp2 = _gc2["tot"], _gc2["buy_pct"]
+                                    ic1, ic2, ic3 = st.columns(3)
+                                    ic1.metric("매수 의견 비율", f"{_bp2:.0f}%", f"Strong Buy {_sb2} + Buy {_b2}명")
+                                    ic2.metric("Hold", f"{_h2}명")
+                                    ic3.metric("Sell / Strong Sell", f"{_s2+_ss2}명", f"총 {_tot2}명")
+                                    # 종합 의견 배지 — grades-consensus 의 consensus 필드가
+                                    # 진짜 애널리스트 컨센서스 라벨("Buy"/"Hold" 등)이다.
+                                    # 구버전은 이 배지를 ratings-snapshot 쪽에만 달아 놨고
+                                    # 그 분기는 한 번도 실행된 적이 없다 → 배지가 영영 안 떴다.
+                                    _rlabel = _gc2["consensus"]
+                                    if _rlabel:
+                                        _col = "#16a34a" if _bp2 >= 60 else ("#f59e0b" if _bp2 >= 40 else "#dc2626")
+                                        st.markdown(
+                                            f"<div style='background:#1e293b;border-radius:8px;padding:10px 16px;"
+                                            f"border-left:4px solid {_col};margin-top:8px;'>"
+                                            f"<span style='color:{_col};font-weight:700;'>📊 종합 의견: {_rlabel}</span></div>",
+                                            unsafe_allow_html=True)
+                                    _shown = True
                             except Exception:
                                 pass
 
@@ -21557,25 +21599,20 @@ if st.session_state.get("logged_in"):
                             _diag_tgt_high = _dan.get("target_high")
                             _diag_tgt_low  = _dan.get("target_low")
                             _diag_rec_list = [f"{r.get('기관','')}: {r.get('등급','')}" for r in _dan.get("recent",[])[:3]]
-                        _k_r = _fmp_key()
-                        if _k_r:
-                            # grades-consensus. 구버전은 ratings-snapshot 을 불렀고 폴백이
-                            # 없어서 _rt 가 늘 0 이었다 → 아래 세 변수가 영구히 ""로 남아
-                            # AI 프롬프트에 "애널리스트 매수의견:  () | 종합의견: " 처럼
-                            # 빈 필드가 나갔다. 애널리스트 컨센서스가 정밀검사에 한 번도
-                            # 들어간 적이 없다. (상세 근거는 8074 주석)
-                            _r_r = requests.get(f"{_FMP_BASE}/grades-consensus?symbol={str(selected_ticker).strip().upper()}&apikey={_k_r}", timeout=_FMP_TIMEOUT)
-                            if _r_r.status_code == 200:
-                                _rrd = _r_r.json()
-                                _rri = _rrd[0] if isinstance(_rrd, list) and _rrd else {}
-                                if _rri:
-                                    _rsb=int(to_float(_rri.get("strongBuy") or 0) or 0); _rb=int(to_float(_rri.get("buy") or 0) or 0)
-                                    _rh=int(to_float(_rri.get("hold") or 0) or 0); _rs=int(to_float(_rri.get("sell") or 0) or 0); _rss=int(to_float(_rri.get("strongSell") or 0) or 0)
-                                    _rt=_rsb+_rb+_rh+_rs+_rss
-                                    if _rt > 0:
-                                        _diag_buy_pct   = f"{round((_rsb+_rb)/_rt*100,1):.0f}%"
-                                        _diag_rat_label = str(_rri.get("consensus") or "").strip()
-                                        _diag_rat_tot   = f"{_rsb+_rb}/{_rt}명"
+                        # grades-consensus. 구버전은 ratings-snapshot 을 불렀고 폴백이
+                        # 없어서 _rt 가 늘 0 이었다 → 아래 세 변수가 영구히 ""로 남아
+                        # AI 프롬프트에 "애널리스트 매수의견:  () | 종합의견: " 처럼
+                        # 빈 필드가 나갔다. 애널리스트 컨센서스가 정밀검사에 한 번도
+                        # 들어간 적이 없다. (상세 근거는 8074 주석)
+                        # ⚠️ 2026-09-04: 파싱을 fetch_grades_consensus 로 옮겼다.
+                        #    같은 엔드포인트·같은 티커를 파싱하는 코드가 이 파일에
+                        #    **세 벌** 있었다(여기 · 기관 보유 뷰 · calculate_style_scores).
+                        #    변수명만 달랐다. 이제 한 곳이다.
+                        _gc3 = fetch_grades_consensus(str(selected_ticker).strip().upper())
+                        if _gc3:
+                            _diag_buy_pct   = f"{_gc3['buy_pct']:.0f}%"
+                            _diag_rat_label = _gc3["consensus"]
+                            _diag_rat_tot   = f"{_gc3['sb'] + _gc3['b']}/{_gc3['tot']}명"
                     except Exception:
                         pass
 
