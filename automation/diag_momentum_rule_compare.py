@@ -37,11 +37,31 @@ diff 가 남는다.
       근거 셋: (a) 25년 문헌(9섹터 ETF, 12M/1M 롱온리)에서 4종목 이상이 샤프
       우위, (b) 4년 구간은 Top1/Top5 차이를 검출할 검정력이 없다(2σ 한계
       ≈ 연 12%p), (c) 손실 방어 우선이라는 계좌 원칙과 정면 충돌.
-  T6  QQQ/VOO/SPY 대비는 **출력 전용**. 후보 풀이 2026년에 사람이 고른 목록이라
-      과거로 돌리면 미래를 아는 풀이다. 절대 비교는 무효 — 판정에 쓰지 않는다.
+  T6  QQQ/VOO/SPY/MTUM 대비는 **출력 전용**. 후보 풀이 2026년에 사람이 고른
+      목록이라 과거로 돌리면 미래를 아는 풀이다. 절대 비교는 무효 — 판정에
+      쓰지 않는다. 단 **한 방향으로는** 읽을 수 있다: 위로 부풀린 우리 숫자가
+      그래도 MTUM 에 진다면, 매주 순위를 확인하고 교체하는 작업 자체가
+      값을 못 한다는 뜻이다.
+  T7  [2026-09-05 추가] 위험조정 12-0 이 12-0 을 대체 ——
+      (mom12_0_ra, top5_eq) 가 (mom12_0, top5_eq) 를 **6창 중 5창 이상**
+      샤프 우위. 임계를 T1/T2 의 4/6 이 아니라 5/6 으로 올린 이유: 12-0 은
+      이제 사실상 현직이고, 후보를 늘리면서 문턱을 그대로 두면 결국 뭐 하나는
+      걸린다. 근거는 데이터가 아니라 **MTUM(MSCI) 방법론**이라는 외부 출처다.
+      ⚠️ mom12_1_ra 는 **판정에 쓰지 않는다**(반증용 · 아래 참조).
 
-⚠️ 비교는 **지정된 짝**끼리만 한다. 21개 설정 중 최고를 뽑는 짓은 하지 않는다.
-   4년 강세장에 21번 질문하면 QQQ 를 이기는 설정은 반드시 나온다.
+⚠️ 비교는 **지정된 짝**끼리만 한다. 설정 중 최고를 뽑는 짓은 하지 않는다.
+   4년 강세장에 수십 번 질문하면 QQQ 를 이기는 설정은 반드시 나온다.
+
+⚠️ T1~T4 는 2026-09-05 실행으로 **판정이 끝났다**(T1·T2 통과, T3·T4 미달).
+   룰을 추가해도 그 결과가 달라지면 안 된다. 그래서 T1~T4 는 RULES 가 아니라
+   **VERDICT_RULES(동결)** 만 본다. _selftest 가 이걸 회귀로 강제한다.
+
+반증용 룰이라는 것에 대해
+─────────────────────────
+mom12_1_ra 는 T7 에 들어가지 않는다. 역할은 하나다 — 위험조정이 12-0 에서만
+듣고 12-1 에서는 반대로 나오면, 그건 '위험조정에 효과가 있다'가 아니라 '이 4년
+구간의 잡음'이라는 신호다. 즉 이 열은 **확신을 낮출 수만 있고 높일 수는 없다.**
+T7 이 통과했는데 mom12_1_ra 가 12-1 보다 나쁘면, 통과를 액면대로 받지 말 것.
 
 
 이 진단이 답할 수 없는 것 (구조적 한계 — 실행 전에 읽을 것)
@@ -87,7 +107,14 @@ GSPREAD_KEY_JSON = os.environ.get("GSPREAD_KEY", "")
 _RESULT_WORKSHEET = "Momentum_Rule_Compare"
 
 # ── 축 정의 ──────────────────────────────────────────────────────────────────
-RULES = ("blend", "mom12_1", "mom12_0")
+# 그리드에 도는 전체 룰. 여기에 추가해도 T1~T4 판정은 움직이지 않는다.
+RULES = ("blend", "mom12_1", "mom12_0", "mom12_0_ra", "mom12_1_ra")
+
+# ⚠️ 동결. T1~T4 는 2026-09-05 실행으로 판정이 끝났고, 그 판정은 이 세 룰만
+#    본 결과다. 나중에 룰을 더 얹었다고 T4("세 룰 전부 5/6")의 분모가 5로
+#    늘어나면 이미 종결된 항목의 결과가 소급해서 바뀐다. 그건 재협상이다.
+#    새 룰은 T7 처럼 **별도 항목**으로 붙이지 이 튜플에 넣지 않는다.
+VERDICT_RULES = ("blend", "mom12_1", "mom12_0")
 
 # (이름, 슬롯, swap모드, 가중스킴키 or None)
 #
@@ -123,7 +150,11 @@ FIXED_FREQ = "weekly"
 FIXED_MKTFILTER = "none"
 FIXED_SELLRULE = "top5"
 
-BENCH = ("SPY", "QQQ", "VOO")     # VOO 추가 — 질문이 "QQQ나 VOO보다 나은가" 였다.
+# MTUM = iShares MSCI USA Momentum Factor. 위험조정 6M/12M 모멘텀(직전 1개월
+# 스킵)으로 개별주를 고르는 ETF — 즉 **모멘텀을 기성품으로 사는 경우**다.
+# QQQ 보다 날카로운 대조군이다: QQQ 에 지는 건 "성장주를 샀어야 했나" 지만
+# MTUM 에 지는 건 "이 일을 왜 하나" 다.
+BENCH = ("SPY", "QQQ", "VOO", "MTUM")
 
 # ── 워크포워드 창 ────────────────────────────────────────────────────────────
 WF_WINDOWS = 6            # item B(산업 모멘텀)와 같은 모양으로 맞춘다
@@ -140,7 +171,15 @@ _RESULT_COLS = [
     "Trades", "Swaps", "WinRate_Pct", "Turnover_x", "MaxW_Peak_Pct",
     "SPY_Ret_Pct", "QQQ_Ret_Pct", "VOO_Ret_Pct",
     "Warmup_Bars", "Universe_Hash",
+    # ⚠️ 신규 열은 **맨 뒤**에만 붙인다. VOO 뒤에 끼워 넣으면 기존 126행의
+    #    Warmup_Bars/Universe_Hash 값이 한 칸씩 밀려 새 헤더와 어긋난다.
+    #    보기 순서보다 과거 행의 정합성이 우선이다.
+    "MTUM_Ret_Pct",
 ]
+
+# 벤치 티커 → 시트 열 이름. 위 '맨 뒤' 규칙 때문에 순서가 BENCH 와 다르다.
+_BENCH_COL = {"SPY": "SPY_Ret_Pct", "QQQ": "QQQ_Ret_Pct",
+              "VOO": "VOO_Ret_Pct", "MTUM": "MTUM_Ret_Pct"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -283,13 +322,30 @@ def verdicts(results: dict) -> list:
     for slots, tier_v, eq_v in ((3, "top3_tier_rb", "top3_eq_rb"),
                                 (5, "top5_tier_rb", "top5_eq_rb")):
         details, all_ok = [], True
-        for rule in RULES:
+        for rule in VERDICT_RULES:          # ⚠️ RULES 아님 — 위 동결 사유 참조
             p = pairwise(results, (rule, tier_v), (rule, eq_v))
             good = p["n"] > 0 and p["wins"] >= 5
             all_ok &= good
             details.append(f"{rule}:{p['wins']}/{p['n']}")
         out.append((f"T4-{slots}", f"Top{slots} 차등 가중이 균등을 대체", all_ok,
                     " · ".join(details) + " (임계: 세 룰 전부 5/6)"))
+
+    # T7 — 위험조정 12-0 이 12-0 을 대체. 임계 5/6 (T1/T2 보다 높다).
+    if ("mom12_0_ra", BASE_VARIANT) in results:
+        p7 = pairwise(results, ("mom12_0_ra", BASE_VARIANT),
+                      ("mom12_0", BASE_VARIANT))
+        ok7 = p7["n"] > 0 and p7["wins"] >= 5
+        # 반증 열 — 판정에 안 들어가지만 통과를 액면대로 받을지 판단에 쓴다.
+        p7c = pairwise(results, ("mom12_1_ra", BASE_VARIANT),
+                       ("mom12_1", BASE_VARIANT))
+        note = (f"샤프 {p7['wins']}/{p7['n']}창 우위 (임계 5/6) · "
+                f"평균차 {p7['mean_delta']:+.3f}")
+        if p7c["n"]:
+            same_dir = (p7c["wins"] >= 4) if ok7 else True
+            note += (f"  ‖ [반증·판정제외] 위험조정이 12-1 에도 듣는가: "
+                     f"{p7c['wins']}/{p7c['n']}창"
+                     f"{'' if same_dir else ' ← 방향 불일치, 통과를 액면대로 받지 말 것'}")
+        out.append(("T7", "위험조정 12-0 이 12-0 을 대체", ok7, note))
 
     return out
 
@@ -315,6 +371,8 @@ def print_summary(results: dict, windows: list, idx: pd.DatetimeIndex) -> None:
             key = (rule, vname)
             mark = " ★" if vname == BASE_VARIANT and rule == "blend" else ""
             mark = " ✋" if vname in EXCLUDED_FROM_VERDICT else mark
+            if rule == "mom12_1_ra":
+                mark = (mark or "") + " ⊘"          # 반증용 — 어떤 판정에도 없음
             print(f"{rule:<10}{vname + mark:<15}"
                   f"{_f(mean_metric(results, key, 'total_ret'), 1):>9}"
                   f"{_f(mean_metric(results, key, 'cagr'), 1):>9}"
@@ -324,7 +382,8 @@ def print_summary(results: dict, windows: list, idx: pd.DatetimeIndex) -> None:
                   f"{_f(mean_metric(results, key, 'turnover'), 2):>8}"
                   f"{_f(mean_metric(results, key, 'maxw_peak'), 1):>11}")
         print("-" * 112)
-    print("★ = 현행 실제 운용 · ✋ = 사전 배제(T5, 판정에 쓰지 않음)")
+    print("★ = 현행 실제 운용 · ✋ = 사전 배제(T5) · ⊘ = 반증 전용(어떤 판정에도 없음)")
+    print("⚠️ 룰이 다르면 점수 단위도 다르다(*_ra 는 % 가 아니라 비율). 순위에만 쓸 것.")
 
     bench = results.get("_bench") or {}
     line = "  ".join(
@@ -385,6 +444,12 @@ def print_verdicts(vs: list) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # 시트 기록
 # ══════════════════════════════════════════════════════════════════════════════
+def _bench_ret(bench: dict, tk: str, k: int, n_win: int) -> float:
+    row = (bench.get(tk) or [{}] * n_win)
+    m = row[k - 1] if k - 1 < len(row) else {}
+    return round((m or {}).get("total_ret", float("nan")), 2)
+
+
 def build_rows(results: dict, windows: list, idx: pd.DatetimeIndex,
                warmup: int, uhash: str) -> list:
     run_date = datetime.now(_ET).strftime("%Y-%m-%d")
@@ -407,9 +472,10 @@ def build_rows(results: dict, windows: list, idx: pd.DatetimeIndex,
                     round(m.get("win", float("nan")), 1),
                     round(m.get("turnover", float("nan")), 2),
                     round(m.get("maxw_peak", float("nan")), 1),
-                    *[round(((bench.get(b) or [{}] * len(windows))[k - 1] or {})
-                            .get("total_ret", float("nan")), 2) for b in BENCH],
+                    *[_bench_ret(bench, b, k, len(windows))
+                      for b in ("SPY", "QQQ", "VOO")],
                     warmup, uhash,
+                    _bench_ret(bench, "MTUM", k, len(windows)),   # 맨 뒤 규칙
                 ])
     return rows
 
@@ -606,13 +672,114 @@ def _selftest() -> int:
     if any(c == "T3" and ok for c, _, ok, _ in verdicts(r)):
         fails.append("T3 이 MDD 악화(-25% vs -10%)에도 통과함")
 
+    # 11) [회귀 · 최우선] RULES 에 룰을 더 얹어도 T1~T4 판정이 **바뀌지 않는가**.
+    #     2026-09-05 실행으로 T1·T2 통과 / T3·T4 미달이 확정됐다. 그 결과가
+    #     나중 룰 추가로 소급해서 흔들리면 사전 커밋 자체가 무의미해진다.
+    #     VERDICT_RULES 동결이 실제로 그 역할을 하는지 여기서 강제한다.
+    def _mk_full(extra_rules):
+        # ⚠️ 데이터를 이렇게 만드는 게 핵심이다. 동결 룰 3개에서는 차등이
+        #    균등을 6/6 으로 이기고(→ T4 통과), 추가 룰에서는 0/6 이다(→ 5룰을
+        #    순회하면 T4 탈락). 모든 룰을 동점으로 두면 T4 가 어느 쪽이든
+        #    False 라서 이 테스트가 **공허하게 통과**한다 — 변이 테스트에서
+        #    실제로 그 상태였다.
+        r = {}
+        for rule in tuple(VERDICT_RULES) + tuple(extra_rules):
+            frozen = rule in VERDICT_RULES
+            for vn, *_ in VARIANTS:
+                sh = 2.0 if (frozen and "tier" in vn) else 1.0
+                r[(rule, vn)] = [{"sharpe": sh, "mdd": -10.0} for _ in range(6)]
+        r[("mom12_1", BASE_VARIANT)] = [{"sharpe": 2.0, "mdd": -10.0} for _ in range(6)]
+        r["_bench"] = {b: [{}] * 6 for b in BENCH}
+        return r
+    base_v = {c: ok for c, _, ok, _ in verdicts(_mk_full(()))
+              if c.startswith(("T1", "T2", "T3", "T4"))}
+    ext_v = {c: ok for c, _, ok, _ in verdicts(_mk_full(("mom12_0_ra", "mom12_1_ra")))
+             if c.startswith(("T1", "T2", "T3", "T4"))}
+    if base_v != ext_v:
+        fails.append(f"룰 추가로 T1~T4 판정이 바뀜: {base_v} → {ext_v} "
+                     f"— VERDICT_RULES 동결이 깨졌다")
+    # 이 테스트가 T4 를 실제로 구동했는지 확인. T4 가 양쪽 다 False 면
+    # 비교가 통과해도 아무것도 검증하지 않은 것이다(공허 통과).
+    if not any(c.startswith("T4") and ok for c, ok in base_v.items()):
+        fails.append("동결 회귀가 T4 통과 경로를 밟지 못함 — 테스트 자체가 무효")
+
+    # 12) T7 임계가 5/6 로 실제로 걸려 있는가 (4/6 은 떨어져야 한다)
+    def _mk7(wins_a):
+        r = {}
+        for rule in RULES:
+            for vn, *_ in VARIANTS:
+                r[(rule, vn)] = [{"sharpe": 1.0, "mdd": -10.0} for _ in range(6)]
+        r[("mom12_0_ra", BASE_VARIANT)] = [
+            {"sharpe": 2.0 if k < wins_a else 0.0, "mdd": -10.0} for k in range(6)]
+        r["_bench"] = {b: [{}] * 6 for b in BENCH}
+        return r
+    if any(c == "T7" and ok for c, _, ok, _ in verdicts(_mk7(4))):
+        fails.append("T7 이 4/6 에서 통과함 — 임계 5/6 이 강제되지 않는다")
+    if not any(c == "T7" and ok for c, _, ok, _ in verdicts(_mk7(5))):
+        fails.append("T7 이 5/6 에서 통과하지 못함 — 임계가 잘못 걸려 있다")
+
+    # 12b) [구멍 메움] mom_vol_annualized 의 계약을 **직접** 검증.
+    #      변이 테스트에서 잡힌 것: √252 를 빼도 모든 후보에 같은 상수라
+    #      랭킹이 안 바뀌어 아무 테스트도 안 걸렸다. 랭킹만 보는 검사로는
+    #      스케일 오류를 영원히 못 잡는다 — 손계산과 맞대야 한다.
+    _rng = np.random.default_rng(99)
+    _v = 100.0 * np.exp(np.cumsum(_rng.normal(0, 0.011, 400)))
+    _tail = _v[-(fx.MOM_VOL_BARS + 1):]
+    _r = _tail[1:] / _tail[:-1] - 1.0
+    _exp = float(np.std(_r, ddof=1)) * float(np.sqrt(252.0)) * 100.0
+    if abs(fx.mom_vol_annualized(_v) - _exp) > 1e-9:
+        fails.append(f"연율 변동성 손계산 불일치: {fx.mom_vol_annualized(_v)} vs {_exp}")
+    if abs(fx.score_mom12_0_ra(_v) - fx.score_mom12_0(_v) / _exp) > 1e-12:
+        fails.append("위험조정 점수가 (수익률 ÷ 연율변동성) 이 아님")
+    # 변동성 0(완전 평탄) → nan 이어야 한다. 0.0 을 돌려주면 호출부가 나누다 죽는다.
+    if not np.isnan(fx.mom_vol_annualized(np.full(400, 100.0))):
+        fails.append("변동성 0 인 계열에서 nan 이 아닌 값을 반환 — 0 나눗셈 위험")
+    if not np.isnan(fx.score_mom12_0_ra(np.full(400, 100.0))):
+        fails.append("변동성 0 계열의 위험조정 점수가 nan 이 아님")
+    # 봉수 경계 — 253 유효 / 252 nan
+    if not (np.isfinite(fx.mom_vol_annualized(_v[:fx.MOM_VOL_BARS + 1]))
+            and np.isnan(fx.mom_vol_annualized(_v[:fx.MOM_VOL_BARS]))):
+        fails.append("변동성 함수의 최소 봉수 경계가 253/252 가 아님")
+
+    # 13) 위험조정이 실제로 다른 랭킹을 내는가 (축이 죽었는지 확인)
+    r_plain = [c["ticker"] for c in
+               bt.RankEngine(close, rank_rule="mom12_0", warmup=warmup).rank_at(idx[-1])[:5]]
+    r_ra = [c["ticker"] for c in
+            bt.RankEngine(close, rank_rule="mom12_0_ra", warmup=warmup).rank_at(idx[-1])[:5]]
+    if r_plain == r_ra:
+        fails.append(f"위험조정 랭킹이 원본과 완전히 동일 — 축이 작동하지 않음: {r_ra}")
+
+    # 14) 시트 열 정합 — 헤더 개수 == 실제 행 길이, 그리고 legacy 23열 위치 불변
+    _legacy = ["Run_Date", "Rule", "Variant", "Slots", "Swap", "Weights",
+               "Win_Idx", "Start", "End", "Total_Ret_Pct", "CAGR_Pct", "MDD_Pct",
+               "Sharpe", "Trades", "Swaps", "WinRate_Pct", "Turnover_x",
+               "MaxW_Peak_Pct", "SPY_Ret_Pct", "QQQ_Ret_Pct", "VOO_Ret_Pct",
+               "Warmup_Bars", "Universe_Hash"]
+    if _RESULT_COLS[:len(_legacy)] != _legacy:
+        fails.append("기존 23열의 순서/이름이 바뀜 — 2026-09-05 의 126행이 헤더와 어긋난다")
+    _wins = walkforward_windows(len(idx), warmup)
+    _res = {}
+    for rule in RULES:
+        for vn, *_ in VARIANTS:
+            _res[(rule, vn)] = [{"total_ret": 1.0, "cagr": 1.0, "mdd": -1.0,
+                                 "sharpe": 1.0, "trades": 1, "win": 50.0,
+                                 "turnover": 1.0, "maxw_peak": 20.0, "log": []}
+                                for _ in _wins]
+    _res["_bench"] = {b: [{"total_ret": 1.0} for _ in _wins] for b in BENCH}
+    _rows = build_rows(_res, _wins, idx, warmup, "utest0000")
+    if not _rows or any(len(r) != len(_RESULT_COLS) for r in _rows):
+        fails.append(f"행 길이 != 헤더 길이({len(_RESULT_COLS)})")
+    if len(_rows) != len(RULES) * len(VARIANTS) * len(_wins):
+        fails.append(f"행 개수 이상: {len(_rows)}")
+
     if fails:
         print("❌ 실패:")
         for f in fails:
             print("   -", f)
         return 1
     print("✅ 전 항목 통과 (공통워밍업·룰축분리·12-1스킵·슬롯·차등가중·"
-          "부정입력거부·창생성·pairwise방향·임계강제·MDD게이트)")
+          "부정입력거부·창생성·pairwise방향·임계강제·MDD게이트·"
+          "T1~T4동결·T7임계·위험조정축·시트열정합)")
     return 0
 
 
