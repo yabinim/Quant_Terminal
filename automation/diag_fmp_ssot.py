@@ -172,7 +172,26 @@ _RAW_GET_BASELINE = {
     #      아무도 의심하지 않는다. 하마터면 이 오탐을 근거로 Google News 를
     #      FMP 레이트리미터에 태울 뻔했다. M11 이 회귀 케이스다.
     #   나머지 46곳은 계속 래칫으로 조인다(인수인계 §6-B5).
-    "app.py": 46,
+    # 2026-09-04d: 46 → 40. **캐시 없는 rerun 경로 6곳을 전부 없앴다 → 남은
+    #   40곳은 전부 @st.cache_data 뒤이거나 간접 호출이다(핫패스 0).**
+    #     calculate_style_scores 3곳 · _fetch_portfolio_movement_data 3곳.
+    #   둘 다 @st.cache_data 가 없는 함수인데 모듈 최상위에서 불렸다.
+    #   Streamlit 은 위젯을 건드릴 때마다 스크립트를 전부 다시 돌리므로
+    #   **사이드바 입력 한 번에** income-statement 2 + cash-flow 1 +
+    #   batch-quote 1 + 누락분 quote + 보유 종목 수만큼의 news/stock 이
+    #   통째로 다시 나갔다. 20종목이면 rerun 한 번에 20콜 이상이고
+    #   전부 레이트리미터 밖이었다.
+    #   ⚠️ 함수 자체에 @st.cache_data 를 달지 않았다 — 인자에 DataFrame
+    #      (kpi_df)과 list(tickers)가 있어 해시가 안 된다. grades-consensus
+    #      때와 같이 **FMP 호출만** 캐시 헬퍼로 뺐다.
+    #   ⚠️ 뉴스는 개별 호출이 아니라 **배치**를 캐시했다. 병렬 조회가
+    #      ThreadPoolExecutor 안이라, 워커에서 @st.cache_data 를 부르면
+    #      Streamlit 세션 컨텍스트가 없어 깨진다. 캐시 경계를 스레드
+    #      바깥에 둔다.
+    #   ⚠️ cash-flow 는 헬퍼를 새로 만들지 않았다. 기존 `_fmp_cashflow()` 와
+    #      URL 이 글자까지 같았다 — 변수명만 달랐고 그쪽엔 이미 캐시가 있었다.
+    #   나머지 40곳은 계속 래칫으로 조인다(인수인계 §6-B5).
+    "app.py": 40,
     # run_drg_predict.py 는 2026-08-28 에 11곳 전부 fmp_http 로 전환됐다(11 → 0).
     #   requests 임포트 자체를 지웠다 — 되살리려면 임포트를 다시 추가해야 한다.
     #   기준선에서 제거 = 이제 한 곳이라도 생기면 '신규 우회'로 실패한다.
