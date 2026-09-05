@@ -1,0 +1,73 @@
+name: 📐 진단 — 랭킹 룰 × 집중도 비교 (수동 전용)
+
+# 무엇을 재는가
+# ─────────────
+#   Q1 랭킹 룰 : 현행 blend(1M40/3M40/6M20) vs 학술 12-1 vs 12-0
+#   Q2 집중도  : Top5 균등(현행) vs Top3 vs 차등 가중 (Top1 은 사전 배제)
+#
+# 판정 임계(4/6 · 5/6)는 diag_momentum_rule_compare.py **파일 상단에 사전 커밋**
+# 되어 있다. 결과를 본 뒤 임계를 바꾸면 diff 가 남는다 — 그게 이 배치의 목적이다.
+# 산업 모멘텀(item B) 때 임계가 대화에만 있어서 흔들릴 뻔했던 것을 코드로 고정했다.
+#
+# ⚠️ 이 진단은 QQQ/VOO 대비 우위를 판정하지 않는다. 후보 풀이 2026년 시점에
+#    사람이 고른 목록이라 과거로 돌리면 미래를 아는 풀이고, 절대 비교는 무효다.
+#    벤치마크 열은 출력 전용이다.
+#
+# ⚠️ 12-1/12-0 은 253봉 워밍업이 필요하고 공정 비교를 위해 blend 도 같은 253봉을
+#    쓴다. FMP 이력 상한(≈1,254봉) 때문에 평가 구간은 ≈1,000봉(≈4년)이고
+#    2022년 하락의 대부분이 워밍업에 먹힌다. 하락장 방어력은 답변 범위 밖이다.
+#
+# 콜 예산: 후보 풀 56 + 벤치 3(SPY·QQQ·VOO) = 59종목 × 2엔드포인트 = 118콜.
+#   diag_satellite_backtest.yml(116콜)과 같은 규모다. 같은 분에 두 워크플로를
+#   겹쳐 돌리지 말 것 — 계정 단위 분당 한도를 함께 쓴다.
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/디스패치 트리거 없음.
+    inputs:
+      min_fetch_rate:
+        description: '페치 성공률 하한 (기본 0.98). 이 밑이면 시트에 안 쓰고 중단.'
+        required: false
+        default: '0.98'
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30     # 페치 59종목 + 시뮬 126회 — 보통 4~7분
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install google-auth gspread requests numpy pandas pytz
+
+      # 락스텝 짝. 배선이 깨진 상태로 나온 숫자는 어차피 못 믿는다.
+      - name: 🛡️ FMP SSOT · 튜플 계약 가드 (락스텝)
+        run: python automation/diag_fmp_ssot.py
+
+      # ⚠️ 이 단계가 핵심 락스텝이다. fmp_extras 의 점수 룰 SSOT 를 바꿨는데
+      #    기존 백테스트 엔진을 안 올리면(또는 그 반대면) 여기서 죽는다.
+      #    기존 24설정 그리드가 그대로 통과하는지도 같이 확인된다.
+      - name: ✅ 위성 백테스트 엔진 자체검증 (합성 데이터 · 네트워크 불필요)
+        run: python automation/diag_satellite_backtest.py --selftest
+
+      - name: ✅ 룰 비교 축·판정 자체검증 (합성 데이터 · 네트워크 불필요)
+        run: python automation/diag_momentum_rule_compare.py --selftest
+
+      - name: 📐 랭킹 룰 × 집중도 비교 (읽기 전용 · Momentum_Rule_Compare 시트에만 기록)
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          # FMP Starter 한도는 분당 300. 67% 로 둔다.
+          # ⚠️ 300 으로 올리지 말 것 — 한도에 붙이면 다시 429 가 난다.
+          FMP_RATE_LIMIT_PER_MIN: '200'
+          MIN_FETCH_RATE: ${{ inputs.min_fetch_rate }}
+        run: |
+          python automation/diag_momentum_rule_compare.py
