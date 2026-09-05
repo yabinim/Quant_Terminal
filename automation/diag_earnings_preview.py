@@ -18,6 +18,7 @@ FMP·Sheets 를 전혀 부르지 않는다. earnings_core 의 순수 함수만 �
 ────
     python automation/diag_earnings_preview.py
 """
+import json
 import os
 import sys
 
@@ -51,7 +52,15 @@ def section(t):
 # ══════════════════════════════════════════════════════════════════════
 section("1) 스키마")
 
-check("PREVIEW_COLS 29열", ec.PREVIEW_NCOL == 29, f"실제 {ec.PREVIEW_NCOL}")
+# ⚠️ 29 → 33 (2026-09-05 정정). 코드가 아니라 **이 단정문이 낡았다.**
+#    C블록(내부자) 4열 — Insider_Sale_Val_90d · Insider_Sale_N_90d ·
+#    Insider_Buy_Val_90d · Insider_Cov_D — 이 29~32번 자리, 즉 **맨 끝**에
+#    규약대로 붙었는데 여기만 29 로 남아 있었다.
+#    ⚠️ 그 결과 이 스위트는 그때부터 **항상 빨간불**이었다. 헤더는 "실패하면
+#       배포하지 말 것" 이라고 하는데 언제나 실패하니 게이트 역할을 못 했다.
+#       실패 개수만 보면 "원래 2개 실패하는 검사" 로 읽히고 아무도 안 본다.
+#       열 수를 바꿀 때 이 줄을 같이 고치지 않으면 같은 일이 반복된다.
+check("PREVIEW_COLS 33열", ec.PREVIEW_NCOL == 33, f"실제 {ec.PREVIEW_NCOL}")
 check("열 이름 중복 없음", len(set(ec.PREVIEW_COLS)) == ec.PREVIEW_NCOL)
 check("Transcript_Summary 자리 확보(3단계 예약)",
       "Transcript_Summary" in ec.PREVIEW_COLS)
@@ -202,7 +211,15 @@ empty = ec.preview_row(ev, "FINAL",
                        {"flags": ["no_target", "no_grades"]}, now_et="x")
 check("결측 → 공란(0 이 아님)",
       empty[ec.PREVIEW_COLS.index("Target_Mean")] == "")
-check("Data_Flags 기록", empty[ec.PREVIEW_COLS.index("Data_Flags")] == "no_target,no_grades")
+# ⚠️ 기대값에 stale_caller 를 더했다(2026-09-05). 이것도 낡은 단정문이다.
+#    preview_row 는 호출부가 내부자 값을 안 주면 [FATAL] 을 찍고 Data_Flags 에
+#    stale_caller 를 남긴다 — **락스텝 감지 장치**다. 여기 합성 호출은 내부자
+#    값을 일부러 안 주므로 그 플래그가 붙는 게 **정상**이다.
+#    기대값에서 빼놓으면 락스텝 장치가 작동할 때마다 이 검사가 실패한다.
+check("Data_Flags 기록(+ 내부자 미제공 → stale_caller)",
+      empty[ec.PREVIEW_COLS.index("Data_Flags")]
+      == "no_target,no_grades,stale_caller",
+      empty[ec.PREVIEW_COLS.index("Data_Flags")])
 check("Sample_N_Q 결측 → 0", empty[ec.PREVIEW_COLS.index("Sample_N_Q")] == 0)
 
 back = ec.parse_preview([ec.PREVIEW_COLS, full, empty])
@@ -237,6 +254,60 @@ check("목표가 상승여력 +16.7%",
       abs(ec.target_upside_pct(210.0, 180.0) - 16.666) < 0.01)
 check("목표가 이미 초과 → 음수", ec.target_upside_pct(150.0, 180.0) < 0)
 check("가격 0 → None", ec.target_upside_pct(210.0, 0) is None)
+
+
+# ══════════════════════════════════════════════════════════════════════
+section("EPS 추정치 분기 아카이브 (est_archive_row)")
+# 왜 여기 있나:
+#   이 함수는 run_earnings_watch 가 부르는데, 그 러너는 main() 최상단에
+#   휴장일 가드가 있어 **주말·공휴일엔 시트를 열기도 전에 종료**한다.
+#   즉 배포 당일이 평일이 아니면 실행 경로로는 확인할 방법이 없다.
+#   순수 함수라 여기서 합성 데이터로 검증한다 — 네트워크 0, 시트 0.
+#
+# 무엇을 지키나:
+#   calendar_row 는 분기가 바뀌면 Est_History_JSON 을 "" 로 버린다.
+#   그 직전에 est_archive_row 가 건지지 못하면 **그 분기 시계열은 영구히
+#   사라진다.** 실패해도 러너는 [WARN] 한 줄만 남기고 초록불로 끝난다 —
+#   조용한 유실이라 이 검사가 유일한 방어선이다.
+_ARCH_HIST = ('[{"d":"2026-06-01","eps":2.1},{"d":"2026-06-15","eps":2.14},'
+              '{"d":"2026-07-01","eps":2.22}]')
+_ARCH_PREV = {"Ticker": "AAPL", "Earnings_Date": "2026-07-31", "Est_EPS": 2.22,
+              "Est_History_JSON": _ARCH_HIST, "Est_Revision_Pct": 5.7}
+_ai = {c: i for i, c in enumerate(ec.EST_ARCHIVE_COLS)}
+_arow = ec.est_archive_row("AAPL", _ARCH_PREV, now_et="2026-11-01 08:00 ET")
+
+check("아카이브 행 길이 == EST_ARCHIVE_NCOL",
+      _arow is not None and len(_arow) == ec.EST_ARCHIVE_NCOL)
+check("Snapshot_N = 3", _arow and _arow[_ai["Snapshot_N"]] == 3)
+check("옛 Earnings_Date 보존 (새 날짜가 아니라)",
+      _arow and _arow[_ai["Earnings_Date"]] == "2026-07-31")
+check("이력 JSON 원문 보존",
+      _arow and _arow[_ai["Est_History_JSON"]] == _ARCH_HIST)
+
+# 거부되어야 하는 입력 — 하나라도 통과하면 쓰레기 행이 쌓인다
+for _lbl, _p in (
+        ("이력 없음", {**_ARCH_PREV, "Est_History_JSON": ""}),
+        ("빈 배열", {**_ARCH_PREV, "Est_History_JSON": "[]"}),
+        ("1점만 (리비전 계산 불가)",
+         {**_ARCH_PREV, "Est_History_JSON": '[{"d":"2026-07-01","eps":2.2}]'}),
+        ("깨진 JSON", {**_ARCH_PREV, "Est_History_JSON": "{not json"}),
+        ("리스트 아님", {**_ARCH_PREV, "Est_History_JSON": '{"a":1}'}),
+        ("Earnings_Date 없음", {**_ARCH_PREV, "Earnings_Date": ""}),
+        ("dict 아님", None)):
+    check(f"거부: {_lbl}", ec.est_archive_row("AAPL", _p) is None)
+
+# ⚠️ 순서 검증. 이게 이 절의 핵심이다 — calendar_row 를 **먼저** 부르면
+#    아카이브할 게 남지 않는다는 것을 실증한다. 러너에서 두 호출 순서가
+#    뒤집히면 조용히 빈 손이 되므로, 여기서 그 사실을 못 박아 둔다.
+_after = ec.calendar_row("AAPL", {"earnings_date": "2026-10-30"}, None,
+                         today="2026-11-01", now_et="x",
+                         prev=_ARCH_PREV, source="user")
+_after_d = {c: _after[i] for i, c in enumerate(ec.CALENDAR_COLS)}
+check("calendar_row 가 분기 전환 시 이력을 버린다 (아카이브가 유일한 기회)",
+      json.loads(_after_d["Est_History_JSON"] or "[]") == []
+      or len(json.loads(_after_d["Est_History_JSON"] or "[]")) < 3)
+check("순서 뒤집으면 아무것도 못 건진다 (calendar_row 결과로는 None)",
+      ec.est_archive_row("AAPL", _after_d) is None)
 
 # ══════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
