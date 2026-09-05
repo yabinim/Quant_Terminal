@@ -24,10 +24,18 @@ ROOT = sys.argv[1] if len(sys.argv) > 1 else "/mnt/project"
 MARKERS = {
     "app.py": ["_SSOT_NEEDS", "load_earnings_universe", "TIMING_LABELS_INFERRED",
                "_open_quant_db", "update_watchlist_row", "시장 이벤트 지형"],
+    # est_archive_row: 2026-09-05 EPS 추정치 분기 아카이브. 이 마커가 없는데
+    #   run_earnings_watch 만 올리면, 분기 전환 종목마다
+    #   "[WARN] {tk} 추정치 아카이브 실패" 만 찍히고 **그 분기 시계열이 영구히
+    #   사라진다.** try/except 안이라 러너는 초록불로 끝난다 — 조용한 유실이다.
     "earnings_core.py": ["infer_timing", "fetch_market_calendar_map", "SOURCE_UNIVERSE",
-                         "UNIVERSE_WORKSHEET", "_timing_from_utc", "TIMING_LABELS_INFERRED"],
+                         "UNIVERSE_WORKSHEET", "_timing_from_utc", "TIMING_LABELS_INFERRED",
+                         "est_archive_row", "EST_ARCHIVE_COLS"],
+    # est_archive_row: 위 earnings_core 마커와 **짝**이다. 반대 방향 유실을
+    #   잡는다 — earnings_core 만 올리면 함수는 있는데 아무도 안 부른다.
     "run_earnings_watch.py": ["pass_universe", "_batch_update", "_merge_runs",
-                              "FORCE_CALENDAR", "FORCE_UNIVERSE", "gsr.call"],
+                              "FORCE_CALENDAR", "FORCE_UNIVERSE", "gsr.call",
+                              "est_archive_row"],
     "fmp_http.py": ["fmp_get_json_ex", "plan_limited", "set_key_provider"],
     # PROFILE_BATCH: 2026-09-04 백테스트 2개의 `_gs` 중복 흡수. 이 마커가 없으면
     #   run_signal_backtest / diag_satellite_backtest 가 import 단계에서 죽는다

@@ -840,6 +840,77 @@ CALENDAR_NCOL = len(CALENDAR_COLS)
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Earnings_Est_Archive — EPS 추정치 이력의 분기 아카이브
+#
+# 왜 필요한가 (2026-09-05 발견):
+#   `Est_History_JSON` 은 Earnings_Events 의 (Ticker, Earnings_Date) **행 안**
+#   에 사는 JSON 문자열이다. 그런데 calendar_row() 가 분기 전환을 감지하면
+#
+#       prev_json = "" if date_changed else …
+#
+#   으로 **이력을 버린다.** 실적이 지나가 Earnings_Date 가 다음 분기로 넘어가는
+#   순간 그 티커의 추정치 시계열이 사라진다. 티커당 행은 하나뿐이라 과거 분기
+#   행도 남지 않는다. 지워지기 전 어디로도 복사되지 않았다.
+#
+#   CALENDAR_COLS 주석은 "오늘부터 매일 스냅샷을 남긴다 → 2~3 실적 시즌 뒤
+#   리비전 요인으로 쓸 수 있다" 고 적어놨지만, **구현이 그걸 못 했다.**
+#   6개월을 기다려도 매 분기 초기화된 3개월치 롤링 버퍼만 있었다.
+#   diag_earnings_preview_backtest 의 F1(EPS 리비전)이 영원히 비는 이유였다.
+#
+# ⚠️ 이 아카이브는 **오늘 이후 분기 전환분만** 잡는다. 이전 분기들은 이미
+#    영구히 사라졌고 되살릴 방법이 없다. 재평가 가능 시점은 2~3 실적 시즌 뒤다.
+#
+# 소유권: Earnings_Events 와 같다 — 티커 단위, 관리자 소유·게스트 읽기 전용.
+#   사용자별 행이 아니므로 uid 열이 없다.
+# 쓰기: append 전용. 과거 분기는 불변이라 갱신할 일이 없다.
+# ──────────────────────────────────────────────────────────────────────────
+EST_ARCHIVE_SHEET = "Earnings_Est_Archive"
+EST_ARCHIVE_COLS = [
+    "Ticker", "Earnings_Date", "Est_EPS", "Est_History_JSON",
+    "Est_Revision_Pct",
+    # Snapshot_N 을 따로 두는 이유: JSON 을 파싱하지 않고도 "몇 점 쌓였나" 를
+    # 시트에서 바로 볼 수 있어야 한다. 재평가 가능 시점을 판단하는 지표다.
+    "Snapshot_N", "Archived_At",
+]
+EST_ARCHIVE_NCOL = len(EST_ARCHIVE_COLS)
+
+# 스냅샷이 이보다 적으면 아카이브하지 않는다. 리비전 계산에 최소 2점이
+# 필요하고(estimate_revision_pct), 1점짜리 행은 잡음이다.
+EST_ARCHIVE_MIN_SNAPSHOTS = 2
+
+
+def est_archive_row(ticker: str, prev: dict, now_et=None):
+    """분기 전환 직전의 prev 행 → 아카이브 행. 남길 게 없으면 None.
+
+    ⚠️ **calendar_row() 를 부르기 전에** 호출해야 한다. 그 함수가
+       date_changed 를 보고 Est_History_JSON 을 버린다. 순서가 뒤집히면
+       빈 문자열을 아카이브하게 된다.
+
+    prev : Earnings_Events 의 **옛** 행(dict). CALENDAR_COLS 키를 가진다.
+    """
+    if not isinstance(prev, dict):
+        return None
+    raw = str(prev.get("Est_History_JSON", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        hist = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(hist, list) or len(hist) < EST_ARCHIVE_MIN_SNAPSHOTS:
+        return None
+    ed = str(prev.get("Earnings_Date", "") or "").strip()
+    if not ed:
+        return None
+    return [
+        str(ticker or "").strip().upper(), ed,
+        _blank(prev.get("Est_EPS")), raw,
+        _blank(prev.get("Est_Revision_Pct")), len(hist),
+        str(now_et or ""),
+    ]
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Earnings_Universe — Tier 2 대형주 유니버스 (주 1회 전체 덮어쓰기)
 #
 # 정의: QQQ 보유종목(≈나스닥 100) ∪ SPY 보유종목 비중 상위 N(≈S&P500 시총 상위 N)
