@@ -183,9 +183,21 @@ WINDOWS        = {"1년": 252, "2년": 504, "3년": 756}   # 거래일 기준
 
 BENCH_TICKERS  = ("SPY", "QQQ")
 
-# 점수 가중치 (fmp_extras.compute_satellite_top10 과 동일)
-_W_1M, _W_3M, _W_6M = 0.40, 0.40, 0.20
-_BARS_1M, _BARS_3M, _BARS_6M = 21, 63, 126
+# 점수식은 fmp_extras 의 룰 SSOT(fx.MOM_RULES / fx.mom_score)가 유일한 출처다.
+# 여기에 가중치 숫자를 다시 적어두지 않는다 — 예전에는 _W_1M/_W_3M/_W_6M 사본이
+# 있었고, 라이브가 바뀌어도 이 파일은 조용히 옛 식으로 계속 돌 수 있었다.
+
+# ── 집중도·가중 스킴 (룰 비교 전용 축) ───────────────────────────────────────
+# 차등 가중은 **rebal 에서만** 정의된다. swap 은 매도한 슬롯의 현금만 재투입하므로
+# 목표 비중이라는 개념 자체가 없다 — swap + 차등을 허용하면 의도와 다른 드리프트
+# 포트폴리오를 '차등 가중'이라고 부르며 비교하게 된다. 그래서 예외로 막는다.
+WEIGHT_SCHEMES = {
+    "eq1":   (1.00,),
+    "eq3":   (1 / 3, 1 / 3, 1 / 3),
+    "eq5":   (0.20, 0.20, 0.20, 0.20, 0.20),
+    "tier3": (0.50, 0.30, 0.20),
+    "tier5": (0.30, 0.25, 0.20, 0.15, 0.10),
+}
 
 # ── 설정 그리드 ───────────────────────────────────────────────────────────────
 FREQS      = ("weekly", "monthly")           # 1A/1B
@@ -379,9 +391,20 @@ def _trailing_return(vals: np.ndarray, bars: int):
 
 
 class RankEngine:
-    """티커별 유효 종가 배열을 미리 잘라두고, 날짜별 챔피언 랭킹을 계산한다."""
+    """티커별 유효 종가 배열을 미리 잘라두고, 날짜별 챔피언 랭킹을 계산한다.
 
-    def __init__(self, close_df: pd.DataFrame):
+    rank_rule : fx.MOM_RULES 의 키. 기본 "blend" = 라이브 compute_satellite_top10.
+    warmup    : 랭킹에 필요한 최소 봉수. None 이면 룰의 필요 봉수를 쓴다.
+      ⚠️ 룰을 **비교**할 때는 반드시 세 룰 공통값(fx.mom_warmup_bars())을 넘겨라.
+         룰마다 다른 워밍업을 쓰면 시작일이 달라져 서로 다른 구간을 비교하게 된다.
+    """
+
+    def __init__(self, close_df: pd.DataFrame, rank_rule: str = "blend",
+                 warmup: int | None = None):
+        if rank_rule not in fx.MOM_RULES:
+            raise KeyError(f"알 수 없는 랭킹 룰: {rank_rule!r}")
+        self.rank_rule = rank_rule
+        self.warmup = int(warmup) if warmup else int(fx.MOM_RULES[rank_rule][1])
         self.pool = fx.satellite_candidate_pool()          # {섹터: [후보들]}
         self.sector_of = {}
         self.series = {}
@@ -408,15 +431,12 @@ class RankEngine:
                     continue
                 idx, vals = ser
                 n = int(np.searchsorted(idx, np.datetime64(key), side="right"))
-                if n < WARMUP_BARS:                     # 라이브의 len(s) < 127 스킵과 동일
+                if n < self.warmup:                     # 라이브의 len(s) < 127 스킵과 동일
                     continue
-                v = vals[:n]
-                r1m = _trailing_return(v, _BARS_1M)
-                r3m = _trailing_return(v, _BARS_3M)
-                r6m = _trailing_return(v, _BARS_6M)
-                if not all(np.isfinite(x) for x in (r1m, r3m, r6m)):
+                # 점수식은 fmp_extras 룰 SSOT. 여기서 다시 쓰지 않는다.
+                score = fx.mom_score(vals[:n], self.rank_rule)
+                if not np.isfinite(score):
                     continue
-                score = _W_1M * r1m + _W_3M * r3m + _W_6M * r6m
                 if best is None or score > best["score"]:
                     best = {"ticker": tk, "sector": sec, "score": score}
             if best is not None:
@@ -451,11 +471,32 @@ def signal_dates(index: pd.DatetimeIndex, freq: str) -> list:
 # 시뮬레이터
 # ══════════════════════════════════════════════════════════════════════════════
 def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.DataFrame,
-             start_i: int, end_i: int, capital: float = CAPITAL) -> dict:
-    """cfg=(freq, swap, sellrule, mktfilter) 로 [start_i, end_i] 구간을 시뮬레이션."""
+             start_i: int, end_i: int, capital: float = CAPITAL,
+             slots: int | None = None, weights: tuple | None = None) -> dict:
+    """cfg=(freq, swap, sellrule, mktfilter) 로 [start_i, end_i] 구간을 시뮬레이션.
+
+    slots   : 보유 슬롯 수. None 이면 모듈 기본 SLOTS(5) — 기존 그리드와 동일.
+    weights : 순위별 목표 비중 튜플(합 1.0). None 이면 균등.
+              rebal 에서만 유효하며, len(weights) == slots 이어야 한다.
+
+    ⚠️ sellrule="top5" 는 '5' 가 아니라 '슬롯 수만큼' 을 뜻한다. slots=3 이면
+       Top3 밖으로 밀린 종목을 판다. 이름을 안 바꾼 이유는 기존 시트 행의
+       SellRule 값과 대조가 끊기기 때문이다.
+    """
     freq, swap, sellrule, mktfilter = cfg
+    n_slots = int(slots) if slots else SLOTS
+    if weights is not None:
+        w = tuple(float(x) for x in weights)
+        if len(w) != n_slots:
+            raise ValueError(f"weights 길이 {len(w)} != slots {n_slots}")
+        if abs(sum(w) - 1.0) > 1e-9:
+            raise ValueError(f"weights 합이 1.0 이 아님: {sum(w)}")
+        if swap != "rebal":
+            raise ValueError("차등 가중은 rebal 에서만 정의된다 (swap 은 목표 비중이 없다)")
+    else:
+        w = None
     index = adj_df.index
-    keep_thresh = SLOTS if sellrule == "top5" else BAND_SLOTS
+    keep_thresh = n_slots if sellrule == "top5" else BAND_SLOTS
 
     all_sig = signal_dates(index, freq)
     pos_of = {d: i for i, d in enumerate(index)}
@@ -546,11 +587,11 @@ def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.
                 keep, buys = [], []
             else:
                 keep = [tk for tk in list(shares) if rank_of.get(tk, 10**6) <= keep_thresh]
-                free = SLOTS - len(keep)
+                free = n_slots - len(keep)
                 if mktfilter == "no_new" and not risk_on:
                     buys = []
                 else:
-                    top = [c["ticker"] for c in champs[:SLOTS]]
+                    top = [c["ticker"] for c in champs[:n_slots]]
                     buys = [tk for tk in top if tk not in keep][:max(0, free)]
 
             for tk in [t for t in list(shares) if t not in keep]:
@@ -561,27 +602,46 @@ def simulate(cfg: tuple, engine: RankEngine, close_df: pd.DataFrame, adj_df: pd.
                     each = cash / len(buys)
                     for tk in buys:
                         buy(tk, i, each)
-            else:  # rebal — 슬롯 균등 재조정
+            else:  # rebal — 슬롯 목표 비중 재조정
                 targets = keep + buys
                 if targets:
                     held_val = sum(shares.get(t, 0.0) * px(t, i) for t in targets
                                    if np.isfinite(px(t, i)))
                     equity = cash + held_val
-                    # 분모는 '생존 종목 수'가 아니라 항상 슬롯 5개.
+                    # 분모는 '생존 종목 수'가 아니라 항상 슬롯 수.
                     # risk-off 로 슬롯이 비면 그만큼 현금으로 남아야 한다.
                     # (len(targets) 로 나누면 남은 종목에 몰빵되어 필터 의도가 뒤집힌다)
-                    tgt = equity / SLOTS
-                    for tk in targets:                      # 초과분 먼저 매도
+                    #
+                    # 차등 가중도 같은 원칙이다 — 비중은 **순위 순서**로 배정하고,
+                    # 슬롯이 비면 그 슬롯 몫은 재분배하지 않고 현금으로 둔다.
+                    # ⚠️ 균등일 때는 **모든** 대상에 equity/n_slots 를 준다.
+                    #    top7 밴드(sellrule="top7")에서는 보유가 슬롯 수를 넘을 수
+                    #    있고, 그때 뒤쪽을 목표 0 으로 잘라내면 밴드 룰의 의미가
+                    #    사라진다(밴드는 '순위가 좀 밀려도 안 판다' 는 규칙이다).
+                    #    현금 부족은 buy() 의 min(..., cash) 가 이미 처리한다.
+                    #    차등 가중은 w 가 슬롯 수만큼만 있으므로 그 뒤는 0 이 맞다.
+                    ordered = sorted(targets, key=lambda t: rank_of.get(t, 10**6))
+                    if w is None:
+                        tgt_of = {t: equity / n_slots for t in ordered}
+                    else:
+                        tgt_of = {t: equity * w[k] for k, t in enumerate(ordered)
+                                  if k < n_slots}
+                    # 순회 순서도 동결한다. 현금이 모자랄 때 **누가 먼저 사느냐**로
+                    # 결과가 갈리므로, 균등 경로는 기존 순서(keep+buys)를 그대로 쓴다.
+                    loop_order = targets if w is None else ordered
+                    for tk in loop_order:                   # 초과분 먼저 매도
                         p = px(tk, i)
                         if not np.isfinite(p):
                             continue
+                        tgt = tgt_of.get(tk, 0.0)
                         cur = shares.get(tk, 0.0) * p
                         if cur > tgt * 1.005:
                             sell(tk, i, frac=min(1.0, (cur - tgt) / cur))
-                    for tk in targets:                      # 부족분 매수
+                    for tk in loop_order:                   # 부족분 매수
                         p = px(tk, i)
                         if not np.isfinite(p):
                             continue
+                        tgt = tgt_of.get(tk, 0.0)
                         cur = shares.get(tk, 0.0) * p
                         if cur < tgt * 0.995:
                             buy(tk, i, min(tgt - cur, cash))
