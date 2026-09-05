@@ -490,12 +490,16 @@ def load_core_keys() -> set:
 
 def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
                   force: bool = False, market_map=None):
-    """캘린더 갱신. 반환: (updates, appends, cal) — cal 은 갱신 반영된 dict.
+    """캘린더 갱신. 반환: (updates, appends, cal, est_archives).
+
+    cal 은 갱신 반영된 dict. est_archives 는 **분기가 넘어간** 종목의 추정치
+    이력 보관 행이다 — calendar_row 가 버리기 직전에 건져낸 것이라, 여기서
+    반환하지 않으면 그 분기 시계열은 영구히 사라진다.
 
     user_set: 보유/워치리스트 티커 집합. 여기 없으면 Tier 2(universe)로 기록해
       스냅샷/이메일/축소 판정에서 제외된다. None 이면 전부 user(구 동작).
     """
-    updates, appends = [], []
+    updates, appends, est_archives = [], [], []
     n_skip = n_light = n_full = n_move = n_map = 0
     n_timing = n_infer = 0
 
@@ -577,6 +581,29 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
                     else ec.SOURCE_UNIVERSE)
             if ev and str(ev.get("timing") or ""):
                 n_timing += 1
+            # ⚠️ 아카이브는 **calendar_row() 보다 먼저** 한다. 그 함수가
+            #    date_changed 를 보고 Est_History_JSON 을 "" 로 버린다
+            #    (earnings_core.calendar_row 의 prev_json 줄). 순서가 뒤집히면
+            #    빈 문자열을 아카이브하게 된다.
+            #    분기 전환 = 실적이 지나가 Earnings_Date 가 다음 분기로 넘어간
+            #    순간이고, 그때가 그 분기 추정치 시계열의 마지막 기회다.
+            #    ⚠️ 중복은 구조적으로 억제된다: 아카이브 후 캘린더 행이 새
+            #       날짜로 갱신되므로 다음 실행엔 date_changed 가 안 뜬다.
+            #       다만 같은 실행에서 캘린더 쓰기가 실패하면 다음 실행에 한 번
+            #       더 들어갈 수 있다. 아카이브는 append 전용이라 읽는 쪽에서
+            #       (Ticker, Earnings_Date) 로 마지막 행만 쓰면 된다.
+            _old_ed = str((prev or {}).get("Earnings_Date", "") or "").strip()
+            _new_ed = str((ev or {}).get("earnings_date", "") or "").strip()
+            if prev is not None and _old_ed and _new_ed and _old_ed != _new_ed:
+                try:
+                    _arch = ec.est_archive_row(tk, prev, now_et=now_et)
+                    if _arch:
+                        est_archives.append(_arch)
+                        print(f"  [ARCHIVE] {tk} {_old_ed} → {_new_ed} · "
+                              f"스냅샷 {_arch[ec.EST_ARCHIVE_COLS.index('Snapshot_N')]}점 보관")
+                except Exception as e:
+                    print(f"  [WARN] {tk} 추정치 아카이브 실패: {e}")
+
             row = ec.calendar_row(tk, ev, move, today=today, now_et=now_et,
                                   prev=prev, source=_src)
             if prev is not None:
@@ -594,7 +621,7 @@ def pass_calendar(tickers, cal, hist_cache, today, now_et, user_set=None,
     print(f"[CAL] 생략 {n_skip} · 맵적중 {n_map}(0콜) · 경량 {n_light}콜 · "
           f"정밀 {n_full}×2콜 · 변동폭 {n_move} · "
           f"timing확보 {n_timing}(추론 {n_infer})")
-    return updates, appends, cal
+    return updates, appends, cal, est_archives
 
 
 # ── 패스 1: 사전 스냅샷 ───────────────────────────────────────────────────
@@ -1126,7 +1153,7 @@ def main():
     print("\n▶ 패스 0: 캘린더 갱신")
     if FORCE_CALENDAR:
         print("[CAL] 강제 재조회(FORCE_CALENDAR) — 티어 주기 무시")
-    c_updates, c_appends, cal = pass_calendar(scan_tickers, cal, hist_cache,
+    c_updates, c_appends, cal, c_archives = pass_calendar(scan_tickers, cal, hist_cache,
                                               today, now_et, user_set=user_set,
                                               force=FORCE_CALENDAR,
                                               market_map=market_map)
@@ -1171,6 +1198,26 @@ def main():
             print(f"[OK] 캘린더 신규 {len(c_appends)}종목 추가")
         except Exception as e:
             print(f"[ERROR] 캘린더 추가 실패: {e}")
+
+    # ── EPS 추정치 아카이브 ────────────────────────────────────────────────
+    # ⚠️ **캘린더 쓰기 뒤**에 둔다. 순서에 이유가 있다:
+    #    아카이브가 먼저 들어가고 캘린더 갱신이 실패하면, 다음 실행에도
+    #    date_changed 가 뜨므로 같은 행이 한 번 더 아카이브된다.
+    #    반대로 캘린더가 먼저 성공하면 다음 실행엔 date_changed 가 안 뜨고,
+    #    아카이브만 실패했을 때 그 분기는 영영 못 건진다.
+    #    → 어느 쪽도 완벽하지 않다. **중복 1행이 유실 1분기보다 낫다**는
+    #      판단으로 캘린더를 먼저 둔다. 아카이브는 append 전용이고 읽는 쪽에서
+    #      (Ticker, Earnings_Date) 마지막 행만 쓰면 중복은 무해하다.
+    if c_archives:
+        try:
+            aws = _ws(ec.EST_ARCHIVE_SHEET, ec.EST_ARCHIVE_COLS)
+            _a_vals = gsr.call(aws.get_all_values, _label="archive_read")
+            _a_next = max(len(_a_vals), 1) + 1
+            _safe_update(aws, c_archives, _a_next, ec.EST_ARCHIVE_NCOL)
+            print(f"[OK] 추정치 아카이브 {len(c_archives)}행 보관 "
+                  f"(분기 전환 종목)")
+        except Exception as e:
+            print(f"[ERROR] 추정치 아카이브 실패: {e}")
 
     # ── 시트 기록: 갱신 먼저, 추가는 마지막 (부분 실패 시 재시도 가능) ──
     idx = {c: i for i, c in enumerate(ec.EVENTS_COLS)}
@@ -1227,6 +1274,7 @@ def main():
 
     print("\n" + "=" * 60)
     print(f"완료 — 캘린더 {len(c_updates)}갱신/{len(c_appends)}신규 · "
+          f"추정치보관 {len(c_archives)} · "
           f"스냅샷 {len(new_rows)} · 프리뷰 {len(p_rows)} · 측정 {len(v_updates)} · "
           f"D+5 {len(d_updates)} · 메일 {sent}통")
     print(gsr.stats_line())
