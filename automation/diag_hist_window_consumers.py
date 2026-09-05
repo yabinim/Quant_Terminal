@@ -403,7 +403,16 @@ _DEFS = [
 #      못 잡는다. H1(이름 참조 강제) + H4(리터럴 == 역산)로 양방향을 유지한다.
 _SITES = [
     ("fmp_extras", "compute_satellite_top10", "_closes", {"spy"}),
-    ("fmp_extras", "compute_satellite_top10", "_closes", {"s"}),
+    # ⚠️ 후보(`s`) 사이트는 여기 없다 — [S] 군으로 이관했다(2026-09-06).
+    #    사유 두 가지:
+    #      1) `bars=SATELLITE_BARS` 는 ast.Name 이라 kw_int 가 못 읽는다.
+    #         run_hidden_alpha 가 `bars=rc.REQUIRED_BARS` 로 [H] 로 간 것과 같다.
+    #      2) 더 중요한 것 — 점수식이 `mom_return(vals, MOM_BARS_12M)` 처럼
+    #         모듈 상수와 계산된 첨자(a[n-1-skip-back])를 쓰게 되면서
+    #         required_bars_for 가 깊이를 못 따라간다(역산이 1 로 접힌다).
+    #         선언 127 vs 역산 1 로 R1b 가 이미 빨갛던 상태였다.
+    #         역산기를 고치는 대신 **정책 소유자(MOM_RULES)에서 직접 읽는다** —
+    #         진단이 든 숫자가 아니라 소스의 값이므로 대조가 공허해지지 않는다.
     ("run_narrative", "verify_emerging_with_quant", "_fmp_close_series", {"spy_close"}),
     ("run_narrative", "verify_emerging_with_quant", "_fmp_close_series", {"s", "vol"}),
     # run_hidden_alpha 는 여기 없다 — [H] 군으로 이관했다(아래 사유).
@@ -794,6 +803,110 @@ def _default_name_of(t: ast.Module, fname: str, arg: str):
     return d.id if isinstance(d, ast.Name) else None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# [S] 위성 랭킹 창 — fmp_extras.MOM_RULES 소유 정책
+# ══════════════════════════════════════════════════════════════════════════════
+# [H] 와 같은 형태다. 지키는 명제도 같다 — "숫자가 같은가"가 아니라:
+#
+#   S1 호출부가 정책을 **복사하지 않고 이름으로 참조**하는가
+#   S2 정책(SATELLITE_BARS)이 리터럴로 굳지 않고 MOM_RULES 파생인가
+#   S3 선언 필요봉수 == 점수함수의 **실제** 최소 봉수 (양방향)
+#   S4 라이브 룰과 백테스트가 검증한 룰이 같은 이름인가
+#   S5 가드(len(s) < N)와 조회(bars=N)가 같은 이름을 쓰는가
+#
+# S1+S2 가 과다/과소 선언을 양방향으로 잡는다. 호출부에 리터럴 253 을 박으면
+# S1 이, `SATELLITE_BARS = 253` 으로 굳히면 S2 가 죽는다.
+#
+# S3 가 특히 중요하다. MOM_RULES 의 선언 봉수는 **사람이 적은 숫자**다.
+# score_mom12_0 의 창을 252→504 로 바꾸면서 선언을 안 고치면, 랭킹은 에러 없이
+# '데이터 부족으로 후보 다수 탈락' 상태로 돌아간다. 그래서 선언값을 믿지 않고
+# 점수 함수를 실제로 호출해 최소 봉수를 **측정**한다.
+#
+# ⚠️ S5 가 없으면 이런 일이 생긴다: 조회는 SATELLITE_BARS(253)로 하는데
+#    가드만 리터럴 127 로 남으면, 127~252봉짜리 종목이 가드를 통과한 뒤
+#    점수 함수에서 nan 을 받는다. 스킵 사유가 '히스토리 부족'이 아니라
+#    '점수 산출 실패'로 찍혀 원인 추적이 한 단계 어긋난다.
+def group_S():
+    print("\n[S] 위성 랭킹 창 — fmp_extras.MOM_RULES 소유 정책")
+
+    t_fx = tree(fx)
+    f = find_func(t_fx, "compute_satellite_top10")
+    if f is None:
+        bad("S0", "fmp_extras.compute_satellite_top10 을 못 찾았다")
+        return
+
+    # ── S1 호출부가 이름으로 참조하는가 ──
+    node = None
+    for stmt in ast.walk(f):
+        if not (isinstance(stmt, ast.Assign) and _assign_targets(stmt) == {"s"}):
+            continue
+        v = stmt.value
+        if isinstance(v, ast.Call):
+            nm = (v.func.id if isinstance(v.func, ast.Name)
+                  else getattr(v.func, "attr", None))
+            if nm == "_closes":
+                node = v
+                break
+    kwv = next((k.value for k in node.keywords if k.arg == "bars"), None) if node else None
+    chk(isinstance(kwv, ast.Name) and kwv.id == "SATELLITE_BARS", "S1",
+        "후보 조회가 `bars=SATELLITE_BARS` 로 정책을 이름 참조한다"
+        + ("" if isinstance(kwv, ast.Name)
+           else f" — 리터럴/식이 박혔다({ast.dump(kwv)[:60] if kwv else 'None'})"))
+
+    # ── S2 정책이 MOM_RULES 파생인가 (리터럴로 굳지 않았는가) ──
+    v = _const_assign_value(t_fx, "SATELLITE_BARS")
+    is_derived = (isinstance(v, ast.Subscript)
+                  and isinstance(v.value, ast.Subscript)
+                  and isinstance(v.value.value, ast.Name)
+                  and v.value.value.id == "MOM_RULES")
+    chk(is_derived, "S2",
+        "SATELLITE_BARS 가 MOM_RULES[...] 파생이다"
+        + ("" if is_derived else " — 리터럴로 굳었다. 룰을 바꿔도 깊이가 안 따라온다"))
+
+    # ── S3 선언 필요봉수 == 실제 최소 봉수 (양방향 측정) ──
+    ramp = np.linspace(100.0, 300.0, 900)
+    for rule, (fn, need) in fx.MOM_RULES.items():
+        ok_at = np.isfinite(fn(ramp[:need]))
+        ok_below = np.isfinite(fn(ramp[:need - 1]))
+        chk(ok_at and not ok_below, f"S3-{rule}",
+            f"{rule}: 선언 {need}봉에서 점수 산출 O / {need - 1}봉에서 X"
+            + ("" if (ok_at and not ok_below)
+               else f" — 실측 {'식이 더 깊은 이력을 요구' if not ok_at else '선언이 실제보다 큼'}"))
+
+    # ── S4 라이브 룰이 백테스트가 검증한 이름 안에 있는가 ──
+    live = getattr(fx, "SATELLITE_RANK_RULE", None)
+    chk(live in fx.MOM_RULES, "S4a",
+        f"라이브 랭킹 룰 '{live}' 가 MOM_RULES 에 존재한다")
+    alt = getattr(fx, "SATELLITE_ALT_RULE", None)
+    chk(alt in fx.MOM_RULES and alt != live, "S4b",
+        f"참고 룰 '{alt}' 가 존재하고 라이브와 다르다")
+    # 점수 호출이 상수를 쓰는가 — mom_score(s, "mom12_0") 처럼 문자열을 박으면
+    # SATELLITE_RANK_RULE 을 바꿔도 실제 점수는 안 바뀐다. 가장 조용한 실패다.
+    lits = [c.args[1].value for c in calls_to(t_fx, "mom_score")
+            if len(c.args) > 1 and isinstance(c.args[1], ast.Constant)]
+    chk(not lits, "S4c",
+        "mom_score 호출에 룰 문자열 리터럴이 없다"
+        + (f" — 잔존 {lits}: 상수를 바꿔도 점수가 안 바뀐다" if lits else ""))
+
+    # ── S5 가드와 조회가 같은 이름을 쓰는가 ──
+    guard_names = set()
+    for cmpn in ast.walk(f):
+        if not isinstance(cmpn, ast.Compare) or not isinstance(cmpn.left, ast.Call):
+            continue
+        lf = cmpn.left.func
+        if getattr(lf, "id", None) != "len":
+            continue
+        for c in cmpn.comparators:
+            if isinstance(c, ast.Name):
+                guard_names.add(c.id)
+            elif isinstance(c, ast.Constant):
+                guard_names.add(repr(c.value))
+    chk("SATELLITE_BARS" in guard_names, "S5",
+        f"이력 가드가 SATELLITE_BARS 를 쓴다 (관측: {sorted(guard_names) or '없음'})"
+        + ("" if "SATELLITE_BARS" in guard_names
+           else " — 가드만 리터럴이면 스킵 사유가 엉뚱하게 찍힌다"))
+
+
 def group_H():
     print("\n[H] Hidden Alpha 창 — rotation_core 소유 정책")
 
@@ -957,7 +1070,10 @@ def group_E(blackout=None, tag_suffix=""):
     B_TKR_N = _bars_at("run_narrative", "verify_emerging_with_quant",
                        "_fmp_close_series", {"s", "vol"})
     B_SPY_F = _bars_at("fmp_extras", "compute_satellite_top10", "_closes", {"spy"})
-    B_CND_F = _bars_at("fmp_extras", "compute_satellite_top10", "_closes", {"s"})
+    # 후보 창은 fmp_extras.SATELLITE_BARS 가 소유한다([S] 군 참조).
+    # 호출부의 `bars=SATELLITE_BARS` 는 ast.Name 이라 _const_int 가 접지 못한다.
+    # B_HID 와 같은 처리다 — 이름 참조 유지는 S1 이 별도로 지킨다.
+    B_CND_F = getattr(fx, "SATELLITE_BARS", None)
     # run_hidden_alpha 의 창은 rotation_core 가 소유한다([H] 군 참조).
     # 호출부의 `bars=rc.REQUIRED_BARS` 는 `ast.Attribute` 라 _const_int 가 접지
     # 못한다. 그래서 여기서만 **정책 소유자에서 직접** 읽는다 — 진단이 들고
@@ -1075,13 +1191,17 @@ def main():
     for name, mod in _MODULES.items():
         print(f"  {name:18s}: {mod.__file__}")
     print(f"  earnings_core     : {ec.__file__}")
-    print(f"  rotation_core     : {rc.__file__} (창 깊이 정책 소유자)")
+    print(f"  rotation_core     : {rc.__file__} (Hidden Alpha 창 정책 소유자)")
+    print(f"  fmp_extras.MOM_RULES: 위성 랭킹 창 정책 소유자 "
+          f"(라이브 룰 {getattr(fx, 'SATELLITE_RANK_RULE', '?')} · "
+          f"{getattr(fx, 'SATELLITE_BARS', '?')}봉)")
     print(f"  하네스             : {dhw.__file__} (스텁·AST 헬퍼 재사용)")
     print("=" * 78)
 
     group_C()
     group_R()
     group_Q()
+    group_S()
     group_H()
     if c_stop():
         group_E()

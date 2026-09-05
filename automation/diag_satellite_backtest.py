@@ -14,7 +14,11 @@
 
   점수 = 1M×0.40 + 3M×0.40 + 6M×0.20   (1주는 노이즈 — 점수 제외)
   GICS 섹터당 최고점 1개만 챔피언 → 점수 내림차순
-  히스토리 127봉 미만 티커 제외 (라이브와 동일)
+  히스토리 127봉 미만 티커 제외
+  ⚠️ [2026-09-06] 라이브는 mom12_0 · 253봉으로 갔다. 이 그리드는 **blend 기준**
+     이므로 127 을 그대로 둔다 — 숫자를 바꾸면 기존 결과와 대조가 끊긴다.
+     즉 이 파일의 24설정 그리드는 이제 '현행 재현'이 아니라 **교체 전 기록**이다.
+     라이브 룰 비교는 diag_momentum_rule_compare 가 소유한다.
   시장 필터 = SPY 종가 vs 최근 200봉 평균 (라이브의 spy.tail(200).mean() 과 동일)
 
 검증 설계
@@ -177,7 +181,10 @@ SEG_MAX        = 6            # 분해 구간 수 **안전 캡** — 실제 도�
 #      FMP 가 상한을 올리면 4 는 데이터를 버리게 된다. 캡은 캡으로 둔다.
 #      진짜 제약은 SEG_MAX 가 아니라 WARMUP_BARS 와 받는 봉수다.
 
-WARMUP_BARS    = 127          # 6M(126봉) 계산 최소 — compute_satellite_top10 과 동일
+WARMUP_BARS    = 127          # 6M(126봉) 계산 최소 — blend 룰 기준
+#   ⚠️ 라이브(compute_satellite_top10)는 2026-09-06 부터 253봉이다. 여기가
+#      127 인 것은 **이 그리드가 blend 를 재는 기록물**이기 때문이다. 맞추려고
+#      253 으로 올리면 기존 24설정 결과가 전부 달라져 대조가 끊긴다.
 MA200_BARS     = 200          # 시장 필터
 WINDOWS        = {"1년": 252, "2년": 504, "3년": 756}   # 거래일 기준
 
@@ -431,7 +438,7 @@ class RankEngine:
                     continue
                 idx, vals = ser
                 n = int(np.searchsorted(idx, np.datetime64(key), side="right"))
-                if n < self.warmup:                     # 라이브의 len(s) < 127 스킵과 동일
+                if n < self.warmup:                     # 라이브의 len(s) < SATELLITE_BARS 와 같은 역할
                     continue
                 # 점수식은 fmp_extras 룰 SSOT. 여기서 다시 쓰지 않는다.
                 score = fx.mom_score(vals[:n], self.rank_rule)

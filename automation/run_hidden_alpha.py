@@ -735,20 +735,40 @@ def build_satellite_html(sat: dict | None) -> str:
             f'<div style="border-bottom:1px solid #1f2937;padding:8px 0;">'
             f'<div style="font-size:14px;color:#e2e8f0;"><b>{r["rank"]}위 {r["ticker"]}</b>'
             f' <span style="color:#94a3b8;">— {r["sector_label"]}{theme}</span>'
-            f' &nbsp;<span style="color:#fbbf24;font-weight:700;">점수 {r["score"]:+.1f}</span></div>'
+            f' &nbsp;<span style="color:#fbbf24;font-weight:700;">점수 {r["score"]:+.1f}</span>'
+            + (f' <span style="color:#64748b;font-size:12px;">&lt;12-1 {r["score_alt"]:+.1f}&gt;</span>'
+               if r.get("score_alt") is not None else "")
+            + '</div>'
             f'<div style="font-size:12px;color:#94a3b8;margin-top:2px;">'
             f'1M {r["r1m"]:+.1f}% · 3M {r["r3m"]:+.1f}% · 6M {r["r6m"]:+.1f}%{r1w}</div>'
             f'<div style="font-size:12px;color:#cbd5e1;margin-top:2px;">중복: {ov}</div>'
             f'</div>'
+        )
+
+    # ── 참고 룰(12-1) 랭킹 — 표시 전용, 매매 판단에 쓰지 않는다 ──
+    # 12-0 채택은 4년 백테스트 근거다. 그 선택의 검증은 앞으로의 실제 데이터로만
+    # 가능하고, 그러려면 "12-1 이었으면 무엇을 들었을까"가 매주 남아 있어야 한다.
+    alt = sat.get("alt") or {}
+    alt_tk = alt.get("tickers") or []
+    alt_html = ""
+    if alt_tk:
+        live5 = [r["ticker"] for r in sat["rows"][:5]]
+        same = len(set(live5) & set(alt_tk[:5]))
+        alt_html = (
+            '<div style="font-size:11px;color:#94a3b8;margin-top:10px;'
+            'padding-top:8px;border-top:1px dashed #334155;">'
+            f'📎 참고 · {alt.get("label", "12-1")} 이었다면 Top5: '
+            f'<b style="color:#cbd5e1;">{", ".join(alt_tk[:5])}</b> '
+            f'(현재 Top5와 {same}/5 일치) — 표시 전용, 매매 판단에 쓰지 않음</div>'
         )
     return (
         '<div style="background:#1e293b;border-radius:10px;padding:14px 16px;margin-bottom:16px;">'
         '<div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:4px;">'
         '🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보</div>'
         '<div style="font-size:11px;color:#64748b;margin-bottom:10px;">'
-        '점수 = 1M×40% + 3M×40% + 6M×20% (1주는 표시만) · GICS 섹터당 1개 · '
-        '중복 % = 구성종목 상위 15개 교집합 · 🟢&lt;25 🟡25~40 🔴40+</div>'
-        f'{mf_html}{rows_html}'
+        '점수 = <b>12개월 수익률(12-0)</b> · 1M/3M/6M 은 맥락 표시일 뿐 점수에 안 들어간다 · '
+        'GICS 섹터당 1개 · 중복 % = 구성종목 상위 15개 교집합 · 🟢&lt;25 🟡25~40 🔴40+</div>'
+        f'{mf_html}{rows_html}{alt_html}'
         f'<div style="font-size:11px;color:#64748b;margin-top:8px;">기준: {sat.get("as_of", "")}'
         ' · 상세 매트릭스는 앱 [2단계] 섹터 &amp; 자금 흐름 탭</div>'
         '</div>'
