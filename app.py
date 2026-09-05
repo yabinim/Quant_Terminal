@@ -7296,6 +7296,36 @@ def _fmp_cashflow(ticker: str) -> dict:
 
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_income_series(ticker: str, *, period: str, limit: int) -> list:
+    """income-statement 원본 레코드 리스트(최신 우선). 실패 시 [].
+
+    ⚠️ `scanner_core._fmp_income` 을 재사용하지 않는 이유:
+       그쪽은 `period=annual&limit=2` **고정**이고 `{latest, prev}` 두 건만
+       돌려준다. 여기 호출부는 연간 3건(추세)과 분기 4건(QoQ 폴백)이 필요해
+       계약이 맞지 않는다. scanner_core 에 period/limit 인자를 뚫는 방법도
+       있지만, 그건 자동화(주말 스캐너)도 쓰는 SSOT 모듈이라 대화형 화면
+       하나 때문에 락스텝 범위를 넓히게 된다. 폭발 반경이 맞지 않는다.
+
+    ⚠️ 캐시가 **필수**다. 호출부 calculate_style_scores 는 @st.cache_data 가
+       없는데 모듈 최상위에서 불린다 — Streamlit 은 위젯을 건드릴 때마다
+       스크립트를 전부 다시 돌리므로, 예전엔 사이드바 입력 한 번에
+       income-statement 콜이 나갔다. 레이트리미터 밖이었다.
+    """
+    k = _fmp_key()
+    if not k or not ticker:
+        return []
+    try:
+        r = _fmp_ui_get(f"{_FMP_BASE}/income-statement?symbol={ticker}"
+                        f"&period={period}&limit={int(limit)}&apikey={k}")
+        if r is None:
+            return []
+        d = r.json()
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
 def _fmp_batch_to_close_df(tickers: list, *, calendar_days: int = 190) -> pd.DataFrame:
     """FMP 배치 조회 → Close 컬럼만 모은 DataFrame 반환.
 
@@ -8405,12 +8435,10 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     k_val = _fmp_key()
     if k_val:
         try:
-            r_inc = requests.get(
-                f"{_FMP_BASE}/income-statement?symbol={ticker_upper}&period=annual&limit=3&apikey={k_val}",
-                timeout=_FMP_TIMEOUT
-            )
-            inc_data = r_inc.json() if r_inc.status_code == 200 else []
-            if isinstance(inc_data, list) and len(inc_data) >= 2:
+            # 캐시 헬퍼 경유(2026-09-04). 이 함수는 @st.cache_data 가 없는데
+            # 모듈 최상위에서 불린다 — 예전엔 rerun 마다 콜이 나갔다.
+            inc_data = _fmp_income_series(ticker_upper, period="annual", limit=3)
+            if len(inc_data) >= 2:
                 latest_inc = inc_data[0]
                 prev_inc   = inc_data[1]
                 rev_now  = to_float(latest_inc.get("revenue"))
@@ -8432,13 +8460,14 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
         except Exception:
             pass
         try:
-            r_cf = requests.get(
-                f"{_FMP_BASE}/cash-flow-statement?symbol={ticker_upper}&period=annual&limit=1&apikey={k_val}",
-                timeout=_FMP_TIMEOUT
-            )
-            cf_data = r_cf.json() if r_cf.status_code == 200 else []
-            if isinstance(cf_data, list) and cf_data:
-                cf = cf_data[0]
+            # ⚠️ 생 호출을 지우고 기존 `_fmp_cashflow()` 를 부른다(2026-09-04).
+            #    URL 이 글자까지 같았다 —
+            #      _fmp_cashflow          …?symbol={ticker}&period=annual&limit=1
+            #      여기(구)               …?symbol={ticker_upper}&period=annual&limit=1
+            #    변수명만 달랐다. 그런데 _fmp_cashflow 는 이미 @st.cache_data 가
+            #    붙어 있고, 같은 렌더에서 같은 티커로 둘 다 돌았다.
+            cf = _fmp_cashflow(ticker_upper)
+            if cf:
                 fcf = to_float(cf.get("freeCashFlow"))
                 if pd.isna(fcf):
                     ocf = to_float(cf.get("operatingCashFlow"))
@@ -8493,17 +8522,12 @@ def calculate_style_scores(ticker_symbol: str, margin_context: dict, kpi_df) -> 
     # QoQ EPS fallback — FMP income-statement(quarter) 직접 계산
     if pd.isna(qoq_eps_growth) and k_val:
         try:
-            r_q = requests.get(
-                f"{_FMP_BASE}/income-statement?symbol={ticker_upper}&period=quarter&limit=4&apikey={k_val}",
-                timeout=_FMP_TIMEOUT
-            )
-            if r_q.status_code == 200:
-                q_data = r_q.json()
-                if isinstance(q_data, list) and len(q_data) >= 2:
-                    eps_now  = to_float(q_data[0].get("epsdiluted") or q_data[0].get("eps"))
-                    eps_prev = to_float(q_data[1].get("epsdiluted") or q_data[1].get("eps"))
-                    if pd.notna(eps_now) and pd.notna(eps_prev) and eps_prev != 0:
-                        qoq_eps_growth = float((eps_now - eps_prev) / abs(eps_prev) * 100)
+            q_data = _fmp_income_series(ticker_upper, period="quarter", limit=4)
+            if len(q_data) >= 2:
+                eps_now  = to_float(q_data[0].get("epsdiluted") or q_data[0].get("eps"))
+                eps_prev = to_float(q_data[1].get("epsdiluted") or q_data[1].get("eps"))
+                if pd.notna(eps_now) and pd.notna(eps_prev) and eps_prev != 0:
+                    qoq_eps_growth = float((eps_now - eps_prev) / abs(eps_prev) * 100)
         except Exception:
             pass
 
@@ -15929,6 +15953,90 @@ def generate_weekly_portfolio_summary(portfolio_context: dict, narrative_context
         return f"Weekly Summary 생성 실패: {exc}"
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _fmp_batch_quote_raw(symbols: tuple) -> list:
+    """batch-quote 원본 리스트. 실패 시 [].
+
+    ⚠️ TTL 이 60초로 **짧다**. 당일 등락률이라 오래 캐시하면 화면이 거짓말을
+       한다. 그래도 rerun 폭풍은 막힌다 — 위젯을 연달아 건드려도 1분에 1콜이다.
+    ⚠️ 인자가 tuple 인 이유: @st.cache_data 는 인자를 해시한다. list 는 안 된다.
+    """
+    k = _fmp_key()
+    if not k or not symbols:
+        return []
+    try:
+        r = _fmp_ui_get(f"{_FMP_BASE}/batch-quote?symbols={','.join(symbols)}&apikey={k}")
+        if r is None:
+            return []
+        d = r.json()
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fmp_single_quote_raw(ticker: str) -> dict:
+    """단일 quote — batch-quote 누락분 폴백. 실패 시 {}."""
+    k = _fmp_key()
+    if not k or not ticker:
+        return {}
+    try:
+        r = _fmp_ui_get(f"{_FMP_BASE}/quote?symbol={ticker}&apikey={k}")
+        if r is None:
+            return {}
+        d = r.json()
+        return d[0] if isinstance(d, list) and d and isinstance(d[0], dict) else {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _fmp_stock_news_batch(tickers: tuple, *, limit: int) -> dict:
+    """{티커: [헤드라인…]} — 종목별 news/stock 을 병렬로 모은다.
+
+    ⚠️ **개별 호출이 아니라 배치를 캐시하는 이유**: 병렬 조회가
+       ThreadPoolExecutor 안에서 일어난다. 워커 스레드에서 @st.cache_data
+       함수를 부르면 Streamlit 세션 컨텍스트가 없어 경고가 나거나 깨진다.
+       그래서 **캐시 경계를 스레드 바깥에** 둔다 — 이 함수는 메인 스레드에서
+       한 번 불리고, 안쪽 워커는 캐시 없는 _fmp_ui_get 을 직접 쓴다.
+    ⚠️ 뉴스는 가격과 달리 TTL 이 길어도 된다(15분).
+    """
+    import concurrent.futures as _cf
+    out = {tk: [] for tk in tickers}
+    k = _fmp_key()
+    if not k or not tickers:
+        return out
+
+    def _one(tk):
+        try:
+            r = _fmp_ui_get(f"{_FMP_BASE}/news/stock?symbols={tk}"
+                            f"&limit={int(limit)}&apikey={k}")
+            if r is None:
+                return tk, []
+            d = r.json()
+            if not isinstance(d, list):
+                return tk, []
+            heads = []
+            for n in d[:int(limit)]:
+                if not isinstance(n, dict):
+                    continue
+                title = _clean_news_text(str(n.get("title") or ""))
+                if title:
+                    heads.append(title)
+            return tk, heads
+        except Exception:
+            return tk, []
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=min(8, len(tickers))) as exe:
+            for tk, heads in exe.map(_one, tickers):
+                if tk in out:
+                    out[tk] = heads
+    except Exception:
+        pass
+    return out
+
+
 def _fetch_portfolio_movement_data(tickers: list) -> tuple:
     """'지금 무슨일이야?' 분석용 데이터 수집.
 
@@ -15937,10 +16045,12 @@ def _fetch_portfolio_movement_data(tickers: list) -> tuple:
       spy_change_pct = float|None  (시장 컨텍스트용 SPY 당일 등락률)
 
     가격·등락률은 FMP /batch-quote 1콜(누락분만 단일 quote 폴백),
-    뉴스는 종목별 /news/stock 을 ThreadPoolExecutor 로 병렬 조회한다.
+    뉴스는 종목별 /news/stock 을 병렬 조회한다.
+    ⚠️ 세 호출 모두 캐시 헬퍼 경유다(_fmp_batch_quote_raw ·
+       _fmp_single_quote_raw · _fmp_stock_news_batch). 병렬 실행은
+       _fmp_stock_news_batch 안으로 들어갔으므로 여기엔 스레드가 없다 —
+       그래서 concurrent.futures import 도 없앴다.
     """
-    import concurrent.futures as _cf
-
     clean = list(dict.fromkeys([str(t).strip().upper() for t in tickers if str(t).strip()]))
     movement_map = {tk: {"change_pct": None, "price": None, "news": []} for tk in clean}
     spy_change_pct = None
@@ -15972,18 +16082,14 @@ def _fetch_portfolio_movement_data(tickers: list) -> tuple:
                 movement_map[sym]["price"] = round(float(prc), 2)
 
     # ── 1) 당일 등락률: batch-quote 1콜 ──────────────────────────────────────
-    try:
-        r = requests.get(
-            f"{_FMP_BASE}/batch-quote?symbols={','.join(quote_syms)}&apikey={k}",
-            timeout=_FMP_TIMEOUT,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list):
-                for it in data:
-                    _apply_quote(it)
-    except Exception:
-        pass
+    # ⚠️ 2026-09-04: 세 호출을 전부 캐시 헬퍼로 옮겼다. 이 함수는
+    #    @st.cache_data 가 없는데 모듈 최상위에서 불린다 — Streamlit 은 위젯을
+    #    건드릴 때마다 스크립트를 다시 돌리므로, 예전엔 사이드바 입력 한 번에
+    #    batch-quote + 누락분 quote + 종목 수만큼의 news/stock 이 통째로
+    #    다시 나갔다. 보유 종목이 20개면 rerun 한 번에 20콜 이상이다.
+    #    전부 레이트리미터 밖이었다.
+    for it in _fmp_batch_quote_raw(tuple(quote_syms)):
+        _apply_quote(it)
 
     # 누락 종목만 단일 quote 폴백
     missing = [
@@ -15992,42 +16098,17 @@ def _fetch_portfolio_movement_data(tickers: list) -> tuple:
         or (tk in movement_map and movement_map[tk]["change_pct"] is None)
     ]
     for tk in missing:
-        try:
-            r = requests.get(f"{_FMP_BASE}/quote?symbol={tk}&apikey={k}", timeout=_FMP_TIMEOUT)
-            if r.status_code == 200:
-                d = r.json()
-                if isinstance(d, list) and d:
-                    _apply_quote(d[0])
-        except Exception:
-            pass
+        d = _fmp_single_quote_raw(tk)
+        if d:
+            _apply_quote(d)
 
     # ── 2) 종목별 뉴스: 병렬 조회 ────────────────────────────────────────────
-    def _fetch_one_news(tk):
-        try:
-            r = requests.get(
-                f"{_FMP_BASE}/news/stock?symbols={tk}&limit=3&apikey={k}",
-                timeout=_FMP_TIMEOUT,
-            )
-            if r.status_code == 200:
-                d = r.json()
-                if isinstance(d, list):
-                    heads = []
-                    for n in d[:3]:
-                        title = _clean_news_text(str(n.get("title") or ""))
-                        if title:
-                            heads.append(title)
-                    return tk, heads
-        except Exception:
-            pass
-        return tk, []
-
-    try:
-        with _cf.ThreadPoolExecutor(max_workers=min(8, len(clean))) as exe:
-            for tk, heads in exe.map(_fetch_one_news, clean):
-                if tk in movement_map:
-                    movement_map[tk]["news"] = heads
-    except Exception:
-        pass
+    # ⚠️ 병렬 조회가 _fmp_stock_news_batch **안으로** 들어갔다. 캐시 경계를
+    #    스레드 바깥에 둬야 한다 — 워커 스레드에서 @st.cache_data 함수를
+    #    부르면 Streamlit 세션 컨텍스트가 없어 경고가 나거나 깨진다.
+    for tk, heads in _fmp_stock_news_batch(tuple(clean), limit=3).items():
+        if tk in movement_map:
+            movement_map[tk]["news"] = heads
 
     return movement_map, spy_change_pct
 
