@@ -3158,7 +3158,7 @@ def _render_guest_guide():
 
 - 🚨 Daily Risk Gauge의 「🔄 지금 스캔」 — 선행 신호 8가지를 실시간 값으로 갱신
 - 🎯 섹터 & 자금 흐름의 「🔍 Early Signal 스캔」 — 막 강해지기 시작한 섹터/ETF 발굴, 결과 아래 **🧭 로테이션 진단**이 자산군 큰 그림을 요약
-- 🛰️ **위성 섹터 Top10** (섹터 & 자금 흐름 탭) — GICS 섹터당 1개 ETF 월간 리밸런싱 후보 (점수 = 1M×40% + 3M×40% + 6M×20%, 자동 계산 · 1시간 캐시)
+- 🛰️ **위성 섹터 Top10** (섹터 & 자금 흐름 탭) — GICS 섹터당 1개 ETF 월간 리밸런싱 후보 (점수 = 12개월 수익률 `12-0`, 자동 계산 · 1시간 캐시)
 
 스캔 결과의 **🐣 인큐베이터 N개** 표시는 상장 이력이 짧아(70거래일 미만) 이번 계산에서 제외된 신규 ETF라는 뜻이며,
 이력이 쌓이면 자동으로 재편입되므로 오류가 아닙니다.
@@ -19451,7 +19451,8 @@ if st.session_state.get("logged_in"):
                 st.divider()
                 st.markdown("#### 🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보")
                 st.caption(
-                    "점수 = 1M×40% + 3M×40% + 6M×20% (1주는 노이즈 — 표시만) · GICS 섹터당 1개 · "
+                    f"점수 = **12개월 수익률(12-0)** · 소요 이력 {fx.SATELLITE_BARS}봉 · "
+                    "GICS 섹터당 1개 · 1M/3M/6M 은 맥락 표시일 뿐 점수에 안 들어간다 · "
                     "중복 % = 구성종목 상위 15개 교집합 · 주말 Hidden Alpha 이메일에도 동일 리스트 포함"
                 )
                 # ⚠️ 계측 결과 이 블록이 섹터 탭 첫 진입의 75%(34.5초 · 67콜)를 썼다.
@@ -19467,7 +19468,7 @@ if st.session_state.get("logged_in"):
                         st.session_state["_sat_show"] = True
                         st.rerun()
                     st.caption(
-                        "약 60개 ETF의 1M·3M·6M 수익률을 받아 점수를 냅니다. "
+                        f"약 60개 ETF의 {fx.SATELLITE_BARS}봉 이력을 받아 12개월 수익률로 점수를 냅니다. "
                         "**월간 리밸런싱 때만 필요한 계산**이라 탭 진입 시 자동으로 "
                         "돌리지 않습니다. 주말 Hidden Alpha 이메일에도 같은 리스트가 "
                         "들어가므로 누르지 않아도 놓치지 않습니다."
@@ -19496,10 +19497,12 @@ if st.session_state.get("logged_in"):
                     for _r in _sat["rows"]:
                         _theme = f" · {_r['theme_label']}" if _r.get("theme_label") else ""
                         _r1w = f" (1W {_r['r1w']:+.1f}%)" if _r.get("r1w") is not None else ""
+                        _alt_s = _r.get("score_alt")
+                        _alt = f" · <12-1 {_alt_s:+.1f}>" if _alt_s is not None else ""
                         st.markdown(
                             f"**{_r['rank']}위 {_r['ticker']}** — {_r['sector_label']}{_theme} · "
-                            f"점수 **{_r['score']:+.1f}** | 1M {_r['r1m']:+.1f}% · 3M {_r['r3m']:+.1f}% · "
-                            f"6M {_r['r6m']:+.1f}%{_r1w}"
+                            f"점수 **{_r['score']:+.1f}**{_alt} | 1M {_r['r1m']:+.1f}% · "
+                            f"3M {_r['r3m']:+.1f}% · 6M {_r['r6m']:+.1f}%{_r1w}"
                         )
                         if _r.get("overlaps"):
                             _ov = " · ".join(
@@ -19520,6 +19523,20 @@ if st.session_state.get("logged_in"):
                             _mx.style.format("{:.0f}%", na_rep="—")
                             .background_gradient(cmap="RdYlGn_r", vmin=0, vmax=60),
                             use_container_width=True,
+                        )
+                    # ── 참고 룰(12-1) 랭킹 — 표시 전용 ──
+                    # 12-0 채택은 4년 백테스트 근거다. 그 선택이 옳았는지는
+                    # 앞으로의 실제 데이터로만 알 수 있고, 그러려면 "12-1 이었으면
+                    # 무엇을 들었을까"가 매주 남아 있어야 한다.
+                    _alt_blk = _sat.get("alt") or {}
+                    _alt_tk = _alt_blk.get("tickers") or []
+                    if _alt_tk:
+                        _live5 = [r["ticker"] for r in _sat["rows"][:5]]
+                        _same = len(set(_live5) & set(_alt_tk[:5]))
+                        st.caption(
+                            f"　📎 참고 · {_alt_blk.get('label', '12-1')} 이었다면 Top5: "
+                            f"**{', '.join(_alt_tk[:5])}** "
+                            f"(현재 Top5와 {_same}/5 일치) — 표시 전용, 매매 판단에 쓰지 않음"
                         )
                     if _sat.get("skipped"):
                         st.caption(

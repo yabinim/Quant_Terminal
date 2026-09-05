@@ -1025,6 +1025,36 @@ MOM_RULES = {
     "mom12_1_ra": (score_mom12_1_ra, MOM_BARS_12M + 1),
 }
 
+# ═══ 위성 랭킹 정책 — 이 두 줄이 '어떤 룰로 돈이 움직이는가'의 유일한 출처 ═══
+#
+# 왜 리터럴 대신 파생인가
+# ───────────────────────
+# 예전에는 호출부에 `bars=127` 이 **손으로 적혀** 있었다. 룰과 깊이가 따로
+# 움직일 수 있다는 뜻이다. 룰만 12-0 으로 바꾸고 127 을 그대로 두면 후보 대부분이
+# 이력 부족으로 조용히 탈락하고, 살아남는 건 오래된 ETF 뿐이다 — **에러 없이
+# 유니버스가 바뀐다.** 그 실패는 로그를 남기지 않는다.
+# SATELLITE_BARS 를 MOM_RULES 에서 파생시키면 룰을 바꿀 때 깊이가 따라온다.
+#
+# ⚠️ 리터럴로 되돌리지 말 것. diag_hist_window_consumers 의 [S] 군이
+#    '이름 참조' 와 '파생 여부'를 양방향으로 지킨다(H1/H2 와 같은 형태).
+#
+# [2026-09-06] blend → mom12_0 교체. 근거: diag_momentum_rule_compare 워크포워드
+#   6창에서 T2(12-0 vs 현행) 5/6 통과, T1(12-1) 6/6 통과. 둘 중 12-0 을 택한 것은
+#   top5_eq 6창 평균이 전 항목 우세(수익 30.3/25.6 · MDD -16.2/-16.8 ·
+#   샤프 1.17/1.00 · 회전 7.3x/8.2x)이고, FF48 산업 1975~2024 문헌이 산업
+#   포트폴리오에서 12-0 을 지지하기 때문이다. T7(위험조정 12-0)은 2/6 으로 미달.
+SATELLITE_RANK_RULE = "mom12_0"
+SATELLITE_ALT_RULE = "mom12_1"      # 표시 전용 — 전진 기록을 쌓기 위한 참고 열
+for _r in (SATELLITE_RANK_RULE, SATELLITE_ALT_RULE):
+    if _r not in MOM_RULES:
+        # 임포트 시점에 **크게** 죽인다. 조용히 폴백하면 '12-0 을 쓰고 있다고
+        # 믿는 blend' 가 돌아가고, 그 실패는 로그를 남기지 않는다.
+        raise KeyError(f"위성 랭킹 룰 {_r!r} 이 MOM_RULES 에 없다 "
+                       f"(가능: {sorted(MOM_RULES)})")
+del _r
+SATELLITE_BARS = MOM_RULES[SATELLITE_RANK_RULE][1]          # → 253
+SATELLITE_ALT_BARS = MOM_RULES[SATELLITE_ALT_RULE][1]       # → 253
+
 MOM_RULE_LABELS = {
     "blend":      "현행(1M40/3M40/6M20)",
     "mom12_1":    "12-1(직전1M 제외)",
@@ -1095,39 +1125,70 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
 
     # ── 섹터별 챔피언 선발 ──
     theme_label_map = {t: lbl for lst in SECTOR_THEME_ETFS.values() for t, lbl in lst}
-    champions = []
+    champions, champions_alt = [], []
     for sec, cands in satellite_candidate_pool().items():
-        best = None
+        best = best_alt = None
         for tk in cands:
-            # 소요 127봉 — 아래 len(s) < 127 가드와 score_blend 의 6M 항(126봉).
-            s = _closes(tk, bars=127)
+            # 소요 봉수는 SATELLITE_BARS 가 소유한다 — 룰에서 파생되므로
+            # 룰을 바꾸면 여기도 따라온다. 숫자를 손으로 적지 말 것.
+            s = _closes(tk, bars=SATELLITE_BARS)
             _time.sleep(pause_sec)
-            if len(s) < 127:  # 6M(126봉) 계산 불가
-                out["skipped"].append((tk, f"히스토리 부족({len(s)}봉)"))
+            if len(s) < SATELLITE_BARS:      # 12개월(252봉) 계산 불가
+                out["skipped"].append(
+                    (tk, f"히스토리 부족({len(s)}봉 · {SATELLITE_BARS}봉 필요)"))
                 continue
-            # 점수식은 이 파일 위쪽의 룰 SSOT(score_blend)를 쓴다. 백테스트가
+            # 점수식은 이 파일 위쪽의 룰 SSOT(mom_score)를 쓴다. 백테스트가
             # 검증하는 식과 돈이 따라가는 식이 갈라지지 않게 하려는 것이 목적이다.
             _c = mom_components(s)
             r1w, r1m, r3m, r6m = _c["r1w"], _c["r1m"], _c["r3m"], _c["r6m"]
             if any(pd.isna(x) for x in (r1m, r3m, r6m)):
                 out["skipped"].append((tk, "수익률 계산 실패"))
                 continue
-            score = score_blend(s)
+            score = mom_score(s, SATELLITE_RANK_RULE)
+            if pd.isna(score):
+                out["skipped"].append((tk, f"{SATELLITE_RANK_RULE} 점수 산출 실패"))
+                continue
+            # 참고 룰 점수. 추가 API 호출 없음 — 같은 s 배열을 쓴다.
+            # nan 이어도 라이브 랭킹에는 영향이 없어야 하므로 스킵하지 않는다.
+            score_alt = mom_score(s, SATELLITE_ALT_RULE)
             row = {"ticker": tk, "sector": sec,
                    "sector_label": GICS_SECTOR_LABELS.get(sec, sec),
                    "theme_label": ("섹터 대표" if tk == sec else theme_label_map.get(tk, "")),
                    "score": round(score, 2),
+                   "score_alt": round(score_alt, 2) if pd.notna(score_alt) else None,
                    "r1w": round(r1w, 2) if pd.notna(r1w) else None,
                    "r1m": round(r1m, 2), "r3m": round(r3m, 2), "r6m": round(r6m, 2)}
             if best is None or row["score"] > best["score"]:
                 best = row
+            # 참고 랭킹은 **독립적으로** 뽑는다. 라이브 챔피언의 대체 점수만 보면
+            # "순서가 바뀌었나"만 알 뿐 "다른 종목을 들었을까"는 알 수 없다.
+            if row["score_alt"] is not None and (
+                    best_alt is None or row["score_alt"] > best_alt["score_alt"]):
+                best_alt = row
         if best is not None:
             champions.append(best)
+        if best_alt is not None:
+            champions_alt.append(best_alt)
 
     champions.sort(key=lambda r: r["score"], reverse=True)
     rows = champions[:max(1, int(top_n))]
     for i, r in enumerate(rows, 1):
         r["rank"] = i
+
+    # ── 참고 룰(12-1) 랭킹 — 표시 전용, 매매 판단에 쓰지 않는다 ──
+    # 목적: 12-0 채택은 4년 백테스트 근거다. 앞으로의 실제 데이터로 그 선택을
+    #   검증하려면 "12-1 이었으면 무엇을 들었을까"가 매주 기록되어야 한다.
+    #   지금 안 쌓으면 1년 뒤에도 똑같이 모른다.
+    champions_alt.sort(key=lambda r: (r["score_alt"] or -1e18), reverse=True)
+    alt_rows = champions_alt[:max(1, int(top_n))]
+    out["alt"] = {
+        "rule": SATELLITE_ALT_RULE,
+        "label": MOM_RULE_LABELS.get(SATELLITE_ALT_RULE, SATELLITE_ALT_RULE),
+        "tickers": [r["ticker"] for r in alt_rows],
+        "scores": {r["ticker"]: r["score_alt"] for r in alt_rows},
+    }
+    out["rule"] = SATELLITE_RANK_RULE
+    out["rule_label"] = MOM_RULE_LABELS.get(SATELLITE_RANK_RULE, SATELLITE_RANK_RULE)
 
     # ── 후보 간 구성종목 중복 (전체 쌍 matrix + 행별 10%↑ 나열) ──
     hold = {r["ticker"]: _top_holdings_set(r["ticker"], ETF_CONSTITUENTS) for r in rows}
