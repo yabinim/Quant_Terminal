@@ -743,7 +743,23 @@ def main():
         if not sym:
             print(f"  ⏭️  {tag} — 시드 없음, 건너뜀")
             return None
-        v, d, det = call(f"historical-price-eod/full?symbol={sym}&limit=250")
+        # ⚠️ `limit=250` 이었다(2026-09-04 수정). 두 가지가 틀려 있었다:
+        #   ① FMP `historical-price-eod` 는 `limit=` 을 조용히 무시한다.
+        #      250 을 요청하든 말든 ~1,254봉이 온다.
+        #   ② 위 주석이 "run_watchlist_alerts:191 과 동일 경로"라고 주장하는데
+        #      **그쪽은 이미 from/to 창으로 옮겼다.** 경로 동일성을 주장하는
+        #      진단이 다른 경로를 타고 있었다. 판정이 "비었나/왔나" 뿐이라
+        #      결과는 안 바뀌었지만, 재현한다고 말하는 걸 재현하지 않았다.
+        # ⚠️ 여기서 `fmp_extras` 를 import 하지 않는다. 이 파일이 A1 기준선에
+        #    남아 있는 사유가 **프로젝트 모듈 무의존**이다 — 사본이 낡아도
+        #    진단 결과가 흔들리지 않아야 한다. 그래서 창을 인라인으로 만든다.
+        #    ⚠️ 대신 이 날짜 계산은 fmp_extras 의 정책과 **다를 수 있다**.
+        #       여기 판정은 "0건인가 아닌가" 뿐이라 정밀도가 필요 없다.
+        #       봉수를 세는 검사를 여기 추가하려면 그때는 fx 를 써야 한다.
+        _to = datetime.now(timezone.utc).date()
+        _from = _to - timedelta(days=520)     # ≈ 250봉 + 넉넉한 여유
+        v, d, det = call(f"historical-price-eod/full?symbol={sym}"
+                         f"&from={_from.isoformat()}&to={_to.isoformat()}")
         n = len(d) if isinstance(d, list) else (1 if d else 0)
         empty = (v == "EMPTY") or (v == "OK" and n == 0)
         show(tag, v, det + ("  ← 비었다 = A-2a 발동" if empty

@@ -39,6 +39,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import earnings_core as ec   # noqa: E402
+import fmp_extras as fx      # noqa: E402  — 창 환산 SSOT
 
 FMP_API_KEY = os.environ["FMP_API_KEY"]
 _FMP_BASE = "https://financialmodelingprep.com/stable"
@@ -48,7 +49,24 @@ SURPRISE_LOOKBACK = 8
 RS_WINDOW = 20
 COST_BPS = 5.0
 MIN_EVENTS = 40
-HIST_LIMIT = 1400
+# ⚠️ 이름이 예전엔 `HIST_LIMIT = 1400` 이었다(2026-09-04 개명·수정).
+#    두 가지가 틀려 있었다:
+#      ① FMP `historical-price-eod` 는 **`limit=` 을 조용히 무시한다.**
+#         요청과 무관하게 항상 ~1,254봉이 온다. 러너·코어는 이미 from/to 창으로
+#         옮겼는데 이 진단만 남아 있었다.
+#      ② 1400 은 **FMP 상한(~1,254봉 ≈ 5.0년)을 넘는 값**이다. limit 이 먹는다
+#         쳐도 못 받는 숫자였다. 검증된 요구치가 아니라 limit 이 작동하는 줄
+#         알고 적은 숫자다.
+#    개명은 락스텝 강제 장치다 — 옛 이름을 쓰는 호출부가 남아 있으면 즉시 터진다
+#    (`HISTORY_LIMIT → HISTORY_BARS` 때와 같은 이유).
+#
+# 요구치는 코드에서 유도한다. 이벤트 1건당:
+#    가장 이른 진입 D-11(ENTRIES) 11봉 + RS_WINDOW 20봉 + ma50 rolling 50봉
+#    + 가장 늦은 청산 max(D+20, SIGNAL_MAX) 20봉 = **101봉**
+# 종목당 이벤트는 분기 실적이라 63봉 간격. 상한 1,254봉이면 약 18건이다.
+# 즉 **상한이 곧 요구치**다 — 더 받을 수 있으면 이벤트가 더 나온다.
+HIST_BARS = 1250          # 상한 부근. hist_days_for_bars 가 HIST_MAX_DAYS 로 포화한다.
+EVENT_MIN_BARS = 101      # 위 유도값. 미달 종목은 이벤트가 0건이다.
 SLEEP_SEC = 0.35
 SIGNAL_MAX = 20
 
@@ -67,8 +85,15 @@ def _get(path):
         return None
 
 
-def price_history(ticker, limit=HIST_LIMIT):
-    d = _get(f"historical-price-eod/full?symbol={ticker}&limit={limit}")
+def price_history(ticker, *, bars=HIST_BARS):
+    """가격 이력. ⚠️ `limit=` 이 아니라 **from/to 창**으로 받는다.
+
+    창 환산은 `fmp_extras` 가 SSOT 다 — 0.6871 비율도 여유 마진도 상한도
+    전부 거기 있다. 여기서 달력일을 직접 계산하면 정책이 두 벌이 되고
+    한쪽만 갱신된다. 그 실패는 로그를 남기지 않는다.
+    """
+    d = _get(f"historical-price-eod/full?symbol={ticker}"
+             f"{fx.hist_range_params(fx.hist_days_for_bars(bars))}")
     rows = d.get("historical", d) if isinstance(d, dict) else d
     if not isinstance(rows, list) or not rows:
         return pd.DataFrame()
@@ -422,8 +447,15 @@ def main():
             gseries = grade_series(tk, show_schema=True)
             evs = build_events(tk, h, spy, recs, gseries)
             all_evs += evs
-            print(f"  {tk:6} 봉 {len(h):>4} · 실적 {len(recs):>2} · "
-                  f"의견 {len(gseries):>3} → 이벤트 {len(evs)}")
+            # ⚠️ 봉이 모자라면 **과거 끝쪽 이벤트가 조용히 탈락한다.**
+            #    build_events 의 `i - back - RS_WINDOW < 1` 가 그냥 continue 하기
+            #    때문에 로그에 아무 흔적이 없다. 예전엔 1,400봉을 요청해놓고
+            #    1,254봉을 받으면서도 아무도 몰랐다. 눈에 보이게 만든다.
+            _short = " ⚠️봉부족" if len(h) < EVENT_MIN_BARS else ""
+            _lost = len(recs) - len(evs)
+            print(f"  {tk:6} 봉 {len(h):>4}{_short} · 실적 {len(recs):>2} · "
+                  f"의견 {len(gseries):>3} → 이벤트 {len(evs)}"
+                  + (f" (실적 {_lost}건은 창 밖)" if _lost > 0 else ""))
         except Exception as e:
             print(f"  {tk:6} 실패: {e}")
         time.sleep(SLEEP_SEC)
