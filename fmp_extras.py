@@ -949,22 +949,88 @@ def score_mom12_0(vals) -> float:
     return mom_return(vals, MOM_BARS_12M)
 
 
+MOM_VOL_BARS = 252          # 위험조정 분모의 관측 창(일간수익률 봉수)
+
+
+def mom_vol_annualized(vals, bars: int = MOM_VOL_BARS) -> float:
+    """최근 `bars`봉 일간수익률의 연율화 표준편차(%). 분모가 0이면 nan.
+
+    MSCI 원본과 다른 점 두 가지 — 재현이 아니라 **근사**다:
+      · MSCI 는 **3년 주간** 수익률을 쓴다. 여기는 **1년 일간**이다.
+        3년(756봉)을 쓰면 공통 워밍업이 756봉으로 뛰고 평가 구간이
+        1,255 − 756 ≈ 499봉(≈2년)만 남는다. 252봉 창 6개를 그 안에 넣으면
+        겹침이 극심해져 유효 독립 표본이 2개 수준이 되고, 4/6·5/6 임계가
+        의미를 잃는다. 창을 지키기 위해 관측 창을 줄인 것이다.
+      · MSCI 는 **무위험수익률 초과분**을 쓴다. 여기는 원수익률이다.
+        무위험수익률은 같은 시점의 모든 후보에 동일한 상수라 크로스섹션
+        **순위**에는 거의 영향이 없고, 랭킹 경로에 FRED 호출을 새로 붙이는
+        비용이 이득보다 크다.
+    호출부는 이 함수 결과를 'MTUM 을 재현했다'고 말하면 안 된다.
+    """
+    try:
+        n = len(vals)
+    except Exception:
+        return float("nan")
+    if n < bars + 1:
+        return float("nan")
+    a = np.asarray(vals, dtype=float)[n - bars - 1:]
+    if not np.all(np.isfinite(a)) or np.any(a <= 0):
+        return float("nan")
+    r = a[1:] / a[:-1] - 1.0
+    sd = float(np.std(r, ddof=1))
+    if not np.isfinite(sd) or sd <= 0:
+        return float("nan")
+    return sd * float(np.sqrt(252.0)) * 100.0
+
+
+def _risk_adjust(raw: float, vals) -> float:
+    v = mom_vol_annualized(vals)
+    if not (np.isfinite(raw) and np.isfinite(v)) or v <= 0:
+        return float("nan")
+    return float(raw / v)
+
+
+def score_mom12_0_ra(vals) -> float:
+    """위험조정 12-0 — 12-0 수익률 ÷ 연율 변동성. MTUM(MSCI) 방법론의 근사.
+
+    ⚠️ 단위가 다르다. 12-0 은 %, 이건 **비율(수익/변동성)** 이다.
+       룰이 다른 점수끼리 크기를 비교하면 안 된다 — 순위에만 쓴다.
+    """
+    return _risk_adjust(score_mom12_0(vals), vals)
+
+
+def score_mom12_1_ra(vals) -> float:
+    """위험조정 12-1. **판정용이 아니라 반증용**이다.
+
+    위험조정이 12-0 에서만 도움이 되고 12-1 에서는 반대로 나온다면, 그건
+    '위험조정이 효과가 있다'가 아니라 '이 4년 구간의 잡음'일 가능성이 높다.
+    즉 이 룰은 확신을 **낮출 수만 있고 높일 수는 없다**. T7 판정에는 안 들어간다.
+    """
+    return _risk_adjust(score_mom12_1(vals), vals)
+
+
 # 룰 이름 → (점수 함수, 필요 최소 봉수). 필요 봉수는 랭킹 워밍업의 하한이다.
 #   blend    : 6M(126봉) + 1 = 127
 #   mom12_0  : 252봉 + 1     = 253
 #   mom12_1  : 231 + 21 + 1  = 253
 # ⚠️ 비교 시에는 세 룰 모두 **최댓값(253)** 을 공통 워밍업으로 써야 한다.
 #    룰마다 다른 워밍업을 쓰면 시작일이 달라져 구간 자체가 다른 실험이 된다.
+#   *_ra      : 12-0/12-1 과 같은 253봉. 변동성 분모가 252 수익률(=253 종가)을
+#               쓰므로 요구치가 늘지 않는다 — 이게 3년이 아니라 1년을 택한 이유다.
 MOM_RULES = {
-    "blend":   (score_blend,   MOM_BARS_6M + 1),
-    "mom12_1": (score_mom12_1, MOM_BARS_12M + 1),
-    "mom12_0": (score_mom12_0, MOM_BARS_12M + 1),
+    "blend":      (score_blend,      MOM_BARS_6M + 1),
+    "mom12_1":    (score_mom12_1,    MOM_BARS_12M + 1),
+    "mom12_0":    (score_mom12_0,    MOM_BARS_12M + 1),
+    "mom12_0_ra": (score_mom12_0_ra, MOM_BARS_12M + 1),
+    "mom12_1_ra": (score_mom12_1_ra, MOM_BARS_12M + 1),
 }
 
 MOM_RULE_LABELS = {
-    "blend":   "현행(1M40/3M40/6M20)",
-    "mom12_1": "12-1(직전1M 제외)",
-    "mom12_0": "12-0(직전1M 포함)",
+    "blend":      "현행(1M40/3M40/6M20)",
+    "mom12_1":    "12-1(직전1M 제외)",
+    "mom12_0":    "12-0(직전1M 포함)",
+    "mom12_0_ra": "위험조정 12-0",
+    "mom12_1_ra": "위험조정 12-1(반증용)",
 }
 
 
