@@ -834,7 +834,7 @@ def _closes(ticker: str, bars: int) -> pd.Series:
 
     bars: 하류가 실제로 소비하는 꼬리 깊이. **기본값을 두지 않는다.**
       두 호출부의 요구가 다르다 — 시장 필터는 200봉(`tail(200)`), 챔피언 선발은
-      127봉(`_trailing_return(s, 126)`). 기본값이 있으면 호출부가 자기 요구를
+      127봉(`mom_return(s, 126)` = score_blend 의 6M 항). 기본값이 있으면 호출부가
       안 밝혀도 통과하고 **어느 요구인지 모르는 창**이 생긴다.
       `run_drg_predict._fmp_hist` 에서 실제로 겪었다(기본 30 이 요구 6봉짜리
       호출부에 5배 창을 주고 있었고 아무도 몰랐다). 요구를 못 밝히면
@@ -863,13 +863,124 @@ def _closes(ticker: str, bars: int) -> pd.Series:
     return pd.Series(dtype=float)
 
 
-def _trailing_return(s: pd.Series, bars: int):
-    if len(s) <= bars:
-        return np.nan
+# ⚠️ `_trailing_return` 은 2026-09-05 제거했다. 구간 수익률 계산기가 두 벌이면
+#    한쪽만 고쳐지고 그 실패는 로그를 안 남긴다. 유일한 출처는 `mom_return` 이다.
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 모멘텀 점수 룰 SSOT — 라이브 랭킹(compute_satellite_top10)과 백테스트 공용
+# ═══════════════════════════════════════════════════════════════════════════════
+# 왜 여기인가
+# ───────────
+# 점수식이 라이브와 백테스트에 각각 있으면, 백테스트가 검증한 룰과 실제로 돈이
+# 따라가는 룰이 조용히 갈라진다. 그 실패는 로그를 남기지 않는다 — 두 곳 다
+# "정상 동작"하기 때문이다. 그래서 식을 이 파일에 한 벌만 둔다.
+#
+# 배열 규약: `vals` 는 **오름차순** 종가(가장 최근이 마지막). numpy 배열도
+# pandas Series 도 받는다. 데이터가 모자라면 예외 대신 nan 을 돌려준다 —
+# 호출부가 이미 nan 을 "이 종목 스킵" 으로 처리하고 있고, 여기서 던지면
+# 랭킹 루프 전체가 한 종목 때문에 죽는다.
+
+MOM_BARS_1M, MOM_BARS_3M, MOM_BARS_6M, MOM_BARS_12M = 21, 63, 126, 252
+MOM_SKIP_BARS = 21          # 12-1 의 '-1' — 직전 1개월 스킵 폭
+
+
+def mom_return(vals, back: int, skip: int = 0) -> float:
+    """구간 수익률(%). `skip`봉 전 시점을 종점으로, 거기서 `back`봉 전이 시점.
+
+        mom_return(v, 21)        = 최근 1개월       (P[-1]   / P[-22]  - 1)
+        mom_return(v, 252)       = 12-0 (최근 달 포함) (P[-1]   / P[-253] - 1)
+        mom_return(v, 231, 21)   = 12-1 (최근 달 제외) (P[-22]  / P[-253] - 1)
+
+    ⚠️ 12-1 의 back 은 252 가 아니라 **231** 이다. "12개월 전부터 1개월 전까지"
+       는 11개월 구간이다. back=252, skip=21 로 쓰면 13개월을 보게 되고 필요
+       봉수도 274 로 늘어난다 — 워밍업이 평가 구간을 그만큼 더 먹는다.
+    """
     try:
-        return float((s.iloc[-1] / s.iloc[-1 - bars] - 1) * 100)
+        n = len(vals)
     except Exception:
-        return np.nan
+        return float("nan")
+    need = skip + back + 1
+    if n < need:
+        return float("nan")
+    a = np.asarray(vals, dtype=float)
+    end, start = a[n - 1 - skip], a[n - 1 - skip - back]
+    if not (np.isfinite(end) and np.isfinite(start)) or start == 0:
+        return float("nan")
+    return float((end / start - 1.0) * 100.0)
+
+
+def mom_components(vals) -> dict:
+    """표시·점수 공용 원자재. 1주는 노이즈라 점수에 안 들어가지만 표시는 한다."""
+    return {
+        "r1w": mom_return(vals, 5),
+        "r1m": mom_return(vals, MOM_BARS_1M),
+        "r3m": mom_return(vals, MOM_BARS_3M),
+        "r6m": mom_return(vals, MOM_BARS_6M),
+    }
+
+
+def score_blend(vals) -> float:
+    """현행 라이브 룰 — 1M×0.40 + 3M×0.40 + 6M×0.20.
+
+    직전 1개월에 **최대 가중**을 준다. 12-1 이 의도적으로 버리는 구간이다.
+    근거 없는 선택은 아니다: Fama-French 48 산업 1975~2024 재현에서 직전 달을
+    포함하는 편이 평균 수익이 더 안정적이었다는 결과가 있다. 다만 창이 6개월에서
+    끊긴다는 점은 문헌(12개월)과 다르고, 그게 mom12_0 을 같이 재는 이유다.
+    """
+    c = mom_components(vals)
+    r1m, r3m, r6m = c["r1m"], c["r3m"], c["r6m"]
+    if not all(np.isfinite(x) for x in (r1m, r3m, r6m)):
+        return float("nan")
+    return 0.40 * r1m + 0.40 * r3m + 0.20 * r6m
+
+
+def score_mom12_1(vals) -> float:
+    """Academic 12-1 (Jegadeesh-Titman / Carhart UMD) — t-252 ~ t-21, 직전 1개월 제외."""
+    return mom_return(vals, MOM_BARS_12M - MOM_SKIP_BARS, MOM_SKIP_BARS)
+
+
+def score_mom12_0(vals) -> float:
+    """12-0 — 12개월 전 구간, 직전 1개월 **포함**. 룩백 길이와 스킵을 분리한다.
+
+    blend 와 mom12_1 만 비교하면 '창 길이'와 '스킵 여부'가 한 덩어리로 움직여
+    어느 쪽이 효과를 냈는지 알 수 없다. mom12_0 이 그 두 축을 갈라준다.
+    """
+    return mom_return(vals, MOM_BARS_12M)
+
+
+# 룰 이름 → (점수 함수, 필요 최소 봉수). 필요 봉수는 랭킹 워밍업의 하한이다.
+#   blend    : 6M(126봉) + 1 = 127
+#   mom12_0  : 252봉 + 1     = 253
+#   mom12_1  : 231 + 21 + 1  = 253
+# ⚠️ 비교 시에는 세 룰 모두 **최댓값(253)** 을 공통 워밍업으로 써야 한다.
+#    룰마다 다른 워밍업을 쓰면 시작일이 달라져 구간 자체가 다른 실험이 된다.
+MOM_RULES = {
+    "blend":   (score_blend,   MOM_BARS_6M + 1),
+    "mom12_1": (score_mom12_1, MOM_BARS_12M + 1),
+    "mom12_0": (score_mom12_0, MOM_BARS_12M + 1),
+}
+
+MOM_RULE_LABELS = {
+    "blend":   "현행(1M40/3M40/6M20)",
+    "mom12_1": "12-1(직전1M 제외)",
+    "mom12_0": "12-0(직전1M 포함)",
+}
+
+
+def mom_score(vals, rule: str) -> float:
+    """룰 이름으로 점수 계산. 모르는 룰은 **던진다** — 오타가 조용히 blend 로
+    폴백하면 '12-1 을 재고 있다고 믿는 blend 결과'가 나온다."""
+    fn = MOM_RULES.get(rule)
+    if fn is None:
+        raise KeyError(f"알 수 없는 모멘텀 룰: {rule!r} (가능: {sorted(MOM_RULES)})")
+    return fn[0](vals)
+
+
+def mom_warmup_bars(rules=None) -> int:
+    """주어진 룰들을 **공정하게** 비교하기 위한 공통 워밍업 봉수 = 필요 봉수의 최댓값."""
+    names = list(rules) if rules else list(MOM_RULES)
+    return max(MOM_RULES[r][1] for r in names)
 
 
 def _top_holdings_set(ticker: str, fallback_map: dict, top_n: int = 15) -> set:
@@ -922,18 +1033,20 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
     for sec, cands in satellite_candidate_pool().items():
         best = None
         for tk in cands:
-            # 소요 127봉 — 아래 len(s) < 127 가드와 _trailing_return(s, 126).
+            # 소요 127봉 — 아래 len(s) < 127 가드와 score_blend 의 6M 항(126봉).
             s = _closes(tk, bars=127)
             _time.sleep(pause_sec)
             if len(s) < 127:  # 6M(126봉) 계산 불가
                 out["skipped"].append((tk, f"히스토리 부족({len(s)}봉)"))
                 continue
-            r1w, r1m = _trailing_return(s, 5), _trailing_return(s, 21)
-            r3m, r6m = _trailing_return(s, 63), _trailing_return(s, 126)
+            # 점수식은 이 파일 위쪽의 룰 SSOT(score_blend)를 쓴다. 백테스트가
+            # 검증하는 식과 돈이 따라가는 식이 갈라지지 않게 하려는 것이 목적이다.
+            _c = mom_components(s)
+            r1w, r1m, r3m, r6m = _c["r1w"], _c["r1m"], _c["r3m"], _c["r6m"]
             if any(pd.isna(x) for x in (r1m, r3m, r6m)):
                 out["skipped"].append((tk, "수익률 계산 실패"))
                 continue
-            score = 0.40 * r1m + 0.40 * r3m + 0.20 * r6m
+            score = score_blend(s)
             row = {"ticker": tk, "sector": sec,
                    "sector_label": GICS_SECTOR_LABELS.get(sec, sec),
                    "theme_label": ("섹터 대표" if tk == sec else theme_label_map.get(tk, "")),
