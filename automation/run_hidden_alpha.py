@@ -736,8 +736,6 @@ def build_satellite_html(sat: dict | None) -> str:
             f'<div style="font-size:14px;color:#e2e8f0;"><b>{r["rank"]}위 {r["ticker"]}</b>'
             f' <span style="color:#94a3b8;">— {r["sector_label"]}{theme}</span>'
             f' &nbsp;<span style="color:#fbbf24;font-weight:700;">점수 {r["score"]:+.1f}</span>'
-            + (f' <span style="color:#64748b;font-size:12px;">&lt;12-1 {r["score_alt"]:+.1f}&gt;</span>'
-               if r.get("score_alt") is not None else "")
             + '</div>'
             f'<div style="font-size:12px;color:#94a3b8;margin-top:2px;">'
             f'1M {r["r1m"]:+.1f}% · 3M {r["r3m"]:+.1f}% · 6M {r["r6m"]:+.1f}%{r1w}</div>'
@@ -745,28 +743,68 @@ def build_satellite_html(sat: dict | None) -> str:
             f'</div>'
         )
 
-    # ── 참고 룰(12-1) 랭킹 — 표시 전용, 매매 판단에 쓰지 않는다 ──
-    # 12-0 채택은 4년 백테스트 근거다. 그 선택의 검증은 앞으로의 실제 데이터로만
-    # 가능하고, 그러려면 "12-1 이었으면 무엇을 들었을까"가 매주 남아 있어야 한다.
+    # ── B반(blend) 전체 랭킹 + A/B 매수 요약 ──
+    # 참고 열이 아니다. 위성 슬리브의 절반이 이 랭킹을 따라 실제로 매수된다.
+    # 백테스트는 후보 풀 편향(T6)으로 절대 비교가 불가능하고, 같은 시장에서
+    # 나란히 굴리는 짝지은 비교만이 "어느 룰이 나은가"에 답을 준다.
     alt = sat.get("alt") or {}
-    alt_tk = alt.get("tickers") or []
+    alt_rows = alt.get("rows") or []
+    ab = sat.get("ab") or {}
+    both_set = set(ab.get("both") or [])
     alt_html = ""
-    if alt_tk:
-        live5 = [r["ticker"] for r in sat["rows"][:5]]
-        same = len(set(live5) & set(alt_tk[:5]))
+    if alt_rows:
+        arow = ""
+        for r in alt_rows:
+            theme = f" · {r['theme_label']}" if r.get("theme_label") else ""
+            r1w = f" (1W {r['r1w']:+.1f}%)" if r.get("r1w") is not None else ""
+            mark = ' 🔁' if r["ticker"] in both_set else ''
+            arow += (
+                '<div style="padding:6px 0;border-bottom:1px solid #1e293b;">'
+                f'<div style="font-size:14px;color:#e2e8f0;">'
+                f'<b>{r["alt_rank"]}위 {r["ticker"]}</b>{mark} '
+                f'<span style="color:#94a3b8;font-size:12px;">{r["sector_label"]}{theme}</span>'
+                f' &nbsp;<span style="color:#38bdf8;font-weight:700;">'
+                f'점수 {r["score_alt"]:+.1f}</span></div>'
+                f'<div style="font-size:12px;color:#94a3b8;">'
+                f'1M {r["r1m"]:+.1f}% · 3M {r["r3m"]:+.1f}% · 6M {r["r6m"]:+.1f}%{r1w}</div>'
+                '</div>'
+            )
         alt_html = (
-            '<div style="font-size:11px;color:#94a3b8;margin-top:10px;'
-            'padding-top:8px;border-top:1px dashed #334155;">'
-            f'📎 참고 · {alt.get("label", "12-1")} 이었다면 Top5: '
-            f'<b style="color:#cbd5e1;">{", ".join(alt_tk[:5])}</b> '
-            f'(현재 Top5와 {same}/5 일치) — 표시 전용, 매매 판단에 쓰지 않음</div>'
+            '<div style="margin-top:16px;padding-top:12px;border-top:2px solid #334155;">'
+            f'<div style="font-size:15px;font-weight:700;color:#38bdf8;">'
+            f'📊 B반 — {alt.get("label", "blend")} Top10</div>'
+            '<div style="font-size:11px;color:#64748b;margin:4px 0 8px;">'
+            '점수 = 1M×40% + 3M×40% + 6M×20% (교체 전 방식) · 위성 슬리브의 절반이 '
+            '이 랭킹을 따른다 · A반과 <b>별도 장부</b>로 관리하고 두 장부 사이는 '
+            '리밸런싱하지 않는다 — 그 격차가 측정하려는 값이다</div>'
+            f'{arow}</div>'
+        )
+    if ab:
+        n = ab.get("slots", 5)
+        ov = ab.get("overlap", 0)
+        warn = ""
+        if ov >= n:
+            warn = ('<div style="margin-top:6px;color:#fbbf24;">⚠️ 두 랭킹이 완전히 같다 '
+                    f'({ov}/{n}). 이번 주 A/B 비교는 아무것도 재지 못한다 — 실행은 하되 '
+                    '결과 해석에서 제외할 것.</div>')
+        alt_html += (
+            '<div style="margin-top:14px;padding:10px;background:#0f172a;'
+            'border:1px solid #334155;border-radius:6px;font-size:12px;color:#cbd5e1;">'
+            f'<b style="color:#e2e8f0;">⚖️ A/B 매수 요약 (각 반 Top{n}) — 겹침 {ov}/{n}</b>'
+            f'<div style="margin-top:6px;">🔁 양쪽 공통: '
+            f'<b>{", ".join(ab.get("both") or []) or "없음"}</b>'
+            ' &nbsp;<span style="color:#94a3b8;">두 장부에 각각 담는다. 실질 비중이 '
+            '두 배가 되므로 집중도가 올라간다</span></div>'
+            f'<div>A반(12-0)만: <b>{", ".join(ab.get("a_only") or []) or "없음"}</b></div>'
+            f'<div>B반(blend)만: <b>{", ".join(ab.get("b_only") or []) or "없음"}</b></div>'
+            f'{warn}</div>'
         )
     return (
         '<div style="background:#1e293b;border-radius:10px;padding:14px 16px;margin-bottom:16px;">'
         '<div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:4px;">'
         '🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보</div>'
         '<div style="font-size:11px;color:#64748b;margin-bottom:10px;">'
-        '점수 = <b>12개월 수익률(12-0)</b> · 1M/3M/6M 은 맥락 표시일 뿐 점수에 안 들어간다 · '
+        '<b>A반</b> 점수 = <b>12개월 수익률(12-0)</b> · 1M/3M/6M 은 맥락 표시일 뿐 점수에 안 들어간다 · '
         'GICS 섹터당 1개 · 중복 % = 구성종목 상위 15개 교집합 · 🟢&lt;25 🟡25~40 🔴40+</div>'
         f'{mf_html}{rows_html}{alt_html}'
         f'<div style="font-size:11px;color:#64748b;margin-top:8px;">기준: {sat.get("as_of", "")}'
