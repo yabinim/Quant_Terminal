@@ -19451,7 +19451,7 @@ if st.session_state.get("logged_in"):
                 st.divider()
                 st.markdown("#### 🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보")
                 st.caption(
-                    f"점수 = **12개월 수익률(12-0)** · 소요 이력 {fx.SATELLITE_BARS}봉 · "
+                    f"**A반** 점수 = **12개월 수익률(12-0)** · 소요 이력 {fx.SATELLITE_BARS}봉 · "
                     "GICS 섹터당 1개 · 1M/3M/6M 은 맥락 표시일 뿐 점수에 안 들어간다 · "
                     "중복 % = 구성종목 상위 15개 교집합 · 주말 Hidden Alpha 이메일에도 동일 리스트 포함"
                 )
@@ -19497,11 +19497,10 @@ if st.session_state.get("logged_in"):
                     for _r in _sat["rows"]:
                         _theme = f" · {_r['theme_label']}" if _r.get("theme_label") else ""
                         _r1w = f" (1W {_r['r1w']:+.1f}%)" if _r.get("r1w") is not None else ""
-                        _alt_s = _r.get("score_alt")
-                        _alt = f" · <12-1 {_alt_s:+.1f}>" if _alt_s is not None else ""
+                        _bm = " 🔁" if _r["ticker"] in (_sat.get("ab") or {}).get("both", []) else ""
                         st.markdown(
-                            f"**{_r['rank']}위 {_r['ticker']}** — {_r['sector_label']}{_theme} · "
-                            f"점수 **{_r['score']:+.1f}**{_alt} | 1M {_r['r1m']:+.1f}% · "
+                            f"**{_r['rank']}위 {_r['ticker']}**{_bm} — {_r['sector_label']}{_theme} · "
+                            f"점수 **{_r['score']:+.1f}** | 1M {_r['r1m']:+.1f}% · "
                             f"3M {_r['r3m']:+.1f}% · 6M {_r['r6m']:+.1f}%{_r1w}"
                         )
                         if _r.get("overlaps"):
@@ -19524,20 +19523,54 @@ if st.session_state.get("logged_in"):
                             .background_gradient(cmap="RdYlGn_r", vmin=0, vmax=60),
                             use_container_width=True,
                         )
-                    # ── 참고 룰(12-1) 랭킹 — 표시 전용 ──
-                    # 12-0 채택은 4년 백테스트 근거다. 그 선택이 옳았는지는
-                    # 앞으로의 실제 데이터로만 알 수 있고, 그러려면 "12-1 이었으면
-                    # 무엇을 들었을까"가 매주 남아 있어야 한다.
+                    # ── B반 (blend) — 실투자 두 번째 랭킹 ──
+                    # 참고 열이 아니다. 위성 슬리브를 반으로 갈라 실제로 굴린다.
+                    # 백테스트로는 후보 풀 편향(T6) 때문에 절대 비교가 불가능하고,
+                    # 같은 시장에서 나란히 굴리는 짝지은 비교만이 답을 준다.
                     _alt_blk = _sat.get("alt") or {}
-                    _alt_tk = _alt_blk.get("tickers") or []
-                    if _alt_tk:
-                        _live5 = [r["ticker"] for r in _sat["rows"][:5]]
-                        _same = len(set(_live5) & set(_alt_tk[:5]))
-                        st.caption(
-                            f"　📎 참고 · {_alt_blk.get('label', '12-1')} 이었다면 Top5: "
-                            f"**{', '.join(_alt_tk[:5])}** "
-                            f"(현재 Top5와 {_same}/5 일치) — 표시 전용, 매매 판단에 쓰지 않음"
+                    _alt_rows = _alt_blk.get("rows") or []
+                    _ab = _sat.get("ab") or {}
+                    if _alt_rows:
+                        st.markdown("---")
+                        st.markdown(
+                            f"##### 📊 B반 — {_alt_blk.get('label', 'blend')} Top10"
                         )
+                        st.caption(
+                            "점수 = 1M×40% + 3M×40% + 6M×20% (교체 전 방식) · "
+                            "위성 슬리브의 절반이 이 랭킹을 따른다 · "
+                            "A반과 별도 장부로 관리하고 **두 장부 사이는 리밸런싱하지 않는다** "
+                            "— 그 격차가 측정하려는 값이다"
+                        )
+                        for _r in _alt_rows:
+                            _theme = f" · {_r['theme_label']}" if _r.get("theme_label") else ""
+                            _r1w = (f" (1W {_r['r1w']:+.1f}%)"
+                                    if _r.get("r1w") is not None else "")
+                            _bm = " 🔁" if _r["ticker"] in _ab.get("both", []) else ""
+                            st.markdown(
+                                f"**{_r['alt_rank']}위 {_r['ticker']}**{_bm} — "
+                                f"{_r['sector_label']}{_theme} · "
+                                f"점수 **{_r['score_alt']:+.1f}** | 1M {_r['r1m']:+.1f}% · "
+                                f"3M {_r['r3m']:+.1f}% · 6M {_r['r6m']:+.1f}%{_r1w}"
+                            )
+                    if _ab:
+                        _n = _ab.get("slots", 5)
+                        _ov = _ab.get("overlap", 0)
+                        _both = ", ".join(_ab.get("both") or []) or "없음"
+                        _ao = ", ".join(_ab.get("a_only") or []) or "없음"
+                        _bo = ", ".join(_ab.get("b_only") or []) or "없음"
+                        st.markdown("---")
+                        st.info(
+                            f"**⚖️ A/B 매수 요약 (각 반 Top{_n})** — 겹침 **{_ov}/{_n}**\n\n"
+                            f"· 🔁 양쪽 공통: **{_both}** — 두 장부에 각각 담는다. "
+                            f"실질 비중이 두 배가 되므로 집중도가 올라간다\n\n"
+                            f"· A반(12-0)만: **{_ao}**\n\n"
+                            f"· B반(blend)만: **{_bo}**"
+                        )
+                        if _ov >= _n:
+                            st.warning(
+                                f"두 랭킹이 완전히 같다({_ov}/{_n}). 이번 주에는 A/B 비교가 "
+                                f"아무것도 재지 못한다 — 실행은 하되 결과 해석에서 제외할 것."
+                            )
                     if _sat.get("skipped"):
                         st.caption(
                             "제외된 후보 "

@@ -1043,8 +1043,23 @@ MOM_RULES = {
 #   top5_eq 6창 평균이 전 항목 우세(수익 30.3/25.6 · MDD -16.2/-16.8 ·
 #   샤프 1.17/1.00 · 회전 7.3x/8.2x)이고, FF48 산업 1975~2024 문헌이 산업
 #   포트폴리오에서 12-0 을 지지하기 때문이다. T7(위험조정 12-0)은 2/6 으로 미달.
+SATELLITE_SLOTS = 5     # 각 book 이 실제로 보유하는 자리 수 (T3 로 확정 — Top5 균등)
 SATELLITE_RANK_RULE = "mom12_0"
-SATELLITE_ALT_RULE = "mom12_1"      # 표시 전용 — 전진 기록을 쌓기 위한 참고 열
+# [2026-09-06] B반 = blend. 표시 전용 참고 열이 아니라 **실제로 돈이 들어가는
+#   두 번째 랭킹**이다. 위성 슬리브(HSA 총액의 1/3)를 반으로 갈라 A반은
+#   mom12_0, B반은 blend 로 굴리며 실데이터로 비교한다.
+#
+#   왜 백테스트로 안 끝내고 실계좌를 가르나
+#   ───────────────────────────────────────
+#   후보 풀이 2026년 사람이 고른 목록이라 어떤 백테스트도 절대 비교가 무효다
+#   (T6). 반면 같은 시장·같은 시점·같은 풀에서 두 룰을 나란히 굴리면 시장
+#   방향이라는 최대 노이즈원이 상쇄된다. 진짜 차이가 연 5%p 일 때
+#   '올바른 쪽이 이길 확률'이 벤치마크 대비 1년 61% → 짝지은 비교 69%,
+#   3년 69% → 81% 로 올라간다. 백테스트가 못 푸는 질문의 유일한 해법이다.
+#
+#   ⚠️ 12-1 은 참고 열에서 뺐다. 실제 돈이 들어가는 두 룰만 표시한다 —
+#      세 개를 늘어놓으면 매수 시점에 무엇을 보고 사야 하는지 흐려진다.
+SATELLITE_ALT_RULE = "blend"
 for _r in (SATELLITE_RANK_RULE, SATELLITE_ALT_RULE):
     if _r not in MOM_RULES:
         # 임포트 시점에 **크게** 죽인다. 조용히 폴백하면 '12-0 을 쓰고 있다고
@@ -1095,11 +1110,20 @@ def _top_holdings_set(ticker: str, fallback_map: dict, top_n: int = 15) -> set:
 
 
 def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
-                            pause_sec: float = 0.12) -> dict:
-    """🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보 리스트 (SSOT).
+                            pause_sec: float = 0.12,
+                            slots_shown: int = SATELLITE_SLOTS) -> dict:
+    """🛰️ 위성 섹터 Top10 — A반/B반 두 랭킹 (SSOT).
 
-    점수 = 1M×0.40 + 3M×0.40 + 6M×0.20  (1주 수익률은 노이즈 — 점수 제외, 표시만)
+    A반 = SATELLITE_RANK_RULE (mom12_0) — out["rows"]
+    B반 = SATELLITE_ALT_RULE  (blend)   — out["alt"]["rows"]
+    겹침 요약                             — out["ab"]
+
+    둘 다 **실제로 돈이 들어가는** 랭킹이다. 위성 슬리브를 반으로 갈라 각각
+    상위 slots_shown 개를 보유하며, 실데이터로 두 룰을 비교한다.
+
     GICS 섹터당 최고점 후보 1개만 → 상위 top_n. 같은 섹터 중복이 구조적으로 차단된다.
+    챔피언은 **룰마다 독립적으로** 뽑는다 — A반 챔피언의 B반 점수만 보면
+    '순서가 바뀌었나'만 알 뿐 '다른 종목을 들었을까'는 알 수 없다.
 
     시장 필터: SPY 종가 vs 200일선 — 아래면 '위성 신규 중단·축소' 수동 룰 발동 신호.
     후보 간 중복: 구성종목 상위 15개 집합의 교집합 비율(작은 쪽 기준 %),
@@ -1181,11 +1205,29 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
     #   지금 안 쌓으면 1년 뒤에도 똑같이 모른다.
     champions_alt.sort(key=lambda r: (r["score_alt"] or -1e18), reverse=True)
     alt_rows = champions_alt[:max(1, int(top_n))]
+    for i, r in enumerate(alt_rows, 1):
+        r["alt_rank"] = i
+
+    # ── 겹침 요약 — 실제 매수 시 가장 먼저 필요한 정보 ──
+    # 양쪽이 같은 종목을 뽑으면 두 book 에 각각 담는다(각 book 은 독립된 장부다).
+    # 실질 비중은 두 배가 되므로 집중도가 올라간다는 점을 화면에 드러낸다.
+    _n = max(1, int(slots_shown))
+    a5 = [r["ticker"] for r in rows[:_n]]
+    b5 = [r["ticker"] for r in alt_rows[:_n]]
+    both = [t for t in a5 if t in b5]
     out["alt"] = {
         "rule": SATELLITE_ALT_RULE,
         "label": MOM_RULE_LABELS.get(SATELLITE_ALT_RULE, SATELLITE_ALT_RULE),
-        "tickers": [r["ticker"] for r in alt_rows],
+        "rows": alt_rows,
+        "tickers": b5,
         "scores": {r["ticker"]: r["score_alt"] for r in alt_rows},
+    }
+    out["ab"] = {
+        "slots": _n,
+        "a_only": [t for t in a5 if t not in b5],
+        "b_only": [t for t in b5 if t not in a5],
+        "both": both,
+        "overlap": len(both),
     }
     out["rule"] = SATELLITE_RANK_RULE
     out["rule_label"] = MOM_RULE_LABELS.get(SATELLITE_RANK_RULE, SATELLITE_RANK_RULE)
