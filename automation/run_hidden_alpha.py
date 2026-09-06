@@ -758,6 +758,10 @@ def build_satellite_html(sat: dict | None) -> str:
             theme = f" · {r['theme_label']}" if r.get("theme_label") else ""
             r1w = f" (1W {r['r1w']:+.1f}%)" if r.get("r1w") is not None else ""
             mark = ' 🔁' if r["ticker"] in both_set else ''
+            if r.get("overlaps"):
+                aov = " &nbsp;·&nbsp; ".join(f"{_grade(p)} {t} {p:.0f}%" for t, p in r["overlaps"])
+            else:
+                aov = "🟢 없음"
             arow += (
                 '<div style="padding:6px 0;border-bottom:1px solid #1e293b;">'
                 f'<div style="font-size:14px;color:#e2e8f0;">'
@@ -767,6 +771,7 @@ def build_satellite_html(sat: dict | None) -> str:
                 f'점수 {r["score_alt"]:+.1f}</span></div>'
                 f'<div style="font-size:12px;color:#94a3b8;">'
                 f'1M {r["r1m"]:+.1f}% · 3M {r["r3m"]:+.1f}% · 6M {r["r6m"]:+.1f}%{r1w}</div>'
+                f'<div style="font-size:12px;color:#cbd5e1;margin-top:2px;">중복: {aov}</div>'
                 '</div>'
             )
         alt_html = (
