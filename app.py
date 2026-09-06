@@ -19511,7 +19511,9 @@ if st.session_state.get("logged_in"):
                         else:
                             st.caption("　중복: 🟢 없음 (10%↑ 기준)")
                     with st.expander("전체 중복 매트릭스 (모든 쌍)", expanded=False):
-                        _tks = [r["ticker"] for r in _sat["rows"]]
+                        # 축은 A반+B반 합집합. A반만 쓰면 B반 전용 종목이 빠져
+                        # 교차 중복(A반 SOXX ↔ B반 XLK)을 볼 수 없다.
+                        _tks = _sat.get("universe") or [r["ticker"] for r in _sat["rows"]]
                         _mx = pd.DataFrame(index=_tks, columns=_tks, dtype=float)
                         for _k, _v in (_sat.get("matrix") or {}).items():
                             _a, _b = _k.split("|")
@@ -19523,6 +19525,14 @@ if st.session_state.get("logged_in"):
                             .background_gradient(cmap="RdYlGn_r", vmin=0, vmax=60),
                             use_container_width=True,
                         )
+                        _bonly = (_sat.get("ab") or {}).get("b_only") or []
+                        if _bonly:
+                            st.caption(
+                                f"A반·B반 합집합 {len(_tks)}종목. "
+                                f"B반에만 있는 **{', '.join(_bonly)}** 과의 교차 중복도 "
+                                f"여기 포함된다 — 두 장부를 합친 실질 집중도를 보려면 "
+                                f"이 표를 봐야 한다."
+                            )
                     # ── B반 (blend) — 실투자 두 번째 랭킹 ──
                     # 참고 열이 아니다. 위성 슬리브를 반으로 갈라 실제로 굴린다.
                     # 백테스트로는 후보 풀 편향(T6) 때문에 절대 비교가 불가능하고,
@@ -19552,6 +19562,13 @@ if st.session_state.get("logged_in"):
                                 f"점수 **{_r['score_alt']:+.1f}** | 1M {_r['r1m']:+.1f}% · "
                                 f"3M {_r['r3m']:+.1f}% · 6M {_r['r6m']:+.1f}%{_r1w}"
                             )
+                            if _r.get("overlaps"):
+                                _ov = " · ".join(
+                                    f"{fx.overlap_grade(p)} {t} {p:.0f}%" for t, p in _r["overlaps"]
+                                )
+                                st.caption(f"　중복: {_ov}")
+                            else:
+                                st.caption("　중복: 🟢 없음 (10%↑ 기준)")
                     if _ab:
                         _n = _ab.get("slots", 5)
                         _ov = _ab.get("overlap", 0)

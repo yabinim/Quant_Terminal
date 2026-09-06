@@ -1232,14 +1232,36 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
     out["rule"] = SATELLITE_RANK_RULE
     out["rule_label"] = MOM_RULE_LABELS.get(SATELLITE_RANK_RULE, SATELLITE_RANK_RULE)
 
-    # ── 후보 간 구성종목 중복 (전체 쌍 matrix + 행별 10%↑ 나열) ──
-    hold = {r["ticker"]: _top_holdings_set(r["ticker"], ETF_CONSTITUENTS) for r in rows}
-    for i, a in enumerate(rows):
-        for b in rows[i + 1:]:
-            sa, sb = hold.get(a["ticker"], set()), hold.get(b["ticker"], set())
+    # ── 후보 간 구성종목 중복 (전체 쌍 matrix + 행별 overlap_floor↑ 나열) ──
+    #
+    # ⚠️ A반과 B반의 **합집합**으로 계산한다. A반만 돌리면 B반에만 있는 종목이
+    #    매트릭스에서 통째로 빠지고 B반 행에는 중복 줄이 안 찍힌다.
+    #    A/B 분할에서 이건 더 중요해졌다 — 양쪽 합쳐 최대 2×slots 종목을 들게
+    #    되는데, A반 SOXX 와 B반 XLK 가 60% 겹치면 실질 집중도가 화면에 보이는
+    #    것보다 훨씬 높다. 교차 쌍이 없으면 그걸 볼 방법이 자체가 없다.
+    #
+    # 비용: _top_holdings_set 은 티커당 FMP 1콜이다. 합집합으로 dedupe 하므로
+    #    같은 티커를 두 번 부르지 않는다. 겹침이 클수록 추가 콜이 적다
+    #    (완전 일치면 0콜, 완전 불일치면 최대 top_n 콜).
+    uni, seen = [], set()
+    for r in rows + alt_rows:
+        if r["ticker"] not in seen:
+            seen.add(r["ticker"])
+            uni.append(r["ticker"])
+    hold = {tk: _top_holdings_set(tk, ETF_CONSTITUENTS) for tk in uni}
+    for i, a in enumerate(uni):
+        for b in uni[i + 1:]:
+            sa, sb = hold.get(a, set()), hold.get(b, set())
             pct = (len(sa & sb) / min(len(sa), len(sb)) * 100.0) if (sa and sb) else 0.0
-            out["matrix"][f"{a['ticker']}|{b['ticker']}"] = round(pct, 1)
-    for r in rows:
+            out["matrix"][f"{a}|{b}"] = round(pct, 1)
+
+    # 행별 나열. rows 와 alt_rows 는 같은 dict 객체를 공유할 수 있으므로
+    # (양쪽 챔피언이 같은 종목이면 같은 row 객체다) id 로 중복 처리를 막는다.
+    done = set()
+    for r in rows + alt_rows:
+        if id(r) in done:
+            continue
+        done.add(id(r))
         partners = []
         for key, pct in out["matrix"].items():
             x, y = key.split("|")
@@ -1248,6 +1270,7 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
         partners.sort(key=lambda p: -p[1])
         r["overlaps"] = partners
 
+    out["universe"] = uni          # 매트릭스 축 순서 (A반 우선, B반 전용이 뒤)
     out["rows"] = rows
     return out
 
