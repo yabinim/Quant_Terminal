@@ -3266,6 +3266,23 @@ _NARRATIVE_HISTORY_MAX_RECORDS = 40
 _NARRATIVE_HISTORY_RETENTION_DAYS = 14
 _DATA_CACHE_TTL = 3600
 
+SATELLITE_MANDATE_FILE = "SATELLITE_MANDATE.md"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _satellite_mandate_text() -> str:
+    """위성 슬리브 원칙 전문 — 저장소 루트의 md 파일을 그대로 읽는다.
+
+    ⚠️ 문안을 이 파일에 복사하지 않는다. 두 벌이 되면 반드시 갈라지고,
+       −30% 구간에서 어느 쪽이 진짜인지 모르게 된다. md 가 SSOT 다.
+    파일이 없으면 빈 문자열 — 호출부가 안내 문구로 대체한다.
+    """
+    try:
+        return (_APP_DIR / SATELLITE_MANDATE_FILE).read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
 def _fred_api_key() -> str:
     """FRED API 키 — st.secrets 우선 (flat 또는 [fred] 섹션), env 폴백."""
     try:
@@ -19597,6 +19614,28 @@ if st.session_state.get("logged_in"):
                     st.caption(f"기준 시각: {_sat.get('as_of', '')}")
                 elif _sat is not None:
                     st.warning("위성 후보 데이터를 산출하지 못했습니다 — FMP 키/네트워크 확인 후 재시도.")
+
+                # ── 📋 위성 슬리브 원칙 (SSOT: 루트 SATELLITE_MANDATE.md) ──
+                # 계산 성공 여부와 무관하게 항상 띄운다. 원칙은 매수 직전,
+                # 즉 Top10 을 보고 결정하는 그 자리에 있어야 의미가 있다.
+                # 별도 문서로 두면 −30% 가 온 날 아무도 열지 않는다.
+                with st.expander(
+                    "📋 위성 슬리브 원칙 — 총액 1/3 · A반·B반 각 1/6 · "
+                    "−30% 시 절반 · 6개월 전제 점검", expanded=False
+                ):
+                    _mnd = _satellite_mandate_text()
+                    if _mnd:
+                        st.markdown(_mnd)
+                    else:
+                        st.warning(
+                            f"`{SATELLITE_MANDATE_FILE}` 을 읽지 못했습니다 — "
+                            "저장소 루트에 있는지 확인하세요. "
+                            "원칙 요약: 위성은 HSA 총액의 1/3(A반 1/6·B반 1/6), "
+                            "각 반 최대 5종목 등가중, 월간 리밸런싱, "
+                            "두 장부 사이 리밸런싱 금지. "
+                            "슬리브 **합산** 낙폭 −30% 도달 시 양쪽을 동시에 절반으로. "
+                            "6개월마다 전제 점검(T2 4/6창), 3회 연속 미달 시 종료 검토."
+                        )
 
         except Exception as e:
             st.error("섹터 데이터를 불러오거나 계산하는 중 오류가 발생했습니다.")
