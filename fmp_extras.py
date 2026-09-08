@@ -16,6 +16,7 @@ app.py 상단에 다음 한 줄만 추가하면 됩니다:
 from __future__ import annotations
 
 import datetime as _dt
+import json as _json
 import os as _os
 import time as _time
 
@@ -1069,6 +1070,248 @@ for _r in (SATELLITE_RANK_RULE, SATELLITE_ALT_RULE):
 del _r
 SATELLITE_BARS = MOM_RULES[SATELLITE_RANK_RULE][1]          # → 253
 SATELLITE_ALT_BARS = MOM_RULES[SATELLITE_ALT_RULE][1]       # → 253
+
+
+# ═══ 위성 슬리브 스냅샷 — §4③ 자본 손상 판정의 유일한 시계열 ═══
+#
+# 왜 상수를 코드로 끌어오나
+# ─────────────────────────
+# SATELLITE_MANDATE.md §1·§4 의 숫자가 코드 어디에도 없었다. 두 장부 이름은
+# seed_reminders.py 안 **한국어 안내 문장**에만 있었고, −30% 는 문서에만 있었다.
+# 문서와 코드가 서로를 모르면 드리프트를 검사할 대상 자체가 없다.
+# diag_satellite_mandate.py 가 아래 상수와 md 를 양방향으로 대조한다.
+#
+# 위성 상수를 **한 파일에** 모으는 것이 요점이다. 흩어지면 가드가 여러 파일을
+# 훑어야 하고, 훑지 못한 파일에 리터럴이 남는다.
+SATELLITE_START_DATE = "2026-09-07"        # A/B 실험 개시일 (md §1)
+SATELLITE_BOOK_A = "hsa-위성-12-0"          # A반 — SATELLITE_RANK_RULE 로 굴린다
+SATELLITE_BOOK_B = "hsa-위성-blend"         # B반 — SATELLITE_ALT_RULE 로 굴린다
+SATELLITE_BOOKS = (SATELLITE_BOOK_A, SATELLITE_BOOK_B)
+
+# md §4③. **음수로 둔다** — abs() 로 비교하면 +30% 상승도 트리거를 통과한다.
+SATELLITE_DRAWDOWN_TRIGGER = -0.30
+
+SATELLITE_SNAPSHOT_SHEET = "Satellite_Snapshot"
+# 헤더가 SSOT. 열이 늘면 **뒤에** 붙인다 — 중간에 끼우면 과거 행이 통째로 밀리고,
+# 그 사고는 조용히 일어나며 되돌리기 어렵다(industry_core 와 같은 규약).
+SATELLITE_SNAPSHOT_COLS = ["Date", "Book", "Holdings_JSON", "Holdings_MV",
+                           "Slots_Filled", "Cash", "Book_Total", "Source"]
+SATELLITE_SNAP_SEED = "seed"          # 개시일 기준선 1회
+SATELLITE_SNAP_MONTHLY = "monthly"    # 매월 마지막 거래일
+
+
+def satellite_snapshot_row(date_str: str, book: str, holdings: dict,
+                           cash=None, source: str = SATELLITE_SNAP_MONTHLY) -> list:
+    """스냅샷 1행. holdings = {TICKER: {"qty": float, "close": float}}.
+
+    Cash 는 **의도적으로 공란 가능**이다. 현재 위성 두 장부의 현금은 추적하지
+    않는다(md §4③ 에 명시). 0.0 으로 채우면 '0원을 확인했다'가 되어,
+    나중에 실제로 추적을 시작했을 때 과거 행과 구분이 안 된다.
+    공란 = "안 쟀다", 0 = "재서 0이었다". 이 둘은 다르다.
+    """
+    hs = {}
+    mv = 0.0
+    for tk, d in (holdings or {}).items():
+        q = float(d.get("qty") or 0.0)
+        c = float(d.get("close") or 0.0)
+        if q <= 0:
+            continue
+        v = q * c
+        hs[str(tk).strip().upper()] = {"qty": round(q, 6), "close": round(c, 4),
+                                       "mv": round(v, 2)}
+        mv += v
+    slots = len(hs)
+    cash_v = "" if cash is None else round(float(cash), 2)
+    total = round(mv + (float(cash) if cash is not None else 0.0), 2)
+    return [str(date_str), str(book),
+            _json.dumps(hs, ensure_ascii=False, sort_keys=True),
+            round(mv, 2), slots, cash_v, total, str(source)]
+
+
+def parse_satellite_snapshots(values) -> list:
+    """시트 전체 값 → 행 dict 리스트. 헤더 순서를 **읽어서** 매핑한다.
+
+    위치로 읽으면 열을 하나 끼우는 순간 전 구간이 조용히 어긋난다.
+    """
+    rows = []
+    vals = list(values or [])
+    if len(vals) < 2:
+        return rows
+    header = [str(x).strip() for x in vals[0]]
+    idx = {c: header.index(c) for c in SATELLITE_SNAPSHOT_COLS if c in header}
+    if "Date" not in idx or "Book" not in idx or "Book_Total" not in idx:
+        return rows
+
+    def _num(r, key, default=None):
+        i = idx.get(key)
+        if i is None or i >= len(r):
+            return default
+        # ⚠️ `r[i] or ""` 로 쓰면 안 된다. 숫자 0 은 falsy 라서 공란으로 접히고,
+        #    Cash=0(재서 0) 이 Cash 공란(안 쟀다) 으로 둔갑한다. 그 둘의 구분이
+        #    빈 장부 가드의 전제다. Book_Total=0 인 행도 통째로 사라진다.
+        v = r[i]
+        s = ("" if v is None else str(v)).replace(",", "").replace("$", "").strip()
+        if not s:
+            return default
+        try:
+            return float(s)
+        except Exception:
+            return default
+
+    for r in vals[1:]:
+        r = list(r)
+        d = str(r[idx["Date"]] if idx["Date"] < len(r) else "").strip()
+        b = str(r[idx["Book"]] if idx["Book"] < len(r) else "").strip()
+        if not d or not b:
+            continue
+        total = _num(r, "Book_Total")
+        if total is None:
+            continue
+        rows.append({
+            "date": d,
+            "book": b,
+            "total": total,
+            "mv": _num(r, "Holdings_MV", 0.0),
+            "slots": int(_num(r, "Slots_Filled", 0) or 0),
+            "cash": _num(r, "Cash"),          # None = 미추적
+            "source": str(r[idx["Source"]]).strip() if idx.get("Source") is not None
+                      and idx["Source"] < len(r) else "",
+            "holdings_json": str(r[idx["Holdings_JSON"]]) if idx.get("Holdings_JSON") is not None
+                             and idx["Holdings_JSON"] < len(r) else "",
+        })
+    return rows
+
+
+def satellite_sleeve_totals(rows) -> list:
+    """날짜별 슬리브 합산(A반+B반). **두 장부가 모두 있는 날짜만** 낸다.
+
+    ⚠️ 이 필터가 이 함수의 존재 이유다. 한 장부만 기록된 날을 그대로 합치면
+       슬리브 평가액이 절반으로 찍히고 **−50% 낙폭이 가짜로 발동한다.**
+       기록 누락이 손실로 둔갑하는 경로를 여기서 끊는다.
+    """
+    by_date = {}
+    for r in rows or []:
+        if r["book"] not in SATELLITE_BOOKS:
+            continue
+        by_date.setdefault(r["date"], {})[r["book"]] = r
+
+    out = []
+    for d in sorted(by_date):
+        books = by_date[d]
+        if len(books) < len(SATELLITE_BOOKS):
+            continue
+        # ⚠️ 두 번째 안전장치. 보유 0종목 + 현금 미추적인 장부는 평가액이 0 이
+        #    아니라 **모른다**. 0 으로 합치면 시장 필터에 따라 전량 현금화한
+        #    달에 슬리브가 반토막 난 것으로 찍혀 −50% 가 가짜로 발동한다.
+        #    규칙을 지킨 행동이 트리거를 당기는 경로를 여기서 끊는다.
+        if any(books[b]["slots"] <= 0 and books[b]["cash"] is None
+               for b in SATELLITE_BOOKS):
+            continue
+        total = sum(books[b]["total"] for b in SATELLITE_BOOKS)
+        out.append({
+            "date": d,
+            "total": round(total, 2),
+            "slots": sum(books[b]["slots"] for b in SATELLITE_BOOKS),
+            "slots_max": SATELLITE_SLOTS * len(SATELLITE_BOOKS),
+            "cash_tracked": all(books[b]["cash"] is not None for b in SATELLITE_BOOKS),
+            "source": books[SATELLITE_BOOK_A]["source"],
+            "books": {b: books[b]["total"] for b in SATELLITE_BOOKS},
+        })
+    return out
+
+
+def satellite_drawdown(rows) -> dict:
+    """md §4③ 판정. rows = parse_satellite_snapshots 결과.
+
+    고점 = 개시일 시드 및 이후 월말 스냅샷 중 최고치. 장중 고점이 아니다.
+
+    ⚠️ 현금 미추적의 편향 방향을 호출부가 알 수 있도록 그대로 넘긴다.
+       고점 시점에 만기 투자였고 이후 현금화했다면 낙폭은 **과대** 계상되어
+       실제보다 일찍 발동한다. 반대로 고점 시점에 이미 현금이 있었다면
+       고점이 과소 기록되어 **늦게** 발동한다. 뒤쪽이 남는 위험이다.
+    """
+    series = satellite_sleeve_totals(rows)
+    out = {
+        "ok": False, "reason": "", "n_points": len(series),
+        "series": series, "trigger": SATELLITE_DRAWDOWN_TRIGGER,
+        "as_of": "", "total": None, "peak": None, "peak_date": "",
+        "drawdown": None, "triggered": False,
+        "cash_tracked": False, "slots_full": False,
+        "incomplete_dates": [], "unvaluable_dates": [],
+    }
+    # 합산에서 빠진 날짜를 호출부에 알린다 — 조용히 버리면 "왜 9월이 없지"를
+    # 영원히 모른다. 두 사유를 구분한다: 기록 누락 vs 평가 불가(빈 장부·현금 미추적).
+    seen, paired = {}, {x["date"] for x in series}
+    for r in rows or []:
+        if r["book"] in SATELLITE_BOOKS:
+            seen.setdefault(r["date"], {})[r["book"]] = r
+    dropped = sorted(d for d in seen if d not in paired)
+    out["incomplete_dates"] = [d for d in dropped
+                               if len(seen[d]) < len(SATELLITE_BOOKS)]
+    out["unvaluable_dates"] = [d for d in dropped
+                               if len(seen[d]) >= len(SATELLITE_BOOKS)]
+
+    if not series:
+        out["reason"] = ("스냅샷 없음 — 두 장부가 **같은 날짜**로 기록된 행이 "
+                         "한 건도 없습니다.")
+        return out
+
+    cur = series[-1]
+    peak = max(series, key=lambda s: s["total"])
+    out.update({
+        "ok": True,
+        "as_of": cur["date"],
+        "total": cur["total"],
+        "peak": peak["total"],
+        "peak_date": peak["date"],
+        "cash_tracked": cur["cash_tracked"],
+        "slots_full": cur["slots"] >= cur["slots_max"],
+    })
+    if peak["total"] > 0:
+        dd = cur["total"] / peak["total"] - 1.0
+        out["drawdown"] = dd
+        out["triggered"] = dd <= SATELLITE_DRAWDOWN_TRIGGER
+    else:
+        out["ok"] = False
+        out["reason"] = "고점 평가액이 0 이하 — 낙폭을 계산할 수 없습니다."
+    return out
+
+
+def satellite_close_on_or_before(ticker: str, target: str, bars: int) -> tuple:
+    """(종가, 실제 사용된 날짜) — target **이하** 마지막 거래일의 종가.
+
+    bars 에 기본값을 두지 않는다. 개시일 시드는 며칠 거슬러 올라갈 수 있고
+    월말 실행은 당일이면 끝난다 — 요구가 다른데 기본값이 있으면 호출부가
+    안 밝혀도 통과하고 '어느 요구인지 모르는 창'이 생긴다(_closes 와 같은 규약).
+
+    ⚠️ `&from=` 창 계산은 이 모듈이 소유한다. 러너가 날짜 산술을 복제하면
+       정책이 두 곳이 되고, FMP 가 `limit` 을 무시하는 성질 때문에 그 드리프트는
+       에러 없이 조용히 다른 구간을 받아온다.
+    """
+    s_ = _closes(ticker, bars=bars)
+    if s_ is None or len(s_) == 0:
+        return None, ""
+    t = pd.to_datetime(str(target), errors="coerce")
+    if t is not None and not pd.isna(t):
+        s_ = s_[s_.index <= t]
+    if len(s_) == 0:
+        return None, ""
+    return float(s_.iloc[-1]), str(pd.Timestamp(s_.index[-1]).date())
+
+
+def satellite_drawdown_line(dd: dict) -> str:
+    """앱·이메일 공용 한 줄 요약. **문안을 두 벌 만들지 않는다.**"""
+    if not dd or not dd.get("ok"):
+        return "🛰️ 슬리브 낙폭: " + (dd or {}).get("reason", "판정 불가")
+    pct = dd["drawdown"] * 100.0
+    mark = "🚨" if dd["triggered"] else ("⚠️" if pct <= -20.0 else "🟢")
+    s = (f"{mark} 슬리브 낙폭 **{pct:+.1f}%** "
+         f"(기준일 {dd['as_of']} ${dd['total']:,.0f} · "
+         f"고점 {dd['peak_date']} ${dd['peak']:,.0f} · "
+         f"트리거 {dd['trigger'] * 100:.0f}%)")
+    if dd["triggered"]:
+        s += " — **§4③ 발동: 양쪽 장부를 동시에 절반으로 축소**"
+    return s
 
 MOM_RULE_LABELS = {
     "blend":      "현행(1M40/3M40/6M20)",

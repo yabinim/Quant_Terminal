@@ -4978,6 +4978,28 @@ def cached_satellite_top10() -> dict:
     return fx.compute_satellite_top10()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_satellite_drawdown() -> dict:
+    """🛰️ 슬리브 낙폭 (md §4③) — 판정 SSOT 는 fmp_extras.satellite_drawdown.
+
+    주간 Hidden Alpha 이메일이 **같은 함수**를 쓴다. 앱에서 다시 계산하지 않는다 —
+    두 벌이 되면 −30% 가 온 날 어느 쪽이 맞는지 모르게 된다.
+
+    FMP 콜 0 · 시트 1회. Top10(약 35초·67콜)과 달리 버튼 뒤에 두지 않는다:
+    낙폭은 **매수 판단 전에 항상 보여야** 하는 손실 방지 표시다.
+    시트가 없으면 빈 dict — 호출부가 '아직 미기록' 안내로 대체한다.
+    """
+    try:
+        sh = _open_quant_db()
+        if sh is None:
+            return {}
+        ws = sh.worksheet(fx.SATELLITE_SNAPSHOT_SHEET)
+        rows = fx.parse_satellite_snapshots(ws.get_all_values() or [])
+    except Exception:
+        return {}
+    return fx.satellite_drawdown(rows)
+
+
 def render_scan_coverage_report(report: dict) -> None:
     """RS 스캔(Early Signal·섹터 꺾임) 커버리지 + 미수집 사유 렌더링.
     '전수 fetch + 투명 보고' 원칙: 311개면 311개 전부에 대해 답이 있거나, 왜 없는지 보여준다."""
@@ -19472,6 +19494,42 @@ if st.session_state.get("logged_in"):
                     "GICS 섹터당 1개 · 1M/3M/6M 은 맥락 표시일 뿐 점수에 안 들어간다 · "
                     "중복 % = 구성종목 상위 15개 교집합 · 주말 Hidden Alpha 이메일에도 동일 리스트 포함"
                 )
+
+                # ── 📉 슬리브 낙폭 (md §4③) — 버튼 뒤가 아니라 **항상** ──
+                # Top10 은 월간 리밸런싱 때만 필요하지만 낙폭은 매수 판단 전에
+                # 늘 보여야 한다. 손실 방지 표시를 버튼 뒤에 두면, 정작 필요한
+                # 구간(하락장)에서 아무도 누르지 않는다.
+                _dd = cached_satellite_drawdown()
+                if _dd and _dd.get("ok"):
+                    _ddl = fx.satellite_drawdown_line(_dd)
+                    if _dd.get("triggered"):
+                        st.error(_ddl)
+                    elif (_dd.get("drawdown") or 0.0) <= -0.20:
+                        st.warning(_ddl)
+                    else:
+                        st.success(_ddl)
+                    _notes = []
+                    if not _dd.get("cash_tracked"):
+                        _notes.append("현금 미추적 — 축소 구간에서 낙폭이 과대 계상됩니다 (§4③)")
+                    if _dd.get("incomplete_dates"):
+                        _notes.append("한 장부만 기록된 날짜(합산 제외): "
+                                      + ", ".join(_dd["incomplete_dates"][:6]))
+                    if _dd.get("unvaluable_dates"):
+                        _notes.append("빈 장부 + 현금 미추적으로 평가 불가: "
+                                      + ", ".join(_dd["unvaluable_dates"][:6]))
+                    if _notes:
+                        st.caption("　⚠️ " + " · ".join(_notes))
+                    else:
+                        st.caption(f"　스냅샷 {_dd.get('n_points', 0)}개 시점 · "
+                                   f"고점 {_dd.get('peak_date', '')}")
+                elif _dd:
+                    st.info(f"📉 슬리브 낙폭: {_dd.get('reason') or '판정 불가'}")
+                else:
+                    st.info(
+                        f"📉 슬리브 낙폭 미기록 — `{fx.SATELLITE_SNAPSHOT_SHEET}` 시트가 "
+                        "아직 없습니다. `run_satellite_snapshot.py --seed` 로 개시일 "
+                        "기준선을 한 번 만들면 이후 매월 마지막 거래일에 자동으로 쌓입니다."
+                    )
                 # ⚠️ 계측 결과 이 블록이 섹터 탭 첫 진입의 75%(34.5초 · 67콜)를 썼다.
                 #    월간 리밸런싱 후보라 탭을 열 때마다 계산할 이유가 없고,
                 #    같은 리스트가 주말 Hidden Alpha 이메일에도 들어간다.

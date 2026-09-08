@@ -22,8 +22,11 @@ ROOT = sys.argv[1] if len(sys.argv) > 1 else "/mnt/project"
 
 # 모듈: 존재를 확인할 기능 마커 (있으면 그 시점 이후 버전)
 MARKERS = {
+    # cached_satellite_drawdown: 2026-09-07 위성 슬리브 낙폭(md §4③) 표시.
+    #   이 마커가 없는데 fmp_extras 만 올리면 앱 위성 블록이 NameError 로 죽는다.
     "app.py": ["_SSOT_NEEDS", "load_earnings_universe", "TIMING_LABELS_INFERRED",
-               "_open_quant_db", "update_watchlist_row", "시장 이벤트 지형"],
+               "_open_quant_db", "update_watchlist_row", "시장 이벤트 지형",
+               "cached_satellite_drawdown"],
     # est_archive_row: 2026-09-05 EPS 추정치 분기 아카이브. 이 마커가 없는데
     #   run_earnings_watch 만 올리면, 분기 전환 종목마다
     #   "[WARN] {tk} 추정치 아카이브 실패" 만 찍히고 **그 분기 시계열이 영구히
@@ -41,7 +44,12 @@ MARKERS = {
     #   run_signal_backtest / diag_satellite_backtest 가 import 단계에서 죽는다
     #   (AttributeError: module 'gs_retry' has no attribute 'PROFILE_BATCH').
     "gs_retry.py": ["_retryable", "GS_MAX_RETRIES", "PROFILE_BATCH"],
-    "fmp_extras.py": ["import fmp_http", "fmp_stats_line"],
+    # satellite_drawdown / SATELLITE_SNAPSHOT_COLS: 2026-09-07 위성 스냅샷 SSOT.
+    #   세 소비자(app · run_hidden_alpha · run_satellite_snapshot)가 전부 여기를
+    #   부른다. 이 마커가 없으면 셋 다 임포트 단계에서 죽는다 — 시끄럽게 죽는
+    #   편이 낫지만, 관문에서 먼저 잡는 게 더 낫다.
+    "fmp_extras.py": ["import fmp_http", "fmp_stats_line",
+                      "SATELLITE_SNAPSHOT_COLS", "satellite_drawdown"],
     "regime_core.py": ["_market_warnings", "ALERT_CONFIRM_DAYS"],
     "users_core.py": ["Gate_Market"],
     "watchlist_metrics_core.py": ["completed_bars_only"],
@@ -51,6 +59,14 @@ MARKERS = {
     "narrative_core.py": ["import fmp_http", "fmp_get_json_ex"],
     "portfolio_core.py": [],
     "accounts_core.py": [], "gemini_core.py": [], "run_watchlist_alerts.py": [],
+    # build_drawdown_html: fmp_extras 위성 마커와 **짝**이다. 반대 방향 유실을
+    #   잡는다 — fmp_extras 만 올리면 함수는 있는데 주간 메일이 안 부른다.
+    #   그 실패는 조용하다: 이메일은 정상 발송되고 낙폭 섹션만 없다.
+    "run_hidden_alpha.py": ["build_drawdown_html", "satellite_drawdown"],
+    # 월별 스냅샷 러너. 없으면 md §4③ 의 시계열이 아예 안 쌓인다.
+    "run_satellite_snapshot.py": ["is_last_trading_day_of_month",
+                                  "load_satellite_holdings",
+                                  "SATELLITE_SNAP_SEED"],
 }
 
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)
@@ -175,7 +191,8 @@ else:
             print(f"  ✅ {mod:26} app.py 가 쓰는 {len(used[mod])}개 심볼 모두 존재")
 
 # 자동화 ↔ 공용 모듈
-for auto in ("run_earnings_watch.py", "run_watchlist_alerts.py"):
+for auto in ("run_earnings_watch.py", "run_watchlist_alerts.py",
+             "run_hidden_alpha.py", "run_satellite_snapshot.py"):
     asrc = srcs.get(auto)
     if not asrc:
         continue
