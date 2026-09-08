@@ -64,9 +64,13 @@ MARKERS = {
     #   그 실패는 조용하다: 이메일은 정상 발송되고 낙폭 섹션만 없다.
     "run_hidden_alpha.py": ["build_drawdown_html", "satellite_drawdown"],
     # 월별 스냅샷 러너. 없으면 md §4③ 의 시계열이 아예 안 쌓인다.
+    # SNAPSHOT_MODES: seed_satellite_snapshot.yml 과 **짝**이다. yml 만 올리고
+    #   이 마커가 없으면, mode=seed 를 눌러도 스크립트가 그 값을 모른 채 기본
+    #   monthly 로 돌아 "[SKIP] 마지막 거래일이 아닙니다" 만 찍고 **exit 0** 으로
+    #   끝난다. Actions 는 초록불이고 시드는 만들어지지 않는다 — 조용한 실패다.
     "run_satellite_snapshot.py": ["is_last_trading_day_of_month",
                                   "load_satellite_holdings",
-                                  "SATELLITE_SNAP_SEED"],
+                                  "SATELLITE_SNAP_SEED", "SNAPSHOT_MODES"],
 }
 
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)
