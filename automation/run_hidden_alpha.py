@@ -701,6 +701,63 @@ def _delta_badge(tk: str, cur_rank: int, prev_map: dict) -> str:
     return '<span style="color:#64748b;">=</span>'
 
 
+def build_drawdown_html(dd: dict | None) -> str:
+    """🛰️ 슬리브 낙폭 (md §4③) — 판정은 fmp_extras.satellite_drawdown 이 한다.
+
+    ⚠️ Top10 섹션과 **독립**이다. build_satellite_html 은 랭킹 계산이 실패하면
+       빈 문자열을 낸다. 낙폭까지 거기 묶으면, FMP 가 흔들리는 날 —
+       즉 하락장에서 더 잘 일어나는 상황에서 — 손실 경고가 조용히 사라진다.
+    """
+    if not dd:
+        return ('<div style="background:#1c1917;border:1px solid #44403c;border-radius:8px;'
+                'padding:12px 16px;margin-bottom:16px;font-size:12px;color:#a8a29e;">'
+                '📉 슬리브 낙폭: 스냅샷 시트를 읽지 못했습니다 — '
+                '<code>run_satellite_snapshot.py --check</code> 로 확인하세요.</div>')
+    if not dd.get("ok"):
+        return ('<div style="background:#1c1917;border:1px solid #44403c;border-radius:8px;'
+                'padding:12px 16px;margin-bottom:16px;font-size:12px;color:#a8a29e;">'
+                f'📉 슬리브 낙폭: {dd.get("reason") or "판정 불가"}</div>')
+
+    pct = dd["drawdown"] * 100.0
+    if dd.get("triggered"):
+        bg, bd, fg = "#2a1214", "#dc2626", "#fca5a5"
+        head = f'🚨 슬리브 낙폭 <b>{pct:+.1f}%</b> — <b>§4③ 발동</b>'
+        act = ('<div style="font-size:13px;color:#fecaca;margin-top:8px;line-height:1.7;">'
+               '<b>조치: 슬리브를 1/3 → 1/6 로 축소.</b> 양쪽 장부를 <b>동시에</b> '
+               '절반으로 줄인다 — 한쪽만 줄이면 A/B 비교가 그 시점 이후 전부 오염된다.</div>')
+    elif pct <= -20.0:
+        bg, bd, fg = "#2a1f0b", "#d97706", "#fcd34d"
+        head = f'⚠️ 슬리브 낙폭 <b>{pct:+.1f}%</b> (트리거 {dd["trigger"] * 100:.0f}%)'
+        act = ""
+    else:
+        bg, bd, fg = "#0b1f17", "#16a34a", "#86efac"
+        head = f'🟢 슬리브 낙폭 <b>{pct:+.1f}%</b> (트리거 {dd["trigger"] * 100:.0f}%)'
+        act = ""
+
+    notes = []
+    if not dd.get("cash_tracked"):
+        notes.append("현금 미추적 — 축소 구간에서 낙폭이 과대 계상됩니다 (§4③ 한계)")
+    if dd.get("incomplete_dates"):
+        notes.append("한 장부만 기록된 날짜(합산 제외): "
+                     + ", ".join(dd["incomplete_dates"][:6]))
+    if dd.get("unvaluable_dates"):
+        notes.append("빈 장부 + 현금 미추적으로 평가 불가: "
+                     + ", ".join(dd["unvaluable_dates"][:6]))
+    notes_html = ""
+    if notes:
+        notes_html = ('<div style="font-size:11px;color:#a8a29e;margin-top:8px;line-height:1.6;">⚠️ '
+                      + " · ".join(notes) + "</div>")
+
+    return (f'<div style="background:{bg};border:1px solid {bd};border-radius:10px;'
+            f'padding:14px 16px;margin-bottom:16px;color:{fg};">'
+            f'<div style="font-size:14px;">{head}</div>'
+            f'<div style="font-size:12px;color:#94a3b8;margin-top:6px;">'
+            f'기준일 {dd["as_of"]} ${dd["total"]:,.0f} · '
+            f'고점 {dd["peak_date"]} ${dd["peak"]:,.0f} · '
+            f'스냅샷 {dd["n_points"]}개 시점</div>'
+            f'{act}{notes_html}</div>')
+
+
 def build_satellite_html(sat: dict | None) -> str:
     """🛰️ 위성 섹터 Top10 이메일 섹션 — app.py 탭과 동일 데이터(SSOT: fmp_extras).
     행마다 중복 상대 전부(10%↑) 표시 — 이메일만으로 위성 리밸런싱이 가능해야 한다."""
@@ -820,7 +877,7 @@ def build_satellite_html(sat: dict | None) -> str:
 
 def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
                      prev_date: str, new_added: int, satellite: dict | None = None,
-                     gates: dict | None = None) -> str:
+                     gates: dict | None = None, drawdown: dict | None = None) -> str:
     now_et  = datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET")
     now_kst = datetime.now(_KST).strftime("%Y-%m-%d %H:%M KST")
 
@@ -905,6 +962,7 @@ def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
     discovery_note = (f' · 신규 ETF {new_added}개 추가됨' if new_added else "")
     prev_note = f"지난주 스냅샷: {prev_date}" if prev_date else "지난주 스냅샷 없음(첫 실행)"
     satellite_html = build_satellite_html(satellite)
+    drawdown_html = build_drawdown_html(drawdown)
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
@@ -940,6 +998,8 @@ def build_email_html(ranked: pd.DataFrame, actions: dict, prev_map: dict,
       점수 = 0.7×(1개월 백분위) + 0.3×(1주 백분위) · 데이터 부족 ETF는 순위 제외
     </div>
   </div>
+
+  {drawdown_html}
 
   {satellite_html}
 
@@ -1069,6 +1129,28 @@ def main():
             print(f"[WARN] 위성 Top10 계산 실패 — 섹션 생략: {exc}")
             satellite = None
 
+    # [STEP 5.6] 🛰️ 슬리브 낙폭 (md §4③ · SSOT: fmp_extras.satellite_drawdown)
+    # 시트 1회 · FMP 콜 0. 실패해도 발송은 계속한다 — 다만 섹션에 "읽지 못했다"가
+    # 그대로 뜬다. 조용히 사라지면 하락장에서 경고가 없는 것과 구분이 안 된다.
+    drawdown = None
+    print("[STEP 5.6] 슬리브 낙폭 판정 중...")
+    try:
+        _sws = gc.open("Quant_DB").worksheet(fx.SATELLITE_SNAPSHOT_SHEET)
+        drawdown = fx.satellite_drawdown(
+            fx.parse_satellite_snapshots(_sws.get_all_values() or []))
+        print("[INFO] " + fx.satellite_drawdown_line(drawdown))
+        if drawdown.get("incomplete_dates"):
+            print(f"[WARN] 한 장부만 기록된 날짜(합산 제외): {drawdown['incomplete_dates']}")
+        if drawdown.get("unvaluable_dates"):
+            print(f"[WARN] 빈 장부 + 현금 미추적으로 평가 불가: {drawdown['unvaluable_dates']}")
+        if drawdown.get("triggered"):
+            print("[ALERT] 🚨 §4③ 트리거 도달 — 양쪽 장부를 동시에 절반으로 축소.")
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"[WARN] `{fx.SATELLITE_SNAPSHOT_SHEET}` 시트 없음 — "
+              "run_satellite_snapshot.py --seed 로 기준선을 먼저 만드세요.")
+    except Exception as exc:
+        print(f"[WARN] 낙폭 판정 실패 — 섹션에 안내만 표시: {exc}")
+
     # [STEP 6] 이메일 발송
     print("[STEP 6] 이메일 발송 중...")
     top5_str = ", ".join(selected) if selected else "해당 없음"
@@ -1078,7 +1160,7 @@ def main():
         tag = f" · 🔁 매수{n_buy}/매도{n_sell}"
     subject = f"💰 [Hidden Alpha] Top5: {top5_str}{tag} · {datetime.now(_ET).strftime('%m/%d')}"
     html_body = build_email_html(ranked, actions, prev_map, prev_date, new_added,
-                                 satellite=satellite, gates=gates)
+                                 satellite=satellite, gates=gates, drawdown=drawdown)
     send_email(subject, html_body)
 
     # [STEP 7] 이번 주 스냅샷 저장 (Top 30만 — Δ 계산엔 충분)
