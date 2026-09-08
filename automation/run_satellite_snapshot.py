@@ -75,6 +75,27 @@ GSPREAD_KEY_JSON = os.environ.get("GSPREAD_KEY", "")
 DRY_RUN = str(os.environ.get("DRY_RUN", "") or "").strip() in ("1", "true", "TRUE", "yes")
 FORCE = str(os.environ.get("FORCE", "") or "").strip() in ("1", "true", "TRUE", "yes")
 
+# ── SNAPSHOT_MODE — 수동 워크플로가 고른 값을 **그대로** 받는다 ──────────────
+# 왜 매핑을 여기 두나
+# ───────────────────
+# yml 에서 `${{ inputs.mode == 'seed' && '1' || '' }}` 같은 표현식으로 플래그를
+# 만들면, 선택지가 늘 때마다 yml 을 고쳐야 하고 **언젠가 안 고쳐진다**
+# (2026-08-22 LIVENESS_FORCE 실제 사고). yml 은 문자열 하나만 넘기고 해석은
+# 여기서 한다 — 매핑이 한 곳에 있고, 진단이 그 한 곳을 검사할 수 있다.
+#
+# ⚠️ 모르는 값은 **죽인다.** 조용히 기본(monthly)으로 떨어지면, 월말이 아닌 날
+#    "[SKIP] 마지막 거래일이 아닙니다" 만 찍고 exit 0 으로 끝난다. Actions 는
+#    초록불이고 사용자는 시드가 만들어졌다고 믿는다. 그 실패는 보이지 않는다.
+SNAPSHOT_MODES = {
+    "":              {"seed": False, "check": False},                  # 정기 실행
+    "monthly":       {"seed": False, "check": False},
+    "check":         {"seed": False, "check": True},                   # 읽기 전용
+    "seed_dryrun":   {"seed": True,  "check": False, "dry": True},     # 시드 미리보기
+    "seed":          {"seed": True,  "check": False},                  # 시드 확정
+    "force_monthly": {"seed": False, "check": False, "force": True},   # 월말 실패 복구
+}
+SNAPSHOT_MODE = str(os.environ.get("SNAPSHOT_MODE", "") or "").strip().lower()
+
 _SPREADSHEET_TITLE = "Quant_DB"
 _ET = pytz.timezone("US/Eastern")
 _KST = pytz.timezone("Asia/Seoul")
@@ -285,6 +306,8 @@ def do_snapshot(sh, mode: str) -> int:
 
 
 def main() -> int:
+    global DRY_RUN, FORCE
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", action="store_true",
                     help="개시일 기준선 1회 기록")
@@ -294,15 +317,30 @@ def main() -> int:
 
     print("=" * 60)
     print(f"[START] 위성 슬리브 스냅샷: {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
+
+    want_seed, want_check = args.seed, args.check
+    if SNAPSHOT_MODE not in SNAPSHOT_MODES:
+        print(f"[ERROR] 알 수 없는 SNAPSHOT_MODE={SNAPSHOT_MODE!r}. "
+              f"가능: {sorted(k for k in SNAPSHOT_MODES if k)}. 종료.")
+        return 1
+    if SNAPSHOT_MODE:
+        cfg = SNAPSHOT_MODES[SNAPSHOT_MODE]
+        want_seed = cfg["seed"] or want_seed
+        want_check = cfg["check"] or want_check
+        DRY_RUN = cfg.get("dry", DRY_RUN) or DRY_RUN
+        FORCE = cfg.get("force", FORCE) or FORCE
+        print(f"[MODE] {SNAPSHOT_MODE} → seed={want_seed} check={want_check} "
+              f"DRY_RUN={DRY_RUN} FORCE={FORCE}")
+
     if not GSPREAD_KEY_JSON:
         print("[ERROR] GSPREAD_KEY 미설정. 종료.")
         return 1
 
     sh = gsr.call(get_gspread_client().open, _SPREADSHEET_TITLE)
-    if args.check:
+    if want_check:
         rc = do_check(sh)
     else:
-        rc = do_snapshot(sh, "seed" if args.seed else "monthly")
+        rc = do_snapshot(sh, "seed" if want_seed else "monthly")
     print(f"[DONE] {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
     print("=" * 60)
     return rc

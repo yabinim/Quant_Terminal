@@ -55,6 +55,23 @@ def chk(name, got, exp):
     (PASS if got == exp else FAIL).append(f"{name}: got={got!r} exp={exp!r}")
 
 
+def fx_snapshot_modes():
+    """러너 소스에서 SNAPSHOT_MODES 키만 뽑는다.
+
+    임포트하지 않는 이유: 러너는 gspread·google-auth 를 최상단에서 요구한다.
+    진단은 네트워크·시크릿 없이 돌아야 하므로 AST 로 읽는다.
+    """
+    src = SNAP or ""
+    for n in ast.walk(ast.parse(src)) if src else []:
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name) and t.id == "SNAPSHOT_MODES":
+                    if isinstance(n.value, ast.Dict):
+                        return [k.value for k in n.value.keys
+                                if isinstance(k, ast.Constant)]
+    return []
+
+
 def _read(*parts):
     p = os.path.join(_ROOT, *parts)
     try:
@@ -70,6 +87,8 @@ HA = _read("automation", "run_hidden_alpha.py") or _read("run_hidden_alpha.py")
 SNAP = (_read("automation", "run_satellite_snapshot.py")
         or _read("run_satellite_snapshot.py"))
 WF = _read(".github", "workflows", "market_5pm_weekday.yml") or _read("market_5pm_weekday.yml")
+WF_SEED = (_read(".github", "workflows", "seed_satellite_snapshot.yml")
+           or _read("seed_satellite_snapshot.yml"))
 
 chk("MD-0 문서 존재", MD is not None, True)
 if MD is None:
@@ -334,6 +353,32 @@ chk("F7 주간 메일에 낙폭 섹션 빌더가 있다",
     "build_drawdown_html" in (HA or ""), True)
 chk("F8 낙폭 섹션이 Top10 성공에 묶여 있지 않다 (독립 호출)",
     "drawdown_html = build_drawdown_html" in (HA or ""), True)
+
+# F9·F10 — 수동 워크플로와 스크립트의 **모드 어휘**가 같은가.
+# yml 이 고른 문자열을 그대로 넘기므로, 두 목록이 갈라지면 사용자는 초록불을
+# 보면서 아무 일도 안 일어난 것을 모른다(스크립트가 죽도록 만들어 뒀지만,
+# 애초에 갈라지지 않게 여기서 잠근다).
+_wf_modes = set()
+if WF_SEED:
+    _in_opts = False
+    for _ln in WF_SEED.splitlines():
+        _t = _ln.strip()
+        if _t.startswith("options:"):
+            _in_opts = True
+            continue
+        if _in_opts:
+            if _t.startswith("- ") and not _t.startswith("- name"):
+                _wf_modes.add(_t[2:].strip().strip("'\""))
+            elif _t and not _t.startswith("#"):
+                _in_opts = False
+
+chk("F9 수동 워크플로 존재 (seed_satellite_snapshot.yml)", WF_SEED is not None, True)
+chk("F10a 워크플로 선택지가 전부 스크립트가 아는 모드",
+    bool(_wf_modes) and _wf_modes <= set(fx_snapshot_modes()), True)
+chk("F10b 시드 모드가 선택지에 있다 (없으면 기준선을 만들 방법이 없다)",
+    {"seed", "seed_dryrun"} <= _wf_modes, True)
+chk("F10c yml 이 표현식이 아니라 입력값을 그대로 넘긴다 (2026-08-22 사고 방지)",
+    "SNAPSHOT_MODE: ${{ inputs.mode }}" in (WF_SEED or ""), True)
 
 
 # ══ [G] 문안 중복 금지 ════════════════════════════════════════════════════
