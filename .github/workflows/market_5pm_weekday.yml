@@ -132,6 +132,32 @@ jobs:
         run: |
           python automation/refresh_industry_perf.py
 
+      # ── 🛰️ 위성 슬리브 월별 스냅샷 ────────────────────────────────────────
+      # SATELLITE_MANDATE.md §4③(자본 손상 −30%)은 **고점**을 알아야 판정된다.
+      # 그 고점을 잴 시계열을 여기서 만든다.
+      #
+      # 매일 붙여 두지만 실제로 쓰는 날은 **월 1회**다. 스크립트 안에
+      # calendar_core 기반 '이 달 마지막 거래일' 가드가 있어 다른 날은 즉시
+      # 종료한다(FMP 콜 0 · 시트 0). 매일 도는 이유는 월말이 무슨 요일이든
+      # 잡기 위해서다 — 주말 워크플로에 얹으면 "그 달 마지막 일요일"이 되어
+      # 문서의 '월말'과 코드가 처음부터 갈라진다.
+      #
+      # ⚠️ 최초 1회 `--seed` 를 수동 실행해야 기준선이 생긴다. 시드가 없으면
+      #    첫 고점이 2026-09-30 이 되어 그 전 구간의 낙폭을 잴 수 없다.
+      #
+      # if: always() + continue-on-error — 앞 스텝 실패와 무관하게 돌고, 이
+      # 스텝이 실패해도 알림 경로에 영향이 없다. 다만 실패하면 **그 달 한 점이
+      # 영구히 빈다**(다음 달까지 기회가 없다) → 로그를 확인할 것.
+      - name: 🛰️ 위성 슬리브 월별 스냅샷 (월말 거래일만)
+        if: always()
+        continue-on-error: true
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          FMP_RATE_LIMIT_PER_MIN: '200'
+        run: |
+          python automation/run_satellite_snapshot.py
+
       - name: 📋 실행 로그 요약
         if: always()
         run: |

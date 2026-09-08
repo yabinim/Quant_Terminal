@@ -1,0 +1,71 @@
+name: 🔬 진단 — 위성 원칙 문서↔코드 드리프트 (수동 전용)
+
+# 언제 쓰나:
+#   SATELLITE_MANDATE.md 를 고쳤을 때, fmp_extras 의 SATELLITE_* 상수를
+#   건드렸을 때, 스냅샷 스키마·낙폭 판정을 손봤을 때. 배포 **전**에 돌린다.
+#
+# 무엇을 검사하나 (59항목):
+#   A 문서 §1 숫자   — 두 장부 이름·개시일·최대 종목수 ↔ fmp_extras 상수
+#   B 문서 §2 랭킹   — A반 룰 리터럴·소요 봉수(파생값)·B반 가중치
+#                      ⚠️ B3 은 텍스트 비교가 아니라 score_blend 를 **실행**해서
+#                         문서의 40/40/20 이 실제 계산과 같은지 본다.
+#   C 문서 §4③      — −30% 값과 **부호**
+#   D 낙폭 판정 회귀 — 경계값, 기록 누락, 빈 장부, 열 순서, 시드 포함,
+#                      부호 안전성(D12·D13)
+#   E 문서 §6 상태표 — ③ 이 ✅ 라면 현금이 실제로 기록돼야 한다
+#                      ← **이 진단의 본체.** §6 은 스스로 "문서에 썼다고
+#                        작동하는 게 아니다"라고 선언했다. 그 선언을 강제한다.
+#   F 소비자 배선    — 앱·주간 메일·러너가 실제로 SSOT 를 부르는가,
+#                      워크플로에 스텝이 배선돼 있는가
+#   G 문안 중복 금지 — app.py 가 md 문장을 복사하지 않았는가
+#   H 양성 대조      — 알려진 불량 입력에서 각 검사가 실제로 실패하는가
+#
+#   ⚠️ D5·D6 을 지우지 말 것. 둘 다 **기록의 결함이 손실로 둔갑하는** 경로를
+#      막는다 — 한 장부 기록 누락(가짜 −50%)과 전량 현금화한 빈 장부(가짜 발동).
+#      즉 규칙을 지킨 행동이 트리거를 당기는 자리다.
+#
+#   ⚠️ D13 을 지우지 말 것. 트리거 비교식을 `abs(dd) >= abs(TRIGGER)` 로 바꾸는
+#      돌연변이는 지금은 **등가**라 D 군 값 검사로는 안 잡힌다(2026-09-07 M9).
+#      고점 정의를 '직전까지의 최댓값'으로 바꾸는 날 그 형태는 +30% 상승에서
+#      축소를 발동시킨다. D13 이 그 자리를 소스 수준에서 잠근다.
+#      `<` 로 바꾸는 변형(M14)도 부동소수 때문에 경계 테스트를 빠져나간다 —
+#      D13c 만 잡는다.
+#
+# 안전성:
+#   · 네트워크·시트·FMP·메일 접근 전부 없음 · 시크릿 불필요 · 부작용 없음
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install numpy pandas pytz requests gspread google-auth
+          # fmp_extras 가 요구하는 집합. streamlit 은 try/except 선택 의존이라 불필요.
+          # diag_rotation_policy.yml / diag_fmp_ssot.yml 과 동일하게 유지한다.
+
+      - name: 🔬 문서↔코드 드리프트 + 낙폭 판정 회귀 + 양성대조
+        run: python automation/diag_satellite_mandate.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          fmp_extras.py
+          app.py
+          automation/run_hidden_alpha.py
+          automation/run_satellite_snapshot.py
+          automation/diag_satellite_mandate.py
