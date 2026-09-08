@@ -64,7 +64,7 @@ M10 이 이 버그를 되살리면 진단이 잡는다.
 
 ---
 
-### 2. `automation/run_satellite_snapshot.py` (신규 · 317줄 / GitHub 316)
+### 2. `automation/run_satellite_snapshot.py` (신규 · 355줄 / GitHub 354)
 
 월별 스냅샷 러너. 세 가지 모드.
 
@@ -98,6 +98,25 @@ DRY_RUN=1  FORCE=1
   보유**를 개시일 종가로 평가하므로, 그 사이 매매가 있었으면 기준선이 거짓이 된다.
 
 `Cash` 는 항상 공란으로 남긴다.
+
+#### `SNAPSHOT_MODE` — 수동 워크플로용 진입점
+
+로컬 실행 없이 Actions 에서 시드를 만들 수 있도록 환경변수 모드를 받는다.
+
+```
+SNAPSHOT_MODES = {"": 정기, "monthly": 정기, "check": 읽기전용,
+                  "seed_dryrun": 시드 미리보기, "seed": 시드 확정,
+                  "force_monthly": 월말 실패 복구}
+```
+
+**매핑을 yml 이 아니라 여기 둔 이유.** `${{ inputs.mode == 'seed' && '1' || '' }}`
+같은 표현식으로 플래그를 만들면 선택지가 늘 때마다 yml 을 고쳐야 하고 **언젠가
+안 고쳐진다**(2026-08-22 `LIVENESS_FORCE` 실제 사고). yml 은 문자열 하나만 넘기고
+해석은 한 곳에서 한다 — 그래야 진단이 그 한 곳을 검사할 수 있다.
+
+**모르는 값은 죽인다.** 조용히 기본(monthly)으로 떨어지면 월말이 아닌 날
+`[SKIP] 마지막 거래일이 아닙니다` 만 찍고 **exit 0** 으로 끝난다. Actions 는
+초록불이고 사용자는 시드가 만들어졌다고 믿는다. 보이지 않는 실패다.
 
 ---
 
@@ -153,9 +172,15 @@ FMP 콜 0 · 시트 1회.
 
 ---
 
-### 6. `diag_satellite_mandate.py` + `.yml` (신규 · 415줄 / GitHub 414)
+### 6. `seed_satellite_snapshot.yml` (신규 · 95줄)
 
-**59항목.** md §6 은 스스로 *"문서에 썼다고 작동하는 게 아니다"* 라고 선언했지만
+수동 전용 워크플로. `workflow_dispatch` 의 `mode` 선택지 4개를 그대로
+`SNAPSHOT_MODE` 로 넘긴다. 기본값은 `check`(읽기 전용) — 실수로 눌러도 아무것도
+쓰지 않는다. 마지막 스텝이 `if: always()` 로 "무엇을 확인해야 하나"를 로그에 찍는다.
+
+### 7. `diag_satellite_mandate.py` + `.yml` (신규 · 460줄 / GitHub 459)
+
+**63항목.** md §6 은 스스로 *"문서에 썼다고 작동하는 게 아니다"* 라고 선언했지만
 그 선언을 지킬 장치가 없었다. 이 진단이 강제한다.
 
 `A` §1 숫자 · `B` §2 랭킹 · `C` §4③ 트리거 · `D` 낙폭 판정 회귀 ·
@@ -177,19 +202,21 @@ FMP 콜 0 · 시트 1회.
 
 ---
 
-### 7. `check_freshness.py` (216 → 233줄 / GitHub 232)
+### 8. `check_freshness.py` (216 → 237줄 / GitHub 236)
 
 - `app.py` 마커에 `cached_satellite_drawdown` (6→7)
 - `fmp_extras.py` 마커에 `SATELLITE_SNAPSHOT_COLS` · `satellite_drawdown` (2→4)
 - `run_hidden_alpha.py` 신규 등록 — `build_drawdown_html` · `satellite_drawdown`.
   fmp_extras 마커와 **짝**이다. 반대 방향 유실(공용 모듈만 올리고 소비자를 안 올림)은
   조용하다 — 이메일은 정상 발송되고 낙폭 섹션만 없다.
-- `run_satellite_snapshot.py` 신규 등록
+- `run_satellite_snapshot.py` 신규 등록 — `SNAPSHOT_MODES` 마커는
+  `seed_satellite_snapshot.yml` 과 **짝**이다. yml 만 올리고 스크립트가 낡으면
+  `mode=seed` 를 눌러도 그 값을 모른 채 monthly 로 돌아 초록불로 끝난다.
 - 자동화 교차 검사 대상에 `run_hidden_alpha.py` · `run_satellite_snapshot.py` 추가
 
 ---
 
-### 8. `market_5pm_weekday.yml` (142 → 168줄 / GitHub 167)
+### 9. `market_5pm_weekday.yml` (142 → 168줄 / GitHub 167)
 
 업종 스냅샷 뒤, 로그 요약 앞에 스텝 추가. `if: always()` + `continue-on-error: true`.
 
@@ -206,12 +233,14 @@ FMP 콜 0 · 시트 1회.
 | `check_py311` | 6/6 Python 3.11 호환 |
 | `pyflakes` delta | **0** (app 34→34 · fmp_extras 기존 1건 · run_hidden_alpha 기존 1건) |
 | `check_freshness` 정합성 | 8/8 모듈 ✅ · 마커 전부 충족 |
-| `diag_satellite_mandate` | **59 / 59** |
+| `diag_satellite_mandate` | **63 / 63** |
+| 모드 해석 단위 시험 | 6/6 (`bogus` 는 시트 접근 **전에** ERROR 로 종료) |
+| YAML 파싱 | 3/3 |
 | 월말 거래일 판정 | 10/10 (Labor Day · 성탄절 · 메모리얼데이 · 토요 월말 포함) |
 | 순수 로직 회귀 | 8/8 |
 | 이메일 조립 | Top10 실패 시에도 낙폭 섹션 유지 확인 |
 
-### 돌연변이 시험 — 14 제거 / 0 생존
+### 돌연변이 시험 — 17 제거 / 0 생존
 
 ```
 ✅ M1  md 개시일 변조              → A2
@@ -227,8 +256,11 @@ FMP 콜 0 · 시트 1회.
 ✅ M11 주간 메일 SSOT 호출 제거      → F2
 ✅ M12 app.py 폴백 % 변조           → F5
 🟡 M14 트리거를 '미만'(<)으로        → D13c
+✅ M15 yml 에 없는 모드로 변조        → F10
+✅ M16 yml 이 표현식으로 매핑        → F10c
+✅ M17 스크립트에서 seed 모드 제거    → F10
 ✅ M13 고점에서 시드 제외           → D11
-복원 후 59/59 · SHA-256 일치 확인
+복원 후 63/63 · SHA-256 일치 확인
 ```
 
 **M9 는 처음에 생존했다.** `dd <= TRIGGER` → `abs(dd) >= abs(TRIGGER)` 로 바꿔도
@@ -253,15 +285,16 @@ D 군 값 검사가 아무것도 못 잡았다. 원인을 따져보니 **등가 
 공용 모듈 → 소비자 → 배선 → 관문 순. 중간에서 멈추면 그 시점 조합이 깨진다.
 
 ```
-1. fmp_extras.py                          1686줄
-2. SATELLITE_MANDATE.md                    121줄
-3. automation/run_satellite_snapshot.py    316줄  (신규)
-4. app.py                                28569줄
-5. automation/run_hidden_alpha.py         1180줄
-6. automation/diag_satellite_mandate.py    414줄  (신규)
-7. .github/workflows/diag_satellite_mandate.yml   (신규)
-8. .github/workflows/market_5pm_weekday.yml
-9. check_freshness.py                      232줄  ← 맨 마지막
+ 1. fmp_extras.py                             1686줄
+ 2. SATELLITE_MANDATE.md                       121줄
+ 3. automation/run_satellite_snapshot.py       354줄  (신규)
+ 4. app.py                                   28569줄
+ 5. automation/run_hidden_alpha.py            1180줄
+ 6. automation/diag_satellite_mandate.py       459줄  (신규)
+ 7. .github/workflows/diag_satellite_mandate.yml  71줄 (신규)
+ 8. .github/workflows/seed_satellite_snapshot.yml 95줄 (신규)
+ 9. .github/workflows/market_5pm_weekday.yml    167줄
+10. check_freshness.py                         236줄  ← 맨 마지막
 ```
 
 `check_freshness.py` 를 마지막에 올리는 이유: 새 마커를 먼저 올리면 아직 안 올라간
