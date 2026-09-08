@@ -1,0 +1,95 @@
+name: 🛰️ 위성 스냅샷 — 수동 실행 (시드 · 확인 · 복구)
+
+# 무엇을 하는 워크플로인가
+# ────────────────────────
+# 정기 월말 기록은 `market_5pm_weekday.yml` 이 알아서 한다. 이 워크플로는
+# **손으로 눌러야 하는 세 가지**를 위한 것이다.
+#
+#   1) 개시일 기준선(시드) 만들기 — 최초 1회. 이게 없으면 첫 고점이
+#      2026-09-30 이 되어 그 전 구간의 낙폭을 잴 수 없다.
+#   2) 현재 낙폭 확인 — 읽기 전용. FMP 콜 0.
+#   3) 월말 기록 실패 복구 — 그 달 한 점이 영구히 비는 것을 막는다.
+#
+# ⚠️ 매핑을 yml 에 두지 않는다
+# ───────────────────────────
+# `${{ inputs.mode == 'seed' && '1' || '' }}` 같은 표현식으로 플래그를 만들면
+# 선택지가 늘 때마다 이 파일을 고쳐야 하고 **언젠가 안 고쳐진다**
+# (2026-08-22 LIVENESS_FORCE 실제 사고). 여기서는 고른 문자열을 **그대로**
+# SNAPSHOT_MODE 로 넘기고, 해석은 run_satellite_snapshot.py 의 SNAPSHOT_MODES
+# 한 곳에서 한다. 모르는 값은 그 안에서 죽는다 — 조용히 monthly 로 떨어지면
+# 월말이 아닌 날 "[SKIP]" 만 찍고 초록불로 끝나서, 시드가 만들어졌다고
+# 착각하게 된다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '실행 모드 (아래 설명 참고)'
+        type: choice
+        required: true
+        default: check
+        options:
+          # check         읽기 전용. 지금 쌓인 스냅샷과 낙폭만 출력한다.
+          #               쓰기 없음 · FMP 콜 0. 아무 때나 눌러도 안전하다.
+          - check
+          # seed_dryrun   시드를 **미리 보기만** 한다. 보유 종목·수량·종가를
+          #               찍어보고 시트에는 쓰지 않는다. seed 전에 반드시 한 번.
+          - seed_dryrun
+          # seed          개시일 기준선을 실제로 기록한다. **최초 1회.**
+          #               이미 기록돼 있으면 중복 가드가 건너뛴다.
+          - seed
+          # force_monthly 월말 가드를 무시하고 오늘 날짜로 기록한다.
+          #               정기 실행이 [ABORT] 로 실패한 날 **당일 안에** 복구용.
+          #               ⚠️ 평범한 날 누르면 월말이 아닌 날짜가 시계열에 남는다.
+          - force_monthly
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install gspread google-auth numpy pandas pytz requests
+
+      - name: 🛰️ 위성 슬리브 스냅샷
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          FMP_RATE_LIMIT_PER_MIN: '200'
+          # 표현식으로 값을 만들지 않고 **입력값을 그대로 넘긴다.**
+          SNAPSHOT_MODE: ${{ inputs.mode }}
+        run: |
+          python automation/run_satellite_snapshot.py
+
+      - name: 📋 무엇을 확인해야 하나
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "모드: ${{ inputs.mode }}"
+          echo ""
+          echo "[seed_dryrun] 위 로그에서 확인할 것:"
+          echo "  · 두 장부의 보유 종목·수량이 실제와 맞는가"
+          echo "  · '사용된 종가 일자' 가 2026-09-04 인가"
+          echo "    (개시일 2026-09-07 은 Labor Day 휴장 → 직전 거래일)"
+          echo "  · 맞으면 mode=seed 로 다시 실행"
+          echo ""
+          echo "[seed] 성공 신호: '[OK] 2행 기록 완료.'"
+          echo "  이어서 mode=check 로 눌러 확인하고, 앱을 새로고침하면"
+          echo "  위성 블록 상단이 초록 배지로 바뀐다."
+          echo ""
+          echo "실패 신호:"
+          echo "  · [ABORT] 종가 미확보  → 아무것도 안 썼다. 재실행하면 된다."
+          echo "  · 슬롯 0/5             → Portfolios 의 Account 문자열 확인"
+          echo "                            (hsa-위성-12-0 / hsa-위성-blend)"
+          echo "=================================================="
