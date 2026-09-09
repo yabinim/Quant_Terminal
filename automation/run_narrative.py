@@ -199,13 +199,20 @@ def _safe_append_rows(ws, rows, value_input_option: str = "USER_ENTERED") -> Non
 
 
 def _session_label_for_utc(dt_utc) -> str:
-    """app.py와 동일한 세션 라벨."""
-    dt_et = dt_utc.astimezone(_ET)
-    m = dt_et.hour * 60 + dt_et.minute
-    if 240 <= m <= 569:  return "🌅 Pre-market Prep"
-    if 570 <= m <= 960:  return "🟢 Market Hours Analysis"
-    if 961 <= m <= 1200: return "🔔 Daily Recap (Post-Market)"
-    return "🌙 Overnight Strategy"
+    """app.py 와 **동일 모듈** 세션 라벨 — calendar_core SSOT.
+
+    ⚠️ 밴드 리터럴(240/570/960/1200)을 여기 다시 적지 말 것.
+    ─────────────────────────────────────────────────────────
+    예전엔 밴드 표가 여기 복사돼 있었고 docstring 이 "app.py와 동일한 세션
+    라벨" 이라고 **선언만** 했다. 검증은 없었다. 게다가 양쪽 다 반일장·휴장을
+    몰라서, 반일장 13:30 을 "🟢 Market Hours Analysis" 로 시트에 저장했다.
+    이제 app.py 와 같은 함수를 부른다 — 선언이 아니라 구조로 보장된다.
+
+    이 값은 Narratives 시트에 남고 앱이 그걸 읽어 표시하므로, 양쪽 문자열이
+    갈리면 히스토리가 두 갈래로 쪼개진다.
+    diag_market_calendar.py K절이 여기 밴드 리터럴이 되살아나는 것을 막는다.
+    """
+    return cc.narrative_session_label(dt_utc.astimezone(_ET))
 
 
 def parse_tickers_from_csv(text: str) -> list[str]:
