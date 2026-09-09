@@ -421,6 +421,7 @@ chk("G4 app.py 는 md 를 **파일로 읽는다**",
 #       못하다.
 MRC = (_read("automation", "diag_momentum_rule_compare.py")
        or _read("diag_momentum_rule_compare.py"))
+SEED = _read("automation", "seed_reminders.py") or _read("seed_reminders.py")
 
 _m_freq = re.search(r'FIXED_FREQ\s*=\s*["\'](\w+)["\']', MRC or "")
 _m_cyc = re.search(r"리밸런싱 주기\s*\|\s*\*\*(\S+?)\*\*", MD)
@@ -517,10 +518,23 @@ chk("I16 층 2 조기 구현 가드 — satellite_execution_gap 은 아직 없�
 # 화면에서 캡션은 "월간", 만다트는 "주간"이 된다. 값을 맞춰 잠근다.
 _CYC = _m_cyc.group(1) if _m_cyc else "?"
 _CYC_OTHER = {"주간": "월간", "월간": "주간"}.get(_CYC, "?")
-chk("I18a 소비자 문구가 §1 주기를 그대로 쓴다 (app.py · 주간 메일)",
-    [f"{_CYC} 리밸런싱" in (src or "") for src in (APP, HA)], [True, True])
+# seed_reminders 도 소비자다. 11-03 점검 절차가 "월간"으로 남아 있으면, 그날
+# 나는 있지도 않은 월 단위 지시를 찾게 된다 — 기록은 주 단위로 쌓여 있는데.
+_CYC_SRC = (APP, HA, SEED)
+chk("I18a 소비자 문구가 §1 주기를 그대로 쓴다 (app.py · 주간 메일 · 리마인더)",
+    [f"{_CYC} 리밸런싱" in (src or "") for src in _CYC_SRC], [True] * 3)
 chk("I18b 소비자에 반대 주기가 남아 있지 않다",
-    [f"{_CYC_OTHER} 리밸런싱" in (src or "") for src in (APP, HA)], [False, False])
+    [f"{_CYC_OTHER} 리밸런싱" in (src or "") for src in _CYC_SRC], [False] * 3)
+
+# I19 — 리마인더가 **읽을 대상**을 지목하는가. 시트는 만들었는데 점검 절차가
+# 그 시트를 모르면, 11-03 에 나는 Portfolios 만 들여다보고 넘어간다.
+chk("I19a 11-03 점검이 Satellite_Instruction 을 지목한다",
+    fx.SATELLITE_INSTRUCTION_SHEET in (SEED or ""), True)
+chk("I19b 실행 쪽 입력(Trade_History) 배선 확인 항목이 있다",
+    ("Trade_History" in (SEED or "")) and ("2026-09-21" in (SEED or "")), True)
+chk("I19c 층 2 착수는 사전 확약 규율을 달고 있다",
+    ("유예 기간" in (SEED or "")) and ("결과를 보고 바꾸지 않는다" in (SEED or "")),
+    True)
 
 
 _r2 = md_row6(MD, "② 실행 실패")
@@ -596,6 +610,13 @@ chk("H11 층 2 함수가 생기면 I16 이 이를 잡는다",
 _bad_cap = (APP or "").replace(f"{_CYC} 리밸런싱", f"{_CYC_OTHER} 리밸런싱", 1)
 chk("H12 앱 캡션 하나만 옛 주기로 되돌려도 I18b 가 잡는다",
     _would_fail(lambda: f"{_CYC_OTHER} 리밸런싱" not in _bad_cap), True)
+
+# ⚠️ **전량** 치환한다. 1건만 지우면 다른 언급이 남아 가드가 살아남는다 —
+#    처음 이렇게 썼다가 H13 이 빨갛게 떠서 알았다. 양성 대조가 없었으면
+#    "시트를 지목한다"는 검사가 실제로는 아무것도 안 지키고 있었을 것이다.
+_bad_seed = (SEED or "").replace(fx.SATELLITE_INSTRUCTION_SHEET, "Portfolios")
+chk("H13 리마인더에서 시트 지목을 지우면 I19a 가 잡는다",
+    _would_fail(lambda: fx.SATELLITE_INSTRUCTION_SHEET in _bad_seed), True)
 
 chk("H6 배수만 바꾼 봉수는 B2 를 통과하지 못한다",
     _would_fail(lambda: int(re.search(
