@@ -54,6 +54,12 @@ import users_core as uc
 # fmp_extras 와 같은 이유로 선택이 아니다 — 이게 없으면 게이트 없는 옛 동작으로
 # 조용히 되돌아간다. 조용한 완화는 조용한 손실이 된다.
 import rotation_core as rc
+# gs_retry: gspread 재시도 SSOT. **[STEP 5.7] 지시 기록에만** 쓴다.
+# 이 파일에서 5.7 만 재시도하는 이유 — 여기서 유일하게 **복구 불가능한 쓰기**다.
+#   ETF 유니버스 추가와 [STEP 7] 스냅샷은 다음 주 실행이 다시 계산해 메운다.
+#   반면 지시는 그 주 금요일 종가 기준이라, 나중에 다시 계산하면 다른 값이
+#   나온다(= 층 2 가 "지시 대비 실행"이 아니라 "지시A 대비 지시B"를 재게 된다).
+import gs_retry as gsr
 
 # ── 환경변수 (기존 run_*.py와 동일 시크릿) ────────────────────────────────────
 FMP_API_KEY        = os.environ["FMP_API_KEY"]
@@ -864,7 +870,7 @@ def build_satellite_html(sat: dict | None) -> str:
     return (
         '<div style="background:#1e293b;border-radius:10px;padding:14px 16px;margin-bottom:16px;">'
         '<div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:4px;">'
-        '🛰️ 위성 섹터 Top10 — 월간 리밸런싱 후보</div>'
+        '🛰️ 위성 섹터 Top10 — 주간 리밸런싱 후보</div>'
         '<div style="font-size:11px;color:#64748b;margin-bottom:10px;">'
         '<b>A반</b> 점수 = <b>12개월 수익률(12-0)</b> · 1M/3M/6M 은 맥락 표시일 뿐 점수에 안 들어간다 · '
         'GICS 섹터당 1개 · 중복 % = 구성종목 상위 15개 교집합 · 🟢&lt;25 🟡25~40 🔴40+</div>'
@@ -1150,6 +1156,73 @@ def main():
               "run_satellite_snapshot.py --seed 로 기준선을 먼저 만드세요.")
     except Exception as exc:
         print(f"[WARN] 낙폭 판정 실패 — 섹션에 안내만 표시: {exc}")
+
+    # [STEP 5.7] 🛰️ 주간 지시 기록 (md §4② 층 1 · SSOT: fx.satellite_instruction_rows)
+    #
+    # ⚠️ 위치가 규약이다 — [STEP 5.6] 낙폭 **뒤**, [STEP 6] 발송 **앞**.
+    #    발송 뒤로 밀면 메일이 실패한 주에 지시가 통째로 비고, 낙폭 앞으로
+    #    당기면 ③(자본 손상)이 ②(실행 기록)의 실패에 끌려 죽는다. 셋은 서로
+    #    독립이어야 한다(md §4 머리말).
+    # ⚠️ [STEP 5.5] 의 `satellite` 객체를 **재사용**한다. 여기서
+    #    compute_satellite_top10 을 다시 부르면 데이터 시점 차로 5위/6위가
+    #    뒤집힐 수 있고, 그러면 기록된 지시가 **메일에 뜬 지시와 다른 것**이 된다.
+    # ⚠️ 판정하지 않는다. 지시를 남기기만 한다 — 실행 대비 이탈 판정은 층 2.
+    # 실패해도 rc 는 불변이다. [WARN] 만 남기고 발송은 계속한다.
+    print("[STEP 5.7] 주간 지시 기록 중...")
+    try:
+        _ddate = (satellite or {}).get("data_date")
+        if satellite is None:
+            print("[WARN] 위성 랭킹 없음 — 지시 기록 생략. 이번 주 지시는 빈다.")
+        elif not _ddate:
+            print("[WARN] 데이터 기준일 없음 — 지시 기록 생략. "
+                  "실행일로 대체하지 않는다(대상일이 아니면 층 2 가 못 읽는다).")
+        else:
+            _ish = gsr.call(gc.open, _SPREADSHEET_TITLE)
+            try:
+                _iws = gsr.call(_ish.worksheet, fx.SATELLITE_INSTRUCTION_SHEET)
+            except gspread.exceptions.WorksheetNotFound:
+                _iws = gsr.call(_ish.add_worksheet,
+                                title=fx.SATELLITE_INSTRUCTION_SHEET, rows=1000,
+                                cols=len(fx.SATELLITE_INSTRUCTION_COLS))
+                gsr.call(_iws.update, [fx.SATELLITE_INSTRUCTION_COLS],
+                         range_name="A1", value_input_option="USER_ENTERED")
+                print(f"[OK] `{fx.SATELLITE_INSTRUCTION_SHEET}` 시트 생성")
+            # 읽기 1회로 중복 검사와 기록 시작행을 같이 구한다.
+            _ivals = gsr.call(_iws.get_all_values) or []
+            _ihdr = [str(c).strip() for c in (_ivals[0] if _ivals else [])]
+            try:                       # 헤더를 **읽어서** 매핑 — 위치로 읽으면
+                _idx_d = _ihdr.index("Date")   # 열을 하나 끼우는 순간 조용히 어긋난다
+                _idx_b = _ihdr.index("Book")
+            except ValueError:
+                _idx_d, _idx_b = 0, 1
+            _iseen = {(str(r[_idx_d]).strip(), str(r[_idx_b]).strip())
+                      for r in _ivals[1:] if len(r) > max(_idx_d, _idx_b)}
+            _irows = [r for r in fx.satellite_instruction_rows(
+                          satellite, _ddate,
+                          source=fx.SATELLITE_INSTR_HIDDEN_ALPHA)
+                      if (str(r[0]), str(r[1])) not in _iseen]
+            if not _irows:
+                print(f"[INFO] 대상일 {_ddate} 지시는 이미 기록됨 — 스킵.")
+            else:
+                # 명시 range. ⚠️ `_safe_append_rows` 를 쓰면 안 된다 — 그 헬퍼는
+                #    범위 폭을 _ETF_UNIVERSE_SHEET_COLS(6열)로 고정해 두었다.
+                #    9열 지시 행은 뒤 3열이 잘린다. 앵커만 지정해 폭에 무관하게
+                #    쓴다(run_satellite_snapshot._safe_append_rows 와 같은 규약).
+                _istart = 1
+                for _i, _r in enumerate(_ivals, start=1):
+                    if any(str(c).strip() != "" for c in _r):
+                        _istart = _i
+                _istart += 1
+                gsr.call(_iws.update, _irows, range_name=f"A{_istart}",
+                         value_input_option="USER_ENTERED")
+                _rk = (satellite.get("market_filter") or {}).get("risk_on")
+                print(f"[OK] 지시 기록 {len(_irows)}행 · 대상일 {_ddate} · "
+                      f"{', '.join(r[1] for r in _irows)}")
+                if _rk is False:
+                    print("[INFO] 🚦 Risk_On=False — 이 주 지시는 '신규 매수 중단'"
+                          "으로 읽는다(md §3).")
+    except Exception as exc:
+        print(f"[WARN] 지시 기록 실패 — 발송은 계속: {exc}")
 
     # [STEP 6] 이메일 발송
     print("[STEP 6] 이메일 발송 중...")

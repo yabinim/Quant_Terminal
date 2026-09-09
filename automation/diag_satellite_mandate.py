@@ -38,6 +38,7 @@ md §6 은 스스로 이렇게 선언한다: *"정직하게 적는다. 문서에
 안전성:  네트워크·시트·FMP·메일 접근 없음. 시크릿 불필요. 부작용 없음.
 """
 import ast
+import json
 import os
 import re
 import sys
@@ -322,6 +323,21 @@ def _alias_of(src, module):
     return None
 
 
+def _call_count(src, alias, attr):
+    """실제 **호출** 횟수. 문자열 카운트로 세면 안 된다 — 같은 이름을 언급한
+    주석까지 세어져, 주석 한 줄을 늘린 것만으로 진단이 빨갛게 된다."""
+    if not (src and alias):
+        return 0
+    n = 0
+    for node in ast.walk(ast.parse(src)):
+        f = getattr(node, "func", None)
+        if (isinstance(node, ast.Call) and isinstance(f, ast.Attribute)
+                and isinstance(f.value, ast.Name) and f.value.id == alias
+                and f.attr == attr):
+            n += 1
+    return n
+
+
 def _calls(src, alias, attr):
     if not (src and alias):
         return False
@@ -396,6 +412,124 @@ chk("G4 app.py 는 md 를 **파일로 읽는다**",
     "SATELLITE_MANDATE_FILE" in (APP or ""), True)
 
 
+# ══ [I] §4② 층 1 — 지시 기록 · 주기 정합 ═════════════════════════════════
+# 이 섹션이 막는 사고는 둘이다.
+#   (1) 문서의 주기와 백테스트 축이 갈라지는 것. 2026-09-08 에 실제로 벌어져
+#       있었다 — 근거가 된 워크포워드는 주간으로 돌았는데 §1 은 "월간"이라고
+#       적혀 있었다. 조용히 갈라지면 6개월 뒤 ① 점검이 다른 축을 재게 된다.
+#   (2) 층 2(판정)를 근거 없이 앞당겨 만드는 것. 기록이 없는 판정은 없느니만
+#       못하다.
+MRC = (_read("automation", "diag_momentum_rule_compare.py")
+       or _read("diag_momentum_rule_compare.py"))
+
+_m_freq = re.search(r'FIXED_FREQ\s*=\s*["\'](\w+)["\']', MRC or "")
+_m_cyc = re.search(r"리밸런싱 주기\s*\|\s*\*\*(\S+?)\*\*", MD)
+_FREQ_KO = {"weekly": "주간", "monthly": "월간", "daily": "일간"}
+
+chk("I1 §1 리밸런싱 주기 행이 읽힌다", bool(_m_cyc), True)
+chk("I2 §1 주기가 백테스트 축(FIXED_FREQ)과 같다 — 2026-09-08 재발 방지",
+    _m_cyc.group(1) if _m_cyc else None,
+    _FREQ_KO.get(_m_freq.group(1) if _m_freq else "", "?"))
+chk("I3 §4③ 스냅샷은 **월간 그대로** (§1 정정이 번지지 않았다)",
+    "매월 **마지막 거래일**" in MD, True)
+
+chk("I4 §4② 가 시트명을 코드 상수와 같게 적는다",
+    fx.SATELLITE_INSTRUCTION_SHEET in MD, True)
+_m_cols = re.search(r"`(Date \| Book \|[^`]+)`", MD)
+chk("I5 §4② 열 목록 = SATELLITE_INSTRUCTION_COLS (순서까지)",
+    [c.strip() for c in _m_cols.group(1).split("|")] if _m_cols else None,
+    list(fx.SATELLITE_INSTRUCTION_COLS))
+chk("I6a Risk_On 열이 있다", "Risk_On" in fx.SATELLITE_INSTRUCTION_COLS, True)
+chk("I6b §4② 의 §3 시장 필터 참조가 살아 있다",
+    ("§3 시장 필터" in MD) and ("신규 매수 중단" in MD), True)
+
+# 실동작 회귀 — 로직을 복사하지 않고 fmp_extras 의 함수를 실제로 부른다.
+# 공유 dict 를 일부러 심는다: A반 1위이면서 B반 6위인 종목이다.
+_shared = {"ticker": "XLK", "score": 9.9, "score_alt": 1.1, "rank": 1, "alt_rank": 6}
+_iA = [_shared] + [{"ticker": f"A{i}", "score": 9.0 - i, "score_alt": None,
+                    "rank": i + 1} for i in range(1, 10)]
+_iB = ([{"ticker": f"B{i}", "score": None, "score_alt": 5.0 - i} for i in range(1, 6)]
+       + [_shared]
+       + [{"ticker": f"B{i}", "score": None, "score_alt": -i} for i in range(6, 10)])
+_iout = {"rows": _iA, "alt": {"rows": _iB, "pool_n": 11}, "pool_n": 11,
+         "market_filter": {"risk_on": False}, "skipped": [("X", "y"), ("Z", "w")]}
+_ir = fx.satellite_instruction_rows(_iout, "2026-09-11")
+
+chk("I7a 행은 2개 (A반·B반)", len(_ir), 2)
+chk("I7b 행 폭 = 헤더 폭", [len(r) for r in _ir],
+    [len(fx.SATELLITE_INSTRUCTION_COLS)] * 2)
+chk("I7c 장부명이 SSOT 상수", [_ir[0][1], _ir[1][1]], list(fx.SATELLITE_BOOKS))
+chk("I7d 룰이 SSOT 상수", [_ir[0][2], _ir[1][2]],
+    [fx.SATELLITE_RANK_RULE, fx.SATELLITE_ALT_RULE])
+
+# ⚠️ 열 이름 조회는 **죽지 않게** 한다. KeyError 로 죽으면 진단이 중간에서
+#    멈춰 "어느 불변식이 깨졌는지"가 안 보이고 뒤 항목이 아예 안 돌아간다.
+#    없는 열은 -1 로 두어 해당 검사만 조용히 실패하게 둔다.
+_ci = {c: i for i, c in enumerate(fx.SATELLITE_INSTRUCTION_COLS)}
+
+
+def _cix(name):
+    return _ci.get(name, -1)
+_bT = json.loads(_ir[1][_cix("Top_JSON")])
+_bB = json.loads(_ir[1][_cix("Bench_JSON")])
+chk("I8a B반 Top 은 1위부터 시작 (A반 rank 가 새지 않았다)",
+    [e["rank"] for e in _bT], list(range(1, fx.SATELLITE_SLOTS + 1)))
+chk("I8b B반 Bench 는 6위부터 이어진다",
+    [e["rank"] for e in _bB],
+    list(range(fx.SATELLITE_SLOTS + 1, fx.SATELLITE_SLOTS * 2 + 1)))
+chk("I8c 공유 dict 는 B반에서 **B반 점수**로 기록된다 (score 9.9 가 아니라 1.1)",
+    [(e["ticker"], e["score"]) for e in _bB if e["ticker"] == "XLK"],
+    [("XLK", 1.1)])
+
+chk("I9a market_filter 가 없으면 Risk_On 은 **공란** ('안 쟀다')",
+    fx.satellite_instruction_rows(
+        dict(_iout, market_filter=None), "d")[0][_cix("Risk_On")], "")
+chk("I9b risk_on=False 는 False 로 남는다 ('재서 위험 구간')",
+    _ir[0][_cix("Risk_On")], False)
+chk("I10 Skipped_N 은 A/B 공용 루프의 제외 수",
+    [_ir[0][_cix("Skipped_N")], _ir[1][_cix("Skipped_N")]], [2, 2])
+
+# 숙주와 순서 — 소스 위치로 강제한다.
+_p_dd = (HA or "").find("[STEP 5.6] 슬리브 낙폭 판정 중")
+_p_in = (HA or "").find("satellite_instruction_rows")
+_p_se = (HA or "").find("[STEP 6] 이메일 발송 중")
+chk("I11a 세 지점이 모두 run_hidden_alpha 에 있다",
+    min(_p_dd, _p_in, _p_se) > 0, True)
+chk("I11b 지시 기록이 [STEP 5.6] 낙폭 **뒤**다 (③이 ②에 죽지 않는다)",
+    _p_dd < _p_in, True)
+chk("I11c 지시 기록이 [STEP 6] 발송 **앞**이다 (발송 실패한 주도 지시는 남는다)",
+    _p_in < _p_se, True)
+chk("I12 run_hidden_alpha 가 SSOT 함수를 부른다",
+    _calls(HA, _alias_of(HA, "fmp_extras"), "satellite_instruction_rows"), True)
+chk("I13 랭킹을 **다시 계산하지 않는다** (compute_satellite_top10 호출 1회)",
+    _call_count(HA, _alias_of(HA, "fmp_extras"), "compute_satellite_top10"), 1)
+chk("I14 Date 는 실행일이 아니라 데이터 기준일(data_date)이다",
+    "data_date" in (HA or ""), True)
+chk("I15 숙주 오배치 가드 — 월말 러너에는 지시 기록이 없다",
+    ("satellite_instruction" in (SNAP or "").lower()
+     or "SATELLITE_INSTRUCTION" in (SNAP or "")), False)
+chk("I16 층 2 조기 구현 가드 — satellite_execution_gap 은 아직 없다",
+    hasattr(fx, "satellite_execution_gap"), False)
+
+# I18 — 주기 문구가 소비자에 복사돼 있다. §G 가 잡는 "문안 복사"의 얇은 판이다.
+# app.py 는 md 를 파일로 읽어 렌더하지만, 그 **위에** 자기 캡션으로 주기를 또
+# 적는다(md 를 못 읽었을 때의 폴백 요약에도 적는다). 그래서 §1 만 고치면 같은
+# 화면에서 캡션은 "월간", 만다트는 "주간"이 된다. 값을 맞춰 잠근다.
+_CYC = _m_cyc.group(1) if _m_cyc else "?"
+_CYC_OTHER = {"주간": "월간", "월간": "주간"}.get(_CYC, "?")
+chk("I18a 소비자 문구가 §1 주기를 그대로 쓴다 (app.py · 주간 메일)",
+    [f"{_CYC} 리밸런싱" in (src or "") for src in (APP, HA)], [True, True])
+chk("I18b 소비자에 반대 주기가 남아 있지 않다",
+    [f"{_CYC_OTHER} 리밸런싱" in (src or "") for src in (APP, HA)], [False, False])
+
+
+_r2 = md_row6(MD, "② 실행 실패")
+chk("I17a §6 ② 행 존재", bool(_r2), True)
+chk("I17b §6 ② 가 ⚠️ (층 1 만 구축)", status_mark(_r2), "⚠️")
+chk("I17c §6 ② 를 ✅ 로 올리지 않았다 (층 2 미구축)",
+    status_mark(_r2) == "✅", False)
+
+
 # ══ [H] 양성 대조 — 알려진 불량 입력에서 실제로 실패하는가 ═══════════════
 # 초록불이 옳은 이유로 켜졌는지 확인하지 않으면 초록불은 정보가 아니다.
 def _would_fail(fn):
@@ -436,6 +570,32 @@ _bad_ha = (HA or "").replace("fx.satellite_drawdown", "_local_drawdown")
 chk("H5 SSOT 호출을 뗀 run_hidden_alpha 는 F2 를 통과하지 못한다",
     _would_fail(lambda: _calls(_bad_ha, _alias_of(_bad_ha, "fmp_extras"),
                                "satellite_drawdown")), True)
+
+_bad_order = (HA or "")
+if _p_dd > 0 and _p_in > 0:      # 지시 블록을 낙폭 **앞**으로 옮긴 소스를 흉내낸다
+    _bad_order = ((HA or "")[:_p_dd] + "fx.satellite_instruction_rows(  # moved\n"
+                  + (HA or "")[_p_dd:])
+chk("H8 지시 기록을 낙폭 앞으로 옮긴 소스는 I11b 를 통과하지 못한다",
+    _would_fail(lambda: _bad_order.find("[STEP 5.6] 슬리브 낙폭 판정 중")
+                < _bad_order.find("satellite_instruction_rows")), True)
+
+_bad_cyc = MD.replace("| 리밸런싱 주기 | **주간**", "| 리밸런싱 주기 | **월간**", 1)
+chk("H9 §1 을 '월간'으로 되돌린 md 는 I2 를 통과하지 못한다",
+    _would_fail(lambda: re.search(r"리밸런싱 주기\s*\|\s*\*\*(\S+?)\*\*",
+                                  _bad_cyc).group(1)
+                == _FREQ_KO.get(_m_freq.group(1))), True)
+
+_bad_cols = [c for c in fx.SATELLITE_INSTRUCTION_COLS if c != "Risk_On"]
+chk("H10 Risk_On 을 뺀 열 목록은 I5·I6a 를 통과하지 못한다",
+    _would_fail(lambda: ([c.strip() for c in _m_cols.group(1).split("|")]
+                         == _bad_cols) and ("Risk_On" in _bad_cols)), True)
+
+chk("H11 층 2 함수가 생기면 I16 이 이를 잡는다",
+    _would_fail(lambda: not hasattr(fx, "satellite_drawdown")), True)
+
+_bad_cap = (APP or "").replace(f"{_CYC} 리밸런싱", f"{_CYC_OTHER} 리밸런싱", 1)
+chk("H12 앱 캡션 하나만 옛 주기로 되돌려도 I18b 가 잡는다",
+    _would_fail(lambda: f"{_CYC_OTHER} 리밸런싱" not in _bad_cap), True)
 
 chk("H6 배수만 바꾼 봉수는 B2 를 통과하지 못한다",
     _would_fail(lambda: int(re.search(
