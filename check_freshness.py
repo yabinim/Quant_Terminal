@@ -62,7 +62,11 @@ MARKERS = {
     # build_drawdown_html: fmp_extras 위성 마커와 **짝**이다. 반대 방향 유실을
     #   잡는다 — fmp_extras 만 올리면 함수는 있는데 주간 메일이 안 부른다.
     #   그 실패는 조용하다: 이메일은 정상 발송되고 낙폭 섹션만 없다.
-    "run_hidden_alpha.py": ["build_drawdown_html", "satellite_drawdown"],
+    # SATELLITE_INSTRUCTION_SHEET: md §4② 층 1 의 유일한 기록 지점이다. 이 마커가
+    #   없으면 주말 메일은 멀쩡히 나가고 지시만 조용히 안 쌓인다 — 낙폭과 같은
+    #   종류의 조용한 실패다. 층 2 를 만드는 날에야 빈 시트를 발견하게 된다.
+    "run_hidden_alpha.py": ["build_drawdown_html", "satellite_drawdown",
+                            "SATELLITE_INSTRUCTION_SHEET"],
     # 월별 스냅샷 러너. 없으면 md §4③ 의 시계열이 아예 안 쌓인다.
     # SNAPSHOT_MODES: seed_satellite_snapshot.yml 과 **짝**이다. yml 만 올리고
     #   이 마커가 없으면, mode=seed 를 눌러도 스크립트가 그 값을 모른 채 기본

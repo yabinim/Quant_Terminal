@@ -1099,6 +1099,68 @@ SATELLITE_SNAPSHOT_COLS = ["Date", "Book", "Holdings_JSON", "Holdings_MV",
 SATELLITE_SNAP_SEED = "seed"          # 개시일 기준선 1회
 SATELLITE_SNAP_MONTHLY = "monthly"    # 매월 마지막 거래일
 
+# ── md §4② 층 1 — 주간 지시 기록 ────────────────────────────────────────────
+# 무엇을 사려 했는지를 남긴다. **판정하지 않는다.** 성과가 나쁠 때 전략 문제인지
+# 실행 문제인지 가르려면 "지시"와 "실행"이 각각 있어야 하는데, 지금 있는 것은
+# 실행뿐이다. 기록을 먼저 시작하지 않으면 층 2 를 만드는 날에도 잴 것이 없다.
+SATELLITE_INSTRUCTION_SHEET = "Satellite_Instruction"
+# 헤더가 SSOT. 열이 늘면 **뒤에** 붙인다 (스냅샷과 같은 규약).
+SATELLITE_INSTRUCTION_COLS = ["Date", "Book", "Rule", "Top_JSON", "Bench_JSON",
+                              "Risk_On", "Pool_N", "Skipped_N", "Source"]
+SATELLITE_INSTR_HIDDEN_ALPHA = "hidden_alpha"
+
+
+def _satellite_instr_json(rows, score_key: str, lo: int, hi: int) -> str:
+    """rows[lo:hi] → `[{"rank":.., "ticker":.., "score":..}]` JSON.
+
+    ⚠️ rank 를 **슬라이스 위치로 다시 매긴다.** `r["rank"]` 를 읽으면 안 된다 —
+       compute_satellite_top10 의 rows 와 alt["rows"] 는 양쪽 챔피언이 같은
+       종목일 때 **같은 dict 객체**를 공유한다(해당 함수 주석). 그 객체에는
+       `rank`(A반)와 `alt_rank`(B반)가 둘 다 붙어 있어, B반 행에 A반 순위가
+       조용히 섞여 들어온다. 층 2 가 그걸 이탈로 읽으면 원인을 못 찾는다.
+    """
+    out = []
+    for i, r in enumerate(list(rows or [])[lo:hi], lo + 1):
+        sc = (r or {}).get(score_key)
+        out.append({"rank": i,
+                    "ticker": str((r or {}).get("ticker", "")).strip().upper(),
+                    "score": None if (sc is None or pd.isna(sc)) else round(float(sc), 2)})
+    return _json.dumps(out, ensure_ascii=False)
+
+
+def satellite_instruction_rows(top10_out: dict, date_str: str,
+                               source: str = SATELLITE_INSTR_HIDDEN_ALPHA) -> list:
+    """지시 기록 2행(A반·B반). SSOT — 앱·러너가 손으로 행을 만들지 않는다.
+
+    date_str 는 **지시 대상일**(직전 금요일 종가)이다. 실행 시각(일요일)이
+    아니다 — 스냅샷의 "동일 대상일·동일 종가" 규약을 잇는다.
+
+    `Bench_JSON`(6~10위)을 같이 남기는 이유: 5위와 6위의 점수차가 벌어져
+    있으면 이탈의 비용이 크고 붙어 있으면 작다. 이탈의 **성격**은 그 간격
+    없이는 판정할 수 없고, 나중에는 그 간격을 복원할 방법이 없다.
+
+    `Risk_On` 공란은 "안 쟀다"이고 False 는 "재서 위험 구간"이다 — 스냅샷의
+    `Cash` 와 같은 규약. 0/False 로 채워 넣으면 둘이 구분되지 않는다.
+    """
+    o = top10_out or {}
+    alt = o.get("alt") or {}
+    n = int(SATELLITE_SLOTS)
+    hi = n * 2                       # Bench = n+1 ~ 2n 위
+    mf = o.get("market_filter")
+    risk_on = "" if not mf else bool(mf.get("risk_on"))
+    skipped_n = len(o.get("skipped") or [])   # 히스토리 부족 제외 — A/B 공용 루프
+    d, src = str(date_str), str(source)
+    return [
+        [d, SATELLITE_BOOK_A, SATELLITE_RANK_RULE,
+         _satellite_instr_json(o.get("rows"), "score", 0, n),
+         _satellite_instr_json(o.get("rows"), "score", n, hi),
+         risk_on, int(o.get("pool_n") or 0), skipped_n, src],
+        [d, SATELLITE_BOOK_B, SATELLITE_ALT_RULE,
+         _satellite_instr_json(alt.get("rows"), "score_alt", 0, n),
+         _satellite_instr_json(alt.get("rows"), "score_alt", n, hi),
+         risk_on, int(alt.get("pool_n") or 0), skipped_n, src],
+    ]
+
 
 def satellite_snapshot_row(date_str: str, book: str, holdings: dict,
                            cash=None, source: str = SATELLITE_SNAP_MONTHLY) -> list:
@@ -1381,9 +1443,21 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
     out = {"as_of": _dt.datetime.now(_ET_TZ).strftime("%Y-%m-%d %H:%M ET"),
            "market_filter": None, "rows": [], "matrix": {}, "skipped": []}
 
+    # 데이터 기준일 — 받아온 모든 시리즈의 마지막 날짜 중 **최대값**.
+    # 지시 기록(md §4② 층 1)의 Date 가 된다: 일요일에 돌아도 대상일은 금요일
+    # 종가다. 실행 시각을 쓰면 같은 지시가 실행일마다 다른 날짜로 남는다.
+    # 낡은(상장폐지 직전) 시리즈가 섞여도 최대값은 부풀지 않으므로 안전하다.
+    _dmax = None
+
+    def _seen_date(_s):
+        nonlocal _dmax
+        if len(_s) and (_dmax is None or _s.index[-1] > _dmax):
+            _dmax = _s.index[-1]
+
     # ── 🚦 시장 필터 (SPY vs 200일선) ──
     # 소요 200봉 — 아래 len(spy) >= 200 가드와 spy.tail(200).mean().
     spy = _closes("SPY", bars=200)
+    _seen_date(spy)
     if len(spy) >= 200:
         ma200 = float(spy.tail(200).mean())
         last = float(spy.iloc[-1])
@@ -1400,6 +1474,8 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
             # 룰을 바꾸면 여기도 따라온다. 숫자를 손으로 적지 말 것.
             s = _closes(tk, bars=SATELLITE_BARS)
             _time.sleep(pause_sec)
+            # 길이 검사 **전**에 본다 — 히스토리가 짧아도 마지막 날짜는 유효하다.
+            _seen_date(s)
             if len(s) < SATELLITE_BARS:      # 12개월(252봉) 계산 불가
                 out["skipped"].append(
                     (tk, f"히스토리 부족({len(s)}봉 · {SATELLITE_BARS}봉 필요)"))
@@ -1437,6 +1513,11 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
         if best_alt is not None:
             champions_alt.append(best_alt)
 
+    # 후보 풀 규모 — 슬라이싱 **전** 챔피언 수. 지시 기록의 분모다: Top5 가
+    # 11개 중 5개인지 4개 중 5개인지에 따라 같은 지시도 의미가 다르다.
+    # top_n 을 키워 노출하지 않는 이유는 겹침 matrix 가 티커당 FMP 1콜이라서다.
+    out["pool_n"] = len(champions)
+
     champions.sort(key=lambda r: r["score"], reverse=True)
     rows = champions[:max(1, int(top_n))]
     for i, r in enumerate(rows, 1):
@@ -1461,6 +1542,8 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
     out["alt"] = {
         "rule": SATELLITE_ALT_RULE,
         "label": MOM_RULE_LABELS.get(SATELLITE_ALT_RULE, SATELLITE_ALT_RULE),
+        # B반 챔피언은 A반과 **독립적으로** 뽑히므로 풀 규모도 따로 셀 수 있다.
+        "pool_n": len(champions_alt),
         "rows": alt_rows,
         "tickers": b5,
         "scores": {r["ticker"]: r["score_alt"] for r in alt_rows},
@@ -1515,6 +1598,8 @@ def compute_satellite_top10(top_n: int = 10, overlap_floor: float = 10.0,
 
     out["universe"] = uni          # 매트릭스 축 순서 (A반 우선, B반 전용이 뒤)
     out["rows"] = rows
+    # 데이터 0건이면 None — 소비자는 "모르는 날짜"로 기록하지 말고 건너뛴다.
+    out["data_date"] = _dmax.strftime("%Y-%m-%d") if _dmax is not None else None
     return out
 
 
