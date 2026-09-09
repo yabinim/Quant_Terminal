@@ -57,8 +57,33 @@ MARKERS = {
     # import fmp_http: 2026-09-04 A1 전환(원시 requests 2곳 → fmp_http).
     #   fmp_get_json_ex: _fmp_validate_symbols_ex 의 3상태 판정이 kind 에 걸려 있다.
     "narrative_core.py": ["import fmp_http", "fmp_get_json_ex"],
+    # session_phase / narrative_session_label: 2026-09-09 세션 구간 SSOT.
+    #   app.py 와 run_narrative.py 가 **둘 다** 이 두 함수를 부른다. 마커가
+    #   없는 calendar_core 를 올리면 양쪽이 AttributeError 로 죽는다 —
+    #   시끄럽게 죽는 편이 낫지만 관문에서 먼저 잡는 게 더 낫다.
+    # nyse_early_close_days / session_close_time: 반일장 규칙 본체.
+    #   이게 없으면 2PM 가드와 앱 시장 상태 헤더가 동시에 무력화된다.
+    "calendar_core.py": ["session_phase", "narrative_session_label",
+                         "nyse_early_close_days", "session_close_time"],
+    # narrative_session_label: 위 calendar_core 마커와 **짝**이다. 반대 방향
+    #   유실을 잡는다 — calendar_core 만 올리면 함수는 있는데 run_narrative 가
+    #   여전히 자기 안의 낡은 밴드 표를 쓴다. 그 실패는 조용하다: 메일도 시트
+    #   저장도 정상이고 반일장 13:30 이 "Market Hours Analysis" 로 남는다.
+    "run_narrative.py": ["narrative_session_label"],
+    # 반일장 규칙 불일치: 2026-09-09 추가된 리마인더 배달 경로.
+    #   이 마커가 없으면 규칙이 FMP 와 어긋나도 Actions 로그에만 남고 아무도
+    #   모른다. HALFDAY-ALERT 는 그 이전 차수(대조 자체)의 마커다.
+    "refresh_market_calendar.py": ["HALFDAY-ALERT", "반일장 규칙 불일치"],
     "portfolio_core.py": [],
-    "accounts_core.py": [], "gemini_core.py": [], "run_watchlist_alerts.py": [],
+    "accounts_core.py": [], "gemini_core.py": [],
+    # _intraday_close_passed: 반일장 2PM 가드의 판정 본체.
+    #   이 마커가 없는 사본을 올리면 **반일장 14:00 에 2PM 잡이 그대로 돈다.**
+    #   /quote 가 돌려주는 13:00 종가를 "장중 잠정" 봉으로 주입해 헤드업 메일을
+    #   보낸다 — 숫자는 맞고 라벨만 틀리며, 3시간 뒤 5PM 이 같은 숫자로 확정
+    #   메일을 또 보낸다. 예외도 에러 로그도 없다. 조용한 실패다.
+    # session_close_time: 마감 시각을 calendar_core 에서 받는다는 증거.
+    #   함수만 있고 이게 없으면 마감 시각이 하드코딩됐다는 뜻이다.
+    "run_watchlist_alerts.py": ["_intraday_close_passed", "session_close_time"],
     # build_drawdown_html: fmp_extras 위성 마커와 **짝**이다. 반대 방향 유실을
     #   잡는다 — fmp_extras 만 올리면 함수는 있는데 주간 메일이 안 부른다.
     #   그 실패는 조용하다: 이메일은 정상 발송되고 낙폭 섹션만 없다.
@@ -80,7 +105,13 @@ MARKERS = {
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)
 CROSS_TARGETS = {"regime_core", "users_core", "narrative_core", "scanner_core",
                  "fmp_extras", "portfolio_core", "watchlist_metrics_core",
-                 "earnings_core", "accounts_core"}
+                 "earnings_core", "accounts_core",
+                 # calendar_core: app.py 가 `mcal.` 로 부르고 자동화 6개가 `cc.`
+                 #   로 부른다. 지금까지 교차 검사 대상이 아니었는데, 세션 구간
+                 #   SSOT 가 들어오면서 소비자가 늘었다 — 딱 이 검사가 필요한
+                 #   자리다. 별칭은 아래에서 자동 추출하므로 mcal/cc 를 가리지
+                 #   않는다.
+                 "calendar_core"}
 
 
 def top_level_names(src: str) -> set:
@@ -199,8 +230,12 @@ else:
             print(f"  ✅ {mod:26} app.py 가 쓰는 {len(used[mod])}개 심볼 모두 존재")
 
 # 자동화 ↔ 공용 모듈
+# run_narrative.py / refresh_market_calendar.py 를 넣은 이유: 둘 다 이번에
+# calendar_core 의 새 심볼에 의존하게 됐다. 여기 없으면 낡은 calendar_core 와
+# 새 소비자를 섞어 올려도 관문이 통과한다.
 for auto in ("run_earnings_watch.py", "run_watchlist_alerts.py",
-             "run_hidden_alpha.py", "run_satellite_snapshot.py"):
+             "run_hidden_alpha.py", "run_satellite_snapshot.py",
+             "run_narrative.py", "refresh_market_calendar.py"):
     asrc = srcs.get(auto)
     if not asrc:
         continue

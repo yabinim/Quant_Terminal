@@ -74,7 +74,7 @@ except Exception:                                    # pragma: no cover
     _ET = None
 
 # SSOT 버전 스탬프 — 소비자가 기동 시 확인한다.
-CALENDAR_CORE_VERSION = "1.1.0"   # 1.1.0: 반일장(조기 마감) 규칙 추가
+CALENDAR_CORE_VERSION = "1.2.0"   # 1.2.0: 세션 구간(session_phase) SSOT
 
 CAL_SHEET = "Market_Calendar"
 # ⚠️ Adj_Open / Adj_Close 는 **가격이 아니라 시각**이다("09:30" · "13:00").
@@ -334,6 +334,124 @@ def close_minutes(t) -> int:
     except Exception:
         pass
     return 16 * 60
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 세션 구간 — 하루 안의 위치. 반일장·휴장이 여기서 한 번에 반영된다.
+# ══════════════════════════════════════════════════════════════════════════
+# 왜 여기로 올렸나
+# ────────────────
+# **같은 밴드 표가 두 파일에 복사**돼 있었다.
+#
+#     app.py:_narrative_session_label_for_et_dt    240/569/570/960/961/1200
+#     run_narrative.py:_session_label_for_utc      (동일 — 주석에 "app.py와 동일")
+#
+# 주석으로 "동일하다"고 **선언만** 하고 기계 검증이 없었다. 게다가 둘 다
+# 반일장·휴장을 모른다 — 11/27 13:30 에 "🟢 Market Hours Analysis" 가 뜨고
+# 추수감사절 정오에도 똑같이 뜬다. 밴드를 여기로 올려 복사본을 없앤다.
+#
+# ⚠️ 라벨 문자열까지 이 모듈에 둔 이유
+# ────────────────────────────────────
+# 캘린더 모듈에 표시 문자열이 있는 건 냄새가 난다. 그런데 두 소비자가 **반드시
+# 같은 문자열**이어야 한다 — run_narrative 는 이 값을 Narratives 시트에 저장하고
+# app.py 는 그 시트를 읽어 표시한다. 문자열이 갈리면 히스토리가 두 갈래로
+# 쪼개진다. 밴드만 올리고 매핑을 남기면 복사본이 그대로 남으므로, 문자열까지
+# 올려야 드리프트가 구조적으로 불가능해진다.
+#
+# ⚠️ d_et 에 기본값을 주지 않는다
+# ───────────────────────────────
+# 이 모듈의 다른 함수는 d=None 을 "오늘"로 읽는다. session_phase 는 **시각**을
+# 보므로 같은 규약이 위험하다 — 앱은 임의 시각에 rerun 되고 자동화는 고정 시각에
+# 돈다. 두 호출부가 서로 다른 기본값을 기대하는 순간 조용히 갈린다. None 은
+# "모름"이고 넘기는 쪽이 항상 명시한다. (fmp_extras 의 bars= 와 같은 이유)
+
+PHASE_UNKNOWN = "unknown"
+PHASE_CLOSED = "closed"
+PHASE_PRE = "pre"
+PHASE_OPEN = "open"
+PHASE_POST = "post"
+PHASE_OVERNIGHT = "overnight"
+
+PRE_OPEN_MIN = 240        # 04:00 — 프리마켓 시작
+REGULAR_OPEN_MIN = 570    # 09:30 — 정규장 개장 (반일장도 개장은 같다)
+POST_WINDOW_MIN = 240     # 마감 후 애프터마켓 4시간
+
+# 세션 라벨 — app.py 와 run_narrative.py 가 **같은 이 표**를 쓴다.
+# 값을 바꾸면 Narratives 시트에 그 시점 이후로 다른 문자열이 쌓인다.
+NARRATIVE_SESSION_LABELS = {
+    PHASE_PRE:       "🌅 Pre-market Prep",
+    PHASE_OPEN:      "🟢 Market Hours Analysis",
+    PHASE_POST:      "🔔 Daily Recap (Post-Market)",
+    PHASE_OVERNIGHT: "🌙 Overnight Strategy",
+    PHASE_CLOSED:    "🌑 Market Closed",
+    PHASE_UNKNOWN:   "⏱️ Unknown session",
+}
+
+
+def session_phase(d_et, extra_closed=None, half_map=None) -> str:
+    """그 시각이 하루 중 어느 구간인가. FMP·시트 접근 없음.
+
+    d_et : **datetime**. date 나 문자열은 시각이 없으므로 unknown 이다.
+
+        "unknown"    판정 불가 — None 이거나 datetime 이 아님
+        "closed"     휴장 (주말·휴일·임시휴장)
+        "pre"        04:00 ~ 09:29
+        "open"       09:30 ~ 마감 직전      ← 반일장이면 12:59 까지
+        "post"       마감 ~ +4시간          ← 반일장이면 13:00 ~ 16:59
+        "overnight"  그 외
+
+    ⚠️ 판정을 **내림차순**으로 한다
+    ───────────────────────────────
+    오름차순(pre 를 먼저 보는 방식)으로 쓰면 half_map 이 이상한 값을 주입했을 때
+    — 예컨대 시트의 Adj_Close 가 "05:00" 으로 들어왔을 때 — 이미 닫힌 장을
+    "pre" 라고 부른다. 마감 기준을 먼저 보면 close_m 이 어떤 값이든 구간의
+    순서가 뒤집히지 않는다.
+
+    ⚠️ 경계는 get_market_status 와 맞춘다
+    ─────────────────────────────────────
+    마감 정각(정규장 16:00)은 open 이 아니라 post 다. 마감+4시간 정각(20:00)은
+    post 가 아니라 overnight 이다. app.py 시장 상태 헤더가 이미 그렇게 판정하고
+    있어서, 예전에는 한 화면에 "🌙 After-hours" 와 "🟢 Market Hours Analysis" 가
+    동시에 뜨는 1분 구간이 두 군데 있었다. 그걸 없앤다.
+
+    ⚠️ 판정 불가는 "unknown" 이지 "open" 이 아니다
+    ──────────────────────────────────────────────
+    is_market_open / session_close_time 은 개장·16:00 으로 fail-open 한다.
+    알림을 통째로 놓치는 것보다 헛도는 쪽이 덜 위험하기 때문이다. 그런데 이
+    함수의 산출물은 **사람이 읽는 라벨**이라 판단 근거가 아니다. 모를 때
+    "장중"이라고 우기는 것보다 모른다고 말하는 쪽이 정직하고 덜 위험하다.
+    """
+    if not isinstance(d_et, datetime):
+        return PHASE_UNKNOWN
+    try:
+        m = d_et.hour * 60 + d_et.minute
+    except Exception:
+        return PHASE_UNKNOWN
+    t = session_close_time(d_et, extra_closed=extra_closed, half_map=half_map)
+    if t is None:
+        return PHASE_CLOSED
+    close_m = close_minutes(t)
+    if m >= close_m + POST_WINDOW_MIN:
+        return PHASE_OVERNIGHT
+    if m >= close_m:
+        return PHASE_POST
+    if m >= REGULAR_OPEN_MIN:
+        return PHASE_OPEN
+    if m >= PRE_OPEN_MIN:
+        return PHASE_PRE
+    return PHASE_OVERNIGHT
+
+
+def narrative_session_label(d_et, extra_closed=None, half_map=None) -> str:
+    """세션 라벨 — app.py 표시와 Narratives 시트 저장값의 SSOT.
+
+    app.py 의 _narrative_session_label_for_et_dt 와 run_narrative.py 의
+    _session_label_for_utc 가 **둘 다 이 함수만** 부른다. 그쪽에 밴드
+    리터럴을 다시 적으면 diag_market_calendar.py K절이 빨간불을 낸다.
+    """
+    return NARRATIVE_SESSION_LABELS.get(
+        session_phase(d_et, extra_closed=extra_closed, half_map=half_map),
+        NARRATIVE_SESSION_LABELS[PHASE_UNKNOWN])
 
 
 def _coerce_date(d):

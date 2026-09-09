@@ -13360,18 +13360,21 @@ def render_global_market_watch_header():
 
 
 def _narrative_session_label_for_et_dt(dt_et):
-    """ET 기준 Ryan 루틴 세션 라벨."""
-    if dt_et is None:
-        return "⏱️ Unknown session"
-    m = dt_et.hour * 60 + dt_et.minute
-    # 04:00 ~ 09:29 / 09:30 ~ 16:00 / 16:01 ~ 20:00 / 20:01 ~ 03:59
-    if 240 <= m <= 569:
-        return "🌅 Pre-market Prep"
-    if 570 <= m <= 960:
-        return "🟢 Market Hours Analysis"
-    if 961 <= m <= 1200:
-        return "🔔 Daily Recap (Post-Market)"
-    return "🌙 Overnight Strategy"
+    """ET 기준 Ryan 루틴 세션 라벨 — calendar_core SSOT 위임.
+
+    ⚠️ 밴드 리터럴(240/570/960/1200)을 여기 다시 적지 말 것.
+    ─────────────────────────────────────────────────────────
+    예전엔 이 함수와 run_narrative.py:_session_label_for_utc 에 **같은 표가
+    복사**돼 있었고, 저쪽 주석은 "app.py와 동일한 세션 라벨" 이라고 선언만
+    했다. 둘 다 반일장·휴장을 몰라서 11/27 13:30 과 추수감사절 정오에
+    "🟢 Market Hours Analysis" 가 떴다. 지금은 양쪽이 같은 함수를 부른다 —
+    주석의 선언이 아니라 구조로 보장된다.
+
+    run_narrative 가 이 라벨을 Narratives 시트에 저장하고 앱이 그걸 읽어
+    표시하므로, 문자열이 갈리면 히스토리가 두 갈래로 쪼개진다.
+    diag_market_calendar.py K절이 여기 밴드 리터럴이 되살아나는 것을 막는다.
+    """
+    return mcal.narrative_session_label(dt_et)
 
 
 def narrative_session_label_at_utc(dt_utc):
@@ -17196,13 +17199,29 @@ if st.session_state.get("logged_in"):
             warning_text = "\n".join(fresh_warnings) if fresh_warnings else "없음"
             now_kst = datetime.now(_MARKET_ET_TZ)
             now_et_for_session = datetime.now(_MARKET_ET_TZ)
-            # 장 세션 판단은 ET 기준 (9:30~16:00 ET)
-            et_hour = now_et_for_session.hour
-            et_minute = now_et_for_session.minute
-            market_session = (
-                "장 전" if (et_hour < 9 or (et_hour == 9 and et_minute < 30))
-                else ("장 중" if et_hour < 16 else "장 후")
-            )
+            # 장 세션 판단은 ET 기준. 마감 시각은 calendar_core 가 준다.
+            #
+            # 예전엔 `et_hour < 16` 하드코딩이라 반일장(13:00 마감) 14:00 에
+            # Gemini 에게 "장 중" 이라고 알렸다 — 프롬프트 [현재 시각] 줄이
+            # 그대로 거짓이 된다. 휴장일도 "장 전/장 후" 중 하나로 뭉개졌다.
+            # DRG 자동화(run_drg_predict)는 8AM·9AM 개장 전에만 돌아서 이
+            # 버그가 안 났고, **앱에서 수동 실행할 때만** 드러나는 자리였다.
+            #
+            # ⚠️ mcal.session_phase 를 쓰지 않는 이유
+            #    이 라벨은 00:00~03:59 를 "장 전", 20:00~23:59 를 "장 후" 로
+            #    부른다. phase 로는 둘 다 overnight 이라 한 값으로 접히지
+            #    않는다. 기존 동작을 그대로 보존하려면 마감 시각만 받아
+            #    여기서 나누는 쪽이 맞다.
+            _sess_ct = mcal.session_close_time(now_et_for_session)
+            _sess_m = now_et_for_session.hour * 60 + now_et_for_session.minute
+            if _sess_ct is None:
+                market_session = "휴장"
+            elif _sess_m < 570:
+                market_session = "장 전"
+            elif _sess_m < mcal.close_minutes(_sess_ct):
+                market_session = "장 중"
+            else:
+                market_session = "장 후"
 
             # 선물·리스크오프 신호 별도 강조
             _futures_sig = fresh_sig.get("futures", {})
