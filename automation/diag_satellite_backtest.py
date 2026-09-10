@@ -231,6 +231,25 @@ COMMISSION_PER_TRADE = 0.0    # Fidelity HSA: 미국 주식·ETF 온라인 매�
 #   있는지는 Fidelity 목록에서 직접 확인해야 한다. 민감도 테스트용 노브로 남겨둔다.
 SELL_ASSESSMENT = 0.00002     # 매도 시 SEC 부과금 ≈ 원금 $1,000당 $0.02
 _AS_OF = None                 # main() 이 _env_as_of() 로 채운다. None = 오늘 기준.
+
+WINDOW_DAYS_PIN = 1826
+#   §4① 판정 재현용 **로컬 창 상한**(달력일). None 이면 봉수 환산 그대로.
+#
+#   왜 있나: 2026-09-10 에 fx.HIST_MAX_DAYS 가 1826 → 5478 로 올라갔다. 그
+#   1826 이 여기서 하던 일은 "상한"이 아니라 **평가 창의 실질 결정자**였다 —
+#   HISTORY_BARS=1300 은 1,892달력일로 환산되는데 클램프가 1,826일로 깎아
+#   실제로는 늘 ~1,255봉이 왔다(실측 2026-09-10: SPY 1255봉 2021-09-10~2026-09-10).
+#   전역 상한만 올리면 같은 코드가 **경고도 에러도 없이 1,300봉**을 받기 시작하고,
+#   워크포워드 6개 창의 구성이 달라진다. 그러면 SATELLITE_MANDATE §4① 의
+#   "6개 창 중 4개 이상" 판정이 '신호가 죽었나'가 아니라 '자를 바꿨나'를 재게 된다.
+#
+#   그래서 전역 상한이 하던 역할을 여기로 **명시적으로 옮겨** 둔다. 값이 같으므로
+#   2026-09-10 이전과 동작이 완전히 동일하다.
+#
+#   ⚠️ 이 값을 바꾸면 T1~T4 와의 대조가 끊긴다. 바꾸려면 SATELLITE_MANDATE §7 에
+#      날짜·근거를 남기고, 판정용 재실행과 참고용 재실행을 분리할 것.
+#   ⚠️ 핀은 **봉수가 아니라 달력일**이다. 봉수는 휴장일 배치 때문에 기준일마다
+#      1~2봉 흔들린다.
 ENTRY_LAG_DAYS = 1            # 신호일 → 체결일 (금 종가 신호 → 월 종가 체결)
 HISTORY_BARS   = 1300         # 요구 **봉수**. 창 환산은 fmp_extras 가 한다.
 #   ⚠️ v2.9 개명: 옛 이름은 HISTORY_LIMIT 이었다. 단위는 처음부터 봉수였고
@@ -326,14 +345,20 @@ def _window_days_for(bars: int, warn=print) -> int:
     warn: 주입 가능 — 진단이 경고 발생 여부를 관찰하기 위함.
     """
     days = fx.hist_days_for_bars(bars)
-    if days >= fx.HIST_MAX_DAYS:
+    # 두 상한 중 **작은 쪽**이 실제로 창을 정한다. 어느 쪽이 물었는지를 경고에
+    # 밝히지 않으면, 전역 상한을 올려도 그대로인 창을 보고 "안 먹었다"고 오진한다.
+    cap, who = fx.HIST_MAX_DAYS, f"fmp_extras.HIST_MAX_DAYS={fx.HIST_MAX_DAYS}"
+    if WINDOW_DAYS_PIN is not None and WINDOW_DAYS_PIN < cap:
+        cap, who = WINDOW_DAYS_PIN, f"WINDOW_DAYS_PIN={WINDOW_DAYS_PIN} (§4① 재현 핀)"
+    if days >= cap:
         with _WARN_LOCK:
             if bars not in _WARNED_CEILING:
                 _WARNED_CEILING.add(bars)
                 warn(f"[WARN] 요구 {bars}봉은 조회 상한에 잘린다 — "
-                     f"창 {days}달력일 ≈ {int(days * fx.HIST_TD_PER_CD)}봉 "
-                     f"(fmp_extras.HIST_MAX_DAYS={fx.HIST_MAX_DAYS}). "
-                     f"이 값을 더 올려도 받는 봉수는 늘지 않는다.")
+                     f"창 {min(days, cap)}달력일 ≈ "
+                     f"{int(min(days, cap) * fx.HIST_TD_PER_CD)}봉 "
+                     f"({who}). 이 값을 더 올려도 받는 봉수는 늘지 않는다.")
+        return cap
     return days
 
 
