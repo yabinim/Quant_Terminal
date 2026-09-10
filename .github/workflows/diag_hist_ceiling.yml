@@ -1,0 +1,85 @@
+name: 📏 진단 — FMP 이력 상한 규명 (Step 0 · 수동 전용)
+
+# 무엇을 묻나
+# ───────────
+#   Q1 상한의 유형 — 고정 시작일인가 · 고정 봉수인가 · 없는가        [판정 D1]
+#   Q2 완전성 — 깊은 창이 경계만 지키고 중간을 자르는가              [판정 D2]
+#   Q3 대조군 + 페이로드 비용                                        [출력 전용]
+#   Q4 상한을 올리면 동결 백테스트가 어떻게 변하나                   [고지 D4]
+#   Q5 저장소에 남은 낡은 상한 주장 목록                             [출력 전용]
+#
+# 왜 지금
+# ───────
+# diag_credit_gate_probe v2 가 부수적으로 잡았다: from=2007-01-01 단일 호출로
+# **4,952봉 · 19.7년**이 왔다. 그런데 저장소 여섯 곳이 "FMP 자체 상한 ~1,255봉"을
+# 사실로 적고 있다.
+#
+# ⚠️ 이것은 §7 재조사 금지 항목에 대한 도전이 **아니다.** §7 의 명제는
+#    "`limit` 은 무시된다"이고 그건 여전히 참이다 — 이 프로브는 limit 을 아예
+#    보내지 않는다. 도전 대상은 거기서 **유도된** "따라서 이력 상한은 ~1,255봉"
+#    이고, from/to 전환 이후 한 번도 검증된 적이 없다.
+#
+#    왜 검증되지 않았나가 핵심이다. hist_days_for_bars() 가 HIST_MAX_DAYS=1826
+#    에서 클램프하므로 **1826일 넘는 요청은 저장소 어디에서도 나가지 않는다.**
+#    정책 상수가 자기를 반증할 기회를 구조적으로 막고 있었다.
+#
+# ⚠️ 이 프로브는 **상수를 정하지 않는다**(사전 약정 D3). 관측만 하고, 숫자는
+#    Step 1 에서 가장 얕은 종목을 제약으로 삼아 정한다. 이번 라운드에서 단일
+#    관측에 앵커를 박는 실수를 두 번 했다(R1 off 36% · P5 5~15%). 세 번은 안 한다.
+#
+# ⚠️ D1 의 판정 통계는 한 종목의 봉수가 아니라 **종목 간 분산**이다. 한 종목만
+#    보면 세 유형(고정 시작일·고정 봉수·상한 없음)이 전부 같은 그림을 낸다.
+#
+# 안전성: **읽기 전용.** 시트를 열지 않고 파일을 쓰지 않는다. 그래서 GSPREAD_KEY 가
+#         env 에 없다 — 키가 없으면 실수로도 쓸 수 없다. FRED 도 안 쓴다.
+#
+# 콜 예산: FMP 6콜(4종목 최심 + 대조군 1 + 여유). 다른 워크플로와 겹쳐도 무방하다.
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/repository_dispatch 트리거 없음.
+
+jobs:
+  ceiling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10     # 실측 6콜. 20년 페이로드라 v1 보다 응답이 크다.
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # gspread·google-auth·fredapi 없음 — 시트도 FRED 도 만지지 않는다.
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install requests numpy pandas pytz
+
+      # 락스텝 짝. 배선이 깨진 상태로 나온 숫자는 어차피 못 믿는다.
+      - name: 🛡️ FMP SSOT · 튜플 계약 가드 (락스텝)
+        run: python automation/diag_fmp_ssot.py
+
+      # ⚠️ 실측 **전에** 돌린다. D1 은 세 유형을 가르는 분류기라, 검사 순서가
+      #    뒤집히면 '우연히 상장일 근처에서 잘린 경우'를 '상한 없음'으로 오판한다.
+      #    자체검증 14개는 변이 10종으로 죽음이 확인된 것이다 —
+      #    D1 순서/각 가지/종목수 가드 · D2 부분연도 제외·임계 ·
+      #    구간 공식 워밍업/캡 · Q5 pycache 제외/패턴.
+      #    스크립트 안에서도 한 번 더 부르고 실패 시 실측을 읽지 않는다.
+      - name: ✅ 판정 로직 자체검증 (합성 데이터 · 네트워크 불필요)
+        run: python automation/diag_hist_ceiling.py --selftest
+
+      - name: 📏 이력 상한 프로브 (읽기 전용 · 시트 접촉 0 · 파일 쓰기 0)
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          # FMP Starter 한도는 분당 300. 67% 로 둔다(다른 진단과 동일 규약).
+          FMP_RATE_LIMIT_PER_MIN: '200'
+        run: |
+          python automation/diag_hist_ceiling.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_hist_ceiling.py
