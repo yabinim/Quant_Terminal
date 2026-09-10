@@ -492,12 +492,13 @@ def _fmp_price_history(ticker: str, lookback_days: int = 460) -> pd.DataFrame:
 
     2026-08-27: `limit` → `from`/`to` 날짜창으로 전환.
 
-      `limit` 은 **한 번도 강제된 적이 없다.** 무엇을 적든 FMP 는 5년 롤링 전폭
+      `limit` 은 **한 번도 강제된 적이 없다.** 무엇을 적든 FMP 는 5년 롤링 기본 창
       (약 1,254봉)을 돌려줬다(diag_fmp_window 실측: limit=500 → 1254봉 수신).
+      기본 창은 상한이 아니다 — 실제 상한은 롤링 5,000 레코드(→ fmp_extras.HIST_MAX_DAYS).
       즉 호출부의 숫자들은 "필요한 최소 봉수"가 아니라 "누가 언젠가 적어둔 값"
       이었고 검증된 적이 없다.
 
-      `from`/`to` 는 먹힌다 — 좁은 창(20봉)부터 전폭(1254봉)까지 6개 케이스 전부
+      `from`/`to` 는 먹힌다 — 좁은 창(20봉)부터 기준선 전량(1254봉)까지 6개 케이스 전부
       `honored_complete`. 봉당 229바이트이므로 1254봉 ≈ 287KB/종목이다.
 
     ⚠️ 전환하는 순간 이 값이 **처음으로 실제 상한**이 된다. 그러므로
@@ -1369,7 +1370,7 @@ def route_candidates_by_regime(candidate_tickers, lookback_days: int = _REGIME_L
         # 2026-08-27: 봉수가 모자라면 52주 창이 짧아지고 ma200_slope 가 미수렴이다.
         #   그대로 두면 이런 종목이 **weak(약추세 Stage4)** 로 나가 매도 레이더에
         #   실린다 — 사유가 거짓말이 된다. 이건 from 전환 위험 대비가 아니라
-        #   지금 있는 버그다: 상장 1년 미만 종목은 1254봉을 요청해도 252봉이 없다.
+        #   지금 있는 버그다: 상장 1년 미만 종목은 창을 얼마나 넓혀도 252봉이 없다.
         if not reg.get("full_metrics", False):
             _b = int(reg.get("bars") or 0)
             result["excluded"].append(
