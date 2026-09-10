@@ -213,7 +213,7 @@ def _fmp_price_history_ohlcv(ticker: str, bars: int) -> tuple[pd.Series, pd.Seri
       어느 요구인지 모르는 창이 조용히 생기는 것보다 낫다.
 
     [2026-08-28] `limit=130` → `from`/`to` 창. FMP 는 이 엔드포인트의 `limit` 을
-      **무시**하므로 실제로는 1,254봉을 받고 있었다. 옛 130 은 검증된 적 없는
+      **무시**하므로 실제로는 1,254봉(기본 창)을 받고 있었다. 옛 130 은 검증된 적 없는
       숫자라 요구의 근거로 쓰지 않았다 — `calculate_period_return(s, 21)` 이
       `iloc[-(21+1)]` 를 읽으므로 요구는 22봉이다.
     """

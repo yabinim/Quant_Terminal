@@ -472,7 +472,7 @@ def group_R():
     chk(m._HIST_MAX_DAYS >= m._HIST_WINDOW_DAYS, "R5",
         f"상한({m._HIST_MAX_DAYS})이 기본 창({m._HIST_WINDOW_DAYS}) 이상")
     chk(m._bars_for_calendar_days(m._HIST_MAX_DAYS) >= 1200, "R6",
-        f"상한이 limit 무효 시절 실측(약 1,254봉)에 준한다 "
+        f"상한이 limit 시절 수신량(약 1,254봉 · 기본 창) 이상 "
         f"→ {m._bars_for_calendar_days(m._HIST_MAX_DAYS)}봉")
 
 

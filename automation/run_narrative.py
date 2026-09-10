@@ -298,7 +298,7 @@ def _fmp_close_series(ticker: str, bars: int):
          그걸 '데이터 부족'으로 읽어 종목이 `continue` 로 빠진다 — Emerging
          검증 결과에서 종목이 통째로 사라지는데 로그에는 아무것도 안 남는다.
       2. `limit=130` → `from`/`to` 창. FMP 는 `limit` 을 **무시**하므로 실제로는
-         1,254봉이 오고 있었다.
+         1,254봉(기본 창)이 오고 있었다.
 
     ⚠️ 옛 `limit=130` 을 그대로 창으로 옮기면 **판정이 조용히 바뀐다.**
       아래 소비부가 `s.rolling(200, min_periods=150)` 을 `if len(s) >= 150`

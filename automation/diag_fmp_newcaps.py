@@ -135,7 +135,8 @@ _D_FROM_90 = (_TODAY - timedelta(days=90)).isoformat()
 _D_FROM_3Y = (_TODAY - timedelta(days=365 * 3)).isoformat()
 # tierB4 — 깊이 재측정용. 3년(tierB3)은 **요청한 만큼만 돌아와서** 한도를 재지
 # 못했다. 넉넉히 요청해야 min(date) 가 어디서 멈추는지 보인다.
-# 가격 엔드포인트의 실측 한도가 5년(1255봉)이었으므로 그보다 넉넉한 7년을 쓴다.
+# 가격 엔드포인트의 한도가 5년(1255봉)이라 믿었으므로 그보다 넉넉한 7년을 쓴다.
+# (그 5년은 from 없는 요청의 기본 창이었다 — 실제 상한은 롤링 5,000 레코드.)
 _D_FROM_7Y = (_TODAY - timedelta(days=365 * 7)).isoformat()
 # 불량 입력 검사용 좁은 창. from/to 가 응답을 실제로 자르는지 본다.
 _D_NARROW_FROM = (_TODAY - timedelta(days=20)).isoformat()
@@ -398,9 +399,12 @@ TIER_B3 = [
 # 판별력 없는 지표를 판별자로 쓴 것이다 — 이 프로젝트에서 반복된 실수다
 # (무필터 대비 건수, 시드 포함 여부에 이어 세 번째).
 #
-# 반례가 이미 있다: `historical-price-eod/full` 의 진짜 한도는 실측 결과
-# **5년(1255봉, limit 무관 롤링)** 이었다(diag_fmp_depth → run_signal_backtest:152).
+# 반례가 이미 있다(고 당시엔 봤다): `historical-price-eod/full` 의 한도가 실측
+# **5년(1255봉, limit 무관 롤링)** 으로 기록돼 있었다(diag_fmp_depth → run_signal_backtest:152).
 # 계정 플랜 차원의 한도라면 업종도 3년이 아닐 수 있다.
+# ⚠️ 2026-09-10 정정: 그 '반례'도 같은 착오였다 — 5년은 from 없는 요청의 기본
+#    창이었고, from 을 넉넉히 주자 롤링 5,000 레코드(≈19.8년)가 왔다
+#    (diag_hist_ceiling). 결론(3년은 한도가 아닐 수 있다)은 맞았고 근거가 틀렸다.
 #
 # 3년과 5년의 차이가 판정을 가른다
 # ────────────────────────────────
@@ -920,8 +924,9 @@ def render_depth_req(res, date_key="date"):
     그게 "플랜 한도 3년"으로 기록됐다.
 
     요청한 날짜부터 데이터가 왔다는 것은 **한도를 재지 못했다**는 뜻이지
-    한도가 그 값이라는 뜻이 아니다. 반례가 있다: historical-price-eod 의 진짜
-    한도는 5년(1255봉, limit 무관)이었다.
+    한도가 그 값이라는 뜻이 아니다. 반례가 있다: historical-price-eod 에서 '한도
+    5년(1255봉)'으로 기록됐던 값도 from 없는 요청의 기본 창이었고, 실제 상한은
+    롤링 5,000 레코드였다(2026-09-10 diag_hist_ceiling).
 
     판별자: min(date) − 요청 from
         ≈ 0  → 한도 미도달. 이 요청으로는 상한을 못 잰다

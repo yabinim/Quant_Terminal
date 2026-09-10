@@ -196,7 +196,7 @@ def verify_prediction(pred_row: pd.Series) -> tuple[str, float, str]:
         #   1. 맨 requests.get → fh.fmp_get_json. 이 경로만 **429 재시도가 없었다.**
         #      레이트리밋을 삼키면 `fmp_r.json()` 이 예외로 튀어 verify_prediction 이
         #      통째로 빈 결과를 돌려준다 = 그날 검증이 사라진다.
-        #   2. `limit=20` → from/to 창. limit 은 무시되므로 1,254봉이 오고 있었다.
+        #   2. `limit=20` → from/to 창. limit 은 무시되므로 1,254봉(기본 창)이 오고 있었다.
         #   3. URL 하드코딩 → fh 의 base/키 조립. `FMP_KEY_V` 지역 변수도 없앤다.
         #
         # 죽은 변수 정리: 옛 `start_date`/`end_date` 는 계산만 하고 **한 번도 쓰이지

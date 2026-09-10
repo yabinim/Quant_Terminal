@@ -275,7 +275,7 @@ def fetch_macro_context(fred: Fred, full_events: list = None) -> str:
                 # [중요] 응답 정렬에 걸지 않는다. 예전 코드는 newest-first 를
                 # 가정하고 첫 행부터 훑었는데, 그 가정이 깨지면 **21일 전 종가가
                 # '직전 종가'로 들어가고 에러는 나지 않는다.** limit 시절에는
-                # 1,254봉이 와서 오차가 5년치였다.
+                # 1,254봉(기본 창)이 와서 오차가 5년치였다.
                 rows = sorted(rows, key=lambda _r: str(_r.get("date", "")),
                               reverse=True)
                 for row in rows:

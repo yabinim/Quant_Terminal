@@ -11,14 +11,14 @@
     high_52w = float(close.max())     # 이름은 52주
     low_52w  = float(close.min())     # 계산은 들어온 길이 전체
 
-FMP 가 `limit` 을 무시해 1254봉(약 5년)이 들어오면서 "52주 고점 대비"가 실제로는
+FMP 가 `limit` 을 무시해 기본 창 1254봉(≈5년)이 들어오면서 "52주 고점 대비"가 실제로는
 "5년 고점 대비"였다. 그리고 이건 표시가 아니라 신호다:
 
     pct_from_high → W_NEAR_HIGH(15) ┐
     pct_from_low  → W_ABOVE_LOW(10) ┴→ score → regime → leaders/setups/excluded
 
 게다가 `classify_regime` 은 **이미 가변 길이로 호출된다** — `regime_core:618` 은
-진입 시점 재구성용 `sliced`(짧음), `:637` 은 현재 `hist`(1254봉). 즉 같은 종목의
+진입 시점 재구성용 `sliced`(짧음), `:637` 은 현재 `hist`(당시 1254봉). 즉 같은 종목의
 then/now 비교가 서로 다른 고점 창을 쓰고 있었다.
 
 왜 가드가 필요한가

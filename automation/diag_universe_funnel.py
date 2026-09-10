@@ -300,7 +300,7 @@ print("=" * 74)
 check("S1  fmp_http 를 임포트한다", W["import_fh"], True)
 check("S2  _fmp_price_history 가 fmp_get_ex 를 호출한다", W["ssot_call"], True)
 check("S3  _fmp_price_history 에 원시 requests.get 이 없다", W["raw_get"], False)
-check("S4  타임아웃이 15초 이상 (1,255봉 페이로드)", bt._FMP_TIMEOUT >= 15, True)
+check("S4  타임아웃이 15초 이상 (5년치 ≈1,260봉 페이로드)", bt._FMP_TIMEOUT >= 15, True)
 
 # ── v2.9 창 정책 (limit → from/to) ─────────────────────────────────────
 # 왜 여기에 두는가: 이 파일이 이미 _fmp_price_history 를 AST 로 들여다보는
