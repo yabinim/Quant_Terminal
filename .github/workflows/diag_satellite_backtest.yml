@@ -16,6 +16,16 @@ name: 🛰️ 진단 — 위성 섹터 로테이션 백테스트 (수동 전용)
 on:
   workflow_dispatch:        # 수동 실행만. 스케줄러/디스패치 트리거 없음.
     inputs:
+      as_of:
+        description: >-
+          기준일 고정 (YYYY-MM-DD). 비우면 오늘 기준 — 기존 동작.
+          §4① 판정 재실행처럼 창을 고정해야 할 때만 채운다.
+          ⚠️ 재현을 보장하지 않는다 — adjClose 는 배당 지급 때마다 과거가 소급
+          재산정되므로 창을 고정해도 값은 달라진다. 고정되는 것은 '어느 구간을
+          봤는가' 뿐이다. ⚠️ 형식 오류·미래 날짜는 즉시 실패한다. 오늘로 조용히
+          되돌리면 결과에 붙는 날짜 라벨이 거짓이 된다.
+        required: false
+        default: ''
       min_fetch_rate:
         description: '페치 성공률 하한 (기본 0.98). 이 밑이면 시트에 안 쓰고 중단.'
         required: false
@@ -52,6 +62,8 @@ jobs:
       - name: 🛰️ 위성 로테이션 백테스트 (읽기 전용 · Satellite_Backtest 시트에만 기록)
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          # 빈 문자열이면 스크립트가 '미지정 → 오늘 기준'으로 읽는다.
+          AS_OF:            ${{ inputs.as_of }}
           GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
           # FMP Starter 한도는 분당 300. 67% 로 둔다.
           # ⚠️ 300 으로 올리지 말 것 — 한도에 붙이면 다시 429 가 난다.
