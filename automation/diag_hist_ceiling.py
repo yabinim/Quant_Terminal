@@ -33,7 +33,7 @@
   실행: python automation/diag_hist_ceiling.py
         python automation/diag_hist_ceiling.py --selftest   # 네트워크 불필요
 
-아무것도 수정하지 않는다. 시트 접근 0 · 파일 쓰기 0 · FMP 6콜.
+아무것도 수정하지 않는다. 시트 접근 0 · 파일 쓰기 0 · FMP 7콜.
 
 
 ═══════════════════════════════════════════════════════════════════════════
@@ -49,6 +49,20 @@
       ⚠️ 판정 통계를 '봉수'가 아니라 **종목 간 분산**으로 잡은 이유: 한 종목만
          보면 세 유형이 전부 같은 그림을 낸다. 파라미터가 작동했을 때만
          성립하는 통계를 고르라는 것이 `symbol-change` 때 배운 규율이다.
+
+  D1b **[v2 신규] D1 의 사각.** 미국 주식은 거래일 달력을 공유한다. 따라서
+      상한이 **레코드 수**에 걸리면 종목 간 봉수도 최소일도 **똑같이** 나오고,
+      '고정 시작일'과 구분되지 않는다. v1 분류기는 최소일 분산을 먼저 보고
+      한쪽을 단정했다 — 데이터가 지지하지 않는 판정이었다.
+      → 둘 다 같으면 **'구분불가'로 떨어뜨리고** D5 로 넘긴다.
+
+  D5  **[v2 신규] 후행 창 판별.** `to` 를 과거로 밀면 두 가설이 갈린다.
+        · **레코드 상한** — 봉수가 앵커와 ±2% 이내로 유지되고 최소일이 뒤로 이동
+        · **고정 시작일** — 최소일이 앵커와 ±5일 이내로 고정되고 봉수가 감소
+        · 그 외 → **불명**(숫자를 정하지 않는다)
+      ⚠️ 판정 통계가 '봉수'와 '최소일'의 **동시 거동**인 이유: 하나만 보면
+         두 가설이 같은 방향으로 움직이는 구간이 있다. 둘의 조합만이
+         가설별로 배타적이다.
 
   D2  **완전성.** 최심 응답의 **연도별 봉 수**가 240~260 밖인 연도가 전체
       연도의 **10% 초과**면 `truncated` — 깊은 창은 쓸 수 없다고 판정한다.
@@ -115,6 +129,13 @@ PROBE_SYMBOLS = [
 
 D1_SAME_DATE_TOL_DAYS = 5
 D1_SAME_BARS_TOL = 0.05
+# D5 — 후행 창 판별. `to` 를 과거로 밀어 두 가설을 가른다.
+DISCRIM_SYMBOL = "SPY"
+DISCRIM_TOS = ("2015-12-31", "2010-12-31")
+D5_BARS_TOL = 0.02          # 봉수가 앵커와 이 비율 이내면 '유지됐다'
+D5_DATE_TOL_DAYS = 5        # 최소일이 앵커와 이 일수 이내면 '고정됐다'
+D5_MIN_SHIFT_DAYS = 30      # 최소일이 이만큼 뒤로 가야 '이동했다'
+
 D2_YEAR_LO, D2_YEAR_HI = 240, 260
 D2_MAX_BAD_FRAC = 0.10
 
@@ -169,13 +190,23 @@ def classify_ceiling(obs: dict) -> tuple:
 
     mins = [v["min"] for v in obs.values()]
     spread = (max(mins) - min(mins)).days
-    if spread <= D1_SAME_DATE_TOL_DAYS:
-        return "고정 시작일", (f"최소일이 전부 {min(mins).date()} 부근 "
-                            f"(분산 {spread}일 ≤ {D1_SAME_DATE_TOL_DAYS})")
-
     bars = [v["bars"] for v in obs.values()]
     lo, hi = min(bars), max(bars)
-    if lo > 0 and (hi - lo) / lo <= D1_SAME_BARS_TOL:
+    same_bars = lo > 0 and (hi - lo) / lo <= D1_SAME_BARS_TOL
+    same_dates = spread <= D1_SAME_DATE_TOL_DAYS
+
+    # ⚠️ D1b — 여기가 v1 의 사각이었다. 미국 주식은 거래일 달력을 공유하므로
+    #    **레코드 수 상한**도 종목 간 최소일을 똑같이 만든다. 둘 다 같으면
+    #    '고정 시작일'과 '고정 봉수'가 관측상 구별되지 않는다. 단정하지 말고
+    #    D5(후행 창 판별)로 넘긴다.
+    if same_dates and same_bars:
+        return "구분불가", (f"최소일 {min(mins).date()} 공통(분산 {spread}일) · "
+                          f"봉수 {lo}~{hi} 공통 — 레코드 상한과 고정 시작일이 "
+                          f"같은 그림을 낸다. D5 가 가른다")
+    if same_dates:
+        return "고정 시작일", (f"최소일이 전부 {min(mins).date()} 부근 "
+                            f"(분산 {spread}일) 인데 봉수는 {lo}~{hi} 로 갈린다")
+    if same_bars:
         return "고정 봉수", (f"최소일은 다른데 봉수가 {lo}~{hi} "
                           f"(편차 {(hi - lo) / lo * 100:.1f}% ≤ "
                           f"{D1_SAME_BARS_TOL * 100:.0f}%)")
@@ -189,6 +220,36 @@ def classify_ceiling(obs: dict) -> tuple:
     n_ok = sum(1 for x in reached if x)
     return "불명", (f"최소일 분산 {spread}일 · 봉수 {lo}~{hi} · "
                   f"상장일 도달 {n_ok}/{len(obs)} — 유형을 특정할 수 없다")
+
+
+def classify_discriminator(anchor_min, anchor_bars: int, samples: list) -> tuple:
+    """D5 — `to` 를 과거로 민 응답들로 상한 유형을 가른다.
+
+    samples: [(to_date_str, min_ts, bars), ...]
+
+    판정 통계는 봉수와 최소일의 **동시 거동**이다. 하나만 보면 두 가설이 같은
+    방향으로 움직이는 구간이 있다 — 예컨대 고정 시작일에서도 `to` 를 충분히
+    밀면 봉수가 준다. 배타적인 것은 조합뿐이다:
+        레코드 상한 : 봉수 유지 + 최소일 이동
+        고정 시작일 : 봉수 감소 + 최소일 고정
+    """
+    ok = [(t, m, b) for (t, m, b) in samples if b > 0 and m is not None]
+    if not ok or anchor_bars <= 0:
+        return "불명", "판별 응답이 없다"
+
+    kept = all(abs(b - anchor_bars) / anchor_bars <= D5_BARS_TOL for _, _, b in ok)
+    moved = all((anchor_min - m).days >= D5_MIN_SHIFT_DAYS for _, m, _ in ok)
+    shrank = all(b < anchor_bars * (1 - D5_BARS_TOL) for _, _, b in ok)
+    pinned = all(abs((m - anchor_min).days) <= D5_DATE_TOL_DAYS for _, m, _ in ok)
+
+    if kept and moved:
+        return "레코드 상한", (f"봉수 유지(≈{anchor_bars}) + 최소일 이동 "
+                            f"({', '.join(str(m.date()) for _, m, _ in ok)})")
+    if shrank and pinned:
+        return "고정 시작일", (f"최소일 고정({anchor_min.date()}) + 봉수 감소 "
+                            f"({', '.join(str(b) for _, _, b in ok)})")
+    return "불명", (f"봉수유지={kept} 최소일이동={moved} 봉수감소={shrank} "
+                  f"최소일고정={pinned} — 어느 가설도 배타적으로 성립하지 않는다")
 
 
 def segments_for(bars: int, warmup: int, seg_bars: int, seg_max: int) -> int:
@@ -279,6 +340,45 @@ def probe_ceiling() -> tuple:
     else:
         print("     → **숫자를 정하지 않는다**(D3). 유형이 불명이면 상수를 못 고친다.")
     return obs, deepest, deepest_sym
+
+
+def probe_discriminator(obs: dict) -> tuple:
+    """Q1b — `to` 를 과거로 밀어 D1 의 구분불가를 가른다. FMP 2콜."""
+    print(f"\n{_SEP}\n■ Q1b — 후행 창 판별 (D5)\n{_SEP}")
+    if not obs:
+        print("  [X] 앵커 없음 — 판정 불가")
+        return "불명", "앵커 없음"
+    anchor_min = min(v["min"] for v in obs.values())
+    anchor_bars = max(v["bars"] for v in obs.values())
+    print(f"  앵커: {DISCRIM_SYMBOL} 최소일 {anchor_min.date()} · 봉수 {anchor_bars}")
+    print("  `to` 를 과거로 민다. 두 가설의 예상이 정반대다 —")
+    print(f"    레코드 상한 → 봉수 ≈{anchor_bars} 유지 · 최소일 뒤로 이동")
+    print(f"    고정 시작일 → 최소일 {anchor_min.date()} 고정 · 봉수 감소\n")
+    print(f"  {'to':<14}{'봉수':>8}{'최소일':>14}{'최대일':>14}")
+    print("  " + "-" * 50)
+
+    samples = []
+    for to_ in DISCRIM_TOS:
+        idx, _nb, _dt, kind = fetch(DISCRIM_SYMBOL, DEEP_FROM, to_)
+        if len(idx) == 0:
+            print(f"  {to_:<14}{'—':>8}{'—':>14}{'—':>14}   ⚠️ {kind}")
+            continue
+        print(f"  {to_:<14}{len(idx):>8}{str(idx[0].date()):>14}"
+              f"{str(idx[-1].date()):>14}")
+        samples.append((to_, idx[0], len(idx)))
+
+    kind_, why = classify_discriminator(anchor_min, anchor_bars, samples)
+    print(f"\n  ★ D5 판정: **{kind_}** — {why}")
+    if kind_ == "레코드 상한":
+        print(f"     → 상한은 응답 **레코드 수**(≈{anchor_bars})다. 날짜가 아니라")
+        print("        개수 제한이므로 `to` 를 나눠 **여러 창으로 이어붙이면**")
+        print("        더 깊은 이력을 받을 수 있다. Step 1 의 설계가 달라진다.")
+    elif kind_ == "고정 시작일":
+        print(f"     → 상한은 **날짜**({anchor_min.date()})다. 창을 나눠도 그 이전은")
+        print("        오지 않는다. 이어붙이기는 무의미하다.")
+    else:
+        print("     → **숫자를 정하지 않는다**(D3). 유형이 불명이면 상수를 못 고친다.")
+    return kind_, why
 
 
 def probe_completeness(idx: pd.DatetimeIndex, sym: str) -> str:
@@ -380,9 +480,11 @@ def _selftest() -> int:
     # 1) D1 세 유형을 각각 만들어 낸다. **하나라도 못 내면 판정기가 죽은 것이다.**
     def _mk(d, b, r):
         return {"min": pd.Timestamp(d), "bars": b, "ref": r}
+    # ⚠️ 봉수를 일부러 벌려 둔다. 봉수까지 같으면 그건 '구분불가'가 정답이고
+    #    (2b 참조), 그 픽스처로는 '고정 시작일' 가지를 검사할 수 없다.
     fixed_start = {"A": _mk("1996-01-02", 7600, "1980-12-12"),
-                   "B": _mk("1996-01-03", 7599, "1986-03-13"),
-                   "C": _mk("1996-01-02", 7601, "1993-01-22")}
+                   "B": _mk("1996-01-03", 6100, "1986-03-13"),
+                   "C": _mk("1996-01-02", 4900, "1993-01-22")}
     if classify_ceiling(fixed_start)[0] != "고정 시작일":
         fails.append("D1: 최소일이 같은데 '고정 시작일'로 판정 안 됨")
     fixed_bars = {"A": _mk("2006-01-02", 5000, "1980-12-12"),
@@ -403,6 +505,45 @@ def _selftest() -> int:
               "C": _mk("1993-01-22", 11395, "1993-01-22")}
     if classify_ceiling(tricky)[0] != "고정 봉수":
         fails.append("D1 순서: 봉수가 같으면 상장일 도달보다 '고정 봉수'가 우선이어야 한다")
+
+    # 2b) D1b 사각 — 최소일도 봉수도 같으면 **단정하지 않는다.**
+    #     이게 v1 이 틀린 자리다. 실측(4종목 전부 5000봉·2006-10-23)이
+    #     그대로 여기 들어온다 — 회귀 앵커다.
+    ambiguous = {"AAPL": _mk("2006-10-23", 5000, "1980-12-12"),
+                 "MSFT": _mk("2006-10-23", 5000, "1986-03-13"),
+                 "SPY": _mk("2006-10-23", 5000, "1993-01-22"),
+                 "QQQ": _mk("2006-10-23", 5000, "1999-03-10")}
+    if classify_ceiling(ambiguous)[0] != "구분불가":
+        fails.append("D1b: 최소일·봉수가 모두 같은데 한쪽을 단정했다 "
+                     "(v1 실측 회귀 — 거래일 달력 공유 때문에 두 가설이 같은 그림)")
+
+    # 2c) 최소일만 같고 봉수가 갈리면 '고정 시작일'이 맞다
+    date_only = {"A": _mk("2006-10-23", 5000, "1980-12-12"),
+                 "B": _mk("2006-10-23", 4200, "1986-03-13"),
+                 "C": _mk("2006-10-23", 3100, "1993-01-22")}
+    if classify_ceiling(date_only)[0] != "고정 시작일":
+        fails.append("D1: 최소일만 같은 경우가 '고정 시작일'로 안 갔다")
+
+    # 2d) D5 세 가지 결론을 각각 낸다 — 하나라도 못 내면 판별기가 죽은 것이다
+    a_min, a_bars = pd.Timestamp("2006-10-23"), 5000
+    rec = [("2015-12-31", pd.Timestamp("1996-01-05"), 5000),
+           ("2010-12-31", pd.Timestamp("1991-02-01"), 4990)]
+    if classify_discriminator(a_min, a_bars, rec)[0] != "레코드 상한":
+        fails.append("D5: 봉수 유지 + 최소일 이동인데 '레코드 상한'이 아니다")
+    fix = [("2015-12-31", pd.Timestamp("2006-10-23"), 2310),
+           ("2010-12-31", pd.Timestamp("2006-10-25"), 1050)]
+    if classify_discriminator(a_min, a_bars, fix)[0] != "고정 시작일":
+        fails.append("D5: 최소일 고정 + 봉수 감소인데 '고정 시작일'이 아니다")
+    # 최소일이 며칠만 흔들린 경우는 '창이 미끄러진' 것이 아니라 달력 잡음이다.
+    # 이동 임계가 없으면 봉수 유지 + 3일 드리프트를 '레코드 상한'으로 오판한다.
+    drift = [("2015-12-31", a_min - pd.Timedelta(days=3), 5000)]
+    if classify_discriminator(a_min, a_bars, drift)[0] == "레코드 상한":
+        fails.append("D5 이동 임계: 최소일 3일 드리프트를 창 이동으로 읽었다")
+    mixed = [("2015-12-31", pd.Timestamp("2001-01-05"), 3800)]
+    if classify_discriminator(a_min, a_bars, mixed)[0] != "불명":
+        fails.append("D5: 봉수도 줄고 최소일도 움직인 애매한 경우를 단정했다")
+    if classify_discriminator(a_min, a_bars, [])[0] != "불명":
+        fails.append("D5: 응답이 없는데 판정을 냈다")
 
     # 3) 종목 부족 → 불명 (분산을 볼 수 없으면 판정하지 않는다)
     if classify_ceiling({"A": _mk("1993-01-22", 8300, "1993-01-22")})[0] != "불명":
@@ -471,8 +612,8 @@ def _selftest() -> int:
             print(f"  [X] {x}")
         print(f"\n  {len(fails)}건 실패")
         return 1
-    print("  [O] 14개 검사 통과 — D1 유형 3 · D1 순서/부족 2 · "
-          "D2 양방향+부분연도 4 · 구간 공식 4 · Q5 스캐너 2")
+    print("  [O] 21개 검사 통과 — D1 유형 3 · **D1b 사각 2** · D1 순서/부족 2 · "
+          "**D5 판별 5** · D2 양방향+부분연도 4 · 구간 공식 4 · Q5 스캐너 2")
     return 0
 
 
@@ -493,6 +634,7 @@ def main() -> int:
     if not obs:
         print("\n[중단] 실측을 하나도 받지 못했다.")
         return 1
+    probe_discriminator(obs)
     probe_completeness(deepest, sym)
     probe_control()
     probe_freeze_impact(obs)
