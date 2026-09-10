@@ -1,0 +1,82 @@
+name: 🩸 진단 — 크레딧 스프레드 게이트 Phase 0 프로브 (수동 전용)
+
+# 무엇을 재는가
+# ─────────────
+#   Q1 FMP 창이 ~1,254봉 **밖**으로 나가나        → 백테스트 평가 구간이 정해진다
+#   Q2 FRED BAMLH0A0HYM2 · NFCI 가 쓸 만한가      → 실패하면 나머지는 무효(P4)
+#   Q3 크레딧 게이트가 SPY200 과 다른 축인가       → **중단 기준 P1**
+#   Q4 R1 의 20일선이 우연인가                     → 파라미터 안정성 P3
+#
+# 판정 임계(P1 Jaccard 0.80 · P3 3/4창 ±0.10)는 diag_credit_gate_probe.py
+# **파일 상단에 사전 커밋**되어 있다. 결과를 본 뒤 바꾸면 diff 가 남는다 —
+# 그게 이 배치의 목적이다(diag_momentum_rule_compare 와 같은 규약).
+#
+# ⚠️ 이 프로브는 **수익률을 계산하지 않는다.** 성과를 먼저 보면 사전 약정
+#    숫자를 그림을 아는 상태에서 쓰게 된다. 백테스트는 Phase 1 의 일이고,
+#    이 워크플로가 정하는 것은 그 백테스트의 **구간과 착수 여부**뿐이다.
+#
+# ⚠️ P1 은 **프로젝트를 죽이는 기준**이다. 겹침이 0.80 이상이면 크레딧 게이트는
+#    200일선의 다른 이름이고, 모듈을 새로 만들지 않는다. 리드/래그가 좋아
+#    보인다는 이유로 무르지 않는다 — 그 열은 출력 전용이다.
+#
+# ⚠️ Q1 이 실패하면(과거 창이 무시되면) 평가 구간에 2020-03 이 들어오지 않는다.
+#    크레딧 스프레드가 가장 크게 일한 구간이 밖이라는 뜻이므로, 이후 Phase 1
+#    결과는 통과하더라도 결론 강도를 낮춰서 읽어야 한다. 로그의 [P2] 줄을 볼 것.
+#
+# 안전성: **읽기 전용.** 시트를 열지 않고 파일을 쓰지 않는다. 그래서 GSPREAD_KEY 가
+#         env 에 없다 — 키가 없으면 실수로도 쓸 수 없다. 몇 번을 돌려도 부작용이 없다.
+#
+# 콜 예산: FMP 4콜(SPY 창 4종) + FRED 2콜. 다른 워크플로와 겹쳐 돌려도 무방한
+#         유일한 진단이다 — 분당 한도에 사실상 영향이 없다.
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/repository_dispatch 트리거 없음.
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10     # 실측 6콜 — 보통 1분 미만. 여유는 FRED 지연용.
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # gspread·google-auth 없음 — 이 프로브는 시트를 만지지 않는다.
+      # fredapi 는 Q2/Q3/Q4 에 필수다(없으면 Q2 가 [X] 로 끝난다).
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install requests numpy pandas pytz fredapi
+
+      # 락스텝 짝. 배선이 깨진 상태로 나온 숫자는 어차피 못 믿는다.
+      # 이 프로브는 fmp_extras(창 정책) · fmp_http(A1 경유)를 import 한다.
+      - name: 🛡️ FMP SSOT · 튜플 계약 가드 (락스텝)
+        run: python automation/diag_fmp_ssot.py
+
+      # ⚠️ 실측 **전에** 돌린다. 부등호 한 글자가 뒤집히면 게이트가 정확히
+      #    거꾸로 돌고, 실측은 에러 없이 '역방향으로 잘 맞는 신호'를 보고한다.
+      #    자체검증 15개는 변이 6종(부등호 ×2 · 확인일 · Jaccard 퇴화 ·
+      #    리드/래그 부호 · 결측 처리)으로 죽음이 확인된 것이다.
+      #    스크립트 안에서도 한 번 더 부르고 실패 시 실측을 읽지 않는다 —
+      #    로컬 실행에도 같은 보호가 걸리게 하기 위해 이중으로 둔다.
+      - name: ✅ 게이트 로직 자체검증 (합성 데이터 · 네트워크 불필요)
+        run: python automation/diag_credit_gate_probe.py --selftest
+
+      - name: 🩸 크레딧 게이트 프로브 (읽기 전용 · 시트 접촉 0 · 파일 쓰기 0)
+        env:
+          FMP_API_KEY:  ${{ secrets.FMP_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          # FMP Starter 한도는 분당 300. 67% 로 둔다(다른 진단과 동일 규약).
+          FMP_RATE_LIMIT_PER_MIN: '200'
+        run: |
+          python automation/diag_credit_gate_probe.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_credit_gate_probe.py
