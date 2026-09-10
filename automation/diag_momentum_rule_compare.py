@@ -772,6 +772,31 @@ def _selftest() -> int:
     if len(_rows) != len(RULES) * len(VARIANTS) * len(_wins):
         fails.append(f"행 개수 이상: {len(_rows)}")
 
+    # ── as_of 전파 (2026-09-10) ───────────────────────────────────────────
+    # ⚠️ 이 검사가 왜 AST 인가: 위 검사들은 전부 합성 데이터로 돌아 `_batch_fetch`
+    #    를 밟지 않는다. 즉 **호출부가 깨져도 자체검증은 초록불이다.** 실제로
+    #    2026-09-10 diag_satellite_backtest v3.0 이 `as_of` 를 기본값 없이
+    #    추가했을 때 이 파일의 main() 은 TypeError 로 죽는 상태였는데 selftest
+    #    는 전 항목 통과였다. 실행 경로를 안 밟는 검사로는 잡을 수 없다.
+    import ast as _ast
+    try:
+        _tree = _ast.parse(open(__file__, encoding="utf-8").read())
+        _calls = [c for c in _ast.walk(_tree)
+                  if isinstance(c, _ast.Call)
+                  and isinstance(c.func, _ast.Attribute)
+                  and c.func.attr == "_batch_fetch"]
+        if not _calls:
+            fails.append("as_of 전파: _batch_fetch 호출을 못 찾았다 — 검사가 무효")
+        for c in _calls:
+            if not any(k.arg == "as_of" for k in c.keywords):
+                fails.append(f"as_of 전파: L{c.lineno} 의 _batch_fetch 호출에 "
+                             f"as_of= 가 없다 — 실행 시 TypeError")
+    except OSError:
+        fails.append("as_of 전파: 자기 소스를 읽지 못했다")
+    # 파서를 재구현하지 않았는지 — bt 의 것을 쓰는가
+    if not hasattr(bt, "_env_as_of"):
+        fails.append("as_of: bt._env_as_of 가 없다 — 락스텝 짝이 낡았다")
+
     if fails:
         print("❌ 실패:")
         for f in fails:
@@ -779,7 +804,7 @@ def _selftest() -> int:
         return 1
     print("✅ 전 항목 통과 (공통워밍업·룰축분리·12-1스킵·슬롯·차등가중·"
           "부정입력거부·창생성·pairwise방향·임계강제·MDD게이트·"
-          "T1~T4동결·T7임계·위험조정축·시트열정합)")
+          "T1~T4동결·T7임계·위험조정축·시트열정합·as_of전파)")
     return 0
 
 
@@ -800,12 +825,30 @@ def main() -> int:
     print(f"\n[STEP 1] 후보 풀 {len(universe)}개 + 벤치 {len(BENCH)}개 = "
           f"{len(fetch_list)}종목 수집 · 공통 워밍업 {warmup}봉")
 
+    # ⚠️ `as_of` 는 기본값이 없다(§7). 빠뜨리면 TypeError 로 즉시 죽는다 —
+    #    조용히 '오늘'이 되는 것보다 낫다. 파서는 bt 것을 그대로 쓴다(SSOT):
+    #    여기서 다시 구현하면 두 파일의 AS_OF 해석이 갈릴 수 있고, 그 차이는
+    #    §4① 재실행 비교에서 정확히 문제가 되는 지점이다.
+    _as_of = bt._env_as_of()
+    print("[STEP 1] 기준일 — "
+          + (f"AS_OF={_as_of} (고정)" if _as_of else "AS_OF=미지정 → 오늘 기준"))
     raw, adjmap, fallback, reasons, failed = bt._batch_fetch(
-        fetch_list, bars=bt.HISTORY_BARS)
+        fetch_list, bars=bt.HISTORY_BARS, as_of=_as_of)
     n = len(fetch_list)
     rate = (len(raw) / n) if n else 1.0
     print(f"[STEP 1] 원종가 {len(raw)}/{n} ({rate * 100:.1f}%) · "
           f"배당조정 {len(raw) - len(fallback)}/{n}")
+    # §4① 재실행 비교의 근거가 되는 값이다. 요청 창이 아니라 **수신 창**을
+    # 남긴다 — 2026-09-05 판정에는 이게 기록되지 않아 소급 재현이 불가능하다.
+    if "SPY" in raw and len(raw["SPY"]):
+        _bi = raw["SPY"].index
+        _sp = [len(v) for v in raw.values() if v is not None and len(v)]
+        print(f"[STEP 1] 수신 창 — SPY {len(_bi)}봉 "
+              f"{_bi[0].date()} ~ {_bi[-1].date()} "
+              f"(전 종목 봉수 {min(_sp)}~{max(_sp)})")
+        print("[STEP 1] ⚠️ §4① 판정 재실행은 이 봉수와 같은 깊이로 돌려야 한다. "
+              "창이 바뀌면 워크포워드 6개 창의 구성이 달라져 4/6 판정이 "
+              "'신호가 죽었나'가 아니라 '자를 바꿨나'를 재게 된다.")
     print("[STEP 1] " + fh.fmp_stats_line())
     if "SPY" not in raw:
         print("[ERROR] SPY 이력 확보 실패 — 중단")

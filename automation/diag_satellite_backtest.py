@@ -2,6 +2,31 @@
 # -*- coding: utf-8 -*-
 """diag_satellite_backtest.py — 🛰️ HSA 위성 섹터 로테이션 백테스트 (읽기 전용 진단)
 
+v3.0 (2026-09-10) — AS_OF 창 고정
+─────────────────────────────────
+`fx.hist_range_params()` 는 `from = 오늘 − N일` 로 창을 만든다. **같은 코드가
+매일 다른 데이터를 본다.** 지금까지 그게 결과에 잘 안 드러난 이유는 위에
+HIST_MAX_DAYS(1826) 클램프가 얹혀 창이 늘 포화해 있었기 때문이다.
+
+그 상한이 **API 한계가 아니라 정책 상수**임이 실측으로 확인됐다(2026-09-10,
+diag_hist_ceiling): 단일 호출의 실제 상한은 **롤링 5,000 레코드(≈19.8년)** 다.
+상한을 올리면 완충이 사라지고 날짜 이동이 그대로 결과에 실린다.
+
+  AS_OF=2026-09-05  또는  --as-of=2026-09-05   (미지정 = 오늘, 기존 동작)
+
+⚠️ **재현을 보장하지 않는다.** 배당조정 종가(adjClose)는 배당 지급 때마다 과거
+   전체가 소급 재산정된다. 창을 고정해도 값은 달라진다. 고정되는 것은 **어느
+   구간을 봤는가**뿐이고, 그것만으로 "창이 바뀐 것"과 "룰이 다른 것"을 구분할
+   수 있다. 그게 이 인자의 전부다 — 그 이상을 주장하지 말 것.
+
+⚠️ 그러므로 T1~T4 는 **소급해서 동결할 수 없다.** 그 판정들은 as-of 이전에
+   나왔고 비트 단위 재현이 불가능하다. §7 에 '수신 창 미기록 · 재현 불가'로
+   남기고, 이후 판정부터 수신 창을 함께 적는다.
+
+또 하나: [STEP 1] 이 이제 **요청 창**과 **수신 창**을 따로 찍는다. 지금까지
+결과 해석의 전제였던 "1,254봉"은 요청값이 아니라 수신값이었는데 어디에도
+남지 않았다.
+
 목적
 ────
 주말 Hidden Alpha 이메일의 '위성 섹터 Top10'을 보고 Top5 를 보유하다가
@@ -101,6 +126,54 @@ _RESULT_WORKSHEET  = "Satellite_Backtest"
 #    공유 모듈로 빼지 않은 이유: 그러려면 run_signal_backtest 와 그 락스텝 짝인
 #    diag_universe_funnel(68/68 통과 중)까지 함께 손대야 한다. 대신 복제가
 #    어긋나지 않는지를 diag_fmp_ssot.py 가 두 모듈을 직접 호출해 대조한다.
+def _env_as_of(raw=None, argv=None, today=None):
+    """AS_OF 파싱 → `datetime.date` 또는 None(= 오늘).
+
+    왜 필요한가
+    ───────────
+    `fx.hist_range_params()` 는 `from = 오늘 − N일`, `to = 오늘 + 1일` 로 창을
+    만든다. 즉 **같은 코드가 매일 다른 데이터를 본다.** 지금까지는 그 위에
+    HIST_MAX_DAYS 클램프가 얹혀 창이 늘 1,826일로 포화해 있었기 때문에 날짜
+    이동이 결과에 잘 안 드러났다. 상한을 올리는 순간 그 완충이 사라진다.
+
+    ⚠️ 이 인자는 **재현을 보장하지 않는다.** 배당조정 종가(adjClose)는 배당이
+       지급될 때마다 과거 전체가 소급 재산정되므로, 창을 고정해도 값은 달라진다.
+       고정되는 것은 **어느 구간을 봤는가**뿐이다. 그것만으로도 "창이 바뀐 것"과
+       "룰이 다른 것"을 구분할 수 있고, 그게 이 인자의 전부다.
+
+    ⚠️ 형식이 틀리면 **오늘로 조용히 되돌리지 않고 죽는다**(ValueError).
+       고정을 요청했는데 오늘로 실행되면, 결과에 붙는 날짜 라벨이 거짓이 된다.
+       빈 값·미지정은 정상이며 None(오늘)이다 — 그건 요청이 없었다는 뜻이다.
+
+    ⚠️ 미래 날짜도 거부한다. 미래를 주면 `to` 가 미래가 되는데 그 창은 조용히
+       '오늘까지'로 잘려서, 라벨은 미래인데 데이터는 오늘까지인 결과가 나온다.
+
+    argv/today 는 주입 가능 — 자체검증이 환경을 건드리지 않기 위함.
+    """
+    if raw is None:
+        raw = os.environ.get("AS_OF", "")
+    t = str(raw).strip()
+    if not t:
+        for a in (argv if argv is not None else sys.argv[1:]):
+            if str(a).startswith("--as-of="):
+                t = str(a).split("=", 1)[1].strip()
+                break
+    if not t:
+        return None
+    try:
+        d = datetime.strptime(t, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"AS_OF 형식 오류: {t!r} — YYYY-MM-DD 여야 한다. "
+            f"오늘로 되돌리지 않는다(라벨이 거짓이 되므로).")
+    # ⚠️ ET 기준이다. `fx.hist_range_params()` 가 ET 로 창을 만들므로 여기서
+    #    KST 를 쓰면 한국 아침 시간대에 하루 앞선 날짜가 '미래'로 반려된다.
+    ref = today or datetime.now(_ET).date()
+    if d > ref:
+        raise ValueError(f"AS_OF 가 미래다: {d} > {ref}. 창이 조용히 잘린다.")
+    return d
+
+
 def _env_fetch_rate(raw=None, default: float = 0.98) -> float:
     """MIN_FETCH_RATE 파싱. 0.0~1.0 만 허용, 그 외는 경고 후 default."""
     if raw is None:
@@ -157,6 +230,7 @@ COMMISSION_PER_TRADE = 0.0    # Fidelity HSA: 미국 주식·ETF 온라인 매�
 #   ⚠️ 단, 일부 소수 ETF 는 건당 $100 서비스 수수료 대상 — 후보 풀에 해당 종목이
 #   있는지는 Fidelity 목록에서 직접 확인해야 한다. 민감도 테스트용 노브로 남겨둔다.
 SELL_ASSESSMENT = 0.00002     # 매도 시 SEC 부과금 ≈ 원금 $1,000당 $0.02
+_AS_OF = None                 # main() 이 _env_as_of() 로 채운다. None = 오늘 기준.
 ENTRY_LAG_DAYS = 1            # 신호일 → 체결일 (금 종가 신호 → 월 종가 체결)
 HISTORY_BARS   = 1300         # 요구 **봉수**. 창 환산은 fmp_extras 가 한다.
 #   ⚠️ v2.9 개명: 옛 이름은 HISTORY_LIMIT 이었다. 단위는 처음부터 봉수였고
@@ -263,7 +337,7 @@ def _window_days_for(bars: int, warn=print) -> int:
     return days
 
 
-def _fmp_eod(ticker: str, endpoint: str, *, bars: int) -> tuple:
+def _fmp_eod(ticker: str, endpoint: str, *, bars: int, as_of) -> tuple:
     """/stable/historical-price-eod/{endpoint} → DatetimeIndex + 'px' 컬럼.
 
     endpoint='full'              : 원 종가 (랭킹용 — 라이브 compute_satellite_top10 과 동일)
@@ -296,7 +370,7 @@ def _fmp_eod(ticker: str, endpoint: str, *, bars: int) -> tuple:
         return pd.DataFrame(), "no_key"
     url = (f"{_FMP_BASE}/historical-price-eod/{endpoint}"
            f"?symbol={ticker}&apikey={FMP_API_KEY}"
-           + fx.hist_range_params(_window_days_for(bars)))
+           + fx.hist_range_params(_window_days_for(bars), today=as_of))
     r, _status, kind = fh.fmp_get_ex(url, timeout=_FMP_TIMEOUT)
     if r is None or kind != "ok":
         return pd.DataFrame(), kind
@@ -323,11 +397,15 @@ def _fmp_eod(ticker: str, endpoint: str, *, bars: int) -> tuple:
         return pd.DataFrame(), "exception"
 
 
-def _batch_fetch(tickers: list, *, bars: int) -> tuple:
+def _batch_fetch(tickers: list, *, bars: int, as_of) -> tuple:
     """(raw_close{}, div_adj{}, fallback_list, reasons{}, failed[]) — 병렬 수집.
 
     reasons : {(endpoint, kind): count} — 엔드포인트별 성공/실패 사유 분포
     failed  : [(ticker, endpoint, kind), ...] — 탈락 항목과 그 이유
+
+    v3.0: `as_of` 도 같은 규칙으로 받는다 — **키워드 전용 · 기본값 없이.**
+      기본값을 두면 상위가 빠뜨렸을 때 조용히 '오늘'이 되고, 그 결과는 고정된
+      창이라는 라벨을 달고 나온다. `bars` 와 정확히 같은 실패 모양이다.
 
     v2.9: `bars` 를 **중간층까지 키워드 전용 · 기본값 없이** 받는다(§7).
       중간층에 기본값을 두면 상위가 요구를 빠뜨려도 조용히 메워진다. 여기서는
@@ -347,7 +425,8 @@ def _batch_fetch(tickers: list, *, bars: int) -> tuple:
         return raw, adj, [], reasons, failed
     jobs = [(tk, "full") for tk in tickers] + [(tk, "dividend-adjusted") for tk in tickers]
     with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
-        futs = {ex.submit(_fmp_eod, tk, ep, bars=bars): (tk, ep) for tk, ep in jobs}
+        futs = {ex.submit(_fmp_eod, tk, ep, bars=bars, as_of=as_of): (tk, ep)
+                for tk, ep in jobs}
         for fut in concurrent.futures.as_completed(futs):
             tk, ep = futs[fut]
             try:
@@ -1189,13 +1268,95 @@ def _selftest() -> int:
     if not exercised:
         fails.append("회귀 테스트가 risk-off 슬롯 공백 경로를 밟지 못함 — 테스트 자체가 무효")
 
+    # ── AS_OF (v3.0) ──────────────────────────────────────────────────────
+    # ⚠️ 통과 경로만 재면 안 된다. 이 인자의 값어치는 **거부**에 있다.
+    #    형식 오류를 오늘로 되돌리면 결과에 붙는 날짜 라벨이 거짓이 되고,
+    #    그 거짓은 시트에 남아 나중에 진짜처럼 읽힌다.
+    _ref = datetime(2026, 9, 10).date()
+    if _env_as_of("", argv=[], today=_ref) is not None:
+        fails.append("AS_OF: 빈 값이 None(오늘)이 아니다")
+    if _env_as_of("   ", argv=[], today=_ref) is not None:
+        fails.append("AS_OF: 공백만 있는 값이 None 이 아니다")
+    if _env_as_of("2026-09-05", argv=[], today=_ref) != datetime(2026, 9, 5).date():
+        fails.append("AS_OF: 정상 날짜를 파싱하지 못했다")
+    for bad in ("2026/09/05", "20260905", "어제", "2026-13-01", "2026-09-32"):
+        try:
+            _env_as_of(bad, argv=[], today=_ref)
+            fails.append(f"AS_OF: 형식 오류 {bad!r} 를 통과시켰다 — 조용히 오늘이 된다")
+        except ValueError:
+            pass
+    try:
+        _env_as_of("2026-09-11", argv=[], today=_ref)
+        fails.append("AS_OF: 미래 날짜를 통과시켰다 — 창이 조용히 잘린다")
+    except ValueError:
+        pass
+    # argv 경로도 같은 규칙이어야 한다(환경변수만 막고 CLI 를 열어두면 무의미)
+    if _env_as_of("", argv=["--as-of=2026-09-05"], today=_ref) != datetime(2026, 9, 5).date():
+        fails.append("AS_OF: --as-of= 인자를 읽지 못했다")
+    try:
+        _env_as_of("", argv=["--as-of=2026-99-99"], today=_ref)
+        fails.append("AS_OF: --as-of= 의 형식 오류를 통과시켰다")
+    except ValueError:
+        pass
+    # 환경변수가 argv 보다 우선(둘 다 있으면 env). 우선순위가 뒤집히면 워크플로가
+    # 지정한 값을 로컬 인자가 조용히 덮는다.
+    if _env_as_of("2026-09-01", argv=["--as-of=2026-09-05"], today=_ref) \
+            != datetime(2026, 9, 1).date():
+        fails.append("AS_OF: env 가 argv 보다 우선이어야 한다")
+
+    # 창이 실제로 고정되는가 — 같은 as_of 면 다른 '오늘'에도 같은 from/to
+    _w1 = fx.hist_range_params(1826, today=datetime(2026, 9, 5).date())
+    _w2 = fx.hist_range_params(1826, today=datetime(2026, 9, 5).date())
+    _w3 = fx.hist_range_params(1826, today=datetime(2026, 9, 6).date())
+    if _w1 != _w2:
+        fails.append("AS_OF: 같은 기준일인데 창이 다르다")
+    if _w1 == _w3:
+        fails.append("AS_OF: 기준일이 달라도 창이 같다 — today 인자가 안 먹는다")
+
+    # 중간층이 as_of 를 **기본값 없이** 요구하는가(§7). 기본값이 생기면 상위가
+    # 빠뜨렸을 때 조용히 오늘이 되고, 결과는 고정 창 라벨을 달고 나온다.
+    import inspect as _insp
+    for _fn in (_fmp_eod, _batch_fetch):
+        _p = _insp.signature(_fn).parameters.get("as_of")
+        if _p is None:
+            fails.append(f"AS_OF: {_fn.__name__} 가 as_of 를 받지 않는다")
+        elif _p.default is not _insp.Parameter.empty:
+            fails.append(f"AS_OF: {_fn.__name__}.as_of 에 기본값이 있다 — §7 위반")
+        elif _p.kind is not _insp.Parameter.KEYWORD_ONLY:
+            fails.append(f"AS_OF: {_fn.__name__}.as_of 가 키워드 전용이 아니다")
+
+    # ⚠️ 여기가 이 기능의 전부다 — `today=as_of` 가 실제로 URL 에 반영되는가.
+    #    위 검사들은 파싱과 시그니처만 본다. 그 한 줄이 빠져도 파싱은 통과하고
+    #    로그는 고정된 창을 찍는데 **실제 호출만 오늘 기준**이 된다.
+    #    네트워크 없이 URL 만 가로채 확인한다.
+    _saved_get, _saved_key = fh.fmp_get_ex, FMP_API_KEY
+    _seen = []
+    try:
+        globals()["FMP_API_KEY"] = "TESTKEY"
+        fh.fmp_get_ex = lambda url, **kw: (_seen.append(url), (None, 0, "empty"))[1]
+        _pin = datetime(2026, 9, 5).date()
+        _fmp_eod("SPY", "full", bars=HISTORY_BARS, as_of=_pin)
+        _fmp_eod("SPY", "full", bars=HISTORY_BARS, as_of=None)
+    finally:
+        fh.fmp_get_ex, globals()["FMP_API_KEY"] = _saved_get, _saved_key
+
+    if len(_seen) != 2:
+        fails.append(f"AS_OF 배선: URL 을 {len(_seen)}개만 가로챘다 — 검사가 무효")
+    else:
+        _want = fx.hist_range_params(_window_days_for(HISTORY_BARS), today=_pin)
+        if _want.lstrip("&") not in _seen[0]:
+            fails.append("AS_OF 배선: 고정 기준일이 실제 URL 창에 반영되지 않았다 "
+                         "— today=as_of 가 빠졌다")
+        if _seen[0] == _seen[1]:
+            fails.append("AS_OF 배선: as_of 고정과 미지정이 같은 URL 을 만든다")
+
     if fails:
         print("❌ 실패:")
         for f in fails:
             print("   -", f)
         return 1
     print("✅ 전 항목 통과 (수익률·섹터제약·무비용정합·슬리피지방향·신호일·"
-          "구간분해·수수료방향·배당패널반영·risk-off슬롯비중)")
+          "구간분해·수수료방향·배당패널반영·risk-off슬롯비중·AS_OF고정·URL배선)")
     return 0
 
 
@@ -1203,9 +1364,14 @@ def _selftest() -> int:
 # 메인
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> int:
+    global _AS_OF
+    # ⚠️ 형식 오류는 여기서 죽는다. 오늘로 되돌리면 결과에 붙는 날짜 라벨이
+    #    거짓이 되고, 그 거짓은 시트에 남아 나중에 진짜처럼 읽힌다.
+    _AS_OF = _env_as_of()
     t0 = time.time()
     print("=" * 108)
-    print(f"🛰️  위성 섹터 로테이션 백테스트 — {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}")
+    print(f"🛰️  위성 섹터 로테이션 백테스트 — {datetime.now(_KST).strftime('%Y-%m-%d %H:%M KST')}"
+          + (f"  ·  AS_OF={_AS_OF}" if _AS_OF else ""))
     print("=" * 108)
 
     pool = fx.satellite_candidate_pool()
@@ -1216,14 +1382,31 @@ def main() -> int:
     # 창을 먼저 확정해 로그로 남긴다. 실제로 몇 봉을 요청했는지가 결과 해석의
     # 전제인데, v2.8 까지는 어디에도 남지 않아 사후에 확인할 방법이 없었다.
     _win_days = _window_days_for(HISTORY_BARS)
+    _asof_txt = (f"AS_OF={_AS_OF} (고정)" if _AS_OF else "AS_OF=미지정 → 오늘 기준")
     print(f"[STEP 1] 조회 창 — 요구 {HISTORY_BARS}봉 → {_win_days}달력일 "
-          f"({fx.hist_range_params(_win_days).lstrip('&').replace('&', ' ')})")
-    raw, adjmap, fallback, _reasons, _failed = _batch_fetch(fetch_list, bars=HISTORY_BARS)
+          f"({fx.hist_range_params(_win_days, today=_AS_OF).lstrip('&').replace('&', ' ')}) "
+          f"· {_asof_txt}")
+    raw, adjmap, fallback, _reasons, _failed = _batch_fetch(
+        fetch_list, bars=HISTORY_BARS, as_of=_AS_OF)
 
     _n = len(fetch_list)
     _rate = (len(raw) / _n) if _n else 1.0
     print(f"[STEP 1] 원종가 확보 {len(raw)}/{_n}종목 ({_rate * 100:.1f}%) · "
           f"배당조정 확보 {len(raw) - len(fallback)}/{_n}종목")
+    # ⚠️ 위는 **요청한** 창이고 여기는 **받은** 창이다. 둘은 다를 수 있고,
+    #    지금까지 결과 해석의 전제였던 "1,254봉"은 요청이 아니라 수신값이었다.
+    #    벤치(SPY)를 기준으로 찍는다 — 종목마다 상장일이 달라 최솟값을 쓰면
+    #    신규 상장 하나가 전체 라벨을 왜곡한다.
+    _bench = next((t for t in BENCH_TICKERS if t in raw), None)
+    if _bench is not None and not raw[_bench].empty:
+        _bi = raw[_bench].index
+        _spans = [len(v) for v in raw.values() if v is not None and len(v)]
+        print(f"[STEP 1] 수신 창 — {_bench} {len(_bi)}봉 "
+              f"{_bi[0].date()} ~ {_bi[-1].date()} "
+              f"(전 종목 봉수 {min(_spans)}~{max(_spans)})")
+        if len(_bi) < HISTORY_BARS:
+            print(f"[WARN] 수신 {len(_bi)}봉 < 요구 {HISTORY_BARS}봉 — "
+                  f"창이 잘렸거나 데이터가 짧다. 결과 라벨에 이 값을 쓸 것.")
     if _reasons:
         print("[STEP 1] 사유별 — " + " · ".join(
             f"{ep}:{k}={v}" for (ep, k), v in

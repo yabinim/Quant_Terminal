@@ -905,6 +905,10 @@ def sb_wiring(src: str) -> dict:
         # ── v2.9 창 정책 (limit → from/to) ──────────────────────────────
         "eod_limit_code": True,      # _fmp_eod **코드**에 limit= 이 있는가(있으면 안 됨)
         "eod_range_params": False,   # _fmp_eod 가 hist_range_params 로 창을 만드는가
+        "eod_asof_kwonly": False,    # _fmp_eod 의 as_of 가 키워드 전용인가 (v3.0)
+        "eod_asof_default": True,    # _fmp_eod 의 as_of 에 기본값이 있는가(있으면 안 됨)
+        "batch_asof_kwonly": False,  # _batch_fetch 의 as_of 가 키워드 전용인가 (v3.0)
+        "batch_asof_default": True,  # _batch_fetch 의 as_of 에 기본값이 있는가(있으면 안 됨)
         "eod_bars_kwonly": False,    # _fmp_eod 의 bars 가 키워드 전용인가
         "eod_bars_default": True,    # 그 bars 에 기본값이 있는가(있으면 안 됨 §7)
         "batch_bars_kwonly": False,  # _batch_fetch 의 bars 가 키워드 전용인가
@@ -948,11 +952,15 @@ def sb_wiring(src: str) -> dict:
         out["eod_range_params"] = _calls_attr(f, "hist_range_params")
         out["eod_bars_kwonly"] = _is_kwonly(f, "bars")
         out["eod_bars_default"] = _has_default(f, "bars")
+        out["eod_asof_kwonly"] = _is_kwonly(f, "as_of")
+        out["eod_asof_default"] = _has_default(f, "as_of")
 
     b = _fn(tree, "_batch_fetch")
     if b is not None:
         out["batch_bars_kwonly"] = _is_kwonly(b, "bars")
         out["batch_bars_default"] = _has_default(b, "bars")
+        out["batch_asof_kwonly"] = _is_kwonly(b, "as_of")
+        out["batch_asof_default"] = _has_default(b, "as_of")
         for c in ast.walk(b):
             if (isinstance(c, ast.Subscript) and isinstance(c.value, ast.Name)
                     and c.value.id == "reasons"):
@@ -1013,6 +1021,15 @@ check("B4b _fmp_eod **코드**에 limit= 이 없다", SW["eod_limit_code"], Fals
 check("B4c _fmp_eod 가 hist_range_params 로 from/to 를 만든다",
       SW["eod_range_params"], True)
 check("B4d _fmp_eod 의 bars 가 키워드 전용이다", SW["eod_bars_kwonly"], True)
+# v3.0 — as_of 도 bars 와 같은 계약이다. 기본값이 생기면 상위가 빠뜨렸을 때
+# 조용히 '오늘'이 되고, 그 결과는 **고정된 창이라는 라벨을 달고** 나온다.
+# 배당조정 소급 재산정 때문에 사후에 구별할 방법이 없다.
+# ⚠️ 라벨은 B4l 부터다. B4f~B4k 는 이미 쓰이고 있다 — 겹치면 출력에서 어느
+#    검사가 빨간불인지 구분이 안 된다(❌ B4i 가 두 개가 된다).
+check("B4l _fmp_eod 의 as_of 가 키워드 전용이다", SW["eod_asof_kwonly"], True)
+check("B4m _fmp_eod 의 as_of 에 기본값이 없다", SW["eod_asof_default"], False)
+check("B4n _batch_fetch 의 as_of 도 키워드 전용이다", SW["batch_asof_kwonly"], True)
+check("B4o _batch_fetch 의 as_of 에 기본값이 없다", SW["batch_asof_default"], False)
 check("B4e _batch_fetch 의 bars 도 키워드 전용이다 (중간층 포함)",
       SW["batch_bars_kwonly"], True)
 check("B4f bars 에 기본값이 없다 (§7 — 두 층 모두)",
@@ -1098,7 +1115,7 @@ def _mk_px():
     return pd.DataFrame({"px": [100.0 + i for i in range(30)]}, index=idx)
 
 
-def _stub_eod(tk, ep, *, bars=None):
+def _stub_eod(tk, ep, *, bars=None, as_of=None):
     """티커별로 서로 다른 실패 사유를 낸다 — 사유가 보존되는지 보기 위함.
 
     v2.9: 시그니처를 `(tk, ep, *, bars=None)` 으로 맞췄다. 옛 `limit=None` 으로
@@ -1124,7 +1141,7 @@ def _stub_eod(tk, ep, *, bars=None):
 _real_eod = sb._fmp_eod
 sb._fmp_eod = _stub_eod
 try:
-    _raw, _adj, _fb, _rs, _fd = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS)
+    _raw, _adj, _fb, _rs, _fd = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS, as_of=None)
 finally:
     sb._fmp_eod = _real_eod
 
@@ -1145,24 +1162,24 @@ def _boom_eod(tk, ep, *, bars=None):
 
 sb._fmp_eod = _boom_eod
 try:
-    _r2, _a2, _f2, _rs2, _fd2 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS)
+    _r2, _a2, _f2, _rs2, _fd2 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS, as_of=None)
 finally:
     sb._fmp_eod = _real_eod
 
 check("B10 워커 예외가 삼켜지지 않고 'exception' 으로 집계된다",
       _rs2.get(("full", "exception")), 10)
 check("B11 빈 입력도 5-튜플을 돌려준다",
-      len(sb._batch_fetch([], bars=sb.HISTORY_BARS)), 5)
+      len(sb._batch_fetch([], bars=sb.HISTORY_BARS, as_of=None)), 5)
 
 
 # ── 양성대조 — 옛 계약으로 되돌리면 실제로 깨지는가 ────────────────────────
-def _old_style_eod(tk, ep, *, bars=None):
+def _old_style_eod(tk, ep, *, bars=None, as_of=None):
     return pd.DataFrame()          # v2.7 이하: kind 없이 DataFrame 만
 
 
 sb._fmp_eod = _old_style_eod
 try:
-    _r3, _a3, _f3, _rs3, _fd3 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS)
+    _r3, _a3, _f3, _rs3, _fd3 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS, as_of=None)
 finally:
     sb._fmp_eod = _real_eod
 
@@ -1185,7 +1202,7 @@ def _unmigrated_stub(tk, ep, limit=None):        # 일부러 옛 시그니처
 
 sb._fmp_eod = _unmigrated_stub
 try:
-    _r4, _a4, _f4, _rs4, _fd4 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS)
+    _r4, _a4, _f4, _rs4, _fd4 = sb._batch_fetch(_TK, bars=sb.HISTORY_BARS, as_of=None)
 finally:
     sb._fmp_eod = _real_eod
 
@@ -1208,7 +1225,7 @@ def _capture(url, timeout=None):
 _real_get, _real_key = sb.fh.fmp_get_ex, sb.FMP_API_KEY
 sb.fh.fmp_get_ex, sb.FMP_API_KEY = _capture, "TESTKEY"
 try:
-    sb._fmp_eod("SPY", "full", bars=400)
+    sb._fmp_eod("SPY", "full", bars=400, as_of=None)
 finally:
     sb.fh.fmp_get_ex, sb.FMP_API_KEY = _real_get, _real_key
 
@@ -1233,7 +1250,7 @@ check("P4  실제 URL 에 from=/to= 가 있다",
 _urls.clear()
 sb.fh.fmp_get_ex, sb.FMP_API_KEY = _capture, "TESTKEY"
 try:
-    sb._fmp_eod("SPY", "full", bars=40)
+    sb._fmp_eod("SPY", "full", bars=40, as_of=None)
 finally:
     sb.fh.fmp_get_ex, sb.FMP_API_KEY = _real_get, _real_key
 _u2 = _urls[0] if _urls else ""
