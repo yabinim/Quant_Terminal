@@ -123,8 +123,11 @@ MARKERS = {
     # 그 셋의 사본이 최신인지 알 수 없었다.
     "diag_beta_mom_ref.py": ["TARGET_LEGS", "R0_TOL_PP", "run_core"],
     "diag_hist_window_consumers.py": ["S3m"],
-    "diag_satellite_mandate.py": ["J8", "K11"],
-    "SATELLITE_MANDATE.md": ["β중립 C1", "β중립 결과"],
+    # C-1 결과 기록(2026-09-11 · 미관찰 → 종료). 위 두 마커는 약정 블록에만 있어서
+    # 결과 기록 **전** 사본과 **후** 사본을 가르지 못한다 — 셋째 마커가 그 구분이다.
+    # md 가 2/3 이면 종료 기록 전 사본이다. 그 사본으로 §2 를 고치면 종료 기록이 날아간다.
+    "diag_satellite_mandate.py": ["J8", "K11", "K12"],
+    "SATELLITE_MANDATE.md": ["β중립 C1", "β중립 결과", "대응 시도 1 — β중립 12-0"],
 }
 
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)
