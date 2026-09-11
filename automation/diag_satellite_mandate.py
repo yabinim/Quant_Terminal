@@ -32,6 +32,7 @@ md §6 은 스스로 이렇게 선언한다: *"정직하게 적는다. 문서에
   G   app.py 가 md 문안을 복사하지 않았는가
   J   §4① 깊은 창 참고 실행 사전 약정 ↔ 러너 상수 (임계·반등·룰·필터·기록 탭),
       §2 약점 각주의 '바꾸지 않는다' 유지
+  K   §4① β중립 12-0 참고 실행 사전 약정 ↔ 러너 상수 (룰쌍·기준일·R0·C1~C3·탭·1회)
   H   양성 대조 — 알려진 불량 입력에서 각 검사가 실제로 실패하는가
 
 ⚠️ 로직을 복사하지 않는다. fmp_extras 의 실제 함수를 부른다.
@@ -632,6 +633,77 @@ chk("J7 수동 워크플로가 러너를 실행한다 (자체검증 → 본 실�
     True)
 
 
+# ══ [K] §4① β중립 12-0 참고 실행 — 사전 약정 ↔ 러너 상수 ═══════════════
+# J 와 같은 이유다. 결과를 본 뒤 러너의 문턱만 슬쩍 낮춰 "통과"로 만드는 경로를
+# 막는다. 문서와 코드를 같이 바꾸면 §7 에 행이 남는다.
+BETA = (_read("automation", "diag_beta_mom_ref.py") or _read("diag_beta_mom_ref.py"))
+WF_BETA = (_read(".github", "workflows", "diag_beta_mom_ref.yml")
+           or _read("diag_beta_mom_ref.yml"))
+
+
+def _md_line(text, label):
+    m = re.search(r"\*\*" + re.escape(label) + r"\*\*([^\n]*)", text or "")
+    return m.group(1) if m else ""
+
+
+def _uniq_ticks(line):
+    out = []
+    for t in re.findall(r"`([a-z0-9_]+)`", line):
+        if t not in out:
+            out.append(t)
+    return tuple(out)
+
+
+def _pp(line):
+    """줄 안의 굵은 %p 수치들(부호 포함, 유니코드 마이너스 허용) → float 튜플."""
+    return tuple(float(x.replace("−", "-"))
+                 for x in re.findall(r"\*\*([+−-]?\d+(?:\.\d+)?)%p(?:/년)?\*\*", line))
+
+
+_K_C1 = _md_line(MD, "β중립 C1")
+_K_C2 = _md_line(MD, "β중립 C2")
+_K_C3 = _md_line(MD, "β중립 C3")
+_k_r0 = re.search(r"\*\*±(\d+(?:\.\d+)?)%p\*\*", _md_line(MD, "β중립 R0"))
+_k_asof = re.search(r"\*\*(\d{4}-\d{2}-\d{2})\*\*", _md_line(MD, "β중립 기준일"))
+_k_tg = _lit(BETA, "TARGET_LEGS") or ()
+_k_rules = _module_assign(BETA, "RULES")
+_k_pair = (_lit(BETA, "RULE_BASE"), _lit(BETA, "RULE_TEST"))
+
+chk("K0 러너·워크플로 존재 (diag_beta_mom_ref.py · .yml)",
+    (BETA is not None, WF_BETA is not None), (True, True))
+chk("K1 §4① 대상 룰 = (RULE_BASE, RULE_TEST), 기준 룰은 A반",
+    (_uniq_ticks(_md_line(MD, "β중립 대상 룰"))[:2], _k_pair[0] == fx.SATELLITE_RANK_RULE),
+    (_k_pair, True))
+chk("K1b 러너 RULES 는 두 상수의 쌍이다 (리터럴 사본 금지)",
+    ast.unparse(_k_rules) if _k_rules is not None else None, "(RULE_BASE, RULE_TEST)")
+chk("K1c 시험 룰은 시장 룰 레지스트리에만 있다 (라이브 랭킹 불가)",
+    (_k_pair[1] in getattr(fx, "MOM_MKT_RULES", {}), _k_pair[1] in fx.MOM_RULES), (True, False))
+chk("K2 §4① 기준일 = AS_OF (상수)", _k_asof.group(1) if _k_asof else None, _lit(BETA, "AS_OF"))
+chk("K3 §4① R0 허용 = R0_TOL_PP", float(_k_r0.group(1)) if _k_r0 else None, _lit(BETA, "R0_TOL_PP"))
+chk("K4 §4① 판정 필터 = (VERDICT_FILTER,)",
+    _uniq_ticks(_md_line(MD, "β중립 판정 필터"))[:1], (_lit(BETA, "VERDICT_FILTER"),))
+chk("K5 §4① C1 = C1_MIN_PP · 대상 바닥 연-월 = TARGET_LEGS",
+    (_pp(_K_C1), tuple(re.findall(r"바닥 (\d{4}-\d{2})", _K_C1))),
+    ((_lit(BETA, "C1_MIN_PP"),), tuple(ym for _, ym in _k_tg)))
+chk("K6 §4① C2 = (C2_MEDIAN_MIN_PP, C2_WORST_MIN_PP)", _pp(_K_C2),
+    (_lit(BETA, "C2_MEDIAN_MIN_PP"), _lit(BETA, "C2_WORST_MIN_PP")))
+chk("K7 §4① C3 = C3_CALM_MIN_PP", _pp(_K_C3), (_lit(BETA, "C3_CALM_MIN_PP"),))
+chk("K8 기록 탭 Momentum_Beta_Ref — 작업 A 탭·판정 탭과 다르다",
+    (_lit(BETA, "_RESULT_WORKSHEET"),
+     _lit(BETA, "_RESULT_WORKSHEET") not in (_lit(DEEP, "_RESULT_WORKSHEET"),
+                                              _lit(RCMP, "_RESULT_WORKSHEET"))),
+    ("Momentum_Beta_Ref", True))
+chk("K9 §4① 가 러너와 탭을 지목한다",
+    ("diag_beta_mom_ref.py" in (MD or ""), "Momentum_Beta_Ref" in (MD or "")), (True, True))
+chk("K10 §4① 결과 줄이 '재시험 금지'를 유지한다",
+    "재시험 금지" in _md_line(MD, "β중립 결과"), True)
+chk("K11 워크플로 — 입력 없음(기준일 재추첨 경로 없음) · 자체검증 → 본 실행",
+    (WF_BETA is not None and "inputs:" not in WF_BETA
+     and "diag_beta_mom_ref.py --selftest" in WF_BETA
+     and re.search(r"python automation/diag_beta_mom_ref\.py\s*$", WF_BETA, re.M) is not None),
+    True)
+
+
 # ══ [H] 양성 대조 — 알려진 불량 입력에서 실제로 실패하는가 ═══════════════
 # 초록불이 옳은 이유로 켜졌는지 확인하지 않으면 초록불은 정보가 아니다.
 def _would_fail(fn):
@@ -696,6 +768,13 @@ chk("H11 층 2 함수가 생기면 I16 이 이를 잡는다",
     _would_fail(lambda: not hasattr(fx, "satellite_drawdown")), True)
 
 _bad_cap = (APP or "").replace(f"{_CYC} 리밸런싱", f"{_CYC_OTHER} 리밸런싱", 1)
+_bad_k = MD.replace("Δ ≥ **+5.0%p**", "Δ ≥ **+3.0%p**", 1)
+chk("H13 C1 문턱을 낮춘 md 는 K5 를 통과하지 못한다",
+    _would_fail(lambda: _pp(_md_line(_bad_k, "β중립 C1")) == (_lit(BETA, "C1_MIN_PP"),)), True)
+_bad_k2 = MD.replace("**하나라도 미달 → 종료. 변형·문턱·구간·기준일을 바꾼 재시험 금지**",
+                     "**하나라도 미달 → 변형을 바꿔 한 번 더 본다**", 1)
+chk("H14 '재시험 금지'를 지운 md 는 K10 을 통과하지 못한다",
+    _would_fail(lambda: "재시험 금지" in _md_line(_bad_k2, "β중립 결과")), True)
 chk("H12 앱 캡션 하나만 옛 주기로 되돌려도 I18b 가 잡는다",
     _would_fail(lambda: f"{_CYC_OTHER} 리밸런싱" not in _bad_cap), True)
 

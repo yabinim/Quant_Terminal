@@ -873,6 +873,30 @@ def group_S():
             + ("" if (ok_at and not ok_below)
                else f" — 실측 {'식이 더 깊은 이력을 요구' if not ok_at else '선언이 실제보다 큼'}"))
 
+    # ── S3m 시장 룰(MOM_MKT_RULES)도 같은 양방향 측정 (2026-09-11) ──
+    #   S3 루프는 fn(vals) 단일 인자라 시장 룰을 부를 수 없다. 여기서는 날짜를 붙인
+    #   종목·시장 램프를 넘긴다. 시장 계열은 종목보다 **길게** 준다 — 시장 쪽 길이가
+    #   필요 봉수를 가리면 선언 오류가 안 보인다.
+    #   ⚠️ 시장 룰의 선언 봉수는 워밍업이다. 위성 비교는 공통 워밍업(최댓값)을 쓰므로
+    #      여기서 선언이 과소하면 bn 만 일찍 시작하는 게 아니라, 과대하면 12-0 까지
+    #      늦게 시작해 작업 A 와의 R0 재현이 깨진다 — 양방향 모두 비싸다.
+    _md = pd.bdate_range("2019-01-01", periods=900).values
+    _mv = np.linspace(100.0, 250.0, 900) * (1.0 + 0.01 * np.sin(np.arange(900) / 3.0))
+    _tv = np.linspace(50.0, 180.0, 900) * (1.0 + 0.02 * np.sin(np.arange(900) / 2.0))
+    _mkt_rules = getattr(fx, "MOM_MKT_RULES", None)
+    # 존재부터 잰다 — 없으면 아래 루프가 비어 S3m 이 **헛통과**한다(옛 fmp_extras 와 짝지을 때).
+    chk(bool(_mkt_rules), "S3m-0",
+        "fmp_extras.MOM_MKT_RULES 가 존재하고 비어 있지 않다 (없으면 S3m 은 죽은 게이트)")
+    for rule, (fn, need) in (_mkt_rules or {}).items():
+        ok_at = np.isfinite(fn(_md[-need:], _tv[-need:], _md, _mv))
+        ok_below = np.isfinite(fn(_md[-(need - 1):], _tv[-(need - 1):], _md, _mv))
+        chk(ok_at and not ok_below, f"S3m-{rule}",
+            f"{rule}: 선언 {need}봉에서 점수 산출 O / {need - 1}봉에서 X (시장 룰)"
+            + ("" if (ok_at and not ok_below)
+               else f" — 실측 {'식이 더 깊은 이력을 요구' if not ok_at else '선언이 실제보다 큼'}"))
+    chk(not (set(fx.MOM_RULES) & set(_mkt_rules or {})), "S3m-sep",
+        "시장 룰과 단일 계열 룰의 이름이 겹치지 않는다 (S3 루프가 시장 룰을 부르지 않는다)")
+
     # ── S4 라이브 룰이 백테스트가 검증한 이름 안에 있는가 ──
     live = getattr(fx, "SATELLITE_RANK_RULE", None)
     chk(live in fx.MOM_RULES, "S4a",

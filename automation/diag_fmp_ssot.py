@@ -1166,9 +1166,58 @@ def _override_writers() -> set:
 
 # 허용: 참고 실행 러너 + 이 가드 자신(B4r 런타임 검사). 판정 파일이 여기 들어오면
 # §4① 판정 재실행이 깊은 창으로 돈다 — 가장 비싼 실패이므로 목록으로 조인다.
-_OV_ALLOWED = {"diag_momentum_deep_ref", "diag_fmp_ssot"}
+_OV_ALLOWED = {"diag_momentum_deep_ref", "diag_beta_mom_ref", "diag_fmp_ssot"}
 check("B4s WINDOW_DAYS_OVERRIDE 대입은 허용 목록뿐 (판정 파일 diag_momentum_rule_compare 금지)",
       sorted(_override_writers() - _OV_ALLOWED), [])
+
+
+def _override_unrestored(mod: str) -> list:
+    """러너 안에서 WINDOW_DAYS_OVERRIDE 에 **값을 켜는** 대입 중, 같은 try 의 finally 가
+    그 속성을 되돌리지 않는 것의 줄 번호. 되돌리지 않으면 같은 프로세스에서 이어
+    import 한 판정 경로가 깊은 창으로 돈다 — B4s 가 파일 경계에서 막는 것을 프로세스
+    경계에서도 막는다."""
+    tree = TREES.get(mod)
+    if tree is None:
+        return ["모듈 없음"]
+    bad = []
+
+    def _sets(stmts):
+        return any(isinstance(t, ast.Attribute) and t.attr == "WINDOW_DAYS_OVERRIDE"
+                   for st in stmts for n in ast.walk(st) if isinstance(n, ast.Assign)
+                   for t in n.targets)
+
+    guarded, restore = set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Try) and _sets(n.finalbody):
+            for st in n.body:
+                guarded.update(id(m) for m in ast.walk(st))
+            for st in n.finalbody:
+                restore.update(id(m) for m in ast.walk(st))
+    # 복구 대입은 **위치**(finally 안)로 가린다. 값의 모양(이름이냐 상수냐)으로 가리면
+    # `= DEEP_WINDOW_DAYS` 같은 켜기 대입도 이름이라 검사에서 빠진다 — 죽은 게이트.
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Attribute) and t.attr == "WINDOW_DAYS_OVERRIDE"
+                for t in n.targets) and id(n) not in guarded and id(n) not in restore:
+            bad.append(n.lineno)
+    return bad
+
+
+# [2026-09-11] β중립 참고 실행 러너 추가. 두 러너 모두 try/finally 로 되돌려야 한다.
+check("B4t 참고 러너의 override 켜기는 전부 try/finally 복구 안에 있다 (deep_ref · beta_ref)",
+      {m: _override_unrestored(m) for m in ("diag_momentum_deep_ref", "diag_beta_mom_ref")},
+      {"diag_momentum_deep_ref": [], "diag_beta_mom_ref": []})
+
+
+# [2026-09-11] 시장 룰 레지스트리 계약 — 시장 룰은 MOM_RULES 밖에만, 라이브 룰은 안에만.
+#   MOM_RULES 에 4인자 함수가 들어가면 S3·1b 가드가 fn(ramp) 에서 TypeError 로 죽고,
+#   라이브 룰 검증(SATELLITE_RANK_RULE ∈ MOM_RULES)은 시장 룰을 못 막는다.
+import fmp_extras as _fxr  # noqa: E402
+check("B4u 시장 룰은 MOM_MKT_RULES 에만 · 이름 겹침 0 · 라이브 두 룰은 단일 계열",
+      (sorted(_fxr.MOM_MKT_RULES), sorted(set(_fxr.MOM_RULES) & set(_fxr.MOM_MKT_RULES)),
+       _fxr.is_mkt_rule(_fxr.SATELLITE_RANK_RULE), _fxr.is_mkt_rule(_fxr.SATELLITE_ALT_RULE),
+       _fxr.mom_warmup_bars()),
+      (["mom12_0_bn"], [], False, False, 253))
 
 
 # ══════════════════════════════════════════════════════════════════════════

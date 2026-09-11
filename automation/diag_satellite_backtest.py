@@ -544,10 +544,22 @@ class RankEngine:
 
     def __init__(self, close_df: pd.DataFrame, rank_rule: str = "blend",
                  warmup: int | None = None):
-        if rank_rule not in fx.MOM_RULES:
+        if rank_rule not in fx.MOM_RULES and not fx.is_mkt_rule(rank_rule):
             raise KeyError(f"알 수 없는 랭킹 룰: {rank_rule!r}")
         self.rank_rule = rank_rule
-        self.warmup = int(warmup) if warmup else int(fx.MOM_RULES[rank_rule][1])
+        self.warmup = int(warmup) if warmup else fx.mom_rule_need(rank_rule)
+        # [2026-09-11] 시장 룰(fx.MOM_MKT_RULES)은 시장 계열을 **날짜와 함께** 넘긴다.
+        #   종목 배열은 아래에서 dropna 로 자기 인덱스를 갖게 되므로 위치로 맞추면
+        #   결측 하루에 회귀가 밀린다. 정렬은 fx 쪽 계약(_mkt_aligned)이 한다.
+        #   시장 계열에 key 이후 값이 있어도 종목 날짜(≤ key)만 찾아 쓰므로 미래를 안 본다.
+        #   단일 계열 룰은 이 값이 None 이고 경로가 이전과 **바이트 단위로** 같다.
+        self._mkt = None
+        if fx.is_mkt_rule(rank_rule):
+            mt = fx.MOM_MKT_TICKER
+            if mt not in close_df.columns:
+                raise KeyError(f"시장 룰 {rank_rule!r} 에 필요한 {mt} 열이 패널에 없다")
+            ms = close_df[mt].dropna()
+            self._mkt = (ms.index.values, ms.to_numpy(dtype=float))
         self.pool = fx.satellite_candidate_pool()          # {섹터: [후보들]}
         self.sector_of = {}
         self.series = {}
@@ -577,7 +589,11 @@ class RankEngine:
                 if n < self.warmup:                     # 라이브의 len(s) < SATELLITE_BARS 와 같은 역할
                     continue
                 # 점수식은 fmp_extras 룰 SSOT. 여기서 다시 쓰지 않는다.
-                score = fx.mom_score(vals[:n], self.rank_rule)
+                if self._mkt is None:
+                    score = fx.mom_score(vals[:n], self.rank_rule)
+                else:
+                    score = fx.mom_score_mkt(idx[:n], vals[:n], self._mkt[0],
+                                             self._mkt[1], self.rank_rule)
                 if not np.isfinite(score):
                     continue
                 if best is None or score > best["score"]:
