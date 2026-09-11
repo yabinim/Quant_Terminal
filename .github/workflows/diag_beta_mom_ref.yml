@@ -1,0 +1,61 @@
+name: 📐 진단 — β중립 12-0 참고 실행 (판정 아님 · 1회 전용 · 수동)
+
+# 무엇을 재는가
+# ─────────────
+#   "12-0 의 모멘텀 붕괴 약점을 β항 제거가 완화하는가, 그 대가는 얼마인가" — 하나뿐이다.
+#   사전 약정(대상 구간 · C1 +5.0 · C2 −2.0/−10.0 · C3 −2.0 · R0 ±0.10 · 1회 전용)은
+#   automation/diag_beta_mom_ref.py 상단과 SATELLITE_MANDATE §4① 에 있다.
+#
+# ⚠️ 1회 전용이다. Momentum_Beta_Ref 탭에 행이 하나라도 있으면 러너가 스스로 멈춘다.
+#    R0(재현) 실패 · 측정 결함으로 **기록 전에** 멈춘 경우만 다시 돌릴 수 있다 — §7 에 사유.
+# ⚠️ 입력이 없다. 기준일(AS_OF=2026-09-10)은 러너의 상수다. 날짜를 바꿔 다시 굴리는
+#    경로를 워크플로에서 없앤 것이다(작업 A 의 as_of 입력과 일부러 다르다).
+# ⚠️ 결과는 Momentum_Beta_Ref 탭에만 쓴다. Momentum_Rule_Deep 은 R0 원본으로 **읽기만**.
+#
+# 콜 예산: 작업 A 와 같다 — 후보 풀 + SPY × 2엔드포인트 ≈ 114콜 · 5,000봉 페이로드.
+#   📐 랭킹 룰 비교 · 🛰️ 위성 백테스트 · 📐 깊은 창 참고 실행과 같은 분에 겹쳐 돌리지 말 것.
+
+on:
+  workflow_dispatch:        # 수동 실행만. 스케줄러/디스패치 트리거 없음. 입력 없음.
+
+jobs:
+  beta_ref:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성 설치
+        run: |
+          pip install --upgrade pip
+          pip install google-auth gspread requests numpy pandas pytz
+
+      # 락스텝 짝. override 허용 목록(B4s)·시장 룰 레지스트리 계약이 여기서 먼저 확인된다.
+      - name: 🛡️ FMP SSOT · 튜플 계약 가드 (락스텝)
+        run: python automation/diag_fmp_ssot.py
+
+      - name: ✅ 위성 백테스트 엔진 자체검증 (합성 데이터 · 네트워크 불필요)
+        run: python automation/diag_satellite_backtest.py --selftest
+
+      - name: ✅ 깊은 창 참고 실행 자체검증 (합성 데이터 · 네트워크 불필요)
+        run: python automation/diag_momentum_deep_ref.py --selftest
+
+      - name: ✅ β중립 참고 실행 자체검증 (합성 데이터 · 네트워크 불필요)
+        run: python automation/diag_beta_mom_ref.py --selftest
+
+      - name: 📐 β중립 12-0 참고 실행 (Momentum_Beta_Ref 시트에만 기록 · 1회)
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          # FMP Starter 한도는 분당 300. 67% 로 둔다. ⚠️ 300 으로 올리지 말 것.
+          FMP_RATE_LIMIT_PER_MIN: '200'
+          MIN_FETCH_RATE: '0.98'
+        run: |
+          python automation/diag_beta_mom_ref.py
