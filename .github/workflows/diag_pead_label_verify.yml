@@ -1,0 +1,77 @@
+name: 🔬 판정 — PEAD 라벨 검증 (1회 전용 · 수동)
+
+# 무엇인가:
+#   라이브 evaluate_pead 의 두 라벨(🟢 상승 지속 후보 / 🔴 하락 이탈 — 근거 훼손)이
+#   주장하는 드리프트를 아무도 본 적 없는 과거 사건에서 검증한다.
+#   약정은 저장소 루트 PEAD_PRECOMMIT.md — 2026-09-11 에 결과 보기 전 박제했다.
+#
+# ⚠️ 이 워크플로는 **판정 실행**이다. 수익률을 한 번이라도 계산하면 그 실행이
+#    유일한 판정이다(약정 §8). 결과가 마음에 들지 않는다는 이유로 다시 돌릴 수 없다.
+#    그래서 세 겹으로 막는다:
+#      ① confirm 입력에 PEAD-JUDGE 를 직접 타이핑해야 한다 (오발 방지)
+#      ② 러너가 PEAD_PRECOMMIT.md 와 문턱·구간·seed·동결 상수를 대조한다
+#      ③ 결과 탭 PEAD_Label_Verify 에 행이 하나라도 있으면 러너가 중단한다
+#    ②③ 은 수익률 계산 **전**에 끝난다 — 걸리면 판정 실행으로 치지 않는다.
+#
+# 안전성:
+#   · 읽기: Watchlist / Portfolios / Earnings_Universe (티커 목록만)
+#   · 쓰기: PEAD_Label_Verify 탭 append 만. 기존 탭·앱·메일에 영향 없음
+#   · 약 400콜 · fmp_http 경유 · 공용 모듈 무변경
+#
+# 실행 전에 반드시:
+#   python automation/diag_pead_label_verify.py --selftest   (네트워크 불필요)
+#
+# ⚠️ repository_dispatch / schedule 없음 — 1회성 판정.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "판정을 시작하려면 PEAD-JUDGE 를 입력 (1회 전용 · 되돌릴 수 없음)"
+        required: true
+        default: ""
+      precommit_commit:
+        description: "PEAD_PRECOMMIT.md 최초 커밋 해시 (결과 행에 기록)"
+        required: false
+        default: ""
+
+jobs:
+  judge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🛑 확인 문구 검사
+        run: |
+          if [ "${{ inputs.confirm }}" != "PEAD-JUDGE" ]; then
+            echo "confirm 입력이 PEAD-JUDGE 가 아닙니다 — 판정을 시작하지 않습니다."
+            exit 1
+          fi
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install requests numpy pandas pytz gspread google-auth
+
+      - name: 🧪 셀프테스트 (네트워크·시트 접근 0)
+        run: python automation/diag_pead_label_verify.py --selftest
+
+      - name: 🔬 판정 실행
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          PRECOMMIT_COMMIT: ${{ inputs.precommit_commit }}
+        run: python automation/diag_pead_label_verify.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_pead_label_verify.py
