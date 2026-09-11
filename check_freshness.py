@@ -100,6 +100,19 @@ MARKERS = {
     "run_satellite_snapshot.py": ["is_last_trading_day_of_month",
                                   "load_satellite_holdings",
                                   "SATELLITE_SNAP_SEED", "SNAPSHOT_MODES"],
+    # ── §4① 판정 · 깊은 창 참고 실행 (2026-09-10 작업 A) ─────────────────────
+    # 넷이 락스텝이다. 이전까지 이 표에 없어서, A 착수 때 세션 시작 지문으로는
+    # 판정 엔진의 사본이 최신인지 알 수 없었다(따로 세어야 했다).
+    # WINDOW_DAYS_OVERRIDE: 참고 실행 전용 창 지정. 이게 없는 bt 에 러너만 올리면
+    #   러너는 AttributeError 로 시끄럽게 죽는다 — 괜찮은 실패다.
+    # _OV_ALLOWED: 판정 파일이 그 값을 대입하지 못하게 막는 B4s 의 허용 목록.
+    #   이 마커가 없는 ssot 는 판정 경로가 깊어져도 초록불이다 — 조용한 실패다.
+    "diag_satellite_backtest.py": ["WINDOW_DAYS_PIN", "WINDOW_DAYS_OVERRIDE",
+                                   "_env_as_of"],
+    "diag_momentum_rule_compare.py": ["VERDICT_RULES", "_env_as_of"],
+    "diag_momentum_deep_ref.py": ["EPISODE_DD", "REBOUND_BARS",
+                                  "WINDOW_DAYS_OVERRIDE"],
+    "diag_fmp_ssot.py": ["_OV_ALLOWED", "B4s"],
 }
 
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)
