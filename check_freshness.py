@@ -48,8 +48,10 @@ MARKERS = {
     #   세 소비자(app · run_hidden_alpha · run_satellite_snapshot)가 전부 여기를
     #   부른다. 이 마커가 없으면 셋 다 임포트 단계에서 죽는다 — 시끄럽게 죽는
     #   편이 낫지만, 관문에서 먼저 잡는 게 더 낫다.
+    #   MOM_MKT_RULES(2026-09-11): 시장 룰 레지스트리. 없는 fmp_extras 에 새 bt 를
+    #   올리면 RankEngine 이 fx.is_mkt_rule 에서 AttributeError — 시끄러운 실패다.
     "fmp_extras.py": ["import fmp_http", "fmp_stats_line",
-                      "SATELLITE_SNAPSHOT_COLS", "satellite_drawdown"],
+                      "SATELLITE_SNAPSHOT_COLS", "satellite_drawdown", "MOM_MKT_RULES"],
     "regime_core.py": ["_market_warnings", "ALERT_CONFIRM_DAYS"],
     "users_core.py": ["Gate_Market"],
     "watchlist_metrics_core.py": ["completed_bars_only"],
@@ -108,12 +110,21 @@ MARKERS = {
     # _OV_ALLOWED: 판정 파일이 그 값을 대입하지 못하게 막는 B4s 의 허용 목록.
     #   이 마커가 없는 ssot 는 판정 경로가 깊어져도 초록불이다 — 조용한 실패다.
     "diag_satellite_backtest.py": ["WINDOW_DAYS_PIN", "WINDOW_DAYS_OVERRIDE",
-                                   "_env_as_of"],
+                                   "_env_as_of", "mom_score_mkt"],
     "diag_momentum_rule_compare.py": ["VERDICT_RULES", "_env_as_of"],
     # Meas_Start: 2026-09-10 측정 결함 수정. 없는 사본이면 절삭 구간이 다시 n/a 다.
     "diag_momentum_deep_ref.py": ["EPISODE_DD", "REBOUND_BARS",
                                   "WINDOW_DAYS_OVERRIDE", "Meas_Start"],
-    "diag_fmp_ssot.py": ["_OV_ALLOWED", "B4s"],
+    "diag_fmp_ssot.py": ["_OV_ALLOWED", "B4s", "B4t", "B4u"],
+    # ── §4① β중립 12-0 참고 실행 (2026-09-11 · C-1) ─────────────────────────
+    # 러너 · 약정 문서 · 두 드리프트 가드가 락스텝이다. 약정 숫자는 md 와 러너에
+    # 두 번 적혀 있고 K 그룹이 그 둘을 묶는다 — 한쪽만 낡으면 K 가 빨간불이다.
+    # 이전까지 md · mandate 가드 · consumers 가드가 이 표에 없어서, 세션 시작 지문으로
+    # 그 셋의 사본이 최신인지 알 수 없었다.
+    "diag_beta_mom_ref.py": ["TARGET_LEGS", "R0_TOL_PP", "run_core"],
+    "diag_hist_window_consumers.py": ["S3m"],
+    "diag_satellite_mandate.py": ["J8", "K11"],
+    "SATELLITE_MANDATE.md": ["β중립 C1", "β중립 결과"],
 }
 
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)

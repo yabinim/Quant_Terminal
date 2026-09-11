@@ -1064,6 +1064,112 @@ MOM_RULES = {
     "mom12_1_ra": (score_mom12_1_ra, MOM_BARS_12M + 1),
 }
 
+
+# ═══ 시장 상대 룰 — 두 번째 계열(시장)이 필요한 점수 (2026-09-11 · 참고 실행 전용) ═══
+#
+# 왜 MOM_RULES 에 넣지 않고 따로 두나
+# ───────────────────────────────────
+# MOM_RULES 의 계약은 `fn(vals)` 단일 인자다. diag_hist_window_consumers S3 과
+# diag_momentum_rule_compare 1b 가 **모든** 항목을 `fn(ramp[:need])` 로 불러 선언
+# 봉수를 양방향으로 잰다. 인자가 넷인 함수를 거기 넣으면 동결된 가드 두 개가 깨진다.
+# 그리고 SATELLITE_RANK_RULE 검증(아래)은 MOM_RULES 만 본다 — 시장 룰은 구조적으로
+# 라이브 랭킹이 될 수 없다. compute_satellite_top10 은 단일 계열 mom_score 만 부른다.
+# 라이브로 올리려면 그 함수를 고치는 **별도 작업**이 필요하고, 그건 SATELLITE_MANDATE
+# §4① β중립 약정의 "통과 시 종이 C반" 이후의 일이다.
+#
+# 날짜 정렬이 계약이다
+# ────────────────────
+# 백테스트 RankEngine 은 종목마다 자기 인덱스로 자른 배열을, 라이브는 종목마다 따로
+# 받은 Series 를 쓴다. 시장 계열과 **위치로** 맞추면 결측·휴장 하루만 달라도 회귀가
+# 한 칸 밀린 채 숫자는 멀쩡히 나온다 — 에러도 로그도 없다. 그래서 날짜를 함께 받고,
+# 종목의 날짜를 시장 계열에서 **찾아** 쓴다. 하나라도 없으면 nan.
+MOM_BETA_WEEKS = 50          # β 추정 주간 수익률 개수 (≈ 형성창 1년)
+MOM_BETA_STEP = 5            # '주' = 5봉. 끝(최근)에서부터 5봉 간격으로 표본
+MOM_MKT_TICKER = "SPY"       # 시장 계열 — §3 필터와 같은 종목
+
+
+def _mkt_aligned(dates, vals, mkt_dates, mkt_vals, need: int):
+    """종목의 최근 `need` 개 날짜 → (종목 종가, 같은 날짜의 시장 종가) 배열. 실패 None.
+
+    종목 날짜가 시장 계열에 **정확히** 없으면 None 이다(가장 가까운 날로 대체 안 함).
+    두 계열 모두 날짜가 엄격히 오름차순이어야 한다 — 중복·역순은 정렬 버그의 증상이라
+    조용히 고치지 않고 거부한다.
+    """
+    try:
+        n = len(vals)
+        if n < need or len(dates) != n or len(mkt_dates) != len(mkt_vals):
+            return None
+        d = np.asarray(dates, dtype="datetime64[ns]")[n - need:]
+        a = np.asarray(vals, dtype=float)[n - need:]
+        md = np.asarray(mkt_dates, dtype="datetime64[ns]")
+        mv = np.asarray(mkt_vals, dtype=float)
+    except Exception:
+        return None
+    if len(md) < need or not (np.all(np.diff(d) > np.timedelta64(0, "ns"))
+                              and np.all(np.diff(md) > np.timedelta64(0, "ns"))):
+        return None
+    pos = np.searchsorted(md, d)
+    if np.any(pos >= len(md)) or np.any(md[pos] != d):
+        return None
+    m = mv[pos]
+    if not (np.all(np.isfinite(a)) and np.all(np.isfinite(m))) or np.any(a <= 0) or np.any(m <= 0):
+        return None
+    return a, m
+
+
+def mom_beta_weekly(a, m) -> float:
+    """정렬된 두 종가 배열의 끝 MOM_BETA_WEEKS 주 β (5봉 간격 표본 · 절편 포함 기울기).
+
+    주간인 이유: 해외·선물 기반 ETF 는 종가 시각이 SPY 와 어긋나 일간 β 가 아래로
+    치우친다. β 가 과소추정되면 시장 성분이 점수에 남아 이 룰의 존재 이유가 사라진다.
+    """
+    k = MOM_BETA_WEEKS * MOM_BETA_STEP
+    if len(a) < k + 1 or len(m) < k + 1:
+        return float("nan")
+    wi = np.arange(len(a) - 1 - k, len(a), MOM_BETA_STEP)       # 51개 표본, 마지막 = 최근
+    ra = a[wi][1:] / a[wi][:-1] - 1.0
+    rm = m[wi][1:] / m[wi][:-1] - 1.0
+    vm = float(np.var(rm, ddof=1))
+    if not np.isfinite(vm) or vm <= 0:
+        return float("nan")
+    return float(np.cov(ra, rm, ddof=1)[0, 1] / vm)
+
+
+def score_mom12_0_bn(dates, vals, mkt_dates, mkt_vals) -> float:
+    """β중립 12-0 = 12-0(종목) − β̂ × 12-0(시장, **같은 두 날짜**). 단위 % (12-0 과 같다).
+
+    · β̂ = 0 이면 **정확히** score_mom12_0 이다. 12-0 과의 차이는 β항 하나뿐이다 —
+      A반(12-0)과 비교할 때 원인을 가를 수 있게 일부러 이렇게 만들었다.
+    · 약세장(시장 12-0 < 0)에서는 덜 빠진 고β 종목에 가점, 강세장에서는 감점.
+      Daniel·Moskowitz(2016) 모멘텀 붕괴 — 약세장 뒤 승자 바구니가 저β 로 쏠려
+      반등을 놓치는 것 — 을 겨냥한다. 강세장 감점이 이 룰의 대가다.
+    · ⚠️ BHM(2011) 잔차 모멘텀이 **아니다.** 절편 포함 잔차의 합은 추정창 평균 알파를
+      빼므로 꾸준한 초과수익을 ≈0 으로 만든다(시뮬: 연 20% 알파 → 점수 −0.05).
+      분모(잔차σ 스케일)도 없다 — 스케일링은 두 번째 변경이고 T7 에서 이미 떨어졌다.
+    · 필요 봉수 253 = 12-0 과 같다. 워밍업이 같아야 시작일이 같다.
+    """
+    need = MOM_BARS_12M + 1
+    got = _mkt_aligned(dates, vals, mkt_dates, mkt_vals, need)
+    if got is None:
+        return float("nan")
+    a, m = got
+    beta = mom_beta_weekly(a, m)
+    if not np.isfinite(beta):
+        return float("nan")
+    r_i = (a[-1] / a[0] - 1.0) * 100.0          # = mom_return(vals, 252)
+    r_m = (m[-1] / m[0] - 1.0) * 100.0
+    return float(r_i - beta * r_m)
+
+
+# 룰 이름 → (점수 함수(dates, vals, mkt_dates, mkt_vals), 필요 최소 봉수)
+MOM_MKT_RULES = {
+    "mom12_0_bn": (score_mom12_0_bn, MOM_BARS_12M + 1),
+}
+if set(MOM_RULES) & set(MOM_MKT_RULES):
+    # 같은 이름이 두 레지스트리에 있으면 mom_score 와 mom_score_mkt 가 서로 다른 식을
+    # 같은 이름으로 부른다. 임포트 시점에 크게 죽인다.
+    raise KeyError(f"룰 이름 중복: {sorted(set(MOM_RULES) & set(MOM_MKT_RULES))}")
+
 # ═══ 위성 랭킹 정책 — 이 두 줄이 '어떤 룰로 돈이 움직이는가'의 유일한 출처 ═══
 #
 # 왜 리터럴 대신 파생인가
@@ -1419,6 +1525,7 @@ MOM_RULE_LABELS = {
     "mom12_0":    "12-0(직전1M 포함)",
     "mom12_0_ra": "위험조정 12-0",
     "mom12_1_ra": "위험조정 12-1(반증용)",
+    "mom12_0_bn": "β중립 12-0(참고)",
 }
 
 
@@ -1427,14 +1534,43 @@ def mom_score(vals, rule: str) -> float:
     폴백하면 '12-1 을 재고 있다고 믿는 blend 결과'가 나온다."""
     fn = MOM_RULES.get(rule)
     if fn is None:
+        if rule in MOM_MKT_RULES:
+            raise TypeError(f"{rule!r} 은 시장 룰이다 — mom_score_mkt(dates, vals, "
+                            f"mkt_dates, mkt_vals, rule) 로 불러야 한다")
         raise KeyError(f"알 수 없는 모멘텀 룰: {rule!r} (가능: {sorted(MOM_RULES)})")
     return fn[0](vals)
 
 
+def is_mkt_rule(rule: str) -> bool:
+    return rule in MOM_MKT_RULES
+
+
+def mom_score_mkt(dates, vals, mkt_dates, mkt_vals, rule: str) -> float:
+    """시장 룰 점수. 날짜 네 개 인자는 **전부 필수** — 위치 정렬로 조용히 틀리는 경로를
+    시그니처에서 없앤다. 단일 계열 룰을 여기로 부르면 던진다."""
+    fn = MOM_MKT_RULES.get(rule)
+    if fn is None:
+        raise KeyError(f"알 수 없는 시장 룰: {rule!r} (가능: {sorted(MOM_MKT_RULES)})")
+    return fn[0](dates, vals, mkt_dates, mkt_vals)
+
+
+def mom_rule_need(rule: str) -> int:
+    """두 레지스트리 어디에 있든 선언 필요 봉수. 모르는 룰은 던진다."""
+    if rule in MOM_RULES:
+        return int(MOM_RULES[rule][1])
+    if rule in MOM_MKT_RULES:
+        return int(MOM_MKT_RULES[rule][1])
+    raise KeyError(f"알 수 없는 모멘텀 룰: {rule!r}")
+
+
 def mom_warmup_bars(rules=None) -> int:
-    """주어진 룰들을 **공정하게** 비교하기 위한 공통 워밍업 봉수 = 필요 봉수의 최댓값."""
+    """주어진 룰들을 **공정하게** 비교하기 위한 공통 워밍업 봉수 = 필요 봉수의 최댓값.
+
+    ⚠️ 인자 없이 부르면 **MOM_RULES 만** 본다(2026-09-11 이전과 동일). 시장 룰을
+       기본 집합에 넣으면 인자 없이 부르던 곳의 워밍업이 조용히 바뀐다.
+    """
     names = list(rules) if rules else list(MOM_RULES)
-    return max(MOM_RULES[r][1] for r in names)
+    return max(mom_rule_need(r) for r in names)
 
 
 def _top_holdings_set(ticker: str, fallback_map: dict, top_n: int = 15) -> set:
