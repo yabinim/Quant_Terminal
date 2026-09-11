@@ -116,6 +116,9 @@ _RESULT_COLS = [
     "SPY_Ret_Pct", "Port_Ret_Pct", "Excess_pp", "Port_MDD_Pct", "Swaps",
     "RiskOff_Weeks", "Sectors_Avail", "Cands_Avail",
     "Recv_From", "Recv_To", "Recv_Bars", "Window_Days", "As_Of", "Universe_Hash",
+    # ⚠️ 신규 열은 **맨 뒤**에만 붙인다(판정 탭과 같은 규칙). 2026-09-10 첫 실행의
+    #    72행은 이 열이 공란이다 — 그 행들의 사건 1 하락 구간은 수익률이 n/a 였다.
+    "Meas_Start",   # 실제 측정 시작일. Start 와 다르면 포트·SPY 모두 이 날부터 쟀다
 ]
 
 
@@ -194,18 +197,38 @@ def _asof(s: pd.Series, d) -> float:
 
 
 def leg_metrics(curve: pd.Series, log: list, lo_d, hi_d) -> dict:
-    """[lo_d, hi_d] 구간의 수익률·MDD·교체 수. 교체는 (lo_d, hi_d] 체결분만 센다.
+    """[lo_d, hi_d] 구간의 수익률·MDD·교체 수 + 실제 측정 시작일.
 
-    lo_d 당일 체결은 구간 **진입 전** 보유를 만든 거래라 세지 않는다.
-    곡선이 lo_d 이후에 시작하면(첫 체결 전) 값이 없으므로 nan.
+    교체는 (lo_d, hi_d] 체결분만 센다 — lo_d 당일 체결은 구간 **진입 전** 보유를
+    만든 거래다.
+
+    곡선이 lo_d **뒤에** 시작하면(첫 체결 전) 곡선의 첫 값부터 잰다. 반환의
+    "start" 가 그 날이고, 호출부는 SPY 도 **같은 날부터** 재야 한다 — 기간이
+    다른 두 수익률의 차이는 초과수익이 아니다. 곡선이 hi_d 뒤에 시작하면 nan.
+
+    [2026-09-10 수정] 첫 실행에서 이 경우를 nan 으로 처리했다. 절삭된 사건 1 의
+    하락 구간은 시작일이 곧 평가 시작일이고, 그 날은 **항상** 첫 체결일보다
+    앞선다 — 그래서 6개 설정 전부 n/a 였다(MDD 는 정상). 룰과 무관한 측정 결함이고,
+    롤링 바닥 때문에 앞으로의 참고 실행에서도 첫 사건은 계속 절삭되므로 반복된다.
     """
-    v0, v1 = _asof(curve, lo_d), _asof(curve, hi_d)
-    ret = (v1 / v0 - 1.0) * 100.0 if np.isfinite(v0) and v0 > 0 else float("nan")
-    sub = curve.loc[lo_d:hi_d].dropna()
+    c = curve.dropna()
+    start = pd.Timestamp(lo_d)
+    if len(c) and c.index[0] > start:
+        start = c.index[0]
+    v0, v1 = _asof(c, start), _asof(c, hi_d)
+    ret = (v1 / v0 - 1.0) * 100.0 if (np.isfinite(v0) and v0 > 0 and start <= hi_d) \
+        else float("nan")
+    sub = c.loc[start:hi_d]
     mdd = float((sub / sub.cummax() - 1.0).min() * 100.0) if len(sub) > 1 else float("nan")
     swaps = sum(1 for r in (log or [])
                 if lo_d < pd.Timestamp(r["exec"]) <= hi_d and r.get("sold"))
-    return {"ret": ret, "mdd": mdd, "swaps": swaps}
+    return {"ret": ret, "mdd": mdd, "swaps": swaps, "start": start}
+
+
+def span_ret(s: pd.Series, a, b) -> float:
+    """[a, b] 단순 수익률(%) — 포트와 SPY 를 같은 기간으로 재기 위한 한 곳."""
+    v0, v1 = _asof(s, a), _asof(s, b)
+    return (v1 / v0 - 1.0) * 100.0 if np.isfinite(v0) and v0 > 0 else float("nan")
 
 
 def risk_off_weeks(spy_close: pd.Series, idx: pd.DatetimeIndex, lo_d, hi_d) -> int:
@@ -271,7 +294,7 @@ def analyze(close_df: pd.DataFrame, adj_df: pd.DataFrame, warmup: int,
     eng0 = engines[RULES[0]]
     for L in legs:
         lo_d, hi_d = idx[L["lo"]], idx[L["hi"]]
-        spy_ret = (_asof(adj_df["SPY"], hi_d) / _asof(adj_df["SPY"], lo_d) - 1.0) * 100.0
+        spy_ret = span_ret(adj_df["SPY"], lo_d, hi_d)
         roff = risk_off_weeks(spy_c, idx, lo_d, hi_d)
         sec, cands = availability(eng0, lo_d)
         flags = (" · 절삭" if L["clipped"] else "") + (" · 데이터 끝 절단" if L["truncated"] else "")
@@ -280,23 +303,34 @@ def analyze(close_df: pd.DataFrame, adj_df: pd.DataFrame, warmup: int,
             f"{lo_d.date()} → {hi_d.date()} ({L['hi'] - L['lo']}봉) · SPY {_f(spy_ret)}% · "
             f"섹터 {sec}/{len(eng0.pool)} · 후보 {cands} · risk-off {roff}주{flags}{sec_warn}")
         say(f"     {'룰':<9}{'필터':<8}{'포트%':>8}{'초과%p':>9}{'MDD%':>8}{'교체':>6}")
+        late = set()
         for r in RULES:
             for flt in FILTERS:
                 m = sims[(r, flt)]
                 lm = (leg_metrics(m["curve"], m.get("log"), lo_d, hi_d) if m
-                      else {"ret": float("nan"), "mdd": float("nan"), "swaps": 0})
-                ex = lm["ret"] - spy_ret
+                      else {"ret": float("nan"), "mdd": float("nan"), "swaps": 0,
+                            "start": lo_d})
+                # 포트가 늦게 시작했으면 SPY 도 같은 날부터 — 기간이 다르면 초과가 아니다
+                spy_row = span_ret(adj_df["SPY"], lm["start"], hi_d) \
+                    if lm["start"] != lo_d else spy_ret
+                if lm["start"] != lo_d:
+                    late.add(lm["start"])
+                ex = lm["ret"] - spy_row
                 say(f"     {r:<9}{flt:<8}{_f(lm['ret']):>8}{_f(ex):>9}"
                     f"{_f(lm['mdd']):>8}{lm['swaps']:>6}")
                 rows.append([
                     run_date, r, flt, L["ep"], L["leg"], str(lo_d.date()), str(hi_d.date()),
                     L["hi"] - L["lo"], L["clipped"], L["truncated"], round(L["dd"] * 100, 2),
-                    round(spy_ret, 2), round(lm["ret"], 2), round(ex, 2), round(lm["mdd"], 2),
+                    round(spy_row, 2), round(lm["ret"], 2), round(ex, 2), round(lm["mdd"], 2),
                     lm["swaps"], roff, sec, cands,
                     meta.get("recv_from", ""), meta.get("recv_to", ""),
                     meta.get("recv_bars", ""), DEEP_WINDOW_DAYS,
                     meta.get("as_of", ""), meta.get("uhash", ""),
+                    str(pd.Timestamp(lm["start"]).date()),
                 ])
+        for d in sorted(late):
+            say(f"     ⓘ 측정 시작 {pd.Timestamp(d).date()} (첫 체결일) — 포트·SPY 모두 "
+                f"이 날부터 쟀다. 위 SPY 수치는 구간 시작일 기준이다.")
     return rows
 
 
@@ -527,9 +561,17 @@ def _selftest() -> int:
         fails.append(f"교체 수 {lm['swaps']} != 1 (lo 당일 제외 · 빈 sold 제외 · hi 포함)")
     if leg_metrics(curve, log, ci[5], ci[8])["swaps"] != 1:
         fails.append("hi 당일 체결이 교체 수에서 빠짐")
+    # 곡선이 구간 뒤에 시작 → 곡선 첫 값부터 (2026-09-10 수정 — 첫 실행의 n/a 결함)
     pre = leg_metrics(curve.iloc[3:], log, ci[1], ci[5])
-    if np.isfinite(pre["ret"]):
-        fails.append("첫 체결 전 구간에서 수익률이 나옴 — nan 이어야 한다")
+    if pre["start"] != ci[3] or abs(pre["ret"] - (108 / 121 - 1) * 100) > 1e-9:
+        fails.append(f"곡선이 늦게 시작한 구간을 첫 값부터 재지 않음: {pre}")
+    if pre["mdd"] != leg_metrics(curve.iloc[3:], log, ci[3], ci[5])["mdd"]:
+        fails.append("늦게 시작한 구간의 MDD 가 측정 시작일 기준과 다름")
+    gone = leg_metrics(curve.iloc[6:], log, ci[1], ci[4])
+    if np.isfinite(gone["ret"]):
+        fails.append("곡선이 구간 끝보다 뒤에 시작하는데 수익률이 나옴 — nan 이어야 한다")
+    if leg_metrics(curve, log, ci[2], ci[7])["start"] != ci[2]:
+        fails.append("곡선이 구간 전부터 있으면 측정 시작은 구간 시작일이어야 한다")
 
     # ── 4. 사전 약정 상수 ───────────────────────────────────────────────
     got = (EPISODE_DD, REBOUND_BARS, RULES, FILTERS, VARIANT_NAME, SLOTS, SWAP_MODE, _WKEY)
@@ -625,6 +667,32 @@ def _selftest() -> int:
     if [_cell(x) for x in (float("nan"), np.float64("inf"), np.int64(3), 1.5, True)] \
             != ["", "", 3, 1.5, True]:
         fails.append("시트 셀 정규화 오류 — NaN 이 API 요청 전체를 거절시킨다")
+    # ── 10. 절삭 구간 — 포트가 늦게 시작하면 SPY 도 같은 날부터 ────────
+    cv = _piecewise([100, 130, 95, 140, 150, 160], seg=180)[:900]   # 고점 180봉 < 워밍업 253
+    close_c, adj_c = close_s.copy(), adj_s.copy()
+    close_c["SPY"] = cv
+    adj_c["SPY"] = cv
+    with contextlib.redirect_stdout(io.StringIO()) as buf2:
+        rows_c = analyze(close_c, adj_c, warm, {"uhash": "TEST"}, verbose=True)
+    ci_ = _RESULT_COLS.index
+    clip = [r for r in rows_c if r[ci_("Clipped")] and r[ci_("Leg")] == "drawdown"]
+    if not clip:
+        fails.append("절삭 구간 검사가 무효 — 합성 패널에 절삭된 하락 구간이 없다")
+    for r in clip:
+        ms, en = pd.Timestamp(r[ci_("Meas_Start")]), pd.Timestamp(r[ci_("End")])
+        if ms <= pd.Timestamp(r[ci_("Start")]):
+            fails.append("절삭 구간의 측정 시작이 첫 체결일로 밀리지 않음 — 검사 전제 붕괴")
+            break
+        if not np.isfinite(r[ci_("Port_Ret_Pct")]):
+            fails.append("절삭 구간 수익률이 여전히 n/a — 2026-09-10 결함 재발")
+            break
+        want = round(span_ret(adj_c["SPY"], ms, en), 2)
+        if r[ci_("SPY_Ret_Pct")] != want:
+            fails.append(f"SPY 가 측정 시작일이 아닌 날부터 측정됨: {r[ci_('SPY_Ret_Pct')]} != {want}")
+            break
+    if "ⓘ 측정 시작" not in buf2.getvalue():
+        fails.append("측정 시작일이 밀린 사실이 로그에 안 찍힘")
+
     for bad in ("샤프", "승 /", "창 중"):
         if bad in txt:
             fails.append(f"판정성 출력 '{bad}' 가 찍힘 — 사전 약정 위반")
@@ -636,7 +704,7 @@ def _selftest() -> int:
         return 1
     print("✅ 전 항목 통과 (사건추출·병합·임계방향·절삭·절단·곡선경계·교체경계·"
           "사전약정상수·판정출력금지·판정탭금지·as_of전파·override복구·배당조정게이트·"
-          "셀정규화·깊이게이트·전경로)")
+          "셀정규화·깊이게이트·절삭구간측정·전경로)")
     return 0
 
 

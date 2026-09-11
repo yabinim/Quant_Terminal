@@ -30,7 +30,8 @@ md §6 은 스스로 이렇게 선언한다: *"정직하게 적는다. 문서에
   F   소비자 배선 — app.py · run_hidden_alpha.py 가 fmp_extras 판정 함수를
       실제로 호출하고, 러너 파일과 워크플로 스텝이 존재하는가
   G   app.py 가 md 문안을 복사하지 않았는가
-  J   §4① 깊은 창 참고 실행 사전 약정 ↔ 러너 상수 (임계·반등·룰·필터·기록 탭)
+  J   §4① 깊은 창 참고 실행 사전 약정 ↔ 러너 상수 (임계·반등·룰·필터·기록 탭),
+      §2 약점 각주의 '바꾸지 않는다' 유지
   H   양성 대조 — 알려진 불량 입력에서 각 검사가 실제로 실패하는가
 
 ⚠️ 로직을 복사하지 않는다. fmp_extras 의 실제 함수를 부른다.
@@ -609,6 +610,21 @@ chk("J5 기록 탭이 판정 탭과 다르다 (Momentum_Rule_Deep)",
     ("Momentum_Rule_Deep", True))
 chk("J6 §4① 가 러너와 탭을 지목한다",
     ("diag_momentum_deep_ref.py" in (MD or ""), "Momentum_Rule_Deep" in (MD or "")), (True, True))
+# J8 — 결과를 기록한 §2 각주가 "바꾸지 않는다"를 잃지 않았는가. 약점 목록은 읽기 좋은
+#      근거라, 나중에 이 문장만 지우고 "그래서 필터를 바꿨다"로 이어 쓰기 쉽다.
+_J8_HEAD = "**깊은 창 참고 실행에서 드러난 알려진 약점"
+_J8_KEEP = "**이 사실로 규칙·필터·트리거를 바꾸지 않는다.**"
+
+
+def md_deep_note_ok(text):
+    t = text or ""
+    i = t.find(_J8_HEAD)
+    j = t.find("### 3.", i if i >= 0 else 0)
+    return i >= 0 and j > i and _J8_KEEP in t[i:j]
+
+
+chk("J8 §2 약점 각주가 '규칙·필터·트리거를 바꾸지 않는다'를 §3 앞에서 유지한다",
+    md_deep_note_ok(MD), True)
 chk("J7 수동 워크플로가 러너를 실행한다 (자체검증 → 본 실행)",
     (WF_DEEP is not None
      and "diag_momentum_deep_ref.py --selftest" in WF_DEEP
@@ -707,6 +723,8 @@ chk("H15 md 대상 룰에 위험조정 룰을 끼우면 J3 이 잡는다",
     _would_fail(lambda: _md_ticks(MD.replace("`mom12_1` · `mom12_0` (",
                                              "`mom12_1` · `mom12_0` · `mom12_0_ra` (", 1),
                                   "대상 룰") == _lit(RCMP, "VERDICT_RULES")), True)
+chk("H17 약점 각주에서 '바꾸지 않는다' 문장만 지우면 J8 이 잡는다",
+    _would_fail(lambda: md_deep_note_ok(MD.replace(_J8_KEEP, "", 1))), True)
 chk("H16 러너 반등 봉수만 63 으로 바꾸면 J2 가 잡는다",
     _would_fail(lambda: md_deep_rebound(MD) == _lit(
         (DEEP or "").replace("REBOUND_BARS = 126", "REBOUND_BARS = 63", 1), "REBOUND_BARS")), True)
