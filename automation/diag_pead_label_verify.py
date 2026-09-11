@@ -212,16 +212,21 @@ def frozen_check() -> tuple:
 # STEP 1 — 수집 (IO)
 # ══════════════════════════════════════════════════════════════════════════
 
-def price_frame(tk: str) -> pd.DataFrame:
-    """OHLCV. 라이브 `run_earnings_watch.fmp_price_history` 와 같은 엔드포인트·열."""
-    data, _k = _json(f"historical-price-eod/full?symbol={tk}"
-                     f"{fx.hist_range_params(PRICE_WINDOW_DAYS)}")
+def price_frame(tk: str) -> tuple:
+    """(OHLCV, kind). 라이브 `run_earnings_watch.fmp_price_history` 와 같은 엔드포인트·열.
+
+    kind 를 함께 돌려주는 이유는 무결성 게이트 때문이다. "조회 실패"와 "조회는
+    됐는데 그 종목에 그 데이터가 없다"는 전혀 다른 사건인데, 빈 결과만 보면
+    구분되지 않는다.
+    """
+    data, kind = _json(f"historical-price-eod/full?symbol={tk}"
+                       f"{fx.hist_range_params(PRICE_WINDOW_DAYS)}")
     rows = P._rows(data)
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(), kind
     df = pd.DataFrame(rows)
     if "date" not in df.columns or "close" not in df.columns:
-        return pd.DataFrame()
+        return pd.DataFrame(), kind
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).set_index("date").sort_index()
     out = pd.DataFrame(index=df.index)
@@ -230,14 +235,67 @@ def price_frame(tk: str) -> pd.DataFrame:
         if src in df.columns:
             out[dst] = pd.to_numeric(df[src], errors="coerce")
     if "Close" not in out.columns:
-        return pd.DataFrame()
-    return out.dropna(subset=["Close"])
+        return pd.DataFrame(), kind
+    return out.dropna(subset=["Close"]), kind
 
 
-def earnings_rows(tk: str) -> list:
-    """발표가 끝난 사건 [(날짜, 행)] 오름차순 — 프로브 `_reported` 규칙 그대로."""
-    data, _k = _json(f"earnings?symbol={tk}&limit=1000")
-    return P._reported(P._rows(data))
+def earnings_rows(tk: str) -> tuple:
+    """([(날짜, 행)] 오름차순, kind) — 프로브 `_reported` 규칙 그대로."""
+    data, kind = _json(f"earnings?symbol={tk}&limit=1000")
+    return P._reported(P._rows(data)), kind
+
+
+def quarter_ends(tk: str) -> tuple:
+    """(분기말 날짜 오름차순, kind).
+
+    `V._quarters` 와 같은 엔드포인트·같은 파싱이다. 따로 두는 이유는 하나뿐 —
+    `V._quarters` 는 kind 를 버리는데, 무결성 게이트가 그 값을 봐야 한다.
+    공시일(filingDate)은 쓰지 않으므로 분기말만 뽑는다.
+    """
+    data, kind = _json(f"income-statement?symbol={tk}&period=quarter&limit=80")
+    out = []
+    for r in P._rows(data):
+        pe = ec._d(r.get("date"))
+        if pe is not None:
+            out.append(pe)
+    return sorted(set(out)), kind
+
+
+def classify_status(kinds, has_bars: bool, n_rep: int, n_q: int,
+                    prof_kind: str = "", is_fund=None) -> str:
+    """종목 1건의 상태 — "ok" | "fail" | "fund". **순수 함수**(셀프테스트 T6).
+
+    약정 §8 의 무결성 게이트는 "가격·실적·분기 재무제표 **조회에 실패한** 종목"을
+    센다. ETF 처럼 애초에 실적이 없는 종목은 조회 실패가 아니라 사건이 0건인
+    종목이다 — 첫 실행(2026-09-11 23:30 ET)이 이 둘을 뭉뚱그려 Tier 1 의 ETF
+    17종목을 '실패 16%'로 세고 중단했다. 여기서 가른다.
+
+    단, 기준을 "실적 0행이면 제외"로 두면 게이트의 이빨이 빠진다 — 진짜 데이터
+    구멍도 조용히 빠져나간다. 그래서 **펀드로 확인된 종목만** 제외하고,
+    나머지 실적 0행은 그대로 실패로 센다.
+    """
+    if any(str(k or "") != "ok" for k in kinds) or not has_bars:
+        return "fail"
+    if n_rep > 0 and n_q > 0:
+        return "ok"
+    if str(prof_kind or "") == "ok" and is_fund is True:
+        return "fund"
+    return "fail"
+
+
+def fetch_ticker(tk: str) -> tuple:
+    """(status, hist, rep, qs). status = classify_status 결과."""
+    hist, pk = price_frame(tk)
+    rep, ek = earnings_rows(tk)
+    qs, qk = quarter_ends(tk)
+    prof_kind, is_fund = "", None
+    if not (rep and qs) and all(k == "ok" for k in (pk, ek, qk)) and not hist.empty:
+        data, prof_kind = _json(f"profile?symbol={tk}")
+        rows = P._rows(data)
+        if rows:
+            is_fund = bool(rows[0].get("isEtf")) or bool(rows[0].get("isFund"))
+    return (classify_status((pk, ek, qk), not hist.empty, len(rep), len(qs),
+                            prof_kind, is_fund), hist, rep, qs)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -255,7 +313,8 @@ def _prev_quarter_end(qends: list, d: pd.Timestamp):
 
 
 def build_events(hist: pd.DataFrame, reported: list, qends: list, *,
-                 pe_filter: bool = True, warmup: bool = True) -> tuple:
+                 pe_filter: bool = True, warmup: bool = True,
+                 today=None) -> tuple:
     """발표 사건 → 라벨 붙은 사건 목록. **수익률을 계산하지 않는다.**
 
     반환: (events, drop) — events 원소
@@ -263,11 +322,20 @@ def build_events(hist: pd.DataFrame, reported: list, qends: list, *,
 
     pe_filter / warmup 은 셀프테스트 전용 뮤테이션 스위치다(설계 메모 4).
     """
-    drop = {"분기말흔적": 0, "분기말미상": 0, "반응불가": 0,
-            "워밍업부족": 0, "반응중복": 0}
+    keys = ("분기말흔적", "분기말미상", "반응불가", "워밍업부족", "반응중복")
+    drop = {k: 0 for k in keys}
+    drop_j = {k: 0 for k in keys}      # 판정창 [2012-01-01, 2021-10-20) 안에서만
     out, used_i = [], set()
+
+    def _bye(k, d):
+        """버린 사유 집계. 전체와 판정창을 따로 센다 — 첫 실행 로그에서 판정창
+        밖(2006~2011) 사건이 카운터를 뒤덮어 판정창의 실제 손실이 보이지 않았다."""
+        drop[k] += 1
+        if pd.Timestamp(JUDGE_FROM) <= d < pd.Timestamp(JUDGE_TO):
+            drop_j[k] += 1
+
     if hist is None or hist.empty or not reported:
-        return out, drop
+        return out, drop, drop_j
 
     j_from = pd.Timestamp(JUDGE_FROM)
     kept_dates = []          # 워밍업 표본 — 규칙 2 를 통과한 사건만 (오름차순)
@@ -276,10 +344,10 @@ def build_events(hist: pd.DataFrame, reported: list, qends: list, *,
         if pe_filter:
             pe = _prev_quarter_end(qends, d)
             if pe is None:
-                drop["분기말미상"] += 1
+                _bye("분기말미상", d)
                 continue
             if (d - pe).days <= PE_LAG_MAX:
-                drop["분기말흔적"] += 1
+                _bye("분기말흔적", d)
                 continue
         # 여기까지가 규칙 2 통과. 워밍업 표본에는 판정 여부와 무관하게 들어간다.
         past = [x for x in kept_dates if x < d and x >= j_from]
@@ -288,11 +356,11 @@ def build_events(hist: pd.DataFrame, reported: list, qends: list, *,
         i = ec.resolve_reaction_index(hist, d, "")
         m = ec.measure_reaction(hist, d, "")
         if i is None or not m.get("ok"):
-            drop["반응불가"] += 1
+            _bye("반응불가", d)
             continue
         if i in used_i:
             # 두 사건이 같은 반응 세션에 걸리면 이른 날짜 하나만 남긴다.
-            drop["반응중복"] += 1
+            _bye("반응중복", d)
             continue
 
         move = None
@@ -300,7 +368,7 @@ def build_events(hist: pd.DataFrame, reported: list, qends: list, *,
             ev = [{"date": x, "timing": ""} for x in reversed(past[-WARMUP_LIMIT:])]
             move = ec.expected_move(ec.gap_history(hist, ev))
             if not move.get("ok"):
-                drop["워밍업부족"] += 1
+                _bye("워밍업부족", d)
                 continue
 
         pead = ec.evaluate_pead(m, move)
@@ -308,7 +376,7 @@ def build_events(hist: pd.DataFrame, reported: list, qends: list, *,
         out.append({"date": d, "i": int(i), "code": pead["code"],
                     "gap_pct": m.get("gap_pct"), "vol_ratio": m.get("volume_ratio"),
                     "move_n": int((move or {}).get("sample_n") or 0)})
-    return out, drop
+    return out, drop, drop_j
 
 
 def window_of(d: pd.Timestamp, today: date) -> str:
@@ -541,31 +609,39 @@ def main() -> int:
         print(f"[ABORT] SPY 첫 봉 {first} > {SPY_FLOOR} — 판정 구간 앞부분이 잘린다(§8).")
         return 1
 
-    per_tier_events, fails = {}, {}
+    per_tier_events, fails, funds = {}, {}, {}
     for tier, tickers in univ.items():
-        evs, bad, dropsum = [], [], {}
+        evs, bad, fnd, dropsum, dropj = [], [], [], {}, {}
         for tk in tickers:
-            hist = price_frame(tk)
-            rep = earnings_rows(tk)
-            qs = [pe for pe, _fd in V._quarters(tk)]
-            if hist.empty or not rep or not qs:
+            status, hist, rep, qs = fetch_ticker(tk)
+            if status == "fund":
+                fnd.append(tk)       # ETF·펀드 — 실적 사건이 없는 종목. 실패 아님
+                continue
+            if status != "ok":
                 bad.append(tk)
                 continue
-            e, drop = build_events(hist, rep, qs)
+            e, drop, dj = build_events(hist, rep, qs)
             for k, v in drop.items():
                 dropsum[k] = dropsum.get(k, 0) + v
+            for k, v in dj.items():
+                dropj[k] = dropj.get(k, 0) + v
             for ev in e:
                 w = window_of(ev["date"], today)
                 if w:
                     evs.append({**ev, "tk": tk, "win": w, "hist": hist})
         per_tier_events[tier] = evs
-        fails[tier] = bad
-        rate = len(bad) / max(1, len(tickers))
-        print(f"  {tier}: 사건 {len(evs)}건 · 조회 실패 {len(bad)}종목({rate:.1%}) · "
-              f"제외 {dropsum}")
+        fails[tier], funds[tier] = bad, fnd
+        denom = max(1, len(tickers) - len(fnd))     # 분모는 실적이 있는 종목
+        rate = len(bad) / denom
+        print(f"  {tier}: 사건 {len(evs)}건 · 실적 종목 {denom} · "
+              f"펀드 제외 {len(fnd)}종목 · 조회 실패 {len(bad)}종목({rate:.1%})")
+        print(f"    버림(전체)   {dropsum}")
+        print(f"    버림(판정창) {dropj}")
+        if fnd:
+            print(f"    펀드 제외: {', '.join(fnd)}")
         if rate > FAIL_RATE_MAX:
             print(f"[ABORT] {tier} 조회 실패율 {rate:.1%} > {FAIL_RATE_MAX:.0%}(§8). "
-                  f"실패: {', '.join(bad[:15])}")
+                  f"실패 {len(bad)}종목: {', '.join(bad)}")
             return 1
 
     # ── STEP 2 ─────────────────────────────────────────────────────────────
@@ -605,8 +681,10 @@ def main() -> int:
               + ("" if allp else f" · 문구 교체: {ec.PEAD_LABELS[code]} → {FAIL_TEXT[code]}"))
 
     meta = {"univ": univ, "commit": commit, "calls": fh.fmp_stats_line(),
-            "note": f"SPY {first} ~ · 실패 " +
-                    " ".join(f"{t}:{len(v)}" for t, v in fails.items())}
+            "note": f"SPY {first} ~ · 실패 "
+                    + " ".join(f"{t}:{len(v)}" for t, v in fails.items())
+                    + " · 펀드제외 "
+                    + " ".join(f"{t}:{','.join(v)}" for t, v in funds.items() if v)}
     rows = result_rows(now_et.strftime("%Y-%m-%d %H:%M"), per, meta)
 
     # 설계 메모 5 — 기록 실패에 대비해 결과를 먼저 로그에 박는다.
@@ -754,7 +832,7 @@ def _selftest() -> int:
         rows = []
         for sd in range(16):         # 종목 16개 — P1(n ≥ 100)·P4(연 10건) 가 서도록
             hist, rep, qe, spy = _synth(seed=sd + 1, eff_up=eu, eff_down=ed)
-            evs, _d1 = build_events(hist, rep, qe)
+            evs, _d1, _dj1 = build_events(hist, rep, qe)
             got_r, _d2 = attach_returns(evs, hist, spy)
             rows.extend(r for r in got_r if 2012 <= r["year"] <= 2021)
         got[name] = {c: judge_tier(rows, c) for c in TARGET_LABELS}
@@ -803,7 +881,7 @@ def _selftest() -> int:
 
     print("\n[T3] 뮤테이션 — 약정을 어기면 숫자가 달라져야 한다")
     hist, rep, qe, spy = _synth(eff_up=2.0, eff_down=-2.0)
-    b_ev, b_drop = build_events(hist, rep, qe)
+    b_ev, b_drop, b_dropj = build_events(hist, rep, qe)
     b_rows, _ = attach_returns(b_ev, hist, spy)
     b_up = judge_tier(b_rows, "up_continue")
     base_mean, base_n = b_up["mean_d"], len(b_rows)
@@ -817,10 +895,10 @@ def _selftest() -> int:
     m3, _ = attach_returns(b_ev, hist, spy, use_spy=False)
     chk("M3 SPY 미차감 탐지",
         abs(judge_tier(m3, "up_continue")["mean_d"] - base_mean) > 1e-6)
-    m4_ev, _ = build_events(hist, rep, qe, pe_filter=False)
+    m4_ev, _, _ = build_events(hist, rep, qe, pe_filter=False)
     chk("M4 분기말 제외 해제 탐지", len(m4_ev) > len(b_ev),
         f"{len(b_ev)} → {len(m4_ev)}")
-    m5_ev, _ = build_events(hist, rep, qe, warmup=False)
+    m5_ev, _, _ = build_events(hist, rep, qe, warmup=False)
     chk("M5 워밍업 해제 탐지", len(m5_ev) > len(b_ev), f"{len(b_ev)} → {len(m5_ev)}")
     chk("M6 무조건 집합에서 라벨 제외 탐지",
         abs(judge_tier(b_rows, "up_continue", excl_label_from_u=True)["mean_d"]
@@ -841,6 +919,24 @@ def _selftest() -> int:
     chk("오늘−99일 사건은 대상 아님",
         window_of(pd.Timestamp(t_today - timedelta(days=99)), t_today) == "")
     chk("판정 사건 수가 0 이 아니다", base_n > 0, f"{base_n}건")
+
+    print("\n[T6] 종목 상태 분류 — 조회 실패 / 펀드 / 정상")
+    # 첫 실행(2026-09-11 23:30 ET)이 여기서 걸렸다. ETF 17종목을 '조회 실패'로
+    # 세어 Tier 1 실패율 16% → 무결성 중단. 진리표로 못 박는다.
+    cases = [
+        ("정상 종목", ("ok", "ok", "ok"), True, 80, 60, "", None, "ok"),
+        ("ETF(실적 0 · 펀드 확인)", ("ok", "ok", "ok"), True, 0, 0, "ok", True, "fund"),
+        ("실적 0 인데 펀드 아님", ("ok", "ok", "ok"), True, 0, 0, "ok", False, "fail"),
+        ("실적 0 · 프로필 조회 실패", ("ok", "ok", "ok"), True, 0, 0, "http_error", None, "fail"),
+        ("플랜 제한", ("ok", "plan_limited", "ok"), True, 80, 60, "", None, "fail"),
+        ("레이트 리밋", ("rate_limited", "ok", "ok"), True, 80, 60, "", None, "fail"),
+        ("가격 0봉", ("ok", "ok", "ok"), False, 80, 60, "", None, "fail"),
+        ("분기재무만 0 · 펀드 확인", ("ok", "ok", "ok"), True, 80, 0, "ok", True, "fund"),
+        ("분기재무만 0 · 펀드 아님", ("ok", "ok", "ok"), True, 80, 0, "ok", False, "fail"),
+    ]
+    for name, kinds, bars, nr, nq, pk, isf, want in cases:
+        got = classify_status(kinds, bars, nr, nq, pk, isf)
+        chk(f"{name} → {want}", got == want, f"결과 {got}")
 
     print("\n[T5] 회귀 — 결과 행 모양")
     per = {"judge": {"Tier 1": {c: judge_tier(b_rows, c) for c in TARGET_LABELS},
