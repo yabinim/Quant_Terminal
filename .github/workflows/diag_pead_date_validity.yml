@@ -1,0 +1,61 @@
+name: 🔬 진단 — C트랙 A4 실적 발표일 유효성 (수동 전용)
+
+# 언제 쓰나:
+#   Phase 0 프로브에서 오래된 실적 '발표일'이 실제로는 분기말이라는 증거가 나왔다
+#   (MSFT 1985-09-30 — 상장 1986-03-13 이전). 이 프로브가 PEAD 사전 약정의
+#   **판정 구간 시작 연도를 기계적으로** 정한다. 규칙은 스크립트 docstring 에 실행 전 기록.
+#
+#   사건마다: ① 분기말 흔적(발표일 − 직전 분기말 ≤ 7일)
+#             ② 거래량 급증(반응 세션 ÷ 직전 20봉 중앙값 ≥ 1.5, 반응 세션 = ec SSOT)
+#   연도 유효 = n ≥ 30 · 흔적 ≤ 5% · 급증률 ≥ 0.8 × 기준(2022~2025 중앙)
+#   티어별 시작 연도 = 그 해부터 2021 까지 전부 유효한 가장 이른 해 → 두 티어 중 늦은 쪽
+#
+# 안전성:
+#   · 종가 · 수익률 미사용(가격 프레임에 Volume 열만) · 사건별 값 미출력(연도별 집계만)
+#   · 시트 쓰기 0 · 읽기는 Watchlist/Portfolios/Earnings_Universe 티커 목록뿐
+#   · 약 470콜 · fmp_http 경유
+#
+# ⚠️ repository_dispatch / schedule 없음 — 일회성 프로브.
+
+on:
+  workflow_dispatch:
+    inputs:
+      t2_sample:
+        description: "Tier 2 표본 크기 (Phase 0 프로브와 같은 seed) — 0 이면 Tier 2 생략"
+        required: false
+        default: "60"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install requests numpy pandas pytz gspread google-auth
+
+      - name: 🧪 임포트 스모크 (콜 0)
+        run: |
+          python -c "import sys; sys.path.insert(0,'automation'); import diag_pead_date_validity; print('import OK')"
+
+      - name: 🔬 A4 발표일 유효성 (읽기 전용)
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          T2_SAMPLE: ${{ inputs.t2_sample }}
+        run: python automation/diag_pead_date_validity.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_pead_date_validity.py
