@@ -110,8 +110,9 @@ MARKERS = {
     "diag_satellite_backtest.py": ["WINDOW_DAYS_PIN", "WINDOW_DAYS_OVERRIDE",
                                    "_env_as_of"],
     "diag_momentum_rule_compare.py": ["VERDICT_RULES", "_env_as_of"],
+    # Meas_Start: 2026-09-10 측정 결함 수정. 없는 사본이면 절삭 구간이 다시 n/a 다.
     "diag_momentum_deep_ref.py": ["EPISODE_DD", "REBOUND_BARS",
-                                  "WINDOW_DAYS_OVERRIDE"],
+                                  "WINDOW_DAYS_OVERRIDE", "Meas_Start"],
     "diag_fmp_ssot.py": ["_OV_ALLOWED", "B4s"],
 }
 
