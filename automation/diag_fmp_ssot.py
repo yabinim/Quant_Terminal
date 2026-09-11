@@ -1071,7 +1071,9 @@ check("B4h 환산 비율을 숫자 리터럴로 복제하지 않는다 (fmp_extr
 _NEED = ("fh", "fx", "_fmp_eod", "_batch_fetch", "universe_hash",
          "_env_fetch_rate", "MIN_FETCH_RATE", "_INFRA_KINDS",
          # v2.9 — 옛 사본이면 여기서 크게 죽는다. 조용히 통과하는 것보다 낫다.
-         "HISTORY_BARS", "_window_days_for", "_WARNED_CEILING")
+         "HISTORY_BARS", "_window_days_for", "_WARNED_CEILING",
+         # 2026-09-10 — 깊은 창 참고 실행 경로. 옛 bt 면 아래 B4p~B4r 대신 여기서 멈춘다.
+         "WINDOW_DAYS_OVERRIDE", "WINDOW_DAYS_PIN")
 _MISSING = [a for a in _NEED if not hasattr(sb, a)]
 if _MISSING:
     print()
@@ -1099,6 +1101,74 @@ sb._window_days_for(99_999, warn=_dup.append)
 sb._window_days_for(99_999, warn=_dup.append)         # 같은 bars 재호출
 check("B4k 같은 요구는 1회만 경고한다 (8워커 동시호출 대비)", len(_dup), 1)
 sb._WARNED_CEILING.clear()
+
+# ── 2026-09-10: 깊은 창 참고 실행 경로 (WINDOW_DAYS_OVERRIDE) ─────────────
+# 판정 경로(§4① — 1,826달력일 핀)와 참고 경로(깊은 창)가 **같은 엔진**을 쓴다.
+# 둘이 섞이는 방향은 하나뿐이다: 참고용 값이 판정 실행에 새어 들어가 2027-03-08
+# 재실행이 '자를 바꾼' 결과가 되는 것. 아래 넷이 그 방향을 막는다.
+#   B4p 기본값 None · B4q 판정 창 = 핀 · B4r 참고 경로가 실제로 동작하고 원상복구
+#   B4s 이 값을 쓰는(대입하는) 파일은 허용 목록뿐 — 판정 파일은 금지
+_ov_assign = None
+_ov_global = False
+for _n in (SB_TREE.body if SB_TREE is not None else []):
+    if isinstance(_n, ast.Assign) and any(isinstance(t, ast.Name) and
+                                          t.id == "WINDOW_DAYS_OVERRIDE" for t in _n.targets):
+        _ov_assign = _n.value
+for _n in (ast.walk(SB_TREE) if SB_TREE is not None else []):
+    if isinstance(_n, ast.Global) and "WINDOW_DAYS_OVERRIDE" in _n.names:
+        _ov_global = True
+check("B4p WINDOW_DAYS_OVERRIDE 기본값이 None (소스·런타임 · bt 안에서 재대입 없음)",
+      (isinstance(_ov_assign, ast.Constant) and _ov_assign.value is None,
+       sb.WINDOW_DAYS_OVERRIDE, _ov_global),
+      (True, None, False))
+
+_q = []
+sb._WARNED_CEILING.clear()
+check("B4q 판정 경로 창 = WINDOW_DAYS_PIN = 1826 (§4① — 바꾸려면 §7)",
+      (sb._window_days_for(sb.HISTORY_BARS, warn=_q.append), sb.WINDOW_DAYS_PIN),
+      (1826, 1826))
+
+_r = []
+_saved_ov = sb.WINDOW_DAYS_OVERRIDE
+sb._WARNED_CEILING.clear()
+try:
+    sb.WINDOW_DAYS_OVERRIDE = 7400
+    _r_days = (sb._window_days_for(50, warn=_r.append),
+               sb._window_days_for(99_999, warn=_r.append))
+finally:
+    sb.WINDOW_DAYS_OVERRIDE = _saved_ov
+sb._WARNED_CEILING.clear()
+_r_back = sb._window_days_for(sb.HISTORY_BARS, warn=lambda *_: None)
+sb._WARNED_CEILING.clear()
+check("B4r 참고 경로 — 지정값 그대로(상한 초과 허용) · 알림 1회 · 해제 후 핀 복귀",
+      (_r_days, len(_r), bool(_r) and "WINDOW_DAYS_OVERRIDE" in _r[0], _r_back),
+      ((7400, 7400), 1, True, 1826))
+
+
+def _override_writers() -> set:
+    """WINDOW_DAYS_OVERRIDE 를 **대입**하는 모듈. 속성 대입(x.W = …)과 setattr 둘 다."""
+    out = set()
+    for mod, tree in TREES.items():
+        for n in ast.walk(tree):
+            tgts = []
+            if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                tgts = n.targets if isinstance(n, ast.Assign) else [n.target]
+            for t in tgts:
+                if isinstance(t, ast.Attribute) and t.attr == "WINDOW_DAYS_OVERRIDE":
+                    out.add(mod)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
+                    and n.func.id == "setattr" and len(n.args) >= 2 \
+                    and isinstance(n.args[1], ast.Constant) \
+                    and n.args[1].value == "WINDOW_DAYS_OVERRIDE":
+                out.add(mod)
+    return out
+
+
+# 허용: 참고 실행 러너 + 이 가드 자신(B4r 런타임 검사). 판정 파일이 여기 들어오면
+# §4① 판정 재실행이 깊은 창으로 돈다 — 가장 비싼 실패이므로 목록으로 조인다.
+_OV_ALLOWED = {"diag_momentum_deep_ref", "diag_fmp_ssot"}
+check("B4s WINDOW_DAYS_OVERRIDE 대입은 허용 목록뿐 (판정 파일 diag_momentum_rule_compare 금지)",
+      sorted(_override_writers() - _OV_ALLOWED), [])
 
 
 # ══════════════════════════════════════════════════════════════════════════

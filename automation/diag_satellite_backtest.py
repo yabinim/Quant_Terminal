@@ -249,8 +249,25 @@ WINDOW_DAYS_PIN = 1826
 #
 #   ⚠️ 이 값을 바꾸면 T1~T4 와의 대조가 끊긴다. 바꾸려면 SATELLITE_MANDATE §7 에
 #      날짜·근거를 남기고, 판정용 재실행과 참고용 재실행을 분리할 것.
+#   ⚠️ 깊은 창 **참고** 실행은 이 값을 바꾸지 않는다 — 아래 WINDOW_DAYS_OVERRIDE 로 한다.
 #   ⚠️ 핀은 **봉수가 아니라 달력일**이다. 봉수는 휴장일 배치 때문에 기준일마다
 #      1~2봉 흔들린다.
+WINDOW_DAYS_OVERRIDE = None
+#   **참고 실행 전용** 창 명시 지정(달력일). None = 판정 경로(봉수 환산 → 상한 → 핀).
+#   값이 있으면 _window_days_for() 가 봉수 환산·fx.HIST_MAX_DAYS·WINDOW_DAYS_PIN 을
+#   전부 건너뛰고 이 값을 그대로 쓴다. 채우는 곳은 diag_momentum_deep_ref 하나다
+#   (SATELLITE_MANDATE §4① "깊은 창 참고 실행 — 사전 약정").
+#
+#   왜 핀이 아니라 별도 이름인가: 핀은 §4① **판정 재현** 장치다. 같은 이름에
+#     "더 깊게 받기"를 얹으면 로그의 핀 값만 보고는 판정 실행인지 참고 실행인지
+#     가를 수 없다. 판정 파일(diag_momentum_rule_compare)은 이 값을 대입하지
+#     않는다 — diag_fmp_ssot B4s 가 AST 로 막는다.
+#   왜 시그니처 키워드가 아니라 모듈 전역인가: _fmp_eod·_batch_fetch 의 시그니처를
+#     바꾸면 diag_fmp_ssot 의 _stub_eod 와 어긋나고, 그 TypeError 는 워커의 except
+#     에 삼켜져 전 항목이 조용히 "exception" 으로 집계된다(그 가드의 P2 사고 모양).
+#     main() 이 _AS_OF 전역을 채우는 것과 같은 모양이다.
+#   ⚠️ 기본값은 반드시 None 이다. 여기에 숫자를 적으면 판정 경로가 경고 없이
+#      깊어진다 — diag_fmp_ssot B4p(기본값)·B4q(판정 창 = 핀) 가 막는다.
 ENTRY_LAG_DAYS = 1            # 신호일 → 체결일 (금 종가 신호 → 월 종가 체결)
 HISTORY_BARS   = 1300         # 요구 **봉수**. 창 환산은 fmp_extras 가 한다.
 #   ⚠️ v2.9 개명: 옛 이름은 HISTORY_LIMIT 이었다. 단위는 처음부터 봉수였고
@@ -346,7 +363,19 @@ def _window_days_for(bars: int, warn=print) -> int:
     이 한 줄보다 훨씬 컸다.
 
     warn: 주입 가능 — 진단이 경고 발생 여부를 관찰하기 위함.
+
+    WINDOW_DAYS_OVERRIDE 가 있으면(참고 실행) 위 전부를 건너뛰고 그 값을 쓴다.
+    그때도 알림은 **1회** 찍는다 — 판정 실행과 로그로 구분돼야 하기 때문이다.
     """
+    if WINDOW_DAYS_OVERRIDE is not None:
+        days = int(WINDOW_DAYS_OVERRIDE)
+        with _WARN_LOCK:
+            if ("override", days) not in _WARNED_CEILING:
+                _WARNED_CEILING.add(("override", days))
+                warn(f"[INFO] 창 명시 지정 — {days}달력일 (WINDOW_DAYS_OVERRIDE · "
+                     f"참고 실행). 봉수 환산·HIST_MAX_DAYS·WINDOW_DAYS_PIN 을 "
+                     f"적용하지 않는다.")
+        return days
     days = fx.hist_days_for_bars(bars)
     # 두 상한 중 **작은 쪽**이 실제로 창을 정한다. 어느 쪽이 물었는지를 경고에
     # 밝히지 않으면, 전역 상한을 올려도 그대로인 창을 보고 "안 먹었다"고 오진한다.

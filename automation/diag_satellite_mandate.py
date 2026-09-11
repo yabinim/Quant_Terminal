@@ -30,6 +30,7 @@ md §6 은 스스로 이렇게 선언한다: *"정직하게 적는다. 문서에
   F   소비자 배선 — app.py · run_hidden_alpha.py 가 fmp_extras 판정 함수를
       실제로 호출하고, 러너 파일과 워크플로 스텝이 존재하는가
   G   app.py 가 md 문안을 복사하지 않았는가
+  J   §4① 깊은 창 참고 실행 사전 약정 ↔ 러너 상수 (임계·반등·룰·필터·기록 탭)
   H   양성 대조 — 알려진 불량 입력에서 각 검사가 실제로 실패하는가
 
 ⚠️ 로직을 복사하지 않는다. fmp_extras 의 실제 함수를 부른다.
@@ -544,6 +545,77 @@ chk("I17c §6 ② 를 ✅ 로 올리지 않았다 (층 2 미구축)",
     status_mark(_r2) == "✅", False)
 
 
+# ══ [J] §4① 깊은 창 참고 실행 — 사전 약정 ↔ 러너 상수 ═══════════════════
+# 사전 약정의 숫자가 문서에만 있으면, 결과를 본 뒤 러너 상수만 슬쩍 바꿔 다시
+# 돌려도 아무것도 울리지 않는다. 문서와 코드를 묶어 두면 한쪽만 바꾸는 순간
+# 이 가드가 빨간불이 되고, 둘 다 바꾸면 §7 에 행이 남는다.
+# 임포트하지 않는다 — 러너는 bt·rc 를 끌고 오고, 이 진단은 의존성 없이 돌아야 한다.
+DEEP = (_read("automation", "diag_momentum_deep_ref.py")
+        or _read("diag_momentum_deep_ref.py"))
+RCMP = (_read("automation", "diag_momentum_rule_compare.py")
+        or _read("diag_momentum_rule_compare.py"))
+WF_DEEP = (_read(".github", "workflows", "diag_momentum_deep_ref.yml")
+           or _read("diag_momentum_deep_ref.yml"))
+
+
+def _module_assign(src, name):
+    """모듈 최상위 `name = <식>` 의 식 노드. 없으면 None."""
+    if not src:
+        return None
+    for n in ast.parse(src).body:
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name
+                                             for t in n.targets):
+            return n.value
+    return None
+
+
+def _lit(src, name):
+    v = _module_assign(src, name)
+    try:
+        return ast.literal_eval(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+def _md_ticks(text, label):
+    m = re.search(r"\*\*" + label + r"\*\*([^\n]*)", text or "")
+    return tuple(re.findall(r"`([a-z0-9_]+)`", m.group(1))) if m else ()
+
+
+def md_deep_dd(text):
+    m = re.search(r"\*\*사건 임계\*\*[^\n]*?\*\*−(\d+(?:\.\d+)?)%\*\*", text or "")
+    return -float(m.group(1)) / 100.0 if m else None
+
+
+def md_deep_rebound(text):
+    m = re.search(r"\*\*반등 구간\*\*[^\n]*?\*\*(\d+)봉\*\*", text or "")
+    return int(m.group(1)) if m else None
+
+
+_deep_rules_expr = _module_assign(DEEP, "RULES")
+chk("J0 러너 파일 존재 (automation/diag_momentum_deep_ref.py)", DEEP is not None, True)
+chk("J1 §4① 사건 임계 = EPISODE_DD", md_deep_dd(MD), _lit(DEEP, "EPISODE_DD"))
+chk("J1b 사건 임계는 음수 (부호를 잃으면 상승이 사건이 된다)",
+    (_lit(DEEP, "EPISODE_DD") or 0) < 0, True)
+chk("J2 §4① 반등 구간 봉수 = REBOUND_BARS", md_deep_rebound(MD), _lit(DEEP, "REBOUND_BARS"))
+chk("J3 §4① 대상 룰 = 판정 파일 VERDICT_RULES (동결 튜플)",
+    _md_ticks(MD, "대상 룰"), _lit(RCMP, "VERDICT_RULES"))
+chk("J3b 러너 RULES 는 rc.VERDICT_RULES 를 그대로 가리킨다 (사본 금지)",
+    ast.unparse(_deep_rules_expr) if _deep_rules_expr is not None else None,
+    "rc.VERDICT_RULES")
+chk("J4 §4① 대상 필터 = FILTERS", _md_ticks(MD, "대상 필터"), _lit(DEEP, "FILTERS"))
+chk("J5 기록 탭이 판정 탭과 다르다 (Momentum_Rule_Deep)",
+    (_lit(DEEP, "_RESULT_WORKSHEET"), _lit(DEEP, "_RESULT_WORKSHEET") != _lit(RCMP, "_RESULT_WORKSHEET")),
+    ("Momentum_Rule_Deep", True))
+chk("J6 §4① 가 러너와 탭을 지목한다",
+    ("diag_momentum_deep_ref.py" in (MD or ""), "Momentum_Rule_Deep" in (MD or "")), (True, True))
+chk("J7 수동 워크플로가 러너를 실행한다 (자체검증 → 본 실행)",
+    (WF_DEEP is not None
+     and "diag_momentum_deep_ref.py --selftest" in WF_DEEP
+     and re.search(r"python automation/diag_momentum_deep_ref\.py\s*$", WF_DEEP, re.M) is not None),
+    True)
+
+
 # ══ [H] 양성 대조 — 알려진 불량 입력에서 실제로 실패하는가 ═══════════════
 # 초록불이 옳은 이유로 켜졌는지 확인하지 않으면 초록불은 정보가 아니다.
 def _would_fail(fn):
@@ -623,6 +695,21 @@ chk("H6 배수만 바꾼 봉수는 B2 를 통과하지 못한다",
         r"소요 이력\s*(\d+)\s*봉",
         MD.replace(f"소요 이력 {fx.SATELLITE_BARS}봉", "소요 이력 127봉", 1)
     ).group(1)) == fx.SATELLITE_BARS), True)
+
+# ── J 양성 대조 ─────────────────────────────────────────────────────────
+chk("H14 md 사건 임계만 −15% 로 바꾸면 J1 이 잡는다",
+    _would_fail(lambda: md_deep_dd(MD.replace("**−12%**", "**−15%**", 1))
+                == _lit(DEEP, "EPISODE_DD")), True)
+chk("H15 md 대상 룰에 위험조정 룰을 끼우면 J3 이 잡는다",
+    # ⚠️ 치환 앵커는 `mom12_1` 까지 포함해야 한다. "`mom12_0` (" 만 쓰면 §2 의
+    #    "A반 — `mom12_0` (12개월…" 에 먼저 걸려 §4① 은 그대로 남고, 이 대조가
+    #    아무것도 안 지키면서 초록불이 된다(작성 중 실측).
+    _would_fail(lambda: _md_ticks(MD.replace("`mom12_1` · `mom12_0` (",
+                                             "`mom12_1` · `mom12_0` · `mom12_0_ra` (", 1),
+                                  "대상 룰") == _lit(RCMP, "VERDICT_RULES")), True)
+chk("H16 러너 반등 봉수만 63 으로 바꾸면 J2 가 잡는다",
+    _would_fail(lambda: md_deep_rebound(MD) == _lit(
+        (DEEP or "").replace("REBOUND_BARS = 126", "REBOUND_BARS = 63", 1), "REBOUND_BARS")), True)
 
 
 print("=" * 74)
