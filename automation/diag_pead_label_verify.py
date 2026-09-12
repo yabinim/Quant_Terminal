@@ -57,6 +57,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -598,9 +600,9 @@ def main() -> int:
         print("[ABORT] 두 티어가 모두 필요하다(약정 §6 은 AND 결합).")
         return 1
 
-    spy_df = price_frame("SPY")
-    if spy_df.empty:
-        print("[ABORT] SPY 가격 수신 실패.")
+    spy_df, spy_kind = price_frame("SPY")
+    if spy_df.empty or spy_kind != "ok":
+        print(f"[ABORT] SPY 가격 수신 실패 (kind={spy_kind}, {len(spy_df)}봉).")
         return 1
     spy = spy_df["Close"]
     first = pd.Timestamp(spy.index[0]).date()
@@ -774,6 +776,103 @@ def _pass_rate(eff, code, reps=120, seed=99) -> float:
     return hit / reps
 
 
+# ── 오프라인 E2E 지지대 ────────────────────────────────────────────────────
+# 셀프테스트가 순수 함수만 때리고 main() 을 한 번도 돌리지 않아서, price_frame
+# 을 튜플 반환으로 바꿀 때 SPY 호출부 한 곳이 낡은 채 남았고 재실행이
+# AttributeError 로 죽었다(2026-09-11 2차 시도). 아래는 그 구멍을 막는다 —
+# 네트워크·시트 없이 main() 을 통째로 굴린다.
+
+class _FakeWS:
+    def __init__(self, title):
+        self.title, self.rows, self.row_count = title, [], 100
+
+    def get_all_values(self):
+        return [list(r) for r in self.rows]
+
+    def add_rows(self, n):
+        self.row_count += int(n)
+
+    def update(self, values, range_name=None, value_input_option=None):
+        self.rows.extend([list(v) for v in values])
+
+
+class _FakeSheet:
+    def __init__(self):
+        self._ws = []
+
+    def worksheets(self):
+        return list(self._ws)
+
+    def worksheet(self, title):
+        for w in self._ws:
+            if w.title == title:
+                return w
+        raise KeyError(title)
+
+    def add_worksheet(self, title=None, rows=None, cols=None):
+        w = _FakeWS(title)
+        self._ws.append(w)
+        return w
+
+
+def _fake_payloads(tk: str, seed: int) -> dict:
+    """FMP 응답 모양 그대로의 합성 페이로드."""
+    hist, rep, qe, _spy = _synth(seed=seed)
+    price = [{"date": d.strftime("%Y-%m-%d"), "open": float(r.Open),
+              "high": float(r.High), "low": float(r.Low), "close": float(r.Close),
+              "volume": float(r.Volume)} for d, r in zip(hist.index, hist.itertuples())]
+    earn = [{"date": d.strftime("%Y-%m-%d"), "epsActual": 1.0, "epsEstimated": 0.9}
+            for d, _row in rep]
+    qs = [{"date": pe.strftime("%Y-%m-%d"),
+           "filingDate": (pe + pd.Timedelta(days=35)).strftime("%Y-%m-%d")} for pe in qe]
+    return {"price": price, "earn": earn, "q": qs,
+            "profile": [{"symbol": tk, "isEtf": False, "isFund": False}]}
+
+
+def _run_main_offline(t1: list, t2: list, funds: tuple = (), bad_kind: dict = None):
+    """네트워크·시트 없이 main() 을 그대로 실행. (exit code, 로그, 시트)."""
+    bad_kind = bad_kind or {}
+    pay = {}
+    for i, tk in enumerate(list(t1) + list(t2) + ["SPY"]):
+        pay[tk] = _fake_payloads(tk, seed=100 + i)
+    for tk in funds:
+        pay[tk] = {"price": pay[tk]["price"], "earn": [], "q": [],
+                   "profile": [{"symbol": tk, "isEtf": True, "isFund": False}]}
+
+    def fake_json(path: str):
+        m = re.search(r"symbol=([A-Z0-9.\-]+)", path)
+        tk = m.group(1) if m else ""
+        k = bad_kind.get(tk)
+        if k:
+            return None, k
+        d = pay.get(tk)
+        if d is None:
+            return None, "http_error"
+        for pre, key in (("historical-price-eod", "price"), ("earnings", "earn"),
+                         ("income-statement", "q"), ("profile", "profile")):
+            if path.startswith(pre):
+                return d[key], "ok"
+        return None, "http_error"
+
+    sheet = _FakeSheet()
+    g = globals()
+    saved = (g["_json"], g["_open_sheet"], fh.fmp_key, V._universe, dict(_CACHE))
+    g["_json"] = fake_json
+    g["_open_sheet"] = lambda: sheet
+    fh.fmp_key = lambda: "test-key"
+    V._universe = lambda: {"Tier 1": list(t1), "Tier 2": list(t2)}
+    _CACHE.clear()
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = main()
+    finally:
+        g["_json"], g["_open_sheet"], fh.fmp_key, V._universe = saved[:4]
+        _CACHE.clear()
+        _CACHE.update(saved[4])
+    return code, buf.getvalue(), sheet
+
+
 def _rows_for(*, per_year=22, years_filled=10, val_ok=3.0, val_bad=-0.1,
               years_ok=10, u_per_year=40, u_val=0.0, spike=None,
               sd=0.01, seed=3):
@@ -937,6 +1036,38 @@ def _selftest() -> int:
     for name, kinds, bars, nr, nq, pk, isf, want in cases:
         got = classify_status(kinds, bars, nr, nq, pk, isf)
         chk(f"{name} → {want}", got == want, f"결과 {got}")
+
+    print("\n[T7] 오프라인 E2E — main() 전체를 네트워크·시트 없이 굴린다")
+    t1 = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+    t2 = ["GGG", "HHH", "III", "JJJ", "KKK", "LLL"]
+    def _try_main(*a, **kw):
+        """예외도 ❌ 로 보고한다 — 터뜨리고 끝내면 뒤 검사가 안 돈다."""
+        try:
+            return _run_main_offline(*a, **kw)
+        except Exception as e:
+            chk(f"main() 이 예외 없이 끝난다", False, f"{type(e).__name__}: {e}")
+            return None, "", _FakeSheet()
+
+    code, log, sheet = _try_main(t1 + ["ETFX"], t2, funds=("ETFX",))
+    chk("정상 경로 exit 0", code == 0, f"code={code}")
+    ws = [w for w in sheet.worksheets() if w.title == RESULT_WORKSHEET]
+    chk("결과 탭 생성 · 행 기록", bool(ws) and len(ws[0].rows) > 1,
+        f"{len(ws[0].rows) if ws else 0}행")
+    if ws:
+        body = ws[0].rows[1:]
+        jud = [r for r in body if r[1] == "judge"]
+        chk("판정 행 4개(티어 2 × 라벨 2)", len(jud) == 4, f"{len(jud)}행")
+        chk("메타 행에 펀드 제외가 기록된다",
+            any("ETFX" in str(r[-1]) for r in body))
+    chk("펀드가 실패로 세어지지 않는다",
+        "펀드 제외 1종목" in log and "조회 실패 0종목" in log)
+    chk("SPY 수신 경로가 살아 있다", "SPY 3024봉" in log or "SPY " in log)
+
+    code2, log2, sheet2 = _try_main(t1, t2, bad_kind={"BBB": "plan_limited"})
+    chk("조회 실패율 초과 시 exit 1", code2 == 1, f"code={code2}")
+    chk("중단 시 시트에 아무것도 쓰지 않는다",
+        not [w for w in sheet2.worksheets() if w.title == RESULT_WORKSHEET])
+    chk("중단 로그에 실패 종목이 전부 찍힌다", "BBB" in log2 and "[ABORT]" in log2)
 
     print("\n[T5] 회귀 — 결과 행 모양")
     per = {"judge": {"Tier 1": {c: judge_tier(b_rows, c) for c in TARGET_LABELS},
