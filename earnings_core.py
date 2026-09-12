@@ -84,10 +84,21 @@ GATE_LABELS = {
     "na":      "⚪ 판정 보류",
 }
 
+# PEAD 라벨 — **관찰 문구다. 예측이 아니다.**
+#   2026-09-11 사전 약정(PEAD_PRECOMMIT.md) 검증에서 두 라벨 모두 미달했다.
+#   미관찰 구간 2012~2021, D+1 진입 · D+60 청산 · −SPY 초과수익 기준으로
+#   같은 유니버스의 평균 실적 사건 대비:
+#     up_continue  +0.57%p (Tier 1) · +0.68%p (Tier 2)  ← 문턱 +1.5%p 미달
+#     down_break   +0.11%p (Tier 1) · +0.80%p (Tier 2)  ← 문턱 −1.0%p, 부호가 반대
+#   즉 "하락 이탈"로 찍혔던 사건들이 평균보다 오히려 더 올랐다.
+#   그래서 §7 대로 두 문구에서 예측 의미를 뺐다. 코드 값은 불변이다 —
+#   Earnings_Events.PEAD_Verdict 의 과거 행이 그대로 읽혀야 한다.
+#   ⚠️ 옛 문구("상승 지속 후보" · "하락 이탈 — 근거 훼손")로 되돌리지 말 것.
+#      되돌리려면 §8 대로 새 사전 약정을 먼저 써야 한다.
 PEAD_LABELS = {
-    "up_continue":   "🟢 상승 지속 후보",
+    "up_continue":   "🟢 강한 상승 반응",
     "up_faded":      "🟡 상승 갭 되돌림 — 관망",
-    "down_break":    "🔴 하락 이탈 — 근거 훼손",
+    "down_break":    "🔴 강한 하락 반응",
     "down_recovered": "🟡 하락 갭 회복 — 관망",
     "muted":         "⚪ 반응 미미",
     "na":            "⚪ 측정 불가",
@@ -1576,6 +1587,11 @@ def evaluate_pead(reaction: dict, move: dict = None, regime: str = "") -> dict:
     """발표 후 반응 판정. 행동을 지시하지 않고 '상태'만 돌려준다.
 
     반환: {code, label, reasons[], is_candidate, is_damage}
+
+    ⚠️ `is_candidate` · `is_damage` 는 **항상 False** 다. 2026-09-11 사전 약정
+       검증에서 두 라벨 모두 미달했고(PEAD_PRECOMMIT.md §11), §7 에 따라 더는
+       True 로 두지 않는다. 키는 호출부 호환을 위해 남긴다. 다시 True 로
+       만들려면 §8 대로 새 사전 약정이 먼저 있어야 한다.
     """
     out = {"code": "na", "label": PEAD_LABELS["na"], "reasons": [],
            "is_candidate": False, "is_damage": False}
@@ -1612,18 +1628,17 @@ def evaluate_pead(reaction: dict, move: dict = None, regime: str = "") -> dict:
 
     if gap > 0:
         if held is not False and vol_ok:
-            out.update({"code": "up_continue", "label": PEAD_LABELS["up_continue"],
-                        "is_candidate": True})
+            out.update({"code": "up_continue", "label": PEAD_LABELS["up_continue"]})
             if str(regime or "") == "weak":
-                out["reasons"] = reasons + ["단 레짐 약세 — 진입 근거로는 부족"]
-                out["is_candidate"] = False
+                # 옛 문구 "진입 근거로는 부족" 은 이 판정이 진입 근거였다는 전제를
+                # 깔고 있었다. 판정이 미달했으니 전제부터 없앤다 — 레짐은 사실만.
+                out["reasons"] = reasons + ["레짐 약세"]
                 return out
         else:
             out.update({"code": "up_faded", "label": PEAD_LABELS["up_faded"]})
     else:
         if held is not False and vol_ok:
-            out.update({"code": "down_break", "label": PEAD_LABELS["down_break"],
-                        "is_damage": True})
+            out.update({"code": "down_break", "label": PEAD_LABELS["down_break"]})
         else:
             out.update({"code": "down_recovered", "label": PEAD_LABELS["down_recovered"]})
     out["reasons"] = reasons
