@@ -150,6 +150,14 @@ MARKERS = {
     #   낡은 사본이면 seed 나 경계일이 달라져 **다른 표본**을 판정하게 된다.
     "diag_pead_issuance_probe.py": ["SEEN_FROM", "T2_SEED"],
     "diag_pead_date_validity.py": ["PE_LAG_MAX", "start_year"],
+    # ── C 트랙 순주식발행 Phase 0 (2026-09-12 · 약정 전 데이터 프로브) ───────
+    # 이 프로브는 diag_pead_issuance_probe 의 _get/_rows/_series/_load_universe 를
+    #   임포트한다. 유니버스 정의를 두 벌로 만들지 않으려는 것인데, 그래서 **둘이
+    #   락스텝이다** — 위 PEAD 프로브 사본이 낡으면 이쪽 표본도 달라진다.
+    # I_LAG_MAX_DAYS: 시총 경로의 탈락 문턱(120일). 이 상수가 없는 사본은 경로
+    #   판정 규칙이 다른 버전이다.
+    # decide_path: [I-PATH] 결정 규칙 본체. 셀프테스트 T8 진리표가 이 함수를 건다.
+    "diag_issuance_probe.py": ["I_LAG_MAX_DAYS", "decide_path"],
 }
 
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)
