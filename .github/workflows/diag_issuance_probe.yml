@@ -1,0 +1,93 @@
+name: 🔬 진단 — C트랙 순주식발행 Phase 0 데이터 프로브 (수동 전용)
+
+# 언제 쓰나:
+#   순주식발행(자사주 매입 · 희석)을 **개별 종목 플래그**로 만들 수 있는지를
+#   사전 약정 전에 데이터 쪽에서만 확인한다. 가설 검증이 아니다.
+#
+#   경로 M  시총 ÷ 종가 = 역산 주식 수 (일간 · 래그를 실측해야 함)
+#   경로 S  income-statement 주식 수 + filingDate (분기 · 지연이 구조적으로 해결)
+#
+#   기존 diag_pead_issuance_probe 의 B 섹션은 종목 3개만 봤다. 여기서는 유니버스
+#   표본에서 커버리지 · 래그 · 잡음 · 아티팩트 · 분산을 재고 **경로를 고른다.**
+#
+# 판독 기준은 스크립트 docstring 에 **실행 전** 기록돼 있다(요약 블록의 7줄).
+#
+# 안전성:
+#   · 수익률 계산 0 · 라벨 산출 0 — 사전 약정 전 오염 방지
+#     종가는 시총의 **분모**로만 쓴다. 두 날짜의 종가 비율은 계산하지 않는다
+#   · 시트 **쓰기 0** · 읽기는 Watchlist/Portfolios/Earnings_Universe 티커 목록뿐
+#   · 이메일 없음 · 알림 상태 머신 미접촉
+#   · 표본 종목당 최대 5콜. fmp_http 경유 — 레이트리밋 적용
+#
+# ⚠️ repository_dispatch / schedule 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      s1_sample:
+        description: "Tier 1(보유·워치)에서 뽑을 표본 수 — 0 이면 생략"
+        required: false
+        default: "20"
+      s2_sample:
+        description: "Tier 2(Earnings_Universe − Tier 1)에서 뽑을 표본 수 — 0 이면 생략"
+        required: false
+        default: "20"
+      tickers:
+        description: "(선택) Tier 1 을 시트 대신 이 목록으로 — 쉼표 구분. 비우면 시트 사용"
+        required: false
+        default: ""
+      selftest:
+        description: "1 이면 합성 셀프테스트만 실행 — FMP 콜 0"
+        required: false
+        default: "0"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 📥 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 의존성
+        run: |
+          pip install --upgrade pip
+          pip install requests numpy pandas pytz gspread google-auth
+
+      # ── 임포트 스모크 (콜 0) ──────────────────────────────────────────
+      # 문법 검사(py_compile · check_py311)는 모듈 최상단 실행 오류를 못 잡는다
+      # (2026-08-22 diag_fmp_newcaps NameError 교훈). 여기서 실제로 임포트한다.
+      # 이 프로브는 diag_pead_issuance_probe 를 임포트하므로, 그쪽이 깨져 있으면
+      # 여기서 먼저 시끄럽게 죽는다 — 락스텝의 관문이다.
+      - name: 🧪 임포트 스모크 (콜 0)
+        run: |
+          python -c "import sys; sys.path.insert(0,'automation'); import diag_issuance_probe; print('import OK')"
+
+      # ── 셀프테스트는 늘 돈다 (콜 0) ───────────────────────────────────
+      # 게이트가 죽어 있으면 프로브가 초록불로 거짓 통과를 만든다. 합성 세계에서
+      # 각 게이트가 실제로 뒤집히는지 먼저 확인하고 본 실행으로 넘어간다.
+      - name: 🧬 셀프테스트 12항목 (콜 0)
+        env:
+          SELFTEST: "1"
+        run: python automation/diag_issuance_probe.py
+
+      - name: 🔬 순주식발행 데이터 프로브 (읽기 전용)
+        if: ${{ inputs.selftest != '1' }}
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSPREAD_KEY: ${{ secrets.GSPREAD_KEY }}
+          S1_SAMPLE: ${{ inputs.s1_sample }}
+          S2_SAMPLE: ${{ inputs.s2_sample }}
+          TICKERS: ${{ inputs.tickers }}
+        run: python automation/diag_issuance_probe.py
+
+      - name: ✅ Python 3.11 문법 호환성
+        run: >
+          python check_py311.py
+          automation/diag_issuance_probe.py
