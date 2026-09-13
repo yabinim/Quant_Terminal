@@ -1,20 +1,25 @@
 name: 🔬 진단 — Track C 크레딧 게이트 Phase 0 데이터 프로브 (수동 전용)
 
 # 언제 쓰나:
-#   SATELLITE_MANDATE §3 시장 필터(SPY < 자기 200일선)에 크레딧 스프레드
-#   (FRED BAMLH0A0HYM2, ICE BofA US High Yield OAS)를 OR 축으로 추가하는 것이
-#   애초에 의미가 있는지 — 신용시장이 주가보다 먼저 무너지는지를 결합 문턱을
-#   정하기 전에 데이터로만 확인한다. 가설 검증이 아니라 이 후보가 Phase 1
-#   사전 약정으로 넘어갈 자격이 있는지를 잰다.
+#   SATELLITE_MANDATE §3 시장 필터(SPY < 자기 200일선)에 크레딧 신호를 OR 축으로
+#   추가하는 것이 애초에 의미가 있는지 — 신용시장이 주가보다 먼저 무너지는지를
+#   결합 문턱을 정하기 전에 데이터로만 확인한다. 가설 검증이 아니라 이 후보가
+#   Phase 1 사전 약정으로 넘어갈 자격이 있는지를 잰다.
 #
 #   판독 기준([C-COVER]·[C-LEAD]·[C-NOISE]·[C-LAG-DATA]·[C-DECIDE])은 스크립트
 #   docstring 에 **실행 전** 기록돼 있다.
 #
+# ⚠️ 데이터 소스 (2026-09-13 교체): 크레딧신호 = FMP HYG/LQD 종가 비율.
+#   1차 실행은 FRED BAMLH0A0HYM2 를 썼으나, FRED 가 2026-04 부터 이 시리즈를
+#   롤링 3년으로 제한해 6개 사건 중 1개만 커버됐다(경제적 결과가 아니라 데이터
+#   단절). 사건 정의·게이트·문턱은 그대로, 벤더만 FMP 로 교체 — **FRED 의존
+#   제거**. fredapi·FRED_API_KEY 더 이상 불필요.
+#
 # 안전성:
-#   · 수익률 계산 0 — SPY·OAS 모두 이동평균 "교차 날짜"만 비교한다
+#   · 수익률 계산 0 — SPY·크레딧신호 모두 이동평균 "교차 날짜"만 비교한다
 #   · 시트 읽기/쓰기 0 — 콘솔 출력뿐, 유니버스 조회도 하지 않는다
 #   · 이메일 없음 · 신규 매수·매도·알림 상태 머신 미접촉
-#   · SPY(FMP 1콜) + OAS(FRED 1콜) = 총 2콜. fmp_http 경유 — A1 래칫 기준선 불변
+#   · SPY + HYG + LQD (FMP 3콜). fmp_http 경유 — A1 래칫 기준선 불변
 #
 # ⚠️ repository_dispatch / schedule 없음 — 일회성 프로브가 매일 콜을 태우면 안 된다.
 
@@ -43,7 +48,7 @@ jobs:
       - name: 📦 의존성
         run: |
           pip install --upgrade pip
-          pip install requests numpy pandas pytz fredapi
+          pip install requests numpy pandas pytz
 
       # ── 임포트 스모크 (콜 0) ──────────────────────────────────────────
       # 이 프로브는 diag_momentum_deep_ref 를 임포트한다(find_episodes 재사용,
@@ -65,7 +70,6 @@ jobs:
         if: ${{ inputs.selftest != '1' }}
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python automation/diag_credit_gate_probe.py
 
       - name: ✅ Python 3.11 문법 호환성
