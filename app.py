@@ -21388,6 +21388,99 @@ if st.session_state.get("logged_in"):
                         else:
                             st.caption("재무 건전성 데이터를 조회할 수 없습니다.")
 
+                    # ── 지난 12개월 주식 수 변화 (사실 표시 · 신호 아님) ──────────
+                    #
+                    # ⚠️ 이 블록에 수익률 주장을 붙이지 말 것 — 색·배지·점수 전부.
+                    #    순주식발행(net share issuance) 트랙은 2026-09-12
+                    #    `ISSUANCE_PRECOMMIT.md` §9 에서 **판정 실행 없이 종료**됐다:
+                    #    이 유니버스·이 구간의 MDE 가 연 9.7%p 인데 문헌의 현실적
+                    #    잔존 효과는 연 2.5~3.4%p 라, 효과가 존재해도 이 장치로는
+                    #    구분되지 않는다. 같은 문서 §7 이 허용한 것은 "P/E 처럼 사실
+                    #    그대로 보여주는 표시" 하나뿐이고 조건이 셋이다:
+                    #      ① 어떤 수익률 주장도 붙이지 않는다
+                    #      ② 화면에 "미검증 — 수익률 검증 없음"을 명시한다
+                    #      ③ 점수·신호·배지·알림에 연동하지 않는다
+                    #    자사주 매입을 초록, 희석을 빨강으로 칠하는 것도 ① 위반이다 —
+                    #    색이 곧 수익률 주장이다. 그래서 중립 회색(#64748b) 고정이다.
+                    #    PEAD 에서 실패한 것은 신호가 아니라 **예측을 주장하는 배지**
+                    #    였다(2026-09-11 판정, 네 칸 전부 미달). 이 수치를 점수화하거나
+                    #    Fundamentals Score·스캐너·워치리스트로 끌고 가려면 새 사전약정이
+                    #    먼저다. 그 전에 하는 연동은 §7 위반이다.
+                    #
+                    #    데이터 경로는 사전약정 §2 와 동일: income-statement(quarter) 의
+                    #    **basic** weightedAverageShsOut. diluted 는 옵션 회계 가정이
+                    #    섞이므로 쓰지 않는다. 이 필드는 분할 조정이 끝난 값이라
+                    #    (Phase 0 I-ARTIF 0.74%) 별도 보정이 없다.
+                    #    ETF 분기에는 이 블록이 구조적으로 닿지 않는다(else: 안이다) —
+                    #    ETF 의 주식 수 변동은 설정/환매 flow 이지 희석이 아니다(§1).
+                    with st.expander("🔢 지난 12개월 주식 수 변화", expanded=False):
+                        st.caption(
+                            "**미검증 — 수익률 검증 없음.** 사실 표시이며 매수·매도 신호가 아닙니다. "
+                            "FMP `income-statement`(quarter) 의 분기 가중평균 주식 수(basic) 기준."
+                        )
+                        try:
+                            with _timed("정밀 주식수"):
+                                _shs_rows = _fmp_income_series(
+                                    str(selected_ticker).strip().upper(),
+                                    period="quarter",
+                                    limit=5,
+                                )
+                            _shs_pairs = []
+                            for _sr in (_shs_rows or []):
+                                if not isinstance(_sr, dict):
+                                    continue
+                                _sv = to_float(_sr.get("weightedAverageShsOut"))
+                                _sd = str(_sr.get("date") or "")[:10]
+                                if _sd and pd.notna(_sv) and _sv > 0:
+                                    _shs_pairs.append((_sd, float(_sv)))
+                            # 최신 우선 정렬을 응답 순서에 맡기지 않는다 — FMP 정렬 가정 금지.
+                            _shs_pairs.sort(key=lambda _p: _p[0], reverse=True)
+
+                            if len(_shs_pairs) < 5:
+                                st.caption(
+                                    f"데이터 부족 — 비교에 5개 분기가 필요한데 "
+                                    f"{len(_shs_pairs)}개만 확보됐습니다. 숫자를 만들지 않습니다."
+                                )
+                            else:
+                                _d_now, _s_now = _shs_pairs[0]
+                                _d_ago, _s_ago = _shs_pairs[4]
+                                _shs_chg = (_s_now / _s_ago - 1.0) * 100.0
+                                st.markdown(
+                                    f"<div style='background:#1e293b;border-radius:10px;padding:14px;"
+                                    f"border-left:4px solid #64748b;'>"
+                                    f"<div style='color:#94a3b8;font-size:12px;'>지난 12개월 주식 수</div>"
+                                    f"<div style='color:#cbd5e1;font-size:26px;font-weight:900;'>"
+                                    f"{_shs_chg:+.2f}%</div>"
+                                    f"<div style='color:#e2e8f0;font-size:13px;margin-top:4px;'>"
+                                    f"{_d_ago} {_s_ago:,.0f}주 → {_d_now} {_s_now:,.0f}주</div>"
+                                    f"<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
+                                    f"분기 가중평균 주식 수(basic) · 분할 조정 반영본</div>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                                # 분기 보고 누락 시 index 4 가 12개월이 아닐 수 있다.
+                                # 기준일을 위에 표시하되, 간격이 벗어나면 라벨을 신뢰하지
+                                # 말라고 명시한다("12개월"이 사실이 아니게 되는 유일한 경로).
+                                try:
+                                    _shs_gap = int(
+                                        (pd.to_datetime(_d_now) - pd.to_datetime(_d_ago)).days
+                                    )
+                                except Exception:
+                                    _shs_gap = 0
+                                if _shs_gap and not (300 <= _shs_gap <= 430):
+                                    st.caption(
+                                        f"⚠️ 두 기준 분기의 간격이 {_shs_gap}일입니다 — "
+                                        "분기 보고 누락으로 실제 구간이 12개월이 아닙니다. "
+                                        "위 기준일을 보고 판단하세요."
+                                    )
+                                if abs(_shs_chg) > 100.0:
+                                    st.caption(
+                                        "12개월 만에 주식 수가 100% 넘게 변했습니다 — "
+                                        "합병·대규모 발행 가능성. (판정이 아니라 주석입니다.)"
+                                    )
+                        except Exception:
+                            st.caption("주식 수 데이터를 조회할 수 없습니다.")
+
                     with st.expander("원본 KPI 테이블 보기"):
                         st.dataframe(
                             kpi_df[["Category", "KPI", "Value", "Rule", "Pass"]],

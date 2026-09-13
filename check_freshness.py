@@ -24,9 +24,14 @@ ROOT = sys.argv[1] if len(sys.argv) > 1 else "/mnt/project"
 MARKERS = {
     # cached_satellite_drawdown: 2026-09-07 위성 슬리브 낙폭(md §4③) 표시.
     #   이 마커가 없는데 fmp_extras 만 올리면 앱 위성 블록이 NameError 로 죽는다.
+    # 지난 12개월 주식 수 변화: 2026-09-13 ISSUANCE_PRECOMMIT §7 허용 표시.
+    #   순발행 트랙은 §9 에서 종료됐고, 살아남은 것은 이 사실 표시 하나뿐이다.
+    #   어떤 점수·신호·알림에도 연동되지 않으므로 **사라져도 아무것도 깨지지 않는다**
+    #   — 조용한 유실이라 지문에서만 잡힌다. 되살릴 때 색·배지·점수를 붙이지 말 것
+    #   (§7 ① 수익률 주장 금지). 붙이려면 새 사전약정이 먼저다.
     "app.py": ["_SSOT_NEEDS", "load_earnings_universe", "TIMING_LABELS_INFERRED",
                "_open_quant_db", "update_watchlist_row", "시장 이벤트 지형",
-               "cached_satellite_drawdown"],
+               "cached_satellite_drawdown", "지난 12개월 주식 수 변화"],
     # est_archive_row: 2026-09-05 EPS 추정치 분기 아카이브. 이 마커가 없는데
     #   run_earnings_watch 만 올리면, 분기 전환 종목마다
     #   "[WARN] {tk} 추정치 아카이브 실패" 만 찍히고 **그 분기 시계열이 영구히
