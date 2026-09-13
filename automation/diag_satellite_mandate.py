@@ -34,6 +34,8 @@ md §6 은 스스로 이렇게 선언한다: *"정직하게 적는다. 문서에
       §2 약점 각주의 '바꾸지 않는다' 유지
   K   §4① β중립 12-0 참고 실행 사전 약정 ↔ 러너 상수 (룰쌍·기준일·R0·C1~C3·탭·1회),
       §2 각주의 β중립 종료 기록·종료 범위·'재시험 금지' 유지 (K12)
+  L   §3 크레딧 게이트 보강 시도 종료 기록 ↔ 프로브 상수 (문턱·사건 정의 SSOT),
+      각주 위치(§3 안)·종료 범위·'재시험 금지' 유지, §3 필터 본문 불변
   H   양성 대조 — 알려진 불량 입력에서 각 검사가 실제로 실패하는가
 
 ⚠️ 로직을 복사하지 않는다. fmp_extras 의 실제 함수를 부른다.
@@ -726,6 +728,80 @@ chk("K12 §2 각주가 β중립 종료 기록·종료 범위·'재시험 금지'
     md_beta_note_ok(MD), True)
 
 
+# ══ [L] §3 크레딧 게이트 보강 시도 — 종료 기록 ↔ 프로브 상수 ═════════════
+# 2026-09-13 종료. K12 와 같은 이유로 가드를 건다 — 2022 의 +59일 리드 하나가
+# 눈에 띄는 숫자라, 나중에 종료 범위 문장만 지우고 "벤더가 달라졌으니 다른 질문"
+# 으로 같은 시험을 다시 열기 쉽다. 벤더는 이미 두 번(FRED → FMP) 바꿨다.
+# ⚠️ 이 각주에는 §2 각주와 같은 문구를 쓰지 않는다. H18 의 치환 앵커
+#    ("이 종료의 재시험으로 본다")가 §2 에만 있어야 그 대조가 엉뚱한 곳을
+#    시험하지 않는다 — 그래서 L 의 종료 범위 앵커는 "세 번째 벤더도" 로 따로 둔다.
+CG = (_read("automation", "diag_credit_gate_probe.py")
+      or _read("diag_credit_gate_probe.py"))
+
+chk("L0 프로브 소스 존재 — 없으면 아래 L 검사는 의미가 없다", CG is not None, True)
+
+_L_HEAD = "**보강 시도 1 — 크레딧 게이트"
+_L_KEEP = ("조기경보 없음 → 종료", "필터는 그대로 남는다",
+           "세 번째 벤더도 다른 트리거 정의도", "재시험 금지")
+
+
+def md_credit_note_ok(text):
+    """각주가 §3 안(§3 헤더 뒤 · §4 앞)에서 종료·범위·재시험금지를 유지하는가."""
+    t = text or ""
+    a = t.find("### 3.")
+    i = t.find(_L_HEAD)
+    j = t.find("### 4.", a if a >= 0 else 0)
+    return 0 <= a < i < j and all(k in t[i:j] for k in _L_KEEP)
+
+
+chk("L1 §3 각주가 종료 기록·종료 범위·'재시험 금지'를 §3 안에서 유지한다",
+    md_credit_note_ok(MD), True)
+
+_L_MD_FRAC = re.search(r"`C_LEAD_PASS_FRAC = (\d+(?:\.\d+)?)`", MD or "")
+
+
+def credit_frac_ok(src):
+    """각주가 적은 문턱과 프로브 상수가 같은가 — 한쪽만 고치면 여기서 걸린다."""
+    if _L_MD_FRAC is None:
+        return False
+    return float(_L_MD_FRAC.group(1)) == _lit(src, "C_LEAD_PASS_FRAC")
+
+
+chk("L2 §3 각주의 문턱 = 프로브 C_LEAD_PASS_FRAC", credit_frac_ok(CG), True)
+
+def _credit_note_seg(text):
+    """§3 각주 본문만 잘라낸다. md 전체를 보면 §7 개정 이력 행이 같은 이름을
+    담고 있어 각주에서 지워도 검사가 통과한다(실측 — 뮤테이션 M5 생존)."""
+    t = text or ""
+    i = t.find(_L_HEAD)
+    j = t.find("### 4.", i if i >= 0 else 0)
+    return t[i:j] if 0 <= i < j else ""
+
+
+chk("L3 §3 각주 본문이 프로브 파일과 데이터 경로를 지목한다",
+    ("diag_credit_gate_probe.py" in _credit_note_seg(MD),
+     "HYG/LQD" in _credit_note_seg(MD)),
+    (True, True))
+
+chk("L4 §3 필터 본문이 그대로다 — 보강에 실패한 것이지 축이 바뀐 게 아니다",
+    "**SPY 가 200일선 아래면 → 신규 매수 중단 · 비중 축소.**" in (MD or ""), True)
+
+
+def credit_episode_ssot_ok(src):
+    """프로브가 사건 정의를 재구현하지 않았는가.
+
+    자체 리터럴 `EPISODE_DD = -0.12` 로 바뀌면 dmr 이 임계를 고쳐도 따라오지
+    않아 사건 정의가 두 갈래로 갈린다 — §4① · J 그룹과 어긋난다.
+    """
+    t = src or ""
+    return ("dmr.find_episodes(" in t and "dmr.EPISODE_DD" in t
+            and _lit(src, "EPISODE_DD") is None)
+
+
+chk("L5 프로브가 사건 정의를 dmr 에서 받아 쓴다(자체 리터럴 아님)",
+    credit_episode_ssot_ok(CG), True)
+
+
 # ══ [H] 양성 대조 — 알려진 불량 입력에서 실제로 실패하는가 ═══════════════
 # 초록불이 옳은 이유로 켜졌는지 확인하지 않으면 초록불은 정보가 아니다.
 def _would_fail(fn):
@@ -854,6 +930,38 @@ def _move_beta_note(text, to):
 chk("H19 β중립 종료 각주를 §3 뒤나 약점 각주 앞으로 옮긴 md 는 K12 를 통과하지 못한다",
     (_would_fail(lambda: md_beta_note_ok(_move_beta_note(MD, "### 4."))),
      _would_fail(lambda: md_beta_note_ok(_move_beta_note(MD, "### 2.")))), (True, True))
+
+
+# ── L 양성 대조 ─────────────────────────────────────────────────────────
+# ⚠️ 치환 앵커는 §3 각주에만 있는 문구를 쓴다. "재시험 금지" 는 §2 각주와
+#    §4① 결과 줄에도 있어 앵커로 쓰면 엉뚱한 곳이 먼저 지워진다(H18 과 같은 함정).
+chk("H20 종료 범위 문장만 지운 md 는 L1 을 통과하지 못한다",
+    _would_fail(lambda: md_credit_note_ok(
+        MD.replace("세 번째 벤더도 다른 트리거 정의도", "", 1))), True)
+
+
+def _move_credit_note(text, to):
+    """각주를 떼어 `to` 헤더 바로 앞에 붙인다 — 내용은 그대로, 위치만 바뀐다."""
+    i = text.find(_L_HEAD)
+    j = text.find("### 4.", i)
+    if i < 0 or j < 0:
+        return text
+    note = text[i:j]
+    rest = text[:i] + text[j:]
+    k = rest.find(to)
+    return rest[:k] + note + rest[k:] if k >= 0 else rest + note
+
+
+# 두 방향 모두 본다 — §4 뒤로 내리는 것과 §3 헤더보다 위로 올리는 것.
+# 한쪽만 보면 위치 조건의 절반이 뮤테이션 검증 없이 남는다.
+chk("H21 각주를 §4 뒤나 §3 앞으로 옮긴 md 는 L1 을 통과하지 못한다",
+    (_would_fail(lambda: md_credit_note_ok(_move_credit_note(MD, "### 5."))),
+     _would_fail(lambda: md_credit_note_ok(_move_credit_note(MD, "### 3.")))),
+    (True, True))
+
+chk("H22 문턱을 바꾼 프로브는 L2 를 통과하지 못한다",
+    _would_fail(lambda: credit_frac_ok((CG or "").replace(
+        "C_LEAD_PASS_FRAC = 0.5", "C_LEAD_PASS_FRAC = 0.2", 1))), True)
 
 
 print("=" * 74)
