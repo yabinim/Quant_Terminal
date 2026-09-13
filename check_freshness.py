@@ -158,6 +158,14 @@ MARKERS = {
     #   판정 규칙이 다른 버전이다.
     # decide_path: [I-PATH] 결정 규칙 본체. 셀프테스트 T8 진리표가 이 함수를 건다.
     "diag_issuance_probe.py": ["I_LAG_MAX_DAYS", "decide_path"],
+    # ── Track C 크레딧 게이트 Phase 0 (2026-09-13 · 약정 전 데이터 프로브) ───
+    # 이 프로브는 diag_momentum_deep_ref.find_episodes 를 그대로 임포트한다
+    #   (사건 정의 재구현 금지) — 그쪽 사본이 낡으면 이쪽 사건 목록도 달라진다.
+    # C_LEAD_PASS_FRAC: [C-LEAD] 판정 문턱(과반). 이 상수가 없는 사본은 판정
+    #   규칙이 다른 버전이다.
+    # _confirmed_run_starts: pandas bool-shift 함정 회귀 가드가 걸려 있는 함수
+    #   본체 — 이름이 없으면 그 회귀 수정 이전 사본이다.
+    "diag_credit_gate_probe.py": ["C_LEAD_PASS_FRAC", "_confirmed_run_starts"],
 }
 
 # app.py 가 `별칭.심볼` 로 참조하는 공용 모듈 (import 별칭은 자동 추출)
