@@ -323,7 +323,12 @@ _THESIS_WORKSHEET_TITLE = "Thesis"
 _WATCHLIST_SHEET_TITLE = "Watchlist"
 _PORTFOLIO_ALERT_STATE_TITLE = "Portfolio_Alert_State"
 # 보유 종목 상태 기반 알림: 키 = "user_id|account|ticker"
-_PORTFOLIO_ALERT_STATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At", "Stop_Loss", "Target_Price"]
+# ⚠️ 이 상수는 run_watchlist_alerts._PFSTATE_COLS 와 **같은 폭**이어야 한다.
+#    (2026-09-14) 이전에는 6칸이었는데 실제로는 G열(Swing_Weight_Pct)까지 쓰고
+#    있었다 — 헤더 동기화가 A1:F1 만 갱신해 G1 이 이름 없이 남았다. H열
+#    Trim_Base_Qty 를 추가하면서 자동화 쪽 정의에 맞춰 8칸으로 정정한다.
+_PORTFOLIO_ALERT_STATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At",
+                               "Stop_Loss", "Target_Price", "Swing_Weight_Pct", "Trim_Base_Qty"]
 
 # ── 계좌 프로필 (포지션 사이징 파라미터) — 계좌별 SSOT ────────────────
 # 계좌 프로필 스키마·기본값·라벨은 accounts_core(SSOT)에 위임 — 자동화와 단일 정의 공유
@@ -1278,6 +1283,48 @@ def open_portfolio_alert_state_worksheet():
         return None, f"Portfolio_Alert_State 워크시트 열기/생성 실패: {exc}"
 
 
+def save_portfolio_trim_base_setting(user_id: str, account: str, ticker: str,
+                                     base_qty) -> tuple[bool, str]:
+    """보유 종목의 트랜치 기준 수량(H열)만 upsert. 나머지 열은 보존.
+
+    축소 권장량을 '남은 수량의 33%'가 아니라 '이 기준의 33%'로 계산하게 만드는
+    값이다. 잔여 기준으로 계산하면 0.67^n 으로 수렴할 뿐 3회에 소진되지 않는다.
+
+    ⚠️ 매수 시점에만 호출한다. 렌더 경로에서 부르면 rerun 마다 시트 쓰기가
+       발생한다. 수량을 [데이터 수정하기]로 직접 고친 경우는 자동화 일일 실행이
+       rc.trim_base_sync 로 자가 치유한다.
+    """
+    ws, err = open_portfolio_alert_state_worksheet()
+    if ws is None:
+        return False, err or "시트 열기 실패"
+    key = _pf_alert_key(user_id, account, ticker)
+    try:
+        f = float(base_qty)
+        cell = f if (f == f and f > 0) else ""
+    except (TypeError, ValueError):
+        cell = ""
+    if cell == "":
+        return False, "기준 수량이 유효하지 않습니다."
+    try:
+        vals = ws.get_all_values() or []
+        row_idx = None
+        for i, r in enumerate(vals[1:], start=2):
+            if r and str(r[0]).strip() == key:
+                row_idx = i
+                break
+        now_str = _narrative_now_et_string()
+        if row_idx:
+            ws.update([[cell]], range_name=f"H{row_idx}", value_input_option="RAW")
+            ws.update([[now_str]], range_name=f"D{row_idx}", value_input_option="RAW")
+        else:
+            _safe_append_rows(ws, [key, "", "", now_str, "", "", "", cell],
+                              value_input_option="RAW")
+        load_portfolio_alert_states.clear()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _pf_alert_key(user_id: str, account: str, ticker: str) -> str:
     return f"{str(user_id).strip()}|{str(account).strip()}|{str(ticker).strip().upper()}"
 
@@ -1294,11 +1341,13 @@ def load_portfolio_alert_states() -> dict:
         return {}
     out = {}
     for r in vals[1:]:
-        r = (list(r) + [""] * 7)[:7]
+        r = (list(r) + [""] * 8)[:8]
         key = str(r[0]).strip()
         if key:
             _sl = to_float(r[4])
             _tp = to_float(r[5])
+            # H열 = 트랜치 기준 수량. 빈칸이면 None → 현재 수량이 기준이 된다.
+            _tb = to_float(r[7])
             # G열 = 종목별 스윙 비중 오버라이드. 빈칸이면 None(계좌 기본 상속).
             # 0 은 유효한 명시값('포지션 100%')이므로 None 과 반드시 구분한다.
             _sw = to_float(r[6])
@@ -1310,6 +1359,8 @@ def load_portfolio_alert_states() -> dict:
                 "swing_weight": (float(_sw)
                                  if (pd.notna(_sw) and 0 <= float(_sw) <= 100)
                                  else None),
+                "trim_base": (float(_tb)
+                              if (pd.notna(_tb) and float(_tb) > 0) else None),
             }
     return out
 
@@ -1404,7 +1455,7 @@ def save_portfolio_swing_weight_setting(user_id: str, account: str, ticker: str,
             ws.update([[cell]], range_name=f"G{row_idx}", value_input_option="RAW")
             ws.update([[now_str]], range_name=f"D{row_idx}", value_input_option="RAW")
         else:
-            _safe_append_rows(ws, [key, "", "", now_str, "", "", cell],
+            _safe_append_rows(ws, [key, "", "", now_str, "", "", cell, ""],
                               value_input_option="RAW")
         load_portfolio_alert_states.clear()
         return True, ""
@@ -1666,6 +1717,78 @@ def get_thesis_options_from_narratives(user_id: str) -> list[dict]:
             "narrative_date": date_str,
         })
     return options
+
+
+_THESIS_SEPARATOR = "─────  이하 전체 카테고리  ─────"
+
+
+def get_thesis_choices(user_id: str) -> tuple[list, list]:
+    """Thesis 선택지 SSOT — (표시 라벨 목록, 매칭용 옵션 목록).
+
+    최근 14일 내러티브에서 뽑은 빈도순 테마가 위에 오고, 구분선 아래에
+    _THEME_KEYWORD_MAP 의 **전체 카테고리**가 붙는다.
+
+    ⚠️ 왜 전체를 붙이나 (2026-09-14)
+       빈도 목록은 '최근 2주 내러티브에 등장한 것'만 담는다. 그래서 분류표에는
+       엄연히 있는 '🏦 금융' 같은 카테고리가, 2주간 금융 내러티브가 없었다는
+       이유만으로 선택지에서 통째로 사라졌다. JKHY 를 사고도 고를 것이 없어
+       'Thesis 없음'으로 등록되는 상황이 실제로 발생했다.
+       자동 연결(find_thesis_for_ticker)은 내러티브가 그 티커를 추천한 적이
+       있어야 동작한다 — 섹터를 보고 추론하지 않으므로 이 구멍을 메우지 못한다.
+       분류 체계에 존재하는 항목은 항상 고를 수 있어야 한다.
+
+    구분선은 선택 가능한 문자열이라 호출부에서 _THESIS_SEPARATOR 를 '없음'과
+    동일하게 처리해야 한다(_link_thesis_on_buy 가 그렇게 한다).
+    """
+    try:
+        recent = get_thesis_options_from_narratives(user_id)
+    except Exception:
+        recent = []
+    seen = {str(o.get("thesis_title", "")) for o in recent}
+    rest = []
+    for _kw, label in _THEME_KEYWORD_MAP:
+        if label in seen:
+            continue
+        seen.add(label)
+        rest.append({"label": label, "thesis_title": label,
+                     "narrative_category": label, "narrative_date": ""})
+    labels = [o["label"] for o in recent]
+    if rest:
+        labels = labels + [_THESIS_SEPARATOR] + [o["label"] for o in rest]
+    return labels, (recent + rest)
+
+
+def _link_thesis_on_buy(user_id: str, ticker: str, account: str,
+                        selected_label: str, none_label: str,
+                        core_label: str, options: list) -> str:
+    """매수 등록 시 Thesis 연결 — 신규/추가 매수가 같은 경로를 쓴다.
+
+    ⚠️ (2026-09-14) 이전에는 이 로직이 '신규 매수' 분기 안에만 있었다. 기존
+       보유 종목에 추가 매수하면 폼에서 Thesis 를 골라도 저장 블록에 도달하지
+       못해 **조용히 버려졌다**. 함수로 빼서 양쪽이 같은 코드를 부르게 한다.
+    """
+    try:
+        if selected_label == core_label:
+            # 코어/정기적립(인덱스 DCA) — thesis 가 아닌 별도 버킷
+            save_thesis_row(user_id, ticker, account, "코어/정기적립 (DCA)", "core_dca", "")
+            return " · 📈 코어/정기적립으로 기록"
+        if selected_label not in (none_label, _THESIS_SEPARATOR):
+            matched = next((o for o in options if o["label"] == selected_label), None)
+            if matched:
+                save_thesis_row(user_id, ticker, account, matched["thesis_title"],
+                                matched["narrative_category"], matched["narrative_date"])
+                return f" · Thesis: {matched['thesis_title']}"
+            return ""
+        # '없음'/구분선 → 최근 내러티브에서 이 티커를 추천한 테마 자동 연결 시도
+        auto = find_thesis_for_ticker(user_id, ticker)
+        if auto:
+            save_thesis_row(user_id, ticker, account, auto["thesis_title"],
+                            auto["narrative_category"], auto["narrative_date"])
+            return (f" · 🔗 자동 연결: [{auto['narrative_date']}] "
+                    f"{auto['thesis_title']} ({auto['where']})")
+        return ""
+    except Exception as exc:
+        return f" · ⚠️ Thesis 연결 실패: {exc}"
 
 
 def find_thesis_for_ticker(user_id: str, ticker: str) -> dict | None:
@@ -10284,6 +10407,7 @@ _ENTRY_REASON_OPTIONS = [
     "🧭 내러티브 / 테마 베팅",
     "🔄 분할 매수 / 물타기",
     "📊 정기 적립 (DCA)",
+    "⚖️ 리밸런싱",
 ]
 _ENTRY_REASON_DEFAULT = _ENTRY_REASON_OPTIONS[0]
 
@@ -10329,9 +10453,14 @@ _SELL_REASON_OPTIONS = [
     "💵 현금 확보",
     "🎯 목표가 도달",
     "🛑 손절 (스탑 도달)",
+    "✂️ 줄이기 / 부분 매도 (트랜치)",
 ]
 _SELL_REASON_DEFAULT = _SELL_REASON_OPTIONS[0]
 _SELL_REASON_SIGNAL = _SELL_REASON_OPTIONS[1]
+# 전량 청산과 부분 축소는 같은 '신호를 따랐다'라도 의미가 다르다. 축소를
+# '매도 신호'로 뭉뚱그리면 나중에 "신호대로 털었는가"와 "계획대로 줄였는가"를
+# 구분할 수 없다. 목록 맨 뒤에 덧붙여 기존 [매도:라벨] 태그에는 영향이 없다.
+_SELL_REASON_TRIM = _SELL_REASON_OPTIONS[-1]
 
 
 def _build_sell_memo(reason: str, base: str = "", verdict: str = "") -> str:
@@ -22480,8 +22609,13 @@ if st.session_state.get("logged_in"):
                                 ).dropna().iloc[-1])
                             except Exception:
                                 _px_tr = None
+                            # 트랜치 기준 수량(H열). 렌더에서는 읽기만 한다 —
+                            # 쓰기는 매수 폼과 자동화 일일 실행이 담당한다.
+                            _base_tr = _pf_states.get(_key0, {}).get("trim_base")
                             _trim_plan = rc.trim_size_plan(
                                 qty=pd.to_numeric(_qty, errors="coerce"), price=_px_tr,
+                                base_qty=rc.resolve_trim_base(
+                                    _base_tr, pd.to_numeric(_qty, errors="coerce")),
                                 swing_weight_pct=_w_eff,
                                 trim_ratio_pct=_prof_tr.get("Trim_Ratio_Pct",
                                                             rc.TRIM_RATIO_DEFAULT_PCT),
@@ -22522,13 +22656,21 @@ if st.session_state.get("logged_in"):
                                 rc.default_events_for_weight(_w_eff, _PORTFOLIO_ALERT_DEFAULT))
                             # 스윙(exit) / 포지션(pexit·ptrim) 호라이즌을 보유별로 선택.
                             # 기본값은 기존 그대로 exit,risk — 중장기로 운용하면 pexit 로 교체.
-                            _opts = ["exit", "risk", "pexit", "ptrim", "regime"]
+                            # entry 는 보유 종목에서 '추가 매수 신호'로 읽힌다.
+                            # ⚠️ (2026-09-14) 이전에는 목록에 entry 자체가 없어서
+                            #    켜고 싶어도 켤 수 없었다. 스윙 몫 0% 계좌의 기본값이
+                            #    pexit,ptrim 이라 축소 알림만 오고 추가 매수 신호는
+                            #    한 번도 발동한 적이 없다. 기본값은 건드리지 않는다 —
+                            #    켜 둔 토글을 코드가 조용히 바꾸지 않는다는 원칙 유지.
+                            _opts = ["entry", "exit", "risk", "pexit", "ptrim", "regime"]
+                            _PF_EVENT_LABELS = dict(rc.ALERT_EVENT_LABELS)
+                            _PF_EVENT_LABELS["entry"] = "🟢 추가 매수 신호"
                             _ac1, _ac2 = st.columns([4, 1])
                             with _ac1:
                                 _sel = st.multiselect(
                                     "🔔 알림 이벤트", options=_opts,
                                     default=[s for s in _cur if s in _opts],
-                                    format_func=lambda c: rc.ALERT_EVENT_LABELS.get(c, c),
+                                    format_func=lambda c: _PF_EVENT_LABELS.get(c, c),
                                     key=f"pf_alert_{acct}_{_tk}",
                                     label_visibility="collapsed",
                                 )
@@ -24079,10 +24221,13 @@ if st.session_state.get("logged_in"):
                     key="portfolio_add_account_selector",
                 )
                 # Thesis 옵션 (폼 바깥에서 미리 로드)
-                thesis_options = get_thesis_options_from_narratives(puid)
-                _THESIS_NONE = "(Thesis 없음 - 일반 매수)"
+                # 워치리스트 등록 폼과 같은 라벨·같은 목록을 쓴다(둘 다 자동 연결을
+                # 시도하는데 문구만 달라 '포트폴리오에는 자동 연결이 없다'는
+                # 오해를 만들었다).
+                _thesis_choice_labels, thesis_options = get_thesis_choices(puid)
+                _THESIS_NONE = "(Thesis 없음 - 자동 연결 시도)"
                 _THESIS_CORE = "📈 코어/정기적립 (인덱스 DCA)"
-                thesis_labels = [_THESIS_NONE, _THESIS_CORE] + [o["label"] for o in thesis_options]
+                thesis_labels = [_THESIS_NONE, _THESIS_CORE] + _thesis_choice_labels
 
                 input_mode = st.radio(
                     "입력 방식",
@@ -24216,10 +24361,21 @@ if st.session_state.get("logged_in"):
                                             # Trade_History에 BUY 기록
                                             _buy_date = new_buy_date.strftime("%Y-%m-%d")
                                             append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, _build_entry_memo(selected_entry_reason, "추가 매수"))
+                                            # 추가 매수도 Thesis 를 저장한다 — 예전에는
+                                            # 신규 분기에만 있어 조용히 버려졌다.
+                                            _thesis_msg = _link_thesis_on_buy(
+                                                puid, new_ticker, account_name, selected_thesis_label,
+                                                _THESIS_NONE, _THESIS_CORE, thesis_options)
+                                            # 트랜치 기준 수량 = 합산 후 총 수량 (분할 횟수 리셋)
+                                            _tb_ok, _tb_err = save_portfolio_trim_base_setting(
+                                                puid, account_name, new_ticker, new_qty_total)
+                                            _tb_msg = (f" · ✂️ 트랜치 기준 {new_qty_total:g}주로 재설정"
+                                                       if _tb_ok else f" · ⚠️ 트랜치 기준 저장 실패: {_tb_err}")
                                             _plan_msg = auto_save_plan_after_add(puid, account_name, new_ticker, new_avg) if auto_plan_on_add else ""
                                             st.success(
                                                 f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
-                                                f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}.{_plan_msg}"
+                                                f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
+                                                f"{_thesis_msg}{_tb_msg}{_plan_msg}"
                                             )
                                             st.rerun()
                                     else:
@@ -24244,32 +24400,17 @@ if st.session_state.get("logged_in"):
                                         # Trade_History에 BUY 기록
                                         _buy_date = new_buy_date.strftime("%Y-%m-%d")
                                         append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, _build_entry_memo(selected_entry_reason, "신규 매수"))
-                                        # ── Thesis 연결 ──
-                                        _thesis_msg = ""
-                                        if selected_thesis_label == _THESIS_CORE:
-                                            # 코어/정기적립(인덱스 DCA) — thesis가 아닌 별도 버킷
-                                            save_thesis_row(puid, new_ticker, account_name, "코어/정기적립 (DCA)", "core_dca", "")
-                                            _thesis_msg = " · 📈 코어/정기적립으로 기록"
-                                        elif selected_thesis_label != _THESIS_NONE:
-                                            # 사용자가 직접 고른 내러티브 테마
-                                            matched = next((o for o in thesis_options if o["label"] == selected_thesis_label), None)
-                                            if matched:
-                                                save_thesis_row(
-                                                    puid, new_ticker, account_name,
-                                                    matched["thesis_title"], matched["narrative_category"], matched["narrative_date"],
-                                                )
-                                                _thesis_msg = f" · Thesis: {matched['thesis_title']}"
-                                        else:
-                                            # '없음'으로 두면 → 최근 내러티브에서 이 티커를 추천한 테마 자동 연결
-                                            auto = find_thesis_for_ticker(puid, new_ticker)
-                                            if auto:
-                                                save_thesis_row(
-                                                    puid, new_ticker, account_name,
-                                                    auto["thesis_title"], auto["narrative_category"], auto["narrative_date"],
-                                                )
-                                                _thesis_msg = f" · 🔗 자동 연결: [{auto['narrative_date']}] {auto['thesis_title']} ({auto['where']})"
+                                        # ── Thesis 연결 (신규/추가 매수 공용 경로) ──
+                                        _thesis_msg = _link_thesis_on_buy(
+                                            puid, new_ticker, account_name, selected_thesis_label,
+                                            _THESIS_NONE, _THESIS_CORE, thesis_options)
+                                        # 트랜치 기준 수량 = 최초 매수 수량
+                                        _tb_ok, _tb_err = save_portfolio_trim_base_setting(
+                                            puid, account_name, new_ticker, qty_v)
+                                        _tb_msg = ("" if _tb_ok
+                                                   else f" · ⚠️ 트랜치 기준 저장 실패: {_tb_err}")
                                         _plan_msg = auto_save_plan_after_add(puid, account_name, new_ticker, price_v) if auto_plan_on_add else ""
-                                        st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다.{_thesis_msg}{_plan_msg}")
+                                        st.success(f"{account_name} / {new_ticker} 종목을 추가했습니다.{_thesis_msg}{_tb_msg}{_plan_msg}")
                                         st.rerun()
 
             with st.expander("데이터 수정하기", expanded=False):
@@ -24448,9 +24589,17 @@ if st.session_state.get("logged_in"):
 
                     # 시스템이 매도/주의를 띄운 상태면 '매도 신호'를 기본 선택으로 제시한다.
                     # 어디까지나 기본값이고, 다른 이유로 팔았으면 바꿔야 한다.
+                    # 판정이 '줄이기'면 전량 청산이 아니라 축소다 — 기본값도 그쪽으로
+                    # 제시한다. verdict_action 을 쓰는 이유는 "청산"이 '분할 청산'
+                    # 같은 축소 문구 안에도 들어가기 때문(부분 문자열 검색 금지).
+                    _sell_act = rc.verdict_action(_sell_verdict)
                     _sig_on = ("매도" in _sell_verdict) or ("🔴" in _sell_verdict)
-                    _sell_reason_default_idx = (
-                        _SELL_REASON_OPTIONS.index(_SELL_REASON_SIGNAL) if _sig_on else 0)
+                    if _sell_act == "trim":
+                        _sell_reason_default_idx = _SELL_REASON_OPTIONS.index(_SELL_REASON_TRIM)
+                    elif _sig_on or _sell_act == "exit":
+                        _sell_reason_default_idx = _SELL_REASON_OPTIONS.index(_SELL_REASON_SIGNAL)
+                    else:
+                        _sell_reason_default_idx = 0
                     if _sell_verdict:
                         st.caption(f"현재 시스템 판정: **{_sell_verdict}**"
                                    + (f" — {_sell_why}" if _sell_why else ""))
@@ -25916,11 +26065,8 @@ if st.session_state.get("logged_in"):
                 _wl_plan_map = {}                      # ticker → build_trade_plan 결과(수량·금액 프리필용)
                 _WL_THESIS_NONE = "(Thesis 없음 - 자동 연결 시도)"
                 _WL_THESIS_CORE = "📈 코어/정기적립 (인덱스 DCA)"
-                try:
-                    _wl_thesis_options = get_thesis_options_from_narratives(uid_wl)
-                except Exception:
-                    _wl_thesis_options = []
-                _wl_thesis_labels = [_WL_THESIS_NONE, _WL_THESIS_CORE] + [o["label"] for o in _wl_thesis_options]
+                _wl_choice_labels, _wl_thesis_options = get_thesis_choices(uid_wl)
+                _wl_thesis_labels = [_WL_THESIS_NONE, _WL_THESIS_CORE] + _wl_choice_labels
                 try:
                     _WL_BUY_REASON_IDX = _ENTRY_REASON_OPTIONS.index("🎯 최적 매수 타이밍 (눌림목·RS반전)")
                 except ValueError:
@@ -26365,6 +26511,7 @@ if st.session_state.get("logged_in"):
                                             _wl_tag = (" · " + " · ".join(_wl_tag_bits)) if _wl_tag_bits else ""
 
                                             _proceed, _base_memo, _plan_entry = False, "신규 매수", _px_v
+                                            _total_q = 0.0   # 등록 후 총 수량(트랜치 기준)
                                             _mask_bp = (
                                                 _pf_now["Account"].astype(str).str.strip().eq(_bp_acct)
                                                 & _pf_now["Ticker"].astype(str).str.strip().str.upper().eq(tk)
@@ -26387,6 +26534,7 @@ if st.session_state.get("logged_in"):
                                                     _pf_now.loc[_mi, "Quantity"] = _new_q
                                                     _pf_now.loc[_mi, "Purchase_Price"] = _new_avg
                                                     _proceed, _base_memo, _plan_entry = True, "추가 매수", _new_avg
+                                                    _total_q = float(_new_q)
                                             else:
                                                 _pf_now = pd.concat(
                                                     [_pf_now, pd.DataFrame([{
@@ -26399,6 +26547,7 @@ if st.session_state.get("logged_in"):
                                                     ignore_index=True,
                                                 )
                                                 _proceed, _base_memo, _plan_entry = True, "신규 매수", _px_v
+                                                _total_q = float(_qty_v)
 
                                             if _proceed:
                                                 save_portfolio(_pf_now)
@@ -26407,32 +26556,16 @@ if st.session_state.get("logged_in"):
                                                     float(_qty_v), float(_px_v), _bp_date_s,
                                                     _build_entry_memo(_bp_reason, f"{_base_memo}{_wl_tag}"),
                                                 )
-                                                # ── Thesis 연결 (포트폴리오 탭과 동일 규칙) ──
-                                                _th_msg = ""
-                                                try:
-                                                    if _bp_thesis == _WL_THESIS_CORE:
-                                                        save_thesis_row(uid_wl, tk, _bp_acct,
-                                                                        "코어/정기적립 (DCA)", "core_dca", "")
-                                                        _th_msg = " · 📈 코어/정기적립으로 기록"
-                                                    elif _bp_thesis != _WL_THESIS_NONE:
-                                                        _m = next((o for o in _wl_thesis_options
-                                                                   if o["label"] == _bp_thesis), None)
-                                                        if _m:
-                                                            save_thesis_row(uid_wl, tk, _bp_acct,
-                                                                            _m["thesis_title"],
-                                                                            _m["narrative_category"],
-                                                                            _m["narrative_date"])
-                                                            _th_msg = f" · Thesis: {_m['thesis_title']}"
-                                                    else:
-                                                        _auto = find_thesis_for_ticker(uid_wl, tk)
-                                                        if _auto:
-                                                            save_thesis_row(uid_wl, tk, _bp_acct,
-                                                                            _auto["thesis_title"],
-                                                                            _auto["narrative_category"],
-                                                                            _auto["narrative_date"])
-                                                            _th_msg = f" · 🔗 자동 연결: {_auto['thesis_title']}"
-                                                except Exception as _exc_th:
-                                                    _th_msg = f" · ⚠️ Thesis 연결 실패: {_exc_th}"
+                                                # ── Thesis 연결 (포트폴리오 탭과 동일 함수) ──
+                                                _th_msg = _link_thesis_on_buy(
+                                                    uid_wl, tk, _bp_acct, _bp_thesis,
+                                                    _WL_THESIS_NONE, _WL_THESIS_CORE,
+                                                    _wl_thesis_options)
+                                                # 트랜치 기준 수량 = 등록 후 총 수량
+                                                _tb_ok2, _tb_err2 = save_portfolio_trim_base_setting(
+                                                    uid_wl, _bp_acct, tk, _total_q)
+                                                if not _tb_ok2:
+                                                    _th_msg += f" · ⚠️ 트랜치 기준 저장 실패: {_tb_err2}"
 
                                                 # ── 플랜: Watchlist 손절/목표 승계 우선 ──
                                                 if _bp_inherit and (_inh_sl is not None or _inh_tp is not None):

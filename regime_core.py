@@ -855,10 +855,59 @@ def verdict_action(label) -> str:
     return "hold"
 
 
+def resolve_trim_base(raw_base, qty):
+    """저장된 트랜치 기준 수량 + 현재 보유 수량 → 실제 적용할 기준 수량.
+
+    규칙은 하나뿐이다: **기준은 현재 보유 수량보다 작아질 수 없다.**
+
+    수량이 기준을 넘어섰다는 것은 추가 매수가 있었다는 뜻이고, 그 시점부터
+    새 총량이 새 기준이 된다(= 분할 횟수가 1번째로 리셋). 줄어드는 방향으로는
+    절대 따라가지 않는다 — 따라가면 매도할 때마다 기준이 같이 내려가서 영원히
+    '1번째 축소'가 되고, 잔여 기준 계산과 구별이 사라진다.
+
+    ⚠️ 이 함수는 순수 함수다. 시트 쓰기는 호출자(앱 매수 폼 · 자동화 일일 실행)가
+       trim_base_sync 로 판단한다. 렌더 경로에서 쓰지 말 것 — rerun 마다 시트
+       쓰기가 발생한다.
+
+    저장값이 없거나(빈칸 · 구버전 행) 망가졌으면 현재 수량을 기준으로 삼는다
+    → 종전과 동일하게 첫 트랜치부터 시작한다(기존 사용자 동작 불변).
+    """
+    try:
+        q = float(qty)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(q) and q > 0):
+        return None
+    try:
+        b = float(raw_base)
+    except (TypeError, ValueError):
+        b = float("nan")
+    if not (np.isfinite(b) and b > 0):
+        return q
+    return max(b, q)
+
+
+def trim_base_sync(raw_base, qty):
+    """(적용할 기준 수량, 시트에 새로 써야 하는가) 튜플.
+
+    쓰기가 필요한 경우는 둘뿐이다 — 저장값이 아예 없거나, 추가 매수로 현재
+    수량이 저장된 기준을 넘어섰을 때. 매도로 수량이 줄기만 한 날은 False 다.
+    """
+    base = resolve_trim_base(raw_base, qty)
+    if base is None:
+        return None, False
+    try:
+        b = float(raw_base)
+    except (TypeError, ValueError):
+        b = float("nan")
+    return base, not (np.isfinite(b) and abs(b - base) < 1e-9)
+
+
 def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
                    trim_ratio_pct=TRIM_RATIO_DEFAULT_PCT,
                    swing_label=None, position_label=None,
                    min_trade_dollars: float = 0.0,
+                   base_qty=None,
                    show: bool = True) -> dict:
     """두 호흡 판정 + 트랜치 비율 → 권장 매도 수량.
 
@@ -880,14 +929,28 @@ def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
        않는다 — 금액이 작다고 청산 신호를 숨기는 것은 손실 방지의 정반대다.
 
     ⚠️ 중간 비율(예 30:70)에서 한쪽 몫만 먼저 판 경우, 잔여가 여전히 설정 비율대로
-       갈려 있다고 가정한다(트랜치 실행 추적 미구현 — note 로 고지한다).
+       갈려 있다고 가정한다(호흡별 실행 추적 미구현 — note 로 고지한다).
        0 또는 100 에서는 몫이 하나뿐이라 이 가정이 개입하지 않는다.
+
+    base_qty: 트랜치 기준 수량(Portfolio_Alert_State H열). 주어지면 축소 수량을
+      **잔여가 아니라 이 기준의 tr%** 로 계산한다. 잔여 기준으로 계산하면
+      매번 남은 것의 1/3 이라 0.67^n 으로 수렴할 뿐 끝나지 않는다 — 3회면
+      소진되도록 기준을 고정한다. 몇 번째 축소인지는 저장하지 않고
+      (기준 - 현재수량) 에서 파생한다. 카운터를 따로 저장하면 앱 렌더와
+      자동화가 둘 다 증가시킬 수 있어 이중 계상이 난다.
+
+      ⚠️ 스윙 몫이 0% 인 '포지션 전용' 운용에서만 적용한다. 스윙을 켜면 하나의
+         보유 수량을 두 호흡이 나눠 쓰는데, 수량이 줄어도 그게 어느 몫에서
+         나간 것인지 사후에 알 방법이 없다. 기준을 세울 수 없으므로 잔여 기준
+         계산(종전 동작)으로 되돌리고 note 로 고지한다 — 틀린 수량을 확신 있게
+         말하는 것보다 낫다.
 
     ⚠️ 주식 수를 정수로 반올림하지 않는다. 소수점 주식 보유가 실제로 존재한다.
     """
     out = {"enabled": False, "qty": 0.0, "pct": 0.0, "dollars": None,
            "full_exit": False, "blocked": False, "assumed": False,
-           "muted": False, "label": "", "note": ""}
+           "muted": False, "label": "", "note": "",
+           "tranche_no": 0, "base_qty": None}
 
     if not show:
         return out
@@ -918,6 +981,15 @@ def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
     sa = verdict_action(swing_label)
     pa = verdict_action(position_label)
 
+    # 트랜치 기준 수량 — 포지션 전용(스윙 몫 0%) 일 때만 적용한다. 위 docstring 참조.
+    base, _base_skipped = None, False
+    if base_qty is not None:
+        if w <= 0:
+            base = resolve_trim_base(base_qty, q)
+        else:
+            _base_skipped = True
+    out["base_qty"] = base
+
     sell, parts = 0.0, []
     if s_share > 0:
         if sa == "exit":
@@ -931,8 +1003,23 @@ def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
             sell += p_share
             parts.append("포지션 몫 전량")
         elif pa == "trim":
-            sell += p_share * tr
-            parts.append(f"포지션 몫의 {tr * 100:.0f}%")
+            if base is not None:
+                unit = base * tr
+                # 잔량이 1.5 트랜치 이하면 이번이 마지막 조각이다. 기계적으로
+                # unit 만 떼면 반올림 부스러기가 영원히 남는다 — 남길 바에는
+                # 털고 끝낸다. 이 경로는 full_exit 가 되어 최소 거래금액 게이트를
+                # 타지 않는다(전량 청산에는 게이트를 걸지 않는다는 규칙 그대로).
+                take = q if (unit <= 0 or q <= unit * 1.5) else unit
+                # ⚠️ 부동소수 경계: 누적 매도량이 정확히 k·unit 일 때 // 가 k-1 을
+                #    돌려준다(110.022/55.011 = 1.9999…). 회차가 하나씩 밀리므로
+                #    작은 엡실론을 더해서 센다.
+                _n = (int(max(0.0, base - q) / unit + 1e-9) + 1) if unit > 0 else 1
+                out["tranche_no"] = _n
+                sell += take
+                parts.append(f"{_n}번째 축소 (기준 {base:g}주의 {tr * 100:.0f}%)")
+            else:
+                sell += p_share * tr
+                parts.append(f"포지션 몫의 {tr * 100:.0f}%")
 
     # ⚠️ 몫이 0 이라 억제된 것과 애초에 매도 신호가 없는 것은 다르다. 둘을 같은
     #    문구로 묶으면 "🟡 줄이기" 바로 밑에 "매도 신호 없음"이 붙어 **거짓말**이
@@ -992,7 +1079,10 @@ def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
     out["dollars"] = dollars
     _d = f" (약 ${dollars:,.0f})" if dollars is not None else ""
     if full:
-        out["label"] = f"전량 매도 — {sell:g}주{_d}"
+        # 마지막 트랜치로 털린 경우와 '처음부터 전량 청산'을 구분해서 보여준다.
+        _last = (f" — {out['tranche_no']}번째(마지막) 축소"
+                 if out.get("tranche_no") else "")
+        out["label"] = f"전량 매도 — {sell:g}주{_d}{_last}"
     else:
         out["label"] = (f"권장 매도 {sell:g}주 · 보유의 {out['pct']:.0f}%{_d}"
                         f" — {' + '.join(parts)}")
@@ -1002,6 +1092,9 @@ def trim_size_plan(*, qty, price=None, swing_weight_pct=None,
                       f"으로 계산했습니다.")
     if 0 < w < 100:
         _notes.append("잔여 물량이 설정 비율대로 남아 있다고 가정합니다.")
+    if _base_skipped:
+        _notes.append("스윙 몫을 쓰는 동안에는 트랜치 기준 수량을 적용하지 않고 "
+                      "잔여 수량 기준으로 계산합니다.")
     out["note"] = " ".join(_notes)
     return out
 
