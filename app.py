@@ -9654,6 +9654,171 @@ def _invalidate_trade_history_cache():
     _trade_history_all_values_cached.clear()
 
 
+def load_trade_history_indexed(user_id: str) -> list:
+    """Trade_History 를 **시트 행 번호와 함께** 로드 (정정·삭제 전용).
+
+    ⚠️ load_trade_history 는 user 필터 후 reset_index 를 한다. 그 DataFrame 의
+       인덱스로 시트 행을 지우면 **다른 사용자의 거래가 지워진다.** 정정 경로는
+       반드시 이 함수를 쓴다.
+
+    ⚠️ 캐시(_trade_history_all_values_cached)를 쓰지 않는다. 삭제·수정은 '지금'
+       그 행이 몇 번째인지가 맞아야 한다 — 5분 묵은 스냅샷으로 행을 지우면
+       그 사이 추가된 거래만큼 어긋난다.
+    """
+    ws, err = open_trade_history_worksheet()
+    if ws is None:
+        return []
+    try:
+        rows = ws.get_all_values() or []
+    except Exception:
+        return []
+    if not rows:
+        return []
+    _first = [str(c).strip().lower() for c in rows[0]]
+    _has_header = any(c in _TRADE_HISTORY_SHEET_COLS for c in _first)
+    body = rows[1:] if _has_header else rows
+    start = 2 if _has_header else 1
+    uid = str(user_id).strip()
+    out = []
+    for i, r in enumerate(body, start=start):
+        r = (list(r) + [""] * 8)[:8]
+        if str(r[0]).strip() != uid:
+            continue
+        out.append({
+            "_row": i,
+            "account": str(r[1]).strip(),
+            "ticker": str(r[2]).strip().upper(),
+            "action": str(r[3]).strip().upper(),
+            "shares": to_float(r[4]),
+            "price": to_float(r[5]),
+            "date": str(r[6]).strip(),
+            "memo": str(r[7]),
+        })
+    return out
+
+
+def delete_trade_history_rows(row_idxs) -> tuple[bool, str]:
+    """Trade_History 행 삭제. 잘못 기록한 거래를 원장에서 제거한다.
+
+    ⚠️ 반드시 **내림차순**으로 지운다. 오름차순으로 지우면 첫 삭제 직후 아래
+       행들이 한 칸씩 당겨져 두 번째부터 엉뚱한 행이 사라진다.
+    """
+    ws, err = open_trade_history_worksheet()
+    if ws is None:
+        return False, err or "시트 열기 실패"
+    try:
+        for i in sorted({int(x) for x in row_idxs}, reverse=True):
+            ws.delete_rows(i)
+        _invalidate_trade_history_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def update_trade_history_account(rows, new_account: str, tag: str = "") -> tuple[bool, str]:
+    """Trade_History 행들의 account(B열)를 바꾸고 memo 에 정정 태그를 남긴다.
+
+    계좌를 옮길 때 원장을 두고 가면 안 된다 — compute_realized_pnl 이
+    groupby(["ticker", "account"]) 로 FIFO 를 맞추기 때문에, 보유만 옮기면
+    새 계좌에서 팔 때 **대응 매수 lot 이 없어 실현손익이 계산되지 않는다.**
+
+    과거 원장을 고치는 일이므로 흔적을 남긴다: memo 앞에 [계좌정정: A→B 날짜].
+    rows 는 load_trade_history_indexed 의 항목들.
+    """
+    ws, err = open_trade_history_worksheet()
+    if ws is None:
+        return False, err or "시트 열기 실패"
+    try:
+        updates = []
+        for r in rows:
+            i = int(r["_row"])
+            updates.append({"range": f"B{i}", "values": [[str(new_account)]]})
+            if tag:
+                updates.append({"range": f"H{i}",
+                                "values": [[f"{tag} {r.get('memo', '')}".strip()]]})
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        _invalidate_trade_history_cache()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def update_thesis_account(user_id: str, ticker: str,
+                          src_account: str, dst_account: str) -> tuple[int, str]:
+    """Thesis 시트의 Account(C열)를 옮긴다. 반환: (갱신 행 수, 에러)."""
+    ws, err = open_thesis_worksheet()
+    if ws is None:
+        return 0, err or "시트 열기 실패"
+    tk = str(ticker).strip().upper()
+    uid = str(user_id).strip()
+    try:
+        vals = ws.get_all_values() or []
+        updates = []
+        for i, r in enumerate(vals[1:], start=2):
+            r = (list(r) + [""] * 7)[:7]
+            if (str(r[0]).strip() == uid and str(r[1]).strip().upper() == tk
+                    and str(r[2]).strip() == str(src_account).strip()):
+                updates.append({"range": f"C{i}", "values": [[str(dst_account)]]})
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        return len(updates), ""
+    except Exception as exc:
+        return 0, str(exc)
+
+
+def migrate_portfolio_alert_state_key(user_id: str, ticker: str, src_account: str,
+                                      dst_account: str, new_base=None) -> tuple[bool, str]:
+    """Portfolio_Alert_State 의 키(uid|account|ticker)를 새 계좌로 이관.
+
+    알림 토글·손절·목표가·스윙 비중·트랜치 기준 수량이 전부 이 행에 붙어 있다.
+    보유만 옮기고 이 행을 두고 가면 새 계좌에서는 **알림이 기본값으로 리셋**되고
+    옛 계좌에는 유령 설정이 남는다.
+
+    대상 키가 이미 있으면(합산 이동) 대상 쪽 설정을 살리고 원본 행을 삭제한다 —
+    사용자가 대상 계좌에서 직접 맞춰 둔 손절·목표가를 덮어쓰지 않기 위해서다.
+    new_base 가 주어지면 트랜치 기준 수량(H열)만 합산 수량으로 재설정한다.
+    """
+    ws, err = open_portfolio_alert_state_worksheet()
+    if ws is None:
+        return False, err or "시트 열기 실패"
+    src_key = _pf_alert_key(user_id, src_account, ticker)
+    dst_key = _pf_alert_key(user_id, dst_account, ticker)
+    try:
+        vals = ws.get_all_values() or []
+        src_ix = dst_ix = None
+        for i, r in enumerate(vals[1:], start=2):
+            k = str(r[0]).strip() if r else ""
+            if k == src_key:
+                src_ix = i
+            elif k == dst_key:
+                dst_ix = i
+        if src_ix is None and dst_ix is None:
+            return True, ""            # 설정을 만든 적이 없는 종목 — 옮길 것이 없다
+        if dst_ix is not None:
+            if src_ix is not None:
+                ws.delete_rows(src_ix)
+                if src_ix < dst_ix:
+                    dst_ix -= 1        # 위쪽 행이 사라지면 아래가 한 칸 당겨진다
+            target_ix = dst_ix
+        else:
+            ws.update([[dst_key]], range_name=f"A{src_ix}", value_input_option="RAW")
+            target_ix = src_ix
+        if new_base is not None:
+            try:
+                b = float(new_base)
+            except (TypeError, ValueError):
+                b = 0.0
+            if b > 0:
+                ws.update([[b]], range_name=f"H{target_ix}", value_input_option="RAW")
+        ws.update([[_narrative_now_et_string()]], range_name=f"D{target_ix}",
+                  value_input_option="RAW")
+        load_portfolio_alert_states.clear()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def load_trade_history(user_id: str) -> pd.DataFrame:
     """Trade_History 시트에서 해당 user_id 행만 로드."""
     empty = pd.DataFrame(columns=_TRADE_HISTORY_SHEET_COLS)
@@ -24510,6 +24675,110 @@ if st.session_state.get("logged_in"):
                                             )
                                             st.rerun()
 
+            with st.expander("🔀 계좌 이동 (잘못 등록한 계좌 바로잡기)", expanded=False):
+                st.caption("종목을 다른 계좌로 통째로 옮깁니다. 수량·평단가는 그대로이고 "
+                           "알림 설정·손절/목표가·트랜치 기준 수량·투자 Thesis·거래 원장이 함께 따라갑니다.")
+                st.caption("⚠️ 한 종목에 **일부만 잘못 들어간** 경우(기존 보유에 실수로 추가 매수)는 "
+                           "이 기능이 아니라 아래 '🩹 거래 기록 정정'으로 그 매수를 취소한 뒤 "
+                           "올바른 계좌에 다시 기록하세요.")
+                if portfolio_df.empty:
+                    st.info("이동할 종목이 없습니다.")
+                else:
+                    _mv_accts = sorted(portfolio_df["Account"].dropna().astype(str).unique().tolist())
+                    _mv_c1, _mv_c2 = st.columns(2)
+                    with _mv_c1:
+                        _mv_src = st.selectbox("현재 계좌", options=_mv_accts, key="pf_move_src")
+                    _mv_cand = portfolio_df[portfolio_df["Account"].astype(str) == _mv_src]
+                    _mv_tks = sorted(_mv_cand["Ticker"].dropna().astype(str).unique().tolist())
+                    with _mv_c2:
+                        _mv_tk = st.selectbox("이동할 종목", options=_mv_tks or ["(없음)"],
+                                              key="pf_move_tk")
+                    # 보유가 있는 계좌 + 시트에 등록된 계좌 전부 (아직 종목이 없는
+                    # 계좌로도 옮길 수 있어야 한다 — HSA 처럼 비어 있는 경우가 있다)
+                    _mv_known = sorted(({str(a).strip() for a in _mv_accts}
+                                        | {str(a).strip() for a in sheet_accounts}) - {""})
+                    _mv_dst_opts = [a for a in _mv_known if a != _mv_src] + ["직접 입력"]
+                    _mv_dst_sel = st.selectbox("옮길 계좌", options=_mv_dst_opts, key="pf_move_dst")
+                    _mv_dst = (st.text_input("계좌명 직접 입력", value="", key="pf_move_dst_custom").strip()
+                               if _mv_dst_sel == "직접 입력" else _mv_dst_sel)
+
+                    _mv_row = portfolio_df[(portfolio_df["Account"].astype(str) == _mv_src)
+                                           & (portfolio_df["Ticker"].astype(str) == _mv_tk)]
+                    if _mv_tks and not _mv_row.empty and _mv_dst:
+                        _sq = float(pd.to_numeric(_mv_row["Quantity"].values[0], errors="coerce") or 0)
+                        _sp = float(pd.to_numeric(_mv_row["Purchase_Price"].values[0], errors="coerce") or 0)
+                        _dst_row = portfolio_df[(portfolio_df["Account"].astype(str) == _mv_dst)
+                                                & (portfolio_df["Ticker"].astype(str) == _mv_tk)]
+                        _merge = not _dst_row.empty
+                        _ok_merge = True
+                        if _merge:
+                            _dq = float(pd.to_numeric(_dst_row["Quantity"].values[0], errors="coerce") or 0)
+                            _dp = float(pd.to_numeric(_dst_row["Purchase_Price"].values[0], errors="coerce") or 0)
+                            _tq = _sq + _dq
+                            _tp = ((_sp * _sq) + (_dp * _dq)) / _tq if _tq > 0 else 0.0
+                            st.warning(f"**{_mv_dst}** 에 이미 {_mv_tk} {_dq:g}주가 있습니다 → "
+                                       f"합산 {_tq:g}주 · 가중평균 평단 ${_tp:,.4f}")
+                            _ok_merge = st.checkbox("합산에 동의합니다 (되돌리려면 다시 분리해야 합니다)",
+                                                    key="pf_move_merge_ok")
+                        else:
+                            _tq, _tp = _sq, _sp
+                            st.info(f"{_mv_src} → **{_mv_dst}** · {_mv_tk} {_sq:g}주 @ ${_sp:,.4f}")
+                        if st.button("🔀 계좌 이동 실행", key="pf_move_go",
+                                     use_container_width=True, disabled=not _ok_merge):
+                            _msgs = []
+                            # ⚠️ Portfolios 갱신을 **마지막**에 한다. 앞 단계가 실패하면
+                            #    보유가 원래 계좌에 그대로 있어 그냥 다시 누르면 된다.
+                            #    보유를 먼저 옮기면 재시도 시 원본을 못 찾아 복구가 막힌다.
+                            _n_th, _e_th = update_thesis_account(puid, _mv_tk, _mv_src, _mv_dst)
+                            if _e_th:
+                                _msgs.append(f"⚠️ Thesis 이관 실패: {_e_th}")
+                            elif _n_th:
+                                _msgs.append(f"Thesis {_n_th}건")
+                            _tag = (f"[계좌정정: {_mv_src}→{_mv_dst} "
+                                    f"{datetime.now(_MARKET_ET_TZ).strftime('%Y-%m-%d')}]")
+                            _th_rows = [r for r in load_trade_history_indexed(puid)
+                                        if r["ticker"] == str(_mv_tk).upper()
+                                        and r["account"] == _mv_src]
+                            if _th_rows:
+                                _ok_h, _e_h = update_trade_history_account(_th_rows, _mv_dst, _tag)
+                                _msgs.append(f"거래 원장 {len(_th_rows)}건" if _ok_h
+                                             else f"⚠️ 원장 이관 실패: {_e_h}")
+                            _ok_a, _e_a = migrate_portfolio_alert_state_key(
+                                puid, _mv_tk, _mv_src, _mv_dst,
+                                new_base=(_tq if _merge else None))
+                            if not _ok_a:
+                                _msgs.append(f"⚠️ 알림 설정 이관 실패: {_e_a}")
+                            _pf2 = portfolio_df.copy()
+                            _sm = ((_pf2["Account"].astype(str) == _mv_src)
+                                   & (_pf2["Ticker"].astype(str) == _mv_tk))
+                            if _merge:
+                                _dm = ((_pf2["Account"].astype(str) == _mv_dst)
+                                       & (_pf2["Ticker"].astype(str) == _mv_tk))
+                                _di = _pf2.index[_dm][0]
+                                _pf2["Quantity"] = _pf2["Quantity"].astype(object)
+                                _pf2["Purchase_Price"] = _pf2["Purchase_Price"].astype(object)
+                                _pf2.at[_di, "Quantity"] = float(_tq)
+                                _pf2.at[_di, "Purchase_Price"] = float(_tp)
+                                # 보유 고점 기준일은 더 오래된 쪽으로 — 트레일링 요구가
+                                # 깊은 쪽에 맞춰야 매도 신호가 느슨해지지 않는다.
+                                try:
+                                    _d1 = str(_mv_row["Date_Added"].values[0] or "")[:10]
+                                    _d2 = str(_dst_row["Date_Added"].values[0] or "")[:10]
+                                    _dd = min([d for d in (_d1, _d2) if d] or [""])
+                                    if _dd:
+                                        _pf2["Date_Added"] = _pf2["Date_Added"].astype(object)
+                                        _pf2.at[_di, "Date_Added"] = _dd
+                                except Exception:
+                                    pass
+                                _pf2 = _pf2.drop(index=_pf2.index[_sm][0]).reset_index(drop=True)
+                            else:
+                                _pf2["Account"] = _pf2["Account"].astype(object)
+                                _pf2.at[_pf2.index[_sm][0], "Account"] = _mv_dst
+                            save_portfolio(_pf2)
+                            st.success(f"✅ {_mv_tk} → {_mv_dst} 이동 완료"
+                                       + (" · " + " · ".join(_msgs) if _msgs else ""))
+                            st.rerun()
+
             with st.expander("🗑️ 종목 삭제 (매도 기록 없이 포지션 제거)", expanded=False):
                 st.caption("매도 기록 없이 포지션만 제거합니다. 실현 손익 추적이 필요하면 아래 '매도 기록'을 이용하세요.")
                 st.warning("⚠️ 이 경로는 **현금 잔고가 자동 반영되지 않습니다** (매도가를 모르기 때문). "
@@ -24675,6 +24944,135 @@ if st.session_state.get("logged_in"):
             st.divider()
             st.markdown("## 📋 전체 거래 내역")
             st.caption("실현 손익·누적 손익 차트 분석은 **📊 매매 복기** 탭으로 이동했습니다. 여기서는 거래 원장만 표시합니다.")
+
+            with st.expander("🩹 거래 기록 정정 (잘못 기록한 매수·매도 취소)", expanded=False):
+                st.caption("계좌를 잘못 골랐거나 수량을 잘못 넣은 거래를 원장에서 지웁니다. "
+                           "'포트폴리오도 함께 되돌리기'를 켜면 그 거래 직전 상태로 수량·평단가를 복원합니다.")
+                # ⚠️ 시트 읽기를 버튼 뒤에 둔다. expander 는 접혀 있어도 본문이 실행되므로
+                #    무조건 읽으면 포트폴리오 탭 rerun 마다 Trade_History 를 조회한다.
+                if st.button("🔄 최근 거래 불러오기", key="tf_load"):
+                    st.session_state["_tf_rows"] = load_trade_history_indexed(puid)[-40:]
+                _tf_rows = st.session_state.get("_tf_rows") or []
+                if not _tf_rows:
+                    st.info("먼저 '최근 거래 불러오기'를 눌러 주세요.")
+                else:
+                    def _tf_label(r):
+                        _sh = r["shares"] if pd.notna(r["shares"]) else 0
+                        _pr = r["price"] if pd.notna(r["price"]) else 0
+                        return (f"{r['date']} · {r['action']} · {r['ticker']} · {r['account']} · "
+                                f"{float(_sh):g}주 @ ${float(_pr):,.4f}")
+                    _tf_opts = list(range(len(_tf_rows)))
+                    _tf_i = st.selectbox("정정할 거래", options=_tf_opts,
+                                         format_func=lambda i: _tf_label(_tf_rows[i]),
+                                         index=len(_tf_rows) - 1, key="tf_pick")
+                    _tf = _tf_rows[_tf_i]
+                    _tf_q = float(_tf["shares"]) if pd.notna(_tf["shares"]) else 0.0
+                    _tf_p = float(_tf["price"]) if pd.notna(_tf["price"]) else 0.0
+                    _tf_undo = st.checkbox("포트폴리오 수량도 함께 되돌리기", value=True,
+                                           key="tf_undo",
+                                           help="끄면 원장에서 기록만 지웁니다 — 이미 손으로 "
+                                                "수량을 맞춰 둔 경우에 쓰세요.")
+                    _tf_hold = portfolio_df[(portfolio_df["Account"].astype(str) == _tf["account"])
+                                            & (portfolio_df["Ticker"].astype(str) == _tf["ticker"])] \
+                        if not portfolio_df.empty else pd.DataFrame()
+                    _tf_missing = _tf_hold.empty
+                    _tf_new_avg, _tf_new_date = None, None
+                    if _tf_undo and _tf["action"] == "SELL" and _tf_missing:
+                        st.warning("이 종목은 현재 포트폴리오에 없습니다(전량 매도됨). 되돌리려면 "
+                                   "평단가와 매수일을 직접 넣어야 합니다 — 추정해서 채우면 "
+                                   "트레일링 스톱 기준일이 조용히 틀어집니다.")
+                        _rc1, _rc2 = st.columns(2)
+                        with _rc1:
+                            _tf_new_avg = st.number_input("복원할 평단가", min_value=0.0, value=0.0,
+                                                          step=0.01, format="%.4f", key="tf_avg")
+                        with _rc2:
+                            _tf_new_date = st.date_input("복원할 매수일",
+                                                         value=datetime.now(_MARKET_ET_TZ).date(),
+                                                         key="tf_date")
+                    if _tf_undo and _tf["action"] == "BUY" and _tf_missing:
+                        st.error("이 종목이 포트폴리오에 없어 매수를 되돌릴 수 없습니다. "
+                                 "'포트폴리오 수량도 함께 되돌리기'를 끄고 기록만 지우세요.")
+                    if st.button("🩹 정정 실행", key="tf_go", use_container_width=True,
+                                 type="primary"):
+                        _blocked = (_tf_undo and _tf["action"] == "BUY" and _tf_missing)
+                        if _blocked:
+                            st.error("위 안내대로 설정을 바꾼 뒤 다시 시도해 주세요.")
+                        else:
+                            # ⚠️ 원장 삭제를 **먼저** 한다. 포트폴리오를 먼저 되돌리고
+                            #    삭제가 실패하면, 다시 눌렀을 때 같은 거래가 두 번
+                            #    되돌려져 수량이 더 줄어든다. 반대 순서는 최악이라도
+                            #    '기록은 지워졌는데 수량이 그대로'라 수정하기에서 손으로
+                            #    바로잡을 수 있다.
+                            _ok_del, _e_del = delete_trade_history_rows([_tf["_row"]])
+                            if not _ok_del:
+                                st.error(f"원장 삭제 실패: {_e_del}")
+                            else:
+                                st.session_state["_tf_rows"] = []
+                                _note = ""
+                                if _tf_undo:
+                                    _p2 = portfolio_df.copy()
+                                    _m2 = ((_p2["Account"].astype(str) == _tf["account"])
+                                           & (_p2["Ticker"].astype(str) == _tf["ticker"]))
+                                    _Q = (float(pd.to_numeric(_p2.loc[_m2, "Quantity"].values[0],
+                                                              errors="coerce") or 0)
+                                          if _m2.any() else 0.0)
+                                    _PP = (float(pd.to_numeric(_p2.loc[_m2, "Purchase_Price"].values[0],
+                                                               errors="coerce") or 0)
+                                           if _m2.any() else 0.0)
+                                    if _tf["action"] == "BUY":
+                                        _q0 = _Q - _tf_q
+                                        if _q0 < -1e-4:
+                                            _note = (f" ⚠️ 보유({_Q:g})가 취소할 매수({_tf_q:g})보다 "
+                                                     "적어 수량은 되돌리지 않았습니다.")
+                                        elif _q0 <= 1e-4:
+                                            _p2 = _p2.drop(index=_p2.index[_m2][0]).reset_index(drop=True)
+                                            save_portfolio(_p2)
+                                            _note = " · 잔여 0주 → 포지션 제거"
+                                        else:
+                                            # 평단가 역산: (Q·P − q₁·p₁) / q₀
+                                            _p0 = ((_Q * _PP) - (_tf_q * _tf_p)) / _q0
+                                            if _p0 <= 0:
+                                                _note = (" ⚠️ 평단가 역산 결과가 0 이하라 수량만 "
+                                                         "되돌렸습니다. 평단가를 확인해 주세요.")
+                                                _p0 = _PP
+                                            _ix2 = _p2.index[_m2][0]
+                                            _p2["Quantity"] = _p2["Quantity"].astype(object)
+                                            _p2["Purchase_Price"] = _p2["Purchase_Price"].astype(object)
+                                            _p2.at[_ix2, "Quantity"] = float(_q0)
+                                            _p2.at[_ix2, "Purchase_Price"] = float(_p0)
+                                            save_portfolio(_p2)
+                                            # 트랜치 기준 수량을 복원 수량으로 **내린다**.
+                                            # '기준은 내려가지 않는다'의 명시적 예외다. 부풀려진
+                                            # 기준을 두면 q ≤ unit×1.5 에 걸려 다음 줄이기
+                                            # 신호에서 곧장 '전량 매도'가 뜬다 — 잘못된 청산
+                                            # 권고는 손실 방지 원칙 정면 위반이다.
+                                            save_portfolio_trim_base_setting(
+                                                puid, _tf["account"], _tf["ticker"], _q0)
+                                            _note = (f" · {_Q:g} → {_q0:g}주 · 평단 "
+                                                     f"${_PP:,.4f} → ${_p0:,.4f}")
+                                    else:   # SELL 취소 — 매도는 평단가를 바꾸지 않으므로 유지
+                                        if _m2.any():
+                                            _ix2 = _p2.index[_m2][0]
+                                            _p2["Quantity"] = _p2["Quantity"].astype(object)
+                                            _p2.at[_ix2, "Quantity"] = float(_Q + _tf_q)
+                                            save_portfolio(_p2)
+                                            _note = f" · {_Q:g} → {_Q + _tf_q:g}주"
+                                        elif _tf_new_avg and float(_tf_new_avg) > 0:
+                                            _p2 = pd.concat([_p2, pd.DataFrame([{
+                                                "Account": _tf["account"], "Ticker": _tf["ticker"],
+                                                "Purchase_Price": float(_tf_new_avg),
+                                                "Quantity": float(_tf_q),
+                                                "Date_Added": _tf_new_date.strftime("%Y-%m-%d"),
+                                            }])], ignore_index=True)
+                                            save_portfolio(_p2)
+                                            save_portfolio_trim_base_setting(
+                                                puid, _tf["account"], _tf["ticker"], _tf_q)
+                                            _note = f" · 포지션 재생성 {_tf_q:g}주"
+                                        else:
+                                            _note = (" ⚠️ 평단가를 넣지 않아 기록만 지웠습니다. "
+                                                     "'종목 추가'로 다시 등록해 주세요.")
+                                st.success(f"✅ {_tf_label(_tf)} 기록을 지웠습니다.{_note}")
+                                st.rerun()
 
             trade_hist_df = load_trade_history(puid)
 
