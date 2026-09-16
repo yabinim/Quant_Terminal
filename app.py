@@ -9830,6 +9830,109 @@ def delete_trade_history_rows(row_idxs) -> tuple[bool, str]:
         return False, str(exc)
 
 
+# ── 원장 1행의 현금 영향 — 거래 정정·계좌 이동의 SSOT ──────────────────────────
+#   [2026-09-15] 정정이 원장·수량만 되돌리고 현금은 그대로 두던 구멍을 막는다.
+#   아래 표는 **기록 경로의 실제 동작**을 그대로 옮긴 것이다. 기록 쪽이 바뀌면
+#   여기도 같이 바꿔야 한다(정정이 조용히 틀어진다).
+def _ledger_cash_effect(action, shares, price, memo="") -> float:
+    """원장 한 행이 **기록될 때** 계좌 현금에 준 영향(부호 포함).
+
+      BUY                 append_trade_history_row 가 −수량×가격
+      BUY [배당재투자]    adjust_account_cash(+배당) 후 BUY(−동액)   → 순 0
+      SELL                append_trade_history_row 가 +수량×가격
+      DIV                 adjust_account_cash(+배당). DIV 행 append 는 현금을
+                          건드리지 않는다                              → +수량×가격
+      그 외 / 금액 이상   0
+
+    ⚠️ 기록 당시 잔고가 음수라 0 으로 보정된 거래는 실제 영향이 이보다 작았다.
+       보정 여부는 저장되지 않으므로 여기서 알 수 없다 — UI 가 미리보기와
+       체크박스로 사람에게 확인시킨다.
+    """
+    try:
+        amt = float(shares) * float(price)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(amt) or amt <= 0:
+        return 0.0
+    a = str(action or "").strip().upper()
+    m = str(memo or "")
+    if a == "BUY":
+        return 0.0 if _DIVIDEND_MEMO_TAG_DRIP in m else -amt
+    if a == "SELL":
+        return amt
+    if a == _DIVIDEND_TRADE_ACTION:
+        return amt
+    return 0.0
+
+
+def _ledger_dividend_ex_date(memo) -> str:
+    """배당 원장 행(현금·재투자) memo 의 '배당락 YYYY-MM-DD' → 'YYYY-MM-DD'. 아니면 ''.
+
+    배당 태그가 없는 행은 memo 에 우연히 '배당락' 이 있어도 무시한다.
+    """
+    m = str(memo or "")
+    if _DIVIDEND_MEMO_TAG_DRIP not in m and _DIVIDEND_MEMO_TAG_CASH not in m:
+        return ""
+    k = m.find("배당락 ")
+    if k == -1:
+        return ""
+    cand = m[k + 4:k + 14]
+    try:
+        dt = pd.to_datetime(cand, format="%Y-%m-%d", errors="coerce")
+    except Exception:
+        return ""
+    return "" if pd.isna(dt) else dt.strftime("%Y-%m-%d")
+
+
+def delete_dividend_log_rows(user_id: str, account: str, ticker: str,
+                             ex_date: str) -> tuple[bool, str]:
+    """거래 정정용 — 그 배당의 처리 기록을 지워 **미처리**로 되돌린다.
+
+    Dividend_Log 가 '처리됨'으로 남아 있으면 원장을 지워도 그 배당이 다시 뜨지
+    않는다(멱등 게이트). 재투자를 현금으로 바꾸려 해도 막다른 길이 된다.
+
+    매칭: (ID, Ticker, Ex_Date) 이면서 Account 일치 → 그 행(들).
+          Account 일치가 없으면 Account 를 무시하고 **정확히 1건**일 때만 삭제한다
+          (계좌 이동은 원장 계좌만 바꾸고 배당 로그는 옛 계좌로 남기 때문).
+          2건 이상이면 모호하므로 지우지 않고 알린다.
+    ⚠️ 캐시를 쓰지 않는다 — 행 번호가 '지금' 맞아야 한다. 내림차순으로 지운다.
+    반환 (ok, 메시지).
+    """
+    ws, err = open_dividend_log_worksheet()
+    if err or ws is None:
+        return False, err or "시트 열기 실패"
+    uid = str(user_id or "").strip().upper()
+    tk = str(ticker or "").strip().upper()
+    ex = str(ex_date or "").strip()[:10]
+    acct = str(account or "").strip().lower()
+    if not uid or not tk or not ex:
+        return False, "배당 식별 정보가 불완전합니다."
+    try:
+        vals = ws.get_all_values() or []
+        ncol = len(_DIVIDEND_LOG_COLS)
+        exact, loose = [], []
+        for i, r in enumerate(vals, start=1):
+            r = (list(r) + [""] * ncol)[:ncol]
+            if (str(r[0]).strip().upper() != uid or str(r[2]).strip().upper() != tk
+                    or str(r[3]).strip()[:10] != ex):
+                continue
+            loose.append(i)
+            if str(r[1]).strip().lower() == acct:
+                exact.append(i)
+        if not loose:
+            return True, "배당 처리 기록 없음(이미 미처리)"
+        targets = exact if exact else (loose if len(loose) == 1 else [])
+        if not targets:
+            return False, (f"같은 배당 기록이 {len(loose)}건이라 자동으로 지우지 않았습니다 "
+                           "— Dividend_Log 에서 직접 확인해 주세요")
+        for i in sorted(set(targets), reverse=True):
+            ws.delete_rows(i)
+        _invalidate_dividend_log_cache()
+        return True, f"배당 처리 기록 {len(targets)}건 삭제 → 미처리"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def update_trade_history_account(rows, new_account: str, tag: str = "") -> tuple[bool, str]:
     """Trade_History 행들의 account(B열)를 바꾸고 memo 에 정정 태그를 남긴다.
 
@@ -24864,6 +24967,30 @@ if st.session_state.get("logged_in"):
                         else:
                             _tq, _tp = _sq, _sp
                             st.info(f"{_mv_src} → **{_mv_dst}** · {_mv_tk} {_sq:g}주 @ ${_sp:,.4f}")
+                        # ── 현금도 옮기기(선택, **기본 끔**) ──
+                        #    방금 잘못 넣은 거래면 원계좌 현금은 잘못 차감·가산돼 있고 대상
+                        #    계좌엔 반영이 없다. 반대로 오래 보유한 종목의 누적 흐름을 옮기면
+                        #    증권사에 맞춰 둔 잔고가 틀어진다 — 그래서 사람이 고르게 한다.
+                        _mv_cash_on = False
+                        try:
+                            _mv_led = load_trade_history(puid)
+                            _mv_led = _mv_led[
+                                (_mv_led["account"].astype(str).str.strip() == _mv_src)
+                                & (_mv_led["ticker"].astype(str).str.strip().str.upper()
+                                   == str(_mv_tk).upper())]
+                            _mv_E = float(sum(
+                                _ledger_cash_effect(_r["action"], _r["shares"], _r["price"], _r["memo"])
+                                for _, _r in _mv_led.iterrows()))
+                            _mv_n = int(len(_mv_led))
+                        except Exception:
+                            _mv_E, _mv_n = 0.0, 0
+                        if abs(_mv_E) >= 0.005:
+                            _mv_cash_on = st.checkbox(
+                                _esc_md(f"💵 현금도 함께 옮기기 — {_mv_src} {-_mv_E:+,.2f} / "
+                                        f"{_mv_dst} {_mv_E:+,.2f} (원장 {_mv_n}건의 순현금흐름)"),
+                                value=False, key=f"pf_move_cash_{_mv_src}_{_mv_tk}_{_mv_dst}",   # 조합이 바뀌면 다시 끔
+                                help="방금 잘못 넣은 거래를 옮길 때만 켜세요. 오래 보유한 종목이면 끄세요 — "
+                                     "누적 흐름을 옮기면 증권사에 맞춰 둔 잔고가 틀어집니다.")
                         if st.button("🔀 계좌 이동 실행", key="pf_move_go",
                                      use_container_width=True, disabled=not _ok_merge):
                             _msgs = []
@@ -24884,6 +25011,26 @@ if st.session_state.get("logged_in"):
                                 _ok_h, _e_h = update_trade_history_account(_th_rows, _mv_dst, _tag)
                                 _msgs.append(f"거래 원장 {len(_th_rows)}건" if _ok_h
                                              else f"⚠️ 원장 이관 실패: {_e_h}")
+                                # 현금 이동은 원장 이관 **성공 직후**에만. 재시도하면 원장 행이
+                                # 이미 대상 계좌로 넘어가 _th_rows 가 비므로 이중 이동이 없다.
+                                # 금액은 미리보기(5분 캐시)가 아니라 방금 읽은 원장으로 다시 잰다.
+                                if _ok_h and _mv_cash_on:
+                                    _E = float(sum(_ledger_cash_effect(r["action"], r["shares"],
+                                                                       r["price"], r["memo"])
+                                                   for r in _th_rows))
+                                    if abs(_E) >= 0.005:
+                                        _ok_c1, _r_c1 = adjust_account_cash(
+                                            puid, _mv_src, -_E, note=f"{_mv_tk} 계좌정정(원계좌)")
+                                        if not _ok_c1:
+                                            _msgs.append(f"⚠️ 현금 이동 실패({_r_c1}) — {_mv_src} {-_E:+,.2f}, "
+                                                         f"{_mv_dst} {_E:+,.2f} 를 직접 수정하세요")
+                                        else:
+                                            _ok_c2, _r_c2 = adjust_account_cash(
+                                                puid, _mv_dst, _E, note=f"{_mv_tk} 계좌정정(대상)")
+                                            _msgs.append(f"현금 {_mv_src} {-_E:+,.2f} / {_mv_dst} {_E:+,.2f}"
+                                                         if _ok_c2 else
+                                                         f"⚠️ 대상 계좌 현금 반영 실패({_r_c2}) — "
+                                                         f"{_mv_dst} {_E:+,.2f} 를 직접 수정하세요")
                             _ok_a, _e_a = migrate_portfolio_alert_state_key(
                                 puid, _mv_tk, _mv_src, _mv_dst,
                                 new_base=(_tq if _merge else None))
@@ -25090,9 +25237,10 @@ if st.session_state.get("logged_in"):
             st.markdown("## 📋 전체 거래 내역")
             st.caption("실현 손익·누적 손익 차트 분석은 **📊 매매 복기** 탭으로 이동했습니다. 여기서는 거래 원장만 표시합니다.")
 
-            with st.expander("🩹 거래 기록 정정 (잘못 기록한 매수·매도 취소)", expanded=False):
+            with st.expander("🩹 거래 기록 정정 (잘못 기록한 매수·매도·배당 취소)", expanded=False):
                 st.caption("계좌를 잘못 골랐거나 수량을 잘못 넣은 거래를 원장에서 지웁니다. "
-                           "'포트폴리오도 함께 되돌리기'를 켜면 그 거래 직전 상태로 수량·평단가·보유 기준일을 복원합니다.")
+                           "'포트폴리오도 함께 되돌리기'를 켜면 그 거래 직전 상태로 수량·평단가·보유 기준일을 복원합니다. "
+                           "현금 잔고와 배당 처리 기록도 그 거래가 없었던 상태로 되돌립니다.")
                 # ⚠️ 시트 읽기를 버튼 뒤에 둔다. expander 는 접혀 있어도 본문이 실행되므로
                 #    무조건 읽으면 포트폴리오 탭 rerun 마다 Trade_History 를 조회한다.
                 if st.button("🔄 최근 거래 불러오기", key="tf_load"):
@@ -25113,10 +25261,17 @@ if st.session_state.get("logged_in"):
                     _tf = _tf_rows[_tf_i]
                     _tf_q = float(_tf["shares"]) if pd.notna(_tf["shares"]) else 0.0
                     _tf_p = float(_tf["price"]) if pd.notna(_tf["price"]) else 0.0
-                    _tf_undo = st.checkbox("포트폴리오 수량도 함께 되돌리기", value=True,
-                                           key="tf_undo",
-                                           help="끄면 원장에서 기록만 지웁니다 — 이미 손으로 "
-                                                "수량을 맞춰 둔 경우에 쓰세요.")
+                    _tf_memo0 = str(_tf.get("memo", "") or "")
+                    if _tf["action"] == _DIVIDEND_TRADE_ACTION:
+                        # DIV 는 수량·평단을 바꾼 적이 없다. 예전에는 이 체크가 켜진 채
+                        # 'else: SELL 취소' 분기로 떨어져 보유 수량에 보유주수가 더해졌다.
+                        _tf_undo = False
+                        st.caption("💵 현금 배당 기록 — 보유 수량·평단은 바뀐 적이 없어 되돌릴 것이 없습니다.")
+                    else:
+                        _tf_undo = st.checkbox("포트폴리오 수량도 함께 되돌리기", value=True,
+                                               key="tf_undo",
+                                               help="끄면 원장에서 기록만 지웁니다 — 이미 손으로 "
+                                                    "수량을 맞춰 둔 경우에 쓰세요.")
                     _tf_hold = portfolio_df[(portfolio_df["Account"].astype(str) == _tf["account"])
                                             & (portfolio_df["Ticker"].astype(str) == _tf["ticker"])] \
                         if not portfolio_df.empty else pd.DataFrame()
@@ -25137,6 +25292,30 @@ if st.session_state.get("logged_in"):
                     if _tf_undo and _tf["action"] == "BUY" and _tf_missing:
                         st.error("이 종목이 포트폴리오에 없어 매수를 되돌릴 수 없습니다. "
                                  "'포트폴리오 수량도 함께 되돌리기'를 끄고 기록만 지우세요.")
+                    # ── 현금 되돌리기: 기록할 때 움직였던 현금의 반대 ──
+                    #    수량 체크와 **별개**다. 수량은 손으로 맞췄지만 현금은 아닌 경우가 있다.
+                    _tf_cash_d = -_ledger_cash_effect(_tf["action"], _tf_q, _tf_p, _tf_memo0)
+                    _tf_cash_on = False
+                    if abs(_tf_cash_d) >= 0.005:
+                        try:
+                            _tf_cash_now = float(get_account_profile(puid, _tf["account"]).get("Cash", 0.0) or 0.0)
+                        except Exception:
+                            _tf_cash_now = 0.0
+                        _tf_cash_on = st.checkbox(
+                            _esc_md(f"현금 잔고도 되돌리기 — {_tf['account']}: ${_tf_cash_now:,.2f} → "
+                                    f"${_tf_cash_now + _tf_cash_d:,.2f} ({_tf_cash_d:+,.2f})"),
+                            value=True, key=f"tf_cash_{_tf['_row']}",   # 거래마다 기본값(켬)으로 시작
+                            help="기록할 때 자동으로 움직였던 현금을 반대로 돌립니다. 이미 손으로 잔고를 "
+                                 "맞춰 두셨으면 끄세요. 기록 당시 잔고가 음수라 0으로 보정됐던 거래는 "
+                                 "되돌리면 실제보다 많아질 수 있으니 금액을 확인하세요.")
+                        if _tf_cash_on and (_tf_cash_now + _tf_cash_d) < 0:
+                            st.warning("⚠️ 되돌린 잔고가 음수라 0으로 보정됩니다 — 실행 후 실제 현금을 확인하세요.")
+                    elif _DIVIDEND_MEMO_TAG_DRIP in _tf_memo0:
+                        st.caption("💵 배당 재투자는 입금과 매수가 함께 사라지므로 현금 변동이 없습니다.")
+                    _tf_div_ex = _ledger_dividend_ex_date(_tf_memo0)
+                    if _tf_div_ex:
+                        st.caption(f"🧾 배당 처리 기록(배당락 {_tf_div_ex})도 지워 **미처리**로 되돌립니다. "
+                                   f"최근 {_DIVIDEND_BACKFILL_DAYS}일 안의 배당이면 배당 알림에 다시 뜹니다.")
                     if st.button("🩹 정정 실행", key="tf_go", use_container_width=True,
                                  type="primary"):
                         _blocked = (_tf_undo and _tf["action"] == "BUY" and _tf_missing)
@@ -25214,7 +25393,7 @@ if st.session_state.get("logged_in"):
                                                 puid, _tf["account"], _tf["ticker"], _q0)
                                             _note = (f" · {_Q:g} → {_q0:g}주 · 평단 "
                                                      f"${_PP:,.4f} → ${_p0:,.4f}{_da_note}")
-                                    else:   # SELL 취소 — 매도는 평단가를 바꾸지 않으므로 유지
+                                    elif _tf["action"] == "SELL":   # SELL 취소 — 매도는 평단가를 바꾸지 않으므로 유지
                                         if _m2.any():
                                             _ix2 = _p2.index[_m2][0]
                                             _p2["Quantity"] = _p2["Quantity"].astype(object)
@@ -25235,7 +25414,26 @@ if st.session_state.get("logged_in"):
                                         else:
                                             _note = (" ⚠️ 평단가를 넣지 않아 기록만 지웠습니다. "
                                                      "'종목 추가'로 다시 등록해 주세요.")
-                                st.success(f"✅ {_tf_label(_tf)} 기록을 지웠습니다.{_note}")
+                                # ── 배당 처리 기록 → 미처리 복귀 ──
+                                if _tf_div_ex:
+                                    _ok_dl, _m_dl = delete_dividend_log_rows(
+                                        puid, _tf["account"], _tf["ticker"], _tf_div_ex)
+                                    _note += (f" · 🧾 {_m_dl}" if _ok_dl
+                                              else f" · ⚠️ 배당 기록 삭제 실패: {_m_dl}")
+                                # ── 현금은 **마지막** ──
+                                #    원장을 지운 뒤로는 어느 단계도 재시도가 안 된다. 현금은
+                                #    숫자 한 칸이라 손으로 고치기 가장 쉬우므로 맨 뒤에 두고,
+                                #    실패하면 정확한 금액을 알려준다.
+                                if _tf_cash_on:
+                                    _ok_c, _res_c = adjust_account_cash(
+                                        puid, _tf["account"], _tf_cash_d,
+                                        note=f"{_tf['ticker']} 거래 정정")
+                                    if _ok_c:
+                                        _note += f" · 💵 현금 {_tf_cash_d:+,.2f}"
+                                    else:
+                                        _note += (f" · ⚠️ 현금 반영 실패({_res_c}) — {_tf['account']} "
+                                                  f"가용 현금을 {_tf_cash_d:+,.2f} 만큼 직접 수정하세요")
+                                st.success(_esc_md(f"✅ {_tf_label(_tf)} 기록을 지웠습니다.{_note}"))
                                 st.rerun()
 
             trade_hist_df = load_trade_history(puid)
