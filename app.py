@@ -9333,6 +9333,121 @@ def load_portfolio():
     return df[_out_cols].copy()
 
 
+# ── 보유 기준일(Date_Added) 수량가중 ─────────────────────────────────────────
+#   Date_Added 는 포지션 트레일링 스톱의 '보유 고점' 기준일이다.
+#   rc.compute_position_drawdown · rc.compute_exit_signals · rc.compute_entry_baseline ·
+#   fx.hist_days_for_holding 이 모두 **이 날짜 하나**를 받는다 — 어떤 날짜를 넣을지는
+#   쓰기 쪽(여기)이 정한다. 그래서 regime_core 계약은 바뀌지 않는다.
+#
+#   [2026-09-15] 추가 매수 시 평단가와 **같은 계약**으로 수량가중한다.
+#     · 최초 매수일 보존(종전): 눌림에 추가해도 1년 전 고점이 기준 → 새 물량에
+#                                즉시 매도 신호. 신규 물량 입장에선 말이 안 된다.
+#     · 추가일로 리셋(기각):     소액 DCA 한 번에 트레일링 기억이 지워진다. 매도 신호가
+#                                뜬 종목을 몇 주 사서 경보를 끄는 경로가 생긴다
+#                                — 손실 방지 원칙 정면 위반.
+#     · 수량가중(채택):          평단처럼 매수 때만 움직이고 매도 때는 그대로.
+#                                역산 가능(거래 정정 롤백). 스키마 A:F 무변경.
+#   §7 재검토 금지 — lot 단위 이원 관리는 G열 추가·legacy 5열 판별·매도 lot 지정을
+#   건드려 기각했다.
+#
+#   ⚠️ 약점(알고 채택): 가중일 이후 고점은 어느 lot 의 실제 고점도 아닌 근사다.
+#      대량 추가 시 오래된 고점이 창에서 빠져 신호가 느슨해질 수 있다(리셋보다 훨씬 작다).
+#
+#   원장 태그: 가중에 **실제로 반영된** 추가 매수 BUY 행 memo 에 붙는다. 거래 정정이
+#   이 태그로 역산 여부를 가린다 — 도입 전 추가 매수는 날짜에 반영된 적이 없으므로
+#   역산하면 기준일이 실제보다 과거로 밀려 매수 전 고점에 앵커된다(허위 매도 신호).
+_DATE_BLEND_MEMO_TAG = "[기준일가중]"
+_DATE_ADDED_MIN_ORD = datetime(1970, 1, 1).toordinal()
+
+
+def _date_added_ordinal(v):
+    """Date_Added 값 → (정규화 'YYYY-MM-DD', ordinal).
+
+    비었으면 ("", None), 값은 있는데 못 읽으면 (None, None).
+    시각이 붙은 값('2026-08-01 10:30')은 앞 10자만 본다.
+    """
+    s_ = str(v if v is not None else "").strip()[:10]
+    if not s_ or s_.lower() in ("nan", "nat", "none"):
+        return "", None
+    try:
+        dt = pd.to_datetime(s_, errors="coerce")
+    except Exception:
+        return None, None
+    if pd.isna(dt):
+        return None, None
+    return dt.strftime("%Y-%m-%d"), dt.date().toordinal()
+
+
+def _blend_date_added(old_date, old_qty, add_date, add_qty):
+    """추가 매수 후 보유 기준일 = 수량가중 평균일.
+
+    new = old + (add − old) × add_qty / (old_qty + add_qty), 일 단위 반올림.
+    반환 (저장할 값, 메시지 조각, applied). 메시지는 ' · ' 로 시작하거나 빈 문자열.
+      · 새 물량 날짜/수량 이상 → 기존 값 그대로 + 경고, applied=False
+      · 기존일 빈 값           → 새 물량 날짜로 채움, applied=True
+      · 기존일 파싱 불가       → 기존 값 그대로 + 경고, applied=False
+                                 (조용히 틀리지 않게. 하류 hist_days_for_holding 은
+                                  읽을 수 없는 값을 최대 창으로 본다 = 보수적)
+    applied=True 일 때만 원장 memo 에 _DATE_BLEND_MEMO_TAG 를 붙인다.
+    """
+    old_s, old_o = _date_added_ordinal(old_date)
+    add_s, add_o = _date_added_ordinal(add_date)
+    old_raw = "" if old_s == "" else str(old_date)   # NaN/None 은 빈 값으로
+    try:
+        oq = float(old_qty)
+    except Exception:
+        oq = float("nan")
+    try:
+        aq = float(add_qty)
+    except Exception:
+        aq = float("nan")
+    if not add_s or add_o is None or not (aq > 0):
+        return old_raw, " · ⚠️ 새 물량 날짜를 읽을 수 없어 보유 기준일은 기존 값 유지", False
+    if old_s == "":
+        return add_s, f" · 📅 보유 기준일 {add_s}", True
+    if old_s is None:
+        return (old_raw,
+                f" · ⚠️ 보유 기준일 '{old_raw[:10]}' 을 읽을 수 없어 그대로 둡니다 "
+                "— [데이터 수정하기]에서 확인해 주세요", False)
+    if not (oq > 0):
+        return add_s, f" · 📅 보유 기준일 {old_s} → {add_s}", True
+    new_o = int(np.floor(old_o + (add_o - old_o) * aq / (oq + aq) + 0.5))
+    new_s = datetime.fromordinal(new_o).strftime("%Y-%m-%d")
+    if new_s == old_s:
+        return new_s, f" · 📅 보유 기준일 {new_s} 유지(수량가중)", True
+    return new_s, f" · 📅 보유 기준일 {old_s} → {new_s} (수량가중)", True
+
+
+def _unblend_date_added(cur_date, cur_qty, lot_date, lot_qty, today_ord=None):
+    """BUY 취소 롤백: d₀ = (Q·D − q₁·d₁) / q₀ — 평단가 역산과 같은 공식.
+
+    반환 (저장할 값, 메시지 조각). 역산할 수 없거나 결과가 비정상(오늘 이후 ·
+    1970 이전)이면 현재 값을 그대로 두고 경고한다.
+    ⚠️ 매수와 취소 사이에 매도가 있었으면 평단 역산과 똑같이 근사다(원가 평균법 한계).
+    """
+    cur_raw = "" if _date_added_ordinal(cur_date)[0] == "" else str(cur_date)
+    try:
+        Q = float(cur_qty)
+        q1 = float(lot_qty)
+    except Exception:
+        return cur_raw, " · ⚠️ 보유 기준일 역산 불가 — 기존 값 유지"
+    q0 = Q - q1
+    cur_s, cur_o = _date_added_ordinal(cur_date)
+    lot_s, lot_o = _date_added_ordinal(lot_date)
+    if cur_o is None or lot_o is None or not (q1 > 0) or not (q0 > 1e-4):
+        return cur_raw, " · ⚠️ 보유 기준일 역산 불가 — 기존 값 유지"
+    d0 = int(np.floor((Q * cur_o - q1 * lot_o) / q0 + 0.5))
+    if today_ord is None:
+        today_ord = datetime.now(_MARKET_ET_TZ).date().toordinal()
+    if d0 > int(today_ord) or d0 < _DATE_ADDED_MIN_ORD:
+        return (cur_raw, " · ⚠️ 보유 기준일 역산 결과가 비정상이라 기존 값 유지 "
+                         "— [데이터 수정하기]에서 확인해 주세요")
+    new_s = datetime.fromordinal(d0).strftime("%Y-%m-%d")
+    if new_s == cur_s:
+        return new_s, f" · 보유 기준일 {new_s} 유지"
+    return new_s, f" · 보유 기준일 {cur_s} → {new_s} (역산)"
+
+
 def save_portfolio(df):
     uid = str(st.session_state.get("user_id") or "").strip()
     if not uid:
@@ -10402,7 +10517,8 @@ def apply_dividend_decision(user_id: str, item: dict, action: str) -> tuple[bool
     if not ok_c:
         return False, f"현금 반영 실패: {res_c}"
 
-    # ② Portfolios 수량·평단 갱신
+    # ② Portfolios 수량·평단·보유 기준일 갱신
+    _drip_blend_tag = ""
     try:
         pf = load_portfolio()
         mask = ((pf["Account"].astype(str).str.strip() == acct)
@@ -10420,6 +10536,15 @@ def apply_dividend_decision(user_id: str, item: dict, action: str) -> tuple[bool
         new_avg = ((old_p * old_q) + gross) / new_q
         pf.loc[idx, "Quantity"] = new_q
         pf.loc[idx, "Purchase_Price"] = new_avg
+        # 재투자도 평단을 섞는 매수다 → 보유 기준일도 같은 계약으로 수량가중.
+        # (소량이라 날짜 이동은 거의 없다. 규칙을 하나로 두는 게 목적)
+        if "Date_Added" in pf.columns:
+            pf["Date_Added"] = pf["Date_Added"].astype(object)
+            _dr_da, _, _dr_applied = _blend_date_added(
+                pf.at[idx, "Date_Added"], old_q, pay_for_record, add_shares)
+            pf.at[idx, "Date_Added"] = _dr_da
+            if _dr_applied:
+                _drip_blend_tag = f" {_DATE_BLEND_MEMO_TAG}"
         save_portfolio(pf)
     except Exception as exc:
         adjust_account_cash(uid, acct, -gross, note=f"{tk} 배당 재투자 롤백")
@@ -10429,7 +10554,7 @@ def apply_dividend_decision(user_id: str, item: dict, action: str) -> tuple[bool
     try:
         append_trade_history_row(
             uid, acct, tk, "BUY", float(add_shares), px, pay_for_record,
-            f"{_DIVIDEND_MEMO_TAG_DRIP} 배당락 {ex_s} · ${gross:,.2f} 재투자",
+            f"{_DIVIDEND_MEMO_TAG_DRIP} 배당락 {ex_s} · ${gross:,.2f} 재투자{_drip_blend_tag}",
         )
     except Exception:
         pass
@@ -24467,7 +24592,8 @@ if st.session_state.get("logged_in"):
                         value=datetime.now(_MARKET_ET_TZ).date(),
                         key="form_portfolio_add_buy_date",
                         help="실제로 매수한 날짜. 트레일링 스톱은 이 날짜 이후의 고점을 기준으로 계산합니다. "
-                             "오늘 추가하더라도 실제 매수일로 지정하세요.",
+                             "오늘 추가하더라도 실제 매수일로 지정하세요. "
+                             "이미 보유 중인 종목에 추가하면 기존 기준일과 **수량가중**한 날짜가 새 기준일이 됩니다.",
                     )
                     auto_plan_on_add = st.checkbox(
                         "📐 제안 플랜 자동 저장 (손절/목표 → 가격 도달 알림 활성화)",
@@ -24522,10 +24648,19 @@ if st.session_state.get("logged_in"):
                                             new_avg = ((old_price * old_qty) + (price_v * qty_v)) / new_qty_total
                                             updated_df.loc[idx, "Quantity"] = new_qty_total
                                             updated_df.loc[idx, "Purchase_Price"] = new_avg
+                                            _buy_date = new_buy_date.strftime("%Y-%m-%d")
+                                            # 보유 기준일 = 수량가중 (평단가와 같은 계약)
+                                            if "Date_Added" not in updated_df.columns:
+                                                updated_df["Date_Added"] = ""
+                                            updated_df["Date_Added"] = updated_df["Date_Added"].astype(object)
+                                            _da_new, _da_msg, _da_applied = _blend_date_added(
+                                                updated_df.at[idx, "Date_Added"], old_qty, _buy_date, qty_v)
+                                            updated_df.at[idx, "Date_Added"] = _da_new
                                             save_portfolio(updated_df)
                                             # Trade_History에 BUY 기록
-                                            _buy_date = new_buy_date.strftime("%Y-%m-%d")
-                                            append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, _build_entry_memo(selected_entry_reason, "추가 매수"))
+                                            _add_base = (f"추가 매수 {_DATE_BLEND_MEMO_TAG}"
+                                                         if _da_applied else "추가 매수")
+                                            append_trade_history_row(puid, account_name, new_ticker, "BUY", qty_v, price_v, _buy_date, _build_entry_memo(selected_entry_reason, _add_base))
                                             # 추가 매수도 Thesis 를 저장한다 — 예전에는
                                             # 신규 분기에만 있어 조용히 버려졌다.
                                             _thesis_msg = _link_thesis_on_buy(
@@ -24540,7 +24675,7 @@ if st.session_state.get("logged_in"):
                                             st.success(
                                                 f"{account_name} / {new_ticker}: 추가 매수를 반영했습니다. "
                                                 f"합산 수량 {new_qty_total:g}, 새 평단가 {new_avg:.4f}."
-                                                f"{_thesis_msg}{_tb_msg}{_plan_msg}"
+                                                f"{_da_msg}{_thesis_msg}{_tb_msg}{_plan_msg}"
                                             )
                                             st.rerun()
                                     else:
@@ -24716,8 +24851,14 @@ if st.session_state.get("logged_in"):
                             _dp = float(pd.to_numeric(_dst_row["Purchase_Price"].values[0], errors="coerce") or 0)
                             _tq = _sq + _dq
                             _tp = ((_sp * _sq) + (_dp * _dq)) / _tq if _tq > 0 else 0.0
+                            try:
+                                _, _mv_da_prev, _ = _blend_date_added(
+                                    _dst_row["Date_Added"].values[0], _dq,
+                                    _mv_row["Date_Added"].values[0], _sq)
+                            except Exception:
+                                _mv_da_prev = ""
                             st.warning(f"**{_mv_dst}** 에 이미 {_mv_tk} {_dq:g}주가 있습니다 → "
-                                       f"합산 {_tq:g}주 · 가중평균 평단 ${_tp:,.4f}")
+                                       f"합산 {_tq:g}주 · 가중평균 평단 ${_tp:,.4f}{_mv_da_prev}")
                             _ok_merge = st.checkbox("합산에 동의합니다 (되돌리려면 다시 분리해야 합니다)",
                                                     key="pf_move_merge_ok")
                         else:
@@ -24759,15 +24900,19 @@ if st.session_state.get("logged_in"):
                                 _pf2["Purchase_Price"] = _pf2["Purchase_Price"].astype(object)
                                 _pf2.at[_di, "Quantity"] = float(_tq)
                                 _pf2.at[_di, "Purchase_Price"] = float(_tp)
-                                # 보유 고점 기준일은 더 오래된 쪽으로 — 트레일링 요구가
-                                # 깊은 쪽에 맞춰야 매도 신호가 느슨해지지 않는다.
+                                # 보유 기준일 = 수량가중 — 추가 매수와 같은 규칙.
+                                # [2026-09-15] 종전 min(더 오래된 쪽)에서 바꿨다. 병합은
+                                # "처음부터 올바른 계좌에 기록했다면"의 결과여야 하는데,
+                                # 추가 매수가 가중으로 바뀐 뒤에도 min 이면 같은 경제적
+                                # 사건에 규칙이 둘이 된다.
                                 try:
-                                    _d1 = str(_mv_row["Date_Added"].values[0] or "")[:10]
-                                    _d2 = str(_dst_row["Date_Added"].values[0] or "")[:10]
-                                    _dd = min([d for d in (_d1, _d2) if d] or [""])
-                                    if _dd:
-                                        _pf2["Date_Added"] = _pf2["Date_Added"].astype(object)
-                                        _pf2.at[_di, "Date_Added"] = _dd
+                                    _dd, _dd_msg, _ = _blend_date_added(
+                                        _dst_row["Date_Added"].values[0], _dq,
+                                        _mv_row["Date_Added"].values[0], _sq)
+                                    _pf2["Date_Added"] = _pf2["Date_Added"].astype(object)
+                                    _pf2.at[_di, "Date_Added"] = _dd
+                                    if _dd_msg:
+                                        _msgs.append(_dd_msg.lstrip(" ·"))
                                 except Exception:
                                     pass
                                 _pf2 = _pf2.drop(index=_pf2.index[_sm][0]).reset_index(drop=True)
@@ -24947,7 +25092,7 @@ if st.session_state.get("logged_in"):
 
             with st.expander("🩹 거래 기록 정정 (잘못 기록한 매수·매도 취소)", expanded=False):
                 st.caption("계좌를 잘못 골랐거나 수량을 잘못 넣은 거래를 원장에서 지웁니다. "
-                           "'포트폴리오도 함께 되돌리기'를 켜면 그 거래 직전 상태로 수량·평단가를 복원합니다.")
+                           "'포트폴리오도 함께 되돌리기'를 켜면 그 거래 직전 상태로 수량·평단가·보유 기준일을 복원합니다.")
                 # ⚠️ 시트 읽기를 버튼 뒤에 둔다. expander 는 접혀 있어도 본문이 실행되므로
                 #    무조건 읽으면 포트폴리오 탭 rerun 마다 Trade_History 를 조회한다.
                 if st.button("🔄 최근 거래 불러오기", key="tf_load"):
@@ -25040,6 +25185,25 @@ if st.session_state.get("logged_in"):
                                             _p2["Purchase_Price"] = _p2["Purchase_Price"].astype(object)
                                             _p2.at[_ix2, "Quantity"] = float(_q0)
                                             _p2.at[_ix2, "Purchase_Price"] = float(_p0)
+                                            # 보유 기준일 역산 — 가중에 반영된 매수만.
+                                            #   · [기준일가중] 태그: 추가 매수로 섞였던 lot
+                                            #   · '신규 매수': 기준일의 출발점이라 공식이 성립
+                                            #     (추가 매수가 없었다면 결과가 현재 값과 같다)
+                                            #   · 그 외(도입 전 추가 매수·도입 전 재투자):
+                                            #     날짜에 섞인 적이 없다 → 역산하면 기준일이
+                                            #     과거로 밀려 매수 전 고점에 앵커된다. 유지.
+                                            _da_note = ""
+                                            _tf_memo = str(_tf.get("memo", "") or "")
+                                            if "Date_Added" in _p2.columns:
+                                                if (_DATE_BLEND_MEMO_TAG in _tf_memo
+                                                        or "신규 매수" in _tf_memo):
+                                                    _p2["Date_Added"] = _p2["Date_Added"].astype(object)
+                                                    _da0, _da_note = _unblend_date_added(
+                                                        _p2.at[_ix2, "Date_Added"], _Q,
+                                                        _tf.get("date", ""), _tf_q)
+                                                    _p2.at[_ix2, "Date_Added"] = _da0
+                                                else:
+                                                    _da_note = " · 보유 기준일 유지(가중 도입 전 기록)"
                                             save_portfolio(_p2)
                                             # 트랜치 기준 수량을 복원 수량으로 **내린다**.
                                             # '기준은 내려가지 않는다'의 명시적 예외다. 부풀려진
@@ -25049,7 +25213,7 @@ if st.session_state.get("logged_in"):
                                             save_portfolio_trim_base_setting(
                                                 puid, _tf["account"], _tf["ticker"], _q0)
                                             _note = (f" · {_Q:g} → {_q0:g}주 · 평단 "
-                                                     f"${_PP:,.4f} → ${_p0:,.4f}")
+                                                     f"${_PP:,.4f} → ${_p0:,.4f}{_da_note}")
                                     else:   # SELL 취소 — 매도는 평단가를 바꾸지 않으므로 유지
                                         if _m2.any():
                                             _ix2 = _p2.index[_m2][0]
@@ -26910,6 +27074,7 @@ if st.session_state.get("logged_in"):
 
                                             _proceed, _base_memo, _plan_entry = False, "신규 매수", _px_v
                                             _total_q = 0.0   # 등록 후 총 수량(트랜치 기준)
+                                            _da_msg2 = ""     # 보유 기준일 안내(추가 매수만)
                                             _mask_bp = (
                                                 _pf_now["Account"].astype(str).str.strip().eq(_bp_acct)
                                                 & _pf_now["Ticker"].astype(str).str.strip().str.upper().eq(tk)
@@ -26931,7 +27096,15 @@ if st.session_state.get("logged_in"):
                                                                 + (float(_px_v) * float(_qty_v))) / _new_q
                                                     _pf_now.loc[_mi, "Quantity"] = _new_q
                                                     _pf_now.loc[_mi, "Purchase_Price"] = _new_avg
-                                                    _proceed, _base_memo, _plan_entry = True, "추가 매수", _new_avg
+                                                    # 보유 기준일 = 수량가중 (평단가와 같은 계약)
+                                                    _pf_now["Date_Added"] = _pf_now["Date_Added"].astype(object)
+                                                    _da_new2, _da_msg2, _da_ap2 = _blend_date_added(
+                                                        _pf_now.at[_mi, "Date_Added"], float(_old_q),
+                                                        _bp_date_s, float(_qty_v))
+                                                    _pf_now.at[_mi, "Date_Added"] = _da_new2
+                                                    _proceed, _base_memo, _plan_entry = True, (
+                                                        f"추가 매수 {_DATE_BLEND_MEMO_TAG}" if _da_ap2
+                                                        else "추가 매수"), _new_avg
                                                     _total_q = float(_new_q)
                                             else:
                                                 _pf_now = pd.concat(
@@ -26994,7 +27167,7 @@ if st.session_state.get("logged_in"):
 
                                                 st.success(
                                                     f"✅ {_bp_acct} / {tk} — {float(_qty_v):g}주 @ "
-                                                    f"${float(_px_v):.2f} 등록 완료{_th_msg}{_pl_msg}{_rm_msg}"
+                                                    f"${float(_px_v):.2f} 등록 완료{_da_msg2}{_th_msg}{_pl_msg}{_rm_msg}"
                                                 )
                                                 st.rerun()
 
