@@ -85,8 +85,12 @@ _PFSTATE_WORKSHEET = "Portfolio_Alert_State"  # [Key, Alert_States, Alert_LastSt
 #    열을 늘리면 읽기·병합·패딩·쓰기 범위가 자동으로 따라온다. 폭을 상수로
 #    하드코딩하지 말 것.
 _PFSTATE_COLS = ["Key", "Alert_States", "Alert_LastState", "Updated_At",
-                 "Stop_Loss", "Target_Price", "Swing_Weight_Pct"]
+                 "Stop_Loss", "Target_Price", "Swing_Weight_Pct", "Trim_Base_Qty"]
 _PFSTATE_IX_SWING_W = 2      # extra(= E열 이후) 안에서의 Swing_Weight_Pct 위치
+# H열 = 트랜치 기준 수량. 축소 권장량을 '잔여'가 아니라 이 기준의 tr% 로 계산한다.
+#   ⚠️ app.py 의 _PORTFOLIO_ALERT_STATE_COLS 와 **반드시 같은 폭**이어야 한다.
+#      한쪽만 늘리면 헤더 동기화가 열을 잘라내거나 위치가 밀린다 — lockstep 필수.
+_PFSTATE_IX_TRIM_BASE = 3
 _PF_ALERT_DEFAULT = "exit,risk"               # 보유 기본 알림 (손절은 exit의 ATR 트레일링에 포함)
 _PF_INTRADAY_EVENTS = ("exit", "risk")        # 장중 보유 행동 가능 이벤트
 # Portfolios 시트 열 인덱스(0-base). D=평단, F=Date_Added.
@@ -1738,6 +1742,7 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
         return [key, states_csv, last_state, today] + _ex
 
     new_rows, n_eval = [], 0
+    _qty_by_key = {}        # key → 현재 보유 수량 (트랜치 기준 수량 갱신용)
     for r in holdings:
         r = (list(r) + [""] * 6)[:6]
         uid, account, tk = str(r[0]).strip(), str(r[1]).strip(), str(r[2]).strip().upper()
@@ -1753,6 +1758,21 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
                  if len(_ex_row) > _PFSTATE_IX_SWING_W else "")
         _prof = _profile_for(uid, account)
         _swing_w = rc.resolve_swing_weight(_tk_w, _prof.get("Swing_Weight_Pct"))
+        # ── 트랜치 기준 수량(H열) ─────────────────────────────────────────
+        # 앱 매수 폼이 기록하지만, [데이터 수정하기]로 수량을 직접 고친 경우에는
+        # 기록되지 않는다. 일일 실행이 '기준은 현재 수량보다 작아질 수 없다'는
+        # 규칙으로 자가 치유한다. 매도로 줄기만 한 날은 쓰기가 발생하지 않는다.
+        _qty_raw = pd.to_numeric(r[_PF_COL_QTY], errors="coerce")
+        _qty_cur = float(_qty_raw) if pd.notna(_qty_raw) else None
+        _base_raw = (_ex_row[_PFSTATE_IX_TRIM_BASE]
+                     if len(_ex_row) > _PFSTATE_IX_TRIM_BASE else "")
+        _trim_base, _ = rc.trim_base_sync(_base_raw, _qty_cur)
+        # ⚠️ 여기서 state_map 을 고쳐 봐야 소용없다. 쓰기 직전 재조회(_fresh)가
+        #    _row[4:] 를 통째로 최신값으로 되돌린다. 저장은 그 병합 **다음**에
+        #    한다(아래 _qty_by_key 사용 블록). 여기 값은 이번 실행의 권장
+        #    수량 계산에만 쓴다.
+        if _qty_cur is not None:
+            _qty_by_key[key] = _qty_cur
         # 비율이 설정된 계좌·종목만 기본 이벤트가 비율에서 파생된다.
         # 미설정이면 _PF_ALERT_DEFAULT 그대로 → 기존 사용자 동작 불변.
         # 명시 저장된 states_csv 는 어느 경우에도 그대로 존중된다.
@@ -1786,9 +1806,8 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
             if fired:
                 _swc = rc.build_sell_card(an, None)
                 _px = float(hist["Close"].iloc[-1])
-                _qty = pd.to_numeric(r[_PF_COL_QTY], errors="coerce")
                 _trim = rc.trim_size_plan(
-                    qty=(float(_qty) if pd.notna(_qty) else None), price=_px,
+                    qty=_qty_cur, price=_px, base_qty=_trim_base,
                     swing_weight_pct=_swing_w,
                     trim_ratio_pct=_prof.get("Trim_Ratio_Pct",
                                              rc.TRIM_RATIO_DEFAULT_PCT),
@@ -1818,6 +1837,23 @@ def eval_portfolio_eod(spy_close, hist_cache, today):
                 _ex = _fresh.get(_row[0], {}).get("extra")
                 if _ex is not None:
                     _row[4:] = (list(_ex) + [""] * (_NPF - 4))[:_NPF - 4]
+
+        # ── 트랜치 기준 수량(H열) 갱신 — 반드시 _fresh 병합 **다음** ────────
+        # 병합은 E/F(손절·목표)의 앱 수정분을 살리려고 행 뒷부분을 통째로
+        # 되돌린다. 기준 수량을 그 앞에서 써 두면 같이 지워진다.
+        # 규칙은 순수 함수(rc.trim_base_sync)에 있고 멱등이므로, 최신값 위에서
+        # 다시 적용하는 것이 항상 옳다. 추가 매수로 수량이 기준을 넘었을 때만
+        # 값이 바뀐다 — 매도로 줄기만 한 날은 아무것도 쓰지 않는다.
+        _ix_tb = 4 + _PFSTATE_IX_TRIM_BASE
+        _n_base = 0
+        for _row in new_rows:
+            _b, _dirty = rc.trim_base_sync(_row[_ix_tb] if len(_row) > _ix_tb else "",
+                                           _qty_by_key.get(_row[0]))
+            if _dirty and _b is not None:
+                _row[_ix_tb] = _b
+                _n_base += 1
+        if _n_base:
+            print(f"  [INFO] 트랜치 기준 수량 갱신 {_n_base}건 (추가매수·신규 기록)")
 
         prev_len = max(0, len(st_vals) - 1)
         padded = new_rows + [[""] * _NPF for _ in range(max(0, prev_len - len(new_rows)))]
